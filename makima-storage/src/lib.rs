@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod blobs;
 pub mod checkpoint;
 pub mod conversation;
 pub mod id;
@@ -14,7 +15,10 @@ pub mod model;
 mod offload_cleanup;
 pub mod paths;
 pub mod plans;
+pub mod restore;
+pub mod restore_digest;
 pub mod session_lock;
+pub mod session_state;
 pub mod sessions;
 pub mod theme;
 pub mod trusted_folders;

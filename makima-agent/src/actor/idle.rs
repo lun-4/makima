@@ -125,6 +125,7 @@ impl Drop for ActorIdleGuard {
         if state.owned_idle(&self.owner).is_some() {
             state.idle = None;
             super::drive_operations(&self.actor.inner, &mut state);
+            self.actor.inner.policy_changed.notify(usize::MAX);
             self.actor.inner.queue.notify();
         }
     }
@@ -141,6 +142,7 @@ impl ActorState {
         self.status != ActorStatus::Idle
             || self.active.is_some()
             || self.processing.is_some()
+            || self.config_publication.is_some()
             || self.pending_publications != 0
             || !self.operations.is_empty()
             || !queue.is_empty()

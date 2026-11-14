@@ -205,7 +205,7 @@ Submit follow-up instructions to a background subagent and return { queued = tru
 
 ### `task_despawn` {#task_despawn}
 
-Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. Unlike local UI cancellation, this retires the subtree. Returns { ok = true }. Also callable from a code_execution script as a Python async function.
+Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. This does not retire their durable identities. Returns { ok = true }. Also callable from a code_execution script as a Python async function.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

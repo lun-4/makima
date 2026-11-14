@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use makima_agent::agent::LoadedInstructions;
 use makima_agent::cancel::CancelToken;
+use makima_agent::manager::AgentIncarnation;
+use makima_agent::state::StateAccess;
 use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
 use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
@@ -86,14 +88,17 @@ impl AgentContext {
 /// capabilities live in its `Caps` variant, so a capability exists exactly
 /// when its data does. Methods a kind lacks return `(nil, err)` instead of
 /// not existing, so callers can probe without pcall.
+#[derive(Clone)]
 pub(crate) struct LuaCtx {
     caps: Caps,
+    state_access: Option<StateAccess>,
     origin: Option<crate::runtime::TaskHandle>,
     pub(crate) cancel: CancelToken,
     tool_output_lines: ToolOutputLines,
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
+#[derive(Clone)]
 enum Caps {
     Trusted {
         authority: Box<crate::orchestration::TrustedContext>,
@@ -108,12 +113,14 @@ enum Caps {
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
-        config: AgentConfig,
+        target: Option<AgentRef>,
+        config: Box<AgentConfig>,
         workflow: bool,
         audience: ToolAudience,
         session_id: Option<SessionRef>,
     },
     Restore {
+        target: Option<AgentRef>,
         state: Option<serde_json::Value>,
     },
 }
@@ -122,6 +129,10 @@ impl LuaCtx {
     fn new(ctx: &ToolContext, caps: Caps) -> Self {
         Self {
             caps,
+            state_access: ctx
+                .managed_turn
+                .as_ref()
+                .map(|current| current.capture_new_invocation_state_access()),
             origin: None,
             cancel: ctx.cancel.clone(),
             tool_output_lines: ctx.tool_output_lines,
@@ -160,7 +171,11 @@ impl LuaCtx {
         Self::new(
             ctx,
             Caps::Start {
-                config: ctx.config.clone(),
+                target: ctx
+                    .managed_turn
+                    .as_ref()
+                    .map(|current| current.manager().reference(current.agent_id())),
+                config: Box::new(ctx.config.clone()),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 session_id: ctx.session_id.clone(),
@@ -171,9 +186,13 @@ impl LuaCtx {
     pub(crate) fn restore(
         tool_output_lines: ToolOutputLines,
         state: Option<serde_json::Value>,
+        target: Option<AgentRef>,
     ) -> Self {
         Self {
-            caps: Caps::Restore { state },
+            state_access: target
+                .as_ref()
+                .map(|target| target.state_access().read_only()),
+            caps: Caps::Restore { target, state },
             origin: None,
             cancel: CancelToken::none(),
             tool_output_lines,
@@ -186,6 +205,19 @@ impl LuaCtx {
         target: crate::orchestration::TrustedTarget,
         plugin: Arc<str>,
     ) -> Self {
+        let incarnation = target
+            .target
+            .incarnation()
+            .map_err(|error| error.to_string());
+        Self::trusted_context_with_incarnation(lua, target, plugin, incarnation)
+    }
+
+    pub(crate) fn trusted_context_with_incarnation(
+        lua: &mlua::Lua,
+        target: crate::orchestration::TrustedTarget,
+        plugin: Arc<str>,
+        incarnation: Result<AgentIncarnation, String>,
+    ) -> Self {
         let agent = Box::new(AgentContext::from(&target.template));
         let cancel = lock_cell(&active_task(lua)).cancel.clone();
         let task = active_task(lua);
@@ -193,12 +225,14 @@ impl LuaCtx {
             .plugin_owner
             .clone()
             .unwrap_or_else(|| crate::orchestration::plugin_authority(lua, plugin.clone()));
+        let state_access = Some(target.target.state_access());
         let authority = Box::new(crate::orchestration::TrustedContext::new(
             lua,
             target,
             &task,
             plugin,
             owner.clone(),
+            incarnation,
         ));
         {
             let mut cell = lock_cell(&task);
@@ -207,6 +241,7 @@ impl LuaCtx {
         }
         Self {
             caps: Caps::Trusted { authority, agent },
+            state_access,
             origin: None,
             cancel,
             tool_output_lines: ToolOutputLines::default(),
@@ -225,6 +260,104 @@ impl LuaCtx {
         Ok(authority)
     }
 
+    pub(crate) fn state_target(&self, lua: &mlua::Lua) -> Result<AgentRef, String> {
+        self.validate_origin(lua)?;
+        match &self.caps {
+            Caps::Trusted { authority, .. } => Ok(authority.target.clone()),
+            Caps::Handler { agent, .. } => {
+                let current = agent
+                    .managed_turn
+                    .as_ref()
+                    .ok_or("state requires a managed invocation")?;
+                Ok(current.manager().reference(current.agent_id()))
+            }
+            Caps::Start { target, .. } | Caps::Restore { target, .. } => {
+                target.clone().ok_or("state_target_unavailable".into())
+            }
+        }
+    }
+
+    pub(crate) fn state_access(
+        &self,
+        lua: &mlua::Lua,
+    ) -> Result<makima_agent::state::StateAccess, String> {
+        self.validate_origin(lua)?;
+        match &self.caps {
+            Caps::Trusted { .. } => self
+                .state_access
+                .clone()
+                .ok_or("state_target_unavailable".into()),
+            Caps::Handler { agent, .. } => {
+                let current = agent
+                    .managed_turn
+                    .as_ref()
+                    .ok_or("state requires a managed invocation")?;
+                let active = crate::runtime::current_managed_turn(lua).ok_or(INVOCATION_EXPIRED)?;
+                if !current.same_authority(&active)
+                    || agent.execution_agent_id != Some(current.agent_id())
+                {
+                    return Err(INVOCATION_EXPIRED.into());
+                }
+                self.state_access
+                    .clone()
+                    .ok_or("state_target_unavailable".into())
+            }
+            Caps::Start { .. } | Caps::Restore { .. } => self
+                .state_access
+                .clone()
+                .map(StateAccess::read_only)
+                .ok_or("state_target_unavailable".into()),
+        }
+    }
+
+    pub(crate) fn validate_state_write(&self, lua: &mlua::Lua) -> Result<(), String> {
+        self.validate_origin(lua)?;
+        if matches!(&self.caps, Caps::Start { .. } | Caps::Restore { .. }) {
+            return Err("state_read_only".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_state_migration(
+        &self,
+        lua: &mlua::Lua,
+        target: makima_agent::AgentId,
+    ) -> Result<(), String> {
+        self.validate_origin(lua)?;
+        match &self.caps {
+            Caps::Start { .. } | Caps::Restore { .. } => Err("state_read_only".into()),
+            Caps::Handler { agent, .. } if agent.execution_agent_id != Some(target) => {
+                Err("state_migration_requires_target".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn claim_state_effect<T>(
+        &self,
+        lua: &mlua::Lua,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.validate_origin(lua)?;
+        if matches!(&self.caps, Caps::Start { .. } | Caps::Restore { .. }) {
+            return Err("state_read_only".into());
+        }
+        let task = active_task(lua);
+        let owner = lock_cell(&task)
+            .plugin_owner
+            .clone()
+            .ok_or(INVOCATION_EXPIRED)?;
+        owner.claim_effect(|| {
+            let cell = lock_cell(&task);
+            if !cell.is_live() {
+                return Err(INVOCATION_EXPIRED.into());
+            }
+            cell.validate_plugin_effect()?;
+            makima_agent::cancel::CancelToken::with_effect(&[&cell.cancel, &self.cancel], effect)
+                .ok_or_else(|| INVOCATION_EXPIRED.to_owned())?
+        })
+    }
+
     pub(crate) fn agent_publication_claim(
         &self,
         lua: &mlua::Lua,
@@ -232,11 +365,14 @@ impl LuaCtx {
         publication: &CheckpointPublication,
     ) -> Result<CheckpointClaim, String> {
         self.validate_origin(lua)?;
+        if let Caps::Trusted { authority, .. } = &self.caps {
+            authority.validate_incarnation()?;
+        }
         target.validate_live().map_err(|error| error.to_string())?;
         self.publication_claim(lua, publication)
     }
 
-    fn publication_claim(
+    pub(crate) fn publication_claim(
         &self,
         lua: &mlua::Lua,
         publication: &CheckpointPublication,
@@ -308,7 +444,7 @@ impl LuaCtx {
     fn config(&self) -> Option<&AgentConfig> {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(&agent.config),
-            Caps::Start { config, .. } => Some(config),
+            Caps::Start { config, .. } => Some(config.as_ref()),
             Caps::Restore { .. } => None,
         }
     }
@@ -357,7 +493,7 @@ impl LuaCtx {
 
     fn state(&self) -> Option<&serde_json::Value> {
         match &self.caps {
-            Caps::Restore { state } => state.as_ref(),
+            Caps::Restore { state, .. } => state.as_ref(),
             _ => None,
         }
     }
@@ -974,6 +1110,7 @@ mod tests {
                 LuaCtx::restore(
                     ToolOutputLines::default(),
                     Some(serde_json::json!({"saved": true})),
+                    None,
                 ),
             )
             .unwrap();
@@ -1071,7 +1208,7 @@ mod tests {
         );
         assert_eq!(LuaCtx::start(&ctx).session_id(), Some(Some(&session_ref())));
         assert_eq!(
-            LuaCtx::restore(ToolOutputLines::default(), None).session_id(),
+            LuaCtx::restore(ToolOutputLines::default(), None, None).session_id(),
             None,
             "restore has no ToolContext to take a session from"
         );

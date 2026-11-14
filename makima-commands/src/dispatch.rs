@@ -44,16 +44,25 @@ impl CommandRegistry {
         self.dispatch_input_at(target.clone(), content, 0)
     }
 
+    pub fn dispatch_input_with_admission(
+        &self,
+        target: &TargetHandle,
+        content: CommandContent,
+        admission: Arc<dyn Any + Send + Sync>,
+    ) -> CommandFuture<InputDispatch> {
+        self.dispatch_input_at_with_admission(target.clone(), content, 0, Some(Some(admission)))
+    }
+
     pub(super) fn dispatch_input_at(
         &self,
         target: TargetHandle,
         content: CommandContent,
         depth: usize,
     ) -> CommandFuture<InputDispatch> {
-        self.dispatch_input_with_admission(target, content, depth, None)
+        self.dispatch_input_at_with_admission(target, content, depth, None)
     }
 
-    fn dispatch_input_with_admission(
+    fn dispatch_input_at_with_admission(
         &self,
         target: TargetHandle,
         content: CommandContent,
@@ -498,7 +507,7 @@ impl InvocationDispatcher {
         admission: Option<Arc<dyn Any + Send + Sync>>,
     ) -> CommandFuture<InputDispatch> {
         self.registry
-            .dispatch_input_with_admission(target, content, depth, Some(admission))
+            .dispatch_input_at_with_admission(target, content, depth, Some(admission))
     }
 }
 

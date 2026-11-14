@@ -1,9 +1,30 @@
-use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::{collections::BTreeMap, path::PathBuf, sync::LazyLock};
 
-use crate::{StateDir, StorageError};
+use crate::{StateDir, StorageError, id::AgentId};
+use makima_domain::ModelSelection;
+use serde::{Deserialize, Serialize};
 
 pub const PLANS_DIR: &str = "plans";
+pub const PLAN_STATE_KEY: &str = "plan/state";
+pub const PLAN_STATE_VERSION: u32 = 1;
+
+pub type PlanSlot = BTreeMap<AgentId, PlanEntry>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub path: PathBuf,
+    pub written: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<ApprovedPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_model: Option<ModelSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedPlan {
+    pub content: String,
+    pub sha256: String,
+}
 const SLUG_RETRIES: usize = 10;
 
 static ADJECTIVES: LazyLock<Vec<&str>> =

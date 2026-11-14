@@ -1,12 +1,16 @@
-use std::sync::{Arc, Weak};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::manager::WorkReservation;
 use makima_providers::{Message, ObservationSource};
+use makima_storage::session_state::{StateChange, StoredDeliveryOp};
 use serde_json::{Value, json};
 
 use super::{
     ActorEvent, ActorInner, ActorLifecycle, ActorOperation, AgentActorHandle, TurnOrigin,
     TurnResult, TurnTicket, drive_operations,
 };
+use crate::journal::{JournalChange, JournalCommit, JournalIncarnation, with_history_changes};
 use crate::tools::offload::OffloadStore;
 use crate::types::{ActorWorkIdentity, ActorWorkKind};
 use crate::{AgentInput, TurnCancellationReason, TurnId, TurnOutcome};
@@ -27,7 +31,7 @@ pub(crate) struct ParentDeliveryPolicy {
 
 #[derive(Clone)]
 pub(crate) struct ParentDelivery {
-    pub parent: Weak<ActorInner>,
+    pub parent_id: crate::AgentId,
     pub metadata: crate::AgentMetadata,
 }
 
@@ -59,11 +63,15 @@ impl ChildDelivery {
         })
     }
 
-    fn preview(&self, store: Option<&OffloadStore>) -> Self {
+    pub(crate) fn preview(&self, store: Option<&OffloadStore>) -> Self {
         let serialized = self.to_json().to_string();
         if serialized.len() + DELIVERY_HEADER.len() < MAX_DELIVERY_PREVIEW_BYTES {
             return self.clone();
         }
+        self.truncated_preview(store, &serialized)
+    }
+
+    pub(crate) fn truncated_preview(&self, store: Option<&OffloadStore>, serialized: &str) -> Self {
         let mut preview = self.clone();
         {
             preview.result.text = bounded(&self.result.text, PREVIEW_TEXT_BYTES);
@@ -76,7 +84,7 @@ impl ChildDelivery {
                 },
             });
             if let Some(store) = store {
-                match store.put(&serialized) {
+                match store.put(serialized) {
                     Ok(saved) => {
                         let path = store.path_of(&saved);
                         if path.as_os_str().len() <= PREVIEW_TEXT_BYTES {
@@ -127,7 +135,7 @@ impl ChildDelivery {
         preview
     }
 
-    fn input(&self) -> AgentInput {
+    pub(crate) fn input(&self) -> AgentInput {
         let envelope = self.to_json();
         AgentInput {
             message: String::new(),
@@ -170,6 +178,7 @@ pub enum DeliveryRejection {
     ParentUnavailable,
     ParentClosed,
     Overflow,
+    Journal(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,21 +199,89 @@ pub(crate) struct PendingDelivery {
     pub delivery: Arc<ChildDelivery>,
     pub message: Message,
     pub bytes: usize,
+    pub(crate) work: Vec<WorkReservation>,
     cancellation_retried: bool,
     arrived_during_run: bool,
 }
 
-pub(super) fn admit_delivery(
+pub(super) fn restore_pending(
+    state: &mut super::ActorState,
+    delivery: Arc<ChildDelivery>,
+    work: Vec<WorkReservation>,
+) {
+    let id = delivery.result.outcome.turn_id();
+    if state.deliveries.contains_key(&id) {
+        return;
+    }
+    let preview = Arc::new(delivery.preview(None));
+    let message = preview.input().preamble.remove(0);
+    let bytes = message.first_text_content().map_or(0, str::len);
+    if !state.delivery_seen.contains(&id) {
+        state.delivery_seen.push_back(id);
+    }
+    state.delivery_order.push_back(id);
+    state.deliveries.insert(
+        id,
+        PendingDelivery {
+            delivery: preview,
+            message,
+            bytes,
+            work,
+            cancellation_retried: false,
+            arrived_during_run: false,
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn admit_delivery(
     inner: &Arc<ActorInner>,
     delivery: Arc<ChildDelivery>,
 ) -> Result<(), DeliveryRejection> {
-    let delivery = Arc::new(delivery.preview(inner.offload.as_deref()));
-    let message = delivery.input().preamble.remove(0);
+    admit_delivery_reserved(inner, delivery, Vec::new())
+}
+
+#[cfg(test)]
+pub(crate) fn admit_delivery_reserved(
+    inner: &Arc<ActorInner>,
+    delivery: Arc<ChildDelivery>,
+    work: Vec<WorkReservation>,
+) -> Result<(), DeliveryRejection> {
+    admit_delivery_bound(inner, delivery, work, None)
+}
+
+pub(crate) fn admit_delivery_bound(
+    inner: &Arc<ActorInner>,
+    delivery: Arc<ChildDelivery>,
+    work: Vec<WorkReservation>,
+    source: Option<JournalIncarnation>,
+) -> Result<(), DeliveryRejection> {
+    let bindings = source
+        .into_iter()
+        .chain(inner.journal_incarnation.clone())
+        .collect::<Vec<_>>();
+    let store = if inner.journal.is_some() {
+        None
+    } else {
+        inner.offload.as_deref()
+    };
+    let preview = Arc::new(delivery.preview(store));
+    let message = preview.input().preamble.remove(0);
     let bytes = message.first_text_content().map_or(0, str::len);
     let mut state = inner
         .state
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    if state.lifecycle == ActorLifecycle::Shutdown {
+        let journal = inner
+            .journal
+            .as_ref()
+            .ok_or(DeliveryRejection::ParentClosed)?;
+        if journal.queue_delivery_for(inner.agent_id, Arc::clone(&delivery), bytes, &bindings)? {
+            retain_work(inner, &delivery, work);
+        }
+        return Ok(());
+    }
     if state.lifecycle != ActorLifecycle::Open {
         return Err(DeliveryRejection::ParentClosed);
     }
@@ -212,7 +289,11 @@ pub(super) fn admit_delivery(
     if state.deliveries.contains_key(&id) || state.delivery_seen.contains(&id) {
         return Ok(());
     }
-    if bytes > MAX_DELIVERY_PREVIEW_BYTES
+    if let Some(journal) = &inner.journal {
+        if !journal.queue_delivery_for(inner.agent_id, Arc::clone(&delivery), bytes, &bindings)? {
+            return Ok(());
+        }
+    } else if bytes > MAX_DELIVERY_PREVIEW_BYTES
         || state.deliveries.len() >= MAX_PENDING_DELIVERIES
         || state
             .deliveries
@@ -224,6 +305,7 @@ pub(super) fn admit_delivery(
     {
         return Err(DeliveryRejection::Overflow);
     }
+    let delivery = preview;
     state.delivery_suspended = false;
     state.delivery_seen.push_back(id);
     if state.delivery_seen.len() > super::MAX_RETAINED_TURN_RESULTS {
@@ -236,6 +318,7 @@ pub(super) fn admit_delivery(
             delivery: Arc::clone(&delivery),
             message,
             bytes,
+            work,
             cancellation_retried: false,
             arrived_during_run: true,
         },
@@ -278,18 +361,33 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
     let Some(result) = ticket.peek_result() else {
         return;
     };
-    let delivery = Arc::new(
-        ChildDelivery {
-            label: target.metadata.label.clone(),
-            result,
-        }
-        .preview(inner.offload.as_deref()),
-    );
-    let result = target
-        .parent
-        .upgrade()
+    let delivery = Arc::new(ChildDelivery {
+        label: target.metadata.label.clone(),
+        result,
+    });
+    let work = inner
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .turn_work
+        .get_mut(&ticket.turn_id())
+        .into_iter()
+        .flatten()
+        .filter_map(WorkReservation::take_report)
+        .collect();
+    let result = inner
+        .managed_admission
+        .as_ref()
+        .and_then(|managed| managed.manager.upgrade())
         .ok_or(DeliveryRejection::ParentUnavailable)
-        .and_then(|parent| admit_delivery(&parent, Arc::clone(&delivery)));
+        .and_then(|manager| {
+            crate::AgentManagerHandle::from_inner(manager).deliver_reserved_for(
+                target.parent_id,
+                Arc::clone(&delivery),
+                work,
+                inner.journal_incarnation.clone(),
+            )
+        });
     if let Err(reason) = result {
         inner
             .state
@@ -303,15 +401,129 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
 }
 
 impl AgentActorHandle {
+    pub(crate) fn reconcile_rewind_delivery_work(
+        &self,
+        mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
+    ) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(journal) = &self.inner.journal {
+            let snapshot = journal.snapshot();
+            let mut deliveries = BTreeMap::new();
+            for record in &snapshot.state {
+                if record.agent == Some(self.agent_id())
+                    && let StateChange::Delivery { id, op } = &record.change
+                {
+                    if deliveries.get(id).is_some_and(|(_, previous)| {
+                        !matches!(previous, StoredDeliveryOp::Queued(_))
+                    }) {
+                        continue;
+                    }
+                    deliveries.insert(*id, (record.seq, op.clone()));
+                }
+            }
+            state.deliveries.retain(|turn, pending| {
+                matches!(
+                    deliveries.get(&(pending.delivery.result.outcome.agent_id(), *turn)),
+                    Some((_, StoredDeliveryOp::Queued(_)))
+                )
+            });
+            let mut order = state
+                .deliveries
+                .iter()
+                .filter_map(|(turn, pending)| {
+                    deliveries
+                        .get(&(pending.delivery.result.outcome.agent_id(), *turn))
+                        .map(|(seq, _)| (*seq, *turn))
+                })
+                .collect::<Vec<_>>();
+            order.sort_unstable();
+            state.delivery_order = order.into_iter().map(|(_, turn)| turn).collect();
+            let pending = state.delivery_order.iter().copied().collect::<Vec<_>>();
+            state.delivery_runs.retain(|_, batch| {
+                batch.retain(|turn| pending.contains(turn));
+                !batch.is_empty()
+            });
+            state.delivery_seen = deliveries.keys().map(|(_, turn)| *turn).collect();
+            state.delivery_held = deliveries
+                .values()
+                .any(|(_, op)| matches!(op, StoredDeliveryOp::Queued(delivery) if delivery.held));
+            state.delivery_suspended = state.delivery_held;
+        }
+        for pending in state.deliveries.values_mut() {
+            pending.work = work(
+                pending.delivery.result.outcome.agent_id(),
+                pending.delivery.result.outcome.turn_id(),
+            );
+        }
+    }
+
+    pub(crate) fn reconcile_pending_deliveries(
+        &self,
+        mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
+    ) -> Result<(), super::ActorError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(journal) = &self.inner.journal else {
+            return Ok(());
+        };
+        let pending = journal
+            .pending_deliveries(self.inner.agent_id)
+            .map_err(super::ActorError::HistoryCheckpoint)?;
+        if pending
+            .iter()
+            .any(|(_, turn, delivery)| delivery.is_none() && !state.deliveries.contains_key(turn))
+        {
+            return Err(super::ActorError::HistoryCheckpoint(
+                "stored delivery was not hydrated before initialization".into(),
+            ));
+        }
+        let ids = pending.iter().map(|(_, turn, _)| *turn).collect::<Vec<_>>();
+        state.deliveries.retain(|turn, _| ids.contains(turn));
+        state.delivery_order.clear();
+        for (source, turn, delivery) in pending {
+            if !state.deliveries.contains_key(&turn) {
+                let delivery = delivery.ok_or_else(|| {
+                    super::ActorError::HistoryCheckpoint(
+                        "stored delivery was not hydrated before initialization".into(),
+                    )
+                })?;
+                restore_pending(&mut state, delivery, work(source, turn));
+            }
+            if let Some(pending) = state.deliveries.get_mut(&turn)
+                && pending.work.is_empty()
+            {
+                pending.work = work(source, turn);
+            }
+            if !state.delivery_order.contains(&turn) {
+                state.delivery_order.push_back(turn);
+            }
+        }
+        Ok(())
+    }
+
     pub fn withdraw_child_delivery(&self, child_turn: TurnId) -> bool {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(pending) = state.deliveries.remove(&child_turn) else {
+        let Some(pending) = state.deliveries.get(&child_turn) else {
             return false;
         };
+        if !record_operation(&self.inner, &pending.delivery, StoredDeliveryOp::Withdrawn) {
+            return false;
+        }
+        let pending = state
+            .deliveries
+            .remove(&child_turn)
+            .expect("checked under actor lock");
         state.delivery_order.retain(|id| *id != child_turn);
         state.emit(ActorEvent::Delivery(DeliveryEvent {
             delivery: pending.delivery,
@@ -321,17 +533,87 @@ impl AgentActorHandle {
     }
 }
 
-pub(super) fn take_pending(state: &mut super::ActorState) -> Vec<Arc<ChildDelivery>> {
+pub(crate) fn change(
+    parent_id: crate::AgentId,
+    delivery: &ChildDelivery,
+    op: StoredDeliveryOp,
+) -> JournalChange {
+    JournalChange {
+        agent: Some(parent_id),
+        generation: 0,
+        change: StateChange::Delivery {
+            id: (
+                delivery.result.outcome.agent_id(),
+                delivery.result.outcome.turn_id(),
+            ),
+            op,
+        },
+    }
+}
+
+pub(super) fn record_drop(inner: &ActorInner, delivery: &ChildDelivery) {
+    record_operation(inner, delivery, StoredDeliveryOp::Dropped);
+}
+
+fn record_operation(inner: &ActorInner, delivery: &ChildDelivery, op: StoredDeliveryOp) -> bool {
+    let Some(journal) = &inner.journal else {
+        return true;
+    };
+    match journal.commit(JournalCommit {
+        incarnations: inner.journal_incarnation.clone().into_iter().collect(),
+        changes: vec![change(inner.agent_id, delivery, op)],
+        ..Default::default()
+    }) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, agent_id = %inner.agent_id, "delivery transition could not be journaled");
+            false
+        }
+    }
+}
+
+fn retain_work(inner: &ActorInner, delivery: &ChildDelivery, work: Vec<WorkReservation>) {
+    if let Some(manager) = inner
+        .managed_admission
+        .as_ref()
+        .and_then(|managed| managed.manager.upgrade())
+    {
+        crate::AgentManagerHandle::from_inner(manager).retain_delivery_work(
+            inner.agent_id,
+            delivery.result.outcome.agent_id(),
+            delivery.result.outcome.turn_id(),
+            work,
+        );
+    }
+}
+
+pub(super) fn take_pending(
+    inner: &ActorInner,
+    state: &mut super::ActorState,
+    preserve: bool,
+) -> Vec<Arc<ChildDelivery>> {
     state.delivery_order.clear();
     state
         .deliveries
         .drain()
-        .map(|(_, pending)| pending.delivery)
+        .map(|(_, pending)| {
+            if preserve {
+                retain_work(inner, &pending.delivery, pending.work);
+            }
+            pending.delivery
+        })
         .collect()
 }
 
-pub(super) fn discard(state: &mut super::ActorState, reason: TurnCancellationReason) {
-    for delivery in take_pending(state) {
+pub(super) fn discard(
+    inner: &ActorInner,
+    state: &mut super::ActorState,
+    reason: TurnCancellationReason,
+) {
+    for delivery in take_pending(inner, state, reason == TurnCancellationReason::Shutdown) {
+        if reason != TurnCancellationReason::Shutdown {
+            record_drop(inner, &delivery);
+        }
         state.emit(ActorEvent::Delivery(DeliveryEvent {
             delivery,
             status: DeliveryStatus::Discarded(reason),
@@ -389,6 +671,7 @@ pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn 
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     if state.lifecycle != ActorLifecycle::Open
+        || held(inner, &state)
         || state
             .processing
             .as_ref()
@@ -426,8 +709,20 @@ pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn 
             .remove(&id)
             .expect("head checked under actor lock");
         state.delivery_order.pop_front();
+        state
+            .turn_work
+            .entry(turn_id)
+            .or_default()
+            .extend(pending.work);
         bytes += pending.bytes;
-        commit(pending.message);
+        with_history_changes(
+            vec![change(
+                inner.agent_id,
+                &pending.delivery,
+                StoredDeliveryOp::Consumed,
+            )],
+            || commit(pending.message),
+        );
         committed += 1;
         state.emit(ActorEvent::Delivery(DeliveryEvent {
             delivery: pending.delivery,
@@ -438,12 +733,31 @@ pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn 
     }
 }
 
+pub(super) fn held(inner: &ActorInner, state: &super::ActorState) -> bool {
+    let Some(journal) = &inner.journal else {
+        return state.delivery_held;
+    };
+    let snapshot = journal.snapshot();
+    let mut deliveries = BTreeMap::new();
+    for record in &snapshot.state {
+        if record.agent == Some(inner.agent_id)
+            && let StateChange::Delivery { id, op } = &record.change
+        {
+            deliveries.insert(*id, op);
+        }
+    }
+    deliveries
+        .values()
+        .any(|op| matches!(op, StoredDeliveryOp::Queued(delivery) if delivery.held))
+}
+
 /// Reserve only after explicit FIFO work has drained. Records are not claimed
 /// until the model loop inserts them into history at a safe request boundary.
 pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     if state.lifecycle != ActorLifecycle::Open
         || state.idle.is_some()
         || state.delivery_suspended
+        || held(inner, state)
         || state.deliveries.is_empty()
         || !state.delivery_runs.is_empty()
         || state.has_pending_work(&inner.queue)
@@ -453,7 +767,6 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     }
     let turn_id = TurnId::generate();
     let ticket = TurnTicket::new(turn_id, Arc::clone(&inner.identity));
-    inner.admit_ticket(turn_id, ticket.clone());
     let mut bytes = 0;
     let batch: Vec<_> = state
         .delivery_order
@@ -465,6 +778,13 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
             bytes <= MAX_DELIVERY_BATCH_BYTES
         })
         .collect();
+    let work = batch
+        .iter()
+        .filter_map(|id| state.deliveries.get(id))
+        .flat_map(|pending| pending.work.iter().map(WorkReservation::hold_only))
+        .collect::<Vec<_>>();
+    state.turn_work.insert(turn_id, work);
+    inner.admit_ticket(turn_id, ticket.clone());
     for pending in state.deliveries.values_mut() {
         pending.arrived_during_run = false;
     }
@@ -499,14 +819,15 @@ mod tests {
     use std::sync::Arc;
 
     use makima_providers::TokenUsage;
+    use makima_storage::session_state::{SessionStateView, StoredDeliveryOp};
     use test_case::test_case;
 
     use super::{
         ChildDelivery, DeliveryRejection, DeliveryStatus, MAX_PENDING_DELIVERIES, admit_delivery,
     };
     use crate::actor::{
-        ActorBackend, ActorEvent, BackendResult, ControlWork, TurnContext, TurnProvenance,
-        TurnResult, WorkKind,
+        ActorBackend, ActorEvent, ActorHistory, BackendResult, ControlWork, TurnContext,
+        TurnProvenance, TurnResult, WorkKind,
     };
     use crate::{
         AgentActorHandle, AgentId, AgentInput, History, TurnCancellationReason, TurnId, TurnOutcome,
@@ -515,13 +836,15 @@ mod tests {
     const CHILD_TEXT: &str = "child result";
     const LABEL: &str = "research";
     const CORRELATION: &str = "child correlation";
+    const CONVERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const CONVERSION_TIMEOUT_MESSAGE: &str = "delivery conversion did not settle";
 
     struct UnusedBackend;
 
     impl ActorBackend for UnusedBackend {
         fn run_turn<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: AgentInput,
             _: WorkKind,
@@ -530,7 +853,7 @@ mod tests {
         }
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: &'a ControlWork,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -538,7 +861,7 @@ mod tests {
         }
         fn run_compact<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -563,6 +886,99 @@ mod tests {
                 duration_ms: 0,
             },
         })
+    }
+
+    #[test_case(None, false; "absent_report_pruned_unheld_outside_preserved")]
+    #[test_case(Some(StoredDeliveryOp::Dropped), true; "dropped_child_report_pruned_held_outside_preserved")]
+    #[test_case(Some(StoredDeliveryOp::Consumed), false; "consumed_child_report_pruned")]
+    #[test_case(Some(StoredDeliveryOp::Withdrawn), true; "withdrawn_child_report_pruned")]
+    fn rewind_reconciles_pending_reports_against_installed_journal(
+        terminal: Option<StoredDeliveryOp>,
+        held: bool,
+    ) {
+        smol::block_on(async {
+            use crate::journal::{JournalChange, JournalCommit};
+            use makima_storage::id::MakimaId;
+            use makima_storage::session_state::{StateChange, StoredDelivery};
+
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let kept = delivery(AgentId::generate());
+            let removed = delivery(AgentId::generate());
+            let kept_turn = kept.result.outcome.turn_id();
+            let removed_turn = removed.result.outcome.turn_id();
+            {
+                let mut state = parent.inner.state.lock().unwrap();
+                super::restore_pending(&mut state, Arc::clone(&removed), Vec::new());
+                super::restore_pending(&mut state, Arc::clone(&kept), Vec::new());
+                state
+                    .delivery_runs
+                    .insert(TurnId::generate(), vec![removed_turn, kept_turn]);
+                state.delivery_suspended = !held;
+                state.delivery_held = !held;
+            }
+            let mut changes = vec![JournalChange {
+                agent: Some(parent.agent_id()),
+                generation: 0,
+                change: StateChange::Delivery {
+                    id: (kept.result.outcome.agent_id(), kept_turn),
+                    op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                        label: kept.label.clone(),
+                        result: kept.result.to_stored(MakimaId::generate(), None).unwrap(),
+                        preview_bytes: None,
+                        held,
+                    })),
+                },
+            }];
+            if let Some(op) = terminal {
+                changes.push(JournalChange {
+                    agent: Some(parent.agent_id()),
+                    generation: 0,
+                    change: StateChange::Delivery {
+                        id: (removed.result.outcome.agent_id(), removed_turn),
+                        op,
+                    },
+                });
+            }
+            let journal = manager.journal();
+            journal
+                .commit(JournalCommit {
+                    changes,
+                    ..Default::default()
+                })
+                .unwrap();
+            let revision = journal.snapshot().revision;
+            let mut reconciled = Vec::new();
+            parent.reconcile_rewind_delivery_work(|source, turn| {
+                reconciled.push((source, turn));
+                Vec::new()
+            });
+            assert_eq!(
+                reconciled,
+                vec![(kept.result.outcome.agent_id(), kept_turn)]
+            );
+            assert_eq!(journal.snapshot().revision, revision);
+            {
+                let state = parent.inner.state.lock().unwrap();
+                assert_eq!(state.deliveries.len(), 1);
+                assert!(state.deliveries.contains_key(&kept_turn));
+                assert_eq!(
+                    state.delivery_order.iter().copied().collect::<Vec<_>>(),
+                    vec![kept_turn]
+                );
+                assert!(
+                    state
+                        .delivery_runs
+                        .values()
+                        .all(|batch| batch == &[kept_turn])
+                );
+                assert_eq!(state.delivery_held, held);
+                assert_eq!(state.delivery_suspended, held);
+                assert_eq!(super::held(&parent.inner, &state), held);
+            }
+            parent.shutdown();
+            task.await;
+        });
     }
 
     #[test_case(false; "saved")]
@@ -768,6 +1184,287 @@ mod tests {
         Withdraw,
     }
 
+    async fn settle_conversions(journal: &crate::journal::SessionJournal) {
+        futures_lite::future::or(
+            async {
+                while journal.pending_revision().is_some() {
+                    smol::future::yield_now().await;
+                }
+            },
+            async {
+                smol::Timer::after(CONVERSION_TIMEOUT).await;
+                panic!("{CONVERSION_TIMEOUT_MESSAGE}");
+            },
+        )
+        .await;
+    }
+
+    async fn delivery_view(manager: &crate::AgentManagerHandle) -> SessionStateView {
+        let journal = manager.journal();
+        settle_conversions(&journal).await;
+        let snapshot = journal.snapshot();
+        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap()
+    }
+
+    #[test_case(false; "persisted_parent")]
+    #[test_case(true; "resident_parent")]
+    fn manager_delivery_routes_once_and_preserves_queue_bound(resident: bool) {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let router = if resident {
+                manager.clone()
+            } else {
+                crate::AgentManagerHandle::new_with_journal(Default::default(), manager.journal())
+                    .unwrap()
+            };
+            let envelope = delivery(AgentId::generate());
+            let id = (
+                envelope.result.outcome.agent_id(),
+                envelope.result.outcome.turn_id(),
+            );
+            router
+                .deliver(parent.agent_id(), Arc::clone(&envelope))
+                .unwrap();
+            router
+                .deliver(parent.agent_id(), Arc::clone(&envelope))
+                .unwrap();
+            for _ in 1..MAX_PENDING_DELIVERIES {
+                router.deliver(parent.agent_id(), delivery(id.0)).unwrap();
+            }
+            assert_eq!(
+                router.deliver(parent.agent_id(), delivery(id.0)),
+                Err(DeliveryRejection::Overflow),
+            );
+            router
+                .deliver(parent.agent_id(), Arc::clone(&envelope))
+                .unwrap();
+            let view = delivery_view(&router).await;
+            let pending = &view.scopes[&Some(parent.agent_id())].deliveries;
+            assert_eq!(pending.len(), MAX_PENDING_DELIVERIES);
+            assert!(matches!(&pending[&id], StoredDeliveryOp::Queued(stored)
+                if stored.result.outcome.agent_id == id.0
+                    && stored.result.outcome.turn_id == id.1));
+            assert_eq!(
+                parent.inner.state.lock().unwrap().deliveries.len(),
+                if resident { MAX_PENDING_DELIVERIES } else { 0 },
+            );
+            parent.shutdown();
+            task.await;
+        });
+    }
+
+    #[test_case(false; "persisted_parent")]
+    #[test_case(true; "resident_parent")]
+    fn manager_delivery_preserves_preview_byte_bound(resident: bool) {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let router = if resident {
+                manager.clone()
+            } else {
+                crate::AgentManagerHandle::new_with_journal(Default::default(), manager.journal())
+                    .unwrap()
+            };
+            let mut envelope = (*delivery(AgentId::generate())).clone();
+            envelope.result.text =
+                CHILD_TEXT.repeat(super::MAX_DELIVERY_PREVIEW_BYTES / CHILD_TEXT.len() / 2);
+            let bytes = envelope.input().preamble[0]
+                .first_text_content()
+                .unwrap()
+                .len();
+            let count = super::MAX_PENDING_PREVIEW_BYTES / bytes;
+            assert!(count < MAX_PENDING_DELIVERIES);
+            for _ in 0..count {
+                envelope.result.outcome = TurnOutcome::cancelled(
+                    envelope.result.outcome.agent_id(),
+                    TurnId::generate(),
+                    TokenUsage::default(),
+                    0,
+                    TurnCancellationReason::User,
+                );
+                router
+                    .deliver(parent.agent_id(), Arc::new(envelope.clone()))
+                    .unwrap();
+            }
+            envelope.result.outcome = TurnOutcome::cancelled(
+                envelope.result.outcome.agent_id(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                0,
+                TurnCancellationReason::User,
+            );
+            assert_eq!(
+                router.deliver(parent.agent_id(), Arc::new(envelope)),
+                Err(DeliveryRejection::Overflow),
+            );
+            parent.shutdown();
+            task.await;
+        });
+    }
+
+    #[test_case(false; "closed")]
+    #[test_case(true; "retired")]
+    fn persisted_terminal_parent_rejects_without_queue_mutation(retired: bool) {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let journal = manager.journal();
+            let mut record = journal.agent(parent.agent_id()).unwrap();
+            record.lifecycle = if retired {
+                makima_storage::session_state::StoredAgentLifecycle::Retired
+            } else {
+                makima_storage::session_state::StoredAgentLifecycle::Closed
+            };
+            journal
+                .commit(crate::journal::JournalCommit {
+                    agents: vec![record],
+                    ..Default::default()
+                })
+                .unwrap();
+            let router =
+                crate::AgentManagerHandle::new_with_journal(Default::default(), journal).unwrap();
+            let before = router.journal().snapshot().revision;
+            assert_eq!(
+                router.deliver(parent.agent_id(), delivery(AgentId::generate())),
+                Err(DeliveryRejection::ParentClosed),
+            );
+            assert_eq!(router.journal().snapshot().revision, before);
+            assert!(parent.inner.state.lock().unwrap().deliveries.is_empty());
+            parent.shutdown();
+            task.await;
+        });
+    }
+
+    #[test_case(false; "explicit_close")]
+    #[test_case(true; "shutdown")]
+    fn manager_delivery_close_distinguishes_shutdown(shutdown: bool) {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let envelope = delivery(AgentId::generate());
+            let id = (
+                envelope.result.outcome.agent_id(),
+                envelope.result.outcome.turn_id(),
+            );
+            manager
+                .deliver(parent.agent_id(), Arc::clone(&envelope))
+                .unwrap();
+            if shutdown {
+                parent.shutdown();
+            } else {
+                parent.close();
+            }
+            task.await;
+            let view = delivery_view(&manager).await;
+            let op = &view.scopes[&Some(parent.agent_id())].deliveries[&id];
+            if shutdown {
+                assert!(matches!(op, StoredDeliveryOp::Queued(_)));
+            } else {
+                assert_eq!(op, &StoredDeliveryOp::Dropped);
+            }
+            assert!(parent.inner.state.lock().unwrap().deliveries.is_empty());
+        });
+    }
+
+    #[test]
+    fn consumed_delivery_and_observation_share_journal_commit() {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let envelope = delivery(AgentId::generate());
+            let id = (
+                envelope.result.outcome.agent_id(),
+                envelope.result.outcome.turn_id(),
+            );
+            manager.deliver(parent.agent_id(), envelope).unwrap();
+            let ticket = schedule_ticket(&parent);
+            let mut history = History::new(Vec::new())
+                .with_mirror(Arc::clone(&parent.inner.history))
+                .with_journal(parent.agent_id(), manager.journal());
+            let journal = manager.journal();
+            settle_conversions(&journal).await;
+            let before = journal.snapshot();
+            assert!(before.histories[&parent.agent_id()].messages.is_empty());
+            let inbox =
+                super::super::inbox::ActorTurnInbox::source(&parent.inner, ticket.turn_id(), None);
+            inbox.commit_completions(&mut |message| {
+                history.push(message);
+                let snapshot = manager.journal().snapshot();
+                let view = SessionStateView::fold(
+                    &snapshot.state,
+                    &snapshot.agent_revisions,
+                    snapshot.seq,
+                )
+                .unwrap();
+                assert_eq!(
+                    view.scopes[&Some(parent.agent_id())].deliveries[&id],
+                    StoredDeliveryOp::Consumed,
+                );
+                assert_eq!(snapshot.histories[&parent.agent_id()].messages.len(), 1);
+                assert_eq!(snapshot.revision, before.revision + 1);
+                assert_eq!(snapshot.seq, before.seq + 1);
+            });
+            let snapshot = journal.snapshot();
+            let mut session = makima_storage::sessions::Session::<
+                makima_providers::Message,
+                TokenUsage,
+                crate::ToolOutput,
+            >::new("test/model", ".");
+            snapshot.apply_to(&mut session).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            session.save_to(directory.path()).unwrap();
+            let loaded = makima_storage::sessions::Session::<
+                makima_providers::Message,
+                TokenUsage,
+                crate::ToolOutput,
+            >::load_from(session.id, directory.path())
+            .unwrap();
+            assert_eq!(loaded.messages().len(), 1);
+            assert_eq!(
+                loaded.latest_state().unwrap().scopes[&Some(parent.agent_id())].deliveries[&id],
+                StoredDeliveryOp::Consumed
+            );
+            let restored = crate::journal::SessionJournal::from_session(&loaded).unwrap();
+            assert_eq!(
+                restored.snapshot().histories[&parent.agent_id()]
+                    .messages
+                    .len(),
+                1
+            );
+            assert!(!parent.withdraw_child_delivery(id.1));
+            parent.shutdown();
+            task.await;
+        });
+    }
+
+    #[test]
+    fn manager_delivery_withdrawal_is_terminal() {
+        smol::block_on(async {
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (parent, task, _start) = deferred_actor(&manager, None);
+            let envelope = delivery(AgentId::generate());
+            let id = (
+                envelope.result.outcome.agent_id(),
+                envelope.result.outcome.turn_id(),
+            );
+            manager
+                .deliver(parent.agent_id(), Arc::clone(&envelope))
+                .unwrap();
+            assert!(parent.withdraw_child_delivery(id.1));
+            assert!(!parent.withdraw_child_delivery(id.1));
+            manager.deliver(parent.agent_id(), envelope).unwrap();
+            let view = delivery_view(&manager).await;
+            assert_eq!(
+                view.scopes[&Some(parent.agent_id())].deliveries[&id],
+                StoredDeliveryOp::Withdrawn,
+            );
+            assert!(parent.inner.state.lock().unwrap().deliveries.is_empty());
+            parent.shutdown();
+            task.await;
+        });
+    }
+
     #[test_case(Discard::Clear; "clear")]
     #[test_case(Discard::Close; "close")]
     #[test_case(Discard::Withdraw; "withdraw")]
@@ -783,14 +1480,10 @@ mod tests {
                 None,
                 Some(rx),
             );
-            let mut managed = crate::actor::types::ManagedTurnAdmission::new(
-                std::sync::Weak::new(),
-                AgentId::generate(),
-            );
-            managed.parent_delivery = Some(super::ParentDelivery {
-                parent: Arc::downgrade(&ancestor.inner),
-                metadata: Default::default(),
-            });
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            manager.register_delivery_actor_for_test(&ancestor);
+            let managed =
+                manager.delivery_admission_for_test(AgentId::generate(), ancestor.agent_id());
             let (_start, rx) = flume::bounded(1);
             let (parent, parent_task) = AgentActorHandle::spawn_inner(
                 managed.agent_id,
@@ -842,14 +1535,10 @@ mod tests {
                 None,
                 Some(rx),
             );
-            let mut managed = crate::actor::types::ManagedTurnAdmission::new(
-                std::sync::Weak::new(),
-                AgentId::generate(),
-            );
-            managed.parent_delivery = Some(super::ParentDelivery {
-                parent: Arc::downgrade(&parent.inner),
-                metadata: Default::default(),
-            });
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            manager.register_delivery_actor_for_test(&parent);
+            let managed =
+                manager.delivery_admission_for_test(AgentId::generate(), parent.agent_id());
             let (_start, rx) = flume::bounded(1);
             let config = crate::EffectiveAgentConfig::new(
                 super::super::tests::policy(false),
@@ -916,13 +1605,14 @@ mod tests {
                 None,
                 Some(parent_rx),
             );
-            let mut admission = crate::actor::types::ManagedTurnAdmission::new(
-                std::sync::Weak::new(),
-                AgentId::generate(),
-            );
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            manager.register_delivery_actor_for_test(&parent);
+            let mut admission =
+                manager.delivery_admission_for_test(AgentId::generate(), parent.agent_id());
             admission.parent_delivery = Some(super::ParentDelivery {
-                parent: Arc::downgrade(&parent.inner),
+                parent_id: parent.agent_id(),
                 metadata: crate::AgentMetadata {
+                    transcript_key: Some(TOOL_ID.into()),
                     label: Some(LABEL.into()),
                     spawned_by_tool_use_id: Some(TOOL_ID.into()),
                 },
@@ -1134,8 +1824,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn pending_completion_blocks_finish_but_not_instruction_close() {
+    #[test_case(false; "available_report_blocks_finish")]
+    #[test_case(true; "held_report_allows_unrelated_turn_to_finish")]
+    fn pending_completion_blocks_finish_but_not_instruction_close(held: bool) {
         smol::block_on(async {
             const INSTRUCTION: &str = "ordinary work";
             let (_start, rx) = flume::bounded(1);
@@ -1160,12 +1851,153 @@ mod tests {
                 super::super::inbox::ActorTurnInbox::source(&actor.inner, ticket.turn_id(), None);
             source.instructions_submitted();
             admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
-            assert!(!source.finish());
+            actor.inner.state.lock().unwrap().delivery_held = held;
+            if held {
+                assert!(source.drain_completions().is_empty());
+            }
+            assert_eq!(source.finish(), held);
             assert!(source.finish_instructions());
             assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
             actor.close();
             task.await;
         });
+    }
+
+    #[test]
+    fn unrelated_plugin_turn_completes_with_restored_held_reports() {
+        const INSTRUCTION: &str = "ordinary plugin work";
+        const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const TURN_TIMEOUT_MESSAGE: &str = "plugin turn did not finish with held reports";
+
+        struct FinishingBackend;
+
+        impl ActorBackend for FinishingBackend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: ActorHistory<'a>,
+                context: TurnContext,
+                input: AgentInput,
+                work: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async move {
+                    assert_eq!(work, WorkKind::Turn);
+                    assert_eq!(input.message, INSTRUCTION);
+                    assert!(input.preamble.is_empty());
+                    let inbox = context.inbox.as_ref().unwrap();
+                    inbox.instructions_submitted();
+                    assert!(inbox.drain_completions().is_empty());
+                    inbox.join_children().await;
+                    assert!(inbox.drain_completions().is_empty());
+                    assert!(inbox.finish());
+                    BackendResult::EnteredRun(TurnOutcome::completed(
+                        context.agent_id,
+                        context.turn_id.unwrap(),
+                        TokenUsage::default(),
+                        1,
+                        crate::DoneReason::EndTurn,
+                    ))
+                })
+            }
+
+            fn run_control<'a>(
+                &'a mut self,
+                _: ActorHistory<'a>,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { unreachable!("plugin turn must not run control work") })
+            }
+
+            fn run_compact<'a>(
+                &'a mut self,
+                _: ActorHistory<'a>,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async { unreachable!("plugin turn must not compact") })
+            }
+        }
+
+        smol::block_on(futures_lite::future::or(
+            async {
+                let (start, rx) = flume::bounded(1);
+                let (actor, task) = AgentActorHandle::spawn_inner(
+                    AgentId::generate(),
+                    Vec::new(),
+                    None,
+                    Box::new(FinishingBackend),
+                    None,
+                    None,
+                    Some(rx),
+                );
+                let reports = [delivery(AgentId::generate()), delivery(AgentId::generate())];
+                let ids = reports
+                    .iter()
+                    .map(|report| report.result.outcome.turn_id())
+                    .collect::<Vec<_>>();
+                {
+                    let mut state = actor.inner.state.lock().unwrap();
+                    for report in &reports {
+                        super::restore_pending(&mut state, Arc::clone(report), Vec::new());
+                    }
+                    state.delivery_held = true;
+                    state.delivery_suspended = true;
+                }
+                let events = actor.subscribe_events();
+                let provenance = TurnProvenance {
+                    origin: crate::actor::TurnOrigin::Plugin,
+                    plugin: Some(LABEL.into()),
+                    ..Default::default()
+                };
+                let ticket = actor
+                    .submit(
+                        AgentInput::new(INSTRUCTION.into(), Vec::new()),
+                        None,
+                        CORRELATION.into(),
+                        crate::actor::TurnAdmissionOptions {
+                            provenance: provenance.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                start.send(()).unwrap();
+                let result = ticket.wait_result().await;
+                assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+                assert_eq!(result.provenance, provenance);
+                actor.runtime_barrier().await.unwrap();
+                {
+                    let state = actor.inner.state.lock().unwrap();
+                    assert!(state.delivery_held);
+                    assert!(state.delivery_runs.is_empty());
+                    assert_eq!(state.deliveries.len(), reports.len());
+                    assert_eq!(
+                        state.delivery_order.iter().copied().collect::<Vec<_>>(),
+                        ids
+                    );
+                    assert_eq!(state.delivery_seen.iter().copied().collect::<Vec<_>>(), ids);
+                    for report in &reports {
+                        let pending = &state.deliveries[&report.result.outcome.turn_id()];
+                        assert_eq!(pending.delivery.to_json(), report.to_json());
+                        assert!(!pending.cancellation_retried);
+                        assert!(!pending.arrived_during_run);
+                    }
+                    assert!(!state.has_pending_work(&actor.inner.queue));
+                    assert!(state.operations.is_empty());
+                }
+                assert_eq!(actor.latest_ticket().unwrap().turn_id(), ticket.turn_id());
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, ActorEvent::Delivery(_)))
+                );
+                actor.close();
+                task.await;
+            },
+            async {
+                smol::Timer::after(TURN_TIMEOUT).await;
+                panic!("{TURN_TIMEOUT_MESSAGE}");
+            },
+        ));
     }
 
     #[test]
@@ -1304,32 +2136,26 @@ mod tests {
     }
 
     fn deferred_actor(
+        manager: &crate::AgentManagerHandle,
         parent: Option<&AgentActorHandle>,
     ) -> (AgentActorHandle, smol::Task<()>, flume::Sender<()>) {
-        let managed = parent.map(|parent| {
-            let mut managed = crate::actor::types::ManagedTurnAdmission::new(
-                std::sync::Weak::new(),
-                AgentId::generate(),
-            );
-            managed.parent_delivery = Some(super::ParentDelivery {
-                parent: Arc::downgrade(&parent.inner),
-                metadata: Default::default(),
-            });
-            managed
-        });
-        let id = managed
-            .as_ref()
-            .map_or_else(AgentId::generate, |managed| managed.agent_id);
+        let id = AgentId::generate();
+        let mut managed =
+            manager.delivery_admission_for_test(id, parent.map_or(id, AgentActorHandle::agent_id));
+        if parent.is_none() {
+            managed.parent_delivery = None;
+        }
         let (start, rx) = flume::bounded(1);
         let (actor, task) = AgentActorHandle::spawn_inner(
             id,
             Vec::new(),
             None,
             Box::new(UnusedBackend),
-            managed,
+            Some(managed),
             None,
             Some(rx),
         );
+        manager.register_delivery_actor_for_test(&actor);
         if parent.is_some() {
             actor.configure_parent_delivery(true).unwrap();
         }
@@ -1344,11 +2170,87 @@ mod tests {
     }
 
     #[test]
+    fn continuation_inherits_all_report_chains_at_capacity() {
+        smol::block_on(async {
+            let ledger = crate::manager::WorkLedger::new(crate::AgentLimits {
+                max_active_agents: 4,
+                ..Default::default()
+            });
+            let ancestor = AgentId::generate();
+            let parent = AgentId::generate();
+            ledger.register(ancestor, None, 0, true);
+            ledger.register(parent, Some(ancestor), 0, true);
+            let mut reports = Vec::new();
+            for _ in 0..2 {
+                let child = AgentId::generate();
+                let admission = ledger.register(child, Some(parent), 0, true);
+                let mut turn = admission.try_reserve_reporting(true).unwrap();
+                reports.push((delivery(child), turn.take_report().unwrap()));
+            }
+            assert_eq!(ledger.active_agents(), 4);
+            let (start, ready) = flume::bounded(1);
+            let (actor, task) = AgentActorHandle::spawn_inner(
+                parent,
+                Vec::new(),
+                None,
+                Box::new(UnusedBackend),
+                None,
+                None,
+                Some(ready),
+            );
+            for (delivery, work) in reports {
+                super::admit_delivery_reserved(&actor.inner, delivery, vec![work]).unwrap();
+            }
+            let ticket = schedule_ticket(&actor);
+            assert!(
+                actor
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .turn_work
+                    .get_mut(&ticket.turn_id())
+                    .unwrap()
+                    .iter_mut()
+                    .all(|work| work.take_report().is_none())
+            );
+            assert_eq!(
+                actor.inner.state.lock().unwrap().turn_work[&ticket.turn_id()].len(),
+                2
+            );
+            assert_eq!(super::drain(&actor.inner, ticket.turn_id()).len(), 2);
+            assert_eq!(ledger.active_agents(), 4);
+            let mut work = actor
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .turn_work
+                .remove(&ticket.turn_id())
+                .unwrap();
+            let reports = work
+                .iter_mut()
+                .filter_map(crate::manager::WorkReservation::take_report)
+                .collect::<Vec<_>>();
+            assert_eq!(reports.len(), 2);
+            assert!(reports.iter().all(|report| report.agent_id() == ancestor));
+            drop(work);
+            assert!(ledger.is_busy(parent));
+            drop(reports);
+            assert_eq!(ledger.active_agents(), 0);
+            actor.shutdown();
+            drop(start);
+            task.await;
+        });
+    }
+
+    #[test]
     fn nested_continuations_report_once_and_quiesce() {
         smol::block_on(async {
-            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(None);
-            let (parent, parent_task, _parent_start) = deferred_actor(Some(&ancestor));
-            let (child, child_task, _child_start) = deferred_actor(Some(&parent));
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(&manager, None);
+            let (parent, parent_task, _parent_start) = deferred_actor(&manager, Some(&ancestor));
+            let (child, child_task, _child_start) = deferred_actor(&manager, Some(&parent));
             let ancestor_events = ancestor.subscribe_events();
             let parent_events = parent.subscribe_events();
             let child_ticket = child
@@ -1414,8 +2316,9 @@ mod tests {
     #[test]
     fn cancelled_parent_resumes_and_reports_upward() {
         smol::block_on(async {
-            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(None);
-            let (parent, parent_task, _parent_start) = deferred_actor(Some(&ancestor));
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (ancestor, ancestor_task, _ancestor_start) = deferred_actor(&manager, None);
+            let (parent, parent_task, _parent_start) = deferred_actor(&manager, Some(&ancestor));
             let original = parent
                 .admit_turn(
                     delivery(parent.agent_id()).input(),
@@ -1468,7 +2371,8 @@ mod tests {
     #[test]
     fn failed_batch_does_not_treat_existing_backlog_as_recovery() {
         smol::block_on(async {
-            let (actor, task, _start) = deferred_actor(None);
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (actor, task, _start) = deferred_actor(&manager, None);
             for _ in 0..super::MAX_DELIVERY_BATCH + 1 {
                 admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
             }
@@ -1489,7 +2393,8 @@ mod tests {
     #[test]
     fn consumed_report_is_acknowledged_after_provider_failure() {
         smol::block_on(async {
-            let (actor, task, _start) = deferred_actor(None);
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (actor, task, _start) = deferred_actor(&manager, None);
             let report = delivery(actor.agent_id());
             admit_delivery(&actor.inner, Arc::clone(&report)).unwrap();
             let ticket = schedule_ticket(&actor);
@@ -1510,7 +2415,8 @@ mod tests {
     #[test]
     fn cancellation_retries_each_unconsumed_report_once() {
         smol::block_on(async {
-            let (actor, task, _start) = deferred_actor(None);
+            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+            let (actor, task, _start) = deferred_actor(&manager, None);
             admit_delivery(&actor.inner, delivery(actor.agent_id())).unwrap();
             let first = schedule_ticket(&actor);
             actor.cancel_turn(first.turn_id()).unwrap();

@@ -17,7 +17,9 @@ use crate::api::agent::{LuaActorState, LuaSession};
 use crate::api::util::pair::Pair;
 
 pub(crate) use agent_methods::AGENT_DOCS;
+pub(super) use authority::authorize as authorize_agent;
 pub(crate) use authority::lookup as lookup_agent;
+pub(super) use module_fns::retain_session;
 pub(crate) use module_fns::{current, focused_agent_ref};
 pub(super) use module_fns::{
     get__doc, get__register, list__doc, list__register, root__doc, root__register, spawn__doc,
@@ -29,11 +31,10 @@ pub(crate) use tickets::TURN_DOCS;
 
 #[derive(Clone)]
 pub(crate) struct LuaAgent {
-    manager: AgentManagerHandle,
-    id: AgentId,
-    state: Option<Arc<LuaActorState>>,
+    pub(super) manager: AgentManagerHandle,
+    pub(super) id: AgentId,
+    transcript_key: Option<String>,
     held: Option<AgentRef>,
-    root: Option<AgentRef>,
     ancestors: Vec<AgentId>,
 }
 
@@ -45,12 +46,7 @@ impl LuaAgent {
         crate::api::autocmd::AgentFilter::new(&self.manager, self.id)
     }
 
-    /// The id the UI keys this agent's transcript by.
-    pub(crate) fn transcript_id(&self) -> Option<&str> {
-        self.state.as_ref().map(|state| state.ui_id.as_str())
-    }
-
-    fn identity(&self) -> String {
+    pub(crate) fn identity(&self) -> String {
         self.id.to_string()
     }
 
@@ -84,8 +80,7 @@ struct AgentOwner {
     plugin: Option<Arc<str>>,
     actor: Weak<AgentActorHandle>,
     state: Weak<LuaActorState>,
-    /// Dropping the session closes the child and emits its ordered close
-    /// notification, so the record keeps it alive until it is retired.
+    /// Keeps runtime capabilities alive until close or owner teardown.
     hold: Option<LuaSession>,
 }
 
@@ -109,14 +104,49 @@ impl AgentOwners {
             state: Arc::downgrade(&session.state),
             hold: Some(session),
         };
-        self.lock().insert(id, owner);
+        let mut owners = self.lock();
+        if owner.hold.as_ref().is_some_and(|session| {
+            session
+                .agent
+                .manager()
+                .validate_activation(&session.incarnation)
+                .is_err()
+        }) {
+            drop(owners);
+            drop(owner);
+            return;
+        }
+        let previous = owners.insert(id, owner);
+        drop(owners);
+        if let Some(previous) = &previous
+            && let Some(session) = &previous.hold
+        {
+            session
+                .state
+                .detached
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        drop(previous);
     }
 
-    /// Records are dropped after the lock is released, since dropping an
-    /// active session re-enters Lua.
-    fn retire(&self, id: AgentId) {
-        let retired = self.lock().get_mut(&id).and_then(AgentOwner::take_hold);
-        drop(retired);
+    fn retire_incarnation(&self, id: AgentId, identity: &Arc<()>) {
+        let retired = self.lock().get_mut(&id).and_then(|owner| {
+            owner
+                .actor
+                .upgrade()
+                .filter(|actor| Arc::ptr_eq(&actor.identity(), identity))
+                .and_then(|_| owner.take_hold())
+        });
+        Self::drop_settled(retired);
+    }
+
+    fn drop_settled(session: Option<LuaSession>) {
+        if let Some(session) = &session
+            && session.actor.snapshot().lifecycle == ActorLifecycle::Closed
+        {
+            session.state.notify_closed_direct();
+        }
+        drop(session);
     }
 
     fn retire_settled(&self) {
@@ -124,7 +154,9 @@ impl AgentOwners {
             .lock()
             .extract_if(|_, owner| owner.settled_closed())
             .collect();
-        drop(retired);
+        for (_, mut owner) in retired {
+            Self::drop_settled(owner.take_hold());
+        }
     }
 
     fn state(&self, id: AgentId) -> Option<Arc<LuaActorState>> {
@@ -140,6 +172,17 @@ impl AgentOwner {
         let snapshot = actor.snapshot();
         snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
     }
+}
+
+pub(super) fn detach_all_agents(lua: &Lua) {
+    let Some(owners) = lua
+        .app_data_ref::<AgentOwners>()
+        .map(|owners| owners.clone())
+    else {
+        return;
+    };
+    let detached = std::mem::take(&mut *owners.lock());
+    drop(detached);
 }
 
 pub(super) fn close_plugin_agents(lua: &Lua, plugin: &str) {
@@ -180,6 +223,7 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::race;
+    use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::tools::test_support::{stub_ctx, stub_ctx_with};
     use makima_agent::tools::{DescriptionContext, RequestTools, ToolContext, TurnToolBindings};
     use makima_agent::{
@@ -190,6 +234,7 @@ mod tests {
         CommandError, CommandFuture, CommandHost, HostRequest, HostResponse, TargetCapabilities,
     };
     use makima_providers::TokenUsage;
+    use makima_storage::session_state::StateChange;
     use mlua::{AnyUserData, Table};
     use smol::Timer;
     use test_case::test_case;
@@ -318,7 +363,7 @@ mod tests {
             );
             let child: AnyUserData = scope.scope_future(spawn_child.eval_async()).await.unwrap();
             let child = child.borrow::<LuaAgent>().unwrap();
-            let state = child.state.as_ref().unwrap();
+            let state = session_state(&lua, child.id).unwrap();
             let template = state.template.get().unwrap();
             assert_eq!(template.audience, context.audience);
             assert!(
@@ -348,9 +393,7 @@ mod tests {
                 .unwrap();
             let empty = empty.borrow::<LuaAgent>().unwrap();
             assert!(
-                empty
-                    .state
-                    .as_ref()
+                session_state(&lua, empty.id)
                     .unwrap()
                     .tools
                     .definitions()
@@ -733,25 +776,153 @@ mod tests {
         })
     }
 
+    #[test]
+    fn same_invocation_spawns_distinct_children_behind_pending_journal() {
+        const TOOL_USE_ID: &str = "call_pending_children";
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let context = stub_ctx_with(&AgentMode::Build, None, Some(TOOL_USE_ID));
+            let root = install_managed_root(&lua, &context);
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            let journal = root.manager.journal();
+            let before = journal.snapshot();
+            let pending = journal.stage(JournalCommit::default(), 1).unwrap();
+            let (first, second): (String, String) = scope
+                .scope_future(
+                    lua.load(
+                        r#"
+                        local opts = { inherit_provider = true, silent = true, tools = {} }
+                        local first, err = agent_api.spawn(ctx, opts)
+                        assert(first, err)
+                        local second, err = agent_api.spawn(ctx, opts)
+                        assert(second, err)
+                        return assert(first:id()), assert(second:id())
+                    "#,
+                    )
+                    .eval_async(),
+                )
+                .await
+                .unwrap();
+            let first = first.parse::<AgentId>().unwrap();
+            let second = second.parse::<AgentId>().unwrap();
+            assert_ne!(first, second);
+            let first = journal.agent(first).unwrap();
+            let second = journal.agent(second).unwrap();
+            assert_eq!(first.transcript_key, TOOL_USE_ID);
+            assert_ne!(first.transcript_key, second.transcript_key);
+            assert_eq!(journal.snapshot().agent_revisions, before.agent_revisions);
+            journal
+                .complete(
+                    pending,
+                    vec![JournalChange {
+                        agent: None,
+                        generation: 0,
+                        change: StateChange::Rules {
+                            rules: Vec::new(),
+                            yolo: None,
+                        },
+                    }],
+                )
+                .unwrap();
+            root.shutdown();
+        });
+    }
+
+    #[test_case(false, false; "owner_drop")]
+    #[test_case(true, false; "plugin_close")]
+    #[test_case(false, true; "deferred_close")]
+    fn stale_owner_cleanup_cannot_close_or_detach_replacement(controlled: bool, deferred: bool) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let context = stub_ctx(&AgentMode::Build);
+            let root = install_managed_root(&lua, &context);
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            lua.globals().set("deferred", deferred).unwrap();
+            let child: AnyUserData = scope.scope_future(lua.load(
+                r#"
+                local child = assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                if deferred then assert(child:defer_close(ctx)) end
+                return child
+                "#
+            ).eval_async()).await.unwrap();
+            let id = child.borrow::<LuaAgent>().unwrap().id;
+            let owners = lua.app_data_ref::<AgentOwners>().unwrap().clone();
+            let old = owners.lock().get_mut(&id).unwrap().take_hold().unwrap();
+            let old_identity = old.actor.identity();
+            old.agent
+                .manager()
+                .detach_incarnation(&old.incarnation)
+                .unwrap();
+            let replacement = root
+                .manager
+                .ensure_resident_with(id, |_| async {
+                    let (_, state, _, _) =
+                        session_with_provider(Arc::clone(&context.provider), None);
+                    let config = EffectiveAgentConfig::new(
+                        RunSettings {
+                            provider: Arc::clone(&context.provider),
+                            model: (*context.model).clone(),
+                            thinking: context.opts.thinking,
+                            fast: context.opts.fast,
+                            workflow: false,
+                        },
+                        AgentMode::Build,
+                    )
+                    .with_mode_def(Some(context.modes.current(&AgentMode::Build)));
+                    Ok(makima_agent::manager::ResidentAgent {
+                        backend: Box::new(LuaActorBackend::new(state)),
+                        config,
+                        shared_messages: None,
+                        start: None,
+                        initialize: None,
+                    })
+                })
+                .await
+                .unwrap();
+            let replacement_actor = replacement.actor().unwrap();
+            assert!(!Arc::ptr_eq(&old_identity, &replacement_actor.identity()));
+            let record = root.manager.journal().agent(id).unwrap();
+            if controlled {
+                old.close_controlled();
+            }
+            drop(scope);
+            drop(old);
+            assert_eq!(root.manager.journal().agent(id).unwrap(), record);
+            assert!(root.manager.is_live(id));
+            assert!(Arc::ptr_eq(
+                &root.manager.actor(id).unwrap().identity(),
+                &replacement_actor.identity()
+            ));
+            root.shutdown();
+        });
+    }
+
     #[test_case("nil", Some(CHILD_NAME) ; "shown_by_default")]
     #[test_case("'the pending diff'", Some("reviewer: the pending diff") ; "with_description")]
     #[test_case("false", None ; "hidden")]
     fn spawn_posts_a_row_for_shown_children(show: &str, expected: Option<&str>) {
-        let (transcript, posts) = run_trusted(&format!(
+        let (id, posts) = run_trusted(&format!(
             r#"
             local child = assert(agent_api.spawn(ctx, {{
                 inherit_provider = true, tools = {{}}, name = "{CHILD_NAME}", show = {show},
             }}))
-            local id = child:_makima_session_id()
+            local id = assert(child:id())
             assert(child:close(ctx))
             return id
         "#
         ));
+        assert!(id.parse::<AgentId>().is_ok());
         let expected: Vec<_> = expected
             .map(|text| Post {
                 text: text.into(),
                 level: PostLevel::Info,
-                agent: Some(transcript),
+                agent: Some(id),
             })
             .into_iter()
             .collect();
@@ -796,15 +967,135 @@ mod tests {
         );
     }
 
+    #[test_case(false; "closed_callback")]
+    #[test_case(true; "restored_resident_callback")]
+    fn callback_posts_use_journal_owner_without_lua_session(restored: bool) {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = plugin_scope(&lua, PLUGIN);
+            let context = stub_ctx(&AgentMode::Build);
+            let root = install_managed_root(&lua, &context);
+            lua.globals()
+                .set("agent_api", create_agent_table(&lua).unwrap())
+                .unwrap();
+            lua.globals()
+                .set(
+                    "ui",
+                    create_ui_table(&lua, None, Arc::from(PLUGIN), None).unwrap(),
+                )
+                .unwrap();
+            let child: AnyUserData = scope.scope_future(lua.load(r#"
+                return assert(agent_api.spawn(ctx, { inherit_provider = true, show = false, tools = {} }))
+            "#).eval_async()).await.unwrap();
+            let id = child.borrow::<LuaAgent>().unwrap().id;
+            let record = root.manager.journal().agent(id).unwrap();
+            let owners = lua.app_data_ref::<AgentOwners>().unwrap().clone();
+            let session = owners.lock().remove(&id).unwrap().hold.unwrap();
+            if restored {
+                root.manager
+                    .detach_incarnation(&session.incarnation)
+                    .unwrap();
+                root.manager
+                    .ensure_resident_with(id, |_| async {
+                        let (_, state, _, _) =
+                            session_with_provider(Arc::clone(&context.provider), None);
+                        Ok(makima_agent::manager::ResidentAgent {
+                            backend: Box::new(LuaActorBackend::new(state)),
+                            config: EffectiveAgentConfig::new(
+                                RunSettings {
+                                    provider: Arc::clone(&context.provider),
+                                    model: (*context.model).clone(),
+                                    thinking: context.opts.thinking,
+                                    fast: context.opts.fast,
+                                    workflow: false,
+                                },
+                                AgentMode::Build,
+                            )
+                            .with_mode_def(Some(context.modes.current(&AgentMode::Build))),
+                            shared_messages: None,
+                            start: None,
+                            initialize: None,
+                        })
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                session.agent.close_subtree().unwrap();
+            }
+            drop(session);
+            assert!(session_state(&lua, id).is_none());
+            let callback = plugin_scope(&lua, PLUGIN);
+            lua.globals()
+                .set(
+                    "ctx",
+                    LuaCtx::trusted_context(
+                        &lua,
+                        TrustedTarget {
+                            target: root.manager.reference(id),
+                            template: root.target.template.clone(),
+                        },
+                        Arc::from(PLUGIN),
+                    ),
+                )
+                .unwrap();
+            callback
+                .scope_future(
+                    lua.load(format!("assert(ui.post(ctx, {POST_TEXT:?}))"))
+                        .exec_async(),
+                )
+                .await
+                .unwrap();
+            if restored {
+                callback.scope_future(lua.load(format!(r#"
+                    local child = assert(agent_api.spawn(ctx, {{ inherit_provider = true, tools = {{}}, name = "{CHILD_NAME}" }}))
+                    assert(child:close(ctx))
+                "#)).exec_async()).await.unwrap();
+            }
+            let posts: Vec<_> = root
+                .events
+                .drain()
+                .filter(|envelope| matches!(envelope.event, AgentEvent::Post(_)))
+                .collect();
+            assert_eq!(posts.len(), if restored { 2 } else { 1 });
+            for envelope in posts {
+                let owner = envelope.subagent.unwrap();
+                assert_eq!(owner.agent_id, id);
+                assert_eq!(owner.parent_agent_id, record.parent);
+                assert_eq!(owner.parent_tool_use_id, record.transcript_key);
+            }
+            root.shutdown();
+        });
+    }
+
+    #[test]
+    fn post_links_a_root_by_durable_id() {
+        let (id, posts) = run_trusted(&format!(
+            r#"
+            local root = assert(agent_api.get(ctx, assert(agent_api.root(ctx))))
+            assert(ui.post(ctx, "{POST_TEXT}", {{ agent = root }}))
+            return assert(root:id())
+        "#
+        ));
+        assert!(id.parse::<AgentId>().is_ok());
+        assert_eq!(
+            posts,
+            [Post {
+                text: POST_TEXT.into(),
+                level: PostLevel::Info,
+                agent: Some(id),
+            }]
+        );
+    }
+
     #[test]
     fn post_links_a_child_at_the_requested_level() {
-        let (transcript, posts) = run_trusted(&format!(
+        let (id, posts) = run_trusted(&format!(
             r#"
             local child = assert(agent_api.spawn(ctx, {{
                 inherit_provider = true, tools = {{}}, show = false,
             }}))
             assert(ui.post(ctx, "{POST_TEXT}", {{ level = "error", agent = child }}))
-            local id = child:_makima_session_id()
+            local id = assert(child:id())
             assert(child:close(ctx))
             return id
         "#
@@ -814,7 +1105,7 @@ mod tests {
             [Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Error,
-                agent: Some(transcript),
+                agent: Some(id.parse::<AgentId>().unwrap().to_string()),
             }]
         );
     }
@@ -1011,9 +1302,8 @@ mod tests {
                     LuaAgent {
                         manager: manager.clone(),
                         id: target.id(),
-                        state: Some(Arc::clone(&managed_fixture.as_ref().unwrap().1)),
+                        transcript_key: Some(managed_fixture.as_ref().unwrap().1.ui_id.clone()),
                         held: Some(target.clone()),
-                        root: Some(manager.root().unwrap()),
                         ancestors: vec![target.id()],
                     },
                 )

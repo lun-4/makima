@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    io::{self, ErrorKind},
+    time::Duration,
+};
 
 use futures_lite::future::race;
 use makima_agent::{
@@ -8,15 +11,43 @@ use makima_lua_macro::{lua_class, lua_fn};
 use mlua::{Lua, Table, UserDataRef};
 use smol::Timer;
 
-use super::LuaAgentTurn;
 use super::authority::{authorize, observe};
 use super::projection::result_table;
+use super::{LuaAgent, LuaAgentTurn};
 use crate::agent_errors::{SELF_TURN_WAIT, TURN_WAIT_TIMEOUT};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::orchestration;
 use crate::runtime::CANCELLED_MSG;
 
 const UNSETTLED_TURN_RESULT: &str = "turn has no settled result";
+
+pub(super) fn retained_ticket(
+    lua: &Lua,
+    agent: &LuaAgent,
+    turn: TurnId,
+) -> Result<TurnTicket, String> {
+    agent
+        .manager
+        .retained_turn_ticket_with(&agent.manager.reference(agent.id), turn, |reference| {
+            let denied = || {
+                io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "stored result is outside the authorized session",
+                )
+            };
+            let root = agent.manager.root().map_err(|_| denied())?;
+            let services = orchestration::services(lua).ok_or_else(denied)?;
+            let template = services.template(&root).map_err(|_| denied())?;
+            if template.session_id.as_ref().map(|session| session.id()) != Some(reference.session) {
+                return Err(denied());
+            }
+            let name = reference.path.to_str().ok_or_else(denied)?;
+            let store = template.offload.as_ref().ok_or_else(denied)?;
+            store.read(name, reference.bytes)
+        })
+        .map_err(|error| error.to_string())
+}
 
 /// Read the stable turn ID.
 /// @return (string?, string?) Turn ID.
@@ -165,4 +196,219 @@ lua_class! {
     "makima.agent.AgentTurn" => LuaAgentTurn, TURN_DOCS [
         turn_id, turn_agent_id, ticket_result, ticket_wait, ticket_cancel,
     ]
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::symlink, sync::Arc};
+
+    use makima_agent::{
+        AgentId, AgentLimits, AgentManagerHandle, AgentMode, AgentRef, DoneReason, HistorySnapshot,
+        TurnId, TurnOutcome, TurnProvenance, TurnResult,
+        journal::{JournalChange, JournalCommit, SessionJournal},
+        tools::{ToolContext, offload::OffloadStore, test_support::stub_ctx},
+    };
+    use makima_storage::{
+        id::{MakimaId, SessionRef},
+        session_state::{
+            MAX_INLINE_TURN_RESULT_BYTES, SessionStateView, StateChange, StoredAgentLifecycle,
+            StoredAgentRecord, StoredPayload,
+        },
+    };
+    use mlua::Lua;
+    use serde_json::json;
+    use test_case::test_case;
+
+    use crate::{
+        api::{
+            agent::create_agent_table,
+            fs::{FsBackendHandle, InMemoryFs},
+            util::ctx::LuaCtx,
+        },
+        orchestration::{
+            OrchestrationServices, OrchestrationServicesSlot, TrustedTarget,
+            install_plugin_authority,
+        },
+        runtime::TaskScope,
+    };
+
+    const PLUGIN: &str = "retained_result_security";
+    const UNAVAILABLE: &str = "turn_result_unavailable";
+    const REPLACEMENT: &str = "replacement";
+    const BODY: &str = "retained result";
+
+    struct ResultServices(TrustedTarget);
+
+    impl OrchestrationServices for ResultServices {
+        fn resolve_target(
+            &self,
+            _: Option<&makima_commands::CommandInvocation>,
+        ) -> Result<Option<TrustedTarget>, String> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
+            if self.0.target.same_manager(target) {
+                Ok(self.0.template.clone())
+            } else {
+                Err(UNAVAILABLE.into())
+            }
+        }
+    }
+
+    #[test_case(false, false, false; "text_artifact_without_fs_backend")]
+    #[test_case(false, true, true; "output_artifact_with_fs_backend")]
+    #[test_case(true, false, false; "directory_without_fs_backend")]
+    #[test_case(true, true, true; "directory_with_fs_backend")]
+    fn lua_retained_turn_rejects_symlink_substitution(
+        directory: bool,
+        output: bool,
+        fs_backend: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let session = MakimaId::generate();
+        let store = Arc::new(OffloadStore::for_session(
+            dir.path(),
+            &SessionRef::from(session),
+        ));
+        let agent = AgentId::generate();
+        let turn = TurnId::generate();
+        let text = BODY.repeat(MAX_INLINE_TURN_RESULT_BYTES);
+        let result = TurnResult {
+            outcome: TurnOutcome::completed(
+                agent,
+                turn,
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ),
+            text: text.clone(),
+            output: vec![json!({ "answer": text })],
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        };
+        let stored = result.to_stored(session, Some(&store)).unwrap();
+        let reference = if output {
+            match &stored.output {
+                StoredPayload::Offloaded(reference) => reference,
+                StoredPayload::Inline(_) => panic!("output must be offloaded"),
+            }
+        } else {
+            match &stored.text {
+                StoredPayload::Offloaded(reference) => reference,
+                StoredPayload::Inline(_) => panic!("text must be offloaded"),
+            }
+        };
+        let artifact = store.dir().join(&reference.path);
+        let mut artifacts = Vec::new();
+        if let StoredPayload::Offloaded(reference) = &stored.text {
+            let path = store.dir().join(&reference.path);
+            artifacts.push((path.clone(), fs::read(path).unwrap()));
+        }
+        if let StoredPayload::Offloaded(reference) = &stored.output {
+            let path = store.dir().join(&reference.path);
+            artifacts.push((path.clone(), fs::read(path).unwrap()));
+        }
+        let replacement = dir.path().join(REPLACEMENT);
+        let (original, moved) = if directory {
+            (store.dir().to_path_buf(), replacement)
+        } else {
+            (artifact.clone(), replacement)
+        };
+        fs::rename(&original, &moved).unwrap();
+        symlink(&moved, &original).unwrap();
+        let journal = Arc::new(SessionJournal::default());
+        journal.bind_session(session).unwrap();
+        journal
+            .commit(JournalCommit {
+                agents: vec![StoredAgentRecord {
+                    id: agent,
+                    parent: None,
+                    depth: 0,
+                    transcript_key: String::new(),
+                    lifecycle: StoredAgentLifecycle::Open,
+                    ancestry_unknown: false,
+                    label: None,
+                    spawned_by_tool_use_id: None,
+                    spec: None,
+                    restorable: Ok(()),
+                    usage: Default::default(),
+                    created_seq: 0,
+                    updated_seq: 0,
+                    legacy: false,
+                }],
+                changes: vec![JournalChange {
+                    agent: Some(agent),
+                    generation: 0,
+                    change: StateChange::Turn {
+                        turn,
+                        result: stored,
+                    },
+                }],
+                histories: [(agent, HistorySnapshot::new(Vec::new()))].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let before = journal.checkpoint_snapshot().unwrap();
+        let view =
+            SessionStateView::fold(&before.state, &before.agent_revisions, before.seq).unwrap();
+        let manager = AgentManagerHandle::restore_graph(
+            AgentLimits::default(),
+            Arc::clone(&journal),
+            view,
+            before.histories.clone(),
+        )
+        .unwrap();
+        let lua = Lua::new();
+        if fs_backend {
+            let fs = Arc::new(InMemoryFs::new());
+            for (path, bytes) in artifacts {
+                fs.seed(&path, bytes);
+            }
+            lua.set_app_data(FsBackendHandle(fs));
+        }
+        let mut template = stub_ctx(&AgentMode::Build);
+        template.session_id = Some(SessionRef::from(session));
+        template.offload = Some(Arc::clone(&store));
+        let target = TrustedTarget {
+            target: manager.reference(agent),
+            template,
+        };
+        lua.set_app_data(OrchestrationServicesSlot(Some(Arc::new(ResultServices(
+            target.clone(),
+        )))));
+        install_plugin_authority(&lua, Arc::from(PLUGIN));
+        let _scope = TaskScope::detached(&lua);
+        lua.globals()
+            .set(
+                "ctx",
+                LuaCtx::trusted_context(&lua, target, Arc::from(PLUGIN)),
+            )
+            .unwrap();
+        lua.globals()
+            .set("agent_api", create_agent_table(&lua).unwrap())
+            .unwrap();
+        lua.globals().set("agent_id", agent.to_string()).unwrap();
+        lua.globals().set("turn_id", turn.to_string()).unwrap();
+        lua.globals().set("expected_text", result.text).unwrap();
+        lua.load(format!(
+            r#"
+            local agent = assert(agent_api.get(ctx, agent_id))
+            local ticket, err = agent:turn(ctx, turn_id)
+            assert(ticket == nil and err:find({UNAVAILABLE:?}, 1, true), tostring(err))
+            assert(not agent:is_live())
+        "#
+        ))
+        .exec()
+        .unwrap();
+        assert_eq!(journal.checkpoint_snapshot().unwrap().state, before.state);
+        assert_eq!(
+            journal.checkpoint_snapshot().unwrap().agent_revisions,
+            before.agent_revisions
+        );
+        fs::remove_file(&original).unwrap();
+        fs::rename(&moved, &original).unwrap();
+        lua.load("local agent = assert(agent_api.get(ctx, agent_id)); local ticket = assert(agent:turn(ctx, turn_id)); assert(assert(ticket:result(ctx)).text == expected_text)")
+            .exec().unwrap();
+    }
 }

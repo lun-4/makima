@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use makima_agent::agent::tool_dispatch;
-use makima_agent::template::Vars;
+use makima_agent::context::RootContext;
+use makima_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use makima_agent::template::{Vars, env_vars_for};
 use makima_agent::tools::hook::{
     HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
 };
@@ -17,7 +19,9 @@ use makima_agent::tools::{
     ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
     format_line_truncated_marker, timeout_annotation,
 };
-use makima_agent::{AgentMode, CallScope, CancelToken, SessionMailbox, SharedBuf, ToolOutput};
+use makima_agent::{
+    AgentMode, CallScope, CancelToken, Instructions, SessionMailbox, SharedBuf, ToolOutput,
+};
 use makima_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use makima_config::{
     AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
@@ -171,10 +175,10 @@ fn test_session(host: &PluginHost) -> makima_agent::session_coordinator::Session
     use makima_agent::session_coordinator::{
         SessionCheckpoint, SessionCoordinatorParams, builtin_option_definitions,
     };
-    use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+    use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
 
     let id = makima_storage::id::MakimaId::generate();
-    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = ClaimingWriter::accept_all();
     makima_agent::session_coordinator::SessionCoordinatorHandle::register(
         SessionCoordinatorParams {
             session_id: id,
@@ -741,6 +745,7 @@ fn restore_snapshot_text(
 
     handle.request_restore(
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: "ok".to_owned(),
@@ -906,6 +911,85 @@ fn agent_api_value_failures_return_err_pairs() {
     host.load_source("agent_pairs_plugin", &src).unwrap();
     let out = exec_tool(&reg, "agent_pairs_probe", serde_json::json!({})).unwrap();
     assert_eq!(out, "prompt_err tools_err model_err");
+}
+
+#[test_case::test_case("true", Some("recorded project instructions"), Some("recorded project instructions"); "recorded")]
+#[test_case::test_case("true", Some(""), Some(""); "recorded_empty")]
+#[test_case::test_case("true", None, None; "unavailable")]
+#[test_case::test_case("false", Some("recorded project instructions"), Some(""); "omitted")]
+#[test_case::test_case("nil", Some("recorded project instructions"), Some(""); "default_omitted")]
+#[test_case::test_case("\"explicit instructions\"", Some("recorded project instructions"), Some("explicit instructions"); "explicit_string")]
+fn system_prompt_uses_admitted_instructions(
+    selection: &str,
+    recorded: Option<&str>,
+    expected: Option<&str>,
+) {
+    const TOOL: &str = "recorded_prompt_probe";
+    const DISK: &str = "unrecorded disk instructions must not leak";
+    const UNAVAILABLE: &str = "recorded instructions are unavailable for this invocation";
+    const RECORDED_SLOT: &str = "recorded prompt contribution";
+    const LIVE_SLOT: &str = "live prompt contribution must not leak";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+            makima.api.register_tool({{
+                name = {TOOL:?}, description = "recorded prompt probe",
+                schema = {MINIMAL_SCHEMA}, audiences = {{ "main" }},
+                handler = function(_, ctx)
+                    local prompt, err = makima.agent.system_prompt(ctx, {{
+                        prompt_id = "general", instructions = {selection},
+                    }})
+                    if err then return err end
+                    return prompt
+                end,
+            }})
+        "#
+        ),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), DISK).unwrap();
+    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    ctx.cwd = dir.path().to_path_buf();
+    let slots = |content: &str| {
+        let mut slots = ResolvedSlots::default();
+        slots.insert(
+            PromptId::General,
+            Slot::ToolUsage,
+            SlotEntry {
+                plugin: TOOL.into(),
+                registration: 0,
+                content: content.into(),
+            },
+        );
+        Arc::new(slots)
+    };
+    ctx.prompt_slots = slots(LIVE_SLOT);
+    let recorded_slots = slots(RECORDED_SLOT);
+    ctx.root_context = recorded.map(|text| {
+        Arc::new(RootContext {
+            instructions: Instructions {
+                text: text.into(),
+                ..Default::default()
+            },
+            slots: Arc::clone(&recorded_slots),
+        })
+    });
+    let output = exec_with_ctx(&reg, TOOL, json!({}), &ctx).unwrap();
+    match expected {
+        Some(expected) => {
+            let vars = env_vars_for(&ctx.cwd);
+            let prompt =
+                makima_agent::prompt::assemble(PromptId::General, &recorded_slots, expected);
+            assert_eq!(output, vars.apply(&prompt));
+            assert!(!output.contains(DISK));
+            assert!(!output.contains(LIVE_SLOT));
+        }
+        None => assert_eq!(output, UNAVAILABLE),
+    }
 }
 
 /// `spec` must win over `tier` when both are given, proving the task plugin's
@@ -1276,6 +1360,14 @@ fn bundled_commands_project_complete_metadata() {
                 None,
                 None,
                 true
+            ),
+            (
+                "/task-retire".into(),
+                "Retire an accessible quiescent leaf agent, preserving its history and results."
+                    .into(),
+                Some("<task_or_agent_id>".into()),
+                Some("<task_or_agent_id>".into()),
+                false
             ),
             (
                 "/thinking".into(),
@@ -1848,6 +1940,7 @@ fn barrier(host: &PluginHost) {
 
 fn warm_restore_item(id: &str, clicks: Vec<usize>) -> makima_lua::RestoreItem {
     makima_lua::RestoreItem {
+        state_target: None,
         tool: Arc::from(WARM_TOOL_NAME),
         tool_use_id: id.to_owned(),
         output: "done".to_owned(),
@@ -4379,7 +4472,11 @@ fn bash_background_moves_the_call_and_still_returns_its_output() {
 #[test]
 fn task_stop_stops_a_moved_call_by_its_id() {
     let (reg, host) = builtins_host();
-    let (ctx, scope, mailbox, _session) = background_bash_ctx(&host, "sleep 30");
+    let (mut ctx, scope, mailbox, _session) = background_bash_ctx(&host, "sleep 30");
+    let (_invocation_cancel, cancel) = CancelToken::new();
+    ctx.cancel = cancel;
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(&host, &reg, &mut ctx, config, Default::default());
     mailbox.move_latest().unwrap();
     assert!(scope.is_moved());
 
@@ -4452,6 +4549,7 @@ fn restore_tool_async_ordering_and_delivery() {
     let event_tx = makima_agent::EventSender::new(tx);
 
     let bash_item = |id: &str| makima_lua::RestoreItem {
+        state_target: None,
         tool: Arc::from("bash"),
         tool_use_id: id.to_owned(),
         output: "tool bash timed out after 1s".to_owned(),
@@ -4463,6 +4561,7 @@ fn restore_tool_async_ordering_and_delivery() {
         state: None,
     };
     let unknown_item = makima_lua::RestoreItem {
+        state_target: None,
         tool: Arc::from("definitely_not_a_tool"),
         tool_use_id: "unknown_id".to_owned(),
         output: "ignored".to_owned(),
@@ -4530,6 +4629,7 @@ fn restore_rebuilds_body_from_input_content(
 
     handle.request_restore(
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: summary.to_owned(),
@@ -4761,6 +4861,9 @@ fn env_permission_guards_uv_and_env() {
     assert!(result.contains("exec=false"), "got: {result}");
 }
 
+const MUTABLE_PATH_CALLBACK_ERROR: &str = "mutable path rejected";
+const MUTABLE_PATH_CALLBACK_INVALID_RESULT: &str =
+    "mutable_path callback must return a string or nil";
 const PATH_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { path = { type = "string" } },
@@ -4816,7 +4919,280 @@ fn mutable_path_returns_path_from_input() {
         .parse(&serde_json::json!({ "path": "/tmp/foo.txt" }))
         .expect("parse failed");
     let ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
-    assert_eq!(inv.mutable_path(&ctx), Some(PathBuf::from("/tmp/foo.txt")));
+    assert_eq!(
+        smol::block_on(inv.mutable_path(&ctx)),
+        Ok(Some(PathBuf::from("/tmp/foo.txt")))
+    );
+}
+
+#[test_case::test_case("return nil", None; "explicit_nil")]
+#[test_case::test_case("return input.path", None; "path")]
+#[test_case::test_case("error('mutable path rejected')", Some(MUTABLE_PATH_CALLBACK_ERROR); "callback_error")]
+#[test_case::test_case("return false", Some(MUTABLE_PATH_CALLBACK_INVALID_RESULT); "boolean")]
+#[test_case::test_case("return 42", Some(MUTABLE_PATH_CALLBACK_INVALID_RESULT); "number")]
+#[test_case::test_case("return {}", Some(MUTABLE_PATH_CALLBACK_INVALID_RESULT); "table")]
+fn mutable_path_callback_failure_prevents_tool_side_effects(callback: &str, error: Option<&str>) {
+    const TOOL: &str = "mutable_callback";
+    const PROBE: &str = "mutable_probe";
+    const PATH: &str = "/tmp/mutable-callback.txt";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+local calls, headers, starts, permissions, handlers = 0, 0, 0, 0, 0
+makima.api.register_tool({{
+    name = "{TOOL}", description = "mutable callback probe", schema = {PATH_FIELD_SCHEMA},
+    mutable_path = function(input)
+        calls += 1
+        {callback}
+    end,
+    header = function() headers += 1; return "header" end,
+    start = function() starts += 1 end,
+    permission_scopes = function() permissions += 1; return nil end,
+    handler = function() handlers += 1; return "executed" end,
+}})
+makima.api.register_tool({{
+    name = "{PROBE}", description = "read counters", schema = {{ type = "object", properties = {{}} }},
+    handler = function()
+        return makima.json.encode({{ calls, headers, starts, permissions, handlers }})
+    end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    let mut ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.tool_use_id = Some(TOOL.into());
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let done = smol::block_on(tool_dispatch::run(
+        TOOL.into(),
+        TOOL,
+        &json!({ "path": PATH }),
+        &ctx,
+        CallOrigin::Nested,
+    ));
+    assert_eq!(done.is_error, error.is_some(), "{}", done.output.as_text());
+    if let Some(error) = error {
+        assert!(
+            done.output.as_text().contains(error),
+            "{}",
+            done.output.as_text()
+        );
+    }
+    let counters = common::exec_tool(&reg, &ctx, PROBE, json!({})).unwrap();
+    assert_eq!(
+        counters,
+        if error.is_some() {
+            json!([1, 0, 0, 0, 0])
+        } else {
+            json!([1, 1, 1, 1, 1])
+        }
+    );
+}
+
+#[test_case::test_case("return nil", false; "nil_is_cached")]
+#[test_case::test_case("return input.path", false; "path_is_cached")]
+#[test_case::test_case("error('mutable path rejected')", true; "error_is_cached")]
+fn mutable_path_callback_result_is_cached(callback: &str, fails: bool) {
+    const TOOL: &str = "cached_mutable";
+    const PATH: &str = "/tmp/cached-mutable.txt";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+local calls = 0
+makima.api.register_tool({{
+    name = "{TOOL}", description = "cached mutable path", schema = {PATH_FIELD_SCHEMA},
+    mutable_path = function(input)
+        calls += 1
+        assert(calls == 1, "callback evaluated twice")
+        {callback}
+    end,
+    handler = function() return tostring(calls) end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    let invocation = reg
+        .get(TOOL)
+        .unwrap()
+        .tool
+        .parse(&json!({ "path": PATH }))
+        .unwrap();
+    let ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    let first = smol::block_on(invocation.mutable_path(&ctx));
+    assert_eq!(first.is_err(), fails);
+    assert_eq!(smol::block_on(invocation.mutable_path(&ctx)), first);
+    assert_eq!(
+        common::exec_tool_text(&reg, &ctx, TOOL, json!({ "path": PATH })).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn mutable_path_unloaded_callback_is_an_error() {
+    const TOOL: &str = "unloaded_mutable";
+    const EXPECTED: &str = "mutable_path callback is unavailable";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+makima.api.register_tool({{
+    name = "{TOOL}", description = "unloaded callback", schema = {{ type = "object", properties = {{}} }},
+    mutable_path = function() return nil end,
+    handler = function() return "must not execute" end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    let invocation = reg.get(TOOL).unwrap().tool.parse(&json!({})).unwrap();
+    host.unload(TOOL).unwrap();
+    let ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    assert_eq!(
+        smol::block_on(invocation.mutable_path(&ctx)),
+        Err(EXPECTED.into())
+    );
+}
+
+#[test_case::test_case(false; "direct")]
+#[test_case::test_case(true; "nested_lua_call_tool")]
+fn mutable_path_callback_dispatch_can_yield(nested: bool) {
+    const TOOL: &str = "yielding_mutable";
+    const WRAPPER: &str = "yielding_wrapper";
+    const PATH: &str = "/tmp/yielding-mutable.txt";
+    const REPLY: &str = "computed path executed";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+makima.api.register_tool({{
+    name = "{TOOL}", description = "computed path", schema = {PATH_FIELD_SCHEMA},
+    mutable_path = function(input) return input.path end,
+    handler = function() return "{REPLY}" end,
+}})
+makima.api.register_tool({{
+    name = "{WRAPPER}", description = "nested call", schema = {PATH_FIELD_SCHEMA},
+    handler = function(input, ctx)
+        local result, err = makima.agent.call_tool(ctx, "{TOOL}", input)
+        assert(result, err)
+        return result
+    end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    let mut ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let name = if nested { WRAPPER } else { TOOL };
+    let result = smol::block_on(common::bounded(tool_dispatch::run(
+        name.into(),
+        name,
+        &json!({ "path": PATH }),
+        &ctx,
+        CallOrigin::Nested,
+    )));
+    assert!(!result.is_error, "{}", result.output.as_text());
+    assert_eq!(result.output.as_text(), REPLY);
+}
+
+#[test]
+fn mutable_path_reloaded_callback_rejects_retained_generation() {
+    const TOOL: &str = "generation_mutable";
+    const EXPECTED: &str = "tool binding changed: generation_mutable";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"
+makima.api.register_tool({{
+    name = "{TOOL}", description = "generation callback", schema = {{ type = "object", properties = {{}} }},
+    mutable_path = function() error("replacement callback must not execute") end,
+    handler = function() return "must not execute" end,
+}})
+"#
+    );
+    host.load_source(TOOL, &source).unwrap();
+    let invocation = reg.get(TOOL).unwrap().tool.parse(&json!({})).unwrap();
+    host.load_source(TOOL, &source).unwrap();
+    let ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    assert_eq!(
+        smol::block_on(invocation.mutable_path(&ctx)),
+        Err(EXPECTED.into())
+    );
+}
+
+#[test_case::test_case("makima.keymap.set('n', '<C-y>', function() end)"; "keymap")]
+#[test_case::test_case("makima.api.create_autocmd('User', { callback = function() end })"; "autocmd")]
+#[test_case::test_case("makima.api.set_slot('mutable.escape', function() end)"; "slot")]
+fn mutable_path_callback_cannot_register_trusted_entrypoints(registration: &str) {
+    const TOOL: &str = "authority_mutable";
+    const PROBE: &str = "authority_mutable_probe";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+local called, rejected = false, false
+makima.api.register_tool({{
+    name = "{TOOL}", description = "restricted callback", schema = {{ type = "object", properties = {{}} }},
+    mutable_path = function()
+        local ok, value, err = pcall(function() return {registration} end)
+        local diagnostic = ok and err or value
+        assert(diagnostic == {expected:?}, tostring(diagnostic))
+        rejected = true
+        return nil
+    end,
+    handler = function() called = true; return "ok" end,
+}})
+makima.api.register_tool({{
+    name = "{PROBE}", description = "authority result", schema = {{ type = "object", properties = {{}} }},
+    handler = function() return makima.json.encode({{ called, rejected }}) end,
+}})
+"#,
+            expected = makima_lua::agent_errors::DELEGATED_REGISTRATION
+        ),
+    )
+    .unwrap();
+    let mut ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let done = smol::block_on(common::bounded(tool_dispatch::run(
+        TOOL.into(),
+        TOOL,
+        &json!({}),
+        &ctx,
+        CallOrigin::Nested,
+    )));
+    assert!(!done.is_error, "{}", done.output.as_text());
+    assert_eq!(
+        common::exec_tool(&reg, &ctx, PROBE, json!({})).unwrap(),
+        json!([true, true])
+    );
 }
 
 #[test]

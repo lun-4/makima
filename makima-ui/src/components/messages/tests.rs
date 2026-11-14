@@ -304,7 +304,7 @@ fn rebuild(panel: &mut MessagesPanel) {
 #[test_case(false ; "plain_post")]
 #[test_case(true ; "linked_post")]
 fn post_agent_target_follows_wrapping_and_scroll(linked: bool) {
-    const AGENT_ID: &str = "reviewer";
+    let agent_id = AgentId::generate();
     const POST_TEXT: &str = "reviewer started checking the pending changes";
     const WIDTH: u16 = 16;
     const HEIGHT: u16 = 2;
@@ -314,14 +314,14 @@ fn post_agent_target_follows_wrapping_and_scroll(linked: bool) {
         DisplayRole::Post(makima_agent::PostLevel::Info),
         POST_TEXT.into(),
     );
-    post.post_agent = linked.then(|| AGENT_ID.into());
+    post.post_agent = linked.then_some(agent_id);
     panel.push(post);
     render(&mut panel, WIDTH, HEIGHT);
     panel.set_scroll_top(SCROLL_ROW);
     let terminal = render(&mut panel, WIDTH, HEIGHT);
     assert_eq!(panel.scroll_top(), SCROLL_ROW);
     let area = Rect::new(0, 0, WIDTH, HEIGHT);
-    let expected = linked.then_some(AGENT_ID);
+    let expected = linked.then_some(agent_id);
     for row in 0..HEIGHT {
         assert_eq!(panel.post_agent_at(row, area), expected);
         let cell = &terminal.backend().buffer()[(0, row)];

@@ -8,13 +8,14 @@ use std::sync::{
 };
 
 use makima_agent::cancel::CancelToken;
+use makima_agent::context::RootContext;
 use makima_agent::tools::test_support::{stub_ctx, stub_ctx_with};
 use makima_agent::tools::{
     DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry, TurnToolBindings,
 };
 use makima_agent::{
-    AgentEvent, AgentLimits, AgentMode, BufferSnapshot, Envelope, EventSender, ModeDef, ModeId,
-    SpanStyle, ToolOutput,
+    ActorError, AgentEvent, AgentLimits, AgentMode, BufferSnapshot, Envelope, EventSender,
+    Instructions, ModeDef, ModeId, SpanStyle, ToolOutput,
 };
 use makima_lua::{
     PluginHost, RestoreItem,
@@ -26,6 +27,9 @@ use makima_providers::{
     RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
 use makima_storage::id::SessionRef;
+use makima_storage::session_state::{
+    MAX_PLUGIN_VALUE_BYTES, SessionStateView, StoredAgentLifecycle,
+};
 use serde_json::{Value, json};
 
 mod common;
@@ -60,10 +64,14 @@ const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
+const SEQUENTIAL_TASK_COUNT: usize = 129;
+const ROLLBACK_RETAINED_LIMIT: usize = 2;
+const ROLLBACK_FAILED_ATTEMPTS: usize = 4;
+const STATE_SIZE_ERROR: &str = "state value exceeds maximum encoded size";
 const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 /// The fixture root holds one manager permit for the whole test.
 const FIXTURE_ROOT_TURNS: usize = 1;
-/// Mirrors the task plugin's per-task turn ticket cap.
+/// Exercises more turns than the removed private cache retained.
 const RETAINED_TURN_LIMIT: usize = 64;
 const TURN_UNAVAILABLE_ERR: &str = "turn_result_unavailable";
 const TICKET_LIMIT_BUSY_ERR: &str = "stub admission busy";
@@ -106,8 +114,32 @@ const SCENARIO_RAISE: &str = "raise";
 /// `makima.async` stays real; structured-output validation uses the real-driver tests.
 const STUB_PRELUDE: &str = r#"
 recorder = { prompts = {}, closed = 0, sessions = 0 }
+local agents = {}
+makima.state.register = function()
+  local stored
+  return {
+    get = function() return stored and makima.json.decode(makima.json.encode(stored)), 0 end,
+    update = function(_, ctx, fn)
+      local value = fn(stored and makima.json.decode(makima.json.encode(stored)))
+      stored = value
+      return value, 1
+    end,
+  }
+end
+makima.agent.get = function(ctx, id)
+  if recorder.can_control == false then return nil, "task is owned by another agent branch" end
+  return agents[id]
+end
 local register_tool = makima.api.register_tool
 makima.api.register_tool = function(spec)
+  local original = spec.handler
+  spec.handler = function(input, ctx)
+    local proxy = setmetatable({}, { __index = function(_, key)
+      if key == "agent" then return function() return { id = function() return "stub-owner" end } end end
+      return function(_, ...) return ctx[key](ctx, ...) end
+    end })
+    return original(input, proxy)
+  end
   if spec.name == "task_wait" or spec.name == "task_send" then
     local handler = spec.handler
     spec.handler = function(input, ctx)
@@ -164,22 +196,29 @@ makima.agent.spawn = function(ctx, opts)
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.output_schema = opts.output_schema
   local agent = { opts = opts }
+  local tickets = {}
+  local latest
+  function agent:id() return opts.name end
+  agents[opts.name] = agents[opts.name] or agent
+  function agent:turn(_, id) return tickets[id], tickets[id] == nil and "turn_result_unavailable" or nil end
   function agent:send(call_ctx, msg, submit_opts)
     assert(submit_opts.when == "join")
     if opts.name == "unresolved" then
-      assert(submit_opts.existing_only == (#recorder.prompts >= @TURN_LIMIT@))
+      assert(submit_opts.existing_only == nil)
       local turn_id = tostring(#recorder.prompts)
-      if submit_opts.existing_only then
+      if #recorder.prompts >= @TURN_LIMIT@ then
         if msg ~= "@JOIN_PENDING_MESSAGE@" then return nil, "@TICKET_LIMIT_BUSY_ERR@" end
       else
         recorder.prompts[#recorder.prompts + 1] = msg
         turn_id = tostring(#recorder.prompts)
       end
-      return {
+      latest = {
         id = function() return turn_id end,
         result = function() return nil end,
         wait = function() return nil, "agent turn wait timed out" end,
       }
+      tickets[turn_id] = latest
+      return latest
     end
     recorder.prompts[#recorder.prompts + 1] = msg
     local res, err = behaviors[opts.name](self, msg)
@@ -190,33 +229,26 @@ makima.agent.spawn = function(ctx, opts)
     local turn_id = tostring(#recorder.prompts)
     res.turn_id = turn_id
     res.agent_id = opts.name
-    return {
+    latest = {
       id = function() return turn_id end,
       result = function(_, ticket_ctx) return res end,
       wait = function(_, ticket_ctx, wait_opts) return res end,
     }
+    tickets[turn_id] = latest
+    return latest
   end
   function agent:status(call_ctx)
     return { status = "idle", queued = 0, input_tokens = 0, output_tokens = 0 }
   end
   function agent:latest_turn(call_ctx)
-    return nil
-  end
-  function agent:_makima_session_id()
-    return opts.name
-  end
-  function agent:_makima_task_owner()
-    return {
-      _makima_can_control = function()
-        return recorder.can_control ~= false
-      end,
-      _makima_retired = function()
-        return false
-      end,
-    }
+    return latest
   end
   function agent:close()
     recorder.closed = recorder.closed + 1
+    return true
+  end
+  function agent:retire()
+    return true
   end
   if opts.name == "runtime" then
     local serial = 0
@@ -244,6 +276,7 @@ makima.agent.spawn = function(ctx, opts)
           return nil, "agent turn wait timed out"
         end,
       }
+      tickets[id] = latest
       return latest
     end
     function agent:send(call_ctx, msg, submit_opts)
@@ -366,6 +399,7 @@ fn load_task_host_in_mode(mode: &str) -> (Arc<ToolRegistry>, PluginHost) {
             local handler = spec.handler
             spec.handler = function(input, ctx)
                 return handler(input, {{
+                    agent = function() return {{ id = function() return "stub-owner" end }} end,
                     mode = function() return {mode:?} end,
                     tool_output_lines = function() return ctx:tool_output_lines() end,
                 }})
@@ -747,7 +781,9 @@ fn task_wait_presentation_matches_standalone_restore(
     } else {
         scenario
     };
-    assert_eq!(start_header, expected_header);
+    let id = input["task_id"].as_str().unwrap();
+    let short_id = &id[id.len().saturating_sub(8)..];
+    assert_eq!(start_header, short_id);
     assert_eq!(live.1.as_ref().unwrap().text(), expected_header);
 
     let (_restore_reg, restore_host) = load_task_host();
@@ -755,6 +791,7 @@ fn task_wait_presentation_matches_standalone_restore(
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         RestoreItem {
+            state_target: None,
             tool: Arc::from(TASK_WAIT_TOOL),
             tool_use_id: WAIT_TOOL_USE_ID.to_owned(),
             input,
@@ -821,7 +858,11 @@ fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, fail
     } else {
         format!("To {}", &UNKNOWN_TASK_ID[UNKNOWN_TASK_ID.len() - 8..])
     };
-    assert_eq!(start_header, expected_header);
+    let id = input["task_id"].as_str().unwrap();
+    assert_eq!(
+        start_header,
+        format!("To {}", &id[id.len().saturating_sub(8)..])
+    );
     assert_eq!(live.1.as_ref().unwrap().text(), expected_header);
 
     let (_restore_reg, restore_host) = load_task_host();
@@ -829,6 +870,7 @@ fn task_send_presentation_shows_message_and_matches_restore(scenario: &str, fail
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         RestoreItem {
+            state_target: None,
             tool: Arc::from(TASK_SEND_TOOL),
             tool_use_id: SEND_TOOL_USE_ID.to_owned(),
             input,
@@ -919,6 +961,7 @@ fn task_lifecycle_presentation_matches_restore(
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         RestoreItem {
+            state_target: None,
             tool: Arc::from(tool),
             tool_use_id: LIFECYCLE_TOOL_USE_ID.to_owned(),
             input,
@@ -937,7 +980,7 @@ fn task_lifecycle_presentation_matches_restore(
 }
 
 #[test]
-fn task_ticket_cache_evicts_oldest_settled_turn() {
+fn task_wait_uses_runtime_retention_beyond_the_old_ticket_cap() {
     let (reg, _host) = load_task_host();
     let first = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = first["task_id"].as_str().unwrap();
@@ -956,8 +999,9 @@ fn task_ticket_cache_evicts_oldest_settled_turn() {
             TASK_WAIT_TOOL,
             json!({"task_id": task_id, "turn_id": first["turn_id"]})
         )
-        .unwrap_err(),
-        TURN_UNAVAILABLE_ERR
+        .map(|output| serde_json::from_str::<Value>(&output).unwrap()["result"]["turn_id"].clone())
+        .unwrap(),
+        first["turn_id"]
     );
     let result = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({"task_id": task_id}));
     assert_eq!(result["result"]["turn_id"], latest);
@@ -993,84 +1037,31 @@ fn implicit_runtime_ticket_is_retained_without_following_successors() {
 }
 
 #[test]
-fn implicit_runtime_tickets_respect_bounds_and_preserve_unresolved_work() {
+fn runtime_turns_remain_addressable_beyond_the_old_ticket_cap() {
     let (reg, _host) = load_task_host();
     let spawned = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input("runtime", None));
     let task_id = &spawned["task_id"];
-    let mut retained = vec![spawned["turn_id"].as_str().unwrap().to_owned()];
-    for _ in 1..RETAINED_TURN_LIMIT {
+    for _ in 0..=RETAINED_TURN_LIMIT {
         let id = exec_tool(&reg, "advance_runtime_turn", json!({"admit": true})).unwrap();
         let pending = exec_tool_json(
             &reg,
             TASK_WAIT_TOOL,
-            json!({"task_id": task_id, "timeout": 0}),
-        );
-        assert_eq!(pending["status"], "running");
-        retained.push(id);
-    }
-    let overflow = exec_tool(&reg, "advance_runtime_turn", json!({"admit": true})).unwrap();
-    assert_eq!(
-        exec_tool(
-            &reg,
-            TASK_WAIT_TOOL,
-            json!({"task_id": task_id, "timeout": 0})
-        )
-        .unwrap_err(),
-        TURN_UNAVAILABLE_ERR
-    );
-    assert_eq!(
-        exec_tool(
-            &reg,
-            TASK_WAIT_TOOL,
-            json!({"task_id": task_id, "turn_id": overflow, "timeout": 0})
-        )
-        .unwrap_err(),
-        TURN_UNAVAILABLE_ERR
-    );
-    for id in &retained {
-        let pending = exec_tool_json(
-            &reg,
-            TASK_WAIT_TOOL,
             json!({"task_id": task_id, "turn_id": id, "timeout": 0}),
         );
         assert_eq!(pending["status"], "running");
     }
-    // Free a settled slot behind unresolved work, then retain the same snapshot.
-    exec_tool(&reg, "advance_runtime_turn", json!({"settle": retained[1]})).unwrap();
-    let pending = exec_tool_json(
+    exec_tool(
+        &reg,
+        "advance_runtime_turn",
+        json!({"settle": spawned["turn_id"]}),
+    )
+    .unwrap();
+    let first = exec_tool_json(
         &reg,
         TASK_WAIT_TOOL,
-        json!({"task_id": task_id, "timeout": 0}),
+        json!({"task_id": task_id, "turn_id": spawned["turn_id"]}),
     );
-    assert_eq!(pending["status"], "running");
-    exec_tool(&reg, "advance_runtime_turn", json!({"settle": overflow})).unwrap();
-    let completed = exec_tool_json(
-        &reg,
-        TASK_WAIT_TOOL,
-        json!({"task_id": task_id, "turn_id": overflow}),
-    );
-    assert_eq!(completed["result"]["turn_id"], overflow);
-    assert_eq!(
-        exec_tool(
-            &reg,
-            TASK_WAIT_TOOL,
-            json!({"task_id": task_id, "turn_id": retained[1]})
-        )
-        .unwrap_err(),
-        TURN_UNAVAILABLE_ERR
-    );
-    for id in retained
-        .iter()
-        .enumerate()
-        .filter_map(|(index, id)| (index != 1).then_some(id))
-    {
-        let pending = exec_tool_json(
-            &reg,
-            TASK_WAIT_TOOL,
-            json!({"task_id": task_id, "turn_id": id, "timeout": 0}),
-        );
-        assert_eq!(pending["status"], "running");
-    }
+    assert_eq!(first["result"]["turn_id"], spawned["turn_id"]);
 }
 
 #[test]
@@ -1165,7 +1156,7 @@ fn duplicate_task_id_is_rejected_without_overwrite() {
     let task_id = first["task_id"].as_str().unwrap();
 
     let error = exec_tool(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap_err();
-    assert_eq!(error, DUPLICATE_TASK_ID_ERR);
+    assert!(error.contains(DUPLICATE_TASK_ID_ERR), "{error}");
 
     let status = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({ "task_id": task_id }));
     assert_eq!(status["status"], json!("done"));
@@ -1255,7 +1246,7 @@ fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
 }
 
 #[test]
-fn despawn_releases_permit_and_clears_task() {
+fn despawn_preserves_task_results() {
     let (reg, _host) = load_task_host();
     let spawn = exec_tool_json(&reg, TASK_SPAWN_TOOL, task_input(SCENARIO_PLAIN, None));
     let task_id = spawn["task_id"].as_str().unwrap();
@@ -1263,9 +1254,8 @@ fn despawn_releases_permit_and_clears_task() {
     let ok = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
     assert_eq!(ok["ok"], json!(true));
 
-    // Unknown task after despawn.
-    let err = exec_tool(&reg, "task_despawn", json!({ "task_id": task_id })).unwrap_err();
-    assert!(err.contains(UNKNOWN_TASK_ERR), "got: {err}");
+    let retained = exec_tool_json(&reg, TASK_WAIT_TOOL, json!({ "task_id": task_id }));
+    assert_eq!(retained["result"]["text"], PLAIN_TEXT);
 
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
@@ -1348,6 +1338,21 @@ fn load_real_driver_host_with_prelude(
     max_concurrent_agent_turns: usize,
     extra_prelude: &str,
 ) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
+    load_real_driver_host_with_limits(
+        ctx,
+        AgentLimits {
+            max_concurrent_agent_turns,
+            ..AgentLimits::default()
+        },
+        extra_prelude,
+    )
+}
+
+fn load_real_driver_host_with_limits(
+    ctx: &ToolContext,
+    limits: AgentLimits,
+    extra_prelude: &str,
+) -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source_with_opts(
@@ -1364,17 +1369,283 @@ fn load_real_driver_host_with_prelude(
         ctx.mcp.as_ref(),
     ));
     let config = common::effective_config(&ctx).with_mode_def(ctx.mode_def.as_deref().cloned());
-    common::bind_parked_root(
-        &host,
+    common::bind_parked_root(&host, &reg, &mut ctx, config, limits);
+    (reg, host, ctx)
+}
+
+#[test_case::test_case("research"; "research")]
+#[test_case::test_case("general"; "general")]
+fn task_system_is_fixed_from_admitted_recorded_context(subagent_type: &str) {
+    use makima_agent::agent::InstructionSource;
+    use makima_agent::context::{ContextBinding, ContextPolicy, root_context};
+    use makima_agent::journal::JournalCommit;
+
+    const RECORDED: &str = "recorded root context before reload";
+    const RELOADED: &str = "recorded root context after reload";
+    const DISK: &str = "changed disk context must not leak";
+    const RESTORE_SYSTEM_PROMPT: &str = r#"
+        local real_system_prompt = makima.agent.system_prompt
+    "#;
+    struct PromptProvider(flume::Sender<String>);
+    impl Provider for PromptProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            _: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.0.send(system.into()).unwrap();
+            Box::pin(async { Ok(common::canned_reply(PLAIN_TEXT)) })
+        }
+    }
+    let (systems, captured) = flume::unbounded();
+    let provider = Arc::new(PromptProvider(systems));
+    let (mut ctx, _events, _cancel) = common::ctx_with_provider(provider);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("AGENTS.md"), DISK).unwrap();
+    ctx.cwd = directory.path().to_path_buf();
+    ctx.root_context = Some(Arc::new(RootContext {
+        instructions: Instructions {
+            text: RECORDED.into(),
+            ..Default::default()
+        },
+        slots: Arc::clone(&ctx.prompt_slots),
+    }));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source_with_opts(
+        "recorded_task",
+        &format!(
+            "{RESTORE_SYSTEM_PROMPT}\n{REAL_DRIVER_PRELUDE}\nmakima.agent.system_prompt = real_system_prompt\n{TASK_PLUGIN_SRC}"
+        ),
+        Default::default(),
+    )
+    .unwrap();
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
         &reg,
-        &mut ctx,
-        config,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(&host, &reg, &mut ctx, config, AgentLimits::default());
+    let manager = ctx.managed_turn.as_ref().unwrap().manager();
+    let access = manager.root().unwrap().state_access();
+    let (_, update) = ContextBinding::capture(access.clone())
+        .unwrap()
+        .prepare(
+            &Instructions::from_sources(vec![InstructionSource {
+                path: directory.path().join("AGENTS.md"),
+                label: "reloaded project".into(),
+                content: RELOADED.into(),
+            }]),
+            &ctx.prompt_slots,
+            true,
+            ContextPolicy::Reload,
+        )
+        .unwrap();
+    manager
+        .journal()
+        .commit(JournalCommit {
+            context_updates: vec![update],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        root_context(&access)
+            .unwrap()
+            .unwrap()
+            .instructions
+            .text
+            .contains(RELOADED)
+    );
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["subagent_type"] = json!(subagent_type);
+    let first = common::exec_tool(&reg, &ctx, TASK_SPAWN_TOOL, input.clone()).unwrap();
+    common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, first.clone()).unwrap();
+    let first_id = first["task_id"].as_str().unwrap().parse().unwrap();
+    let saved = manager
+        .journal()
+        .agent(first_id)
+        .unwrap()
+        .spec
+        .unwrap()
+        .system;
+    assert!(saved.contains(RECORDED));
+    assert!(!saved.contains(RELOADED));
+    assert!(!saved.contains(DISK));
+    let initial_request = smol::block_on(common::bounded(captured.recv_async())).unwrap();
+    assert!(initial_request.contains(&saved));
+    ctx.root_context = Some(Arc::new(RootContext {
+        instructions: Instructions {
+            text: RELOADED.into(),
+            ..Default::default()
+        },
+        slots: Arc::clone(&ctx.prompt_slots),
+    }));
+    let second = common::exec_tool(&reg, &ctx, TASK_SPAWN_TOOL, input).unwrap();
+    common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, second.clone()).unwrap();
+    let second_id = second["task_id"].as_str().unwrap().parse().unwrap();
+    let second_system = manager
+        .journal()
+        .agent(second_id)
+        .unwrap()
+        .spec
+        .unwrap()
+        .system;
+    assert!(second_system.contains(RELOADED));
+    assert!(!second_system.contains(RECORDED));
+    let second_request = smol::block_on(common::bounded(captured.recv_async())).unwrap();
+    assert!(second_request.contains(&second_system));
+    let sent = common::exec_tool(
+        &reg,
+        &ctx,
+        TASK_SEND_TOOL,
+        json!({
+            "task_id": first["task_id"], "message": TASK_PROMPT,
+        }),
+    )
+    .unwrap();
+    common::exec_tool(
+        &reg,
+        &ctx,
+        TASK_WAIT_TOOL,
+        json!({
+            "task_id": first["task_id"], "turn_id": sent["turn_id"],
+        }),
+    )
+    .unwrap();
+    let original_request = smol::block_on(common::bounded(captured.recv_async())).unwrap();
+    assert!(original_request.contains(&saved));
+    assert!(!original_request.contains(RELOADED));
+    assert_eq!(
+        manager
+            .journal()
+            .agent(first_id)
+            .unwrap()
+            .spec
+            .unwrap()
+            .system,
+        saved
+    );
+}
+
+#[test]
+fn task_129th_spawn_preserves_the_first_task() {
+    let provider = Arc::new(common::CannedProvider::new(
+        (0..=SEQUENTIAL_TASK_COUNT)
+            .map(|_| common::canned_reply(PLAIN_TEXT))
+            .collect(),
+    ));
+    let (ctx, _events, _cancel) = common::ctx_with_provider(provider);
+    let (reg, _host, ctx) = load_real_driver_host(&ctx);
+    let mut tasks = Vec::with_capacity(SEQUENTIAL_TASK_COUNT);
+    for index in 0..SEQUENTIAL_TASK_COUNT {
+        eprintln!("sequential task {index}/{SEQUENTIAL_TASK_COUNT}: spawn");
+        let task = common::exec_tool(
+            &reg,
+            &ctx,
+            TASK_SPAWN_TOOL,
+            task_input(&format!("sequential {index}"), None),
+        )
+        .unwrap_or_else(|error| panic!("spawn {index}/{SEQUENTIAL_TASK_COUNT}: {error}"));
+        eprintln!("sequential task {index}/{SEQUENTIAL_TASK_COUNT}: wait");
+        let result = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, task.clone())
+            .unwrap_or_else(|error| panic!("wait {index}/{SEQUENTIAL_TASK_COUNT}: {error}"));
+        assert_eq!(result["result"]["text"], PLAIN_TEXT, "task {index}");
+        tasks.push(task);
+    }
+    let manager = ctx.managed_turn.as_ref().unwrap().manager();
+    for task in &tasks {
+        let id = task["task_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            manager.journal().agent(id).unwrap().lifecycle,
+            StoredAgentLifecycle::Open
+        );
+    }
+    let first = &tasks[0];
+    let retained = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, first.clone()).unwrap();
+    assert_eq!(retained["result"]["turn_id"], first["turn_id"]);
+    let sent = common::exec_tool(
+        &reg,
+        &ctx,
+        TASK_SEND_TOOL,
+        json!({ "task_id": first["task_id"], "message": TASK_PROMPT }),
+    )
+    .unwrap();
+    assert_ne!(sent["turn_id"], first["turn_id"]);
+    let result = common::exec_tool(
+        &reg,
+        &ctx,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": first["task_id"], "turn_id": sent["turn_id"] }),
+    )
+    .unwrap();
+    assert_eq!(result["result"]["text"], PLAIN_TEXT);
+}
+
+#[test_case::test_case(false; "initial_admission")]
+#[test_case::test_case(true; "policy_commit")]
+fn failed_task_creation_returns_retained_quota(policy_failure: bool) {
+    let provider = Arc::new(common::CannedProvider::new(vec![common::canned_reply(
+        PLAIN_TEXT,
+    )]));
+    let (ctx, _events, _cancel) = common::ctx_with_provider(Arc::clone(&provider));
+    let (reg, _host, ctx) = load_real_driver_host_with_limits(
+        &ctx,
         AgentLimits {
-            max_concurrent_agent_turns,
+            max_retained_agents: ROLLBACK_RETAINED_LIMIT,
             ..AgentLimits::default()
         },
+        "",
     );
-    (reg, host, ctx)
+    let manager = ctx.managed_turn.as_ref().unwrap().manager();
+    for _ in 0..ROLLBACK_FAILED_ATTEMPTS {
+        let mut input = task_input(SCENARIO_PLAIN, None);
+        input[if policy_failure {
+            "description"
+        } else {
+            "prompt"
+        }] = json!("x".repeat(MAX_PLUGIN_VALUE_BYTES + 1));
+        let error = common::exec_tool_text(&reg, &ctx, TASK_SPAWN_TOOL, input).unwrap_err();
+        if policy_failure {
+            assert!(error.contains(STATE_SIZE_ERROR), "{error}");
+        } else {
+            assert_eq!(error, ActorError::InstructionOverflow.to_string());
+        }
+        let snapshot = manager.journal().checkpoint_snapshot().unwrap();
+        let folded =
+            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+                .unwrap();
+        assert!(
+            folded
+                .agents
+                .values()
+                .filter(|agent| agent.parent.is_some())
+                .all(|agent| agent.lifecycle == StoredAgentLifecycle::Retired
+                    && folded
+                        .scopes
+                        .get(&Some(agent.id))
+                        .is_none_or(|scope| scope.admitted.is_empty()))
+        );
+        assert!(
+            folded
+                .scopes
+                .get(&None)
+                .and_then(|scope| scope.plugins.get("task_policy_real/policy"))
+                .and_then(|slot| slot.value.as_ref())
+                .is_none_or(|value| value.as_object().is_some_and(|map| map.is_empty()))
+        );
+    }
+    assert!(provider.captured_tools().is_empty());
+    let result = spawn_and_wait(&reg, &ctx, task_input(SCENARIO_PLAIN, None)).unwrap();
+    assert_eq!(result["text"], PLAIN_TEXT);
 }
 
 struct GatedProvider {
@@ -1977,9 +2248,12 @@ fn despawn_releases_capacity_from_an_active_turn() {
         let out =
             exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": first_id }));
         assert_eq!(out["ok"], json!(true));
-        let error = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, json!({ "task_id": first_id }))
-            .unwrap_err();
-        assert!(error.contains(UNKNOWN_TASK_ERR), "got: {error}");
+        let retained =
+            common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, json!({ "task_id": first_id })).unwrap();
+        assert_eq!(retained["status"], "done");
+        assert_eq!(retained["result"]["status"], "cancelled");
+        assert_eq!(retained["result"]["turn_id"], first["turn_id"]);
+        assert_eq!(retained["result"]["cancellation_reason"], "closed");
         assert_task_input(
             &common::bounded(started_rx.recv_async()).await.unwrap(),
             TASK_PROMPT,
@@ -2177,6 +2451,210 @@ impl Provider for NestedTaskProvider {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move { Ok(Self::reply(messages)) })
     }
+}
+
+#[test_case::test_case(false, false; "live_child")]
+#[test_case::test_case(true, false; "restored_child")]
+#[test_case::test_case(false, true; "live_child_after_reload")]
+#[test_case::test_case(true, true; "restored_child_after_reload")]
+fn nested_task_spawn_uses_recorded_root_context(restart: bool, reload: bool) {
+    use common::{RestartHost, TestSession};
+    use makima_agent::AgentId;
+    use makima_agent::agent::InstructionSource;
+    use makima_agent::context::{ContextBinding, ContextPolicy};
+    use makima_agent::journal::JournalCommit;
+    use makima_lua::test_support::{InMemoryFs, run_command};
+    use makima_storage::StateDir;
+
+    const PLUGIN: &str = "nested_recorded";
+    const COMMAND: &str = "/nested_recorded";
+    const RECORDED: &str = "recorded nested root instructions";
+    const RELOADED: &str = "reloaded nested root instructions";
+    const DISK: &str = "changed nested disk instructions";
+    const READY: &str = "nested child ready";
+    const START: &str = "start nested task";
+    const NESTED_REQUESTS: usize = 4;
+    const TOTAL_REQUESTS: usize = 5;
+    const GRAPH_NODES: usize = 3;
+    const SOURCE: &str = r#"
+local child
+makima.api.register_command({
+    name = "/nested_recorded", tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx)
+        if opts.args == "create" then
+            child = assert(makima.agent.spawn(ctx, {
+                system = "recorded nested root instructions",
+                inherit_provider = true, audience = "general_sub", silent = true,
+                tools = {
+                    { name = "task_spawn", description = "spawn", input_schema = { type = "object" } },
+                    { name = "task_wait", description = "wait", input_schema = { type = "object" } },
+                },
+            }))
+            local result = assert(assert(child:send(ctx, "prepare nested child", { when = "idle" })):wait(ctx))
+            assert(result.text == "nested child ready", result.error)
+            assert(makima.fs.write(SAVED_PATH, child:id()))
+        else
+            local id = assert(makima.fs.read(SAVED_PATH))
+            child = assert(makima.agent.get(ctx, id))
+            local result = assert(assert(child:send(ctx, "start nested task", { when = "idle" })):wait(ctx))
+            assert(result.status == "completed", result.error)
+            local nested = makima.json.decode(result.text)
+            assert(nested.status == "done" and nested.result.text == "child finished", result.text)
+        end
+    end,
+})
+local real_spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
+    opts.inherit_provider = true
+    opts.auto_deliver = false
+    return real_spawn(ctx, opts)
+end
+makima.agent.resolve_model = function() return { spec = "anthropic/claude-sonnet-4-20250514" } end
+"#;
+    struct ContextProvider {
+        requests: flume::Sender<(bool, String)>,
+        step: AtomicUsize,
+    }
+    impl Provider for ContextProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            _: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let first_text = messages.first().and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            });
+            let is_grandchild = first_text == Some(NESTED_CHILD_PROMPT);
+            self.requests.send((is_grandchild, system.into())).unwrap();
+            let step = self.step.fetch_add(1, Ordering::SeqCst);
+            let reply = if step == 0 {
+                common::canned_reply(READY)
+            } else {
+                NestedTaskProvider::reply(messages)
+            };
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(directory.path().into());
+    let mut session = TestSession::new(
+        &common::default_model().spec(),
+        directory.path().to_str().unwrap(),
+    );
+    session.save(&state).unwrap();
+    let saved = directory.path().join("nested-child-id");
+    let source = format!(
+        "local SAVED_PATH = {:?}\n{SOURCE}\n{TASK_PLUGIN_SRC}",
+        saved.to_str().unwrap()
+    );
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        &directory
+            .path()
+            .join("plugins")
+            .join(format!("{PLUGIN}.lua")),
+        source.into_bytes(),
+    );
+    let (requests, captured) = flume::unbounded();
+    let provider = Arc::new(ContextProvider {
+        requests,
+        step: AtomicUsize::new(0),
+    });
+    let mut host = RestartHost::open_with_provider(
+        directory.path(),
+        session.id,
+        fs,
+        vec![PLUGIN.into()],
+        provider.clone(),
+    );
+    for (content, policy) in [(RECORDED, ContextPolicy::Admission)]
+        .into_iter()
+        .chain(reload.then_some((RELOADED, ContextPolicy::Reload)))
+    {
+        let instructions = Instructions::from_sources(vec![InstructionSource {
+            path: directory.path().join("AGENTS.md"),
+            label: "recorded project".into(),
+            content: content.into(),
+        }]);
+        let (_, update) = ContextBinding::capture(host.root.target.state_access())
+            .unwrap()
+            .prepare(&instructions, &Default::default(), true, policy)
+            .unwrap();
+        host.manager
+            .journal()
+            .commit(JournalCommit {
+                context_updates: vec![update],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    assert!(host.root.template.root_context.is_none());
+    let command = |host: &RestartHost, action: &str| {
+        let finished = run_command(
+            &host.host.command_registry(),
+            &format!("{COMMAND} {action}"),
+            0,
+            Some(host.root.clone()),
+        );
+        assert_eq!(
+            smol::block_on(common::bounded(finished.recv_async())).unwrap(),
+            Ok(())
+        );
+    };
+    command(&host, "create");
+    let (is_grandchild, first) = smol::block_on(common::bounded(captured.recv_async())).unwrap();
+    assert!(!is_grandchild);
+    assert!(first.contains(RECORDED));
+    assert!(!first.contains(RELOADED));
+    assert!(!first.contains(DISK));
+    let id: AgentId = std::str::from_utf8(
+        &host
+            .fs
+            .files()
+            .into_iter()
+            .find(|(path, _)| path == &saved)
+            .unwrap()
+            .1,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    std::fs::write(directory.path().join("AGENTS.md"), DISK).unwrap();
+    if restart {
+        host = host.restart_host(directory.path());
+        assert!(!host.manager.is_live(id));
+        assert!(host.root.template.root_context.is_none());
+    }
+    command(&host, START);
+    let mut grandchild_requests = 0;
+    for _ in 0..NESTED_REQUESTS {
+        let (is_grandchild, system) =
+            smol::block_on(common::bounded(captured.recv_async())).unwrap();
+        grandchild_requests += usize::from(is_grandchild);
+        let (expected, excluded) = if is_grandchild && reload {
+            (RELOADED, RECORDED)
+        } else {
+            (RECORDED, RELOADED)
+        };
+        assert!(system.contains(expected), "{system}");
+        assert!(!system.contains(excluded), "{system}");
+        assert!(!system.contains(DISK));
+    }
+    assert_eq!(grandchild_requests, 1);
+    assert_eq!(provider.step.load(Ordering::SeqCst), TOTAL_REQUESTS);
+    assert!(host.manager.is_live(id));
+    assert_eq!(host.manager.snapshot().len(), GRAPH_NODES);
 }
 
 /// With one child permit, a general subagent blocked in `task_wait` must

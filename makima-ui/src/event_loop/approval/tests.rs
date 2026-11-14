@@ -10,10 +10,13 @@ use makima_agent::actor::{
     PreparedModel,
 };
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::journal::{JournalChange, JournalCommit, SessionJournal};
 use makima_agent::manager::ManagerError;
-use makima_agent::session_options::SessionOptionError;
+use makima_agent::session_options::{
+    ENABLED_VALUE, FAST_PENDING_MODEL_OPTION_ID, SessionOptionError, WORKFLOW_OPTION_ID,
+};
 use makima_agent::tools::ToolRegistry;
-use makima_agent::{AgentInput, AgentMode};
+use makima_agent::{AgentInput, AgentMode, ModeId};
 use makima_domain::{Effort, ModelSelection, ThinkingConfig as DomainThinkingConfig};
 use makima_lua::PluginHost;
 use makima_providers::model::FastSupport;
@@ -24,13 +27,17 @@ use makima_providers::{
     ModelCapabilities, ProviderEvent, RequestDelivery, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingSupport, TokenUsage,
 };
-use makima_storage::checkpoint::{CheckpointRequest, CheckpointVersion, CheckpointWriter};
-use makima_storage::id::{MakimaId, SessionRef};
+use makima_storage::checkpoint::{CheckpointRequest, CheckpointVersion};
+use makima_storage::id::{AgentId, MakimaId, SessionRef};
 use makima_storage::model::{read_model, read_recents};
+use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
+use makima_storage::restore::RestoreChoice;
 use makima_storage::session_lock;
+use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
 use makima_storage::sessions::{StoredMode, read_prefs};
 use test_case::test_case;
 
+use super::super::rewind::tests::assert_persisted_state;
 use super::super::tests::{pump_until, shutdown_manager, sync_preparer, with_event_loop};
 use super::super::{
     EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, reserve_config_change,
@@ -53,7 +60,6 @@ mod pending_fast;
 
 const SOURCE_MODEL: &str = "anthropic/claude-opus-4-6";
 const TARGET_MODEL: &str = "openai/gpt-5";
-const TARGET_MODEL_ID: &str = "gpt-5";
 const HISTORY: &str = "existing planning conversation";
 const PLAN: &str = "# Implementation\n\nImplement the regression tests.\n";
 const RESPONSE: &str = "implementation finished";
@@ -141,7 +147,7 @@ fn stage_with_picker(event_loop: &mut EventLoop<'_>, index: usize) {
         panic!("picker did not confirm implementation selection");
     };
     assert_eq!(selection, implementation_selection());
-    app.plan_form.set_implementation_selection(selection);
+    app.stage_plan_selection(selection);
 }
 
 fn assert_actor_selection(actor: &AgentActorHandle, spec: &str, options: RequestOptions) {
@@ -847,7 +853,7 @@ fn managed_child_approval(
                 })
             });
         }
-        event_loop.sessions[index].app.state.fast_pending = true;
+        let pending_fast_model = seed_pending_fast(event_loop, index);
         event_loop.prepare_plan_approval(
             index,
             clear_context,
@@ -855,7 +861,7 @@ fn managed_child_approval(
             false,
             path.clone(),
         );
-        assert!(event_loop.sessions[index].app.state.fast_pending);
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         assert!(
             event_loop.sessions[index].pending_approval.is_some(),
             "child approval rejected before preparation: {:?}",
@@ -868,8 +874,7 @@ fn managed_child_approval(
                 selection.fast = Some(true);
                 event_loop.sessions[index]
                     .app
-                    .plan_form
-                    .set_implementation_selection(selection.clone());
+                    .stage_plan_selection(selection.clone());
             }
             if saved {
                 event_loop.sessions[index].app.active_chat = 0;
@@ -916,6 +921,7 @@ fn managed_child_approval(
             );
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
             assert!(Arc::ptr_eq(&history, &child.committed_history()));
+            assert_pending_fast(event_loop, index, Some(&pending_fast_model));
             assert_eq!(
                 child.effective_config().unwrap().mode,
                 AgentMode::Plan(path)
@@ -1044,6 +1050,7 @@ fn managed_child_approval(
             );
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
             assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert_pending_fast(event_loop, index, Some(&pending_fast_model));
             assert!(requests.is_empty());
             drop(checkpoint_release);
             event_loop.sessions[index].app.active_chat = child_chat;
@@ -1113,10 +1120,7 @@ fn managed_child_approval(
         }
         event_loop.handle_internal(committed);
         assert!(event_loop.sessions[index].pending_approval.is_none());
-        if !fail_checkpoint {
-            assert!(event_loop.sessions[index].app.state.fast_pending);
-        }
-        event_loop.sessions[index].app.state.fast_pending = false;
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         if fail_checkpoint {
             let idle = child
                 .prepare_idle()
@@ -1172,14 +1176,18 @@ fn managed_child_approval(
             pump_until(event_loop, |_| child.snapshot().status == ActorStatus::Idle);
             checkpoint(event_loop, index);
             let restored = AppSession::load(session, &event_loop.ctx.storage).unwrap();
-            let stored = restored
-                .subagents()
-                .iter()
-                .find(|stored| stored.tool_use_id == child_key)
-                .unwrap();
-            assert_eq!(stored.model.as_deref(), Some(TARGET_MODEL_ID));
-            assert_eq!(stored.thinking, Some(options.thinking.into()));
-            assert_eq!(stored.fast, options.fast);
+            assert!(
+                restored
+                    .subagents()
+                    .iter()
+                    .any(|stored| stored.tool_use_id == child_key)
+            );
+            let view = restored.latest_state().unwrap();
+            let config = view.scopes[&Some(child_id)].config.as_ref().unwrap();
+            assert_eq!(config.model, TARGET_MODEL);
+            assert_eq!(config.thinking, Some(options.thinking.into()));
+            assert_eq!(config.fast, options.fast);
+            assert_eq!(config.mode.id, ModeId::Build.key());
             event_loop.sessions[index].app.active_chat = child_chat;
             event_loop.sessions[index].app.sync_focused_queue();
             assert!(!event_loop.sessions[index].app.plan_approval_pending);
@@ -1228,10 +1236,41 @@ fn setup_with_registry(
     let (requests, receiver) = flume::unbounded();
     let mut session = AppSession::new(SOURCE_MODEL, &event_loop.session_cwd);
     session.meta.mode = Some(StoredMode::Plan);
-    session.meta.plan_path = Some(path.display().to_string());
-    session.meta.plan_written = true;
+    let root = AgentId::generate();
+    session.bind_root_id(root).unwrap();
+    session.push_state(StoredStateRecord {
+        seq: 1,
+        agent: None,
+        generation: 0,
+        change: StateChange::Plugin {
+            key: PLAN_STATE_KEY.into(),
+            version: PLAN_STATE_VERSION,
+            value: Some(
+                serde_json::to_value(PlanSlot::from([(
+                    root,
+                    PlanEntry {
+                        path: path.clone(),
+                        written: true,
+                        approved: None,
+                        staged_model: Some(implementation_selection()),
+                    },
+                )]))
+                .unwrap(),
+            ),
+        },
+    });
     session.meta.thinking = Some(DomainThinkingConfig::Off.into());
     session.meta.fast = true;
+    session
+        .resolve_legacy_mode(
+            event_loop
+                .ctx
+                .lua_event_handle
+                .mode_registry()
+                .current(&AgentMode::Plan(path.clone()))
+                .stored_snapshot(&AgentMode::Plan(path.clone())),
+        )
+        .unwrap();
     session.push_message(Message::user(HISTORY.into()));
     let runtime = event_loop
         .ctx
@@ -1250,8 +1289,7 @@ fn setup_with_registry(
     event_loop.push_runtime(runtime);
     event_loop.sessions[index]
         .app
-        .plan_form
-        .set_implementation_selection(implementation_selection());
+        .stage_plan_selection(implementation_selection());
     event_loop.ctx.prepare_provider = sync_preparer(move |model| {
         Ok(PreparedModel {
             model: capable_model(&model.spec()),
@@ -1271,6 +1309,7 @@ fn press(event_loop: &mut EventLoop<'_>, key_event: KeyEvent) {
 /// Reopening the form resets its selection to the first row.
 fn choose_form_row(event_loop: &mut EventLoop<'_>, index: usize, row: usize, parallel: bool) {
     event_loop.set_focused(index);
+    event_loop.sync_orchestration();
     if event_loop.sessions[index].app.plan_form.is_visible() {
         press(event_loop, key::PLAN_TOGGLE.to_key_event());
     }
@@ -1307,6 +1346,57 @@ fn next_ready(event_loop: &mut EventLoop<'_>) -> InternalEvent {
     }
 }
 
+fn root_stored_config(event_loop: &EventLoop<'_>, index: usize) -> StoredAgentConfig {
+    let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+    manager
+        .journal()
+        .snapshot()
+        .state
+        .iter()
+        .rev()
+        .find_map(|record| match &record.change {
+            StateChange::Config(config) if record.agent == Some(root) => Some(config.clone()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn seed_pending_fast(event_loop: &EventLoop<'_>, index: usize) -> String {
+    let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+    let mut config = root_stored_config(event_loop, index);
+    let model = config.model.clone();
+    config
+        .options
+        .insert(FAST_PENDING_MODEL_OPTION_ID.into(), model.clone());
+    manager
+        .journal()
+        .commit(JournalCommit {
+            changes: vec![JournalChange {
+                agent: Some(root),
+                generation: manager
+                    .actor(root)
+                    .unwrap()
+                    .config_snapshot()
+                    .unwrap()
+                    .generation,
+                change: StateChange::Config(config),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    model
+}
+
+fn assert_pending_fast(event_loop: &EventLoop<'_>, index: usize, model: Option<&str>) {
+    assert_eq!(
+        root_stored_config(event_loop, index)
+            .options
+            .get(FAST_PENDING_MODEL_OPTION_ID)
+            .map(String::as_str),
+        model
+    );
+}
+
 fn apply_patch(actor: &AgentActorHandle, patch: ConfigPatch) -> ConfigCommit {
     let ticket = actor.reserve_prepared_operation(None).unwrap();
     smol::block_on(ticket.commit_when_ready(Some(ConfigChange::Patch(patch))))
@@ -1340,14 +1430,17 @@ fn session_log(event_loop: &EventLoop<'_>, id: MakimaId) -> PathBuf {
 fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
     event_loop.sessions[index].app.checkpoint_now();
     let runtime = &event_loop.sessions[index];
-    smol::block_on(event_loop.ctx.storage_writer.checkpoint(CheckpointRequest {
-        session_id: runtime.id(),
-        version: CheckpointVersion {
-            revision: runtime.app.state.session.revision(),
-            epoch: runtime.app.state.session.history_snapshot().epoch,
+    smol::block_on(event_loop.ctx.storage_writer.checkpoint_fenced(
+        CheckpointRequest {
+            session_id: runtime.id(),
+            version: CheckpointVersion {
+                revision: runtime.app.state.session.revision(),
+                epoch: runtime.app.state.session.history_snapshot().epoch,
+            },
+            snapshot: Arc::clone(&runtime.app.state.session),
         },
-        snapshot: Arc::clone(&runtime.app.state.session),
-    }))
+        &runtime.app.storage_fence,
+    ))
     .unwrap();
 }
 
@@ -1524,7 +1617,28 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         assert!(instruction.contains(IMPLEMENT_PARALLEL_HINT));
         assert!(requests.is_empty());
         let runtime = &mut event_loop.sessions[index];
-        assert_eq!(runtime.id(), original_id);
+        assert_eq!(runtime.id() == original_id, !fresh);
+        if fresh {
+            let link = runtime.app.state.session.parent().unwrap();
+            assert_eq!(link.session, original_id);
+            let parent = AppSession::load(original_id, &event_loop.ctx.storage).unwrap();
+            let parent_root = parent.root_agent_id().unwrap();
+            assert_eq!(
+                parent.latest_state().unwrap().scopes[&Some(parent_root)]
+                    .config
+                    .as_ref()
+                    .unwrap()
+                    .mode
+                    .id,
+                ModeId::Plan.key()
+            );
+            assert!(
+                parent
+                    .messages()
+                    .iter()
+                    .any(|message| message.user_text() == Some(HISTORY))
+            );
+        }
         assert_eq!(runtime.app.root_mode(), Mode::Build);
         assert_eq!(runtime.app.root_config().model.spec(), TARGET_MODEL);
         assert_eq!(
@@ -1545,10 +1659,12 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         let id = runtime.id();
         checkpoint(event_loop, index);
         let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        assert_eq!(restored.model, TARGET_MODEL);
-        assert_eq!(restored.meta.mode, Some(StoredMode::Build));
-        assert_eq!(restored.meta.thinking, Some(options.thinking.into()));
-        assert_eq!(restored.meta.fast, options.fast);
+        let view = restored.latest_state().unwrap();
+        let config = view.scopes[&Some(root)].config.as_ref().unwrap();
+        assert_eq!(config.model, TARGET_MODEL);
+        assert_eq!(config.mode.id, ModeId::Build.key());
+        assert_eq!(config.thinking, Some(options.thinking.into()));
+        assert_eq!(config.fast, options.fast);
         assert_eq!(
             restored
                 .messages()
@@ -1618,86 +1734,429 @@ fn mode_transition_emits_once_and_config_only_emits_none() {
 }
 
 #[test]
-fn clear_context_preserves_runtime_and_session_state() {
+fn clear_context_links_new_runtime_and_preserves_planning_session() {
     with_event_loop(|event_loop| {
-        let (index, _, requests, host) = setup(event_loop);
+        let (index, path, requests, host) = setup(event_loop);
         let source = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
         let command_target = event_loop.sessions[index].app.command_target.id();
-        let coordinator = event_loop.sessions[index].coordinator.clone();
-        let options = coordinator.read().options();
-        let mailbox = coordinator.mailbox().unwrap();
+        let permissions = Arc::clone(&event_loop.sessions[index].app.permissions);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let actor = manager.actor(root).unwrap();
-        let actor_identity = actor.identity();
-        let usage = event_loop.sessions[index].app.state.session.token_usage;
+        let config = manager.actor(root).unwrap().effective_config().unwrap();
+        let history = manager.actor(root).unwrap().committed_history();
         event_loop.sessions[index]
             .app
             .input_box
             .set_input(DRAFT.into());
-        event_loop.sessions[index].app.checkpoint_now();
         checkpoint(event_loop, index);
         approve(event_loop, index, true);
         let ready = final_ready(event_loop, &requests);
-        event_loop.handle_internal(ready);
+        assert_eq!(event_loop.sessions[index].id(), source);
         assert!(requests.is_empty());
+        event_loop.handle_internal(ready);
         let committed = next_ready(event_loop);
         assert!(requests.is_empty());
         event_loop.handle_internal(committed);
-        assert!(
-            session_lock::claim(&event_loop.sessions_dir, &source)
-                .unwrap()
-                .is_none()
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].id() != source
+                && event_loop.sessions[index].app.status == Status::Idle
+                && !requests.is_empty()
+        });
+        let runtime = &event_loop.sessions[index];
+        assert!(!Arc::ptr_eq(&identity, &runtime.handles.identity()));
+        assert!(!Arc::ptr_eq(&permissions, &runtime.app.permissions));
+        assert_ne!(runtime.app.command_target.id(), command_target);
+        assert_eq!(runtime.app.root_mode(), Mode::Build);
+        let link = runtime.app.state.session.parent().unwrap().clone();
+        assert_eq!(link.session, source);
+        assert_eq!(link.message_count, history.len());
+        requests.recv_timeout(WAIT).unwrap();
+        assert!(requests.is_empty());
+        assert!(observed(event_loop, &host, index, RESET_COMMAND).is_empty());
+        checkpoint(event_loop, index);
+        let implementation =
+            AppSession::load(event_loop.sessions[index].id(), &event_loop.ctx.storage).unwrap();
+        assert_eq!(implementation.parent(), Some(&link));
+        let parent = AppSession::load(source, &event_loop.ctx.storage).unwrap();
+        assert_eq!(
+            serde_json::to_value(parent.messages()).unwrap(),
+            serde_json::to_value(history.as_ref()).unwrap()
         );
-        assert_eq!(event_loop.sessions[index].id(), source);
+        let view = parent.latest_state().unwrap();
+        let stored = view.scopes[&Some(root)].config.as_ref().unwrap();
+        assert_eq!(stored.model, config.model.spec());
+        assert_eq!(stored.mode.id, ModeId::Plan.key());
+        assert_eq!(parent.meta.input_draft.as_deref(), Some(DRAFT));
+        let plans = makima_agent::plan_state::plan_entries(&view).unwrap();
+        assert_eq!(plans[&root].path, path);
+        assert_eq!(plans[&root].approved.as_ref().unwrap().content, PLAN);
+        assert_eq!(plans[&root].staged_model, Some(implementation_selection()));
+        assert_eq!(view.boundaries[&link.seq].offset, link.message_count);
+    });
+}
+
+#[test_case(false; "parent_lock_held")]
+#[test_case(true; "parent_cwd_changed")]
+fn parent_navigation_rejects_without_replacing_implementation(changed_cwd: bool) {
+    with_event_loop(|event_loop| {
+        let (index, _, requests, _host) = setup(event_loop);
+        approve(event_loop, index, true);
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.root_mode() == Mode::Build
+                && event_loop.sessions[index].app.status == Status::Idle
+                && !requests.is_empty()
+        });
+        requests.recv_timeout(WAIT).unwrap();
+        checkpoint(event_loop, index);
+        let runtime = &event_loop.sessions[index];
+        let implementation = runtime.id();
+        let identity = runtime.handles.identity();
+        let link = runtime.app.state.session.parent().unwrap().clone();
+        let path = session_log(event_loop, link.session);
+        let mut held = None;
+        let expected = if changed_cwd {
+            let mut parent = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
+            let root = parent.root_agent_id().unwrap();
+            let mut config = parent.latest_state().unwrap().scopes[&Some(root)]
+                .config
+                .clone()
+                .unwrap();
+            config.cwd = PathBuf::from(&event_loop.session_cwd)
+                .join(MOVED_CWD)
+                .display()
+                .to_string();
+            let expected = session_lock::ResumeBlock::OtherCwd(config.cwd.clone()).to_string();
+            parent.push_state(StoredStateRecord {
+                seq: parent.next_state_seq(),
+                agent: Some(root),
+                generation: 0,
+                change: StateChange::Config(config),
+            });
+            parent.save(&event_loop.ctx.storage).unwrap();
+            expected
+        } else {
+            held = session_lock::claim(&event_loop.sessions_dir, &link.session).unwrap();
+            assert!(held.is_some());
+            session_lock::OPEN_ELSEWHERE_MSG.to_owned()
+        };
+        let before = fs::read(&path).unwrap();
+        let result = event_loop.dispatch_parent_restore(index, link.session, link.seq);
+        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(event_loop.sessions[index].id(), implementation);
         assert!(Arc::ptr_eq(
             &identity,
             &event_loop.sessions[index].handles.identity()
         ));
-        assert!(Arc::ptr_eq(
-            &actor_identity,
-            &manager.actor(root).unwrap().identity()
-        ));
-        assert_eq!(
-            event_loop.sessions[index].app.command_target.id(),
-            command_target
-        );
-        assert_eq!(
-            event_loop.sessions[index].app.input_box.buffer.value(),
-            DRAFT
-        );
-        assert_eq!(
-            event_loop.sessions[index].app.state.session.token_usage,
-            usage
-        );
-        assert!(coordinator.mailbox().is_ok());
-        drop(mailbox);
-        let committed_options = coordinator.read().options();
-        assert!(committed_options.version > options.version);
+        assert!(!event_loop.sessions[index].app.restore_in_progress);
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(AppSession::load(implementation, &event_loop.ctx.storage).is_ok());
+        drop(held);
+    });
+}
+
+#[test_case(false; "normal_publication")]
+#[test_case(true; "implementation_lease_lost_after_publication")]
+fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(lose_source_lease: bool) {
+    const LATEST_DRAFT: &str = "implementation draft typed immediately before parent navigation";
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.root_mode() == Mode::Build
                 && event_loop.sessions[index].app.status == Status::Idle
+                && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
-        assert!(observed(event_loop, &host, index, RESET_COMMAND).is_empty());
-        assert!(
-            event_loop
-                .ctx
-                .storage_writer
-                .latest_snapshot(source)
-                .is_some()
-        );
-        event_loop.sessions[index].app.checkpoint_now();
+        let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
+        smol::block_on(manager.wait_settled());
         checkpoint(event_loop, index);
-        let restored = AppSession::load(source, &event_loop.ctx.storage).unwrap();
-        assert_eq!(restored.meta.input_draft.as_deref(), Some(DRAFT));
+        let implementation = event_loop.sessions[index].id();
+        let link = event_loop.sessions[index]
+            .app
+            .state
+            .session
+            .parent()
+            .unwrap()
+            .clone();
+        let before = AppSession::load(implementation, &event_loop.ctx.storage).unwrap();
         assert!(
-            !restored
-                .messages()
+            before
+                .state()
                 .iter()
-                .any(|message| message.user_text() == Some(HISTORY))
+                .any(|record| matches!(&record.change, StateChange::Turn { .. }))
         );
-        assert_eq!(restored.model, TARGET_MODEL);
+        event_loop.sessions[index]
+            .app
+            .input_box
+            .set_input(LATEST_DRAFT.into());
+        let source = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
+        let source_history = serde_json::to_value(source.messages()).unwrap();
+        fs::write(&path, MUTATED_PLAN).unwrap();
+        event_loop
+            .dispatch_parent_restore(index, link.session, link.seq)
+            .unwrap();
+        assert_eq!(event_loop.sessions[index].id(), implementation);
+        let published = loop {
+            let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
+            if matches!(event, InternalEvent::ParentRestorePublished { .. }) {
+                break event;
+            }
+            if let InternalEvent::RestorePreview { reply, .. } = &event {
+                reply.send(RestoreChoice::ConversationAndFiles).unwrap();
+                continue;
+            }
+            event_loop.handle_internal(event);
+        };
+        assert!(matches!(
+            &published,
+            InternalEvent::ParentRestorePublished { result: Ok(_), .. }
+        ));
+        assert_ne!(index, 0);
+        event_loop.focused = 0;
+        if lose_source_lease {
+            event_loop.sessions[index].cancel_background_work();
+            event_loop.sessions[index].lock_lost = true;
+        }
+        event_loop.handle_internal(published);
+        assert_eq!(event_loop.focused, 0);
+        assert_eq!(
+            event_loop.sessions[index].id(),
+            link.session,
+            "{:?}",
+            event_loop.sessions[index].app.status_bar.flash_text()
+        );
+        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
+        pump_until(event_loop, |event_loop| {
+            !event_loop.sessions[index].app.restore_in_progress
+        });
+        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
+        let journal = event_loop.sessions[index]
+            .handles
+            .manager_and_root()
+            .0
+            .journal()
+            .checkpoint_snapshot()
+            .unwrap();
+        assert_persisted_state(&persisted, &journal);
+        assert_eq!(persisted.agent_revisions(), journal.agent_revisions);
+        let root = persisted.root_agent_id().unwrap();
+        assert_eq!(
+            event_loop.sessions[index]
+                .app
+                .state
+                .session
+                .history_snapshot()
+                .epoch,
+            journal.histories[&root].epoch
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), PLAN);
+        assert_eq!(
+            serde_json::to_value(event_loop.sessions[index].app.state.session.messages()).unwrap(),
+            source_history
+        );
+        let after = AppSession::load(implementation, &event_loop.ctx.storage).unwrap();
+        assert_eq!(
+            serde_json::to_value(after.messages()).unwrap(),
+            serde_json::to_value(before.messages()).unwrap()
+        );
+        assert_persisted_state(
+            &after,
+            &SessionJournal::from_session(&before).unwrap().snapshot(),
+        );
+        assert_eq!(after.parent(), before.parent());
+        assert_eq!(after.meta.input_draft.as_deref(), Some(LATEST_DRAFT));
+        event_loop.sessions[index]
+            .app
+            .input_box
+            .set_input(LATEST_DRAFT.into());
+        checkpoint(event_loop, index);
+        assert_eq!(
+            AppSession::load(link.session, &event_loop.ctx.storage)
+                .unwrap()
+                .meta
+                .input_draft
+                .as_deref(),
+            Some(LATEST_DRAFT)
+        );
+        let changed = smol::block_on(
+            event_loop.sessions[index]
+                .coordinator
+                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
+        );
+        assert!(changed.is_ok(), "{changed:?}");
+        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
+        assert!(
+            persisted.latest_state().unwrap().scopes[&Some(root)]
+                .config
+                .as_ref()
+                .unwrap()
+                .workflow
+        );
+        let cwd = PathBuf::from(&event_loop.session_cwd).join(MOVED_CWD);
+        fs::create_dir_all(&cwd).unwrap();
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        let reservation = reserve_config_change(
+            &manager.lookup(root).unwrap(),
+            &event_loop.sessions[index].coordinator,
+            None,
+        )
+        .unwrap();
+        smol::block_on(reservation.commit_change(ConfigChange::WorkingDirectory(cwd.clone())))
+            .unwrap();
+        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
+        assert_eq!(PathBuf::from(&persisted.cwd), cwd);
+        let branch = event_loop.sessions[index]
+            .app
+            .state
+            .session
+            .branches()
+            .last()
+            .unwrap()
+            .id;
+        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+        event_loop.handle_action(
+            index,
+            Action::RestoreBranch {
+                target: manager.lookup(root).unwrap(),
+                id: branch,
+            },
+        );
+        pump_until(event_loop, |event_loop| {
+            !event_loop.sessions[index].app.restore_in_progress
+        });
+        assert_eq!(event_loop.sessions[index].id(), link.session);
+        assert!(AppSession::load(implementation, &event_loop.ctx.storage).is_ok());
+        assert!(requests.is_empty());
+    });
+}
+
+#[test_case(false; "queued_result_dropped")]
+#[test_case(true; "source_lease_lost_before_publication")]
+fn queued_parent_restore_abort_repairs_projection_without_publishing(handle_after_loss: bool) {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, true);
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.root_mode() == Mode::Build
+                && event_loop.sessions[index].app.status == Status::Idle
+                && !requests.is_empty()
+        });
+        requests.recv_timeout(WAIT).unwrap();
+        let manager = event_loop.sessions[index].handles.manager_and_root().0;
+        smol::block_on(manager.wait_settled());
+        let checkpoint_guard = manager.reserve_graph_transition().unwrap();
+        checkpoint(event_loop, index);
+        drop(checkpoint_guard);
+        let link = event_loop.sessions[index]
+            .app
+            .state
+            .session
+            .parent()
+            .unwrap()
+            .clone();
+        let before = fs::read(session_log(event_loop, link.session)).unwrap();
+        let source_manager = event_loop.sessions[index].handles.manager_and_root().0;
+        fs::write(&path, MUTATED_PLAN).unwrap();
+        event_loop
+            .dispatch_parent_restore(index, link.session, link.seq)
+            .unwrap();
+        let ready = loop {
+            let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
+            if matches!(event, InternalEvent::ParentRestoreReady { .. }) {
+                break event;
+            }
+            if let InternalEvent::RestorePreview { reply, .. } = &event {
+                reply.send(RestoreChoice::ConversationAndFiles).unwrap();
+                continue;
+            }
+            event_loop.handle_internal(event);
+        };
+        assert!(matches!(
+            &ready,
+            InternalEvent::ParentRestoreReady { result: Ok(_), .. }
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), PLAN);
+        assert!(matches!(
+            source_manager.reserve_graph_transition(),
+            Err(ManagerError::RewindInProgress)
+        ));
+        event_loop.sessions[index].cancel_background_work();
+        if handle_after_loss {
+            event_loop.sessions[index].lock_lost = true;
+            event_loop.handle_internal(ready);
+        } else {
+            let (queued, receiver) = flume::bounded(1);
+            queued.send(ready).unwrap();
+            drop(queued);
+            drop(receiver);
+        }
+        assert!(source_manager.reserve_graph_transition().is_ok());
+        assert_eq!(fs::read_to_string(path).unwrap(), MUTATED_PLAN);
+        assert_eq!(
+            fs::read(session_log(event_loop, link.session)).unwrap(),
+            before
+        );
+        event_loop.sessions[index].app.restore_in_progress = false;
+    });
+}
+
+#[test]
+fn parent_provider_failure_restores_actual_plan_bytes_and_keeps_implementation() {
+    const FAILURE: &str = "parent rewind provider preparation failed";
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        approve(event_loop, index, true);
+        pump_until(event_loop, |event_loop| {
+            event_loop.sessions[index].app.root_mode() == Mode::Build
+                && event_loop.sessions[index].app.status == Status::Idle
+                && !requests.is_empty()
+        });
+        requests.recv_timeout(WAIT).unwrap();
+        checkpoint(event_loop, index);
+        let implementation = event_loop.sessions[index].id();
+        let identity = event_loop.sessions[index].handles.identity();
+        let link = event_loop.sessions[index]
+            .app
+            .state
+            .session
+            .parent()
+            .unwrap()
+            .clone();
+        let source_manager = event_loop.sessions[index].handles.manager_and_root().0;
+        let before = fs::read(session_log(event_loop, link.session)).unwrap();
+        fs::write(&path, MUTATED_PLAN).unwrap();
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::clone(&preparations);
+        event_loop.ctx.prepare_provider = sync_preparer(move |_| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Err(FAILURE.into())
+        });
+        event_loop
+            .dispatch_parent_restore(index, link.session, link.seq)
+            .unwrap();
+        pump_until(event_loop, |event_loop| {
+            !event_loop.sessions[index].app.restore_in_progress
+        });
+        assert_eq!(event_loop.sessions[index].id(), implementation);
+        assert!(Arc::ptr_eq(
+            &identity,
+            &event_loop.sessions[index].handles.identity()
+        ));
+        assert_eq!(
+            fs::read(session_log(event_loop, link.session)).unwrap(),
+            before
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), MUTATED_PLAN);
+        assert!(source_manager.reserve_graph_transition().is_ok());
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert!(
+            event_loop.sessions[index]
+                .app
+                .status_bar
+                .flash_text()
+                .is_some_and(|message| message.contains(FAILURE))
+        );
+        assert!(requests.is_empty());
     });
 }
 
@@ -1726,7 +2185,7 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
         assert_eq!(model, TARGET_MODEL);
         let id = event_loop.sessions[index].id();
         let identity = event_loop.sessions[index].handles.identity();
-        assert_eq!(id, source_id);
+        assert_eq!(id == source_id, !fresh);
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let turn = actor.snapshot().active_turn.unwrap();
@@ -1759,9 +2218,59 @@ fn postcommit_cancel_keeps_selected_build_runtime(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
+fn oversized_plan_rejects_approval_before_config_or_turn_commit(fresh: bool) {
+    with_event_loop(|event_loop| {
+        let (index, path, requests, _host) = setup(event_loop);
+        fs::write(
+            &path,
+            "x".repeat(makima_storage::session_state::MAX_PLUGIN_VALUE_BYTES),
+        )
+        .unwrap();
+        let runtime = &event_loop.sessions[index];
+        let (manager, root) = runtime.handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let before_config = actor.effective_config().unwrap();
+        let before_history = actor.committed_history();
+        let access = manager.lookup(root).unwrap().state_access();
+        let before_plan = makima_agent::plan_state::slot(&access)
+            .unwrap()
+            .get(&access)
+            .unwrap();
+        approve(event_loop, index, fresh);
+        pump_until(event_loop, |event_loop| {
+            !event_loop.sessions[index].app.plan_approval_pending
+        });
+        assert!(requests.is_empty());
+        assert!(Arc::ptr_eq(
+            &before_config,
+            &actor.effective_config().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&before_history, &actor.committed_history()));
+        let access = manager.lookup(root).unwrap().state_access();
+        assert_eq!(
+            makima_agent::plan_state::slot(&access)
+                .unwrap()
+                .get(&access)
+                .unwrap(),
+            before_plan
+        );
+        assert!(
+            event_loop.sessions[index]
+                .app
+                .status_bar
+                .flash_text()
+                .unwrap()
+                .contains("encoded bytes")
+        );
+    });
+}
+
+#[test_case(false; "existing_context")]
+#[test_case(true; "fresh_context")]
 fn captured_plan_survives_later_edits(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
+        let parent_id = event_loop.sessions[index].id();
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
         fs::write(&path, MUTATED_PLAN).unwrap();
@@ -1787,6 +2296,26 @@ fn captured_plan_survives_later_edits(fresh: bool) {
         );
         assert!(!input.contains(MUTATED_PLAN.trim()));
         assert!(requests.is_empty());
+        checkpoint(event_loop, index);
+        let runtime = &event_loop.sessions[index];
+        let saved = AppSession::load(
+            if fresh { parent_id } else { runtime.id() },
+            &event_loop.ctx.storage,
+        )
+        .unwrap();
+        let plans = makima_agent::plan_state::plan_entries(&saved.latest_state().unwrap()).unwrap();
+        let root = saved.root_agent_id().unwrap();
+        let entry = &plans[&root];
+        assert_eq!(entry.path, path);
+        assert!(entry.written);
+        assert_eq!(entry.staged_model, Some(implementation_selection()));
+        let approved = entry.approved.as_ref().unwrap();
+        assert_eq!(approved.content, PLAN);
+        assert_eq!(
+            approved.sha256,
+            makima_agent::plan_state::content_sha256(PLAN)
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), MUTATED_PLAN);
     });
 }
 
@@ -1906,6 +2435,15 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
                 ),
             }),
         )
+        .unwrap();
+        let target = manager.lookup(root).unwrap();
+        let access = target.state_access();
+        let slot = makima_agent::plan_state::slot(&access).unwrap();
+        slot.update(&access, |plans| {
+            let mut plans = plans.unwrap();
+            plans.get_mut(&root).unwrap().path = mode.plan_path().unwrap().to_path_buf();
+            Ok(Some(plans))
+        })
         .unwrap();
         approve(event_loop, index, true);
         let ready = next_ready(event_loop);
@@ -2029,6 +2567,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         let (index, path, requests, host) = setup(event_loop);
         let id = event_loop.sessions[index].id();
         let run = event_loop.sessions[index].app.run_id;
+        let pending_fast_model = seed_pending_fast(event_loop, index);
         event_loop.ctx.prepare_provider = sync_preparer(|_| Err(PROVIDER_FAILURE.into()));
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
@@ -2036,6 +2575,7 @@ fn provider_preparation_failure_preserves_plan(fresh: bool) {
         });
         let failure = ConfigChangeError::ModelPreparation(PROVIDER_FAILURE.into()).to_string();
         assert_preserved(event_loop, &host, index, &path, run, Some(&failure));
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         assert_eq!(event_loop.sessions[index].id(), id);
         assert!(requests.is_empty());
     });
@@ -2047,6 +2587,7 @@ fn cancel_during_provider_preparation_ignores_late_result(clear_context: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
+        let pending_fast_model = seed_pending_fast(event_loop, index);
         let (entered, entry) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         let (completed, completion) = flume::bounded(1);
@@ -2069,6 +2610,7 @@ fn cancel_during_provider_preparation_ignores_late_result(clear_context: bool) {
         let cancelled = next_ready(event_loop);
         event_loop.handle_internal(cancelled);
         assert_preserved(event_loop, &host, index, &path, run, None);
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         release.send(()).unwrap();
         completion.recv_timeout(WAIT).unwrap();
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
@@ -2095,12 +2637,15 @@ fn cancel_before_ready_preserves_plan(fresh: bool) {
     with_event_loop(|event_loop| {
         let (index, path, requests, host) = setup(event_loop);
         let run = event_loop.sessions[index].app.run_id;
+        let pending_fast_model = seed_pending_fast(event_loop, index);
         approve(event_loop, index, fresh);
         let ready = next_ready(event_loop);
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         event_loop.dispatch(index, vec![Action::CancelPlanApproval]);
         event_loop.handle_internal(ready);
         let _ = event_loop.tick();
         assert_preserved(event_loop, &host, index, &path, run, None);
+        assert_pending_fast(event_loop, index, Some(&pending_fast_model));
         assert!(requests.is_empty());
     });
 }
@@ -2130,6 +2675,11 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         });
         deletion.recv_timeout(WAIT).unwrap().unwrap();
         fs::create_dir(&log).unwrap();
+        let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
+        event_loop
+            .ctx
+            .storage_writer
+            .bind_journal(id, manager.journal());
         event_loop.sessions[index]
             .app
             .input_box
@@ -2147,10 +2697,18 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         fs::rename(&moved, &log).unwrap();
         event_loop.sessions[index].app.checkpoint_now();
         checkpoint(event_loop, index);
+        let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
+        assert_eq!(restored.meta.input_draft.as_deref(), Some(DRAFT));
+        let (_, root) = event_loop.sessions[index].handles.manager_and_root();
+        let view = restored.latest_state().unwrap();
+        let config = view.scopes[&Some(root)].config.as_ref().unwrap();
+        assert_eq!(config.model, TARGET_MODEL);
+        assert_eq!(config.mode.id, ModeId::Build.key());
         assert_eq!(
-            AppSession::load(id, &event_loop.ctx.storage).unwrap().model,
-            TARGET_MODEL
+            config.thinking,
+            Some(implementation_options().thinking.into())
         );
+        assert_eq!(config.fast, implementation_options().fast);
         assert!(requests.is_empty());
     });
 }
@@ -2206,11 +2764,14 @@ fn without_override_uses_actor_predecessor(fresh: bool) {
                     app.status_bar.flash_text()
                 );
             }
+            let runtime = &event_loop.sessions[index];
+            let (current_manager, current_root) = runtime.handles.manager_and_root();
+            let current_actor = current_manager.actor(current_root).unwrap();
             !app.plan_approval_pending
                 && app.status == Status::Idle
-                && actor.snapshot().status == ActorStatus::Idle
+                && current_actor.snapshot().status == ActorStatus::Idle
                 && matches!(
-                    actor.snapshot().latest,
+                    current_actor.snapshot().latest,
                     Some(makima_agent::TurnOutcome::Completed { .. })
                 )
                 && !recorded.is_empty()

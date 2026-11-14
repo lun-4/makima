@@ -69,6 +69,26 @@ Every mode name goes through one `modes::resolve`, against the registry the Lua 
 
 An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints use the existing session format and project onto stored metadata without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
 
+### Session state audit
+
+| State | Authority and restoration |
+|---|---|
+| Agent identity, ancestry, lifecycle, spawn specification and usage | Ordered agent revisions. Reservations, resident actors and runner tasks are rebuilt. |
+| Transcripts, tool outputs, observations and posts | Session message, child-message, output and post records. Conversation continuation metadata and compaction metadata belong to the matching transcript epoch. |
+| Turn admissions, outcomes and deliveries | Journal records. Recovery interrupts admitted unfinished turns without executing them again. Terminal delivery records prevent duplicate observations after restart and compaction. |
+| Model, thinking, effective fast setting, workflow, cwd and resolved mode | Per-agent `Config` records. Provider instances, model capabilities, runtime generations and caches are rebuilt. The spawn ceiling remains separate from mutable mode configuration. |
+| Deferred fast intent | A model-pinned internal Config option. Discovery consumes the intent with the committed setting change. |
+| Plugin options | All current values belong to Config history. Resume applies values whose current definitions declare persistence. Full-state rewind will restore every value in its later implementation phase. |
+| Permission grants and explicit YOLO intent | Session-scoped `Rules` records. Invocation-only YOLO, config/project/plugin rules and cwd-derived boundary checks are rebuilt. Allow-once answers and pending prompts are discarded. |
+| Plan path and written status | Path and written status are retained in session metadata until the plan slot replaces these fields. Approved content and staged implementation selection are not restart-durable until that migration. |
+| Draft, inactive root text queue, context display, title and billed usage | Session metadata or the existing usage records. Draft and queued attachments are not retained. Pending compaction requests are discarded. |
+| Completed shell output not yet submitted to a turn | Not retained. Once submitted, it belongs to the transcript. |
+| Provider sessions, MCP transports, background invocations and session locks | Rebuilt or interrupted. No live resource handle is deserialized. |
+| Plugin registrations, callbacks, timers and VM tables | Rebuilt when plugins load. VM tables, callbacks, timers and registrations are not stored. Registered durable slots are deferred to Phase 6. |
+| Focus, panels, scroll position and expanded rows | Transient UI state, except the existing persisted tool presentation state. Input history retains its separate storage. |
+
+Runtime configuration epochs and provider metadata are not independent durable settings. A restored actor receives its resolved mode definition with the configuration before admission. Saved mode snapshots do not consult changed or removed registry definitions. An unusable saved plan file requires a visible Build fallback; the fallback must pass through the normal configuration commit path.
+
 ### Durable publication
 
 Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (rewind, plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:

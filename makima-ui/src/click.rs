@@ -43,6 +43,7 @@ pub enum Surface {
     Float(u32),
     Menu,
     Plan,
+    Restore,
     Queue,
     Completion,
 }

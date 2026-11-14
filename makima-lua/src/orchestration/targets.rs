@@ -1,8 +1,9 @@
 use arc_swap::ArcSwapOption;
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::manager::AgentIncarnation;
 use makima_agent::session_coordinator::ConfigMutation;
 use makima_agent::{
-    AgentRef,
+    AgentActorHandle, AgentRef,
     agent::LoadedInstructions,
     cancel::CancelToken,
     tools::{Deadline, ToolContext, TurnToolBindings},
@@ -31,6 +32,7 @@ struct RootTarget {
 struct ChildTarget {
     target: TrustedTarget,
     history_key: String,
+    actor_identity: Arc<()>,
 }
 
 #[derive(Default)]
@@ -110,11 +112,20 @@ impl AgentOrchestration {
 
     pub fn history_key(&self, target: &AgentRef) -> Result<String, String> {
         self.validate_target(target)?;
-        self.lock()
+        let registered = self
+            .lock()
             .children
             .iter()
             .find(|entry| same_agent(&entry.target.target, target))
-            .map(|entry| entry.history_key.clone())
+            .map(|entry| entry.history_key.clone());
+        registered
+            .or_else(|| {
+                target
+                    .snapshot()
+                    .ok()
+                    .filter(|node| node.parent_id.is_some())
+                    .and_then(|node| node.metadata.transcript_key)
+            })
             .ok_or_else(|| CHILD_HISTORY_KEY_UNAVAILABLE.into())
     }
 
@@ -152,6 +163,13 @@ impl OrchestrationServices for AgentOrchestration {
         invocation: Option<&CommandInvocation>,
     ) -> Result<Option<TrustedTarget>, String> {
         if let Some(invocation) = invocation {
+            if let Some(pinned) = invocation.admission_context::<super::PinnedCommandTarget>() {
+                if pinned.validate().is_err() || pinned.target.validate_live().is_err() {
+                    return Ok(None);
+                }
+                self.validate_target(&pinned.target)?;
+                return Ok(Some(pinned.trusted()));
+            }
             let Some(pinned) = invocation.admission_context::<TrustedTarget>() else {
                 return Ok(None);
             };
@@ -168,6 +186,48 @@ impl OrchestrationServices for AgentOrchestration {
                     .map(|template| TrustedTarget { target, template })
             })
             .transpose()
+    }
+
+    fn register_child_activation(
+        &self,
+        target: TrustedTarget,
+        history_key: String,
+        actor: &AgentActorHandle,
+        incarnation: &AgentIncarnation,
+    ) -> Result<(), String> {
+        self.validate_target(&target.target)?;
+        if actor.agent_id() != target.target.id() {
+            return Err("child activation actor identity does not match target".into());
+        }
+        let mut targets = self.lock();
+        target
+            .target
+            .manager()
+            .validate_activation(incarnation)
+            .map_err(|error| error.to_string())?;
+        if targets
+            .roots
+            .iter()
+            .any(|root| same_agent(&root.target.target, &target.target))
+        {
+            return Err("root template registration is owned by the host".into());
+        }
+        targets
+            .children
+            .retain(|entry| !same_agent(&entry.target.target, &target.target));
+        targets.children.push(ChildTarget {
+            target,
+            history_key,
+            actor_identity: actor.identity(),
+        });
+        Ok(())
+    }
+
+    fn unregister_child_target(&self, target: &AgentRef, identity: &Arc<()>) {
+        self.lock().children.retain(|entry| {
+            !same_agent(&entry.target.target, target)
+                || !Arc::ptr_eq(&entry.actor_identity, identity)
+        });
     }
 
     fn register_child_target(
@@ -188,9 +248,15 @@ impl OrchestrationServices for AgentOrchestration {
             entry.target.target.validate_live().is_ok()
                 && !same_agent(&entry.target.target, &target.target)
         });
+        let actor_identity = target
+            .target
+            .actor()
+            .map_err(|error| error.to_string())?
+            .identity();
         targets.children.push(ChildTarget {
             target,
             history_key,
+            actor_identity,
         });
         Ok(())
     }
@@ -235,7 +301,7 @@ impl OrchestrationServices for AgentOrchestration {
     }
 
     fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
-        target.validate_live().map_err(|error| error.to_string())?;
+        target.snapshot().map_err(|error| error.to_string())?;
         if self.lock().roots.iter().any(|entry| {
             entry.target.target.same_manager(target) && entry.target.target.validate_live().is_ok()
         }) {

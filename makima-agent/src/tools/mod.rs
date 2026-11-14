@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::context::RootContext;
 use crate::mcp::{
     McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
 };
@@ -488,6 +489,7 @@ pub struct ToolContext {
     pub timeouts: makima_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub root_context: Option<Arc<RootContext>>,
     pub modes: Arc<crate::ModeRegistry>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
@@ -895,6 +897,7 @@ pub fn interpreter_ctx(
         timeouts: makima_providers::Timeouts::default(),
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        root_context: None,
         modes,
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),

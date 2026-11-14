@@ -12,11 +12,14 @@ use std::sync::Arc;
 
 use super::{Action, App, Status};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender, visible_pending};
+#[cfg(test)]
+use crate::agent::shared_queue::QueueItem;
+use crate::agent::shared_queue::{QueueSender, visible_pending};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
+pub(crate) const RESTORE_IN_PROGRESS: &str = "Session restore is in progress";
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_SUBAGENT_ERR: &str = "subagent is no longer accepting messages";
 
@@ -234,6 +237,9 @@ impl App {
     /// Submits raw keyboard input to the focused actor after reference expansion.
     /// The caller handles slash commands, `exit`, and shell prefixes.
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if self.restore_in_progress {
+            return SubmitOutcome::Rejected(RESTORE_IN_PROGRESS.into());
+        }
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR.into());
         }
@@ -291,13 +297,26 @@ impl App {
     pub(super) fn admit_user_turn(
         &mut self,
         target: &AgentRef,
-        mut input: AgentInput,
+        input: AgentInput,
         display: Option<String>,
     ) -> Result<bool, String> {
         let actor = target
             .validate_live()
             .and_then(|()| target.actor())
             .map_err(|error| error.to_string())?;
+        self.admit_user_turn_on(target, actor, input, display)
+    }
+
+    pub(super) fn admit_user_turn_on(
+        &mut self,
+        target: &AgentRef,
+        actor: AgentActorHandle,
+        mut input: AgentInput,
+        display: Option<String>,
+    ) -> Result<bool, String> {
+        if self.restore_in_progress {
+            return Err(RESTORE_IN_PROGRESS.into());
+        }
         let root = self.chats[0].agent_id == Some(target.id());
         input.preamble = self.shell.results_for(Some(target.id())).to_vec();
         if root {
@@ -343,6 +362,7 @@ impl App {
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
+    #[cfg(test)]
     pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
@@ -356,20 +376,8 @@ impl App {
             .is_ok()
     }
 
-    /// Push restored queue items only here, never in `restore_display`, which
-    /// runs before the loaded or rewound history is committed.
-    pub(crate) fn flush_restored_queue(&mut self) {
-        // The live queue owns the text from here on, so the recovery
-        // snapshot must stop overriding it on save.
+    pub(crate) fn clear_recoverable_queue(&mut self) {
         self.recoverable_queue.clear();
-        // Read, not taken: the live queue is what the next checkpoint mirrors
-        // back into the session, so emptying it here changes nothing on disk.
-        for text in self.state.session.meta.queued_messages.clone() {
-            self.queue_and_notify(QueuedMessage {
-                text,
-                images: Vec::new(),
-            });
-        }
     }
 
     pub(crate) fn start_mailbox_run(

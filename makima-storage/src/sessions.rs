@@ -6,21 +6,29 @@
 //! enable O(delta) incremental saves.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::UNIX_EPOCH;
 
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
 
 use crate::conversation::ConversationState;
-use crate::id::MakimaId;
+use crate::id::{AgentId, MakimaId};
 use crate::offload_cleanup::Root;
+use crate::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
+use crate::restore::{RestoreError, RestoreStore, TransitionRef};
 use crate::session_lock::SessionPublicationGuard;
+use crate::session_state::{
+    ParentLink, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
+    StoredAgentLifecycle, StoredAgentRecord, StoredBranch, StoredDeliveryOp, StoredModeSnapshot,
+    StoredStateRecord, StoredTurnResult,
+};
+use makima_domain::TokenUsage;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -30,16 +38,28 @@ pub use makima_domain::{
 
 use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
 
-const LOG_FORMAT_VERSION: u32 = 2;
+const LOG_FORMAT_VERSION: u32 = 3;
+const LEGACY_LOG_FORMAT_VERSION: u32 = 2;
+const BRANCH_DIR: &str = "branches";
+const BLOBS_DIR: &str = "blobs";
+const RESTORES_DIR: &str = "restores";
+const BRANCH_KEEP: usize = 20;
+const BRANCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
+type Publication = Arc<Mutex<u64>>;
+type PublicationRegistry = Mutex<HashMap<PathBuf, Weak<Mutex<u64>>>>;
+static PUBLICATIONS: OnceLock<PublicationRegistry> = OnceLock::new();
+const LEGACY_CHILD_UNRESTORABLE: &str = "legacy child has no stored spawn specification";
+const LEGACY_PLAN_SLOT: &str = "makima.plan";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
-const SCAN_CACHE_VERSION: u32 = 1;
+const SCAN_CACHE_VERSION: u32 = 2;
 #[cfg(test)]
 const TAIL_BUF: u64 = 4096;
 const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const EPOCH_CHANGED: &str = "messages were rewritten";
+const HEADER_CHANGED: &str = "root configuration changed header cache";
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
 const CURSOR_AHEAD: &str = "cursor ahead of session";
 const LOG_BLOATED: &str = "too many stale meta records";
@@ -72,8 +92,19 @@ pub fn next_epoch() -> u64 {
 pub enum SessionError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Restore(#[from] RestoreError),
     #[error("incompatible session version {found} (expected {expected})")]
     VersionMismatch { found: u32, expected: u32 },
+    #[error("session requires unsupported features: {features:?}")]
+    UnsupportedFeatures { features: BTreeSet<String> },
+    #[error(transparent)]
+    InvalidState(#[from] StateFoldError),
+    #[error("session root ID mismatch: stored {stored_id}, got {given_id}")]
+    RootIdMismatch {
+        stored_id: AgentId,
+        given_id: AgentId,
+    },
     #[error("session ID mismatch: log owns {log_id}, got {given_id}")]
     IdMismatch {
         log_id: MakimaId,
@@ -85,6 +116,8 @@ pub enum SessionError {
     LogDiverged { reason: &'static str },
     #[error("session is open in another terminal; close it there first")]
     OpenElsewhere,
+    #[error("branch_expired")]
+    BranchExpired { branch: MakimaId },
     #[error(
         "session log {path} line {line} holds a record this makima cannot read ({reason}); \
          the session is not loaded so that saving it cannot drop that record"
@@ -154,13 +187,9 @@ pub struct SessionMeta {
     pub compacted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<ConversationState>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub mode: Option<StoredMode>,
-    #[serde(default)]
-    pub plan_path: Option<String>,
-    #[serde(default)]
-    pub plan_written: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub session_rules: Vec<StoredRule>,
     #[serde(default)]
     pub context_size: u32,
@@ -168,18 +197,61 @@ pub struct SessionMeta {
     pub input_draft: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub thinking: Option<StoredThinking>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing)]
     pub fast: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing)]
     pub workflow: bool,
     /// `None` when the user never set yolo for this session, which is what
     /// makes `--yolo` a property of the invocation rather than of the log.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub yolo: Option<bool>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing)]
     pub session_options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct LegacyPlan {
+    #[serde(default, skip_serializing)]
+    plan_path: Option<PathBuf>,
+    #[serde(default, skip_serializing)]
+    plan_written: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyConfig {
+    mode: Option<StoredMode>,
+    thinking: Option<StoredThinking>,
+    fast: bool,
+    workflow: bool,
+    session_options: BTreeMap<String, String>,
+    session_rules: Vec<StoredRule>,
+    yolo: Option<bool>,
+}
+
+impl LegacyConfig {
+    fn from_meta(meta: &SessionMeta) -> Self {
+        Self {
+            mode: meta.mode.clone(),
+            thinking: meta.thinking,
+            fast: meta.fast,
+            workflow: meta.workflow,
+            session_options: meta.session_options.clone(),
+            session_rules: meta.session_rules.clone(),
+            yolo: meta.yolo,
+        }
+    }
+
+    fn restore(&self, meta: &mut SessionMeta) {
+        meta.mode = self.mode.clone();
+        meta.thinking = self.thinking;
+        meta.fast = self.fast;
+        meta.workflow = self.workflow;
+        meta.session_options = self.session_options.clone();
+        meta.session_rules = self.session_rules.clone();
+        meta.yolo = self.yolo;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +319,16 @@ pub struct Session<M, U, T> {
     subagent_conversations: HashMap<String, Arc<str>>,
     subagents: Vec<StoredSubagent>,
     posts: Vec<StoredPost>,
+    state: Vec<StoredStateRecord>,
+    sequence_high_water: Option<u64>,
+    agent_revisions: Vec<(u64, StoredAgentRecord)>,
+    agents: BTreeMap<AgentId, StoredAgentRecord>,
+    legacy_root_unpublished: bool,
+    legacy_config: Option<LegacyConfig>,
+    branches: Vec<StoredBranch>,
+    restore_refs: Vec<TransitionRef>,
+    parent: Option<ParentLink>,
+    features: BTreeSet<String>,
     usage_by_model: HashMap<String, StoredTokenUsage>,
     pub meta: SessionMeta,
     pub created_at: u64,
@@ -417,7 +499,19 @@ enum LogRecord<M, U, T> {
         model: String,
         cwd: String,
         created_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ParentLink>,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        features: BTreeSet<String>,
     },
+    #[serde(rename = "state")]
+    State { d: StoredStateRecord },
+    #[serde(rename = "agent")]
+    Agent { seq: u64, d: StoredAgentRecord },
+    #[serde(rename = "branch")]
+    Branch { d: StoredBranch },
+    #[serde(rename = "restore_ref")]
+    RestoreRef { d: TransitionRef },
     #[serde(rename = "msg")]
     Msg { d: M },
     #[serde(rename = "out")]
@@ -431,21 +525,37 @@ enum LogRecord<M, U, T> {
         title: String,
         token_usage: U,
         updated_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence_high_water: Option<u64>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        history_epochs: BTreeMap<AgentId, u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         subagents: Vec<StoredSubagent>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         subagent_conversations: HashMap<String, Arc<str>>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_config: Option<LegacyConfig>,
         #[serde(flatten)]
         meta: Box<SessionMeta>,
+        #[serde(flatten)]
+        legacy_plan: LegacyPlan,
     },
 }
 
 // -- SessionLog: append-only persistence --
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchAvailability {
+    pub branch: StoredBranch,
+    pub available: bool,
+}
+
 pub struct SessionLog {
     session_id: MakimaId,
+    publication: Publication,
+    saved_generation: u64,
     file: File,
     /// The session's `(epoch, rewrites)` at the last write. Appending is
     /// sound only while both stay the same.
@@ -456,17 +566,40 @@ pub struct SessionLog {
     saved_len: u64,
     saved_msg_count: usize,
     saved_post_count: usize,
+    saved_state_count: usize,
+    saved_agent_revision_count: usize,
+    saved_branch_count: usize,
+    saved_restore_ref_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
     /// Serialized trailing meta record; lets `append` persist meta-only
     /// changes (title, draft, updated_at) instead of dropping them.
     saved_meta: Vec<u8>,
+    saved_header: (String, String),
+}
+
+#[derive(Debug)]
+pub enum PublicationOutcome {
+    NotPublished,
+    Published,
+    PublishedUnsynced(StorageError),
+}
+
+impl PublicationOutcome {
+    pub fn is_published(&self) -> bool {
+        !matches!(self, Self::NotPublished)
+    }
 }
 
 pub struct StagedCheckpoint {
     temporary: NamedTempFile,
+    publication: Publication,
+    branch: Option<StoredBranch>,
+    branches: Vec<StoredBranch>,
     path: PathBuf,
+    cwd: String,
+    session_id: MakimaId,
 }
 
 impl StagedCheckpoint {
@@ -475,24 +608,198 @@ impl StagedCheckpoint {
         guard: &SessionPublicationGuard,
         claim_publication: impl FnOnce() -> bool,
     ) -> Result<bool, SessionError> {
+        self.publish_outcome(guard, claim_publication)
+            .map(|outcome| outcome.is_published())
+    }
+
+    pub fn publish_outcome(
+        self,
+        guard: &SessionPublicationGuard,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<PublicationOutcome, SessionError> {
         guard
-            .publish(|| self.publish_unowned(claim_publication))
+            .publish(|| self.publish_unowned_outcome(claim_publication))
             .map_err(StorageError::from)?
-            .unwrap_or(Ok(false))
+            .unwrap_or(Ok(PublicationOutcome::NotPublished))
     }
 
     pub fn publish_unowned(
         self,
         claim_publication: impl FnOnce() -> bool,
     ) -> Result<bool, SessionError> {
+        self.publish_unowned_outcome(claim_publication)
+            .map(|outcome| outcome.is_published())
+    }
+
+    pub fn publish_unowned_outcome(
+        self,
+        claim_publication: impl FnOnce() -> bool,
+    ) -> Result<PublicationOutcome, SessionError> {
+        self.publish_with_sync(claim_publication, |path| {
+            if let Some(parent) = path.parent() {
+                SessionLog::sync_publication(parent)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn publish_with_sync(
+        self,
+        claim_publication: impl FnOnce() -> bool,
+        sync_directory: impl FnOnce(&Path) -> Result<(), StorageError>,
+    ) -> Result<PublicationOutcome, SessionError> {
+        let mut generation = self
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if !claim_publication() {
-            return Ok(false);
+            return Ok(PublicationOutcome::NotPublished);
         }
-        self.temporary
-            .persist(&self.path)
-            .map_err(|error| StorageError::from(error.error))?;
-        crate::sync_parent_dir(&self.path);
-        Ok(true)
+        let preserved = if let Some(branch) = &self.branch {
+            let dir = self
+                .path
+                .parent()
+                .ok_or_else(|| StorageError::Io(io::Error::other(FILE_CHANGED_UNDERNEATH)))?;
+            validate_branch_source(&self.path, self.session_id)?;
+            let destination = branch_path(dir, self.session_id, branch.id);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| StorageError::Io(io::Error::other(FILE_CHANGED_UNDERNEATH)))?;
+            fs::create_dir_all(parent).map_err(StorageError::from)?;
+            sync_branch_directory(parent)?;
+            link_archive(&self.path, &destination).map_err(StorageError::from)?;
+            if let Err(error) = sync_branch_file(&destination) {
+                let _ = fs::remove_file(&destination);
+                return Err(error.into());
+            }
+            Some(destination)
+        } else {
+            None
+        };
+        if let Err(error) = self.temporary.persist(&self.path) {
+            if let Some(path) = preserved {
+                let _ = fs::remove_file(path);
+            }
+            return Err(StorageError::from(error.error).into());
+        }
+        *generation = generation.wrapping_add(1);
+        if let Err(error) = sync_directory(&self.path) {
+            warn!(%error, session_id = %self.session_id, published = true, durability_confirmed = false, "session replacement is live but directory sync failed; retaining all branches");
+            return Ok(PublicationOutcome::PublishedUnsynced(error));
+        }
+        if let Some(branch) = &self.branch {
+            prune_branches(
+                self.path.parent().unwrap_or(Path::new(".")),
+                self.session_id,
+                branch.id,
+                &self.branches,
+            );
+        }
+        if let Some(dir) = self.path.parent()
+            && let Err(error) = update_cwd_index(dir, &self.cwd, self.session_id)
+        {
+            warn!(error = %error, session_id = %self.session_id, cwd = %self.cwd, "failed to update published session cwd index");
+        }
+        Ok(PublicationOutcome::Published)
+    }
+}
+
+fn publication_for(dir: &Path, id: MakimaId) -> Result<Publication, StorageError> {
+    let path = jsonl_path(&fs::canonicalize(dir)?, id);
+    let mut publications = PUBLICATIONS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    publications.retain(|_, publication| publication.strong_count() > 0);
+    if let Some(publication) = publications.get(&path).and_then(Weak::upgrade) {
+        return Ok(publication);
+    }
+    let publication = Arc::new(Mutex::new(0));
+    publications.insert(path, Arc::downgrade(&publication));
+    Ok(publication)
+}
+
+fn branch_path(dir: &Path, session: MakimaId, branch: MakimaId) -> PathBuf {
+    dir.join(BRANCH_DIR)
+        .join(session.to_string())
+        .join(format!("{branch}.jsonl"))
+}
+
+fn validate_branch_source(path: &Path, session_id: MakimaId) -> Result<(), SessionError> {
+    let file = File::open(path).map_err(StorageError::from)?;
+    let mut header = String::new();
+    BufReader::new(file)
+        .read_line(&mut header)
+        .map_err(StorageError::from)?;
+    let header: JsonlHeader = serde_json::from_str(&header).map_err(StorageError::from)?;
+    if header.id != session_id {
+        return Err(SessionError::IdMismatch {
+            log_id: session_id,
+            given_id: header.id,
+        });
+    }
+    Ok(())
+}
+
+fn sync_branch_directory(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+            if let Some(ancestor) = parent.parent() {
+                File::open(ancestor)?.sync_all()?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    crate::sync_parent_dir(path);
+    Ok(())
+}
+
+fn sync_branch_file(path: &Path) -> Result<(), StorageError> {
+    File::open(path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_branch_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn prune_branches(dir: &Path, session: MakimaId, newest: MakimaId, metadata: &[StoredBranch]) {
+    let branch_dir = dir.join(BRANCH_DIR).join(session.to_string());
+    let Ok(entries) = fs::read_dir(branch_dir) else {
+        return;
+    };
+    let mut branches: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_jsonl(&path) {
+                return None;
+            }
+            let id: MakimaId = path.file_stem()?.to_str()?.parse().ok()?;
+            let metadata = entry.metadata().ok()?;
+            Some((id == newest, id, metadata.len(), path))
+        })
+        .collect();
+    let created_at: HashMap<_, _> = metadata
+        .iter()
+        .map(|branch| (branch.id, branch.created_at))
+        .collect();
+    branches.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| created_at.get(&b.1).cmp(&created_at.get(&a.1)))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    let mut bytes = 0u64;
+    for (index, (_, _, size, path)) in branches.into_iter().enumerate() {
+        bytes = bytes.saturating_add(size);
+        if index > 0
+            && (index >= BRANCH_KEEP || bytes > BRANCH_MAX_BYTES)
+            && let Err(error) = fs::remove_file(&path)
+        {
+            warn!(%error, path = %path.display(), "failed to prune session branch");
+        }
     }
 }
 
@@ -577,12 +884,27 @@ fn log_msg_count_exceeds(path: &Path, limit: usize) -> bool {
 /// renames a fresh file over the path, so the old bytes stay whole under the
 /// new name and not one of them is copied. Filesystems with no links (FAT32 on
 /// a stick) fall back to a plain copy. The size is for the byte budget.
-fn link_archive(from: &Path, to: &Path) -> Result<u64, std::io::Error> {
-    if fs::hard_link(from, to).is_err() {
-        // `create_new` first: the name is only free if the seq scan saw every
-        // archive, and `fs::copy` would truncate the one it collided with.
-        OpenOptions::new().write(true).create_new(true).open(to)?;
-        fs::copy(from, to).inspect_err(|_| {
+fn link_archive(from: &Path, to: &Path) -> Result<u64, io::Error> {
+    link_archive_with(
+        from,
+        to,
+        |source, destination| fs::hard_link(source, destination),
+        io::copy,
+    )
+}
+
+fn link_archive_with(
+    from: &Path,
+    to: &Path,
+    hard_link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    copy: impl FnOnce(&mut File, &mut File) -> io::Result<u64>,
+) -> Result<u64, io::Error> {
+    if hard_link(from, to).is_err() {
+        let mut destination = OpenOptions::new().write(true).create_new(true).open(to)?;
+        let result = File::open(from)
+            .and_then(|mut source| copy(&mut source, &mut destination))
+            .and_then(|bytes| destination.sync_all().map(|()| bytes));
+        result.inspect_err(|_| {
             let _ = fs::remove_file(to);
         })?;
     }
@@ -638,6 +960,10 @@ fn prune_archives(existing: Vec<Archive>, new_bytes: u64) {
 }
 
 impl SessionLog {
+    pub fn sync_publication(dir: &Path) -> Result<(), StorageError> {
+        sync_branch_directory(dir)
+    }
+
     /// Starts the file over: writes the whole log through a rename, so a crash
     /// mid-write leaves the old one intact, then claims the cwd index and
     /// sweeps pre-jsonl leftovers. A rewrite that drops messages (compaction,
@@ -653,6 +979,10 @@ impl SessionLog {
         T: Serialize,
     {
         fs::create_dir_all(dir).map_err(StorageError::from)?;
+        let publication = publication_for(dir, session.id)?;
+        let mut generation = publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let path = jsonl_path(dir, session.id);
         let tmp = path.with_extension("jsonl.tmp");
 
@@ -663,13 +993,19 @@ impl SessionLog {
         // spend an archive slot, since taking one prunes the oldest.
         archive_if_shrinking(dir, session);
         fs::rename(&tmp, &path).map_err(StorageError::from)?;
+        *generation = generation.wrapping_add(1);
         crate::sync_parent_dir(&path);
         let file = OpenOptions::new()
             .append(true)
             .open(&path)
             .map_err(StorageError::from)?;
-        update_cwd_index(dir, &session.cwd, session.id)?;
-        Ok(Self::cursor_from(session, file))
+        update_cwd_index(dir, &session.header_cache()?.1, session.id)?;
+        Ok(Self::cursor_from(
+            session,
+            file,
+            Arc::clone(&publication),
+            *generation,
+        ))
     }
 
     /// Stages a complete session without changing its durable file or cwd index.
@@ -690,7 +1026,52 @@ impl SessionLog {
             .as_file()
             .sync_data()
             .map_err(StorageError::from)?;
-        Ok(StagedCheckpoint { temporary, path })
+        Ok(StagedCheckpoint {
+            temporary,
+            publication: publication_for(dir, session.id)?,
+            branch: None,
+            branches: Vec::new(),
+            path,
+            cwd: session.header_cache()?.1,
+            session_id: session.id,
+        })
+    }
+
+    pub fn stage_checkpoint_with_branch<M, U, T>(
+        dir: &Path,
+        session: &Session<M, U, T>,
+        branch: StoredBranch,
+    ) -> Result<StagedCheckpoint, SessionError>
+    where
+        M: Serialize,
+        U: Serialize,
+        T: Serialize,
+    {
+        let mut staged = Self::stage_checkpoint(dir, session)?;
+        if !session
+            .branches
+            .iter()
+            .any(|existing| existing.id == branch.id)
+        {
+            let mut buf = Vec::new();
+            append_record(
+                &mut buf,
+                &LogRecord::<&M, &U, &T>::Branch { d: branch.clone() },
+            )?;
+            staged
+                .temporary
+                .as_file_mut()
+                .write_all(&buf)
+                .map_err(StorageError::from)?;
+            staged
+                .temporary
+                .as_file()
+                .sync_data()
+                .map_err(StorageError::from)?;
+        }
+        staged.branches = session.branches.clone();
+        staged.branch = Some(branch);
+        Ok(staged)
     }
 
     pub fn session_id(&self) -> MakimaId {
@@ -704,7 +1085,22 @@ impl SessionLog {
         T: Serialize,
     {
         self.require_same_id(session)?;
+        let publication = Arc::clone(&self.publication);
+        let generation = publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *generation != self.saved_generation {
+            return Err(SessionError::LogDiverged {
+                reason: FILE_CHANGED_UNDERNEATH,
+            });
+        }
+        session.latest_state()?;
         self.ensure_appendable(session)?;
+        if session.header_cache()? != self.saved_header {
+            return Err(SessionError::LogDiverged {
+                reason: HEADER_CHANGED,
+            });
+        }
 
         let mut buf = Vec::new();
         let mut new_msg_count = self.saved_msg_count;
@@ -749,6 +1145,26 @@ impl SessionLog {
             append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
         }
 
+        append_journal_records(
+            &mut buf,
+            &session.state[self.saved_state_count..],
+            &session.agent_revisions[self.saved_agent_revision_count..],
+        )?;
+        for branch in &session.branches[self.saved_branch_count..] {
+            append_record(
+                &mut buf,
+                &LogRecord::<&M, &U, &T>::Branch { d: branch.clone() },
+            )?;
+        }
+
+        for reference in &session.restore_refs[self.saved_restore_ref_count..] {
+            append_record(
+                &mut buf,
+                &LogRecord::<&M, &U, &T>::RestoreRef {
+                    d: reference.clone(),
+                },
+            )?;
+        }
         let meta = meta_record(session)?;
         if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
@@ -771,6 +1187,10 @@ impl SessionLog {
         self.appends += 1;
         self.saved_msg_count = new_msg_count;
         self.saved_post_count = session.posts.len();
+        self.saved_state_count = session.state.len();
+        self.saved_agent_revision_count = session.agent_revisions.len();
+        self.saved_branch_count = session.branches.len();
+        self.saved_restore_ref_count = session.restore_refs.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
@@ -780,7 +1200,12 @@ impl SessionLog {
         Ok(())
     }
 
-    fn cursor_from<M, U, T>(session: &Session<M, U, T>, file: File) -> Self
+    fn cursor_from<M, U, T>(
+        session: &Session<M, U, T>,
+        file: File,
+        publication: Publication,
+        saved_generation: u64,
+    ) -> Self
     where
         M: Serialize,
         U: Serialize,
@@ -789,16 +1214,23 @@ impl SessionLog {
         let saved_len = file.metadata().map(|m| m.len()).unwrap_or_default();
         Self {
             session_id: session.id,
+            publication,
+            saved_generation,
             file,
             saved_epoch: session.epoch,
             saved_rewrites: session.rewrites,
             saved_len,
             saved_msg_count: session.messages.len(),
             saved_post_count: session.posts.len(),
+            saved_state_count: session.state.len(),
+            saved_agent_revision_count: session.agent_revisions.len(),
+            saved_branch_count: session.branches.len(),
+            saved_restore_ref_count: session.restore_refs.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
             saved_meta: meta_record(session).unwrap_or_default(),
+            saved_header: session.header_cache().unwrap_or_default(),
         }
     }
 
@@ -837,6 +1269,10 @@ impl SessionLog {
     fn cursor_ahead<M, U, T>(&self, session: &Session<M, U, T>) -> bool {
         self.saved_msg_count > session.messages.len()
             || self.saved_post_count > session.posts.len()
+            || self.saved_state_count > session.state.len()
+            || self.saved_agent_revision_count > session.agent_revisions.len()
+            || self.saved_branch_count > session.branches.len()
+            || self.saved_restore_ref_count > session.restore_refs.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -856,6 +1292,7 @@ where
     U: Serialize,
     T: Serialize,
 {
+    let history_epochs = session.canonical_history_epochs();
     let mut buf = Vec::new();
     append_record(
         &mut buf,
@@ -863,10 +1300,18 @@ where
             title: session.title.clone(),
             token_usage: &session.token_usage,
             updated_at: session.updated_at,
+            sequence_high_water: session.sequence_high_water(),
+            history_epochs,
             subagents: session.subagents.clone(),
             subagent_conversations: session.subagent_conversations.clone(),
             usage_by_model: session.usage_by_model.clone(),
+            legacy_config: if session.root_config()?.is_none() {
+                session.legacy_config.clone()
+            } else {
+                None
+            },
             meta: Box::new(session.meta.clone()),
+            legacy_plan: LegacyPlan::default(),
         },
     )?;
     Ok(buf)
@@ -881,15 +1326,18 @@ where
     U: Serialize,
     T: Serialize,
 {
+    let (model, cwd) = session.header_cache()?;
     let mut buf = Vec::new();
     append_record(
         &mut buf,
         &LogRecord::<&M, &U, &T>::Header {
             v: LOG_FORMAT_VERSION,
             id: session.id,
-            model: session.model.clone(),
-            cwd: session.cwd.clone(),
+            model,
+            cwd,
             created_at: session.created_at,
+            parent: session.parent.clone(),
+            features: session.features.clone(),
         },
     )?;
     for msg in session.messages.iter() {
@@ -918,9 +1366,116 @@ where
     for post in &session.posts {
         append_record(&mut buf, &LogRecord::<&M, &U, &T>::Post { d: post.clone() })?;
     }
+    append_journal_records(&mut buf, &session.state, &session.agent_revisions)?;
+    for branch in &session.branches {
+        append_record(
+            &mut buf,
+            &LogRecord::<&M, &U, &T>::Branch { d: branch.clone() },
+        )?;
+    }
+    for reference in &session.restore_refs {
+        append_record(
+            &mut buf,
+            &LogRecord::<&M, &U, &T>::RestoreRef {
+                d: reference.clone(),
+            },
+        )?;
+    }
     buf.extend_from_slice(&meta_record(session)?);
     file.write_all(&buf).map_err(StorageError::from)?;
     Ok(())
+}
+
+fn append_journal_records(
+    buf: &mut Vec<u8>,
+    state: &[StoredStateRecord],
+    agents: &[(u64, StoredAgentRecord)],
+) -> Result<(), SessionError> {
+    let mut records: Vec<_> = state
+        .iter()
+        .map(|record| {
+            (
+                record.seq,
+                LogRecord::<(), (), ()>::State { d: record.clone() },
+            )
+        })
+        .chain(agents.iter().map(|(seq, record)| {
+            (
+                *seq,
+                LogRecord::<(), (), ()>::Agent {
+                    seq: *seq,
+                    d: record.clone(),
+                },
+            )
+        }))
+        .collect();
+    records.sort_by_key(|(seq, _)| *seq);
+    for (_, record) in records {
+        append_record(buf, &record)?;
+    }
+    Ok(())
+}
+
+fn rekey_result(result: &mut StoredTurnResult, previous: AgentId, id: AgentId) {
+    if result.outcome.agent_id == previous {
+        result.outcome.agent_id = id;
+    }
+    if result.provenance.source_agent == Some(previous) {
+        result.provenance.source_agent = Some(id);
+    }
+}
+
+fn root_record(id: AgentId, seq: u64) -> StoredAgentRecord {
+    StoredAgentRecord {
+        id,
+        parent: None,
+        depth: 0,
+        transcript_key: String::new(),
+        lifecycle: StoredAgentLifecycle::Open,
+        ancestry_unknown: false,
+        label: None,
+        spawned_by_tool_use_id: None,
+        spec: None,
+        restorable: Ok(()),
+        usage: TokenUsage::default(),
+        created_seq: seq,
+        updated_seq: seq,
+        legacy: false,
+    }
+}
+
+fn legacy_child(
+    root: AgentId,
+    transcript_key: String,
+    label: Option<String>,
+    spawned_by_tool_use_id: Option<String>,
+    seq: u64,
+) -> StoredAgentRecord {
+    StoredAgentRecord {
+        id: AgentId::generate(),
+        parent: Some(root),
+        depth: 1,
+        transcript_key,
+        lifecycle: StoredAgentLifecycle::Closed,
+        ancestry_unknown: true,
+        label,
+        spawned_by_tool_use_id,
+        spec: None,
+        restorable: Err(LEGACY_CHILD_UNRESTORABLE.to_owned()),
+        usage: TokenUsage::default(),
+        created_seq: seq,
+        updated_seq: seq,
+        legacy: true,
+    }
+}
+
+fn latest_agents(revisions: &[(u64, StoredAgentRecord)]) -> BTreeMap<AgentId, StoredAgentRecord> {
+    let mut ordered: Vec<_> = revisions.iter().collect();
+    ordered.sort_by_key(|(seq, _)| *seq);
+    ordered
+        .into_iter()
+        .map(|(_, record)| (record.id, record.clone()))
+        .collect()
 }
 
 fn append_record<R: Serialize>(buf: &mut Vec<u8>, record: &R) -> Result<(), SessionError> {
@@ -954,6 +1509,17 @@ where
     let mut posts = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
+    let mut legacy_config = None;
+    let mut legacy_plan = LegacyPlan::default();
+    let mut version = LOG_FORMAT_VERSION;
+    let mut parent = None;
+    let mut features = BTreeSet::new();
+    let mut state = Vec::new();
+    let mut agent_revisions = Vec::new();
+    let mut branches = Vec::new();
+    let mut restore_refs = Vec::new();
+    let mut sequence_high_water = None;
+    let mut history_epochs = BTreeMap::new();
     for line in data.split(|&b| b == b'\n') {
         line_count += 1;
         if line.is_empty() {
@@ -963,6 +1529,22 @@ where
         // skipped, and so is a bad header, which leaves the log headerless.
         // Whole JSON after the header that does not decode came from another
         // version; skipping it would let the next save drop it from disk.
+        if id.is_none()
+            && let Ok(header) = serde_json::from_slice::<HeaderCompatibility>(line)
+            && header.t == "header"
+        {
+            if !matches!(header.v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION) {
+                return Err(SessionError::VersionMismatch {
+                    found: header.v,
+                    expected: LOG_FORMAT_VERSION,
+                });
+            }
+            if !header.features.is_empty() {
+                return Err(SessionError::UnsupportedFeatures {
+                    features: header.features,
+                });
+            }
+        }
         let record: LogRecord<M, U, T> = match serde_json::from_slice(line) {
             Ok(r) => r,
             Err(e) if e.is_data() && id.is_some() => {
@@ -989,17 +1571,35 @@ where
                 model: h_model,
                 cwd: h_cwd,
                 created_at: h_created,
+                parent: h_parent,
+                features: h_features,
             } => {
-                if v != LOG_FORMAT_VERSION {
+                if !matches!(v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION) {
                     return Err(SessionError::VersionMismatch {
                         found: v,
                         expected: LOG_FORMAT_VERSION,
                     });
                 }
+                if !h_features.is_empty() {
+                    return Err(SessionError::UnsupportedFeatures {
+                        features: h_features,
+                    });
+                }
+                version = v;
+                parent = h_parent;
+                features = h_features;
                 id = Some(h_id);
                 model = h_model;
                 cwd = h_cwd;
                 created_at = h_created;
+            }
+            LogRecord::State { d } => state.push(d),
+            LogRecord::Agent { seq, d } => agent_revisions.push((seq, d)),
+            LogRecord::Branch { d } => branches.push(d),
+            LogRecord::RestoreRef { d } => {
+                if !restore_refs.contains(&d) {
+                    restore_refs.push(d);
+                }
             }
             LogRecord::Msg { d } => messages.push(d),
             LogRecord::Out { id: out_id, d } => {
@@ -1013,18 +1613,26 @@ where
                 title: m_title,
                 token_usage: m_usage,
                 updated_at: m_updated,
+                sequence_high_water: m_sequence_high_water,
+                history_epochs: m_history_epochs,
                 subagents: m_subagents,
                 subagent_conversations: m_subagent_conversations,
                 usage_by_model: m_usage_by_model,
                 meta: m_meta,
+                legacy_config: m_legacy_config,
+                legacy_plan: m_legacy_plan,
             } => {
                 title = m_title;
                 token_usage = m_usage;
                 updated_at = m_updated;
+                sequence_high_water = sequence_high_water.max(m_sequence_high_water);
+                history_epochs = m_history_epochs;
                 subagents = m_subagents;
                 subagent_conversations = m_subagent_conversations;
                 usage_by_model = m_usage_by_model;
                 meta = *m_meta;
+                legacy_config = m_legacy_config;
+                legacy_plan = m_legacy_plan;
             }
         }
     }
@@ -1033,8 +1641,9 @@ where
         path: display_path.to_string(),
     })?;
 
+    remap_loaded_history_epochs(&mut state, &mut history_epochs, next_epoch);
     mark_duplicate_subagent_identities(&mut subagents);
-    Ok(Session {
+    let mut session = Session {
         id,
         title,
         cwd,
@@ -1050,6 +1659,16 @@ where
         subagent_conversations,
         subagents,
         posts,
+        state,
+        sequence_high_water,
+        agents: latest_agents(&agent_revisions),
+        legacy_root_unpublished: version == LEGACY_LOG_FORMAT_VERSION,
+        legacy_config,
+        agent_revisions,
+        branches,
+        restore_refs,
+        parent,
+        features,
         usage_by_model,
         meta,
         created_at,
@@ -1058,7 +1677,115 @@ where
         content_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
-    })
+    };
+    if version == LEGACY_LOG_FORMAT_VERSION {
+        session.legacy_config = Some(LegacyConfig::from_meta(&session.meta));
+        session.migrate_legacy();
+    }
+    session.migrate_legacy_plan(legacy_plan)?;
+    if session.root_config()?.is_none() {
+        if let Some(legacy) = &session.legacy_config {
+            legacy.restore(&mut session.meta);
+        }
+    } else {
+        session.legacy_config = None;
+    }
+    session.restore_loaded_history_epochs(&history_epochs);
+    (session.model, session.cwd) = session.header_cache()?;
+    Ok(session)
+}
+
+fn remap_loaded_history_epochs(
+    state: &mut [StoredStateRecord],
+    canonical: &mut BTreeMap<AgentId, u64>,
+    mut allocate: impl FnMut() -> u64,
+) {
+    let mut saved = BTreeSet::new();
+    visit_history_epochs(state, canonical, &mut |epoch| {
+        saved.insert(epoch);
+        epoch
+    });
+    let mapping: BTreeMap<_, _> = saved.into_iter().map(|epoch| (epoch, allocate())).collect();
+    visit_history_epochs(state, canonical, &mut |epoch| mapping[&epoch]);
+}
+
+fn visit_history_epochs(
+    state: &mut [StoredStateRecord],
+    canonical: &mut BTreeMap<AgentId, u64>,
+    visit: &mut impl FnMut(u64) -> u64,
+) {
+    for epoch in canonical.values_mut() {
+        *epoch = visit(*epoch);
+    }
+    for record in state {
+        match &mut record.change {
+            StateChange::Boundary { lens, .. } => {
+                for (epoch, _) in lens.values_mut() {
+                    *epoch = visit(*epoch);
+                }
+            }
+            StateChange::Compaction { epoch } => *epoch = visit(*epoch),
+            StateChange::BoundarySnapshot { snapshot, .. } => visit_pin_epochs(snapshot, visit),
+            _ => {}
+        }
+    }
+}
+
+fn visit_pin_epochs(snapshot: &mut serde_json::Value, visit: &mut impl FnMut(u64) -> u64) {
+    let mut pending = vec![snapshot];
+    while let Some(snapshot) = pending.pop() {
+        if let Some(histories) = snapshot
+            .get_mut("histories")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for history in histories.values_mut() {
+                if let Some(epoch) = history.get_mut("epoch") {
+                    visit_epoch_value(epoch, visit);
+                }
+            }
+        }
+        if let Some(state) = snapshot
+            .get_mut("state")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for record in state {
+                let Some(change) = record.get_mut("change") else {
+                    continue;
+                };
+                match change.get("kind").and_then(serde_json::Value::as_str) {
+                    Some("boundary") => {
+                        if let Some(lens) = change
+                            .get_mut("lens")
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            for entry in lens.values_mut() {
+                                if let Some(epoch) = entry.get_mut(0) {
+                                    visit_epoch_value(epoch, visit);
+                                }
+                            }
+                        }
+                    }
+                    Some("compaction") => {
+                        if let Some(epoch) = change.get_mut("epoch") {
+                            visit_epoch_value(epoch, visit);
+                        }
+                    }
+                    Some("boundary_snapshot") => {
+                        if let Some(snapshot) = change.get_mut("snapshot") {
+                            pending.push(snapshot);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn visit_epoch_value(value: &mut serde_json::Value, visit: &mut impl FnMut(u64) -> u64) {
+    if let Some(epoch) = value.as_u64() {
+        *value = visit(epoch).into();
+    }
 }
 
 // -- CWD index --
@@ -1073,9 +1800,14 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakimaId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
-    if index.get(cwd).is_some_and(|v| *v == id_str) {
+    if index.get(cwd).is_some_and(|v| *v == id_str)
+        && !index
+            .iter()
+            .any(|(key, value)| key != cwd && *value == id_str)
+    {
         return Ok(());
     }
+    index.retain(|key, value| key == cwd || *value != id_str);
     index.insert(cwd.to_string(), id_str);
     atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
 }
@@ -1114,10 +1846,22 @@ fn remove_from_cwd_index(dir: &Path, session_id: MakimaId) -> Result<(), Storage
 // -- Header scanning for session list --
 
 #[derive(Deserialize)]
+struct HeaderCompatibility {
+    t: String,
+    v: u32,
+    #[serde(default)]
+    features: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
 struct JsonlHeader {
     v: u32,
     id: MakimaId,
     cwd: String,
+    #[serde(default)]
+    parent: Option<ParentLink>,
+    #[serde(default)]
+    features: BTreeSet<String>,
 }
 
 /// A `meta` line starts with this. Only meta lines get parsed during a scan;
@@ -1155,6 +1899,7 @@ struct ScanCacheFile {
 #[derive(Serialize, Deserialize)]
 struct ScannedHeader {
     id: MakimaId,
+    parent: Option<ParentLink>,
     cwd: String,
     title: String,
     updated_at: u64,
@@ -1241,7 +1986,9 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line).ok()?;
     let header: JsonlHeader = serde_json::from_slice(line.trim_ascii_end()).ok()?;
-    if header.v != LOG_FORMAT_VERSION {
+    if !matches!(header.v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION)
+        || !header.features.is_empty()
+    {
         return None;
     }
 
@@ -1282,6 +2029,7 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
 
     Some(ScannedHeader {
         id: header.id,
+        parent: header.parent,
         cwd: header.cwd,
         title,
         updated_at,
@@ -1324,6 +2072,237 @@ where
 
 // -- Session impl --
 
+impl<M, U, T> Session<M, U, T> {
+    fn canonical_history_epochs(&self) -> BTreeMap<AgentId, u64> {
+        self.agents
+            .values()
+            .filter_map(|agent| {
+                let epoch = if agent.transcript_key.is_empty() {
+                    self.epoch
+                } else {
+                    if !self.subagent_messages.contains_key(&agent.transcript_key) {
+                        return None;
+                    }
+                    self.subagent_history_epochs
+                        .get(&agent.transcript_key)
+                        .copied()
+                        .unwrap_or_default()
+                };
+                Some((agent.id, epoch))
+            })
+            .collect()
+    }
+
+    fn restore_loaded_history_epochs(&mut self, saved: &BTreeMap<AgentId, u64>) {
+        for agent in self.agents.values() {
+            if agent.transcript_key.is_empty() {
+                if let Some(epoch) = saved.get(&agent.id) {
+                    self.epoch = *epoch;
+                }
+            } else {
+                let epoch = saved.get(&agent.id).copied().unwrap_or_else(next_epoch);
+                self.subagent_history_epochs
+                    .insert(agent.transcript_key.clone(), epoch);
+                if saved.contains_key(&agent.id) {
+                    self.subagent_messages
+                        .entry(agent.transcript_key.clone())
+                        .or_default();
+                }
+            }
+        }
+    }
+
+    pub fn sequence_high_water(&self) -> Option<u64> {
+        self.state
+            .iter()
+            .map(|record| record.seq)
+            .chain(self.agent_revisions.iter().map(|(seq, _)| *seq))
+            .chain(self.sequence_high_water)
+            .max()
+    }
+
+    pub fn next_state_seq(&self) -> u64 {
+        self.sequence_high_water()
+            .map_or(0, |seq| seq.saturating_add(1))
+    }
+
+    pub fn root_agent_id(&self) -> Option<AgentId> {
+        self.agents
+            .values()
+            .find(|agent| agent.parent.is_none())
+            .map(|agent| agent.id)
+    }
+
+    fn root_config(&self) -> Result<Option<StoredAgentConfig>, SessionError> {
+        let mut view = self.latest_state()?;
+        Ok(self.root_agent_id().and_then(|root| {
+            view.scopes
+                .remove(&Some(root))
+                .and_then(|scope| scope.config)
+        }))
+    }
+
+    fn header_cache(&self) -> Result<(String, String), SessionError> {
+        Ok(self.root_config()?.map_or_else(
+            || (self.model.clone(), self.cwd.clone()),
+            |config| (config.model, config.cwd),
+        ))
+    }
+
+    fn migrate_legacy(&mut self) {
+        let root = AgentId::generate();
+        let mut seq = self.next_state_seq();
+        self.agent_revisions.push((seq, root_record(root, seq)));
+        seq += 1;
+        self.state.push(StoredStateRecord {
+            seq,
+            agent: None,
+            generation: 0,
+            change: StateChange::Rules {
+                rules: self.meta.session_rules.clone(),
+                yolo: self.meta.yolo,
+            },
+        });
+        seq += 1;
+        let mut transcripts = HashSet::new();
+        for child in &self.subagents {
+            transcripts.insert(child.tool_use_id.clone());
+            self.agent_revisions.push((
+                seq,
+                legacy_child(
+                    root,
+                    child.tool_use_id.clone(),
+                    Some(child.name.clone()),
+                    Some(child.tool_use_id.clone()),
+                    seq,
+                ),
+            ));
+            seq += 1;
+        }
+        let mut orphans: Vec<_> = self
+            .subagent_messages
+            .keys()
+            .filter(|key| !transcripts.contains(*key))
+            .cloned()
+            .collect();
+        orphans.sort();
+        for transcript in orphans {
+            self.agent_revisions
+                .push((seq, legacy_child(root, transcript, None, None, seq)));
+            seq += 1;
+        }
+        self.agents = latest_agents(&self.agent_revisions);
+        for stored in &mut self.posts {
+            let Some(key) = stored.post.agent.as_deref() else {
+                continue;
+            };
+            let mut matches = self
+                .agents
+                .values()
+                .filter(|record| record.parent.is_some() && record.transcript_key == key);
+            stored.post.agent = matches
+                .next()
+                .filter(|_| {
+                    matches.next().is_none()
+                        && !self
+                            .subagents
+                            .iter()
+                            .any(|child| child.tool_use_id == key && child.ambiguous)
+                })
+                .map(|record| record.id.to_string());
+        }
+    }
+
+    fn migrate_legacy_plan(&mut self, legacy: LegacyPlan) -> Result<(), SessionError> {
+        let view = self.latest_state()?;
+        let plugins = view.scopes.get(&None).map(|scope| &scope.plugins);
+        if plugins.is_some_and(|plugins| plugins.contains_key(PLAN_STATE_KEY)) {
+            return Ok(());
+        }
+        let entry = match plugins.and_then(|plugins| plugins.get(LEGACY_PLAN_SLOT)) {
+            Some(stored) => stored.value.as_ref().and_then(|value| {
+                let path = value.get("path")?.as_str()?;
+                Some(PlanEntry {
+                    path: PathBuf::from(path),
+                    written: value
+                        .get("written")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    approved: None,
+                    staged_model: None,
+                })
+            }),
+            None => legacy.plan_path.map(|path| PlanEntry {
+                path,
+                written: legacy.plan_written,
+                approved: None,
+                staged_model: None,
+            }),
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let root = match self.root_agent_id() {
+            Some(root) => root,
+            None => {
+                let root = AgentId::generate();
+                let seq = self.next_state_seq();
+                self.agent_revisions.push((seq, root_record(root, seq)));
+                self.agents = latest_agents(&self.agent_revisions);
+                self.legacy_root_unpublished = true;
+                root
+            }
+        };
+        let value =
+            serde_json::to_value(PlanSlot::from([(root, entry)])).map_err(StorageError::from)?;
+        self.state.push(StoredStateRecord {
+            seq: self.next_state_seq(),
+            agent: None,
+            generation: 0,
+            change: StateChange::Plugin {
+                key: PLAN_STATE_KEY.to_owned(),
+                version: PLAN_STATE_VERSION,
+                value: Some(value),
+            },
+        });
+        self.latest_state()?;
+        Ok(())
+    }
+
+    pub fn state(&self) -> &[StoredStateRecord] {
+        &self.state
+    }
+
+    pub fn agent_revisions(&self) -> &[(u64, StoredAgentRecord)] {
+        &self.agent_revisions
+    }
+
+    pub fn agents(&self) -> &BTreeMap<AgentId, StoredAgentRecord> {
+        &self.agents
+    }
+
+    pub fn branches(&self) -> &[StoredBranch] {
+        &self.branches
+    }
+
+    pub fn parent(&self) -> Option<&ParentLink> {
+        self.parent.as_ref()
+    }
+
+    pub fn features(&self) -> &BTreeSet<String> {
+        &self.features
+    }
+
+    pub fn state_at(&self, seq: u64) -> Result<SessionStateView, SessionError> {
+        SessionStateView::fold(&self.state, &self.agent_revisions, seq)
+            .map_err(SessionError::InvalidState)
+    }
+
+    pub fn latest_state(&self) -> Result<SessionStateView, SessionError> {
+        self.state_at(u64::MAX)
+    }
+}
+
 impl<M, U, T> Session<M, U, T>
 where
     M: Serialize + DeserializeOwned + TitleSource + Clone,
@@ -1345,6 +2324,16 @@ where
             subagent_conversations: HashMap::new(),
             subagents: Vec::new(),
             posts: Vec::new(),
+            state: Vec::new(),
+            sequence_high_water: None,
+            agent_revisions: Vec::new(),
+            agents: BTreeMap::new(),
+            legacy_root_unpublished: false,
+            legacy_config: None,
+            branches: Vec::new(),
+            restore_refs: Vec::new(),
+            parent: None,
+            features: BTreeSet::new(),
             usage_by_model: HashMap::new(),
             meta: SessionMeta {
                 mode: Some(StoredMode::Build),
@@ -1356,6 +2345,281 @@ where
             content_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
+        }
+    }
+
+    pub fn bind_root_id(&mut self, id: AgentId) -> Result<(), SessionError> {
+        let Some(previous) = self.root_agent_id() else {
+            self.push_agent_revision(
+                self.next_state_seq(),
+                root_record(id, self.next_state_seq()),
+            );
+            self.legacy_root_unpublished = false;
+            return Ok(());
+        };
+        if previous == id {
+            return Ok(());
+        }
+        if !self.legacy_root_unpublished
+            || self.agents.contains_key(&id)
+            || self
+                .agent_revisions
+                .iter()
+                .any(|(_, agent)| agent.id == previous && agent.spec.is_some())
+        {
+            return Err(SessionError::RootIdMismatch {
+                stored_id: previous,
+                given_id: id,
+            });
+        }
+        self.latest_state()?;
+        for (_, agent) in &mut self.agent_revisions {
+            if agent.id == previous {
+                agent.id = id;
+            }
+            if agent.parent == Some(previous) {
+                agent.parent = Some(id);
+            }
+        }
+        for record in &mut self.state {
+            if record.agent == Some(previous) {
+                record.agent = Some(id);
+            }
+            match &mut record.change {
+                StateChange::Boundary { lens, .. } => {
+                    if let Some(value) = lens.remove(&previous) {
+                        lens.insert(id, value);
+                    }
+                }
+                StateChange::Plugin {
+                    key,
+                    value: Some(serde_json::Value::Object(entries)),
+                    ..
+                } if record.agent.is_none() && key == PLAN_STATE_KEY => {
+                    if let Some(entry) = entries.remove(&previous.to_string()) {
+                        entries.insert(id.to_string(), entry);
+                    }
+                }
+                StateChange::Turn { result, .. } => rekey_result(result, previous, id),
+                StateChange::Delivery {
+                    id: delivery_id,
+                    op,
+                } => {
+                    if delivery_id.0 == previous {
+                        delivery_id.0 = id;
+                    }
+                    if let StoredDeliveryOp::Queued(delivery) = op {
+                        rekey_result(&mut delivery.result, previous, id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for branch in &mut self.branches {
+            if branch.agent == previous {
+                branch.agent = id;
+            }
+        }
+        self.agents = latest_agents(&self.agent_revisions);
+        self.legacy_root_unpublished = false;
+        self.rewrite();
+        Ok(())
+    }
+
+    pub fn resolve_legacy_mode(
+        &mut self,
+        snapshot: StoredModeSnapshot,
+    ) -> Result<(), SessionError> {
+        let legacy = self
+            .legacy_config
+            .clone()
+            .unwrap_or_else(|| LegacyConfig::from_meta(&self.meta));
+        self.resolve_legacy_config(StoredAgentConfig {
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            thinking: legacy.thinking,
+            fast: legacy.fast,
+            workflow: legacy.workflow,
+            mode: snapshot,
+            options: legacy.session_options,
+        })
+    }
+
+    pub fn resolve_legacy_config(&mut self, config: StoredAgentConfig) -> Result<(), SessionError> {
+        let view = self.latest_state()?;
+        if self.root_agent_id().is_some_and(|root| {
+            view.scopes
+                .get(&Some(root))
+                .is_some_and(|scope| scope.config.is_some())
+        }) {
+            return Ok(());
+        }
+        if self.root_agent_id().is_none() {
+            self.migrate_legacy();
+        }
+        let root = self.root_agent_id();
+        self.push_state(StoredStateRecord {
+            seq: self.next_state_seq(),
+            agent: root,
+            generation: 0,
+            change: StateChange::Config(config),
+        });
+        Ok(())
+    }
+
+    pub fn replace_authoritative(&mut self, mut replacement: Self) -> Result<(), SessionError> {
+        if self.id != replacement.id {
+            return Err(SessionError::IdMismatch {
+                log_id: self.id,
+                given_id: replacement.id,
+            });
+        }
+        replacement.latest_state()?;
+        replacement.sequence_high_water = self
+            .sequence_high_water()
+            .max(replacement.sequence_high_water());
+        let mut branches = self.branches.clone();
+        for branch in &replacement.branches {
+            if !branches.iter().any(|existing| existing.id == branch.id) {
+                branches.push(branch.clone());
+            }
+        }
+        replacement.branches = branches;
+        let mut restore_refs = self.restore_refs.clone();
+        for reference in &replacement.restore_refs {
+            if !restore_refs.contains(reference) {
+                restore_refs.push(reference.clone());
+            }
+        }
+        replacement.restore_refs = restore_refs;
+        replacement.revision = self.revision;
+        replacement.content_revision = self.content_revision;
+        replacement.rewrites = self.rewrites;
+        let removed_keys: BTreeSet<_> = self
+            .subagent_history_epochs
+            .keys()
+            .chain(self.subagent_messages.keys())
+            .chain(replacement.subagent_history_epochs.keys())
+            .filter(|key| !replacement.subagent_messages.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in removed_keys {
+            replacement
+                .subagent_history_epochs
+                .insert(key, next_epoch());
+        }
+        replacement.created_at = self.created_at;
+        replacement.rewrite();
+        *self = replacement;
+        Ok(())
+    }
+
+    pub fn list_branches_in(&self, dir: &Path) -> Result<Vec<BranchAvailability>, SessionError> {
+        Ok(self
+            .branches
+            .iter()
+            .map(|branch| BranchAvailability {
+                branch: branch.clone(),
+                available: self.load_branch_from(branch.id, dir).is_ok(),
+            })
+            .collect())
+    }
+
+    pub fn load_branch_from(&self, branch: MakimaId, dir: &Path) -> Result<Self, SessionError> {
+        let expired = || SessionError::BranchExpired { branch };
+        if !self.branches.iter().any(|stored| stored.id == branch) {
+            return Err(expired());
+        }
+        let path = branch_path(dir, self.id, branch);
+        let data = fs::read(&path).map_err(|_| expired())?;
+        if !data.ends_with(b"\n")
+            || data
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .any(|line| serde_json::from_slice::<serde_json::Value>(line).is_err())
+        {
+            return Err(expired());
+        }
+        let restored: Self =
+            load_jsonl(&data, &path.display().to_string()).map_err(|_| expired())?;
+        if restored.id != self.id {
+            return Err(expired());
+        }
+        restored.latest_state().map_err(|_| expired())?;
+        Ok(restored)
+    }
+
+    pub fn push_state(&mut self, record: StoredStateRecord) {
+        let reorders = self
+            .state
+            .iter()
+            .map(|record| record.seq)
+            .chain(self.agent_revisions.iter().map(|(seq, _)| *seq))
+            .any(|seq| seq >= record.seq);
+        self.state.push(record);
+        if reorders {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+    }
+
+    pub fn replace_state(&mut self, state: Vec<StoredStateRecord>) {
+        self.sequence_high_water = self.sequence_high_water();
+        if self.state != state {
+            self.state = state;
+            self.rewrite();
+        }
+    }
+
+    pub fn push_agent_revision(&mut self, seq: u64, record: StoredAgentRecord) {
+        let reorders = self.state.iter().any(|record| record.seq >= seq)
+            || self.agent_revisions.iter().any(|(saved, _)| *saved >= seq);
+        self.agent_revisions.push((seq, record));
+        self.agents = latest_agents(&self.agent_revisions);
+        if reorders {
+            self.rewrite();
+        } else {
+            self.touch();
+        }
+    }
+
+    pub fn replace_agent_revisions(&mut self, revisions: Vec<(u64, StoredAgentRecord)>) {
+        self.sequence_high_water = self.sequence_high_water();
+        if self.agent_revisions != revisions {
+            self.agents = latest_agents(&revisions);
+            self.agent_revisions = revisions;
+            self.rewrite();
+        }
+    }
+
+    pub fn restore_refs(&self) -> &[TransitionRef] {
+        &self.restore_refs
+    }
+
+    pub fn push_restore_ref(&mut self, reference: TransitionRef) {
+        if !self.restore_refs.contains(&reference) {
+            self.restore_refs.push(reference);
+            self.touch();
+        }
+    }
+
+    pub fn push_branch(&mut self, branch: StoredBranch) {
+        self.branches.push(branch);
+        self.touch();
+    }
+
+    pub fn replace_branches(&mut self, branches: Vec<StoredBranch>) {
+        if self.branches != branches {
+            self.branches = branches;
+            self.rewrite();
+        }
+    }
+
+    pub fn set_parent(&mut self, parent: Option<ParentLink>) {
+        if self.parent != parent {
+            self.parent = parent;
+            self.rewrite();
         }
     }
 
@@ -1482,6 +2746,11 @@ where
             meta.compacted = this.meta.compacted;
             meta.conversation = this.meta.conversation.clone();
         }
+        if let Some(legacy) = &this.legacy_config
+            && this.root_config().is_ok_and(|config| config.is_none())
+        {
+            legacy.restore(&mut meta);
+        }
         let history = history.filter(|h| {
             !Arc::ptr_eq(&this.messages, &h.messages)
                 || h.compacted != this.meta.compacted
@@ -1556,6 +2825,58 @@ where
             self.touch();
         }
         true
+    }
+
+    pub fn replace_journal_histories(&mut self, histories: &BTreeMap<AgentId, HistorySnapshot<M>>) {
+        let epoch = next_epoch();
+        self.epoch = epoch;
+        self.subagent_history_epochs
+            .values_mut()
+            .for_each(|saved| *saved = epoch);
+        for key in self.subagent_messages.keys() {
+            self.subagent_history_epochs.insert(key.clone(), epoch);
+        }
+        self.messages = Arc::default();
+        self.meta.compacted = false;
+        self.meta.conversation = None;
+        self.subagent_messages.clear();
+        self.subagent_conversations.clear();
+        for (agent, history) in histories {
+            let Some(record) = self.agents.get(agent) else {
+                continue;
+            };
+            if record.transcript_key.is_empty() {
+                self.epoch = history.epoch;
+                self.messages = Arc::clone(&history.messages);
+                self.meta.compacted = history.compacted;
+                self.meta.conversation = history.conversation.clone();
+            } else {
+                let key = record.transcript_key.clone();
+                self.subagent_history_epochs
+                    .insert(key.clone(), history.epoch);
+                self.subagent_messages
+                    .insert(key.clone(), Arc::clone(&history.messages));
+                if let Some(conversation) = &history.conversation {
+                    self.subagent_conversations
+                        .insert(key, Arc::clone(&conversation.id));
+                }
+            }
+        }
+        let keys: HashSet<_> = self
+            .agents
+            .values()
+            .map(|agent| agent.transcript_key.as_str())
+            .collect();
+        self.subagents
+            .retain(|child| keys.contains(child.tool_use_id.as_str()));
+        self.posts.retain(|post| match &post.chat {
+            None => post.after_message <= self.messages.len(),
+            Some(key) => self
+                .subagent_messages
+                .get(key)
+                .is_some_and(|messages| post.after_message <= messages.len()),
+        });
+        self.rewrite();
     }
 
     pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
@@ -1683,10 +3004,15 @@ where
         let mut post_agents: HashMap<Option<&str>, Vec<&str>> = HashMap::new();
         for stored in &self.posts {
             if let Some(agent) = stored.post.agent.as_deref() {
+                let transcript_key = agent
+                    .parse::<AgentId>()
+                    .ok()
+                    .and_then(|id| self.agents.get(&id))
+                    .map_or(agent, |record| record.transcript_key.as_str());
                 post_agents
                     .entry(stored.chat.as_deref())
                     .or_default()
-                    .push(agent);
+                    .push(transcript_key);
             }
         }
         let mut pending: Vec<String> = self
@@ -1715,8 +3041,6 @@ where
             }
         }
         self.subagent_messages
-            .retain(|id, _| reachable.contains(id));
-        self.subagent_history_epochs
             .retain(|id, _| reachable.contains(id));
         self.subagent_conversations
             .retain(|id, _| reachable.contains(id));
@@ -1805,7 +3129,8 @@ where
             });
         if let Some(id) = cached {
             match Self::load_from(id, dir) {
-                Ok(s) => return Ok(Some(s)),
+                Ok(s) if crate::paths::dirs_equal(&s.cwd, cwd) => return Ok(Some(s)),
+                Ok(_) => {}
                 Err(e) => warn!(error = %e, cwd, "indexed session missing on disk; rescanning"),
             }
         }
@@ -1825,13 +3150,14 @@ where
 
     pub fn delete(id: MakimaId, dir: &StateDir) -> Result<(), SessionError> {
         fs::create_dir_all(dir.path()).map_err(StorageError::from)?;
-        let root = Root::open(dir.path()).map_err(StorageError::from)?;
+        let state_root = fs::canonicalize(dir.path()).map_err(StorageError::from)?;
+        let root = Root::open(&state_root).map_err(StorageError::from)?;
         let cleanup_root = match root.directory(Path::new(SESSIONS_DIR)) {
             Ok(root) => Ok(root),
             Err(error) if error.kind() == ErrorKind::NotFound => Err(error),
             Err(error) => return Err(StorageError::from(error).into()),
         };
-        Self::delete_from_with_cleanup(id, &dir.path().join(SESSIONS_DIR), cleanup_root)
+        Self::delete_from_with_cleanup(id, &state_root.join(SESSIONS_DIR), cleanup_root)
     }
 
     pub fn delete_from(id: MakimaId, dir: &Path) -> Result<(), SessionError> {
@@ -1846,6 +3172,13 @@ where
         if session_lock::open_elsewhere(dir, &id) {
             return Err(SessionError::OpenElsewhere);
         }
+        let _restore_guard = RestoreStore::guard_session_deletion_in(dir, id).map_err(|error| {
+            if matches!(&error, RestoreError::Io(error) if error.kind() == ErrorKind::NotFound) {
+                SessionError::Storage(StorageError::NotFound(id.to_string()))
+            } else {
+                SessionError::Restore(error)
+            }
+        })?;
         let removed = try_remove(&jsonl_path(dir, id))?;
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
@@ -1853,6 +3186,12 @@ where
         let session_id = id.to_string();
         let paths = [
             (Path::new(ARCHIVE_DIR).join(&session_id), "archives"),
+            (Path::new(BRANCH_DIR).join(&session_id), "branches"),
+            (Path::new(BLOBS_DIR).join(&session_id), "file blobs"),
+            (
+                Path::new(RESTORES_DIR).join(&session_id),
+                "file restore transitions",
+            ),
             (
                 Path::new(OFFLOAD_DIR).join(&session_id),
                 "offloaded tool output",
@@ -1891,29 +3230,43 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
         MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSIONS_DIR, StoredSubagent, TAIL_BUF,
-        generate_title, jsonl_path, load_cwd_index, next_epoch, offload_dir, update_cwd_index,
-        write_full_session,
+        generate_title, jsonl_path, load_cwd_index, next_epoch, offload_dir, root_record,
+        update_cwd_index, write_full_session,
     };
     use super::{
-        HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
-        StorageError, TitleSource,
+        BRANCH_DIR, BRANCH_KEEP, BRANCH_MAX_BYTES, branch_path, link_archive_with, prune_branches,
     };
+    use super::{
+        HistorySnapshot, PublicationOutcome, SCAN_CACHE_FILE, Session, SessionError, SessionLog,
+        SessionMeta, StorageError, TitleSource,
+    };
+    use super::{LEGACY_CHILD_UNRESTORABLE, LEGACY_PLAN_SLOT, StoredMode};
     use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
     use crate::conversation::{ConversationLink, ConversationRelation, ConversationState};
-    use crate::id::MakimaId;
+    use crate::id::{AgentId, MakimaId};
+    use crate::plans::{PLAN_STATE_KEY, PlanSlot};
+    use crate::restore::TransitionRef;
     use crate::session_lock;
+    use crate::session_state::{
+        ParentLink, StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredBranch,
+        StoredModeSnapshot, StoredStateRecord,
+    };
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
     #[cfg(unix)]
     use std::os::unix::fs::symlink as symlink_dir;
     #[cfg(windows)]
     use std::os::windows::fs::symlink_dir;
     use std::path::{Path, PathBuf};
+    use std::slice::from_ref;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1924,6 +3277,8 @@ mod tests {
     #[cfg(any(unix, windows))]
     const OFFLOAD_SENTINEL_FILE: &str = "sentinel.txt";
     const FIXTURE_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const UNSUPPORTED_FEATURE: &str = "future-state-format";
+    const FUTURE_FORMAT_VERSION: u32 = 99;
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
@@ -1940,6 +3295,1974 @@ mod tests {
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
     /// A pid no live process on this machine has.
     const FAKE_LOCK_PID: u32 = u32::MAX - 1;
+
+    fn resolved_mode() -> StoredModeSnapshot {
+        StoredModeSnapshot {
+            id: "custom-review".into(),
+            label: "Review".into(),
+            system_prompt: Some("Inspect without changing files".into()),
+            restrict_write_to: Some(PathBuf::from("review.md")),
+            tools: Some(Vec::new()),
+        }
+    }
+
+    fn plugin_record(seq: u64, value: Option<Value>) -> StoredStateRecord {
+        StoredStateRecord {
+            seq,
+            agent: None,
+            generation: 0,
+            change: StateChange::Plugin {
+                key: "test.slot".into(),
+                version: 1,
+                value,
+            },
+        }
+    }
+
+    fn branch(session: &TestSession) -> StoredBranch {
+        StoredBranch {
+            id: MakimaId::generate(),
+            created_at: session.updated_at,
+            at_seq: session.next_state_seq().saturating_sub(1),
+            agent: session.root_agent_id().unwrap(),
+            offset: session.messages().len(),
+            transition: None,
+        }
+    }
+
+    fn branch_fixture() -> (TempDir, TestSession) {
+        let dir = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.push_message(user_message(POST_TEXT));
+        session.save_to(dir.path()).unwrap();
+        (dir, session)
+    }
+
+    #[test]
+    fn restore_references_round_trip_append_deduplicate_and_survive_replacement() {
+        let (dir, mut session) = branch_fixture();
+        let original = session.clone();
+        let first = TransitionRef {
+            session: session.id,
+            transition: MakimaId::generate(),
+        };
+        let second = TransitionRef {
+            session: session.id,
+            transition: MakimaId::generate(),
+        };
+        session.push_restore_ref(first.clone());
+        let mut log = SessionLog::rewrite(dir.path(), &session).unwrap();
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(loaded.restore_refs(), from_ref(&first));
+        let revision = session.revision();
+        session.push_restore_ref(first.clone());
+        assert_eq!(session.revision(), revision);
+        session.push_restore_ref(second.clone());
+        log.append(&session).unwrap();
+        let size = fs::metadata(jsonl_path(dir.path(), session.id))
+            .unwrap()
+            .len();
+        log.append(&session).unwrap();
+        assert_eq!(
+            fs::metadata(jsonl_path(dir.path(), session.id))
+                .unwrap()
+                .len(),
+            size
+        );
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(loaded.restore_refs(), &[first.clone(), second.clone()]);
+        assert_eq!(loaded.messages(), original.messages());
+        assert_eq!(loaded.state(), original.state());
+
+        let mut replacement = original;
+        replacement.push_restore_ref(second.clone());
+        replacement.replace_messages(Vec::new());
+        session.replace_authoritative(replacement).unwrap();
+        session.save_to(dir.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(loaded.restore_refs(), &[first, second]);
+        assert!(loaded.messages().is_empty());
+    }
+
+    #[test_case(false, false ; "cancelled")]
+    #[test_case(true, false ; "published")]
+    #[test_case(true, true ; "published_unsynced")]
+    fn restore_reference_is_committed_only_by_checkpoint_publication(
+        publish: bool,
+        sync_failure: bool,
+    ) {
+        let (dir, session) = branch_fixture();
+        let reference = TransitionRef {
+            session: session.id,
+            transition: MakimaId::generate(),
+        };
+        let mut replacement = session.clone();
+        replacement.push_restore_ref(reference.clone());
+        let staged = SessionLog::stage_checkpoint(dir.path(), &replacement).unwrap();
+        assert!(
+            TestSession::load_from(session.id, dir.path())
+                .unwrap()
+                .restore_refs()
+                .is_empty()
+        );
+        let outcome = staged
+            .publish_with_sync(
+                || publish,
+                |_| {
+                    if sync_failure {
+                        Err(StorageError::Io(io::Error::other(POST_TEXT)))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.is_published(), publish);
+        assert_eq!(
+            matches!(outcome, PublicationOutcome::PublishedUnsynced(_)),
+            sync_failure
+        );
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(
+            loaded.restore_refs(),
+            if publish { vec![reference] } else { Vec::new() }
+        );
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.state(), session.state());
+    }
+
+    #[test]
+    fn branch_transition_reference_round_trips_without_publishing_it() {
+        let (dir, mut session) = branch_fixture();
+        let reference = TransitionRef {
+            session: session.id,
+            transition: MakimaId::generate(),
+        };
+        let mut saved = branch(&session);
+        saved.transition = Some(reference);
+        session.push_branch(saved.clone());
+        SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone())
+            .unwrap()
+            .publish_unowned(|| true)
+            .unwrap();
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(loaded.branches(), &[saved]);
+        assert!(loaded.restore_refs().is_empty());
+    }
+
+    #[test]
+    fn branch_publication_excludes_concurrent_and_stale_append_cursors() {
+        let (dir, session) = branch_fixture();
+        let cursor = SessionLog::rewrite(dir.path(), &session).unwrap();
+        let before = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        let saved = branch(&session);
+        let mut replacement = session.clone();
+        replacement.replace_messages(Vec::new());
+        replacement.push_branch(saved.clone());
+        let staged =
+            SessionLog::stage_checkpoint_with_branch(dir.path(), &replacement, saved.clone())
+                .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let publication = Arc::clone(&staged.publication);
+        let mut worker = None;
+        assert!(
+            staged
+                .publish_unowned(|| {
+                    worker = Some(thread::spawn(move || {
+                        let mut cursor = cursor;
+                        let mut pending = session;
+                        pending.push_message(user_message(PENDING_DRAFT));
+                        assert!(publication.try_lock().is_err());
+                        started_tx.send(()).unwrap();
+                        cursor.append(&pending)
+                    }));
+                    started_rx.recv().unwrap();
+                    true
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            worker.unwrap().join().unwrap(),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        let archive = branch_path(dir.path(), replacement.id, saved.id);
+        assert_eq!(fs::read(&archive).unwrap(), before);
+        let mut live_cursor = SessionLog::rewrite(dir.path(), &replacement).unwrap();
+        replacement.push_message(user_message(PENDING_DRAFT));
+        live_cursor.append(&replacement).unwrap();
+        assert_eq!(fs::read(archive).unwrap(), before);
+        let restored = replacement.load_branch_from(saved.id, dir.path()).unwrap();
+        assert_eq!(restored.messages(), &[user_message(POST_TEXT)]);
+        assert_eq!(
+            replacement.list_branches_in(dir.path()).unwrap()[0].branch,
+            saved
+        );
+        assert!(replacement.list_branches_in(dir.path()).unwrap()[0].available);
+    }
+
+    #[test]
+    fn restoring_a_branch_preserves_the_displaced_state_as_another_branch() {
+        let (dir, mut session) = branch_fixture();
+        let original = branch(&session);
+        let mut rewound = session.clone();
+        rewound.replace_messages(Vec::new());
+        rewound.push_branch(original.clone());
+        SessionLog::stage_checkpoint_with_branch(dir.path(), &rewound, original.clone())
+            .unwrap()
+            .publish_unowned(|| true)
+            .unwrap();
+        let restored = rewound.load_branch_from(original.id, dir.path()).unwrap();
+        let displaced = branch(&rewound);
+        rewound.replace_authoritative(restored).unwrap();
+        rewound.push_branch(displaced.clone());
+        let lease = session_lock::claim(dir.path(), &rewound.id)
+            .unwrap()
+            .unwrap();
+        SessionLog::stage_checkpoint_with_branch(dir.path(), &rewound, displaced.clone())
+            .unwrap()
+            .publish(&lease.publication_guard(), || true)
+            .unwrap();
+        session = TestSession::load_from(rewound.id, dir.path()).unwrap();
+        assert_eq!(session.messages(), &[user_message(POST_TEXT)]);
+        assert_eq!(session.branches(), &[original.clone(), displaced.clone()]);
+        assert!(
+            session
+                .load_branch_from(displaced.id, dir.path())
+                .unwrap()
+                .messages()
+                .is_empty()
+        );
+        assert_eq!(
+            session
+                .load_branch_from(original.id, dir.path())
+                .unwrap()
+                .messages(),
+            session.messages()
+        );
+    }
+
+    #[test_case(false ; "hard_link")]
+    #[test_case(true ; "copy_fallback")]
+    fn branch_preservation_round_trips_and_copy_failure_removes_partial_file(copy_fallback: bool) {
+        let (dir, session) = branch_fixture();
+        let source = jsonl_path(dir.path(), session.id);
+        let destination = dir.path().join("preserved.jsonl");
+        link_archive_with(
+            &source,
+            &destination,
+            |from, to| {
+                if copy_fallback {
+                    Err(io::Error::other(POST_TEXT))
+                } else {
+                    fs::hard_link(from, to)
+                }
+            },
+            io::copy,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        let before = fs::read(&destination).unwrap();
+        assert!(
+            link_archive_with(
+                &source,
+                &destination,
+                |_, _| Err(io::Error::other(POST_TEXT)),
+                |_, _| panic!("existing branch must not be copied over"),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), before);
+        fs::remove_file(&destination).unwrap();
+        assert!(
+            link_archive_with(
+                &source,
+                &destination,
+                |_, _| Err(io::Error::other(POST_TEXT)),
+                |_, to| {
+                    to.write_all(POST_TEXT.as_bytes())?;
+                    Err(io::Error::other(POST_TEXT))
+                },
+            )
+            .is_err()
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            TestSession::load_from(session.id, dir.path())
+                .unwrap()
+                .messages(),
+            session.messages()
+        );
+    }
+
+    #[test_case(false ; "cancelled")]
+    #[test_case(true ; "preserve_failure")]
+    fn branch_publication_aborts_without_mutating_live_log_or_branch_metadata(
+        preserve_failure: bool,
+    ) {
+        let (dir, session) = branch_fixture();
+        let before = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        let saved = branch(&session);
+        let mut replacement = session.clone();
+        replacement.replace_messages(Vec::new());
+        let staged =
+            SessionLog::stage_checkpoint_with_branch(dir.path(), &replacement, saved.clone())
+                .unwrap();
+        if preserve_failure {
+            fs::write(dir.path().join(BRANCH_DIR), POST_TEXT).unwrap();
+            assert!(staged.publish_unowned(|| true).is_err());
+        } else {
+            assert!(!staged.publish_unowned(|| false).unwrap());
+        }
+        assert_eq!(
+            fs::read(jsonl_path(dir.path(), session.id)).unwrap(),
+            before
+        );
+        let current = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert!(current.branches().is_empty());
+        assert!(!branch_path(dir.path(), session.id, saved.id).exists());
+    }
+
+    #[test]
+    fn branch_rename_failure_cleans_preservation_and_never_prunes() {
+        let (dir, session) = branch_fixture();
+        let saved = branch(&session);
+        let staged =
+            SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone()).unwrap();
+        let before = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        let branch_dir = branch_path(dir.path(), session.id, saved.id)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::create_dir_all(&branch_dir).unwrap();
+        let older = branch(&session);
+        let older_path = branch_path(dir.path(), session.id, older.id);
+        fs::write(&older_path, POST_TEXT).unwrap();
+        fs::remove_file(staged.temporary.path()).unwrap();
+        assert!(staged.publish_unowned(|| true).is_err());
+        assert_eq!(
+            fs::read(jsonl_path(dir.path(), session.id)).unwrap(),
+            before
+        );
+        assert!(!branch_path(dir.path(), session.id, saved.id).exists());
+        assert_eq!(fs::read_to_string(older_path).unwrap(), POST_TEXT);
+    }
+
+    #[test_case(false ; "not_published")]
+    #[test_case(true ; "published")]
+    fn typed_publication_reports_claim_outcome(publish: bool) {
+        let (dir, session) = branch_fixture();
+        let staged = SessionLog::stage_checkpoint(dir.path(), &session).unwrap();
+        let lease = session_lock::claim(dir.path(), &session.id)
+            .unwrap()
+            .unwrap();
+        let outcome = staged
+            .publish_outcome(&lease.publication_guard(), || publish)
+            .unwrap();
+        assert_eq!(outcome.is_published(), publish);
+        assert!(matches!(
+            (publish, outcome),
+            (false, PublicationOutcome::NotPublished) | (true, PublicationOutcome::Published)
+        ));
+    }
+
+    #[test]
+    fn post_rename_sync_failure_reports_live_publication_and_preserves_retention() {
+        let (dir, mut session) = branch_fixture();
+        let cursor = SessionLog::rewrite(dir.path(), &session).unwrap();
+        let previous = branch(&session);
+        let previous_path = branch_path(dir.path(), session.id, previous.id);
+        fs::create_dir_all(previous_path.parent().unwrap()).unwrap();
+        fs::write(&previous_path, POST_TEXT).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&previous_path)
+            .unwrap()
+            .set_len(BRANCH_MAX_BYTES)
+            .unwrap();
+        session.push_branch(previous);
+        let saved = branch(&session);
+        let before = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        session.replace_messages(Vec::new());
+        session.push_branch(saved.clone());
+        let staged =
+            SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone()).unwrap();
+        let outcome = staged
+            .publish_with_sync(
+                || true,
+                |path| {
+                    assert!(
+                        TestSession::load_from(session.id, path.parent().unwrap())
+                            .unwrap()
+                            .messages()
+                            .is_empty()
+                    );
+                    Err(StorageError::Io(io::Error::other(POST_TEXT)))
+                },
+            )
+            .unwrap();
+        assert!(outcome.is_published());
+        assert!(
+            matches!(outcome, PublicationOutcome::PublishedUnsynced(ref error) if error.to_string() == POST_TEXT)
+        );
+        let live = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        SessionLog::sync_publication(dir.path()).unwrap();
+        assert_eq!(fs::read(jsonl_path(dir.path(), session.id)).unwrap(), live);
+        assert_eq!(fs::metadata(previous_path).unwrap().len(), BRANCH_MAX_BYTES);
+        assert_eq!(
+            fs::read(branch_path(dir.path(), session.id, saved.id)).unwrap(),
+            before
+        );
+        assert_same_session(
+            &TestSession::load_from(session.id, dir.path()).unwrap(),
+            &session,
+        );
+        let mut cursor = cursor;
+        assert!(matches!(
+            cursor.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+    }
+
+    #[test_case(false ; "count_budget")]
+    #[test_case(true ; "byte_budget")]
+    fn branch_retention_leaves_expired_metadata_and_restore_is_read_only(byte_budget: bool) {
+        let (dir, mut session) = branch_fixture();
+        let mut saved = Vec::new();
+        for _ in 0..=BRANCH_KEEP {
+            let mut branch = branch(&session);
+            branch.created_at = saved.len() as u64;
+            SessionLog::stage_checkpoint_with_branch(dir.path(), &session, branch.clone())
+                .unwrap()
+                .publish_unowned(|| true)
+                .unwrap();
+            session.push_branch(branch.clone());
+            saved.push(branch);
+        }
+        let latest = saved.last().unwrap();
+        if byte_budget {
+            let newest_path = branch_path(dir.path(), session.id, latest.id);
+            let original = fs::read(&newest_path).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(&newest_path)
+                .unwrap()
+                .set_len(BRANCH_MAX_BYTES)
+                .unwrap();
+            prune_branches(dir.path(), session.id, latest.id, session.branches());
+            fs::write(newest_path, original).unwrap();
+        }
+        let availability = session.list_branches_in(dir.path()).unwrap();
+        assert_eq!(availability.len(), BRANCH_KEEP + 1);
+        assert!(!availability[0].available);
+        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(loaded.branches(), session.branches());
+        assert!(!loaded.list_branches_in(dir.path()).unwrap()[0].available);
+        let before = fs::read(jsonl_path(dir.path(), session.id)).unwrap();
+        assert!(
+            matches!(session.load_branch_from(saved[0].id, dir.path()), Err(SessionError::BranchExpired { branch }) if branch == saved[0].id)
+        );
+        assert_eq!(
+            fs::read(jsonl_path(dir.path(), session.id)).unwrap(),
+            before
+        );
+        let remaining = fs::read_dir(
+            branch_path(dir.path(), session.id, latest.id)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap()
+        .count();
+        assert_eq!(remaining, if byte_budget { 1 } else { BRANCH_KEEP });
+    }
+
+    #[test]
+    fn branch_restore_validates_session_and_complete_records() {
+        let (dir, mut session) = branch_fixture();
+        let saved = branch(&session);
+        SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone())
+            .unwrap()
+            .publish_unowned(|| true)
+            .unwrap();
+        session.push_branch(saved.clone());
+        let path = branch_path(dir.path(), session.id, saved.id);
+        let original = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let other = TestSession::new("other", "/other");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        write_full_session(&mut file, &other).unwrap();
+        assert!(matches!(
+            session.load_branch_from(saved.id, dir.path()),
+            Err(SessionError::BranchExpired { .. })
+        ));
+        fs::write(&path, &original[..original.len() - 1]).unwrap();
+        assert!(matches!(
+            session.load_branch_from(saved.id, dir.path()),
+            Err(SessionError::BranchExpired { .. })
+        ));
+        fs::write(&path, &original).unwrap();
+        assert!(session.load_branch_from(saved.id, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn authoritative_replacement_removes_discarded_collections_and_fences_identical_content() {
+        let (dir, mut current) = branch_fixture();
+        let replacement = current.clone();
+        let child = AgentId::generate();
+        let mut record = root_record(child, current.next_state_seq());
+        record.parent = current.root_agent_id();
+        current.push_agent_revision(current.next_state_seq(), record);
+        current.push_state(plugin_record(
+            current.next_state_seq(),
+            Some(Value::Bool(true)),
+        ));
+        current.insert_tool_output(POST_AGENT.into(), Value::Bool(true));
+        current.set_subagent_messages(POST_AGENT.into(), vec![user_message(PENDING_DRAFT)]);
+        current.push_post(stored_post(None, 0, None));
+        let saved = branch(&current);
+        current.push_branch(saved.clone());
+        let high_water = current.sequence_high_water();
+        let revision = current.revision();
+        current.replace_authoritative(replacement).unwrap();
+        assert!(current.revision() > revision);
+        assert!(!current.agents().contains_key(&child));
+        assert!(current.tool_outputs().is_empty());
+        assert!(current.subagent_messages().is_empty());
+        assert!(current.posts().is_empty());
+        assert_eq!(current.branches(), &[saved]);
+        assert_eq!(current.sequence_high_water(), high_water);
+        let revision = current.revision();
+        let different = TestSession::new("other", "/other");
+        assert!(matches!(
+            current.replace_authoritative(different),
+            Err(SessionError::IdMismatch { .. })
+        ));
+        assert_eq!(current.revision(), revision);
+        let mut cursor = SessionLog::rewrite(dir.path(), &current).unwrap();
+        let revision = current.revision();
+        let history = current.history_identity();
+        current.replace_authoritative(current.clone()).unwrap();
+        assert!(current.revision() > revision);
+        assert_eq!(current.history_identity(), history);
+        assert!(matches!(
+            cursor.append(&current),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        current.save_to(dir.path()).unwrap();
+        let loaded = TestSession::load_from(current.id, dir.path()).unwrap();
+        assert_eq!(loaded.sequence_high_water(), high_water);
+        assert!(loaded.next_state_seq() > high_water.unwrap());
+        assert_same_session(&loaded, &current);
+    }
+
+    #[test]
+    fn journal_history_replacement_removes_absent_children_and_fences_identical_history() {
+        let (dir, mut session) = branch_fixture();
+        let root = session.root_agent_id().unwrap();
+        let child = AgentId::generate();
+        let mut record = root_record(child, session.next_state_seq());
+        record.parent = Some(root);
+        record.transcript_key = POST_AGENT.into();
+        session.push_agent_revision(record.created_seq, record);
+        let stale = HistorySnapshot::new(vec![user_message(POST_TEXT)]);
+        session.adopt_subagent_history(ORPHAN_CHILD.into(), &stale);
+        let histories = [
+            (
+                root,
+                HistorySnapshot::new(vec![user_message(PENDING_DRAFT)]),
+            ),
+            (child, HistorySnapshot::new(vec![user_message(POST_TEXT)])),
+        ]
+        .into();
+        let mut cursor = SessionLog::rewrite(dir.path(), &session).unwrap();
+        session.replace_journal_histories(&histories);
+        assert_eq!(session.history_snapshot().epoch, histories[&root].epoch);
+        assert_eq!(
+            session.subagent_history_snapshot(POST_AGENT).unwrap().epoch,
+            histories[&child].epoch
+        );
+        assert_eq!(session.messages(), &[user_message(PENDING_DRAFT)]);
+        assert_eq!(session.subagent_messages().len(), 1);
+        assert_eq!(
+            session.subagent_messages()[POST_AGENT].as_ref(),
+            &[user_message(POST_TEXT)]
+        );
+        assert!(!session.adopt_subagent_history(ORPHAN_CHILD.into(), &stale));
+        assert!(matches!(
+            cursor.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        let revision = session.revision();
+        session.replace_journal_histories(&histories);
+        assert!(session.revision() > revision);
+        let key = session.agents()[&child].transcript_key.clone();
+        let mut pending = histories[&child].clone();
+        Arc::make_mut(&mut pending.messages).push(user_message(PENDING_DRAFT));
+        assert!(session.adopt_subagent_history(key, &pending));
+        session.replace_journal_histories(&histories);
+        session.save_to(dir.path()).unwrap();
+        assert_same_session(
+            &TestSession::load_from(session.id, dir.path()).unwrap(),
+            &session,
+        );
+    }
+
+    #[test_case(false; "matching_destination_namespace")]
+    #[test_case(true; "different_destination_namespace")]
+    fn authoritative_replacement_preserves_supplied_history_lineages_and_fences_cursor(
+        different: bool,
+    ) {
+        const GENERATION: u64 = 41;
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut record = super::root_record(child, session.next_state_seq());
+        record.parent = Some(root);
+        record.depth = 1;
+        record.transcript_key = POST_AGENT.into();
+        session.push_agent_revision(record.created_seq, record);
+        let stale_root = session.history_snapshot().epoch;
+        let root_history = HistorySnapshot::new(Vec::new());
+        let child_history = HistorySnapshot::new(Vec::new());
+        session.adopt_history(&root_history);
+        session.adopt_subagent_history(POST_AGENT.into(), &child_history);
+        let stale = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: stale,
+            agent: Some(root),
+            generation: GENERATION,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: [(root, (stale_root, 0)), (child, (child_history.epoch, 0))].into(),
+            },
+        });
+        let pinned = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: pinned,
+            agent: Some(root),
+            generation: GENERATION,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: [
+                    (root, (root_history.epoch, 0)),
+                    (child, (child_history.epoch, 0)),
+                ]
+                .into(),
+            },
+        });
+        let pin = serde_json::json!({
+            "state": session.state(), "agents": session.agent_revisions(),
+            "histories": {
+                root.to_string(): {"epoch": root_history.epoch, "compacted": false, "messages": []},
+                child.to_string(): {"epoch": child_history.epoch, "compacted": false, "messages": []}
+            }
+        });
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: None,
+            generation: 0,
+            change: StateChange::BoundarySnapshot {
+                boundary: pinned,
+                snapshot: pin.clone(),
+            },
+        });
+        let current = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: current,
+            agent: Some(root),
+            generation: GENERATION,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: [
+                    (root, (root_history.epoch, 0)),
+                    (child, (child_history.epoch, 0)),
+                ]
+                .into(),
+            },
+        });
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: Some(child),
+            generation: GENERATION,
+            change: StateChange::Compaction {
+                epoch: child_history.epoch,
+            },
+        });
+        let replacement = session.clone();
+        if different {
+            session.adopt_history(&HistorySnapshot::new(Vec::new()));
+            session.adopt_subagent_history(POST_AGENT.into(), &HistorySnapshot::new(Vec::new()));
+        }
+        let mut cursor = SessionLog::rewrite(directory.path(), &session).unwrap();
+        session.replace_authoritative(replacement).unwrap();
+        let root_epoch = session.history_snapshot().epoch;
+        let child_epoch = session.subagent_history_snapshot(POST_AGENT).unwrap().epoch;
+        assert_eq!(root_epoch, root_history.epoch);
+        assert_eq!(child_epoch, child_history.epoch);
+        assert!(matches!(
+            cursor.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        let view = session.latest_state().unwrap();
+        assert_eq!(view.boundaries[&current].lens[&root].0, root_epoch);
+        assert_eq!(view.boundaries[&current].lens[&child].0, child_epoch);
+        assert_eq!(view.boundaries[&stale].lens[&root].0, stale_root);
+        assert_eq!(view.boundaries[&stale].lens[&child].0, child_epoch);
+        assert_eq!(view.boundaries[&pinned].lens[&root].0, root_history.epoch);
+        assert_eq!(view.compactions[&child].1, child_epoch);
+        assert!(
+            session
+                .state()
+                .iter()
+                .filter(|record| record.agent.is_some())
+                .all(|record| record.generation == GENERATION)
+        );
+        assert!(session.state().iter().any(|record| matches!(&record.change, StateChange::BoundarySnapshot { snapshot, .. } if snapshot == &pin)));
+        session.save_to(directory.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        let view = loaded.latest_state().unwrap();
+        assert_eq!(
+            view.boundaries[&current].lens[&root].0,
+            loaded.history_snapshot().epoch
+        );
+        assert_ne!(
+            view.boundaries[&stale].lens[&root].0,
+            loaded.history_snapshot().epoch
+        );
+        assert_eq!(
+            view.boundaries[&pinned].lens[&root].0,
+            loaded.history_snapshot().epoch
+        );
+    }
+
+    #[test]
+    fn authoritative_replacement_keeps_removed_child_epoch_tombstones() {
+        let (dir, mut session) = branch_fixture();
+        let replacement = session.clone();
+        let stale = HistorySnapshot::new(vec![user_message(POST_TEXT)]);
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &stale));
+        session.replace_authoritative(replacement).unwrap();
+        assert!(!session.adopt_subagent_history(POST_AGENT.into(), &stale));
+        session.prune_orphans(|_| Vec::new());
+        session.replace_authoritative(session.clone()).unwrap();
+        assert!(!session.adopt_subagent_history(POST_AGENT.into(), &stale));
+        assert!(session.subagent_messages().is_empty());
+        session.save_to(dir.path()).unwrap();
+        assert!(
+            TestSession::load_from(session.id, dir.path())
+                .unwrap()
+                .subagent_messages()
+                .is_empty()
+        );
+        let fresh = HistorySnapshot::new(vec![user_message(PENDING_DRAFT)]);
+        assert!(session.adopt_subagent_history(POST_AGENT.into(), &fresh));
+    }
+
+    #[test]
+    fn individual_prefix_replacements_preserve_sequence_high_water_after_restart() {
+        let (dir, mut session) = branch_fixture();
+        let high_water = session.next_state_seq() + POST_APPEND_COUNT as u64;
+        session.push_state(plugin_record(high_water, Some(Value::Bool(true))));
+        session.replace_state(Vec::new());
+        session.replace_agent_revisions(Vec::new());
+        session.save_to(dir.path()).unwrap();
+        let session = TestSession::load_from(session.id, dir.path()).unwrap();
+        assert_eq!(session.sequence_high_water(), Some(high_water));
+        assert_eq!(session.next_state_seq(), high_water + 1);
+    }
+
+    fn records(dir: &Path, id: MakimaId) -> Vec<Value> {
+        fs::read(jsonl_path(dir, id))
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn assert_retired_meta_absent(records: &[Value]) {
+        for record in records.iter().filter(|record| record["t"] == "meta") {
+            for key in [
+                "plan_path",
+                "plan_written",
+                "mode",
+                "thinking",
+                "fast",
+                "workflow",
+                "session_options",
+                "session_rules",
+                "yolo",
+            ] {
+                assert!(
+                    record.get(key).is_none(),
+                    "unexpected metadata field: {key}"
+                );
+            }
+        }
+    }
+
+    #[test_case(false; "rewrite_before_resolution")]
+    #[test_case(true; "stage_before_resolution")]
+    fn unresolved_v2_config_survives_checkpoint_save_append_and_resolution(staged: bool) {
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"legacy-model", "cwd":"/legacy", "created_at":1});
+        let meta = serde_json::json!({
+            "t":"meta", "title":"legacy", "token_usage":null, "updated_at":2,
+            "mode":{"custom":"removed-mode"}, "thinking":{"kind":"off"},
+            "fast":true, "workflow":true, "session_options":{"custom":"option"},
+            "session_rules":[{"tool":"bash", "effect":"deny"}], "yolo":false,
+            "plan_path":"plan.md", "plan_written":true
+        });
+        fs::write(jsonl_path(tmp.path(), id), format!("{header}\n{meta}\n")).unwrap();
+        let mut session = Arc::new(TestSession::load_from(id, tmp.path()).unwrap());
+        let legacy = session.meta.clone();
+        TestSession::checkpoint(
+            &mut session,
+            None,
+            SessionMeta {
+                input_draft: Some(PENDING_DRAFT.into()),
+                ..Default::default()
+            },
+            Value::Null,
+        );
+        if staged {
+            assert!(
+                SessionLog::stage_checkpoint(tmp.path(), &session)
+                    .unwrap()
+                    .publish_unowned(|| true)
+                    .unwrap()
+            );
+        } else {
+            Arc::make_mut(&mut session).save_to(tmp.path()).unwrap();
+        }
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(loaded.meta.mode, legacy.mode);
+        assert_eq!(loaded.meta.thinking, legacy.thinking);
+        assert_eq!(loaded.meta.session_options, legacy.session_options);
+        assert!(loaded.meta.fast && loaded.meta.workflow);
+        assert_retired_meta_absent(&records(tmp.path(), id));
+        assert!(
+            records(tmp.path(), id)
+                .last()
+                .unwrap()
+                .get("legacy_config")
+                .is_some()
+        );
+        let mut log = SessionLog::rewrite(tmp.path(), &loaded).unwrap();
+        loaded.push_message(user_message("before resolution"));
+        log.append(&loaded).unwrap();
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        loaded.resolve_legacy_mode(resolved_mode()).unwrap();
+        let count = loaded.state().len();
+        loaded.resolve_legacy_mode(resolved_mode()).unwrap();
+        assert_eq!(loaded.state().len(), count);
+        let mut log = SessionLog::rewrite(tmp.path(), &loaded).unwrap();
+        loaded.push_message(user_message("after resolution"));
+        log.append(&loaded).unwrap();
+        let appended_records = records(tmp.path(), id);
+        assert_retired_meta_absent(&appended_records);
+        assert!(
+            appended_records
+                .last()
+                .unwrap()
+                .get("legacy_config")
+                .is_none()
+        );
+        loaded.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        let view = loaded.latest_state().unwrap();
+        let config = view.scopes[&loaded.root_agent_id()]
+            .config
+            .as_ref()
+            .unwrap();
+        assert_eq!(config.thinking, legacy.thinking);
+        assert_eq!(config.options, legacy.session_options);
+        assert!(config.fast && config.workflow);
+        assert_eq!(config.mode, resolved_mode());
+        assert_eq!(view.scopes[&None].rules, legacy.session_rules);
+        assert_eq!(view.scopes[&None].yolo, legacy.yolo);
+        let plans: PlanSlot = serde_json::from_value(
+            view.scopes[&None].plugins[PLAN_STATE_KEY]
+                .value
+                .clone()
+                .unwrap(),
+        )
+        .unwrap();
+        let plan = &plans[&loaded.root_agent_id().unwrap()];
+        assert_eq!(plan.path, Path::new("plan.md"));
+        assert!(plan.written);
+        assert!(plan.approved.is_none());
+        assert_eq!(loaded.meta.input_draft.as_deref(), Some(PENDING_DRAFT));
+        let records = records(tmp.path(), id);
+        assert_retired_meta_absent(&records);
+        assert!(records.last().unwrap().get("legacy_config").is_none());
+    }
+
+    #[test_case(false; "rewrite")]
+    #[test_case(true; "staged_publication")]
+    fn root_config_updates_header_and_listing_cache_without_metadata_authority(staged: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("old-model", "/old");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        let root = session.root_agent_id().unwrap();
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        assert_eq!(TestSession::list_in("/old", tmp.path()).unwrap().len(), 1);
+        let config = StoredAgentConfig {
+            cwd: "/new".into(),
+            model: "new-model".into(),
+            thinking: Some(StoredThinking::Off),
+            fast: true,
+            workflow: true,
+            mode: resolved_mode(),
+            options: BTreeMap::new(),
+        };
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Config(config.clone()),
+        });
+        let bytes = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        assert!(
+            matches!(log.append(&session), Err(SessionError::LogDiverged { reason }) if reason == super::HEADER_CHANGED)
+        );
+        assert_eq!(fs::read(jsonl_path(tmp.path(), session.id)).unwrap(), bytes);
+        if staged {
+            let staged = SessionLog::stage_checkpoint(tmp.path(), &session).unwrap();
+            assert!(TestSession::list_in("/new", tmp.path()).unwrap().is_empty());
+            assert!(staged.publish_unowned(|| true).unwrap());
+        } else {
+            log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+            session.push_message(user_message("after config"));
+            log.append(&session).unwrap();
+        }
+        assert_eq!(records(tmp.path(), session.id)[0]["model"], config.model);
+        assert!(TestSession::list_in("/old", tmp.path()).unwrap().is_empty());
+        assert_eq!(
+            TestSession::list_in("/new", tmp.path()).unwrap()[0].id,
+            session.id
+        );
+        assert!(
+            TestSession::latest_in("/old", tmp.path())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            TestSession::latest_in("/new", tmp.path())
+                .unwrap()
+                .unwrap()
+                .id,
+            session.id
+        );
+        assert!(!load_cwd_index(tmp.path()).contains_key("/old"));
+        let conflicting = serde_json::json!({
+            "t":"meta", "title":"conflict", "token_usage":null, "updated_at":3,
+            "mode":"build", "thinking":{"kind":"adaptive"}, "fast":false,
+            "workflow":false, "session_options":{"stale":"value"}, "yolo":true,
+            "session_rules":[{"tool":"bash", "effect":"allow"}]
+        });
+        writeln!(
+            OpenOptions::new()
+                .append(true)
+                .open(jsonl_path(tmp.path(), session.id))
+                .unwrap(),
+            "{conflicting}"
+        )
+        .unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        loaded.resolve_legacy_mode(resolved_mode()).unwrap();
+        let view = loaded.latest_state().unwrap();
+        assert_eq!(view.scopes[&Some(root)].config.as_ref(), Some(&config));
+        assert!(view.scopes[&None].rules.is_empty());
+        assert_eq!(view.scopes[&None].yolo, None);
+        loaded.save_to(tmp.path()).unwrap();
+        assert_retired_meta_absent(&records(tmp.path(), session.id));
+    }
+
+    #[test]
+    fn config_and_rules_append_ignore_stale_legacy_payload_and_seed_only_once() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        let root = session.root_agent_id().unwrap();
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let mut config = session.root_config().unwrap().unwrap();
+        config.fast = true;
+        config
+            .options
+            .insert("persistent".into(), "committed".into());
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Config(config.clone()),
+        });
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: None,
+            generation: 0,
+            change: StateChange::Rules {
+                rules: Vec::new(),
+                yolo: Some(false),
+            },
+        });
+        log.append(&session).unwrap();
+        let count = session.state().len();
+        let stale_meta = serde_json::json!({
+            "t":"meta", "title":"stale", "token_usage":null, "updated_at":3,
+            "legacy_config": {
+                "mode":"plan", "thinking":{"kind":"off"}, "fast":false, "workflow":true,
+                "session_options":{"persistent":"stale"}, "session_rules":[], "yolo":true
+            }
+        });
+        writeln!(
+            OpenOptions::new()
+                .append(true)
+                .open(jsonl_path(tmp.path(), session.id))
+                .unwrap(),
+            "{stale_meta}"
+        )
+        .unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert!(loaded.legacy_config.is_none());
+        loaded.resolve_legacy_mode(resolved_mode()).unwrap();
+        assert_eq!(loaded.state().len(), count);
+        let view = loaded.latest_state().unwrap();
+        assert_eq!(view.scopes[&Some(root)].config.as_ref(), Some(&config));
+        assert_eq!(view.scopes[&None].yolo, Some(false));
+        loaded.save_to(tmp.path()).unwrap();
+        let records = records(tmp.path(), session.id);
+        assert_retired_meta_absent(&records);
+        assert!(records.last().unwrap().get("legacy_config").is_none());
+    }
+
+    #[test]
+    fn staged_config_publication_succeeds_when_auxiliary_index_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("old-model", "/old");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.push_message(user_message("before config"));
+        session.save_to(tmp.path()).unwrap();
+        let mut config = session.root_config().unwrap().unwrap();
+        config.cwd = "/new".into();
+        config.model = "new-model".into();
+        config.fast = true;
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: session.root_agent_id(),
+            generation: 0,
+            change: StateChange::Config(config.clone()),
+        });
+        session.push_message(user_message("after config"));
+        let staged = SessionLog::stage_checkpoint(tmp.path(), &session).unwrap();
+        let index_path = tmp.path().join(CWD_INDEX_FILE);
+        fs::remove_file(&index_path).unwrap();
+        fs::create_dir(&index_path).unwrap();
+
+        assert!(staged.publish_unowned(|| true).unwrap());
+        assert!(index_path.is_dir());
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.root_config().unwrap().as_ref(), Some(&config));
+        assert_same_session(&loaded, &session);
+    }
+
+    #[test]
+    fn rejected_staged_config_publication_preserves_header_and_cwd_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("old-model", "/old");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.save_to(tmp.path()).unwrap();
+        let before = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        let index = load_cwd_index(tmp.path());
+        let mut config = session.root_config().unwrap().unwrap();
+        config.cwd = "/new".into();
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: session.root_agent_id(),
+            generation: 0,
+            change: StateChange::Config(config),
+        });
+        assert!(
+            !SessionLog::stage_checkpoint(tmp.path(), &session)
+                .unwrap()
+                .publish_unowned(|| false)
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read(jsonl_path(tmp.path(), session.id)).unwrap(),
+            before
+        );
+        assert_eq!(load_cwd_index(tmp.path()), index);
+    }
+
+    #[test]
+    fn colliding_staged_configs_publish_only_the_claimed_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/old");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.save_to(tmp.path()).unwrap();
+        let stale = SessionLog::stage_checkpoint(tmp.path(), &session).unwrap();
+        let mut config = session.root_config().unwrap().unwrap();
+        config.cwd = "/winner".into();
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: session.root_agent_id(),
+            generation: 0,
+            change: StateChange::Config(config),
+        });
+        let winner = SessionLog::stage_checkpoint(tmp.path(), &session).unwrap();
+        assert_ne!(stale.temporary.path(), winner.temporary.path());
+        assert!(winner.publish_unowned(|| true).unwrap());
+        let bytes = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        let index = load_cwd_index(tmp.path());
+        assert!(!stale.publish_unowned(|| false).unwrap());
+        assert_eq!(fs::read(jsonl_path(tmp.path(), session.id)).unwrap(), bytes);
+        assert_eq!(load_cwd_index(tmp.path()), index);
+        assert_eq!(
+            TestSession::load_from(session.id, tmp.path()).unwrap().cwd,
+            "/winner"
+        );
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &session,
+        );
+    }
+
+    #[test_case(false, false; "rewrite")]
+    #[test_case(true, false; "staged_checkpoint")]
+    #[test_case(false, true; "empty_child_rewrite")]
+    #[test_case(true, true; "empty_child_staged_checkpoint")]
+    fn canonical_history_epochs_survive_load_without_rebasing_stale_lenses(
+        staged: bool,
+        empty: bool,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut record = super::root_record(child, session.next_state_seq());
+        record.parent = Some(root);
+        record.depth = 1;
+        record.transcript_key = POST_AGENT.into();
+        session.push_agent_revision(record.created_seq, record);
+        let root_history = HistorySnapshot::new(vec![user_message(PENDING_DRAFT)]);
+        let child_history = HistorySnapshot::new(vec![user_message(POST_TEXT)]);
+        session.adopt_history(&root_history);
+        session.adopt_subagent_history(POST_AGENT.into(), &child_history);
+        let seq = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq,
+            agent: Some(root),
+            generation: root_history.epoch,
+            change: StateChange::Boundary {
+                offset: 1,
+                lens: [
+                    (root, (root_history.epoch, 1)),
+                    (child, (child_history.epoch, 1)),
+                ]
+                .into(),
+            },
+        });
+        let replacement = HistorySnapshot::new(if empty {
+            Vec::new()
+        } else {
+            vec![user_message(POST_TEXT)]
+        });
+        session.adopt_subagent_history(POST_AGENT.into(), &replacement);
+        let seq = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq,
+            agent: Some(child),
+            generation: replacement.epoch,
+            change: StateChange::Compaction {
+                epoch: replacement.epoch,
+            },
+        });
+        if staged {
+            SessionLog::stage_checkpoint(directory.path(), &session)
+                .unwrap()
+                .publish_unowned(|| true)
+                .unwrap();
+        } else {
+            session.save_to(directory.path()).unwrap();
+        }
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        let loaded_root = loaded.history_snapshot().epoch;
+        let loaded_child = loaded.subagent_history_snapshot(POST_AGENT).unwrap().epoch;
+        let view = loaded.latest_state().unwrap();
+        let boundary = view.boundaries.values().next().unwrap();
+        assert_ne!(loaded_root, root_history.epoch);
+        assert_eq!(boundary.lens[&root].0, loaded_root);
+        assert_ne!(boundary.lens[&child].0, loaded_child);
+        assert!(boundary.lens[&child].0 < loaded_child);
+        assert_eq!(view.compactions[&child].1, loaded_child);
+        assert!(super::next_epoch() > loaded_child);
+    }
+
+    #[test_case(false; "absent_transcript")]
+    #[test_case(true; "explicit_empty_zero_epoch_transcript")]
+    fn child_epoch_metadata_preserves_transcript_presence_across_repeated_loads(present: bool) {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut child_record = super::root_record(child, session.next_state_seq());
+        child_record.parent = Some(root);
+        child_record.depth = 1;
+        child_record.transcript_key = POST_AGENT.into();
+        session.push_agent_revision(child_record.created_seq, child_record);
+        if present {
+            let history = HistorySnapshot {
+                epoch: 0,
+                ..Default::default()
+            };
+            session.adopt_subagent_history(POST_AGENT.into(), &history);
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                session.canonical_history_epochs().contains_key(&child),
+                present
+            );
+            session.save_to(directory.path()).unwrap();
+            session = TestSession::load_from(session.id, directory.path()).unwrap();
+            assert_eq!(
+                session.subagent_messages().contains_key(POST_AGENT),
+                present
+            );
+            assert_eq!(
+                session.subagent_history_snapshot(POST_AGENT).is_some(),
+                present
+            );
+        }
+    }
+
+    #[test]
+    fn absent_canonical_epoch_is_not_reconstructed_from_zero_lens() {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: [(root, (0, 0))].into(),
+            },
+        });
+        session.save_to(directory.path()).unwrap();
+        let path = jsonl_path(directory.path(), session.id);
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut without_metadata = String::new();
+        for line in raw.lines() {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            if record["t"] == "meta" {
+                record.as_object_mut().unwrap().remove("history_epochs");
+            }
+            without_metadata.push_str(&record.to_string());
+            without_metadata.push('\n');
+        }
+        fs::write(&path, without_metadata).unwrap();
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        let view = loaded.latest_state().unwrap();
+        assert_ne!(
+            view.boundaries.values().next().unwrap().lens[&root].0,
+            loaded.history_snapshot().epoch
+        );
+    }
+
+    #[test]
+    fn loaded_epoch_mapping_is_complete_ordered_and_independent_of_saved_magnitude() {
+        const START: u64 = 11;
+        const FIRST: u64 = 0;
+        const SECOND: u64 = 37;
+        const LAST: u64 = u64::MAX;
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        let mut canonical = [(root, LAST), (child, FIRST)].into();
+        let mut state = vec![
+            StoredStateRecord {
+                seq: 1,
+                agent: Some(root),
+                generation: LAST,
+                change: StateChange::Boundary {
+                    offset: 0,
+                    lens: [(root, (SECOND, 0)), (child, (FIRST, 0))].into(),
+                },
+            },
+            StoredStateRecord {
+                seq: 2,
+                agent: Some(root),
+                generation: LAST,
+                change: StateChange::Compaction { epoch: LAST },
+            },
+            StoredStateRecord {
+                seq: 3,
+                agent: None,
+                generation: 0,
+                change: StateChange::BoundarySnapshot {
+                    boundary: 1,
+                    snapshot: serde_json::json!({
+                        "histories": {"saved": {"epoch": LAST}, "malformed": {"epoch": "invalid"}},
+                        "state": [
+                            {"generation": LAST, "change": {"kind": "boundary", "lens": {"saved": [SECOND, 0]}}},
+                            {"change": {"kind": "boundary_snapshot", "snapshot": {
+                                "histories": {"saved": {"epoch": FIRST}},
+                                "state": [{"change": {"kind": "compaction", "epoch": LAST}}]
+                            }}}
+                        ]
+                    }),
+                },
+            },
+        ];
+        let allocator = AtomicU64::new(START);
+        super::remap_loaded_history_epochs(&mut state, &mut canonical, || {
+            allocator.fetch_add(1, Ordering::Relaxed)
+        });
+        assert_eq!(allocator.load(Ordering::Relaxed), START + 3);
+        assert_eq!(canonical[&child], START);
+        assert_eq!(canonical[&root], START + 2);
+        if let StateChange::Boundary { lens, .. } = &state[0].change {
+            assert_eq!(lens[&root].0, START + 1);
+            assert_eq!(lens[&child].0, canonical[&child]);
+            assert!(lens[&root].0 < canonical[&root]);
+        } else {
+            panic!("expected boundary")
+        }
+        assert_eq!(state[0].generation, LAST);
+        assert!(
+            matches!(state[1].change, StateChange::Compaction { epoch } if epoch == canonical[&root])
+        );
+        let StateChange::BoundarySnapshot { snapshot, .. } = &state[2].change else {
+            panic!("expected pin")
+        };
+        assert_eq!(snapshot["histories"]["saved"]["epoch"], START + 2);
+        assert_eq!(snapshot["histories"]["malformed"]["epoch"], "invalid");
+        assert_eq!(snapshot["state"][0]["generation"], LAST);
+        assert_eq!(
+            snapshot["state"][0]["change"]["lens"]["saved"][0],
+            START + 1
+        );
+        assert_eq!(
+            snapshot["state"][1]["change"]["snapshot"]["histories"]["saved"]["epoch"],
+            START
+        );
+        assert_eq!(
+            snapshot["state"][1]["change"]["snapshot"]["state"][0]["change"]["epoch"],
+            START + 2
+        );
+    }
+
+    #[test_case(false; "rewrite")]
+    #[test_case(true; "staged_checkpoint")]
+    fn maximal_saved_epoch_import_remains_writable_and_reloads_consistently(staged: bool) {
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut history = session.history_snapshot();
+        history.epoch = u64::MAX;
+        session.adopt_history(&history);
+        let boundary = session.next_state_seq();
+        session.push_state(StoredStateRecord {
+            seq: boundary,
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: [(root, (u64::MAX, 0))].into(),
+            },
+        });
+        if staged {
+            SessionLog::stage_checkpoint(directory.path(), &session)
+                .unwrap()
+                .publish_unowned(|| true)
+                .unwrap();
+        } else {
+            session.save_to(directory.path()).unwrap();
+        }
+        for _ in 0..3 {
+            let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+            let runtime_epoch = loaded.history_snapshot().epoch;
+            assert_ne!(runtime_epoch, u64::MAX);
+            assert_eq!(
+                loaded.latest_state().unwrap().boundaries[&boundary].lens[&root].0,
+                runtime_epoch
+            );
+            assert!(super::next_epoch() > runtime_epoch);
+            loaded.push_message(user_message(POST_TEXT));
+            loaded.save_to(directory.path()).unwrap();
+        }
+    }
+
+    #[test]
+    fn v3_journal_round_trips_append_rewrite_stage_and_archive() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        let root = session.root_agent_id().unwrap();
+        session.set_parent(Some(ParentLink {
+            session: MakimaId::generate(),
+            message_count: 7,
+            seq: 11,
+        }));
+        session.push_message(user_message("first"));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let historical_seq = session.next_state_seq() - 1;
+        let before = session.state_at(historical_seq).unwrap();
+        let seq = session.next_state_seq();
+        session.push_state(plugin_record(seq, Some(Value::Null)));
+        let mut revision = session.agents()[&root].clone();
+        revision.updated_seq = seq + 1;
+        revision.label = Some("renamed".into());
+        session.push_agent_revision(seq + 1, revision);
+        session.push_state(plugin_record(
+            seq + 2,
+            Some(serde_json::json!({"value": 2})),
+        ));
+        session.push_branch(branch(&session));
+        session.push_message(assistant_message("second"));
+        log.append(&session).unwrap();
+        let first_append = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        log.append(&session).unwrap();
+        assert_eq!(
+            fs::read(jsonl_path(tmp.path(), session.id)).unwrap(),
+            first_append
+        );
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+        assert_eq!(loaded.state_at(historical_seq).unwrap(), before);
+        assert_eq!(
+            loaded.latest_state().unwrap().agents[&root]
+                .label
+                .as_deref(),
+            Some("renamed")
+        );
+        let records: Vec<Value> = first_append
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["v"], 3);
+        let sequences: Vec<_> = records
+            .iter()
+            .filter_map(|record| match record["t"].as_str() {
+                Some("state") => record["d"]["seq"].as_u64(),
+                Some("agent") => record["seq"].as_u64(),
+                _ => None,
+            })
+            .collect();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            TestSession::list_all_in(tmp.path()).unwrap()[0].message_count,
+            2
+        );
+        let scanned = super::scan_jsonl_header(&jsonl_path(tmp.path(), session.id)).unwrap();
+        assert_eq!(scanned.parent.as_ref(), session.parent());
+        let staged = SessionLog::stage_checkpoint(tmp.path(), &session).unwrap();
+        session.push_state(plugin_record(seq + 3, None));
+        assert!(staged.publish_unowned(|| true).unwrap());
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &loaded,
+        );
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        session.truncate_messages(1);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &session,
+        );
+        let archived: TestSession =
+            super::load_session_at(&archive_paths(tmp.path(), session.id)[0]).unwrap();
+        assert_eq!(archived.messages().len(), 2);
+        assert_eq!(
+            normalized_epoch_state(&archived),
+            normalized_epoch_state(&session)
+        );
+        assert_eq!(archived.agent_revisions(), session.agent_revisions());
+        assert_eq!(archived.branches(), session.branches());
+    }
+
+    #[test_case(0; "state_replacement")]
+    #[test_case(1; "agent_revision_replacement")]
+    #[test_case(2; "branch_replacement")]
+    fn same_length_journal_replacements_invalidate_append(collection: usize) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.push_state(plugin_record(
+            session.next_state_seq(),
+            Some(Value::Bool(true)),
+        ));
+        session.push_branch(branch(&session));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let bytes = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        match collection {
+            0 => {
+                let mut records = session.state().to_vec();
+                let last = records.last_mut().unwrap();
+                *last = plugin_record(last.seq, None);
+                session.replace_state(records);
+            }
+            1 => {
+                let mut records = session.agent_revisions().to_vec();
+                records[0].1.label = Some("changed".into());
+                session.replace_agent_revisions(records);
+            }
+            _ => {
+                let mut records = session.branches().to_vec();
+                records[0].offset += 1;
+                session.replace_branches(records);
+            }
+        }
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        assert_eq!(fs::read(jsonl_path(tmp.path(), session.id)).unwrap(), bytes);
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &session,
+        );
+    }
+
+    #[test]
+    fn fresh_root_binding_is_idempotent_and_not_legacy() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let revision = session.revision();
+        session.bind_root_id(root).unwrap();
+        assert_eq!(session.revision(), revision);
+        let agent = &session.agents()[&root];
+        assert_eq!(agent.lifecycle, StoredAgentLifecycle::Open);
+        assert!(agent.parent.is_none());
+        assert!(!agent.legacy && !agent.ancestry_unknown);
+        assert!(session.state().is_empty());
+        session.save_to(tmp.path()).unwrap();
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &session,
+        );
+    }
+
+    #[test]
+    fn v2_double_load_can_bind_root_before_publication_and_rekey_seeded_state() {
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"legacy", "cwd":"/project", "created_at":0});
+        let meta = serde_json::json!({"t":"meta", "title":"legacy", "token_usage":null, "updated_at":0,
+            "subagents":[{"tool_use_id":"child", "name":"legacy child"}]});
+        fs::write(jsonl_path(tmp.path(), id), format!("{header}\n{meta}\n")).unwrap();
+        let first = TestSession::load_from(id, tmp.path()).unwrap();
+        let expected = first.root_agent_id().unwrap();
+        let mut second = TestSession::load_from(id, tmp.path()).unwrap();
+        let previous = second.root_agent_id().unwrap();
+        assert_ne!(expected, previous);
+        assert!(second.legacy_root_unpublished);
+        second.resolve_legacy_mode(resolved_mode()).unwrap();
+        let seq = second.next_state_seq();
+        second.push_state(StoredStateRecord {
+            seq,
+            agent: Some(previous),
+            generation: 0,
+            change: StateChange::Boundary {
+                offset: 0,
+                lens: BTreeMap::from([(previous, (0, 0))]),
+            },
+        });
+        second.push_branch(branch(&second));
+        second.bind_root_id(expected).unwrap();
+        assert!(!second.legacy_root_unpublished);
+        assert_eq!(second.root_agent_id(), Some(expected));
+        assert!(!second.agents().contains_key(&previous));
+        assert!(
+            second
+                .agents()
+                .values()
+                .filter(|agent| agent.parent.is_some())
+                .all(|agent| agent.parent == Some(expected))
+        );
+        let view = second.latest_state().unwrap();
+        assert!(!view.scopes.contains_key(&Some(previous)));
+        assert_eq!(
+            view.scopes[&Some(expected)].config.as_ref().unwrap().mode,
+            resolved_mode()
+        );
+        assert_eq!(view.boundaries[&seq].agent, Some(expected));
+        assert_eq!(
+            view.boundaries[&seq].lens,
+            BTreeMap::from([(expected, (0, 0))])
+        );
+        assert_eq!(second.branches()[0].agent, expected);
+        second.save_to(tmp.path()).unwrap();
+        let reloaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_same_session(&reloaded, &second);
+        assert!(!reloaded.legacy_root_unpublished);
+    }
+
+    #[test_case(false; "fresh_root")]
+    #[test_case(true; "published_root")]
+    fn established_root_rebind_refuses_without_mutation_or_disk_changes(reload: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let original = AgentId::generate();
+        session.bind_root_id(original).unwrap();
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        session.save_to(tmp.path()).unwrap();
+        if reload {
+            session = TestSession::load_from(session.id, tmp.path()).unwrap();
+        }
+        let before = session.clone();
+        let bytes = fs::read(jsonl_path(tmp.path(), session.id)).unwrap();
+        let replacement = AgentId::generate();
+        assert!(matches!(session.bind_root_id(replacement),
+            Err(SessionError::RootIdMismatch { stored_id, given_id })
+                if stored_id == original && given_id == replacement));
+        assert_eq!(session.revision(), before.revision());
+        assert_same_session(&session, &before);
+        assert_eq!(fs::read(jsonl_path(tmp.path(), session.id)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_config_resolution_seeds_host_config_once_and_preserves_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("legacy-model", "/legacy");
+        let legacy_meta = session.meta.clone();
+        let config = StoredAgentConfig {
+            cwd: "/restored".into(),
+            model: "discovered-model".into(),
+            thinking: Some(StoredThinking::Adaptive),
+            fast: true,
+            workflow: true,
+            mode: resolved_mode(),
+            options: [("host.option".to_owned(), "restored".to_owned())].into(),
+        };
+        session.resolve_legacy_config(config.clone()).unwrap();
+        let root = session.root_agent_id().unwrap();
+        let revision = session.revision();
+        let mut different = config.clone();
+        different.model = "must-not-overwrite".into();
+        session.resolve_legacy_config(different).unwrap();
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.meta, legacy_meta);
+        session.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_same_session(&loaded, &session);
+        assert_eq!(
+            loaded.latest_state().unwrap().scopes[&Some(root)]
+                .config
+                .as_ref(),
+            Some(&config)
+        );
+    }
+
+    #[test_case(false, false; "legacy_slot")]
+    #[test_case(true, false; "canonical_value_wins")]
+    #[test_case(true, true; "canonical_tombstone_wins")]
+    fn legacy_plan_migration_respects_canonical_presence(canonical: bool, tombstone: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/tmp");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut record = plugin_record(
+            session.next_state_seq(),
+            Some(serde_json::json!({"path":"legacy.md", "written":true})),
+        );
+        if let StateChange::Plugin { key, .. } = &mut record.change {
+            *key = LEGACY_PLAN_SLOT.into();
+        }
+        session.push_state(record);
+        if canonical {
+            let mut record = plugin_record(
+                session.next_state_seq(),
+                (!tombstone).then(|| serde_json::json!({})),
+            );
+            if let StateChange::Plugin { key, .. } = &mut record.change {
+                *key = PLAN_STATE_KEY.into();
+            }
+            session.push_state(record);
+        }
+        session.save_to(tmp.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        let view = loaded.latest_state().unwrap();
+        let value = &view.scopes[&None].plugins[PLAN_STATE_KEY].value;
+        if canonical {
+            assert_eq!(*value, (!tombstone).then(|| serde_json::json!({})));
+        } else {
+            let plans: PlanSlot = serde_json::from_value(value.clone().unwrap()).unwrap();
+            assert_eq!(plans[&root].path, Path::new("legacy.md"));
+            assert!(plans[&root].written);
+            assert!(plans[&root].approved.is_none());
+        }
+        let mut loaded = loaded;
+        loaded.save_to(tmp.path()).unwrap();
+        let reloaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.state(), reloaded.state());
+    }
+
+    #[test_case(2; "v2")]
+    #[test_case(3; "v3")]
+    fn plan_metadata_is_load_only_and_root_rekey_preserves_plan_map(version: u32) {
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":version, "id":id, "model":"model", "cwd":"/tmp", "created_at":1});
+        let meta = serde_json::json!({"t":"meta", "title":"plan", "token_usage":null, "updated_at":2, "plan_path":"legacy.md", "plan_written":true});
+        fs::write(jsonl_path(tmp.path(), id), format!("{header}\n{meta}\n")).unwrap();
+        let mut session = TestSession::load_from(id, tmp.path()).unwrap();
+        let previous = session.root_agent_id().unwrap();
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let view = session.latest_state().unwrap();
+        let plans: PlanSlot = serde_json::from_value(
+            view.scopes[&None].plugins[PLAN_STATE_KEY]
+                .value
+                .clone()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!plans.contains_key(&previous));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[&root].path, Path::new("legacy.md"));
+        assert!(plans[&root].written);
+        assert!(plans[&root].approved.is_none());
+        session.save_to(tmp.path()).unwrap();
+        assert_retired_meta_absent(&records(tmp.path(), id));
+        let loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(loaded.state(), session.state());
+    }
+
+    #[test_case("unique", true; "unique_child")]
+    #[test_case("orphan", true; "unlisted_transcript")]
+    #[test_case("duplicate", false; "duplicate_transcript_key")]
+    #[test_case("ambiguous", false; "ambiguous_identity")]
+    #[test_case("missing", false; "missing_transcript")]
+    fn v2_post_links_migrate_to_durable_ids_and_survive_rewrite(case: &str, available: bool) {
+        const KEY: &str = "legacy-post-child";
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"m", "cwd":"/tmp", "created_at":1});
+        let child =
+            serde_json::json!({"tool_use_id":KEY, "name":KEY, "ambiguous":case == "ambiguous"});
+        let children = match case {
+            "orphan" | "missing" => Vec::new(),
+            "duplicate" => vec![child.clone(), child],
+            _ => vec![child],
+        };
+        let meta = serde_json::json!({"t":"meta", "title":"legacy", "token_usage":null, "updated_at":2, "subagents":children});
+        let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":0, "text":POST_TEXT, "agent":KEY}});
+        let history = if case == "missing" {
+            String::new()
+        } else {
+            serde_json::json!({"t":"sub_msg", "sub":KEY, "d":user_message(POST_TEXT)}).to_string()
+        };
+        fs::write(
+            jsonl_path(tmp.path(), id),
+            format!("{header}\n{meta}\n{post}\n{history}\n"),
+        )
+        .unwrap();
+        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        let target = loaded.posts()[0].post.agent.clone();
+        assert_eq!(target.is_some(), available);
+        if let Some(target) = &target {
+            let target = target.parse::<AgentId>().unwrap();
+            assert_eq!(loaded.agents()[&target].transcript_key, KEY);
+            assert_eq!(
+                loaded.agents()[&target].lifecycle,
+                StoredAgentLifecycle::Closed
+            );
+        }
+        loaded.save_to(tmp.path()).unwrap();
+        let rewritten = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(rewritten.posts()[0].post.agent, target);
+        assert_eq!(rewritten.posts()[0].post.text, POST_TEXT);
+    }
+
+    #[test]
+    fn v2_migration_preserves_legacy_metadata_and_resolves_mode_only_on_request() {
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"legacy-model", "cwd":"/legacy", "created_at":1});
+        let child =
+            serde_json::json!({"tool_use_id":"duplicate", "agent_id":"old-id", "name":"legacy"});
+        let meta = serde_json::json!({
+            "t":"meta", "title":"legacy", "token_usage":null, "updated_at":2,
+            "subagents":[child.clone(),child], "mode":{"custom":"removed-mode"},
+            "thinking":{"kind":"off"}, "fast":true, "workflow":true,
+            "session_options":{"custom":"option"}, "session_rules":[{"tool":"bash", "effect":"deny"}],
+            "yolo":false, "plan_path":"plan.md", "plan_written":true
+        });
+        let orphan =
+            serde_json::json!({"t":"sub_msg", "sub":"orphan", "d":user_message("orphan history")});
+        let path = jsonl_path(tmp.path(), id);
+        fs::write(&path, format!("{header}\n{meta}\n{orphan}\n")).unwrap();
+        let mut session = TestSession::load_from(id, tmp.path()).unwrap();
+        let root = session.root_agent_id().unwrap();
+        assert_eq!(
+            session.meta.mode,
+            Some(StoredMode::Custom("removed-mode".into()))
+        );
+        let view = session.latest_state().unwrap();
+        assert!(
+            view.scopes
+                .get(&Some(root))
+                .is_none_or(|scope| scope.config.is_none())
+        );
+        assert_eq!(view.scopes[&None].rules, session.meta.session_rules);
+        assert_eq!(view.scopes[&None].yolo, Some(false));
+        let plans: PlanSlot = serde_json::from_value(
+            view.scopes[&None].plugins[PLAN_STATE_KEY]
+                .value
+                .clone()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plans[&root].path, Path::new("plan.md"));
+        assert!(plans[&root].written);
+        assert!(plans[&root].approved.is_none());
+        let children: Vec<_> = session
+            .agents()
+            .values()
+            .filter(|agent| agent.parent.is_some())
+            .collect();
+        assert_eq!(children.len(), 3);
+        assert_eq!(
+            children
+                .iter()
+                .map(|agent| agent.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+        for agent in children {
+            assert_eq!(agent.parent, Some(root));
+            assert!(agent.legacy && agent.ancestry_unknown);
+            assert_eq!(agent.lifecycle, StoredAgentLifecycle::Closed);
+            assert_eq!(agent.restorable, Err(LEGACY_CHILD_UNRESTORABLE.to_owned()));
+            assert!(agent.spec.is_none());
+        }
+        let legacy_meta = session.meta.clone();
+        session.save_to(tmp.path()).unwrap();
+        let mut session = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(session.meta, legacy_meta);
+        assert_eq!(session.root_agent_id(), Some(root));
+        assert!(
+            session
+                .latest_state()
+                .unwrap()
+                .scopes
+                .get(&Some(root))
+                .is_none_or(|scope| scope.config.is_none())
+        );
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        let revision = session.revision();
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        assert_eq!(session.revision(), revision);
+        session.save_to(tmp.path()).unwrap();
+        let reloaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_same_session(&reloaded, &session);
+        let config = reloaded.latest_state().unwrap().scopes[&Some(root)]
+            .config
+            .clone()
+            .unwrap();
+        assert_eq!(config.mode, resolved_mode());
+        assert_eq!(config.model, "legacy-model");
+        assert_eq!(config.cwd, "/legacy");
+        assert_eq!(config.thinking, Some(StoredThinking::Off));
+        assert!(config.fast && config.workflow);
+        assert_eq!(config.options, legacy_meta.session_options);
+        assert_eq!(
+            reloaded.subagent_messages()["orphan"][0],
+            user_message("orphan history")
+        );
+    }
+
+    #[test_case(b"{\"t\":\"state\",\"d\":{}}\n"; "malformed_state")]
+    #[test_case(b"{\"t\":\"agent\",\"seq\":1,\"d\":{}}\n"; "malformed_agent")]
+    #[test_case(b"{\"t\":\"branch\",\"d\":{}}\n"; "malformed_branch")]
+    fn malformed_v3_records_refuse_load_without_modifying_disk(record: &[u8]) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.save_to(tmp.path()).unwrap();
+        let path = jsonl_path(tmp.path(), session.id);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(record)
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(matches!(
+            TestSession::load_from(session.id, tmp.path()),
+            Err(SessionError::UnreadableRecord { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn inserting_an_earlier_cross_stream_revision_requires_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
+        let seq = session.next_state_seq();
+        session.push_state(plugin_record(seq + 1, Some(Value::Bool(true))));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let mut revision = session.agents()[&session.root_agent_id().unwrap()].clone();
+        revision.updated_seq = seq;
+        revision.label = Some("inserted earlier".into());
+        session.push_agent_revision(seq, revision);
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::LogDiverged { .. })
+        ));
+        SessionLog::rewrite(tmp.path(), &session).unwrap();
+        assert_same_session(
+            &TestSession::load_from(session.id, tmp.path()).unwrap(),
+            &session,
+        );
+    }
+
+    #[test]
+    fn invalid_journal_is_rejected_before_append_or_publication() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.push_state(plugin_record(1, Some(Value::Bool(true))));
+        let mut log = SessionLog::rewrite(tmp.path(), &session).unwrap();
+        let path = jsonl_path(tmp.path(), session.id);
+        let bytes = fs::read(&path).unwrap();
+        session.push_state(plugin_record(1, None));
+        assert!(matches!(
+            session.latest_state(),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            log.append(&session),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            SessionLog::rewrite(tmp.path(), &session),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert!(matches!(
+            SessionLog::stage_checkpoint(tmp.path(), &session),
+            Err(SessionError::InvalidState(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 
     #[test]
     fn child_history_epochs_fence_reconstructed_events_without_changing_disk_format() {
@@ -2416,6 +5739,52 @@ mod tests {
         SessionLog::rewrite(tmp.path(), &session).unwrap();
         let rewritten = TestSession::load_from(session.id, tmp.path()).unwrap();
         assert_eq!(rewritten.posts(), session.posts());
+    }
+
+    #[test_case(false; "in_memory")]
+    #[test_case(true; "reloaded")]
+    fn durable_post_references_retain_transcript_keys(reload: bool) {
+        const CHILD_KEY: &str = "post-child-transcript";
+        const DESCENDANT_KEY: &str = "post-descendant-transcript";
+        const ORPHAN_KEY: &str = "post-orphan-transcript";
+        let mut session = TestSession::new("m", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let mut ids = Vec::new();
+        for key in [CHILD_KEY, DESCENDANT_KEY, ORPHAN_KEY] {
+            let mut record = root_record(
+                AgentId::generate(),
+                session.agent_revisions().last().unwrap().0 + 1,
+            );
+            record.parent = Some(root);
+            record.depth = 1;
+            record.transcript_key = key.into();
+            ids.push(record.id);
+            session.push_agent_revision(record.created_seq, record);
+            session.set_subagent_messages(key.into(), vec![user_message(key)]);
+        }
+        let kept = stored_post(None, 0, Some(&ids[0].to_string()));
+        let nested = stored_post(Some(CHILD_KEY), 0, Some(&ids[1].to_string()));
+        session.push_post(kept.clone());
+        session.push_post(nested.clone());
+        session.push_post(stored_post(Some(ORPHAN_KEY), 0, Some(&ids[2].to_string())));
+        let tmp = TempDir::new().unwrap();
+        if reload {
+            session.save_to(tmp.path()).unwrap();
+            session = TestSession::load_from(session.id, tmp.path()).unwrap();
+        }
+        assert_eq!(session.subagent_messages().len(), ids.len());
+        session.prune_orphans(|_| Vec::new());
+        assert_eq!(
+            session.subagent_messages()[CHILD_KEY].as_slice(),
+            [user_message(CHILD_KEY)]
+        );
+        assert_eq!(
+            session.subagent_messages()[DESCENDANT_KEY].as_slice(),
+            [user_message(DESCENDANT_KEY)]
+        );
+        assert!(!session.subagent_messages().contains_key(ORPHAN_KEY));
+        assert_eq!(session.posts(), [kept, nested]);
     }
 
     #[test]
@@ -2904,6 +6273,29 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_branch_directory_without_touching_other_sessions() {
+        let (dir, session) = branch_fixture();
+        let saved = branch(&session);
+        SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone())
+            .unwrap()
+            .publish_unowned(|| true)
+            .unwrap();
+        let other = MakimaId::generate();
+        let other_path = branch_path(dir.path(), other, saved.id);
+        fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        fs::write(&other_path, POST_TEXT).unwrap();
+        TestSession::delete_from(session.id, dir.path()).unwrap();
+        assert!(
+            !branch_path(dir.path(), session.id, saved.id)
+                .parent()
+                .unwrap()
+                .exists()
+        );
+        assert!(!jsonl_path(dir.path(), session.id).exists());
+        assert_eq!(fs::read_to_string(other_path).unwrap(), POST_TEXT);
+    }
+
+    #[test]
     fn delete_removes_offload_dir() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -3161,7 +6553,7 @@ mod tests {
         assert_eq!(list[0].title, "renamed");
         let cache: Value =
             serde_json::from_slice(&fs::read(dir.join(SCAN_CACHE_FILE)).unwrap()).unwrap();
-        assert_eq!(cache["version"], 1);
+        assert_eq!(cache["version"], super::SCAN_CACHE_VERSION);
         assert_eq!(
             cache["entries"].as_object().unwrap().len(),
             1,
@@ -3445,15 +6837,20 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_yolo_roundtrip() {
+    fn legacy_yolo_seeds_rules_without_metadata_authoring() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("test/model", "/tmp");
         session.meta.yolo = Some(true);
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
-        assert_eq!(loaded.meta.yolo, Some(true));
+        assert_eq!(
+            loaded.latest_state().unwrap().scopes[&None].yolo,
+            Some(true)
+        );
+        assert_eq!(loaded.meta.yolo, None);
     }
 
     /// A torn tail is what a crash mid-append leaves behind, and the file is
@@ -3593,22 +6990,29 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_persists_through_save_load() {
+    fn legacy_config_seeds_state_without_metadata_authoring() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
         session.meta.workflow = true;
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
+        let view = loaded.latest_state().unwrap();
+        let config = view.scopes[&loaded.root_agent_id()]
+            .config
+            .as_ref()
+            .unwrap();
         assert_eq!(
-            loaded.meta.thinking,
+            config.thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
         );
-        assert!(loaded.meta.fast);
-        assert!(loaded.meta.workflow);
+        assert!(config.fast && config.workflow);
+        assert!(loaded.meta.thinking.is_none());
+        assert!(!loaded.meta.fast && !loaded.meta.workflow);
     }
 
     #[test]
@@ -3688,6 +7092,43 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
+    #[test_case(true; "unsupported_feature")]
+    #[test_case(false; "unsupported_version")]
+    fn incompatible_header_refuses_load_and_scan_without_touching_session(feature: bool) {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.push_message(user_message("preserved"));
+        session.save_to(tmp.path()).unwrap();
+        let path = jsonl_path(tmp.path(), session.id);
+        let bytes = fs::read_to_string(&path).unwrap();
+        let mut lines = bytes.lines();
+        let mut header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        if feature {
+            header["features"] = serde_json::json!([UNSUPPORTED_FEATURE]);
+        } else {
+            header["v"] = FUTURE_FORMAT_VERSION.into();
+        }
+        let changed = format!("{header}\n{}\n", lines.collect::<Vec<_>>().join("\n"));
+        fs::write(&path, changed.as_bytes()).unwrap();
+        let error = TestSession::load_from(session.id, tmp.path()).unwrap_err();
+        if feature {
+            assert!(
+                matches!(error, SessionError::UnsupportedFeatures { features }
+                if features == BTreeSet::from([UNSUPPORTED_FEATURE.to_owned()]))
+            );
+        } else {
+            assert!(matches!(
+                error,
+                SessionError::VersionMismatch {
+                    found: FUTURE_FORMAT_VERSION,
+                    ..
+                }
+            ));
+        }
+        assert!(TestSession::list_all_in(tmp.path()).unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), changed.as_bytes());
+    }
+
     #[test]
     fn scan_returns_latest_title_after_multiple_appends() {
         let tmp = TempDir::new().unwrap();
@@ -3745,7 +7186,7 @@ mod tests {
 
     const PROPERTY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
     const PROPERTY_STEPS: usize = 500;
-    const MUTATION_KINDS: u64 = 8;
+    const MUTATION_KINDS: u64 = 15;
     const EXTERNAL_TRUNCATION: u64 = 12;
 
     /// Deterministic xorshift so a failure is always the same failure.
@@ -3786,6 +7227,17 @@ mod tests {
         }
     }
 
+    fn normalized_epoch_state(session: &TestSession) -> Vec<StoredStateRecord> {
+        let mut state = session.state().to_vec();
+        let mut canonical = session.canonical_history_epochs();
+        let mut epoch = 0;
+        super::remap_loaded_history_epochs(&mut state, &mut canonical, || {
+            epoch += 1;
+            epoch
+        });
+        state
+    }
+
     #[track_caller]
     fn assert_same_session(loaded: &TestSession, expected: &TestSession) {
         assert_eq!(loaded.messages(), expected.messages(), "messages");
@@ -3796,8 +7248,61 @@ mod tests {
             "subagent messages",
         );
         assert_eq!(loaded.title, expected.title, "title");
-        assert_eq!(loaded.meta, expected.meta, "meta");
+        assert_eq!(
+            serde_json::to_value(&loaded.meta).unwrap(),
+            serde_json::to_value(&expected.meta).unwrap(),
+            "meta"
+        );
         assert_eq!(loaded.updated_at, expected.updated_at, "updated_at");
+        assert_eq!(loaded.id, expected.id, "id");
+        let (model, cwd) = expected.header_cache().unwrap();
+        assert_eq!(loaded.cwd, cwd, "cwd");
+        assert_eq!(loaded.model, model, "model");
+        assert_eq!(loaded.created_at, expected.created_at, "created_at");
+        assert_eq!(loaded.token_usage, expected.token_usage, "usage");
+        assert_eq!(loaded.subagents(), expected.subagents(), "subagents");
+        assert_eq!(loaded.posts(), expected.posts(), "posts");
+        assert_eq!(
+            loaded.usage_by_model(),
+            expected.usage_by_model(),
+            "model usage"
+        );
+        assert_eq!(
+            loaded.subagent_conversations,
+            expected.subagent_conversations
+        );
+        let loaded_state = normalized_epoch_state(loaded);
+        let expected_state = normalized_epoch_state(expected);
+        assert_eq!(loaded_state, expected_state, "state");
+        assert_eq!(
+            loaded.agent_revisions(),
+            expected.agent_revisions(),
+            "agent revisions"
+        );
+        assert_eq!(
+            loaded.sequence_high_water(),
+            expected.sequence_high_water(),
+            "sequence high water"
+        );
+        assert_eq!(loaded.agents(), expected.agents(), "agents");
+        assert_eq!(loaded.branches(), expected.branches(), "branches");
+        assert_eq!(loaded.parent(), expected.parent(), "parent");
+        assert_eq!(loaded.features(), expected.features(), "features");
+        assert_eq!(
+            crate::session_state::SessionStateView::fold(
+                &loaded_state,
+                loaded.agent_revisions(),
+                u64::MAX
+            )
+            .unwrap(),
+            crate::session_state::SessionStateView::fold(
+                &expected_state,
+                expected.agent_revisions(),
+                u64::MAX
+            )
+            .unwrap(),
+            "folded state"
+        );
     }
 
     fn mutate(session: &mut TestSession, rng: &mut Rng, step: usize) {
@@ -3822,6 +7327,38 @@ mod tests {
             }
             5 => session.replace_messages(vec![user_message(&format!("fresh-{step}"))]),
             6 => session.prune_orphans(tool_ids),
+            8 => session.push_state(plugin_record(
+                session.next_state_seq(),
+                Some(Value::from(step)),
+            )),
+            9 => session.push_state(plugin_record(session.next_state_seq(), None)),
+            10 => {
+                let mut agent = session.agents()[&session.root_agent_id().unwrap()].clone();
+                agent.updated_seq = session.next_state_seq();
+                agent.label = Some(format!("agent-{step}"));
+                session.push_agent_revision(agent.updated_seq, agent);
+            }
+            11 => session.push_branch(branch(session)),
+            12 => {
+                let mut records = session.branches().to_vec();
+                records.pop();
+                session.replace_branches(records);
+            }
+            13 => session.set_parent(Some(ParentLink {
+                session: session.id,
+                message_count: session.messages().len(),
+                seq: session.next_state_seq().saturating_sub(1),
+            })),
+            14 => session.push_state(StoredStateRecord {
+                seq: session.next_state_seq(),
+                agent: session.root_agent_id(),
+                generation: 0,
+                change: StateChange::Context {
+                    source: slot,
+                    hash: format!("hash-{step}"),
+                    content: format!("context-{step}"),
+                },
+            }),
             _ => {
                 session.set_title(format!("title-{step}"));
                 session.set_meta(SessionMeta {
@@ -3842,6 +7379,7 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         let mut log = SessionLog::rewrite(dir, &session).unwrap();
         let mut rng = Rng(PROPERTY_SEED);
+        session.resolve_legacy_mode(resolved_mode()).unwrap();
 
         for step in 0..PROPERTY_STEPS {
             mutate(&mut session, &mut rng, step);

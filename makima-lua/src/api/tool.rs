@@ -3,10 +3,11 @@
 use std::borrow::Cow;
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_lock::OnceCell;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
@@ -52,7 +53,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
-use crate::orchestration::{TrustedTarget, detached_outcome, services};
+use crate::orchestration::{PinnedCommandTarget, TrustedTarget, detached_outcome, services};
 use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintRegistration, Request, command_depth, command_invocation,
@@ -96,10 +97,10 @@ const COMPLETION_KEYS: &[&str] = &[
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Upper bound for the synchronous `mutable_path` callback round trip. On
-/// timeout the invocation reports no mutable path and dispatch skips the
-/// lock, degrading to today's behavior instead of blocking the agent.
 const MUTABLE_PATH_TIMEOUT: Duration = Duration::from_secs(3);
+const MUTABLE_PATH_DISCONNECTED: &str = "mutable_path callback runtime disconnected";
+const MUTABLE_PATH_TIMED_OUT: &str = "mutable_path callback timed out";
+const MUTABLE_PATH_INVALID_FIELD: &str = "mutable_path field must contain a string";
 const PLAIN_HEADER_STYLE: &str = "tool";
 
 type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
@@ -339,7 +340,8 @@ impl Tool for LuaTool {
             tx: self.tx.clone(),
             permission_state,
             mutable_path: self.mutable_path.clone(),
-            mutable_path_once: OnceLock::new(),
+            mutable_path_once: OnceCell::new(),
+            nested: crate::runtime::under_inflight_slot(),
             timeout: self.timeout,
             start_annotation: self.start_annotation.clone(),
         }))
@@ -363,9 +365,10 @@ struct LuaToolInvocation {
     mutable_path: Option<MutablePathKind>,
     /// Cache for the registry-key callback form: the per-invocation Lua
     /// round trip runs at most once.
-    mutable_path_once: OnceLock<Option<PathBuf>>,
+    mutable_path_once: OnceCell<Result<Option<PathBuf>, String>>,
     timeout: Option<Duration>,
     start_annotation: Option<StartAnnotation>,
+    nested: bool,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -437,7 +440,7 @@ impl ToolInvocation for LuaToolInvocation {
             },
             ctx: Box::new(LuaCtx::start(ctx)),
             reply: reply_tx,
-            nested: crate::runtime::under_inflight_slot(),
+            nested: self.nested,
         };
         let tx = self.tx.clone();
         Box::pin(async move {
@@ -487,24 +490,30 @@ impl ToolInvocation for LuaToolInvocation {
         }
     }
 
-    fn mutable_path(&self, ctx: &ToolContext) -> Option<PathBuf> {
-        match &self.mutable_path {
-            Some(MutablePathKind::Field(field)) => {
-                self.input.get(field.as_ref())?.as_str().map(PathBuf::from)
+    fn mutable_path<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+        Box::pin(async move {
+            match &self.mutable_path {
+                Some(MutablePathKind::Field(field)) => self
+                    .input
+                    .get(field.as_ref())
+                    .and_then(Value::as_str)
+                    .map(|path| Some(PathBuf::from(path)))
+                    .ok_or_else(|| MUTABLE_PATH_INVALID_FIELD.into()),
+                Some(MutablePathKind::Callback) => self
+                    .mutable_path_once
+                    .get_or_init(|| self.compute_callback_mutable_path(ctx))
+                    .await
+                    .clone(),
+                None => Ok(None),
             }
-            Some(MutablePathKind::Callback) => self
-                .mutable_path_once
-                .get_or_init(|| self.compute_callback_mutable_path(&ctx.cwd))
-                .clone(),
-            None => None,
-        }
+        })
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
-        // Read here on the caller's stack, not inside the future: a call a Lua
-        // tool dispatched is built while its parent is being polled, and that
-        // is the only moment we can tell it runs under the parent's slot.
-        let nested = crate::runtime::under_inflight_slot();
+        let nested = self.nested;
         let deadline = ctx.deadline;
         let plugin = self.plugin;
         let tool = self.tool;
@@ -516,8 +525,6 @@ impl ToolInvocation for LuaToolInvocation {
         Box::pin(async move {
             let now = Instant::now();
             let invocation_deadline = invocation_deadline(deadline, tool_timeout, now);
-            let effective_secs = invocation_deadline
-                .map(|deadline| deadline.saturating_duration_since(now).as_secs());
             if let Err(error) = deadline.check() {
                 return Err(error).into();
             }
@@ -549,44 +556,9 @@ impl ToolInvocation for LuaToolInvocation {
                 return Err("lua thread disconnected".to_string()).into();
             }
 
-            let recv = async { Some(reply_rx.recv_async().await) };
-            let result = match invocation_deadline {
-                Some(deadline) => {
-                    let call = ctx.call.clone();
-                    let timeout = async move {
-                        let moved = async {
-                            match call.as_ref() {
-                                Some(call) => {
-                                    call.moved().await;
-                                    true
-                                }
-                                None => std::future::pending().await,
-                            }
-                        };
-                        let timer = async {
-                            smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
-                            false
-                        };
-                        if futures_lite::future::or(moved, timer).await {
-                            std::future::pending::<()>().await;
-                        }
-                        None
-                    };
-                    futures_lite::future::or(recv, timeout).await
-                }
-                None => recv.await,
-            };
-
-            match result {
-                None => Err(format!(
-                    "plugin {} tool {} exceeded timeout ({}s)",
-                    plugin,
-                    tool,
-                    effective_secs.unwrap_or(0)
-                ))
-                .into(),
-                Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
-                Some(Ok(mut reply)) => {
+            match reply_rx.recv_async().await {
+                Err(_) => Err("lua thread disconnected".to_string()).into(),
+                Ok(mut reply) => {
                     reply.deadline = if reply.timeout_cleanup {
                         Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
                     } else {
@@ -1185,6 +1157,12 @@ async fn run_command(
     let depth = command_depth(&lua).saturating_add(1);
     let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
+        if let Some(ctx) = &ctx {
+            try_pair!(
+                ctx.trusted(&lua)
+                    .and_then(|trusted| trusted.validate_incarnation())
+            );
+        }
         let result = invocation
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
@@ -1196,10 +1174,13 @@ async fn run_command(
         return Ok(err_pair(TRUSTED_RUN_COMMAND_REQUIRED));
     };
     let trusted = try_pair!(ctx.trusted(&lua).map_err(|_| TRUSTED_RUN_COMMAND_REQUIRED));
+    try_pair!(trusted.validate_incarnation());
     let target = TrustedTarget {
         target: trusted.target.clone(),
         template: trusted.template.clone(),
     };
+    let incarnation = try_pair!(trusted.target_incarnation(&trusted.target));
+    let target = try_pair!(PinnedCommandTarget::pin_incarnation(target, incarnation));
     drop(ctx);
     let services = try_pair!(services(&lua).ok_or(NO_ORCHESTRATION_SERVICES));
     let run = try_pair!(services.command_runner(&target.target));
@@ -1552,7 +1533,9 @@ fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue>
         ),
         _ => (ToolOutputLines::default(), None),
     };
-    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    let mut ctx = LuaCtx::restore(tol, state, None);
+    ctx.bind_origin(&crate::runtime::active_task(lua));
+    let ud = lua.create_userdata(ctx)?;
     Ok(LuaValue::UserData(ud))
 }
 
@@ -2536,43 +2519,98 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 }
 
 impl LuaToolInvocation {
-    /// Synchronous round trip to the plugin host for a computed `mutable_path`
-    /// callback. Mirrors the `describe` round trip: same timeout, and on any
-    /// failure the invocation reports no mutable path so dispatch skips the
-    /// lock rather than stalling the agent.
-    fn compute_callback_mutable_path(&self, cwd: &Path) -> Option<PathBuf> {
+    async fn compute_callback_mutable_path(
+        &self,
+        ctx: &ToolContext,
+    ) -> Result<Option<PathBuf>, String> {
+        let deadline = match ctx.deadline {
+            Deadline::None => Instant::now() + MUTABLE_PATH_TIMEOUT,
+            Deadline::At(deadline) => deadline.min(Instant::now() + MUTABLE_PATH_TIMEOUT),
+        };
+        let (_abandon, cancel) = ctx.cancel.child();
         let (reply_tx, reply_rx) = flume::bounded(1);
-        let sent = self
-            .tx
-            .send(Request::MutablePath {
+        self.tx
+            .send_async(Request::MutablePath {
                 plugin: Arc::clone(&self.plugin),
                 tool: Arc::clone(&self.tool),
+                generation: self.generation,
                 input: self.input.clone(),
-                cwd: cwd.to_path_buf(),
+                cwd: ctx.cwd.clone(),
+                session: ctx.session_id.as_ref().map(SessionRef::id),
+                cancel: cancel.clone(),
+                deadline,
                 reply: reply_tx,
             })
-            .is_ok();
-        if !sent {
-            return None;
-        }
-        match reply_rx.recv_timeout(MUTABLE_PATH_TIMEOUT) {
-            Ok(Some(path)) => Some(PathBuf::from(path)),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(
-                    tool = %self.tool,
-                    error = %e,
-                    "mutable_path callback timed out; dispatch proceeds without a lock"
-                );
-                None
-            }
-        }
+            .await
+            .map_err(|_| MUTABLE_PATH_DISCONNECTED.to_owned())?;
+        let received = async {
+            reply_rx
+                .recv_async()
+                .await
+                .map_err(|_| MUTABLE_PATH_DISCONNECTED.to_owned())?
+                .map(|path| path.map(PathBuf::from))
+        };
+        let timed_out = async {
+            smol::Timer::at(deadline).await;
+            Err(MUTABLE_PATH_TIMED_OUT.to_owned())
+        };
+        cancel
+            .race(futures_lite::future::or(received, timed_out))
+            .await?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case::test_case(false; "request_disconnected")]
+    #[test_case::test_case(true; "reply_disconnected")]
+    fn mutable_path_transport_failure_is_cached(reply_disconnected: bool) {
+        let (tx, rx) = flume::unbounded();
+        let invocation = LuaToolInvocation {
+            tx,
+            mutable_path: Some(MutablePathKind::Callback),
+            ..invocation(json!({}))
+        };
+        let worker = if reply_disconnected {
+            Some(std::thread::spawn(move || {
+                let Request::MutablePath { reply, .. } = rx.recv().unwrap() else {
+                    panic!("expected mutable path request");
+                };
+                drop(reply);
+                assert!(rx.recv().is_err());
+            }))
+        } else {
+            drop(rx);
+            None
+        };
+        let ctx = makima_agent::tools::test_support::stub_ctx(&makima_agent::AgentMode::Build);
+        let result = smol::block_on(invocation.mutable_path(&ctx));
+        assert_eq!(result, Err(MUTABLE_PATH_DISCONNECTED.into()));
+        assert_eq!(smol::block_on(invocation.mutable_path(&ctx)), result);
+        drop(invocation);
+        if let Some(worker) = worker {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mutable_path_reply_timeout_is_an_error() {
+        let (tx, rx) = flume::unbounded();
+        let invocation = LuaToolInvocation {
+            tx,
+            mutable_path: Some(MutablePathKind::Callback),
+            ..invocation(json!({}))
+        };
+        let mut ctx = makima_agent::tools::test_support::stub_ctx(&makima_agent::AgentMode::Build);
+        ctx.deadline = Deadline::At(Instant::now());
+        assert_eq!(
+            smol::block_on(invocation.mutable_path(&ctx)),
+            Err(MUTABLE_PATH_TIMED_OUT.into())
+        );
+        drop(rx);
+    }
 
     #[test_case::test_case(None, Some(Duration::from_millis(1900)), Some(Duration::from_millis(1900)); "fractional_inherited")]
     #[test_case::test_case(Some(Duration::from_secs(1)), Some(Duration::from_millis(1900)), Some(Duration::from_secs(1)); "tool_timeout_caps_inherited")]
@@ -2784,7 +2822,8 @@ mod tests {
             tx,
             permission_state: PermissionState::Ready(None),
             mutable_path: None,
-            mutable_path_once: OnceLock::new(),
+            mutable_path_once: OnceCell::new(),
+            nested: crate::runtime::under_inflight_slot(),
             timeout: Some(Duration::from_secs(60)),
             start_annotation: None,
             has_start_fn: false,
@@ -2847,6 +2886,37 @@ mod tests {
             examples: None,
             has_describe_fn: false,
         }
+    }
+
+    #[test]
+    fn parsed_nested_tool_keeps_its_slot_after_execution_moves() {
+        const URL: &str = "https://example.com";
+        let (tx, rx) = flume::unbounded();
+        let tool = LuaTool {
+            tx,
+            ..make_lua_tool(None)
+        };
+        let invocation = smol::block_on(crate::runtime::covered_for_test(async {
+            tool.parse(&json!({ "url": URL })).unwrap()
+        }));
+        assert!(!crate::runtime::under_inflight_slot());
+        let ctx = makima_agent::tools::test_support::stub_ctx(&makima_agent::AgentMode::Build);
+        smol::block_on(async {
+            let mut execution = invocation.execute(&ctx);
+            assert!(
+                futures_lite::future::poll_once(execution.as_mut())
+                    .await
+                    .is_none()
+            );
+            let Request::CallTool { nested, reply, .. } = rx.recv_async().await.unwrap() else {
+                panic!("expected tool execution request");
+            };
+            assert!(nested);
+            reply
+                .send(ToolCallReply::err(crate::runtime::CANCELLED_MSG))
+                .unwrap();
+            execution.await;
+        });
     }
 
     #[test]
@@ -2946,7 +3016,8 @@ mod tests {
             tx,
             permission_state: PermissionState::NeedsCompute,
             mutable_path: None,
-            mutable_path_once: OnceLock::new(),
+            mutable_path_once: OnceCell::new(),
+            nested: crate::runtime::under_inflight_slot(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
@@ -2966,7 +3037,8 @@ mod tests {
             tx: tx2,
             permission_state: PermissionState::NeedsCompute,
             mutable_path: None,
-            mutable_path_once: OnceLock::new(),
+            mutable_path_once: OnceCell::new(),
+            nested: crate::runtime::under_inflight_slot(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,
@@ -2992,7 +3064,8 @@ mod tests {
             tx,
             permission_state: PermissionState::NeedsCompute,
             mutable_path: None,
-            mutable_path_once: OnceLock::new(),
+            mutable_path_once: OnceCell::new(),
+            nested: crate::runtime::under_inflight_slot(),
             timeout: None,
             start_annotation: None,
             has_start_fn: false,

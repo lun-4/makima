@@ -43,6 +43,5 @@ pub const SHOW_UNTRUSTED_PARENT: &str = "showing an agent requires a trusted par
 pub const BLANK_POST: &str = "post text must not be blank";
 pub const UNKNOWN_POST_OPTION: &str = "unknown post option";
 pub const UNKNOWN_POST_LEVEL: &str = "unknown post level";
-pub const UNLINKABLE_POST_AGENT: &str = "only agents spawned from Lua can be linked from a post";
 pub const POST_TARGET_SILENT: &str = "silent agents have no chat to post to";
 pub const POST_TARGET_NOT_STARTED: &str = "agent has no chat before its first turn";

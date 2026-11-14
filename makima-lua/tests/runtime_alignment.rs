@@ -8,9 +8,11 @@ use std::{
 
 use makima_agent::{
     ActorBackend, AgentContextSnapshot, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
-    ConfigChange, ConfigPatch, ControlWork, DoneReason, History, PreparedModel, RunSettings,
-    ToolOutput, TurnContext, TurnOutcome, WorkKind,
-    actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, graph_quiescence_barrier},
+    ConfigChange, ConfigPatch, ControlWork, DoneReason, PreparedModel, RunSettings, ToolOutput,
+    TurnContext, TurnOutcome, WorkKind,
+    actor::{
+        ActorEvent, ActorHistory, DeliveryStatus, EffectiveAgentConfig, graph_quiescence_barrier,
+    },
     cancel::CancelTrigger,
     tools::{ToolContext, ToolRegistry, TurnToolBindings},
 };
@@ -34,7 +36,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL: &str = "alignment initial";
 const STEERING: &str = "alignment steering";
 const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
-const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 const REPLY: &str = "alignment complete";
 const PROVIDER_FAILURE: &str = "alignment provider failure";
 const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
@@ -1041,7 +1042,7 @@ struct ManagedDriver {
 impl ActorBackend for ManagedDriver {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1115,7 +1116,7 @@ impl ActorBackend for ManagedDriver {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1124,7 +1125,7 @@ impl ActorBackend for ManagedDriver {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1467,7 +1468,15 @@ fn task_send_after_despawn_rejects() {
             json!({ "task_id": task["task_id"], "message": STEERING }),
         )
         .unwrap_err();
-        assert!(error.contains(UNKNOWN_TASK_ERR));
+        let agent_id = task["task_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            error,
+            makima_agent::ManagerError::NonLiveAgent(agent_id).to_string()
+        );
+        assert_eq!(
+            fixture.manager.node(agent_id).unwrap().graph_lifecycle,
+            makima_agent::GraphLifecycle::Closed
+        );
         assert!(fixture.requests.is_empty());
     });
 }

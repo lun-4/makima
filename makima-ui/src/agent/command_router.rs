@@ -45,11 +45,11 @@ mod tests {
     use std::pin::Pin;
     use std::time::Duration;
 
+    use makima_agent::actor::ActorHistory;
     use makima_agent::{
         ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentMetadata,
         BackendResult, ControlWork, CurrentManagedTurn, DoneReason, EffectiveAgentConfig,
-        EventSender, History, RunSettings, TurnCancellationReason, TurnContext, TurnOutcome,
-        WorkKind,
+        EventSender, RunSettings, TurnCancellationReason, TurnContext, TurnOutcome, WorkKind,
     };
     use makima_providers::{
         AgentError, Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions,
@@ -70,7 +70,7 @@ mod tests {
     impl ActorBackend for CancellableBackend {
         fn run_turn<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             context: TurnContext,
             _: AgentInput,
             _: WorkKind,
@@ -102,7 +102,7 @@ mod tests {
 
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: &'a ControlWork,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -111,7 +111,7 @@ mod tests {
 
         fn run_compact<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -127,7 +127,7 @@ mod tests {
     impl ActorBackend for CancelThenCompleteBackend {
         fn run_turn<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             context: TurnContext,
             _: AgentInput,
             _: WorkKind,
@@ -160,7 +160,7 @@ mod tests {
 
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: &'a ControlWork,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -169,7 +169,7 @@ mod tests {
 
         fn run_compact<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {

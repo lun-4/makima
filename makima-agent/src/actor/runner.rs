@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, TurnContext, WorkKind};
 use super::{
-    ActiveCancel, ActorEvent, ActorInner, ActorWork, CompactionStatus, ProcessingWork,
-    TurnAdmission, cancelled_outcome, settle_and_finalize_turn,
+    ActiveCancel, ActorEvent, ActorHistory, ActorInner, ActorWork, CompactionStatus,
+    ProcessingWork, TurnAdmission, cancelled_outcome, settle_and_finalize_turn,
 };
 use crate::types::{ActorWorkIdentity, TurnCancellationReason, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -123,7 +123,13 @@ impl Runner {
                     .unwrap_or_else(|error| error.into_inner());
                 super::delivery::schedule(&self.inner, &mut state);
                 let guarded = state.idle.is_some();
-                let work = state.pop_work(&self.queue);
+                let work = if self.inner.terminal_checkpoint.is_some()
+                    && state.pending_publications != 0
+                {
+                    None
+                } else {
+                    state.pop_work(&self.queue)
+                };
                 if guarded && state.idle.is_none() {
                     self.inner.policy_changed.notify(usize::MAX);
                 }
@@ -210,13 +216,13 @@ impl Runner {
             }
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
-        let lifecycle = {
+        let can_exit = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.runner_busy = false;
-            state.lifecycle
+            state.lifecycle != ActorLifecycle::Open && state.pending_publications == 0
         };
         self.inner.drained.notify(usize::MAX);
-        if lifecycle != ActorLifecycle::Open {
+        if can_exit {
             return Step::Exit;
         }
 
@@ -228,15 +234,15 @@ impl Runner {
         )
         .await;
 
-        match self
+        let state = self
             .inner
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lifecycle
-        {
-            ActorLifecycle::Open => Step::Waiting,
-            ActorLifecycle::Closed | ActorLifecycle::Shutdown => Step::Exit,
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle != ActorLifecycle::Open && state.pending_publications == 0 {
+            Step::Exit
+        } else {
+            Step::Waiting
         }
     }
 
@@ -245,6 +251,7 @@ impl Runner {
         work: ActorWork,
         cancellation_generation: u64,
     ) -> Option<super::history_edit::HistoryEditCompletion> {
+        self.history.synchronize_prepared_mirror();
         match work {
             ActorWork::Turn(admission) => self.run_turn(*admission, cancellation_generation).await,
             ActorWork::Control(control) => self.run_control(control).await,
@@ -285,18 +292,17 @@ impl Runner {
                 .get(&turn_id)
                 .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
             {
-                admission.ticket.resolve(cancelled_outcome(
-                    agent_id,
-                    turn_id,
-                    TurnCancellationReason::Withdrawn,
-                ));
                 state.delivery_runs.remove(&turn_id);
-                self.inner
-                    .tickets
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&turn_id);
-                state.settle_runner();
+                drop(state);
+                self.settle_turn(
+                    &admission,
+                    Some(cancelled_outcome(
+                        agent_id,
+                        turn_id,
+                        TurnCancellationReason::Withdrawn,
+                    )),
+                    false,
+                );
                 return;
             }
             // A reusable cancellation cut may have landed after this work was
@@ -398,18 +404,17 @@ impl Runner {
                 .get(&turn_id)
                 .is_some_and(|batch| batch.iter().all(|id| !state.deliveries.contains_key(id)))
             {
-                admission.ticket.resolve(cancelled_outcome(
-                    agent_id,
-                    turn_id,
-                    TurnCancellationReason::Withdrawn,
-                ));
                 state.delivery_runs.remove(&turn_id);
-                self.inner
-                    .tickets
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&turn_id);
-                state.settle_runner();
+                drop(state);
+                self.settle_turn(
+                    &admission,
+                    Some(cancelled_outcome(
+                        agent_id,
+                        turn_id,
+                        TurnCancellationReason::Withdrawn,
+                    )),
+                    false,
+                );
                 return;
             }
             admission.ticket.mark_started();
@@ -425,7 +430,7 @@ impl Runner {
             });
         }
         let backend = self.backend.run_turn(
-            &mut self.history,
+            ActorHistory::new(&mut self.history),
             TurnContext {
                 agent_id,
                 turn_id: Some(turn_id),
@@ -499,6 +504,7 @@ impl Runner {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if state.lifecycle != ActorLifecycle::Open
+                || self.inner.validate_effect_admission().is_err()
                 || state
                     .processing
                     .as_ref()
@@ -517,7 +523,7 @@ impl Runner {
         let result = self
             .backend
             .run_control(
-                &mut self.history,
+                ActorHistory::new(&mut self.history),
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,
@@ -568,6 +574,10 @@ impl Runner {
             if state.lifecycle != ActorLifecycle::Open {
                 return;
             }
+            if self.inner.validate_effect_admission().is_err() {
+                state.emit(ActorEvent::CompactionEnd(CompactionStatus::Cancelled));
+                return;
+            }
             if state
                 .processing
                 .as_ref()
@@ -588,7 +598,7 @@ impl Runner {
         let result = self
             .backend
             .run_compact(
-                &mut self.history,
+                ActorHistory::new(&mut self.history),
                 TurnContext {
                     agent_id: self.inner.agent_id,
                     turn_id: None,

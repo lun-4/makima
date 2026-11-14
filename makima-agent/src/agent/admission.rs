@@ -10,9 +10,11 @@ use tracing::warn;
 use super::instructions::{Instructions, load_instructions};
 use super::run::{ResolvedPromptInputs, TurnAdmissionSnapshot, TurnPromptInputs};
 use crate::actor::{ActorError, AdmissionPreparation, EffectiveAgentConfig, PreparedReadiness};
+use crate::context::{ContextBinding, ContextPolicy, ContextUpdate, RootContext};
 use crate::mcp::McpSession;
 use crate::mcp::protocol::{PromptMessage, PromptRole};
 use crate::prompt::ResolvedSlots;
+use crate::state::{StateAccess, StateError};
 use crate::tools::{LocalTools, ToolRegistry, TurnToolBindings};
 use crate::{AgentError, AgentInput, AgentMode, ModeRegistry};
 
@@ -60,6 +62,13 @@ impl PromptSlotSource {
             Err(_) => (Arc::default(), Some(PROMPT_SLOTS_CLOSED.into())),
         }
     }
+}
+
+#[derive(Clone, Default)]
+pub struct PromptContext {
+    binding: Option<ContextBinding>,
+    effective: Option<Arc<RootContext>>,
+    update: Option<ContextUpdate>,
 }
 
 #[derive(Clone)]
@@ -143,6 +152,7 @@ impl TurnSetup {
             mcp_prompt: binding,
             resolved: Some(rx),
             ready: None,
+            context: self.instructions.then(PromptContext::default),
         }
     }
 
@@ -159,7 +169,15 @@ impl TurnSetup {
 }
 
 async fn prepare_prompt_inputs(
+    snapshot: TurnAdmissionSnapshot,
+) -> Result<TurnAdmissionSnapshot, ActorError> {
+    resolve_prompt_inputs(snapshot, true, ContextPolicy::Admission).await
+}
+
+pub(crate) async fn resolve_prompt_inputs(
     mut snapshot: TurnAdmissionSnapshot,
+    strict: bool,
+    policy: ContextPolicy,
 ) -> Result<TurnAdmissionSnapshot, ActorError> {
     if let Some(prompt) = snapshot.prompt_inputs.as_mut() {
         let prompt = Arc::make_mut(prompt);
@@ -174,18 +192,52 @@ async fn prepare_prompt_inputs(
                     .map_err(ActorError::InvalidConfig)?,
             );
         }
-        if let Some(error) = prompt
-            .ready
-            .as_ref()
-            .and_then(|ready| ready.slots_error.as_ref())
+        if strict
+            && let Some(error) = prompt
+                .ready
+                .as_ref()
+                .and_then(|ready| ready.slots_error.as_ref())
         {
             return Err(ActorError::InvalidConfig(error.clone()));
+        }
+        if let Some(context) = &mut prompt.context
+            && context.update.is_none()
+            && let Some(binding) = &context.binding
+            && let Some(ready) = &mut prompt.ready
+        {
+            let (effective, update) = binding
+                .prepare(
+                    &prompt.instructions,
+                    &ready.slots,
+                    ready.slots_error.is_none(),
+                    policy,
+                )
+                .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
+            prompt.instructions = effective.instructions.clone();
+            ready.slots = Arc::clone(&effective.slots);
+            context.effective = Some(effective);
+            context.update = Some(update);
         }
     }
     Ok(snapshot)
 }
 
 impl TurnPromptInputs {
+    pub fn bind_context(&mut self, access: StateAccess) -> Result<(), StateError> {
+        if let Some(context) = &mut self.context {
+            context.binding = Some(ContextBinding::capture(access)?);
+        }
+        Ok(())
+    }
+
+    pub fn root_context(&self) -> Option<Arc<RootContext>> {
+        self.context.as_ref()?.effective.clone()
+    }
+
+    pub fn context_update(&self) -> Option<ContextUpdate> {
+        self.context.as_ref()?.update.clone()
+    }
+
     /// Waits for the slots and MCP prompt admitted with this turn and expands
     /// the prompt into the input's preamble.
     pub async fn resolve(
@@ -267,22 +319,43 @@ fn prompt_message(message: PromptMessage) -> Message {
 mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use futures_lite::future::poll_once;
     use makima_providers::Model;
+    use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
     use test_case::test_case;
 
-    use super::*;
-    use crate::actor::AgentContextSnapshot;
+    use super::{
+        PROMPT_SLOTS_CLOSED, PromptSlotSource, TurnSetup, mcp_prompt_error, resolve_prompt_inputs,
+        unknown_prompt,
+    };
+    use crate::actor::{ActorError, AgentContextSnapshot, EffectiveAgentConfig};
+    use crate::agent::{InstructionSource, Instructions, TurnAdmissionSnapshot};
+    use crate::context::{CONTEXT_CHANGED_NOTICE, ContextPolicy, ContextUpdate, RootContext};
+    use crate::journal::{JournalCommit, SessionJournal};
     use crate::mcp::test_support::stub_prompt_session;
-    use crate::prompt::{PromptId, Slot};
-    use crate::tools::NullProvider;
-    use crate::{McpPromptRef, RunSettings};
+    use crate::prompt::{PromptId, PromptSource, ResolvedSlots, Slot, SlotEntry};
+    use crate::state::StateAccess;
+    use crate::tools::{LocalTools, NullProvider, ToolRegistry};
+    use crate::{
+        AgentEvent, AgentId, AgentInput, AgentMode, EventSender, HistorySnapshot, McpPromptRef,
+        ModeRegistry, RunSettings,
+    };
 
     const PROMPT: &str = "srv.review";
     const MISSING_PROMPT: &str = "srv.missing";
     const PROMPT_TEXT: &str = "review the diff";
     const CWD: &str = "/tmp/admitted";
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const INSTRUCTION_PATH: &str = "/admission-context/project/AGENTS.md";
+    const INSTRUCTION_LABEL: &str = "project instructions";
+    const RECORDED_INSTRUCTIONS: &str = "recorded instructions";
+    const CHANGED_INSTRUCTIONS: &str = "changed instructions";
+    const RECORDED_SLOT: &str = "recorded identity";
+    const CHANGED_SLOT: &str = "changed identity";
+    const CONTEXT_PLUGIN: &str = "admission-context";
 
     fn setup(slots: PromptSlotSource) -> TurnSetup {
         TurnSetup {
@@ -376,5 +449,301 @@ mod tests {
             let slots = smol::block_on(inputs.resolve(&mut input, setup.mcp.as_ref())).unwrap();
             assert!(slots.get(PromptId::System, Slot::Identity).is_empty());
         }
+    }
+
+    fn root_journal() -> (Arc<SessionJournal>, StateAccess) {
+        let journal = Arc::new(SessionJournal::default());
+        let root = AgentId::generate();
+        journal
+            .commit(JournalCommit {
+                agents: vec![StoredAgentRecord {
+                    id: root,
+                    parent: None,
+                    depth: 0,
+                    transcript_key: String::new(),
+                    lifecycle: StoredAgentLifecycle::Open,
+                    ancestry_unknown: false,
+                    label: None,
+                    spawned_by_tool_use_id: None,
+                    spec: None,
+                    restorable: Ok(()),
+                    usage: Default::default(),
+                    created_seq: 0,
+                    updated_seq: 0,
+                    legacy: false,
+                }],
+                histories: [(root, HistorySnapshot::default())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let access = journal.state_access(root, None);
+        (journal, access)
+    }
+
+    fn context_snapshot(
+        access: &StateAccess,
+        slots: PromptSlotSource,
+        content: &str,
+    ) -> TurnAdmissionSnapshot {
+        let mut setup = setup(slots);
+        setup.instructions = true;
+        let mut snapshot =
+            setup.snapshot(&AgentInput::new(String::new(), Vec::new()), Some(&config()));
+        let prompt = Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap());
+        prompt.instructions = Instructions::from_sources(vec![InstructionSource {
+            path: INSTRUCTION_PATH.into(),
+            label: INSTRUCTION_LABEL.into(),
+            content: content.into(),
+        }]);
+        prompt.bind_context(access.clone()).unwrap();
+        snapshot
+    }
+
+    fn context_slots(content: Option<&str>) -> ResolvedSlots {
+        let mut slots = ResolvedSlots::default();
+        if let Some(content) = content {
+            slots.insert(
+                PromptId::System,
+                Slot::Identity,
+                SlotEntry {
+                    plugin: CONTEXT_PLUGIN.into(),
+                    registration: 0,
+                    content: content.into(),
+                },
+            );
+        } else {
+            slots.observe(PromptSource {
+                prompt: PromptId::System,
+                slot: Slot::Identity,
+                plugin: CONTEXT_PLUGIN.into(),
+                registration: 0,
+                content: None,
+            });
+        }
+        slots
+    }
+
+    fn slot_source(content: Option<&'static str>) -> PromptSlotSource {
+        PromptSlotSource::new(move || {
+            let (sender, receiver) = flume::bounded(1);
+            sender.send(context_slots(content)).unwrap();
+            receiver
+        })
+    }
+
+    fn effective_context(snapshot: &TurnAdmissionSnapshot) -> (Arc<RootContext>, ContextUpdate) {
+        let prompt = snapshot.prompt_inputs.as_ref().unwrap();
+        (
+            prompt.root_context().unwrap(),
+            prompt.context_update().unwrap(),
+        )
+    }
+
+    fn assert_recorded_context(context: &RootContext) {
+        assert_eq!(context.instructions.sources.len(), 1);
+        let source = &context.instructions.sources[0];
+        assert_eq!(source.path, Path::new(INSTRUCTION_PATH));
+        assert_eq!(source.label, INSTRUCTION_LABEL);
+        assert_eq!(source.content, RECORDED_INSTRUCTIONS);
+        let slots = context.slots.get(PromptId::System, Slot::Identity);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].plugin.as_ref(), CONTEXT_PLUGIN);
+        assert_eq!(slots[0].registration, 0);
+        assert_eq!(slots[0].content, RECORDED_SLOT);
+    }
+
+    #[test_case(Some(CHANGED_SLOT); "changed_slot")]
+    #[test_case(None; "empty_slot_observation")]
+    fn context_preparation_is_pinned_and_notifies_only_after_commit(
+        observed_slot: Option<&'static str>,
+    ) {
+        smol::block_on(async {
+            let (journal, access) = root_journal();
+            let before = journal.snapshot();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&requests);
+            let snapshot = context_snapshot(
+                &access,
+                PromptSlotSource::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let (sender, receiver) = flume::bounded(1);
+                    sender.send(context_slots(Some(RECORDED_SLOT))).unwrap();
+                    receiver
+                }),
+                RECORDED_INSTRUCTIONS,
+            );
+            let prepared = resolve_prompt_inputs(snapshot, true, ContextPolicy::Admission)
+                .await
+                .unwrap();
+            let (effective, update) = effective_context(&prepared);
+            assert_recorded_context(&effective);
+            assert_eq!(journal.snapshot().seq, before.seq);
+            assert!(
+                journal
+                    .snapshot()
+                    .state
+                    .iter()
+                    .all(|record| { !matches!(&record.change, StateChange::Context { .. }) })
+            );
+            let repeated = resolve_prompt_inputs(prepared, true, ContextPolicy::Admission)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&effective, &effective_context(&repeated).0));
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let (sender, events) = flume::unbounded();
+            let sender = EventSender::new(sender);
+            journal
+                .commit(JournalCommit {
+                    context_updates: vec![update.clone()],
+                    ..Default::default()
+                })
+                .unwrap();
+            update.notify(&sender);
+            assert!(events.try_recv().is_err());
+            assert!(journal.snapshot().state.iter().any(|record| {
+                record.agent == Some(access.target())
+                    && matches!(&record.change, StateChange::Context { .. })
+            }));
+            let committed = journal.snapshot().seq;
+            let changed = resolve_prompt_inputs(
+                context_snapshot(&access, slot_source(observed_slot), CHANGED_INSTRUCTIONS),
+                true,
+                ContextPolicy::Admission,
+            )
+            .await
+            .unwrap();
+            let (effective, update) = effective_context(&changed);
+            assert_recorded_context(&effective);
+            assert_eq!(journal.snapshot().seq, committed);
+            assert!(events.try_recv().is_err());
+            journal
+                .commit(JournalCommit {
+                    context_updates: vec![update.clone()],
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(events.try_recv().is_err());
+            update.notify(&sender);
+            assert!(matches!(
+                events.try_recv().unwrap().event,
+                AgentEvent::Post(post) if post.text == CONTEXT_CHANGED_NOTICE
+            ));
+            assert!(events.try_recv().is_err());
+            let repeated = resolve_prompt_inputs(
+                context_snapshot(&access, slot_source(observed_slot), CHANGED_INSTRUCTIONS),
+                true,
+                ContextPolicy::Admission,
+            )
+            .await
+            .unwrap();
+            let (effective, update) = effective_context(&repeated);
+            assert_recorded_context(&effective);
+            assert!(update.changes.is_empty());
+            update.notify(&sender);
+            assert!(events.try_recv().is_err());
+        });
+    }
+
+    #[test_case(true; "strict_rejects_failed_slots")]
+    #[test_case(false; "tolerant_preserves_recorded_slots")]
+    fn failed_slots_do_not_replace_recorded_context(strict: bool) {
+        smol::block_on(async {
+            let (journal, access) = root_journal();
+            let recorded = resolve_prompt_inputs(
+                context_snapshot(
+                    &access,
+                    slot_source(Some(RECORDED_SLOT)),
+                    RECORDED_INSTRUCTIONS,
+                ),
+                true,
+                ContextPolicy::Admission,
+            )
+            .await
+            .unwrap();
+            journal
+                .commit(JournalCommit {
+                    context_updates: vec![effective_context(&recorded).1],
+                    ..Default::default()
+                })
+                .unwrap();
+            let before = journal.snapshot().seq;
+            let result = resolve_prompt_inputs(
+                context_snapshot(
+                    &access,
+                    PromptSlotSource::new(|| flume::bounded(1).1),
+                    RECORDED_INSTRUCTIONS,
+                ),
+                strict,
+                ContextPolicy::Admission,
+            )
+            .await;
+            if strict {
+                assert!(matches!(
+                    result,
+                    Err(ActorError::InvalidConfig(message)) if message == PROMPT_SLOTS_CLOSED
+                ));
+            } else {
+                let snapshot = result.unwrap();
+                let (effective, update) = effective_context(&snapshot);
+                assert_recorded_context(&effective);
+                assert!(update.changes.is_empty());
+                let mut input = AgentInput::new(String::new(), Vec::new());
+                let slots = snapshot
+                    .prompt_inputs
+                    .as_ref()
+                    .unwrap()
+                    .resolve(&mut input, None)
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&slots, &effective.slots));
+            }
+            assert_eq!(journal.snapshot().seq, before);
+        });
+    }
+
+    #[test]
+    fn dropping_unresolved_or_prepared_context_leaves_the_journal_unchanged() {
+        smol::block_on(async {
+            let (journal, access) = root_journal();
+            let before = journal.snapshot();
+            let (sender, receiver) = flume::bounded(1);
+            let snapshot = context_snapshot(
+                &access,
+                PromptSlotSource::new(move || receiver.clone()),
+                RECORDED_INSTRUCTIONS,
+            );
+            let mut resolving = Box::pin(resolve_prompt_inputs(
+                snapshot,
+                true,
+                ContextPolicy::Admission,
+            ));
+            assert!(poll_once(resolving.as_mut()).await.is_none());
+            drop(resolving);
+            drop(sender);
+            let prepared = resolve_prompt_inputs(
+                context_snapshot(
+                    &access,
+                    slot_source(Some(RECORDED_SLOT)),
+                    RECORDED_INSTRUCTIONS,
+                ),
+                true,
+                ContextPolicy::Admission,
+            )
+            .await
+            .unwrap();
+            let (effective, update) = effective_context(&prepared);
+            assert_recorded_context(&effective);
+            drop(update);
+            drop(prepared);
+            let after = journal.snapshot();
+            assert_eq!(after.seq, before.seq);
+            assert_eq!(after.revision, before.revision);
+            assert!(
+                after
+                    .state
+                    .iter()
+                    .all(|record| { !matches!(&record.change, StateChange::Context { .. }) })
+            );
+        });
     }
 }

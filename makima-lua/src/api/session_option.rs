@@ -481,14 +481,14 @@ mod tests {
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
-    use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+    use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use makima_storage::id::MakimaId;
     use test_case::test_case;
 
     use super::*;
 
     fn coordinator(id: MakimaId, catalog: &SessionOptionCatalog) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = ClaimingWriter::accept_all();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog: catalog.clone(),

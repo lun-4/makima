@@ -554,6 +554,7 @@ fn restore_snapshot(
     let (tx, rx) = flume::unbounded::<makima_agent::Envelope>();
     eh.request_restore(
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from("code_execution"),
             tool_use_id: SCRIPT_TOOL_ID.into(),
             output: output.into(),

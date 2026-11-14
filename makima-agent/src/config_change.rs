@@ -9,6 +9,7 @@ use makima_domain::ModelSelection;
 use makima_providers::ModelError;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
+use makima_storage::session_state::StoredAgentConfig;
 use thiserror::Error;
 
 use crate::AgentMode;
@@ -22,6 +23,7 @@ use crate::session_coordinator::{
     publication_claim,
 };
 use crate::session_options::SessionOptionError;
+use crate::state::StateEdit;
 use crate::{ActorError, AgentActorHandle, AgentRef, ManagerError};
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -66,7 +68,7 @@ impl ConfigChangeError {
         )
     }
 
-    async fn wait_released(&self, actor: &AgentActorHandle) {
+    pub(crate) async fn wait_released(&self, actor: &AgentActorHandle) {
         match self {
             Self::Actor(ActorError::Busy) => actor.wait_unguarded().await,
             Self::Coordinator(SessionCoordinatorError::SessionBusy(id)) => {
@@ -82,19 +84,19 @@ impl ConfigChangeError {
 /// A change that met a busy target, in the actor's dispatch-ordered wait
 /// queue. Only the head retries, so a later change never overtakes an
 /// earlier waiting one.
-struct QueuedChange {
+pub(crate) struct QueuedChange {
     actor: AgentActorHandle,
     place: Arc<()>,
 }
 
 impl QueuedChange {
-    fn enqueue(actor: AgentActorHandle) -> Self {
+    pub(crate) fn enqueue(actor: AgentActorHandle) -> Self {
         let place = Arc::new(());
         waiting(&actor).push_back(Arc::clone(&place));
         Self { actor, place }
     }
 
-    async fn wait_turn(&self) {
+    pub(crate) async fn wait_turn(&self) {
         loop {
             let listener = self.actor.inner.policy_changed.listen();
             if waiting(&self.actor)
@@ -121,9 +123,17 @@ impl Drop for QueuedChange {
 /// nor overtakes a waiting change.
 pub async fn reserve_in_turn<T>(
     target: &AgentRef,
+    reserve: impl FnMut() -> Result<T, ConfigChangeError>,
+) -> Result<T, ConfigChangeError> {
+    reserve_in_turn_for_actor(target.actor()?, reserve).await
+}
+
+/// Takes a place in the captured actor's FIFO without resolving its durable id.
+/// `reserve` validates admission on every attempt.
+pub async fn reserve_in_turn_for_actor<T>(
+    actor: AgentActorHandle,
     mut reserve: impl FnMut() -> Result<T, ConfigChangeError>,
 ) -> Result<T, ConfigChangeError> {
-    let actor = target.actor()?;
     if waiting(&actor).is_empty() {
         match reserve() {
             Err(error) if error.is_busy() => {}
@@ -140,7 +150,7 @@ pub async fn reserve_in_turn<T>(
     }
 }
 
-fn waiting(actor: &AgentActorHandle) -> MutexGuard<'_, VecDeque<Arc<()>>> {
+pub(crate) fn waiting(actor: &AgentActorHandle) -> MutexGuard<'_, VecDeque<Arc<()>>> {
     actor
         .inner
         .config_waiters
@@ -148,17 +158,13 @@ fn waiting(actor: &AgentActorHandle) -> MutexGuard<'_, VecDeque<Arc<()>>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// A slot in an agent's config FIFO. Reserving takes the durable mutation and
-/// then the actor operation synchronously, so changes hold the session lease
-/// in dispatch order. A change that meets a held lease or idle guard queues
-/// and takes its slot once the holder lets go; it fails only if the target
-/// closes or the change is rejected.
 pub struct ConfigChangeTicket<'a> {
     publication: CheckpointPublication,
     reserve: Box<
         dyn FnMut(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError> + Send + 'a,
     >,
     queued: Option<QueuedChange>,
+    state_edits: Vec<StateEdit>,
     reserved: Option<(ConfigMutation, PreparedOperationTicket)>,
 }
 
@@ -171,11 +177,23 @@ impl<'a> ConfigChangeTicket<'a> {
         + 'a,
     ) -> Result<Self, ConfigChangeError> {
         target.validate_live()?;
-        let actor = target.actor()?;
+        Self::reserve_for_actor(target.actor()?, publication, reserve)
+    }
+
+    /// Reserves on the captured actor. `reserve` must validate the admission on
+    /// every attempt, including retries after a busy lease or idle guard.
+    pub fn reserve_for_actor(
+        actor: AgentActorHandle,
+        publication: CheckpointPublication,
+        reserve: impl FnMut(CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>
+        + Send
+        + 'a,
+    ) -> Result<Self, ConfigChangeError> {
         let mut ticket = Self {
             publication,
             reserve: Box::new(reserve),
             queued: None,
+            state_edits: Vec::new(),
             reserved: None,
         };
         if waiting(&actor).is_empty() {
@@ -188,25 +206,12 @@ impl<'a> ConfigChangeTicket<'a> {
         Ok(ticket)
     }
 
-    /// A refused attempt rolls its publication back, so the next attempt
-    /// takes a fresh one.
     fn try_reserve(&mut self, actor: &AgentActorHandle) -> Result<(), ConfigChangeError> {
-        let attempt = (|| {
-            let mutation = (self.reserve)(self.publication.clone())?;
-            let operation = actor.reserve_prepared_operation(None)?;
-            operation.register_publication(&self.publication)?;
-            Ok((mutation, operation))
-        })();
-        match attempt {
-            Ok(reserved) => {
-                self.reserved = Some(reserved);
-                Ok(())
-            }
-            Err(error) => {
-                self.publication = CheckpointPublication::default();
-                Err(error)
-            }
-        }
+        let operation = actor.reserve_prepared_operation(None)?;
+        let mutation = (self.reserve)(self.publication.clone())?;
+        operation.register_publication(&self.publication)?;
+        self.reserved = Some((mutation, operation));
+        Ok(())
     }
 
     async fn reserved(&mut self) -> Result<&PreparedOperationTicket, ConfigChangeError> {
@@ -234,8 +239,6 @@ impl<'a> ConfigChangeTicket<'a> {
         Ok(self.reserved().await?.wait_predecessor().await?)
     }
 
-    /// Cancelling it before the claim rolls the change back. A change that
-    /// queued publishes through a fresh one, so take it once reserved.
     pub fn publication(&self) -> CheckpointPublication {
         self.publication.clone()
     }
@@ -254,7 +257,8 @@ impl<'a> ConfigChangeTicket<'a> {
         let (claim, change) = prepare(self.publication, predecessor).await?;
         operation.resolve(Some(change))?;
         operation.wait_ready().await?;
-        let transaction = mutation(operation.ready_config()?, claim)?;
+        let mut transaction = mutation(operation.ready_config()?, claim)?;
+        transaction.state_edits.append(&mut self.state_edits);
         Ok(operation.commit_durable(transaction).await?.config)
     }
 
@@ -263,7 +267,7 @@ impl<'a> ConfigChangeTicket<'a> {
     /// session's file), else the predecessor's. {claim} sees the definition
     /// before it yields the claim.
     pub async fn commit_mode(
-        self,
+        mut self,
         target: &AgentRef,
         registry: &ModeRegistry,
         key: &str,
@@ -275,13 +279,20 @@ impl<'a> ConfigChangeTicket<'a> {
         ) -> Result<CheckpointClaim, ConfigChangeError>,
     ) -> Result<ConfigCommit, ConfigChangeError> {
         let actor = target.actor()?;
-        self.commit(async |publication, predecessor| {
-            let current = kept_plan.map_or_else(
-                || predecessor.mode.clone(),
-                |plan| AgentMode::Plan(plan.to_path_buf()),
-            );
-            let (mode, mode_def) = modes::resolve(registry, key, &current, state_dir)?;
-            actor.validate_mode_change(&mode, &mode_def)?;
+        let predecessor = self.wait_predecessor().await?;
+        let current = kept_plan.map_or_else(
+            || predecessor.mode.clone(),
+            |plan| AgentMode::Plan(plan.to_path_buf()),
+        );
+        let (mode, mode_def) = modes::resolve(registry, key, &current, state_dir)?;
+        actor.validate_mode_change(&mode, &mode_def)?;
+        if let Some(path) = mode.plan_path()
+            && let Some(edit) = crate::plan_state::allocation_edit(target, path)
+                .map_err(|error| ConfigChangeError::Rejected(error.to_string().into()))?
+        {
+            self.state_edits.push(edit);
+        }
+        self.commit(async |publication, _| {
             let claim = claim(publication, &mode_def).await?;
             let change = ConfigChange::Mode {
                 mode,
@@ -300,6 +311,37 @@ impl<'a> ConfigChangeTicket<'a> {
         self.commit(async |_, _| Ok((publication_claim(), change)))
             .await
     }
+}
+
+pub struct PreparedRestoreConfig {
+    pub saved: StoredAgentConfig,
+    pub model: PreparedModel,
+    pub mode: (AgentMode, ModeDef),
+    pub warning: Option<String>,
+}
+
+impl PreparedRestoreConfig {
+    pub fn resolve(self, operation: &PreparedOperationTicket) -> Result<(), ConfigChangeError> {
+        operation.resolve_restore(self.saved, self.model, self.mode)?;
+        Ok(())
+    }
+}
+
+pub async fn prepare_restore(
+    mut saved: StoredAgentConfig,
+    policy: &ModelPolicy,
+    prepare: &ModelPreparer,
+    modes: &ModeRegistry,
+) -> Result<PreparedRestoreConfig, ConfigChangeError> {
+    let model = prepare_model(&saved.model, policy, prepare).await?;
+    let restored = modes::prepare_restore(&saved.mode, modes)?;
+    saved.mode = restored.definition.stored_snapshot(&restored.mode);
+    Ok(PreparedRestoreConfig {
+        saved,
+        model,
+        mode: (restored.mode, restored.definition),
+        warning: restored.warning,
+    })
 }
 
 /// Resolves {spec} under {policy} and prepares its provider.

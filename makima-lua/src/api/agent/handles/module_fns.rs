@@ -3,12 +3,12 @@ use std::sync::Arc;
 use makima_agent::actor::ActorLifecycle;
 use makima_agent::{ActorEvent, AgentId, AgentManagerHandle};
 use makima_lua_macro::lua_fn;
-use mlua::{Lua, Table, UserDataRef};
+use mlua::{Lua, Table, UserDataRef, Value as LuaValue};
 
-use super::authority::{authorize, context_graph, lookup, scope};
+use super::authority::{authorize, context_graph, lookup, observe, scope};
 use super::{AgentOwners, LuaAgent, LuaAgentRef};
 use crate::agent_errors::{DELEGATED_FOCUS, FOREIGN_AGENT_REFERENCE, NO_FOCUSED_AGENT};
-use crate::api::agent::build_session;
+use crate::api::agent::{LuaSession, build_session};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::orchestration::resolve_target;
@@ -17,6 +17,7 @@ use crate::runtime::{current_plugin, in_delegated_tool};
 /// The agent of an explicit invocation context, for `ctx:agent()`.
 pub(crate) fn current(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgent>> {
     let (manager, id) = try_pair!(context_graph(lua, &ctx));
+    try_pair!(manager.reference(id).validate_live());
     try_pair!(scope(lua, &ctx, id));
     Ok((Some(try_pair!(lookup(manager, id, lua))), None))
 }
@@ -41,12 +42,14 @@ pub(crate) fn focused_agent_ref(lua: &Lua) -> Result<LuaAgentRef, String> {
 fn root(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgentRef>> {
     let (manager, _) = try_pair!(context_graph(lua, &ctx));
     let id = try_pair!(manager.root_id());
-    if let Ok(trusted) = ctx.trusted(lua) {
-        try_pair!(trusted.validate_target(lua, &try_pair!(manager.lookup(id))));
+    let reference = manager.reference(id);
+    let agent = try_pair!(lookup(manager.clone(), id, lua));
+    if ctx.trusted(lua).is_ok() {
+        try_pair!(observe(lua, &ctx, &agent));
     }
     Ok((
         Some(LuaAgentRef {
-            held: Some(try_pair!(manager.lookup(id))),
+            held: Some(reference),
             manager,
             id,
         }),
@@ -54,22 +57,36 @@ fn root(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<LuaAgentRef>> 
     ))
 }
 
-/// Resolve an AgentRef with current control authority. String IDs are not accepted.
+/// Resolve an agent reference or stable ID with current control authority.
 /// @param ctx LuaCtx Invocation context.
-/// @param reference AgentRef Visibility-only reference.
+/// @param reference AgentRef|string Visibility-only reference or stable agent ID.
 /// @return (Agent?, string?) Nonowning handle or error.
 #[lua_fn]
-fn get(
-    lua: &Lua,
-    ctx: UserDataRef<LuaCtx>,
-    reference: UserDataRef<LuaAgentRef>,
-) -> mlua::Result<Pair<LuaAgent>> {
+fn get(lua: &Lua, ctx: UserDataRef<LuaCtx>, reference: LuaValue) -> mlua::Result<Pair<LuaAgent>> {
     let (manager, _) = try_pair!(context_graph(lua, &ctx));
-    if ctx.trusted(lua).is_err() && !manager.same_manager(&reference.manager) {
-        return Ok(err_pair(FOREIGN_AGENT_REFERENCE));
+    let (manager, id) = match reference {
+        LuaValue::String(id) => (manager, try_pair!(id.to_str()?.parse::<AgentId>())),
+        LuaValue::UserData(reference) => {
+            let reference = reference.borrow::<LuaAgentRef>()?;
+            if ctx.trusted(lua).is_err() && !manager.same_manager(&reference.manager) {
+                return Ok(err_pair(FOREIGN_AGENT_REFERENCE));
+            }
+            (reference.manager.clone(), reference.id)
+        }
+        value => {
+            return Err(mlua::Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: "AgentRef or string".to_owned(),
+                message: None,
+            });
+        }
+    };
+    let agent = try_pair!(lookup(manager, id, lua));
+    if ctx.trusted(lua).is_ok() {
+        try_pair!(observe(lua, &ctx, &agent));
+    } else {
+        try_pair!(authorize(lua, &ctx, &agent));
     }
-    let agent = try_pair!(lookup(reference.manager.clone(), reference.id, lua));
-    try_pair!(authorize(lua, &ctx, &agent));
     Ok((Some(agent), None))
 }
 
@@ -93,7 +110,7 @@ fn is_self_or_ancestor(
     }
 }
 
-/// List accessible live agents in this context's graph.
+/// List accessible resident and dormant agents in this context's graph.
 /// @param ctx LuaCtx Invocation context.
 /// @return (table?, string?) Array of visibility-only AgentRef values. Visibility does not grant control.
 #[lua_fn]
@@ -105,11 +122,9 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     }
     let table = lua.create_table()?;
     for node in manager.snapshot() {
-        if let Some(trusted) = trusted {
-            let Ok(target) = manager.lookup(node.agent_id) else {
-                continue;
-            };
-            if trusted.validate_target(lua, &target).is_err() {
+        if trusted.is_some() {
+            let agent = try_pair!(lookup(manager.clone(), node.agent_id, lua));
+            if observe(lua, &ctx, &agent).is_err() {
                 continue;
             }
         } else if !try_pair!(is_self_or_ancestor(&manager, id, node.agent_id))
@@ -118,7 +133,7 @@ fn list(lua: &Lua, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
             continue;
         }
         table.push(LuaAgentRef {
-            held: Some(try_pair!(manager.lookup(node.agent_id))),
+            held: Some(manager.reference(node.agent_id)),
             manager: manager.clone(),
             id: node.agent_id,
         })?;
@@ -174,10 +189,20 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
         return Ok((None, error));
     };
     let id = session.agent_id;
-    let mut agent = try_pair!(lookup(session.agent.manager(), id, &lua));
-    agent.state = Some(Arc::clone(&session.state));
+    let agent = try_pair!(lookup(session.agent.manager(), id, &lua));
+    retain_session(&lua, session, owner);
+    Ok((Some(agent), None))
+}
+
+pub(in crate::api::agent) fn retain_session(
+    lua: &Lua,
+    session: LuaSession,
+    owner: Option<Arc<str>>,
+) {
+    let id = session.agent_id;
     let actor = Arc::clone(&session.actor);
     let events = actor.subscribe_events();
+    let identity = actor.identity();
     let existing = lua
         .app_data_ref::<AgentOwners>()
         .map(|owners| owners.clone());
@@ -189,17 +214,16 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
     owners.insert(session, owner);
     let snapshot = actor.snapshot();
     if snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none() {
-        owners.retire(id);
-        return Ok((Some(agent), None));
+        owners.retire_incarnation(id, &identity);
+        return;
     }
     smol::spawn(async move {
         while let Ok(event) = events.recv_async().await {
             if matches!(event, ActorEvent::Close { .. }) {
-                owners.retire(id);
+                owners.retire_incarnation(id, &identity);
                 break;
             }
         }
     })
     .detach();
-    Ok((Some(agent), None))
 }

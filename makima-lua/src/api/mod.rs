@@ -24,6 +24,7 @@ pub(crate) mod session;
 pub(crate) mod session_option;
 pub(crate) mod slot;
 pub(crate) mod split;
+pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod text;
 pub(crate) mod time;
@@ -62,6 +63,7 @@ pub(crate) struct PluginLoadContext {
     pub(crate) pending_commands: PendingCommandMap,
     pub(crate) pending_keymaps: PendingKeymapStore,
     pub(crate) pending_store: PendingStore,
+    pub(crate) pending_state: state::PendingState,
     pub(crate) pending_options: crate::api::options::PendingPluginOptionSpecs,
     pub(crate) pending_sources: Arc<Mutex<crate::api::completion::PendingCompletionStore>>,
     pub(crate) pending_expanders: Arc<Mutex<crate::api::completion::PendingExpanderStore>>,
@@ -129,6 +131,10 @@ pub(crate) fn create_makima_global(
     makima.set(
         "session",
         session::create_session_table(lua, ui_action_tx.clone())?,
+    )?;
+    makima.set(
+        "state",
+        state::create_state_table(lua, context.pending_state.clone(), Arc::clone(&plugin))?,
     )?;
     makima.set("model", model::create_model_table(lua)?)?;
     makima.set(

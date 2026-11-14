@@ -90,6 +90,7 @@ The rules:
 | [`makima.api`](#makima-api) | Plugin registration. |
 | [`makima.perf`](#makima-perf) | Performance instrumentation for splashes and the UI. |
 | [`makima.store`](#makima-store) | Shared key-value store for plugin contributions. |
+| [`makima.state`](#makima-state) | Journaled plugin slots, scoped to an agent or session. |
 | [`makima.agent`](#makima-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`makima.agent.Agent`](#makima-agent-Agent) | A nonowning agent handle. |
 | [`makima.agent.AgentRef`](#makima-agent-AgentRef) | Visibility-only identity. |
@@ -1490,6 +1491,33 @@ empty table.
 **Returns:** table Map of entry key to registered value.
 
 
+## makima.state {#makima-state}
+
+Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Unloaded plugin values remain stored without running plugin code.
+
+---
+
+### `makima.state.register()` {#makima-state-register}
+
+```lua
+makima.state.register({name}, {spec})
+```
+
+Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Registration is transactional with plugin load.
+
+**Returns:** (`StateSlot`) Registered slot.
+
+---
+
+### `makima.state.null()` {#makima-state-null}
+
+```lua
+makima.state.null()
+```
+
+JSON null sentinel. Unlike nil it remains present in arrays and objects.
+
+
 ## makima.agent {#makima-agent}
 
 Subagent primitives for plugins that need to talk to an LLM.
@@ -1566,7 +1594,7 @@ prompt for a subagent session.
   Optional fields:
 
   - `instructions` (`string|boolean?`) extra text appended to the prompt.
-    `true` loads instructions from the project `.makima/instructions` file.
+    `true` uses the invoking turn's recorded instructions.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
@@ -1768,7 +1796,7 @@ Read the root agent of this context's graph.
 makima.agent.list({ctx})
 ```
 
-List accessible live agents in this context's graph.
+List accessible resident and dormant agents in this context's graph.
 
 **Parameters:**
 
@@ -1784,12 +1812,12 @@ List accessible live agents in this context's graph.
 makima.agent.get({ctx}, {reference})
 ```
 
-Resolve an AgentRef with current control authority. String IDs are not accepted.
+Resolve an agent reference or stable ID with current control authority.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{reference}` ([`AgentRef`](#makima-agent-AgentRef)) Visibility-only reference.
+- `{reference}` (`AgentRef|string`) Visibility-only reference or stable agent ID.
 
 **Returns:** ([`Agent?`](#makima-agent-Agent), `string?`) Nonowning handle or error.
 
@@ -1859,6 +1887,35 @@ Agent:id()
 Read the stable agent ID.
 
 **Returns:** (`string?`, `string?`) Agent ID.
+
+---
+
+### `Agent:is_live()` {#Agent-is_live}
+
+```lua
+Agent:is_live()
+```
+
+Check whether this agent currently has an open resident actor.
+
+**Returns:** (`boolean?`, `string?`) Liveness without restoring the agent.
+
+---
+
+### `Agent:turn()` {#Agent-turn}
+
+```lua
+Agent:turn({ctx}, {turn_id})
+```
+
+Resolve an exact retained turn without starting or restoring the agent.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{turn_id}` (`string`) Stable turn ID.
+
+**Returns:** ([`AgentTurn?`](#makima-agent-AgentTurn), `string?`) Exact-turn ticket or a retention error.
 
 ---
 
@@ -2086,6 +2143,22 @@ Permanently close this agent and its descendants.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:retire()` {#Agent-retire}
+
+```lua
+Agent:retire({ctx})
+```
+
+Retire a quiescent leaf, preserving its retained results and transcript.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or a retirement error.
 
 ---
 

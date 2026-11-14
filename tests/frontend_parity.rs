@@ -34,11 +34,15 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use makima_agent::ToolOutput;
+use makima_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
 use makima_lua::ui_sink::NO_UI_ERR;
 use makima_providers::{Message, TokenUsage};
 use makima_storage::StateDir;
-use makima_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
+use makima_storage::plans::{
+    ApprovedPlan, PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot,
+};
+use makima_storage::session_state::{StateChange, StoredStateRecord};
+use makima_storage::sessions::{Effort, Prefs, Session, StoredThinking};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -99,6 +103,8 @@ const NO_RESPONSE: &str = "makima never answered the request";
 const REPLY: &str = "ok";
 const PROMPT_ID: u64 = 3;
 const NO_INIT: &str = "the SDK never emitted its init event";
+const PLAN_CONTENT: &str = "Implement the saved plan.";
+const MODIFIED_PLAN_CONTENT: &str = "Unexpected external edit.";
 const PLAN_FILE: &str = "saved-plan.md";
 const SSE_REPLY: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
@@ -705,8 +711,16 @@ fn print_refuses_a_child_ask_at_once() {
 
 /// Like the TUI and ACP, an SDK resume puts the session back in the mode it
 /// was saved in, here plan mode with its plan file.
-#[test]
-fn sdk_resume_restores_the_saved_mode() {
+#[test_case(None, "plan", "plan", None; "invocation_yolo_preserves_saved_plan")]
+#[test_case(Some("default"), "default", "build", Some(false); "explicit_default_exits_saved_plan")]
+#[test_case(Some("bypassPermissions"), "bypassPermissions", "build", Some(true); "explicit_bypass_exits_saved_plan")]
+#[test_case(Some("plan"), "plan", "plan", Some(false); "explicit_plan_disables_invocation_yolo")]
+fn sdk_resume_restores_the_saved_mode(
+    permission_mode: Option<&str>,
+    expected_permission_mode: &str,
+    expected_mode: &str,
+    expected_yolo: Option<bool>,
+) {
     let home = TempDir::new().unwrap();
     write_config(home.path(), DEAD_PROXY, BLANK);
     let work = home.path().join("work");
@@ -717,12 +731,51 @@ fn sdk_resume_restores_the_saved_mode() {
     let mut session: Session<Message, TokenUsage, ToolOutput> =
         Session::new(&format!("{PROVIDER}/{MODEL}"), &work.to_string_lossy());
     session.replace_messages(vec![Message::user(PROMPT.into())]);
-    session.meta.mode = Some(StoredMode::Plan);
-    session.meta.plan_path = Some(plan.to_string_lossy().into_owned());
-    session.save(&StateDir::from_path(state)).unwrap();
+    let mode = AgentMode::Plan(plan.clone());
+    let definition = ModeDef::default_for(ModeId::Plan);
+    session
+        .resolve_legacy_mode(definition.stored_snapshot(&mode))
+        .unwrap();
+    let plans: PlanSlot = [(
+        session.root_agent_id().unwrap(),
+        PlanEntry {
+            path: plan.clone(),
+            written: true,
+            approved: Some(ApprovedPlan {
+                content: PLAN_CONTENT.into(),
+                sha256: makima_agent::plan_state::content_sha256(PLAN_CONTENT),
+            }),
+            staged_model: None,
+        },
+    )]
+    .into();
+    let next_sequence = session
+        .state()
+        .iter()
+        .map(|record| record.seq)
+        .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
+        .max()
+        .unwrap_or_default()
+        + 1;
+    session.push_state(StoredStateRecord {
+        seq: next_sequence,
+        agent: None,
+        generation: 0,
+        change: StateChange::Plugin {
+            key: PLAN_STATE_KEY.into(),
+            version: PLAN_STATE_VERSION,
+            value: Some(serde_json::to_value(plans).unwrap()),
+        },
+    });
+    let storage = StateDir::from_path(state);
+    session.save(&storage).unwrap();
+    std::fs::write(&plan, MODIFIED_PLAN_CONTENT).unwrap();
 
     let mut args = frontend_args(Frontend::Sdk);
     args.extend(["-c".to_owned(), session.id.to_string()]);
+    if let Some(permission_mode) = permission_mode {
+        args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
+    }
     let mut child = spawn_makima(home.path(), &work, args);
     let output = json_lines(child.stdout.take().unwrap());
     let init = loop {
@@ -732,8 +785,27 @@ fn sdk_resume_restores_the_saved_mode() {
         }
     };
     drop(child.stdin.take());
-    assert_eq!(init["permissionMode"], "plan", "{init}");
+    assert_eq!(init["permissionMode"], expected_permission_mode, "{init}");
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), PLAN_CONTENT);
     assert!(wait_exit(child).success());
+    let restored: Session<Message, TokenUsage, ToolOutput> =
+        Session::load(session.id, &storage).unwrap();
+    let folded = restored.latest_state().unwrap();
+    let config = folded.scopes[&restored.root_agent_id()]
+        .config
+        .as_ref()
+        .unwrap();
+    assert_eq!(config.mode.id, expected_mode);
+    if expected_mode == ModeId::Plan.key() {
+        assert_eq!(
+            config.mode.restrict_write_to.as_deref(),
+            Some(plan.as_path())
+        );
+    }
+    assert_eq!(
+        folded.scopes.get(&None).and_then(|scope| scope.yolo),
+        expected_yolo
+    );
 }
 
 /// Waits for {child} to exit, killing it if it outlives the bound.

@@ -161,7 +161,8 @@ mod tests {
     #[test]
     fn accepted_reports_are_captured_before_settlement_and_cannot_change_frozen_results() {
         use makima_agent::{
-            AgentActorHandle, AgentId, AgentInput, History, TurnCancellationReason, TurnOutcome,
+            AgentActorHandle, AgentId, AgentInput, TurnCancellationReason, TurnOutcome,
+            actor::ActorHistory,
             actor::{ActorBackend, BackendResult, TurnContext, WorkKind},
         };
         use makima_providers::TokenUsage;
@@ -169,7 +170,7 @@ mod tests {
         impl ActorBackend for Backend {
             fn run_turn<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 context: TurnContext,
                 _input: AgentInput,
                 _work: WorkKind,
@@ -188,7 +189,7 @@ mod tests {
             }
             fn run_control<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 _context: TurnContext,
                 _control: &'a makima_agent::actor::ControlWork,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -197,7 +198,7 @@ mod tests {
             }
             fn run_compact<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 _context: TurnContext,
                 _instructions: Option<&'a str>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>

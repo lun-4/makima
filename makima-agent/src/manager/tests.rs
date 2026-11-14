@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,17 +9,41 @@ use std::time::Duration;
 
 use test_case::test_case;
 
+#[cfg(unix)]
+use crate::file_restore::{StoredSession, recording::ToolRecording};
+use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
+#[cfg(unix)]
+use crate::tools::{offload::OffloadStore, test_support::stub_ctx};
 use event_listener::Event;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
 };
+#[cfg(unix)]
+use makima_storage::StateDir;
+#[cfg(unix)]
+use makima_storage::blobs::{BlobStore, FileState};
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::SessionRef;
+use makima_storage::session_state::{
+    StateChange, StoredAgentLifecycle, StoredDelivery, StoredDeliveryOp,
+};
+use makima_storage::sessions::Session;
+#[cfg(unix)]
+use makima_storage::sessions::{SESSIONS_DIR, offload_dir};
 use serde_json::Value;
 
-use super::{AgentLimits, AgentManagerHandle, AgentMetadata, GraphLifecycle, ManagerError};
-use crate::actor::PreparedTurn;
+use super::{
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
+};
+use crate::actor::{
+    ActorHistory, ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES,
+    MAX_PENDING_PREVIEW_BYTES, PreparedTurn, TurnProvenance, TurnResult, graph_quiescence_barrier,
+};
+use crate::journal::{
+    GraphCheckpoint, GraphMutation, GraphRestartError, GraphStore, MemoryGraphStore,
+    MemoryGraphStoreError,
+};
 use crate::{
     ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelToken,
     ConfigChange, ConfigPatch, ControlWork, EventSender, History, PreparedModel,
@@ -27,6 +53,323 @@ use crate::{
 const GRAPH_SUBSCRIBER: u64 = 1;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
+const SMALL_RETAINED_QUOTA: usize = 4;
+#[cfg(unix)]
+const TOOL_WRITE_BYTES: &[u8] = b"write completed after shutdown cut";
+#[cfg(unix)]
+const TOOL_WRITE_MODEL: &str = "shutdown-tool-recording";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestAgentRecord {
+    id: crate::AgentId,
+    parent: Option<crate::AgentId>,
+    label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestStateRecord {
+    agent: crate::AgentId,
+    turn: crate::TurnId,
+}
+
+type TestGraphStore = MemoryGraphStore<TestAgentRecord, TestStateRecord>;
+
+fn restart_manager(store: &TestGraphStore) -> AgentManagerHandle {
+    store.restart().unwrap();
+    AgentManagerHandle::restore_empty_graph(AgentLimits::default(), store).unwrap()
+}
+
+#[cfg(unix)]
+#[test_case(false; "shutdown_waits_for_postcapture")]
+#[test_case(true; "timeout_reaper_preserves_postcapture")]
+fn shutdown_drains_actual_write_before_incarnation_cleanup(timeout: bool) {
+    smol::block_on(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temporary.path().canonicalize().unwrap());
+        let mut session = StoredSession::new(TOOL_WRITE_MODEL, temporary.path().to_str().unwrap());
+        session.save(&state).unwrap();
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        manager.journal().bind_session(session.id).unwrap();
+        let (entered, current) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(ReportingCancellableBackend { current: entered }),
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+        let turn = current.recv_async().await.unwrap();
+        let incarnation = root.incarnation().unwrap();
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.managed_turn = Some(turn);
+        ctx.offload = Some(Arc::new(OffloadStore::on_disk(offload_dir(
+            &state.path().join(SESSIONS_DIR),
+            session.id,
+        ))));
+        let recording = ToolRecording::from_context(&ctx).unwrap().unwrap();
+        let path = temporary.path().canonicalize().unwrap().join("written");
+        let capture = recording.capture(&path).unwrap();
+        let write_path = path.clone();
+        let (write_entered, writing) = flume::bounded(1);
+        let (release, resume) = flume::bounded(1);
+        let (finished, recorded) = flume::bounded(1);
+        manager
+            .retain_tool_completion(root.id(), async move {
+                let result = smol::unblock(move || {
+                    write_entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                    fs::write(write_path, TOOL_WRITE_BYTES).unwrap();
+                    recording.finish(capture)
+                })
+                .await;
+                finished.send(result).unwrap();
+            })
+            .unwrap();
+        writing.recv_async().await.unwrap();
+        let journal = manager.journal();
+        let publication = journal.reserve_publication().await;
+        let mut shutdown = Box::pin(manager.shutdown(if timeout {
+            Duration::ZERO
+        } else {
+            COMPLETION_TIMEOUT
+        }));
+        if timeout {
+            let report = shutdown.as_mut().await;
+            assert!(report.timed_out.contains(&root.id()));
+        } else {
+            assert!(
+                futures_lite::future::poll_once(shutdown.as_mut())
+                    .await
+                    .is_none()
+            );
+            manager.detach_incarnation(&incarnation).unwrap();
+        }
+        assert_eq!(
+            journal.incarnation(root.id()).reservation,
+            incarnation.reservation
+        );
+        assert!(actor.admit_turn(input(), None, String::new()).is_err());
+        assert!(manager.retain_tool_completion(root.id(), async {}).is_err());
+        release.send(()).unwrap();
+        recorded.recv_async().await.unwrap().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), TOOL_WRITE_BYTES);
+        let snapshot = journal.snapshot();
+        let after = snapshot
+            .state
+            .iter()
+            .find_map(|record| match &record.change {
+                StateChange::File {
+                    path: recorded_path,
+                    before: FileState::Absent,
+                    after,
+                } if recorded_path == &path => Some(after),
+                _ => None,
+            })
+            .unwrap();
+        let FileState::Blob(reference) = after else {
+            panic!("written file requires post-image");
+        };
+        assert_eq!(
+            BlobStore::new(state).read(reference).unwrap(),
+            TOOL_WRITE_BYTES
+        );
+        drop(publication);
+        if !timeout {
+            assert!(shutdown.await.timed_out.is_empty());
+        }
+        ticket.wait_result().await;
+        manager.wait_until_reaped().await;
+        assert!(manager.tool_completions_finished(None));
+        assert_ne!(
+            journal.incarnation(root.id()).reservation,
+            incarnation.reservation
+        );
+    });
+}
+
+#[test]
+fn weak_manager_observer_does_not_retain_manager_or_journal() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let journal = manager.journal();
+    let journal_weak = Arc::downgrade(&journal);
+    let observer = manager.downgrade();
+    assert!(observer.upgrade().unwrap().same_manager(&manager));
+    let receiver = journal.subscribe_state_changes();
+    drop(journal);
+    drop(manager);
+    assert!(observer.upgrade().is_none());
+    assert!(journal_weak.upgrade().is_none());
+    assert!(receiver.is_disconnected());
+}
+
+#[test]
+fn restart_manager_round_trips_an_empty_graph() {
+    let store = TestGraphStore::default();
+    let manager = restart_manager(&store);
+    let generation = manager.generation();
+    assert!(manager.snapshot().is_empty());
+    drop(manager);
+
+    let manager = restart_manager(&store);
+    assert!(manager.snapshot().is_empty());
+    assert!(matches!(manager.root(), Err(ManagerError::MissingRoot)));
+    assert_ne!(manager.generation(), generation);
+    assert_eq!(manager.limits(), AgentLimits::default());
+
+    smol::block_on(async {
+        let (entered, current) = flume::unbounded();
+        let gate = Gate::new();
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                TestBackend::reporting(entered, Some(gate.clone())),
+            )
+            .unwrap();
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, String::new())
+            .unwrap();
+        let context = current.recv_async().await.unwrap();
+        assert_eq!(context.agent_id(), root.id());
+        gate.release(1);
+        let result = ticket.wait_result().await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "successful_publication")]
+#[test_case(true; "retry_failed_publication")]
+fn graph_store_restarts_at_the_published_immutable_prefix(fail_first: bool) {
+    let store = TestGraphStore::default();
+    let root = TestAgentRecord {
+        id: crate::AgentId::generate(),
+        parent: None,
+        label: "root".into(),
+    };
+    let admitted = TestStateRecord {
+        agent: root.id,
+        turn: crate::TurnId::generate(),
+    };
+    let first_revision = store.put_agent(root.clone()).unwrap();
+    let published_revision = store.append_state(admitted.clone()).unwrap();
+    assert!(published_revision > first_revision);
+    let checkpoint = store.snapshot().unwrap();
+    let child = TestAgentRecord {
+        id: crate::AgentId::generate(),
+        parent: Some(root.id),
+        label: "unpublished child".into(),
+    };
+    store.put_agent(child).unwrap();
+    assert_eq!(checkpoint.revision(), published_revision);
+    assert!(store.load().unwrap().records().is_empty());
+    if fail_first {
+        store.fail_next_publication().unwrap();
+        assert_eq!(
+            store.publish(&checkpoint),
+            Err(MemoryGraphStoreError::PublicationFailed)
+        );
+        assert!(store.load().unwrap().records().is_empty());
+    }
+    store.publish(&checkpoint).unwrap();
+    assert_eq!(store.load().unwrap().records(), checkpoint.records());
+    assert!(store.snapshot().unwrap().revision() > checkpoint.revision());
+
+    store.restart().unwrap();
+    assert_eq!(
+        store.load().unwrap().records(),
+        &[GraphMutation::Agent(root), GraphMutation::State(admitted)]
+    );
+    assert_eq!(store.snapshot().unwrap().revision(), published_revision);
+    assert_eq!(
+        store.publish(&checkpoint),
+        Err(MemoryGraphStoreError::StaleCheckpoint)
+    );
+    assert!(matches!(
+        AgentManagerHandle::restore_empty_graph(AgentLimits::default(), &store),
+        Err(GraphRestartError::NonemptyGraph)
+    ));
+}
+
+#[test]
+fn graph_store_publication_is_idempotent_and_cannot_regress() {
+    let store = TestGraphStore::default();
+    let agent = TestAgentRecord {
+        id: crate::AgentId::generate(),
+        parent: None,
+        label: "before".into(),
+    };
+    store.put_agent(agent.clone()).unwrap();
+    let older = store.snapshot().unwrap();
+    let mut updated = agent;
+    updated.label = "after".into();
+    store.put_agent(updated.clone()).unwrap();
+    let latest = store.snapshot().unwrap();
+    store.publish(&latest).unwrap();
+    store.publish(&older).unwrap();
+    store.publish(&latest).unwrap();
+    store.restart().unwrap();
+    assert_eq!(store.load().unwrap().records(), latest.records());
+    assert_eq!(
+        store.load().unwrap().records().last(),
+        Some(&GraphMutation::Agent(updated))
+    );
+}
+
+#[test]
+fn graph_store_rejects_a_forged_prefix_without_mutation() {
+    let store = TestGraphStore::default();
+    let checkpoint = store.snapshot().unwrap();
+    let forged = GraphCheckpoint::new(
+        checkpoint.epoch(),
+        vec![GraphMutation::State(TestStateRecord {
+            agent: crate::AgentId::generate(),
+            turn: crate::TurnId::generate(),
+        })],
+    );
+    assert_eq!(
+        store.publish(&forged),
+        Err(MemoryGraphStoreError::InvalidCheckpoint)
+    );
+    assert!(store.load().unwrap().records().is_empty());
+}
+
+#[test]
+fn restart_manager_discards_unpublished_graph_mutations() {
+    let store = TestGraphStore::default();
+    let manager = restart_manager(&store);
+    store
+        .put_agent(TestAgentRecord {
+            id: crate::AgentId::generate(),
+            parent: None,
+            label: "lost on crash".into(),
+        })
+        .unwrap();
+    let unpublished = store.snapshot().unwrap();
+    store.fail_next_publication().unwrap();
+    assert_eq!(
+        store.publish(&unpublished),
+        Err(MemoryGraphStoreError::PublicationFailed)
+    );
+    drop(manager);
+    let manager = restart_manager(&store);
+    assert!(manager.snapshot().is_empty());
+    assert!(store.snapshot().unwrap().records().is_empty());
+    assert_eq!(
+        store.publish(&unpublished),
+        Err(MemoryGraphStoreError::StaleCheckpoint)
+    );
+}
 
 #[test]
 fn held_ticket_observation_checks_manager_and_survives_graph_removal() {
@@ -63,8 +406,16 @@ fn held_ticket_observation_checks_manager_and_survives_graph_removal() {
                 .is_empty()
         );
         assert_eq!(ticket.wait_result().await.text, result.text);
-        assert!(
-            matches!(root.turn_ticket(ticket.turn_id()), Err(ManagerError::UnknownAgent(id)) if id == root.id())
+        let retained = manager.lookup(root.id()).unwrap();
+        assert!(retained.actor().is_err());
+        assert_eq!(
+            retained
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .wait_result()
+                .await
+                .text,
+            result.text
         );
         assert!(other.shutdown(SHUTDOWN_TIMEOUT).await.timed_out.is_empty());
     });
@@ -114,10 +465,13 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
         );
         if close_parent {
             assert!(matches!(result, Err(ManagerError::NonLiveAgent(id)) if id == root.id()));
-            assert!(matches!(
-                manager.lookup(root.id()),
-                Err(ManagerError::UnknownAgent(_))
-            ));
+            let retained = manager.lookup(root.id()).unwrap();
+            assert_eq!(retained.id(), root.id());
+            assert_eq!(
+                retained.snapshot().unwrap().graph_lifecycle,
+                GraphLifecycle::Closed
+            );
+            assert!(retained.actor().is_err());
         } else {
             let child = result.unwrap();
             assert_eq!(child.snapshot().unwrap().parent_id, Some(root.id()));
@@ -716,7 +1070,7 @@ fn idle_guard_reports_closed_actor_as_non_live() {
         }
         assert!(matches!(
             manager.prepare_idle_subtree(root.id()),
-            Err(ManagerError::UnknownAgent(id)) if id == root.id()
+            Err(ManagerError::NonLiveAgent(id)) if id == root.id()
         ));
         manager.shutdown(Duration::from_secs(1)).await;
     });
@@ -929,14 +1283,61 @@ fn turn_cancel_preserves_trusted_child(nominal: bool) {
     assert!(report.timed_out.is_empty());
     assert_eq!(
         trusted.snapshot().unwrap().graph_lifecycle,
-        GraphLifecycle::Closed
+        GraphLifecycle::Dormant
     );
 }
 
 #[test]
-fn spawn_close_cycles_reclaim_nodes_and_share_terminal_snapshots() {
+fn runner_finished_observes_reclaimed_resources_after_gated_close() {
+    let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+    let child_gate = Gate::new();
+    let (entered, running) = flume::bounded(1);
+    let child = current
+        .spawn_child(
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
+        )
+        .unwrap();
+    let actor = child.actor().unwrap();
+    let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+    smol::block_on(async {
+        running.recv_async().await.unwrap();
+        child.close_subtree().unwrap();
+        assert!(!manager.runner_finished(child.id()).unwrap());
+        {
+            let graph = manager.lock_graph();
+            let node = &graph.nodes[&child.id()];
+            assert!(node.task.is_some());
+            assert_eq!(node.residency, AgentResidency::Resident);
+        }
+        child_gate.release(1);
+        ticket.wait().await;
+        yield_until(|| manager.runner_finished(child.id()).unwrap()).await;
+        {
+            let graph = manager.lock_graph();
+            let node = &graph.nodes[&child.id()];
+            assert!(node.task.is_none());
+            assert_eq!(node.residency, AgentResidency::Dormant);
+            assert!(node.actor.as_ref().unwrap().same_actor(&actor));
+        }
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn spawn_close_cycles_reclaim_tasks_and_retain_terminal_nodes() {
     const CYCLES: usize = 32;
     let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let mut children = Vec::new();
     for _ in 0..CYCLES {
         let child = current
             .spawn_child(
@@ -949,20 +1350,22 @@ fn spawn_close_cycles_reclaim_nodes_and_share_terminal_snapshots() {
         let held = child.clone();
         let terminal = Arc::downgrade(&child.terminal);
         child.close_subtree().unwrap();
-        smol::block_on(async {
-            loop {
-                let listener = manager.0.reaped.listen();
-                if !manager.lock_graph().nodes.contains_key(&child.id()) {
-                    break;
-                }
-                listener.await;
-            }
-        });
-        assert_eq!(manager.lock_graph().nodes.len(), 1);
-        assert!(root.snapshot().unwrap().children.is_empty());
-        assert!(
-            matches!(manager.lookup(child.id()), Err(ManagerError::UnknownAgent(id)) if id == child.id())
+        smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
+        children.push(child.id());
+        assert_eq!(manager.lock_graph().nodes.len(), children.len() + 1);
+        assert_eq!(root.snapshot().unwrap().children, children);
+        let retained = manager.lookup(child.id()).unwrap();
+        assert_eq!(retained.id(), child.id());
+        assert_eq!(
+            manager.node(child.id()).unwrap().residency,
+            AgentResidency::Dormant
         );
+        {
+            let graph = manager.lock_graph();
+            let node = &graph.nodes[&child.id()];
+            assert!(node.task.is_none());
+            assert!(node.actor.is_some());
+        }
         assert!(child.actor().is_err());
         assert!(child.validate_live().is_err());
         assert!(child.cancel().is_err());
@@ -974,10 +1377,11 @@ fn spawn_close_cycles_reclaim_nodes_and_share_terminal_snapshots() {
             held.snapshot().unwrap().actor.unwrap().lifecycle,
             crate::ActorLifecycle::Closed
         );
+        drop(retained);
         drop(child);
         assert!(terminal.upgrade().is_some());
         drop(held);
-        assert!(terminal.upgrade().is_none());
+        assert!(terminal.upgrade().is_some());
     }
     gate.release(1);
     assert!(
@@ -985,10 +1389,18 @@ fn spawn_close_cycles_reclaim_nodes_and_share_terminal_snapshots() {
             .timed_out
             .is_empty()
     );
-    assert!(manager.lock_graph().nodes.is_empty());
+    assert_eq!(manager.snapshot().len(), CYCLES + 1);
+    assert_eq!(root.snapshot().unwrap().children, children);
     assert_eq!(
         root.snapshot().unwrap().graph_lifecycle,
-        GraphLifecycle::Closed
+        GraphLifecycle::Dormant
+    );
+    assert!(
+        manager
+            .lock_graph()
+            .nodes
+            .values()
+            .all(|node| node.task.is_none())
     );
 }
 
@@ -1706,7 +2118,7 @@ struct ReportingCancellableBackend {
 impl ActorBackend for ReportingCancellableBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1728,7 +2140,7 @@ impl ActorBackend for ReportingCancellableBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1737,7 +2149,7 @@ impl ActorBackend for ReportingCancellableBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1748,7 +2160,7 @@ impl ActorBackend for ReportingCancellableBackend {
 impl ActorBackend for CancellableBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1768,7 +2180,7 @@ impl ActorBackend for CancellableBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1777,7 +2189,7 @@ impl ActorBackend for CancellableBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1849,7 +2261,7 @@ impl Future for BlockingPendingFuture {
 impl ActorBackend for SuspendDuringPollBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1867,7 +2279,7 @@ impl ActorBackend for SuspendDuringPollBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1876,7 +2288,7 @@ impl ActorBackend for SuspendDuringPollBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1887,7 +2299,7 @@ impl ActorBackend for SuspendDuringPollBackend {
 impl ActorBackend for TestBackend {
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1904,10 +2316,13 @@ impl ActorBackend for TestBackend {
             }
             if let Some(inbox) = &context.inbox {
                 for input in inbox.drain_instructions() {
-                    history.push(makima_providers::Message::user(input.message));
+                    history
+                        .push(makima_providers::Message::user(input.message))
+                        .await
+                        .unwrap();
                 }
                 for message in inbox.drain_completions() {
-                    history.push(message);
+                    history.push_observation(message).unwrap();
                 }
                 inbox.instructions_submitted();
                 assert!(inbox.finish());
@@ -1924,7 +2339,7 @@ impl ActorBackend for TestBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1933,7 +2348,7 @@ impl ActorBackend for TestBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -2007,6 +2422,250 @@ fn active_root(
         .unwrap();
     let current = smol::block_on(rx.recv_async()).unwrap();
     (manager, root, current, gate)
+}
+
+#[test_case("local"; "local_cancel")]
+#[test_case("turn"; "cancel_turn")]
+#[test_case("correlation"; "cancel_correlation")]
+#[test_case("agent"; "cancel_agent")]
+#[test_case("subtree"; "cancel_subtree")]
+#[test_case("close"; "close_subtree")]
+#[test_case("detach"; "detach_incarnation")]
+#[test_case("end"; "turn_completion")]
+#[test_case("history"; "history_replacement")]
+#[test_case("shutdown"; "shutdown")]
+fn state_write_authority_is_revoked_at_manager_transition(transition: &str) {
+    use crate::{StateError, StateScope, StateSlotSpec, TurnCancellationReason};
+
+    const SLOT_KEY: &str = "fixture/manager-state";
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let slot = manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: SLOT_KEY.into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap();
+    let access = current.state_access();
+    slot.set(&access, Value::Bool(true), None).unwrap();
+    match transition {
+        "local" => {
+            manager.local_cancel(root.id(), 0).unwrap();
+        }
+        "turn" => {
+            manager
+                .cancel_turn(root.id(), current.turn_id(), TurnCancellationReason::User)
+                .unwrap();
+        }
+        "correlation" => {
+            manager
+                .cancel_correlation(root.id(), "root", TurnCancellationReason::User)
+                .unwrap();
+        }
+        "agent" => {
+            manager.cancel_agent(root.id()).unwrap();
+        }
+        "subtree" => {
+            manager.cancel_subtree(root.id()).unwrap();
+        }
+        "close" => {
+            manager.close_subtree(root.id()).unwrap();
+        }
+        "detach" => {
+            manager
+                .detach_incarnation(&root.incarnation().unwrap())
+                .unwrap();
+        }
+        "end" => {
+            let ticket = root.turn_ticket(current.turn_id()).unwrap();
+            gate.release(1);
+            smol::block_on(ticket.wait_result());
+        }
+        "history" => {
+            let journal = manager.journal();
+            journal
+                .commit(JournalCommit {
+                    state_epoch_agents: [root.id()].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(matches!(
+                slot.set(&current.state_access(), Value::Bool(false), None),
+                Err(StateError::StaleAccess)
+            ));
+        }
+        "shutdown" => {
+            smol::block_on(manager.shutdown(Duration::ZERO));
+        }
+        _ => unreachable!(),
+    }
+    assert!(matches!(
+        slot.set(&access, Value::Bool(false), None),
+        Err(StateError::StaleAccess)
+    ));
+    if matches!(transition, "detach" | "end" | "history") {
+        slot.set(&root.state_access(), Value::Bool(false), None)
+            .unwrap();
+        assert_eq!(
+            slot.get(&root.state_access()).unwrap().value,
+            Some(Value::Bool(false))
+        );
+    }
+    gate.release(1);
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+}
+
+struct NonpersistentHistoryFenceBackend {
+    compact: bool,
+}
+
+impl ActorBackend for NonpersistentHistoryFenceBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        mut history: ActorHistory<'a>,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::{StateError, StateScope, StateSlotSpec};
+            const SLOT_KEY: &str = "fixture/nonpersistent-invocation";
+            let current = context.managed_turn.as_ref().unwrap();
+            let slot = current
+                .manager()
+                .journal()
+                .register_state::<Value>(StateSlotSpec {
+                    key: SLOT_KEY.into(),
+                    scope: StateScope::Agent,
+                    version: 1,
+                })
+                .unwrap();
+            let old = current.capture_new_invocation_state_access();
+            slot.set(&old, Value::Bool(true), None).unwrap();
+            if self.compact {
+                history.replace_compacted(Vec::new()).await.unwrap();
+            } else {
+                history.replace_snapshot(history.snapshot().clone()).await;
+            }
+            assert!(matches!(
+                slot.set(&old, Value::Bool(false), None),
+                Err(StateError::StaleAccess)
+            ));
+            slot.set(
+                &current.capture_new_invocation_state_access(),
+                Value::Bool(false),
+                None,
+            )
+            .unwrap();
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                1,
+                crate::DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+#[test_case(false; "identical_replacement")]
+#[test_case(true; "compaction")]
+fn nonpersistent_actor_history_fences_old_invocation_and_accepts_new(compact: bool) {
+    smol::block_on(async {
+        let journal = Arc::new(SessionJournal::nonpersistent());
+        let manager =
+            AgentManagerHandle::new_with_journal(AgentLimits::default(), Arc::clone(&journal))
+                .unwrap();
+        let root = manager
+            .create_root_with_config(
+                Some(config("anthropic/claude-sonnet-4-20250514", false)),
+                Vec::new(),
+                None,
+                |_| {
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(
+                        NonpersistentHistoryFenceBackend { compact },
+                    ))
+                },
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        assert!(actor.inner.journal.is_none());
+        let ticket = actor
+            .admit_turn(input(), None, "runtime-fence".into())
+            .unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        assert!(!journal.snapshot().state.iter().any(|record| matches!(
+            record.change,
+            StateChange::Boundary { .. } | StateChange::Turn { .. } | StateChange::Delivery { .. }
+        )));
+        assert!(journal.snapshot().managed_histories.is_empty());
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
+}
+
+#[test]
+fn new_invocation_captures_post_compaction_epoch_without_refreshing_old_access() {
+    use crate::{StateError, StateScope, StateSlotSpec};
+
+    const SLOT_KEY: &str = "fixture/invocation-state";
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let slot = manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: SLOT_KEY.into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap();
+    let old = current.capture_new_invocation_state_access();
+    slot.set(&old, Value::Bool(true), None).unwrap();
+    manager
+        .journal()
+        .commit(JournalCommit {
+            state_epoch_agents: [root.id()].into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(matches!(
+        slot.set(&old, Value::Bool(false), None),
+        Err(StateError::StaleAccess)
+    ));
+    let fresh = current.capture_new_invocation_state_access();
+    slot.set(&fresh, Value::Bool(false), None).unwrap();
+    assert!(matches!(
+        slot.set(&old, Value::Bool(true), None),
+        Err(StateError::StaleAccess)
+    ));
+    manager.cancel_agent(root.id()).unwrap();
+    assert!(matches!(
+        slot.set(
+            &current.capture_new_invocation_state_access(),
+            Value::Bool(true),
+            None
+        ),
+        Err(StateError::StaleAccess)
+    ));
+    gate.release(1);
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
 }
 
 #[test]
@@ -2330,7 +2989,11 @@ fn zero_agent_limits_are_rejected() {
             ..AgentLimits::default()
         },
         AgentLimits {
-            max_live_agents: 0,
+            max_active_agents: 0,
+            ..AgentLimits::default()
+        },
+        AgentLimits {
+            max_retained_agents: 0,
             ..AgentLimits::default()
         },
     ] {
@@ -2860,6 +3523,659 @@ fn root_and_nested_children_use_one_factory() {
     assert!(shutdown.timed_out.is_empty());
 }
 
+#[test_case(false; "immediate")]
+#[test_case(true; "deferred")]
+fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferred: bool) {
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const INITIAL: &str = "initial root history";
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let id = crate::AgentId::generate();
+    let messages = vec![makima_providers::Message::user(INITIAL.into())];
+    let (start, wait) = flume::bounded(1);
+    let root = if deferred {
+        manager.create_root_deferred_with_id_and_config(
+            id,
+            Some(config(MODEL, false)),
+            messages,
+            None,
+            |actual| {
+                assert_eq!(actual, id);
+                Ok::<_, String>(TestBackend::boxed())
+            },
+            wait,
+        )
+    } else {
+        manager.create_root_with_id_and_config(
+            id,
+            Some(config(MODEL, false)),
+            messages,
+            None,
+            |actual| {
+                assert_eq!(actual, id);
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        )
+    }
+    .unwrap();
+    assert_eq!(root.id(), id);
+    if deferred {
+        start.send(()).unwrap();
+    }
+    let snapshot = manager.journal().snapshot();
+    assert_eq!(snapshot.agent_revisions.len(), 1);
+    let created = snapshot.agent_revisions[0].1.created_seq;
+    assert_eq!(snapshot.state.len(), 1);
+    assert!(
+        matches!(&snapshot.state[0].change, StateChange::Config(saved) if saved.model == MODEL)
+    );
+    let mut session = Session::new(MODEL, ".");
+    session.adopt_history(&snapshot.histories[&id]);
+    snapshot.apply_to(&mut session).unwrap();
+    assert_eq!(session.messages().len(), 1);
+    let mut projection = session.clone();
+    projection.adopt_history(&crate::HistorySnapshot::new(Vec::new()));
+    snapshot.apply_to(&mut projection).unwrap();
+    assert_eq!(projection.messages().len(), 1);
+    assert_eq!(projection.messages()[0].user_text(), Some(INITIAL));
+    assert_eq!(
+        projection.history_snapshot().epoch,
+        snapshot.histories[&id].epoch
+    );
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+    assert_eq!(
+        manager.journal().agent(id).unwrap().lifecycle,
+        StoredAgentLifecycle::Open
+    );
+    let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+    assert_ne!(journal.snapshot().epoch, snapshot.epoch);
+    let restored =
+        AgentManagerHandle::new_with_journal(AgentLimits::default(), Arc::clone(&journal)).unwrap();
+    restored
+        .create_root_with_id_and_config(
+            id,
+            Some(config(MODEL, true)),
+            session.messages().to_vec(),
+            None,
+            |_| Ok::<_, String>(TestBackend::boxed()),
+        )
+        .unwrap();
+    let reopened = journal.snapshot();
+    assert_eq!(reopened.state, snapshot.state);
+    assert_eq!(reopened.agent_revisions.len(), 2);
+    assert_eq!(journal.agent(id).unwrap().created_seq, created);
+    assert!(reopened.seq > snapshot.seq);
+    reopened.apply_to(&mut session).unwrap();
+    smol::block_on(restored.shutdown(Duration::from_secs(1)));
+}
+
+#[test]
+fn journaled_root_history_clear_survives_checkpoint_reload() {
+    const MODEL: &str = "test/model";
+    const INITIAL: &str = "root history before clear";
+    let mut session =
+        Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::new(MODEL, ".");
+    let id = crate::AgentId::generate();
+    session.bind_root_id(id).unwrap();
+    let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+    let mut history = History::new(vec![makima_providers::Message::user(INITIAL.into())])
+        .with_journal(id, Arc::clone(&journal));
+    let initial = journal.snapshot();
+    initial.apply_to(&mut session).unwrap();
+    assert_eq!(session.messages()[0].user_text(), Some(INITIAL));
+    history.replace(Vec::new());
+    let cleared_epoch = history.snapshot().epoch;
+    let cleared = journal.snapshot();
+    assert!(cleared.revision > initial.revision);
+    assert!(cleared.histories[&id].messages.is_empty());
+    cleared.apply_to(&mut session).unwrap();
+    assert!(session.messages().is_empty());
+    assert_eq!(session.history_snapshot().epoch, cleared_epoch);
+    let directory = tempfile::tempdir().unwrap();
+    session.save_to(directory.path()).unwrap();
+    let mut loaded =
+        Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+            session.id,
+            directory.path(),
+        )
+        .unwrap();
+    assert!(loaded.messages().is_empty());
+    let restored = Arc::new(SessionJournal::from_session(&loaded).unwrap());
+    assert!(restored.snapshot().histories[&id].messages.is_empty());
+    let resumed = History::restored_snapshot(loaded.history_snapshot())
+        .with_journal(id, Arc::clone(&restored));
+    assert!(resumed.is_empty());
+    loaded.adopt_history(&initial.histories[&id]);
+    restored.snapshot().apply_to(&mut loaded).unwrap();
+    assert!(loaded.messages().is_empty());
+}
+
+#[test_case(false; "shutdown_wins")]
+#[test_case(true; "explicit_close_wins")]
+fn explicit_close_racing_shutdown_preserves_first_durable_lifecycle(close_first: bool) {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (_start, wait) = flume::bounded(1);
+        let root = manager
+            .create_root_deferred_with_config(
+                None,
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+                wait,
+            )
+            .unwrap();
+        if close_first {
+            manager.close_subtree(root.id()).unwrap();
+        }
+        let (entered, captured) = flume::bounded(1);
+        let (release, resume) = flume::bounded(1);
+        *manager.0.shutdown_cut_gate.lock().unwrap() = Some(super::TestGate {
+            entered,
+            release: resume,
+        });
+        let shutting_down = manager.clone();
+        let shutdown =
+            std::thread::spawn(move || smol::block_on(shutting_down.shutdown(COMPLETION_TIMEOUT)));
+        captured.recv_async().await.unwrap();
+        let before = manager.journal().snapshot().revision;
+        assert_eq!(
+            manager.close_subtree(root.id()),
+            Err(ManagerError::GraphShutdown)
+        );
+        let lifecycle = if close_first {
+            StoredAgentLifecycle::Closed
+        } else {
+            StoredAgentLifecycle::Open
+        };
+        assert_eq!(
+            manager.journal().agent(root.id()).unwrap().lifecycle,
+            lifecycle
+        );
+        assert_eq!(manager.journal().snapshot().revision, before);
+        release.send(()).unwrap();
+        let report = shutdown.join().unwrap();
+        assert!(report.timed_out.is_empty());
+        assert_eq!(
+            manager.journal().agent(root.id()).unwrap().lifecycle,
+            lifecycle
+        );
+    });
+}
+
+fn queued_result(text: &str) -> Arc<ChildDelivery> {
+    Arc::new(ChildDelivery {
+        label: None,
+        result: TurnResult {
+            outcome: TurnOutcome::cancelled(
+                crate::AgentId::generate(),
+                crate::TurnId::generate(),
+                TokenUsage::default(),
+                0,
+                crate::TurnCancellationReason::User,
+            ),
+            text: text.into(),
+            output: Vec::new(),
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        },
+    })
+}
+
+fn delivery_bytes(delivery: &ChildDelivery) -> usize {
+    delivery.preview(None).input().preamble[0]
+        .first_text_content()
+        .unwrap()
+        .len()
+}
+
+#[test_case(false; "count_bound")]
+#[test_case(true; "preview_byte_bound")]
+fn disk_restored_delivery_queue_preserves_exact_capacity(byte_bound: bool) {
+    smol::block_on(async {
+        const MODEL: &str = "test/model";
+        const TEXT: &str = "queued result";
+        const HALF_PREVIEW: usize = crate::actor::MAX_DELIVERY_PREVIEW_BYTES / 2;
+        let mut session =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::new(MODEL, ".");
+        let parent = crate::AgentId::generate();
+        session.bind_root_id(parent).unwrap();
+        let journal = SessionJournal::from_session(&session).unwrap();
+        let text = if byte_bound {
+            "x".repeat(HALF_PREVIEW)
+        } else {
+            TEXT.into()
+        };
+        let envelope = queued_result(&text);
+        let bytes = delivery_bytes(&envelope);
+        let capacity = MAX_PENDING_DELIVERIES.min(MAX_PENDING_PREVIEW_BYTES / bytes);
+        let restored_count = capacity / 2;
+        assert!(restored_count > 0);
+        journal
+            .commit(JournalCommit {
+                changes: (0..restored_count)
+                    .map(|_| {
+                        let delivery = queued_result(&text);
+                        crate::actor::delivery::change(
+                            parent,
+                            &delivery,
+                            StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                                label: delivery.label.clone(),
+                                result: delivery.result.to_stored(session.id, None).unwrap(),
+                                preview_bytes: None,
+                                held: false,
+                            })),
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal.snapshot().apply_to(&mut session).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        session.save_to(directory.path()).unwrap();
+        let loaded =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+                session.id,
+                directory.path(),
+            )
+            .unwrap();
+        let restored = Arc::new(SessionJournal::from_session(&loaded).unwrap());
+        for _ in restored_count..capacity {
+            assert!(
+                restored
+                    .queue_delivery(parent, queued_result(&text), bytes)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            restored.queue_delivery(parent, queued_result(&text), bytes),
+            Err(DeliveryRejection::Overflow),
+        );
+        yield_until(|| restored.pending_revision().is_none()).await;
+        let mut saved = loaded;
+        restored.snapshot().apply_to(&mut saved).unwrap();
+        saved.save_to(directory.path()).unwrap();
+        let reloaded =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+                saved.id,
+                directory.path(),
+            )
+            .unwrap();
+        let view = reloaded.latest_state().unwrap();
+        assert_eq!(view.scopes[&Some(parent)].deliveries.len(), capacity);
+        assert!(
+            view.scopes[&Some(parent)]
+                .deliveries
+                .values()
+                .all(|op| matches!(op, StoredDeliveryOp::Queued(_)))
+        );
+    });
+}
+
+#[test_case(StoredDeliveryOp::Consumed; "consumed")]
+#[test_case(StoredDeliveryOp::Withdrawn; "withdrawn")]
+#[test_case(StoredDeliveryOp::Dropped; "dropped")]
+fn disk_restored_terminal_delivery_deduplicates_before_bounds(op: StoredDeliveryOp) {
+    smol::block_on(async {
+        const MODEL: &str = "test/model";
+        const TEXT: &str = "terminal delivery";
+        let mut session =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::new(MODEL, ".");
+        let parent = crate::AgentId::generate();
+        session.bind_root_id(parent).unwrap();
+        let journal = SessionJournal::from_session(&session).unwrap();
+        let delivery = queued_result(TEXT);
+        let key = (
+            delivery.result.outcome.agent_id(),
+            delivery.result.outcome.turn_id(),
+        );
+        let queued = crate::actor::delivery::change(
+            parent,
+            &delivery,
+            StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                label: None,
+                result: delivery.result.to_stored(session.id, None).unwrap(),
+                preview_bytes: None,
+                held: false,
+            })),
+        );
+        journal
+            .commit(JournalCommit {
+                changes: vec![
+                    queued,
+                    crate::actor::delivery::change(parent, &delivery, op.clone()),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        journal.snapshot().apply_to(&mut session).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        session.save_to(directory.path()).unwrap();
+        let loaded =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+                session.id,
+                directory.path(),
+            )
+            .unwrap();
+        let restored = Arc::new(SessionJournal::from_session(&loaded).unwrap());
+        let before = restored.snapshot();
+        assert!(
+            !restored
+                .queue_delivery(parent, delivery, MAX_PENDING_PREVIEW_BYTES)
+                .unwrap()
+        );
+        assert_eq!(restored.snapshot().state, before.state);
+        assert_eq!(restored.snapshot().revision, before.revision);
+        assert!(restored.pending_revision().is_none());
+        let mut saved = loaded;
+        restored.snapshot().apply_to(&mut saved).unwrap();
+        saved.save_to(directory.path()).unwrap();
+        let reloaded =
+            Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+                saved.id,
+                directory.path(),
+            )
+            .unwrap();
+        assert_eq!(
+            reloaded.latest_state().unwrap().scopes[&Some(parent)].deliveries[&key],
+            op
+        );
+    });
+}
+
+#[test]
+fn transcript_key_query_includes_reservations_and_hidden_logical_agents() {
+    const KEY: &str = "hidden-child-transcript";
+    const RESERVED: &str = "reserved-child-transcript";
+    const AVAILABLE: &str = "available-child-transcript";
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let journal = manager.journal();
+    let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
+    let pending_revision = journal.pending_revision();
+    assert!(pending_revision.is_some());
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata {
+                transcript_key: Some(KEY.into()),
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    assert!(
+        !journal
+            .snapshot()
+            .agent_revisions
+            .iter()
+            .any(|(_, record)| record.id == child.id())
+    );
+    let hidden =
+        AgentManagerHandle::new_with_journal(AgentLimits::default(), Arc::clone(&journal)).unwrap();
+    assert!(manager.transcript_key_in_use(KEY));
+    assert!(hidden.transcript_key_in_use(KEY));
+    assert!(!hidden.transcript_key_in_use(AVAILABLE));
+    assert_eq!(journal.pending_revision(), pending_revision);
+    let reserved_child = manager
+        .spawn_child_with(
+            &current,
+            AgentMetadata {
+                transcript_key: Some(RESERVED.into()),
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+            |_| {
+                assert!(manager.transcript_key_in_use(RESERVED));
+                assert!(!hidden.transcript_key_in_use(RESERVED));
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        )
+        .unwrap();
+    assert!(hidden.transcript_key_in_use(RESERVED));
+    assert!(matches!(
+        manager.set_agent_transcript_key(reserved_child.id(), KEY.into()),
+        Err(ManagerError::Policy(_))
+    ));
+    journal
+        .complete(
+            barrier,
+            vec![JournalChange {
+                agent: Some(root.id()),
+                generation: 0,
+                change: StateChange::Admitted {
+                    turn: crate::TurnId::generate(),
+                    origin: makima_storage::session_state::StoredTurnOrigin::Internal,
+                },
+            }],
+        )
+        .unwrap();
+    gate.release(1);
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+}
+
+#[test]
+fn child_graph_metadata_is_persisted_and_explicit_close_is_durable() {
+    const LABEL: &str = "durable child";
+    const TOOL: &str = "spawn-tool";
+    const INITIAL: &str = "child history";
+    let (manager, root, current, gate) = active_root(AgentLimits::default());
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata {
+                label: Some(LABEL.into()),
+                spawned_by_tool_use_id: Some(TOOL.into()),
+                transcript_key: Some(TOOL.into()),
+            },
+            vec![makima_providers::Message::user(INITIAL.into())],
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    let journal = manager.journal();
+    let before_collision = journal.snapshot();
+    assert!(matches!(
+        manager.spawn_child_with(
+            &current,
+            AgentMetadata {
+                label: None,
+                spawned_by_tool_use_id: Some(TOOL.into()),
+                transcript_key: Some(TOOL.into()),
+            },
+            Vec::new(),
+            None,
+            |_| -> Result<Box<dyn ActorBackend>, String> {
+                panic!("duplicate transcript key reached the actor factory")
+            },
+        ),
+        Err(ManagerError::Policy(_))
+    ));
+    let after_collision = journal.snapshot();
+    assert_eq!(after_collision.revision, before_collision.revision);
+    assert_eq!(after_collision.state, before_collision.state);
+    assert_eq!(
+        after_collision.agent_revisions,
+        before_collision.agent_revisions
+    );
+    assert_eq!(
+        after_collision.histories.len(),
+        before_collision.histories.len()
+    );
+    const SIBLING_KEY: &str = "session-sibling";
+    let sibling = manager
+        .spawn_child(
+            &current,
+            AgentMetadata {
+                label: None,
+                spawned_by_tool_use_id: Some(TOOL.into()),
+                transcript_key: Some(SIBLING_KEY.into()),
+            },
+            vec![makima_providers::Message::user(SIBLING_KEY.into())],
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    assert_eq!(
+        journal.agent(sibling.id()).unwrap().transcript_key,
+        SIBLING_KEY
+    );
+    let snapshot = journal.snapshot();
+    assert_eq!(journal.agent(child.id()).unwrap().transcript_key, TOOL);
+    let created = journal.agent(child.id()).unwrap().created_seq;
+    manager
+        .set_agent_transcript_key(child.id(), TOOL.into())
+        .unwrap();
+    assert_eq!(journal.snapshot().revision, snapshot.revision);
+    assert!(
+        manager
+            .set_agent_transcript_key(child.id(), String::new())
+            .is_err()
+    );
+    assert_eq!(journal.agent(child.id()).unwrap().created_seq, created);
+    let mut session = Session::new("test/model", ".");
+    snapshot.apply_to(&mut session).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    session.save_to(directory.path()).unwrap();
+    let mut loaded =
+        Session::<makima_providers::Message, TokenUsage, crate::ToolOutput>::load_from(
+            session.id,
+            directory.path(),
+        )
+        .unwrap();
+    let saved = &loaded.agents()[&child.id()];
+    assert_eq!(saved.parent, Some(root.id()));
+    assert_eq!(saved.depth, 1);
+    assert_eq!(saved.label.as_deref(), Some(LABEL));
+    assert_eq!(saved.spawned_by_tool_use_id.as_deref(), Some(TOOL));
+    assert!(saved.restorable.is_err());
+    assert_eq!(loaded.subagent_messages()[&saved.transcript_key].len(), 1);
+    manager.close_subtree(child.id()).unwrap();
+    let closed = journal.snapshot();
+    closed.apply_to(&mut loaded).unwrap();
+    snapshot.apply_to(&mut loaded).unwrap();
+    assert_eq!(
+        loaded.agents()[&child.id()].lifecycle,
+        StoredAgentLifecycle::Closed
+    );
+    assert_eq!(
+        loaded.agents()[&root.id()].lifecycle,
+        StoredAgentLifecycle::Open
+    );
+    assert_eq!(journal.published_revision(), 0);
+    journal.acknowledge(&closed).unwrap();
+    journal.acknowledge(&snapshot).unwrap();
+    assert_eq!(journal.published_revision(), closed.revision);
+    assert!(matches!(
+        SessionJournal::default().acknowledge(&closed),
+        Err(JournalError::StaleCheckpoint)
+    ));
+    gate.release(1);
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+}
+
+#[test]
+fn journal_batch_validation_is_atomic_and_projection_rejects_sequence_collisions() {
+    let journal = SessionJournal::default();
+    let before = journal.snapshot();
+    assert!(
+        journal
+            .commit(JournalCommit {
+                changes: vec![JournalChange {
+                    agent: None,
+                    generation: 0,
+                    change: StateChange::Compaction { epoch: 1 }
+                }],
+                ..Default::default()
+            })
+            .is_err()
+    );
+    assert_eq!(journal.snapshot().revision, before.revision);
+    assert_eq!(journal.snapshot().seq, before.seq);
+    journal
+        .commit(JournalCommit {
+            changes: vec![JournalChange {
+                agent: None,
+                generation: 0,
+                change: StateChange::Rules {
+                    rules: Vec::new(),
+                    yolo: Some(true),
+                },
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut session = Session::new("test/model", ".");
+    session.push_state(makima_storage::session_state::StoredStateRecord {
+        seq: journal.snapshot().seq,
+        agent: None,
+        generation: 0,
+        change: StateChange::Rules {
+            rules: Vec::new(),
+            yolo: Some(false),
+        },
+    });
+    assert!(matches!(
+        journal.snapshot().apply_to(&mut session),
+        Err(JournalError::Diverged(_))
+    ));
+    assert!(matches!(
+        &session.state()[0].change,
+        StateChange::Rules {
+            yolo: Some(false),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn failed_root_factory_leaves_no_durable_agent_or_history() {
+    const FAILURE: &str = "injected root failure";
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let id = crate::AgentId::generate();
+    assert!(matches!(manager.create_root_with_id_and_config(
+        id, None, Vec::new(), None, |_| Err::<Box<dyn ActorBackend>, _>(FAILURE),
+    ), Err(ManagerError::Factory(message)) if message == FAILURE));
+    assert!(manager.journal().snapshot().agent_revisions.is_empty());
+    assert!(manager.journal().snapshot().histories.is_empty());
+    manager
+        .create_root_with_id(id, Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+}
+
+#[test]
+fn unresolved_root_config_fails_without_publishing_agent_or_history() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let id = crate::AgentId::generate();
+    let mut unresolved = config("test/model", false);
+    unresolved.mode = AgentMode::Custom(crate::ModeId::parse("unresolved"));
+    unresolved.mode_def = None;
+    let expected = crate::session_checkpoint::stored_agent_config(&unresolved, Default::default())
+        .unwrap_err()
+        .to_string();
+    let factory_called = AtomicUsize::new(0);
+    let error = manager
+        .create_root_with_id_and_config(id, Some(unresolved), Vec::new(), None, |_| {
+            factory_called.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(TestBackend::boxed())
+        })
+        .unwrap_err();
+    assert_eq!(error, ManagerError::Policy(expected));
+    assert_eq!(factory_called.load(Ordering::SeqCst), 0);
+    assert!(manager.snapshot().is_empty());
+    let journal = manager.journal().snapshot();
+    assert!(journal.agent_revisions.is_empty());
+    assert!(journal.histories.is_empty());
+    assert!(journal.state.is_empty());
+    manager
+        .create_root_with_id(id, Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+    smol::block_on(manager.shutdown(Duration::from_secs(1)));
+}
+
 #[test]
 fn duplicate_root_is_rejected_without_mutating_graph() {
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -2964,10 +4280,10 @@ fn panicking_root_factory_rolls_back_reservation() {
 fn panicking_child_factory_restores_capacity() {
     let limits = AgentLimits {
         max_children_per_agent: 1,
-        max_live_agents: 2,
+        max_retained_agents: 2,
         ..AgentLimits::default()
     };
-    let (manager, _root, current, gate) = active_root(limits);
+    let (manager, root, current, gate) = active_root(limits);
     let error = manager
         .spawn_child_with(
             &current,
@@ -2982,6 +4298,8 @@ fn panicking_child_factory_restores_capacity() {
         error,
         ManagerError::Factory("agent factory panicked".into())
     );
+    assert_eq!(manager.snapshot().len(), 1);
+    assert!(root.snapshot().unwrap().children.is_empty());
     let child = manager
         .spawn_child(
             &current,
@@ -3063,7 +4381,7 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
 }
 
 #[test]
-fn shutdown_excludes_removed_child_and_preserves_held_snapshot() {
+fn shutdown_excludes_finished_child_runner_and_preserves_retained_node() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let child = manager
         .spawn_child(
@@ -3084,7 +4402,9 @@ fn shutdown_excludes_removed_child_and_preserves_held_snapshot() {
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
     );
-    assert!(!manager.lock_graph().nodes.contains_key(&child.id()));
+    assert_eq!(manager.lookup(child.id()).unwrap().id(), child.id());
+    assert_eq!(root.snapshot().unwrap().children, vec![child.id()]);
+    assert!(manager.lock_graph().nodes[&child.id()].task.is_none());
     gate.release(1);
 
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
@@ -3095,7 +4415,9 @@ fn shutdown_excludes_removed_child_and_preserves_held_snapshot() {
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
     );
-    assert!(!manager.lock_graph().nodes.contains_key(&child.id()));
+    assert_eq!(manager.lookup(child.id()).unwrap().id(), child.id());
+    assert_eq!(root.snapshot().unwrap().children, vec![child.id()]);
+    assert!(manager.lock_graph().nodes[&child.id()].task.is_none());
 }
 
 #[test]
@@ -3124,14 +4446,32 @@ fn close_and_factory_failure_remove_never_committed_root() {
 }
 
 #[test]
-fn depth_and_child_limits_are_atomic() {
+fn idle_spawn_ignores_active_and_child_limits_but_enforces_depth() {
     let limits = AgentLimits {
         max_agent_depth: 1,
         max_children_per_agent: 1,
+        max_active_agents: 2,
         ..AgentLimits::default()
     };
     let (manager, root, current, gate) = active_root(limits);
-    manager
+    let child_gate = Gate::new();
+    let (entered, contexts) = flume::bounded(1);
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
+        )
+        .unwrap();
+    child
+        .actor()
+        .unwrap()
+        .admit_turn(input(), None, "child".into())
+        .unwrap();
+    let child_current = smol::block_on(contexts.recv_async()).unwrap();
+    let idle = manager
         .spawn_child(
             &current,
             AgentMetadata::default(),
@@ -3140,31 +4480,110 @@ fn depth_and_child_limits_are_atomic() {
             TestBackend::boxed(),
         )
         .unwrap();
+    assert_eq!(
+        root.snapshot().unwrap().children,
+        vec![child.id(), idle.id()]
+    );
     let error = manager
         .spawn_child(
-            &current,
+            &child_current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
         )
         .unwrap_err();
-    assert_eq!(
-        error,
-        ManagerError::ChildLimit {
-            parent_id: root.id(),
-            max: 1
-        }
-    );
-    assert_eq!(manager.snapshot().len(), 2);
+    assert_eq!(error, ManagerError::DepthExceeded { depth: 2, max: 1 });
+    assert_eq!(manager.snapshot().len(), 3);
+    child_gate.release(1);
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
 }
 
+#[test_case(33, None; "thirty_three_completed_children")]
+#[test_case(65, None; "sixty_five_completed_children")]
+#[test_case(SMALL_RETAINED_QUOTA - 1, Some(SMALL_RETAINED_QUOTA); "full_retained_quota")]
+fn completed_children_preserve_early_open_actor(task_count: usize, retained_quota: Option<usize>) {
+    let mut limits = AgentLimits::default();
+    if let Some(quota) = retained_quota {
+        limits.max_retained_agents = quota;
+    }
+    let (manager, root, current, gate) = active_root(limits);
+    smol::block_on(async {
+        let mut children = Vec::new();
+        for _ in 0..task_count {
+            let child = current
+                .spawn_child(
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+                .unwrap();
+            let actor = child.actor().unwrap();
+            let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+            assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+            children.push((child, actor.identity()));
+            graph_quiescence_barrier(&[actor]).await.unwrap();
+            assert_eq!(manager.snapshot().len(), children.len() + 1);
+            assert_eq!(manager.active_agent_count(), 1);
+            assert_eq!(manager.active_child_count(root.id()), 0);
+        }
+        let (early, identity) = &children[0];
+        let actor = early.actor().unwrap();
+        assert!(Arc::ptr_eq(identity, &actor.identity()));
+        let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        graph_quiescence_barrier(&[actor]).await.unwrap();
+        assert!(Arc::ptr_eq(identity, &early.actor().unwrap().identity()));
+        assert_eq!(manager.snapshot().len(), task_count + 1);
+        assert_eq!(manager.active_agent_count(), 1);
+        assert_eq!(manager.active_child_count(root.id()), 0);
+
+        if let Some(quota) = retained_quota {
+            let spawn = || {
+                current.spawn_child(
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+            };
+            assert_eq!(
+                spawn().unwrap_err(),
+                ManagerError::RetentionLimit { max: quota }
+            );
+            let (closed, _) = children.last().unwrap();
+            closed.close_subtree().unwrap();
+            yield_until(|| manager.runner_finished(closed.id()).unwrap()).await;
+            assert_eq!(
+                closed.snapshot().unwrap().graph_lifecycle,
+                GraphLifecycle::Closed
+            );
+            assert_eq!(
+                spawn().unwrap_err(),
+                ManagerError::RetentionLimit { max: quota }
+            );
+            manager.retire(&current, closed.id()).unwrap();
+            let replacement = spawn().unwrap();
+            assert_ne!(replacement.id(), closed.id());
+            assert_eq!(manager.snapshot().len(), quota + 1);
+        }
+        gate.release(1);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
 #[test]
-fn live_agent_limit_is_atomic() {
+fn retained_agent_limit_is_atomic() {
     let limits = AgentLimits {
-        max_live_agents: 2,
+        max_retained_agents: 2,
         ..AgentLimits::default()
     };
     let (manager, _, current, gate) = active_root(limits);
@@ -3188,16 +4607,16 @@ fn live_agent_limit_is_atomic() {
         )
         .unwrap_err();
 
-    assert_eq!(error, ManagerError::LiveAgentLimit { max: 2 });
+    assert_eq!(error, ManagerError::RetentionLimit { max: 2 });
     assert_eq!(manager.snapshot().len(), 2);
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
 }
 
 #[test]
-fn closing_idle_child_releases_capacity_on_next_admission() {
+fn closing_idle_child_retains_identity_quota_until_retired() {
     let limits = AgentLimits {
-        max_children_per_agent: 1,
+        max_retained_agents: 2,
         ..AgentLimits::default()
     };
     let (manager, root, current, gate) = active_root(limits);
@@ -3216,6 +4635,22 @@ fn closing_idle_child_releases_capacity_on_next_admission() {
             smol::future::yield_now().await;
         }
     });
+    assert!(matches!(
+        manager.spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        ),
+        Err(ManagerError::RetentionLimit { max: 2 })
+    ));
+    assert_eq!(root.snapshot().unwrap().children, vec![child.id()]);
+    manager.retire(&current, child.id()).unwrap();
+    assert_eq!(
+        child.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Retired
+    );
     let replacement = manager
         .spawn_child(
             &current,
@@ -3227,8 +4662,13 @@ fn closing_idle_child_releases_capacity_on_next_admission() {
         .unwrap();
     assert_ne!(child.id(), replacement.id());
     assert_eq!(
+        root.snapshot().unwrap().children,
+        vec![child.id(), replacement.id()]
+    );
+    assert_eq!(manager.snapshot().len(), 3);
+    assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
-        GraphLifecycle::Closed
+        GraphLifecycle::Retired
     );
     assert_eq!(
         root.snapshot().unwrap().graph_lifecycle,
@@ -3275,9 +4715,9 @@ fn closing_descendants_does_not_resurrect_closed_tombstones() {
 }
 
 #[test]
-fn direct_actor_close_releases_child_capacity_when_runner_finishes() {
+fn direct_actor_close_retains_identity_quota_when_runner_finishes() {
     let limits = AgentLimits {
-        max_children_per_agent: 1,
+        max_retained_agents: 2,
         ..AgentLimits::default()
     };
     let (manager, _, current, gate) = active_root(limits);
@@ -3301,25 +4741,27 @@ fn direct_actor_close_releases_child_capacity_when_runner_finishes() {
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
     );
-    manager
-        .spawn_child(
+    assert!(matches!(
+        manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
-        )
-        .unwrap();
+        ),
+        Err(ManagerError::RetentionLimit { max: 2 })
+    ));
+    assert_eq!(manager.lookup(child.id()).unwrap().id(), child.id());
 
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
 }
 
 #[test]
-fn closing_active_child_consumes_capacity_until_runner_finishes() {
+fn closing_active_child_retains_identity_quota_after_runner_finishes() {
     smol::block_on(async {
         let limits = AgentLimits {
-            max_children_per_agent: 1,
+            max_retained_agents: 2,
             ..AgentLimits::default()
         };
         let (manager, _, current, root_gate) = active_root(limits);
@@ -3358,7 +4800,7 @@ fn closing_active_child_consumes_capacity_until_runner_finishes() {
                 None,
                 TestBackend::boxed(),
             ),
-            Err(ManagerError::ChildLimit { .. })
+            Err(ManagerError::RetentionLimit { max: 2 })
         ));
 
         child_gate.release(1);
@@ -3374,15 +4816,29 @@ fn closing_active_child_consumes_capacity_until_runner_finishes() {
             crate::ActorEvent::Close { .. }
         ));
         assert!(events.is_empty());
-        manager
-            .spawn_child(
+        assert!(matches!(
+            manager.spawn_child(
                 &current,
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
                 TestBackend::boxed(),
-            )
-            .unwrap();
+            ),
+            Err(ManagerError::RetentionLimit { max: 2 })
+        ));
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+        assert_eq!(
+            manager
+                .lookup(child.id())
+                .unwrap()
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .peek(),
+            Some(outcome)
+        );
 
         root_gate.release(1);
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
@@ -3799,8 +5255,13 @@ fn reserved_cancellation_precedes_live_publication() {
         manager.actor(child_id),
         Err(ManagerError::NonLiveAgent(id)) if id == child_id
     ));
+    assert!(manager.journal().agent(child_id).is_none());
     commit_release_tx.send(()).unwrap();
     let child = factory.join().unwrap().unwrap();
+    assert_eq!(
+        manager.journal().agent(child_id).unwrap().parent,
+        Some(root.id())
+    );
     let ticket = observer.join().unwrap();
     assert_eq!(child.id(), child_id);
     assert!(matches!(
@@ -4798,8 +6259,9 @@ fn shutdown_timeout_reaper_eventually_joins_timed_out_node() {
         assert!(manager.runner_finished(root.id()).unwrap());
         assert_eq!(
             root.snapshot().unwrap().graph_lifecycle,
-            GraphLifecycle::Closed
+            GraphLifecycle::Dormant
         );
+        assert_eq!(root.snapshot().unwrap().residency, AgentResidency::Dormant);
     });
 }
 
@@ -4859,7 +6321,7 @@ struct JoiningBackend {
 impl ActorBackend for JoiningBackend {
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -4876,12 +6338,12 @@ impl ActorBackend for JoiningBackend {
             let completions = inbox.drain_completions();
             let _ = self.joined.send(completions.len());
             for message in completions {
-                history.push(message);
+                history.push_observation(message).unwrap();
             }
             inbox.instructions_submitted();
             while !inbox.finish() {
                 for message in inbox.drain_completions() {
-                    history.push(message);
+                    history.push_observation(message).unwrap();
                 }
             }
             BackendResult::EnteredRun(TurnOutcome::completed(
@@ -4896,7 +6358,7 @@ impl ActorBackend for JoiningBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -4905,7 +6367,7 @@ impl ActorBackend for JoiningBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {

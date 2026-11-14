@@ -6,14 +6,76 @@ use makima_providers::{
     Model, PreparedProvider, ProviderRegistry, RequestOptions, ThinkingConfig, ThinkingConfigExt,
 };
 
-use crate::{AgentMode, ModeDef};
+use makima_storage::session_state::{StoredAgentConfig, StoredModeCeiling};
 
-use super::{ActorError, EffectiveAgentConfig};
+use crate::{AgentMode, ModeDef, RunSettings};
+
+use super::{ActorError, AgentContextSnapshot, EffectiveAgentConfig};
+
+impl EffectiveAgentConfig {
+    pub fn from_stored(
+        stored: &StoredAgentConfig,
+        prepared: PreparedModel,
+        (mode, definition): (AgentMode, ModeDef),
+    ) -> Result<Self, ActorError> {
+        if prepared.model.spec() != stored.model {
+            return Err(ActorError::InvalidConfig(
+                "prepared model does not match stored configuration".into(),
+            ));
+        }
+        let cwd = PathBuf::from(&stored.cwd);
+        if !cwd.is_absolute() {
+            return Err(ActorError::InvalidConfig(
+                "stored working directory must be absolute".into(),
+            ));
+        }
+        if definition.id != mode.id() {
+            return Err(ActorError::InvalidConfig(
+                "resolved mode definition does not match restored mode".into(),
+            ));
+        }
+        let options = RequestOptions {
+            thinking: stored.thinking.into(),
+            fast: stored.fast,
+        }
+        .clamped(&prepared.model);
+        Ok(Self::new(
+            RunSettings {
+                provider: prepared.provider,
+                model: prepared.model,
+                fast: options.fast,
+                thinking: options.thinking,
+                workflow: stored.workflow,
+            },
+            mode,
+        )
+        .with_mode_def(Some(definition))
+        .with_context(AgentContextSnapshot::new(cwd)))
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ModeCeiling {
     restrict_write_to: Option<PathBuf>,
     tools: Option<Vec<String>>,
+}
+
+impl From<StoredModeCeiling> for ModeCeiling {
+    fn from(ceiling: StoredModeCeiling) -> Self {
+        Self {
+            restrict_write_to: ceiling.restrict_write_to,
+            tools: ceiling.tools,
+        }
+    }
+}
+
+impl From<&ModeCeiling> for StoredModeCeiling {
+    fn from(ceiling: &ModeCeiling) -> Self {
+        Self {
+            restrict_write_to: ceiling.restrict_write_to.clone(),
+            tools: ceiling.tools.clone(),
+        }
+    }
 }
 
 impl ModeCeiling {
@@ -88,6 +150,7 @@ pub enum ConfigChange {
         mode: AgentMode,
         mode_def: Option<ModeDef>,
     },
+    Restore(StoredAgentConfig),
     WorkingDirectory(PathBuf),
     ToggleFast,
     ToggleWorkflow,
@@ -114,6 +177,46 @@ pub async fn rediscovered_model(providers: &ProviderRegistry, model: &Model) -> 
 }
 
 impl ConfigChange {
+    pub(super) fn resolved_restore(
+        stored: &StoredAgentConfig,
+        prepared: PreparedModel,
+        mode: (AgentMode, ModeDef),
+        current: &EffectiveAgentConfig,
+    ) -> Result<EffectiveAgentConfig, ActorError> {
+        let mut config = EffectiveAgentConfig::from_stored(stored, prepared, mode)?;
+        config.context = current.context.change_directory(PathBuf::from(&stored.cwd));
+        config.mode_authority = current.mode_authority.clone();
+        if let Some(ceiling) = &config.mode_authority {
+            ceiling.validate(&config.mode, config.mode_def.as_ref())?;
+        }
+        Ok(config)
+    }
+
+    pub(super) fn restores_pending_fast(&self, current: &EffectiveAgentConfig) -> bool {
+        matches!(self, Self::Refresh { expected, replacement }
+            if Arc::ptr_eq(&expected.provider, &current.provider)
+                && expected.model.spec() == current.model.spec()
+                && replacement.model.supports_fast())
+    }
+
+    pub(super) fn clears_pending_fast(&self, current: &EffectiveAgentConfig) -> bool {
+        match self {
+            Self::Patch(patch) | Self::PatchAndMode { patch, .. } => {
+                patch.model.is_some() || patch.fast.is_some()
+            }
+            Self::ToggleFast => true,
+            Self::Refresh {
+                expected,
+                replacement,
+            } => {
+                Arc::ptr_eq(&expected.provider, &current.provider)
+                    && expected.model.spec() == current.model.spec()
+                    && !replacement.model.fast_pending()
+            }
+            _ => false,
+        }
+    }
+
     /// A metadata-only refresh: the provider stays, so a concurrent model
     /// switch makes the compare-and-swap a no-op.
     pub async fn rediscovered(
@@ -139,6 +242,11 @@ impl ConfigChange {
     ) -> Result<EffectiveAgentConfig, ActorError> {
         let mut config = current.clone();
         let mut patch = match self {
+            Self::Restore(_) => {
+                return Err(ActorError::InvalidConfig(
+                    "restore requires resources resolved against current discovery".into(),
+                ));
+            }
             Self::WorkingDirectory(cwd) => {
                 if !cwd.is_absolute() {
                     return Err(ActorError::InvalidConfig(
@@ -276,9 +384,303 @@ pub(super) fn equivalent(left: &EffectiveAgentConfig, right: &EffectiveAgentConf
 mod context_tests {
     use std::path::PathBuf;
 
-    use super::ConfigChange;
+    use super::{ConfigChange, ModeCeiling};
     use crate::AgentMode;
     use crate::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+    use crate::modes::{ModeDef, ModeId};
+    use makima_storage::session_state::StoredModeCeiling;
+    use test_case::test_case;
+
+    #[test_case(None; "unrestricted_tools")]
+    #[test_case(Some(Vec::new()); "no_tools")]
+    #[test_case(Some(vec!["read".into()]); "read_only_tools")]
+    fn restored_ceiling_preserves_tool_authority(tools: Option<Vec<String>>) {
+        let stored = StoredModeCeiling {
+            restrict_write_to: Some(PathBuf::from("/allowed")),
+            tools: tools.clone(),
+        };
+        let ceiling = ModeCeiling::from(stored.clone());
+        assert_eq!(StoredModeCeiling::from(&ceiling), stored);
+        let mut definition = ModeDef::default_for(ModeId::parse("build"));
+        definition.restrict_write_to = Some(PathBuf::from("/allowed"));
+        definition.tools = tools;
+        assert!(
+            ceiling
+                .validate(&AgentMode::Build, Some(&definition))
+                .is_ok()
+        );
+        definition.restrict_write_to = Some(PathBuf::from("/outside"));
+        assert!(
+            ceiling
+                .validate(&AgentMode::Build, Some(&definition))
+                .is_err()
+        );
+        definition.restrict_write_to = Some(PathBuf::from("/allowed"));
+        definition.tools = Some(vec!["write".into()]);
+        assert_eq!(
+            ceiling
+                .validate(&AgentMode::Build, Some(&definition))
+                .is_ok(),
+            stored.tools.is_none()
+        );
+    }
+
+    #[test_case(false; "root")]
+    #[test_case(true; "child")]
+    fn post_spawn_policy_commit_records_once_before_observation(child: bool) {
+        use crate::actor::tests::{ScriptedBackend, policy};
+        use crate::manager::AgentManagerHandle;
+        use crate::session_checkpoint::stored_agent_config;
+        use makima_storage::session_state::{SessionStateView, StateChange};
+        use std::collections::BTreeMap;
+
+        smol::block_on(async {
+            let manager = AgentManagerHandle::new(Default::default()).unwrap();
+            let config = EffectiveAgentConfig::new(policy(false), AgentMode::Build)
+                .with_context(AgentContextSnapshot::new(PathBuf::from("/original")))
+                .with_mode_def(Some(ModeDef::default_for(ModeId::parse("build"))));
+            let root = manager
+                .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+                    Ok::<Box<dyn crate::actor::ActorBackend>, String>(Box::new(
+                        ScriptedBackend::new(),
+                    ))
+                })
+                .unwrap();
+            let target = if child {
+                manager
+                    .spawn_child_trusted_with_config(
+                        &root,
+                        config,
+                        Default::default(),
+                        Vec::new(),
+                        None,
+                        |_| {
+                            Ok::<Box<dyn crate::actor::ActorBackend>, String>(Box::new(
+                                ScriptedBackend::new(),
+                            ))
+                        },
+                    )
+                    .unwrap()
+            } else {
+                root.clone()
+            };
+            let actor = target.actor().unwrap();
+            let journal = manager.journal();
+            let options = BTreeMap::from([("plugin.transient".into(), "selected".into())]);
+            let original =
+                stored_agent_config(&actor.effective_config().unwrap(), options.clone()).unwrap();
+            journal
+                .record_config(target.id(), 0, original, Some(options.clone()))
+                .unwrap();
+            let before = journal.snapshot();
+            let observer = actor.subscribe_config_commits();
+            while observer.try_recv().is_ok() {}
+            let committed = actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::ToggleFast))
+                .await
+                .unwrap();
+            assert!(committed.config.config.fast);
+            let changed = journal.snapshot();
+            assert_eq!(changed.state.len(), before.state.len() + 1);
+            let folded =
+                SessionStateView::fold(&changed.state, &changed.agent_revisions, changed.seq)
+                    .unwrap();
+            let saved = folded.scopes[&Some(target.id())].config.as_ref().unwrap();
+            assert!(saved.fast);
+            assert_eq!(saved.options, options);
+            assert_eq!(saved.cwd, "/original");
+            assert_eq!(saved.mode.id, "build");
+            assert_eq!(
+                observer.try_recv().unwrap().generation,
+                committed.config.generation
+            );
+            actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(None)
+                .await
+                .unwrap();
+            assert_eq!(journal.snapshot().state, changed.state);
+            let cancelled = actor.reserve_prepared_operation(None).unwrap();
+            drop(cancelled);
+            assert_eq!(journal.snapshot().state, changed.state);
+            assert!(matches!(
+                changed.state.last().unwrap().change,
+                StateChange::Config(_)
+            ));
+            root.close_subtree().unwrap();
+        });
+    }
+
+    #[test_case(true; "supported")]
+    #[test_case(false; "unsupported")]
+    fn discovery_consumes_model_pinned_fast_intent_atomically(supported: bool) {
+        use crate::actor::PreparedModel;
+        use crate::actor::tests::{ScriptedBackend, policy};
+        use crate::manager::AgentManagerHandle;
+        use crate::session_checkpoint::stored_agent_config;
+        use crate::session_options::FAST_PENDING_MODEL_OPTION_ID;
+        use makima_providers::model::FastSupport;
+        use makima_storage::session_state::StateChange;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        smol::block_on(async {
+            let manager = AgentManagerHandle::new(Default::default()).unwrap();
+            let mut settings = policy(false);
+            settings.model.fast_support = Some(FastSupport::Pending);
+            let config = EffectiveAgentConfig::new(settings, AgentMode::Build)
+                .with_mode_def(Some(ModeDef::default_for(ModeId::Build)));
+            let root = manager
+                .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                    Ok::<Box<dyn crate::actor::ActorBackend>, String>(Box::new(
+                        ScriptedBackend::new(),
+                    ))
+                })
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let before = actor.effective_config().unwrap();
+            let options =
+                BTreeMap::from([(FAST_PENDING_MODEL_OPTION_ID.into(), before.model.spec())]);
+            manager
+                .journal()
+                .record_config(
+                    root.id(),
+                    0,
+                    stored_agent_config(&before, options.clone()).unwrap(),
+                    Some(options),
+                )
+                .unwrap();
+            let mut replacement = before.model.clone();
+            replacement.fast_support = Some(if supported {
+                FastSupport::Supported
+            } else {
+                FastSupport::Unsupported
+            });
+            let commit = actor
+                .reserve_prepared_operation(None)
+                .unwrap()
+                .commit_when_ready(Some(ConfigChange::Refresh {
+                    expected: PreparedModel {
+                        provider: Arc::clone(&before.provider),
+                        model: before.model.clone(),
+                    },
+                    replacement: PreparedModel {
+                        provider: Arc::clone(&before.provider),
+                        model: replacement,
+                    },
+                }))
+                .await
+                .unwrap();
+            assert_eq!(commit.config.config.fast, supported);
+            let snapshot = manager.journal().snapshot();
+            let StateChange::Config(stored) = &snapshot.state.last().unwrap().change else {
+                panic!("expected configuration record")
+            };
+            assert_eq!(stored.fast, supported);
+            assert!(!stored.options.contains_key(FAST_PENDING_MODEL_OPTION_ID));
+            root.close_subtree().unwrap();
+        });
+    }
+
+    #[test_case(true; "supported")]
+    #[test_case(false; "unsupported")]
+    fn restored_config_uses_stored_values_and_clamps_capabilities(supported: bool) {
+        use crate::actor::PreparedModel;
+        use crate::actor::tests::policy;
+        use crate::session_checkpoint::stored_agent_config;
+        use makima_providers::model::FastSupport;
+        use makima_providers::{Effort, ThinkingConfig, ThinkingSupport};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut definition = ModeDef::default_for(ModeId::parse("saved_custom"));
+        definition.system_prompt = Some("exact saved prompt".into());
+        definition.tools = Some(Vec::new());
+        let mode = AgentMode::Custom(definition.id.clone());
+        let original = EffectiveAgentConfig::new(policy(true), mode.clone())
+            .with_context(AgentContextSnapshot::new(PathBuf::from("/saved")))
+            .with_mode_def(Some(definition.clone()));
+        let mut stored = stored_agent_config(&original, BTreeMap::new()).unwrap();
+        stored.thinking = Some(ThinkingConfig::Effort(Effort::High).into());
+        stored.workflow = true;
+        let mut model = original.model.clone();
+        model.fast_support = Some(if supported {
+            FastSupport::Supported
+        } else {
+            FastSupport::Unsupported
+        });
+        model.thinking_support = Some(if supported {
+            ThinkingSupport::Yes
+        } else {
+            ThinkingSupport::No
+        });
+        let restored = EffectiveAgentConfig::from_stored(
+            &stored,
+            PreparedModel {
+                provider: Arc::clone(&original.provider),
+                model,
+            },
+            (mode.clone(), definition.clone()),
+        )
+        .unwrap();
+        assert_eq!(restored.context.cwd(), PathBuf::from("/saved"));
+        assert_eq!(restored.model.spec(), stored.model);
+        assert_eq!(restored.fast, supported);
+        assert_eq!(
+            restored.thinking,
+            if supported {
+                ThinkingConfig::Effort(Effort::High)
+            } else {
+                ThinkingConfig::Off
+            }
+        );
+        assert!(restored.workflow);
+        assert_eq!(restored.mode, mode);
+        assert_eq!(restored.mode_def, Some(definition));
+    }
+
+    #[test_case(false; "rejects_changed_permissions")]
+    #[test_case(true; "restores_inside_existing_ceiling")]
+    fn restore_preserves_current_mode_authority(allowed: bool) {
+        use crate::actor::{ModeCeiling, PreparedModel};
+        use crate::session_checkpoint::stored_agent_config;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        const RESTRICTED_TOOL: &str = "read";
+        let mut definition = ModeDef::default_for(ModeId::Build);
+        definition.tools = Some(vec![RESTRICTED_TOOL.into()]);
+        let current =
+            EffectiveAgentConfig::new(crate::actor::tests::policy(false), AgentMode::Build)
+                .with_context(AgentContextSnapshot::new(PathBuf::from("/current")))
+                .with_mode_def(Some(definition.clone()))
+                .with_mode_authority(ModeCeiling::from_mode(&AgentMode::Build, Some(&definition)));
+        let mut saved = stored_agent_config(&current, BTreeMap::new()).unwrap();
+        if !allowed {
+            saved.mode.tools = None;
+        }
+        let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
+        let result = ConfigChange::resolved_restore(
+            &saved,
+            PreparedModel {
+                provider: Arc::clone(&current.provider),
+                model: current.model.clone(),
+            },
+            mode,
+            &current,
+        );
+        assert_eq!(result.is_ok(), allowed);
+        if let Ok(config) = result {
+            assert!(config.mode_authority().is_some());
+            assert_eq!(
+                config.context.generation(),
+                current.context.generation() + 1
+            );
+        }
+    }
 
     #[test]
     fn cwd_config_captures_context_generation_and_rejects_relative_paths() {

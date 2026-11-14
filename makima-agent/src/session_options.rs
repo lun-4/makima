@@ -9,6 +9,7 @@ use thiserror::Error;
 pub const MODEL_OPTION_ID: &str = "model";
 pub const YOLO_OPTION_ID: &str = "yolo";
 pub const FAST_OPTION_ID: &str = "fast";
+pub const FAST_PENDING_MODEL_OPTION_ID: &str = "fast_pending_model";
 pub const WORKFLOW_OPTION_ID: &str = "workflow";
 pub const THINKING_OPTION_ID: &str = "thinking";
 pub const ENABLED_VALUE: &str = "enabled";
@@ -74,9 +75,69 @@ pub struct SessionOptionState {
 pub struct SessionOptionsSnapshot {
     pub version: u64,
     pub options: Arc<[SessionOptionState]>,
+    pending_fast_model: Option<Arc<str>>,
 }
 
 impl SessionOptionsSnapshot {
+    pub(crate) fn set_pending_fast_model(&mut self, model: Option<&str>) {
+        self.pending_fast_model = model.map(Arc::from);
+    }
+
+    pub fn pending_fast_model(&self) -> Option<&str> {
+        self.pending_fast_model.as_deref()
+    }
+
+    pub fn values(&self) -> BTreeMap<String, String> {
+        let mut values: BTreeMap<_, _> = self
+            .options
+            .iter()
+            .map(|option| {
+                (
+                    option.definition.id.to_string(),
+                    option.current_value.to_string(),
+                )
+            })
+            .collect();
+        if let Some(model) = &self.pending_fast_model {
+            values.insert(FAST_PENDING_MODEL_OPTION_ID.into(), model.to_string());
+        }
+        values
+    }
+
+    pub fn config_values(&self) -> BTreeMap<String, String> {
+        let mut values = self.values();
+        values.remove(YOLO_OPTION_ID);
+        values
+    }
+
+    pub(crate) fn set_yolo(&mut self, enabled: bool) {
+        let mut options = self.options.to_vec();
+        if let Some(option) = options
+            .iter_mut()
+            .find(|option| option.definition.id.as_ref() == YOLO_OPTION_ID)
+        {
+            option.current_value = Arc::from(if enabled {
+                ENABLED_VALUE
+            } else {
+                DISABLED_VALUE
+            });
+        }
+        self.options = options.into();
+    }
+
+    pub fn plugin_values(&self) -> BTreeMap<String, String> {
+        self.options
+            .iter()
+            .filter(|option| matches!(option.definition.owner, SessionOptionOwner::Plugin { .. }))
+            .map(|option| {
+                (
+                    option.definition.id.to_string(),
+                    option.current_value.to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// Whether boolean option {id} is on; an absent option is off.
     pub fn enabled(&self, id: &str) -> bool {
         self.options.iter().any(|option| {
@@ -116,6 +177,7 @@ struct State {
     version: u64,
     definitions: Vec<SessionOptionDefinition>,
     values: HashMap<Arc<str>, Arc<str>>,
+    pending_fast_model: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -125,6 +187,20 @@ pub(crate) struct SessionOptionsCandidate {
 }
 
 impl SessionOptionsCandidate {
+    pub(crate) fn set_pending_fast(&mut self, model: Option<&str>) {
+        let model = model.map(Arc::from);
+        if self.state.pending_fast_model != model {
+            self.state.pending_fast_model = model;
+            if self.state.version == self.base_version {
+                self.state.version += 1;
+            }
+        }
+    }
+
+    pub(crate) fn clear_pending_fast(&mut self) {
+        self.set_pending_fast(None);
+    }
+
     pub(crate) fn base_version(&self) -> u64 {
         self.base_version
     }
@@ -243,6 +319,11 @@ impl SessionOptions {
         let mut values = HashMap::with_capacity(definitions.len());
         let mut ids = BTreeMap::new();
         for definition in &definitions {
+            if definition.id.as_ref() == FAST_PENDING_MODEL_OPTION_ID {
+                return Err(SessionOptionError::InvalidDefinition(Arc::clone(
+                    &definition.id,
+                )));
+            }
             definition.validate()?;
             if ids.insert(definition.id.as_ref(), ()).is_some() {
                 return Err(SessionOptionError::InvalidDefinition(Arc::from(
@@ -251,7 +332,7 @@ impl SessionOptions {
             }
             let value = persisted
                 .get(definition.id.as_ref())
-                .filter(|value| definition.accepts(value))
+                .filter(|value| definition.persistent && definition.accepts(value))
                 .map(|value| Arc::from(value.as_str()))
                 .unwrap_or_else(|| Arc::clone(&definition.initial_value));
             values.insert(Arc::clone(&definition.id), value);
@@ -262,6 +343,10 @@ impl SessionOptions {
                     version: 1,
                     definitions,
                     values,
+                    pending_fast_model: persisted
+                        .get(FAST_PENDING_MODEL_OPTION_ID)
+                        .filter(|model| !model.is_empty())
+                        .map(|model| Arc::from(model.as_str())),
                 },
                 reserved: false,
             }),
@@ -327,6 +412,13 @@ impl SessionOptions {
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         let state = lock(&self.state);
         let mut candidate = state.clone();
+        if candidate
+            .pending_fast_model
+            .as_deref()
+            .is_some_and(|pending| pending != model || fast == ENABLED_VALUE)
+        {
+            candidate.pending_fast_model = None;
+        }
         let definition = candidate
             .definitions
             .iter_mut()
@@ -340,7 +432,7 @@ impl SessionOptions {
             });
             definition.values = choices.into();
         }
-        Self::prepare_set_values_from_state(
+        let prepared = Self::prepare_set_values_from_state(
             &candidate,
             &[
                 (MODEL_OPTION_ID, model),
@@ -348,7 +440,16 @@ impl SessionOptions {
                 (THINKING_OPTION_ID, thinking),
                 (WORKFLOW_OPTION_ID, workflow),
             ],
-        )
+        )?;
+        Ok(prepared.or_else(|| {
+            (candidate.pending_fast_model != state.pending_fast_model).then(|| {
+                candidate.version += 1;
+                SessionOptionsCandidate {
+                    base_version: state.version,
+                    state: candidate,
+                }
+            })
+        }))
     }
 
     fn prepare_set_values_from_state(
@@ -392,6 +493,11 @@ impl SessionOptions {
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         for definition in &definitions {
             definition.validate()?;
+            if definition.id.as_ref() == FAST_PENDING_MODEL_OPTION_ID {
+                return Err(SessionOptionError::InvalidDefinition(Arc::clone(
+                    &definition.id,
+                )));
+            }
             if !matches!(
                 &definition.owner,
                 SessionOptionOwner::Plugin { plugin: owner, .. } if owner.as_ref() == plugin
@@ -468,12 +574,43 @@ impl SessionOptions {
                 version: state.version + 1,
                 definitions: next_definitions,
                 values: next_values,
+                pending_fast_model: state.pending_fast_model.clone(),
             },
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_batch(
         candidates: Vec<(&SessionOptionsReservation, SessionOptionsCandidate)>,
+    ) -> Result<Vec<SessionOptionsSnapshot>, SessionOptionError> {
+        Self::commit_batch_with(candidates, || Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_batch_with(
+        candidates: Vec<(&SessionOptionsReservation, SessionOptionsCandidate)>,
+        before_commit: impl FnOnce() -> Result<(), SessionOptionError>,
+    ) -> Result<Vec<SessionOptionsSnapshot>, SessionOptionError> {
+        let reservations = candidates
+            .iter()
+            .map(|(reservation, _)| *reservation)
+            .collect::<Vec<_>>();
+        let snapshots = Self::commit_batch_unpublished(candidates, before_commit)?;
+        Self::publish_batch(reservations.into_iter().zip(&snapshots));
+        Ok(snapshots)
+    }
+
+    pub(crate) fn publish_batch<'a>(
+        snapshots: impl IntoIterator<Item = (&'a SessionOptionsReservation, &'a SessionOptionsSnapshot)>,
+    ) {
+        for (reservation, snapshot) in snapshots {
+            reservation.options.published(snapshot);
+        }
+    }
+
+    pub(crate) fn commit_batch_unpublished(
+        candidates: Vec<(&SessionOptionsReservation, SessionOptionsCandidate)>,
+        before_commit: impl FnOnce() -> Result<(), SessionOptionError>,
     ) -> Result<Vec<SessionOptionsSnapshot>, SessionOptionError> {
         if candidates
             .iter()
@@ -499,22 +636,16 @@ impl SessionOptions {
                 )));
             }
         }
-        let changed = candidates
-            .iter()
-            .map(|(reservation, _)| Arc::clone(&reservation.options))
-            .collect::<Vec<_>>();
+        before_commit()?;
         let mut snapshots = Vec::with_capacity(candidates.len());
         for (guard, (_, candidate)) in guards.iter_mut().zip(&candidates) {
             guard.committed = candidate.state.clone();
             snapshots.push(snapshot(guard));
         }
-        drop(guards);
-        for (options, snapshot) in changed.iter().zip(&snapshots) {
-            options.published(snapshot);
-        }
         Ok(snapshots)
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_reserved_batch_if_versions(
         snapshots: Vec<(&SessionOptionsReservation, u64, SessionOptionsSnapshot)>,
     ) -> bool {
@@ -547,6 +678,7 @@ impl SessionOptions {
         for (guard, (_, _, snapshot)) in guards.iter_mut().zip(snapshots) {
             guard.committed = State {
                 version: snapshot.version,
+                pending_fast_model: snapshot.pending_fast_model,
                 definitions: snapshot
                     .options
                     .iter()
@@ -617,6 +749,53 @@ impl SessionOptions {
         }))
     }
 
+    pub(crate) fn prepare_restore(
+        &self,
+        values: &BTreeMap<String, String>,
+    ) -> Result<SessionOptionsCandidate, SessionOptionError> {
+        let state = lock(&self.state);
+        let mut candidate = state.committed.clone();
+        if let Some(model) = values.get(MODEL_OPTION_ID)
+            && let Some(definition) = candidate
+                .definitions
+                .iter_mut()
+                .find(|definition| definition.id.as_ref() == MODEL_OPTION_ID)
+            && !definition.accepts(model)
+        {
+            let mut choices = definition.values.to_vec();
+            choices.push(SessionOptionValue {
+                value: Arc::from(model.as_str()),
+                name: Arc::from(model.as_str()),
+            });
+            definition.values = choices.into();
+        }
+        candidate.version = candidate
+            .version
+            .checked_add(1)
+            .ok_or(SessionOptionError::Busy)?;
+        candidate.pending_fast_model = values
+            .get(FAST_PENDING_MODEL_OPTION_ID)
+            .map(|value| Arc::from(value.as_str()));
+        for definition in &candidate.definitions {
+            let value = values
+                .get(definition.id.as_ref())
+                .map_or(definition.initial_value.as_ref(), String::as_str);
+            if !definition.accepts(value) {
+                return Err(SessionOptionError::InvalidValue {
+                    id: Arc::clone(&definition.id),
+                    value: Arc::from(value),
+                });
+            }
+            candidate
+                .values
+                .insert(Arc::clone(&definition.id), Arc::from(value));
+        }
+        Ok(SessionOptionsCandidate {
+            base_version: state.version,
+            state: candidate,
+        })
+    }
+
     pub(crate) fn unchanged_candidate(&self) -> SessionOptionsCandidate {
         let state = lock(&self.state);
         SessionOptionsCandidate {
@@ -680,6 +859,7 @@ fn snapshot(state: &State) -> SessionOptionsSnapshot {
     SessionOptionsSnapshot {
         version: state.version,
         options,
+        pending_fast_model: state.pending_fast_model.clone(),
     }
 }
 
@@ -702,6 +882,7 @@ fn valid_id(id: &str, owner: &SessionOptionOwner) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
 
     fn definition(id: &str, initial: &str) -> SessionOptionDefinition {
         SessionOptionDefinition {
@@ -736,6 +917,223 @@ mod tests {
             Some(candidate) => reservation.commit(candidate),
             None => options.snapshot(),
         })
+    }
+
+    #[test]
+    fn plugin_values_include_transient_candidate_values_without_builtins() {
+        const PLUGIN: &str = "plugin";
+        const PERSISTENT: &str = "plugin.persistent";
+        const TRANSIENT: &str = "plugin.transient";
+        let mut persistent = definition(PERSISTENT, DISABLED_VALUE);
+        persistent.owner = SessionOptionOwner::Plugin {
+            plugin: Arc::from(PLUGIN),
+            generation: 1,
+        };
+        let mut transient = persistent.clone();
+        transient.id = Arc::from(TRANSIENT);
+        transient.persistent = false;
+        let options = SessionOptions::new(
+            vec![
+                definition(YOLO_OPTION_ID, ENABLED_VALUE),
+                transient,
+                persistent,
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let before = options.snapshot().plugin_values();
+        assert_eq!(
+            options.snapshot().values(),
+            BTreeMap::from([
+                (PERSISTENT.into(), DISABLED_VALUE.into()),
+                (TRANSIENT.into(), DISABLED_VALUE.into()),
+                (YOLO_OPTION_ID.into(), ENABLED_VALUE.into()),
+            ])
+        );
+        assert_eq!(
+            before,
+            BTreeMap::from([
+                (PERSISTENT.into(), DISABLED_VALUE.into()),
+                (TRANSIENT.into(), DISABLED_VALUE.into()),
+            ])
+        );
+        let candidate = options
+            .prepare_set_values(&[(PERSISTENT, ENABLED_VALUE), (TRANSIENT, ENABLED_VALUE)])
+            .unwrap()
+            .unwrap();
+        let values = SessionOptions::candidate_snapshot(&candidate).plugin_values();
+        assert_eq!(
+            values,
+            BTreeMap::from([
+                (PERSISTENT.into(), ENABLED_VALUE.into()),
+                (TRANSIENT.into(), ENABLED_VALUE.into()),
+            ])
+        );
+        assert_eq!(options.snapshot().plugin_values(), before);
+        assert_eq!(
+            options
+                .reserve(&candidate)
+                .unwrap()
+                .commit(candidate)
+                .plugin_values(),
+            values
+        );
+    }
+
+    #[test_case(true; "persistent")]
+    #[test_case(false; "transient")]
+    fn catalog_generation_change_preserves_complete_values(persistent: bool) {
+        const PLUGIN: &str = "plugin";
+        const OPTION: &str = "plugin.choice";
+        let mut original = definition(OPTION, DISABLED_VALUE);
+        original.owner = SessionOptionOwner::Plugin {
+            plugin: Arc::from(PLUGIN),
+            generation: 1,
+        };
+        original.persistent = persistent;
+        let options = SessionOptions::new(vec![original.clone()], &BTreeMap::new()).unwrap();
+        set(&options, OPTION, ENABLED_VALUE).unwrap();
+        let before = options.snapshot();
+        let mut replacement = original;
+        replacement.owner = SessionOptionOwner::Plugin {
+            plugin: Arc::from(PLUGIN),
+            generation: 2,
+        };
+        let candidate = options
+            .prepare_replace_plugin(PLUGIN, vec![replacement])
+            .unwrap()
+            .unwrap();
+        let staged = SessionOptions::candidate_snapshot(&candidate);
+        assert!(staged.version > before.version);
+        assert_ne!(staged.options, before.options);
+        assert_eq!(staged.values(), before.values());
+        assert_eq!(options.snapshot(), before);
+        options.reserve(&candidate).unwrap().commit(candidate);
+        let removed = options
+            .prepare_replace_plugin(PLUGIN, Vec::new())
+            .unwrap()
+            .unwrap();
+        assert!(
+            SessionOptions::candidate_snapshot(&removed)
+                .values()
+                .is_empty()
+        );
+        drop(removed);
+        assert_eq!(options.snapshot().values(), before.values());
+        drop(options.try_reserve(None).unwrap());
+    }
+
+    #[test_case(true, ENABLED_VALUE; "persistent_restored")]
+    #[test_case(false, DISABLED_VALUE; "transient_reset")]
+    fn resume_filters_transient_values_from_complete_config(persistent: bool, expected: &str) {
+        const PLUGIN: &str = "plugin";
+        const OPTION: &str = "plugin.choice";
+        let mut option = definition(OPTION, DISABLED_VALUE);
+        option.owner = SessionOptionOwner::Plugin {
+            plugin: Arc::from(PLUGIN),
+            generation: 1,
+        };
+        option.persistent = persistent;
+        let options = SessionOptions::new(vec![option.clone()], &BTreeMap::new()).unwrap();
+        set(&options, OPTION, ENABLED_VALUE).unwrap();
+        let saved = options.snapshot().values();
+        assert_eq!(saved[OPTION], ENABLED_VALUE);
+        let resumed = SessionOptions::new(vec![option], &saved).unwrap();
+        assert_eq!(resumed.snapshot().values()[OPTION], expected);
+    }
+
+    #[test]
+    fn pending_fast_is_internal_persistent_and_survives_complete_candidates() {
+        const MODEL: &str = "provider/model";
+        let mut model = definition(MODEL_OPTION_ID, MODEL);
+        model.values = Arc::from([SessionOptionValue {
+            value: Arc::from(MODEL),
+            name: Arc::from(MODEL),
+        }]);
+        let options = SessionOptions::new(
+            vec![
+                model,
+                definition(FAST_OPTION_ID, DISABLED_VALUE),
+                definition(THINKING_OPTION_ID, DISABLED_VALUE),
+                definition(WORKFLOW_OPTION_ID, DISABLED_VALUE),
+            ],
+            &BTreeMap::from([(FAST_PENDING_MODEL_OPTION_ID.into(), MODEL.into())]),
+        )
+        .unwrap();
+        let before = options.snapshot();
+        assert_eq!(before.pending_fast_model(), Some(MODEL));
+        assert_eq!(before.values()[FAST_PENDING_MODEL_OPTION_ID], MODEL);
+        assert!(before.plugin_values().is_empty());
+        assert!(matches!(
+            options.prepare_set(FAST_PENDING_MODEL_OPTION_ID, "other"),
+            Err(SessionOptionError::UnknownId(_))
+        ));
+        let candidate = options
+            .prepare_actor_config(MODEL, DISABLED_VALUE, DISABLED_VALUE, ENABLED_VALUE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SessionOptions::candidate_snapshot(&candidate).pending_fast_model(),
+            Some(MODEL)
+        );
+        options.reserve(&candidate).unwrap().commit(candidate);
+        let mut candidate = options.unchanged_candidate();
+        candidate.clear_pending_fast();
+        assert!(
+            SessionOptions::candidate_snapshot(&candidate)
+                .pending_fast_model()
+                .is_none()
+        );
+        assert_eq!(options.snapshot().pending_fast_model(), Some(MODEL));
+        options.reserve(&candidate).unwrap().commit(candidate);
+        assert!(
+            !options
+                .snapshot()
+                .values()
+                .contains_key(FAST_PENDING_MODEL_OPTION_ID)
+        );
+    }
+
+    #[test_case(true; "enabled")]
+    #[test_case(false; "changed_model")]
+    fn actor_config_clears_pending_fast_intent(enabled: bool) {
+        const MODEL: &str = "provider/model";
+        let mut model = definition(MODEL_OPTION_ID, MODEL);
+        model.values = Arc::from([SessionOptionValue {
+            value: Arc::from(MODEL),
+            name: Arc::from(MODEL),
+        }]);
+        let options = SessionOptions::new(
+            vec![
+                model,
+                definition(FAST_OPTION_ID, DISABLED_VALUE),
+                definition(THINKING_OPTION_ID, DISABLED_VALUE),
+                definition(WORKFLOW_OPTION_ID, DISABLED_VALUE),
+            ],
+            &BTreeMap::from([(FAST_PENDING_MODEL_OPTION_ID.into(), MODEL.into())]),
+        )
+        .unwrap();
+        let candidate = options
+            .prepare_actor_config(
+                if enabled { MODEL } else { "provider/other" },
+                if enabled {
+                    ENABLED_VALUE
+                } else {
+                    DISABLED_VALUE
+                },
+                DISABLED_VALUE,
+                DISABLED_VALUE,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            SessionOptions::candidate_snapshot(&candidate)
+                .pending_fast_model()
+                .is_none()
+        );
+        assert_eq!(options.snapshot().pending_fast_model(), Some(MODEL));
+        options.reserve(&candidate).unwrap().commit(candidate);
+        assert!(options.snapshot().pending_fast_model().is_none());
     }
 
     #[test]

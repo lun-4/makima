@@ -125,6 +125,14 @@ impl App {
         if self.root_mode() != Mode::Plan {
             return;
         }
+        if matches!(trigger, PlanTrigger::InteractivePrompt)
+            && self.state.plan.is_ready()
+            && let (Some(target), Some(path)) = (self.root_agent.clone(), self.state.plan.path())
+            && let Err(error) = makima_agent::plan_state::set_written(&target, path, false)
+        {
+            self.flash(error.to_string());
+            return;
+        }
         match trigger {
             PlanTrigger::WriteDone => {
                 if self.state.plan.is_ready() {

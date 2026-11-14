@@ -4,6 +4,7 @@
 //! `cancelled()` uses a double-check around the listener to close the TOCTOU window between flag read and listener registration.
 
 use std::collections::HashMap;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -92,6 +93,42 @@ impl Drop for PublicationRegistration {
                 .publications
                 .retain(|registered| !registered.ptr_eq(&publication));
         }
+    }
+}
+
+pub struct PublicationGuard(CheckpointPublication);
+
+impl Debug for PublicationGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicationGuard").finish_non_exhaustive()
+    }
+}
+
+impl PublicationGuard {
+    pub(crate) fn new(publication: CheckpointPublication) -> Self {
+        Self(publication)
+    }
+
+    pub(crate) fn register(
+        publication: &CheckpointPublication,
+        registrations: &mut Vec<Weak<Self>>,
+    ) -> Arc<Self> {
+        registrations.retain(|registration| registration.strong_count() > 0);
+        let guard = Arc::new(Self(publication.clone()));
+        registrations.push(Arc::downgrade(&guard));
+        guard
+    }
+
+    pub(crate) fn cancel_all(registrations: &mut Vec<Weak<Self>>) {
+        for guard in registrations.drain(..).filter_map(|guard| guard.upgrade()) {
+            guard.0.cancel();
+        }
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -237,6 +274,23 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled()
+    }
+
+    pub fn with_effect<T>(tokens: &[&Self], effect: impl FnOnce() -> T) -> Option<T> {
+        let mut gates = tokens
+            .iter()
+            .map(|token| &token.0.publication_gate)
+            .collect::<Vec<_>>();
+        gates.sort_unstable_by_key(|gate| Arc::as_ptr(gate));
+        gates.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let _guards = gates
+            .iter()
+            .map(|gate| gate.lock().unwrap_or_else(|error| error.into_inner()))
+            .collect::<Vec<_>>();
+        if tokens.iter().any(|token| token.is_cancelled()) {
+            return None;
+        }
+        Some(effect())
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {

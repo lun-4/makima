@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,13 +7,16 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
+use makima_agent::cancel::PublicationRegistration;
+use makima_agent::journal::{JournalChange, SessionJournalSnapshot};
 use makima_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
-use makima_agent::session_coordinator::SessionOptionCatalog;
+use makima_agent::session_coordinator::{SessionOptionCatalog, publication_claim};
 use makima_agent::tools::{ToolRegistry, ToolSource};
-use makima_agent::{AgentManagerHandle, AgentRef};
+use makima_agent::{AgentId, AgentManagerHandle, AgentRef, CancelToken};
 use makima_commands::{CommandBehavior, CommandRegistry};
 use makima_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use makima_providers::{ProviderRegistry, Timeouts};
+use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
@@ -22,7 +26,7 @@ use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentR
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
-use crate::orchestration::TrustedTarget;
+use crate::orchestration::{PluginAuthority, TrustedTarget};
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
@@ -214,6 +218,56 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)
 });
+
+pub struct PreparedStateRestore {
+    pub changes: Vec<JournalChange>,
+    pub claim: CheckpointClaim,
+}
+
+impl fmt::Debug for PreparedStateRestore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStateRestore")
+            .field("changes", &self.changes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedStateRestore {
+    pub(crate) fn new(
+        changes: Vec<JournalChange>,
+        mut owners: Vec<Arc<PluginAuthority>>,
+        publication: CheckpointPublication,
+    ) -> Self {
+        owners.sort_unstable_by_key(|owner| owner.generation());
+        owners.dedup_by_key(|owner| owner.generation());
+        let registrations: Vec<PublicationRegistration> = owners
+            .iter()
+            .map(|owner| owner.register_publication(&publication))
+            .collect();
+        let base = publication_claim();
+        let claim = Arc::new(move |requested: &CheckpointPublication| {
+            let _registrations = &registrations;
+            if !publication.same_request(requested) {
+                return Err(Arc::from("state restore publication does not match"));
+            }
+            claim_state_restore(&owners, &|| base(requested))
+        });
+        Self { changes, claim }
+    }
+}
+
+fn claim_state_restore(
+    owners: &[Arc<PluginAuthority>],
+    claim: &dyn Fn() -> Result<(), Arc<str>>,
+) -> Result<(), Arc<str>> {
+    match owners.split_first() {
+        Some((owner, remaining)) => {
+            owner.claim_publication(|| claim_state_restore(remaining, claim))
+        }
+        None => claim(),
+    }
+}
 
 pub struct PluginHost {
     inner: LuaThread,
@@ -612,6 +666,22 @@ impl PluginHost {
         Ok(reply_rx)
     }
 
+    #[cfg(feature = "memory-profile")]
+    pub fn profile_memory(&self, collect: bool) -> Result<usize, PluginError> {
+        let (reply, response) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::ProfileMemory { collect, reply })
+            .map_err(|_| PluginError::HostDead)?;
+        response
+            .recv()
+            .map_err(|_| PluginError::HostDead)?
+            .map_err(|source| PluginError::Lua {
+                plugin: "<memory-profile>".to_owned(),
+                source,
+            })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn collect_garbage_for_test(&self) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
@@ -997,12 +1067,17 @@ impl EventHandle {
                 .await
                 .map_err(Into::into);
         }
+        let publication = CheckpointPublication::default();
+        let (trigger, cancel) = CancelToken::new();
+        let _caller = (trigger, cancel.register_publication(&publication));
         let (reply, response) = flume::bounded(1);
         self.tx
             .send_async(Request::SetSessionOption {
                 coordinator,
                 id,
                 value,
+                publication,
+                cancel,
                 reply,
             })
             .await
@@ -1129,6 +1204,44 @@ impl EventHandle {
                 shared.send(Request::SplashFrame(work)).is_ok()
             }),
         }
+    }
+
+    pub async fn prepare_state_restore(
+        &self,
+        snapshot: SessionJournalSnapshot,
+        affected: BTreeSet<AgentId>,
+        session_scope: bool,
+        publication: CheckpointPublication,
+    ) -> Result<PreparedStateRestore, String> {
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send_async(Request::PrepareStateRestore {
+                snapshot,
+                affected,
+                session_scope,
+                publication,
+                reply,
+            })
+            .await
+            .map_err(|_| "Lua host stopped".to_owned())?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| "Lua host stopped".to_owned())?
+    }
+
+    /// Waits for journal observation without emitting resume notifications.
+    /// Call outside the Lua worker, before draining installed rewind notices.
+    pub fn observe_state_restored(&self, target: AgentRef) -> Result<(), String> {
+        let (reply, response) = flume::bounded(1);
+        self.tx
+            .send(Request::ObserveStateRestored { target, reply })
+            .map_err(|_| "Lua host stopped".to_owned())?;
+        response.recv().map_err(|_| "Lua host stopped".to_owned())
+    }
+
+    pub fn notify_state_restored(&self, target: makima_agent::AgentRef) {
+        let _ = self.tx.try_send(Request::NotifyStateRestored(target));
     }
 
     /// Install explicit agent target and discovery services supplied by the host.
@@ -1431,23 +1544,199 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::agent::create_agent_table;
+    use crate::api::util::ctx::LuaCtx;
+    use crate::orchestration::{OrchestrationServices, TrustedTarget};
+    use crate::runtime::bind_plugin_owner;
     use crate::test_support::run_command;
-    use makima_agent::SessionMailbox;
-    use makima_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use futures_lite::future::poll_once;
+    use makima_agent::actor::{ActorHistory, PreparedModel};
+    use makima_agent::permissions::PermissionManager;
+    use makima_agent::prompt::{PromptId, PromptSource, ResolvedSlots, Slot};
     use makima_agent::session_coordinator::{
-        SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
-        builtin_option_definitions,
+        SessionCheckpoint, SessionCoordinatorError, SessionCoordinatorHandle,
+        SessionCoordinatorParams, builtin_option_definitions,
     };
-    use makima_agent::tools::ToolRegistry;
+    use makima_agent::session_options::{ENABLED_VALUE, YOLO_OPTION_ID};
+    use makima_agent::tools::test_support::stub_ctx_with_session;
+    use makima_agent::tools::{ToolContext, ToolRegistry};
+    use makima_agent::{
+        ActorBackend, AgentInput, AgentMode, BackendResult, ControlWork, EffectiveAgentConfig,
+        RunSettings, SessionMailbox, TurnContext, WorkKind,
+    };
     use makima_storage::checkpoint::{
-        CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
-        accept_all,
+        CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointRequest,
+        CheckpointWriter, ClaimingWriter,
     };
     use makima_storage::id::MakimaId;
+    use makima_storage::session_state::StateChange;
     use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
+
+    const OPTION_OWNER: &str = "option_invocation";
+    const OPTION_CHECKPOINT_TIMEOUT: &str = "session option checkpoint did not complete";
+    const OPTION_SET_SOURCE: &str = r#"
+        local reference = assert(makima.agent.root(ctx))
+        local agent = assert(makima.agent.get(ctx, reference))
+        return agent:set_option(ctx, "yolo", "enabled")
+    "#;
+
+    struct IdleOptionBackend;
+
+    impl ActorBackend for IdleOptionBackend {
+        fn run_turn<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: AgentInput,
+            _: WorkKind,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: &'a ControlWork,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!() })
+        }
+    }
+
+    struct OptionTarget(TrustedTarget);
+
+    impl OrchestrationServices for OptionTarget {
+        fn resolve_target(
+            &self,
+            _: Option<&makima_commands::CommandInvocation>,
+        ) -> Result<Option<TrustedTarget>, String> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
+            assert!(target.same_manager(&self.0.target));
+            Ok(self.0.template.clone())
+        }
+    }
+
+    struct OptionCheckpointGate {
+        reached: flume::Sender<CheckpointPublication>,
+        release: flume::Receiver<()>,
+        claim_first: bool,
+    }
+
+    struct StagedOptionCheckpoint {
+        gate: Mutex<Option<OptionCheckpointGate>>,
+        durable: Arc<Mutex<Option<Arc<SessionCheckpoint>>>>,
+    }
+
+    impl CheckpointWriter<SessionCheckpoint> for StagedOptionCheckpoint {
+        fn checkpoint(&self, request: CheckpointRequest<SessionCheckpoint>) -> CheckpointFuture {
+            let durable = self.durable.clone();
+            Box::pin(async move {
+                let ack = CheckpointAck::for_request(&request);
+                *durable.lock().unwrap() = Some(request.snapshot);
+                Ok(ack)
+            })
+        }
+
+        fn checkpoint_guarded(
+            &self,
+            request: CheckpointRequest<SessionCheckpoint>,
+            publication: CheckpointPublication,
+            claim: CheckpointClaim,
+        ) -> CheckpointFuture {
+            let gate = self.gate.lock().unwrap().take();
+            let durable = self.durable.clone();
+            Box::pin(async move {
+                let claim_first = gate.as_ref().is_none_or(|gate| gate.claim_first);
+                let publish = || {
+                    claim(&publication).map_err(|message| CheckpointError::Save {
+                        session_id: request.session_id,
+                        message,
+                    })
+                };
+                if claim_first {
+                    publish()?;
+                }
+                if let Some(gate) = gate {
+                    gate.reached.send(publication.clone()).unwrap();
+                    gate.release.recv_async().await.unwrap();
+                }
+                if !claim_first {
+                    publish()?;
+                }
+                let ack = CheckpointAck::for_request(&request);
+                *durable.lock().unwrap() = Some(request.snapshot);
+                Ok(ack)
+            })
+        }
+    }
+
+    fn option_target(coordinator: &SessionCoordinatorHandle) -> TrustedTarget {
+        let mut template =
+            stub_ctx_with_session(&AgentMode::Build, None, None, coordinator.session_id());
+        template.permissions = Arc::new(PermissionManager::new(
+            Default::default(),
+            template.cwd.clone(),
+            ProjectConfig::for_project(&template.cwd),
+            Arc::default(),
+        ));
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider: template.provider.clone(),
+                model: (*template.model).clone(),
+                thinking: template.opts.thinking,
+                fast: false,
+                workflow: false,
+            },
+            AgentMode::Build,
+        )
+        .with_mode_def(Some(template.modes.current(&AgentMode::Build)));
+        let manager = AgentManagerHandle::new(Default::default()).unwrap();
+        let target = manager
+            .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleOptionBackend))
+            })
+            .unwrap();
+        template
+            .permissions
+            .bind_journal(manager.journal(), None)
+            .unwrap();
+        coordinator
+            .bind_permissions(template.permissions.clone())
+            .unwrap();
+        let provider = template.provider.clone();
+        let model = (*template.model).clone();
+        coordinator
+            .bind_actor(
+                target.clone(),
+                Arc::new(move |_| {
+                    let prepared = PreparedModel {
+                        model: model.clone(),
+                        provider: provider.clone(),
+                    };
+                    Box::pin(async move { Ok(prepared) })
+                }),
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+        TrustedTarget { target, template }
+    }
 
     struct FakeCommandHost;
 
@@ -1479,7 +1768,7 @@ mod tests {
         catalog: SessionOptionCatalog,
         persisted_options: BTreeMap<String, String>,
     ) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = ClaimingWriter::accept_all();
         test_coordinator_with_checkpoint(catalog, persisted_options, checkpoint)
     }
 
@@ -1772,6 +2061,292 @@ mod tests {
                     .iter()
                     .all(|option| option.definition.id.as_ref() != "choice.candidate")
             );
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    async fn option_checkpoint_bound<T>(future: impl Future<Output = T>) -> T {
+        futures_lite::future::race(future, async {
+            smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+            panic!("{OPTION_CHECKPOINT_TIMEOUT}");
+        })
+        .await
+    }
+
+    fn staged_option_coordinator(
+        catalog: SessionOptionCatalog,
+        claim_first: bool,
+    ) -> (
+        SessionCoordinatorHandle,
+        Arc<StagedOptionCheckpoint>,
+        flume::Receiver<CheckpointPublication>,
+        flume::Sender<()>,
+    ) {
+        let (reached, entered) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let writer = Arc::new(StagedOptionCheckpoint {
+            gate: Mutex::new(Some(OptionCheckpointGate {
+                reached,
+                release: released,
+                claim_first,
+            })),
+            durable: Arc::default(),
+        });
+        let coordinator =
+            test_coordinator_with_checkpoint(catalog, BTreeMap::new(), writer.clone());
+        (coordinator, writer, entered, release)
+    }
+
+    fn assert_option_publication(
+        coordinator: &SessionCoordinatorHandle,
+        target: &TrustedTarget,
+        writer: &StagedOptionCheckpoint,
+        published: bool,
+    ) {
+        assert_eq!(
+            coordinator.read().options().enabled(YOLO_OPTION_ID),
+            published
+        );
+        assert_eq!(
+            target.template.permissions.snapshot().yolo,
+            published.then_some(true)
+        );
+        let journal = target.target.manager().journal().snapshot();
+        assert_eq!(
+            journal.state.iter().any(|record| matches!(
+                record.change,
+                StateChange::Rules {
+                    yolo: Some(true),
+                    ..
+                }
+            )),
+            published,
+        );
+        let durable = writer.durable.lock().unwrap();
+        assert_eq!(
+            durable
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.options.enabled(YOLO_OPTION_ID)),
+            published
+        );
+    }
+
+    #[test_case(false, false, false; "cancel_before_claim")]
+    #[test_case(true, false, false; "unload_before_claim")]
+    #[test_case(false, true, false; "cancel_after_claim")]
+    #[test_case(true, true, false; "unload_after_claim")]
+    #[test_case(false, false, true; "origin_child_detached_before_claim")]
+    #[test_case(false, true, true; "origin_child_detached_after_claim")]
+    fn agent_set_option_keeps_invocation_publication_owner(
+        unload: bool,
+        claim_first: bool,
+        detach_origin: bool,
+    ) {
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            host.load_source(OPTION_OWNER, "").unwrap();
+            let handle = host.event_handle();
+            let (coordinator, writer, entered, release) =
+                staged_option_coordinator(handle.session_option_catalog(), claim_first);
+            let target = option_target(&coordinator);
+            handle.install_orchestration_services(Arc::new(OptionTarget(target.clone())));
+            let (trigger, cancel) = CancelToken::new();
+            let (owner_tx, owner_rx) = flume::bounded(1);
+            let (result_tx, result_rx) = flume::bounded(1);
+            let invocation_target = if detach_origin {
+                let config = target.target.effective_config().unwrap().unwrap();
+                let child = target
+                    .target
+                    .manager()
+                    .spawn_child_trusted_with_config(
+                        &target.target,
+                        (*config).clone(),
+                        Default::default(),
+                        Vec::new(),
+                        None,
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleOptionBackend)),
+                    )
+                    .unwrap();
+                TrustedTarget {
+                    target: child,
+                    template: target.template.clone(),
+                }
+            } else {
+                target.clone()
+            };
+            let origin = invocation_target.target.clone();
+            handle
+                .tx
+                .send(Request::Provider {
+                    cancel,
+                    job: Box::new(move |lua| {
+                        Box::pin(async move {
+                            let owner = crate::orchestration::plugin_authority(
+                                &lua,
+                                Arc::from(OPTION_OWNER),
+                            );
+                            bind_plugin_owner(&lua, Arc::from(OPTION_OWNER), owner.clone())
+                                .unwrap();
+                            owner_tx.send(owner).unwrap();
+                            let ctx = LuaCtx::trusted_context(
+                                &lua,
+                                invocation_target,
+                                Arc::from(OPTION_OWNER),
+                            );
+                            let env = lua.create_table().unwrap();
+                            let makima = lua.create_table().unwrap();
+                            makima
+                                .set("agent", create_agent_table(&lua).unwrap())
+                                .unwrap();
+                            env.set("makima", makima).unwrap();
+                            env.set("ctx", ctx).unwrap();
+                            env.set_metatable(Some({
+                                let metatable = lua.create_table().unwrap();
+                                metatable.set("__index", lua.globals()).unwrap();
+                                metatable
+                            }))
+                            .unwrap();
+                            let result = lua
+                                .load(OPTION_SET_SOURCE)
+                                .set_environment(env)
+                                .eval_async::<(Option<bool>, Option<String>)>()
+                                .await;
+                            let _ = result_tx.send(result);
+                        })
+                    }),
+                })
+                .unwrap();
+            let owner = option_checkpoint_bound(owner_rx.recv_async())
+                .await
+                .unwrap();
+            let publication = option_checkpoint_bound(futures_lite::future::race(
+                async { entered.recv_async().await.unwrap() },
+                async {
+                    let result = result_rx.recv_async().await;
+                    panic!("session option invocation exited before checkpoint: {result:?}");
+                },
+            ))
+            .await;
+            if detach_origin {
+                let incarnation = origin.incarnation().unwrap();
+                origin.manager().detach_incarnation(&incarnation).unwrap();
+                assert!(
+                    origin
+                        .manager()
+                        .actor_for_incarnation(&incarnation)
+                        .is_err()
+                );
+                assert_eq!(publication.is_cancelled(), !claim_first);
+                release.send(()).unwrap();
+            } else if unload {
+                let (reply, unloaded) = flume::bounded(1);
+                handle
+                    .tx
+                    .send(Request::ClearPlugin {
+                        plugin: Arc::from(OPTION_OWNER),
+                        reply,
+                    })
+                    .unwrap();
+                option_checkpoint_bound(async {
+                    while owner.is_alive() {
+                        smol::future::yield_now().await;
+                    }
+                    if !claim_first {
+                        publication.cancelled().await;
+                    }
+                })
+                .await;
+                let error = option_checkpoint_bound(unloaded.recv_async())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                let PluginError::Unload { plugin, error } = error else {
+                    panic!("expected transactional session option unload failure");
+                };
+                assert_eq!(plugin, OPTION_OWNER);
+                assert_eq!(
+                    error,
+                    SessionCoordinatorError::SessionBusy(coordinator.session_id()).to_string(),
+                );
+                assert!(!owner.is_alive());
+                assert_eq!(publication.is_cancelled(), !claim_first);
+                release.send(()).unwrap();
+            } else {
+                trigger.cancel();
+                assert_eq!(publication.is_cancelled(), !claim_first);
+                release.send(()).unwrap();
+            }
+            option_checkpoint_bound(coordinator.read().wait_unreserved()).await;
+            host.drain_tasks_for_test();
+            if unload || detach_origin {
+                let result = option_checkpoint_bound(result_rx.recv_async())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.0, claim_first.then_some(true));
+                assert_eq!(result.1.is_some(), !claim_first);
+            }
+            assert_option_publication(&coordinator, &target, &writer, claim_first);
+            if unload {
+                host.unload(OPTION_OWNER).unwrap();
+                assert_option_publication(&coordinator, &target, &writer, claim_first);
+            }
+            coordinator.close().await.unwrap();
+            target.target.manager().shutdown(SHUTDOWN_TIMEOUT).await;
+        });
+    }
+
+    #[test_case(false; "drop_before_claim")]
+    #[test_case(true; "drop_after_claim")]
+    fn dropped_event_handle_option_request_preserves_publication_order(claim_first: bool) {
+        smol::block_on(async {
+            let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+            let handle = host.event_handle();
+            let (coordinator, writer, entered, release) =
+                staged_option_coordinator(handle.session_option_catalog(), claim_first);
+            let target = option_target(&coordinator);
+            let mut request = Box::pin(handle.set_session_option(
+                coordinator.clone(),
+                YOLO_OPTION_ID,
+                ENABLED_VALUE,
+            ));
+            assert!(poll_once(&mut request).await.is_none());
+            let publication = option_checkpoint_bound(entered.recv_async()).await.unwrap();
+            drop(request);
+            assert_eq!(publication.is_cancelled(), !claim_first);
+            release.send(()).unwrap();
+            option_checkpoint_bound(coordinator.read().wait_unreserved()).await;
+            host.drain_tasks_for_test();
+            assert_option_publication(&coordinator, &target, &writer, claim_first);
+            coordinator.close().await.unwrap();
+            target.target.manager().shutdown(SHUTDOWN_TIMEOUT).await;
+        });
+    }
+
+    #[test]
+    fn dropped_event_handle_option_request_cancels_before_runtime_dispatch() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded();
+            let handle = EventHandle::from_tx(tx);
+            let coordinator = test_coordinator(SessionOptionCatalog::default());
+            let mut request = Box::pin(handle.set_session_option(
+                coordinator.clone(),
+                YOLO_OPTION_ID,
+                ENABLED_VALUE,
+            ));
+            assert!(poll_once(&mut request).await.is_none());
+            drop(request);
+            let Request::SetSessionOption {
+                publication,
+                cancel,
+                ..
+            } = rx.recv().unwrap()
+            else {
+                panic!("expected a session option request");
+            };
+            assert!(publication.is_cancelled());
+            assert!(!cancel.claim_publication(&publication));
+            assert!(!coordinator.read().options().enabled(YOLO_OPTION_ID));
             coordinator.close().await.unwrap();
         });
     }
@@ -2999,6 +3574,285 @@ mod tests {
             "#,
         );
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
+
+    #[test_case("nil"; "nil_result")]
+    #[test_case("42"; "non_string_result")]
+    #[test_case("error('missing callback result')"; "callback_failure")]
+    fn prompt_observation_identity_survives_missing_results_and_reload(missing: &str) {
+        const PLUGIN: &str = "observed";
+        const FIRST: &str = "first";
+        const SECOND: &str = "second";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = |value: &str, extra: &str| {
+            format!(
+                r#"
+            {extra}
+            makima.api.register_prompt_hint({{
+                slot = "tool_usage", prompt = {{ "system", "general", "system" }},
+                content = function() return {value} end,
+            }})
+            makima.api.register_prompt_hint({{
+                slot = "tool_usage", prompt = "system", content = "second",
+            }})
+        "#
+            )
+        };
+        host.load_source(PLUGIN, &source(missing, "")).unwrap();
+        let absent = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            contents(&absent, PromptId::System, Slot::ToolUsage),
+            [SECOND]
+        );
+        let observations = absent.sources();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(observations[0].content, None);
+        assert_eq!(observations[1].content.as_deref(), Some(SECOND));
+        assert_eq!(observations[2].content, None);
+        assert_eq!(observations[0].prompt, PromptId::System);
+        assert_eq!(observations[2].prompt, PromptId::General);
+        let key = |entry: &PromptSource| {
+            (
+                entry.plugin.clone(),
+                entry.slot,
+                entry.registration,
+                entry.prompt,
+            )
+        };
+        assert_ne!(key(&observations[0]), key(&observations[1]));
+        assert_ne!(key(&observations[0]), key(&observations[2]));
+        let keys: Vec<_> = observations
+            .iter()
+            .map(|entry| {
+                (
+                    entry.plugin.clone(),
+                    entry.slot,
+                    entry.registration,
+                    entry.prompt,
+                )
+            })
+            .collect();
+        host.load_source(PLUGIN, &source(&format!("{FIRST:?}"), ""))
+            .unwrap();
+        let present = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            contents(&present, PromptId::System, Slot::ToolUsage),
+            [FIRST, SECOND]
+        );
+        assert_eq!(
+            present
+                .sources()
+                .iter()
+                .map(|entry| (
+                    entry.plugin.clone(),
+                    entry.slot,
+                    entry.registration,
+                    entry.prompt
+                ))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        host.load_source(
+            PLUGIN,
+            &source(
+                missing,
+                r#"makima.api.set_prompt({ slot = "tone", content = "unrelated" })"#,
+            ),
+        )
+        .unwrap();
+        let missing_again = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            missing_again
+                .sources()
+                .iter()
+                .filter(|entry| entry.slot == Slot::ToolUsage)
+                .map(|entry| (
+                    entry.plugin.clone(),
+                    entry.slot,
+                    entry.registration,
+                    entry.prompt
+                ))
+                .collect::<Vec<_>>(),
+            keys
+        );
+        host.unload(PLUGIN).unwrap();
+        assert!(
+            host.event_handle()
+                .collect_prompt_slots()
+                .sources()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prompt_observations_preserve_registration_order_and_evaluate_callback_once() {
+        const PLUGIN: &str = "ordered";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = |reverse: bool| {
+            format!(
+                r#"
+            local calls = 0
+            makima.api.register_prompt_hint({{
+                slot = "tool_usage", content = function()
+                    calls = calls + 1
+                    return tostring(calls)
+                end,
+            }})
+            makima.api.register_prompt_hint({{
+                slot = "conventions", prompt = "system", content = {first:?},
+            }})
+            makima.api.register_prompt_hint({{
+                slot = "conventions", prompt = "system", content = {last:?},
+            }})
+        "#,
+                first = if reverse { "last" } else { "first" },
+                last = if reverse { "first" } else { "last" },
+            )
+        };
+        host.load_source(PLUGIN, &source(false)).unwrap();
+        let initial = host.event_handle().collect_prompt_slots();
+        for &prompt in PromptId::ALL {
+            assert_eq!(initial.get(prompt, Slot::ToolUsage)[0].content, "1");
+        }
+        assert_eq!(
+            contents(&initial, PromptId::System, Slot::Conventions),
+            ["first", "last"]
+        );
+        let next = host.event_handle().collect_prompt_slots();
+        for &prompt in PromptId::ALL {
+            assert_eq!(next.get(prompt, Slot::ToolUsage)[0].content, "2");
+        }
+        let initial_keys: Vec<_> = initial
+            .sources()
+            .iter()
+            .filter(|entry| entry.slot == Slot::Conventions)
+            .map(|entry| {
+                (
+                    entry.plugin.clone(),
+                    entry.slot,
+                    entry.registration,
+                    entry.prompt,
+                )
+            })
+            .collect();
+        host.load_source(PLUGIN, &source(true)).unwrap();
+        let reordered = host.event_handle().collect_prompt_slots();
+        let reordered_keys: Vec<_> = reordered
+            .sources()
+            .iter()
+            .filter(|entry| entry.slot == Slot::Conventions)
+            .map(|entry| {
+                (
+                    entry.plugin.clone(),
+                    entry.slot,
+                    entry.registration,
+                    entry.prompt,
+                )
+            })
+            .collect();
+        assert_eq!(reordered_keys, initial_keys);
+        assert_eq!(
+            contents(&reordered, PromptId::System, Slot::Conventions),
+            ["last", "first"]
+        );
+    }
+
+    #[test]
+    fn prompt_first_missing_then_successful_is_recorded_and_survives_restore() {
+        use makima_agent::context::{ContextBinding, ContextPolicy, root_context};
+        use makima_agent::journal::{JournalCommit, SessionJournal};
+        use makima_agent::{AgentLimits, AgentManagerHandle, Instructions, ToolOutput};
+        use makima_providers::{Message, TokenUsage};
+        use makima_storage::sessions::Session;
+
+        const PLUGIN: &str = "first_prompt";
+        const CONTENT: &str = "first successful prompt contribution";
+        const CHANGED: &str = "later unaccepted prompt contribution";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, Box::new(IdleOptionBackend))
+            .unwrap();
+        let source = |value: &str| {
+            format!(
+                r#"
+            makima.api.register_prompt_hint({{
+                slot = "tool_usage", prompt = "system", content = function() return {value} end,
+            }})
+        "#
+            )
+        };
+        let prepare = || {
+            ContextBinding::capture(root.state_access())
+                .unwrap()
+                .prepare(
+                    &Instructions::default(),
+                    &host.event_handle().collect_prompt_slots(),
+                    true,
+                    ContextPolicy::Admission,
+                )
+                .unwrap()
+        };
+        let commit = |update| {
+            manager
+                .journal()
+                .commit(JournalCommit {
+                    context_updates: vec![update],
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        host.load_source(PLUGIN, &source("nil")).unwrap();
+        let (missing, update) = prepare();
+        assert!(
+            missing
+                .slots
+                .get(PromptId::System, Slot::ToolUsage)
+                .is_empty()
+        );
+        commit(update);
+        host.load_source(PLUGIN, &source(&format!("{CONTENT:?}")))
+            .unwrap();
+        let (present, update) = prepare();
+        assert_eq!(
+            contents(&present.slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
+        commit(update);
+        let snapshot = manager.journal().snapshot();
+        let mut stored = Session::<Message, TokenUsage, ToolOutput>::new("test/context", "/");
+        snapshot.apply_to(&mut stored).unwrap();
+        let restored_journal = Arc::new(SessionJournal::from_session(&stored).unwrap());
+        let restored_histories = restored_journal.checkpoint_snapshot().unwrap().histories;
+        let restored = AgentManagerHandle::restore_graph(
+            AgentLimits::default(),
+            restored_journal,
+            stored.latest_state().unwrap(),
+            restored_histories,
+        )
+        .unwrap();
+        let recorded = root_context(&restored.root().unwrap().state_access())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            contents(&recorded.slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
+        host.load_source(PLUGIN, &source(&format!("{CHANGED:?}")))
+            .unwrap();
+        let (unchanged, _) = ContextBinding::capture(restored.root().unwrap().state_access())
+            .unwrap()
+            .prepare(
+                &Instructions::default(),
+                &host.event_handle().collect_prompt_slots(),
+                true,
+                ContextPolicy::Admission,
+            )
+            .unwrap();
+        assert_eq!(
+            contents(&unchanged.slots, PromptId::System, Slot::ToolUsage),
+            [CONTENT]
+        );
     }
 
     /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.

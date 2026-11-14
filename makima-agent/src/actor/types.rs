@@ -7,16 +7,20 @@ use std::pin::Pin;
 use makima_providers::{CompleteModelSelection, TokenUsage};
 use std::sync::Arc;
 
+use crate::actor::{ActorHistory, TurnResult};
 use crate::cancel::{CancelToken, ReasonedCancelToken};
-use crate::manager::{CurrentManagedTurn, ManagerInner};
+use crate::journal::SessionJournal;
+use crate::manager::{CurrentManagedTurn, ManagerInner, WorkAdmission};
 use crate::tools::offload::OffloadStore;
 use crate::types::{ActorWorkIdentity, AgentId, TurnFailure, TurnId, TurnOutcome};
-use crate::{AgentMode, InterruptSource, RunSettings};
+use crate::{AgentMode, HistorySnapshot, InterruptSource, ModeDef, RunSettings};
 
 #[derive(Clone)]
 pub(crate) struct ManagedTurnAdmission {
     pub(crate) manager: std::sync::Weak<ManagerInner>,
     pub(crate) agent_id: AgentId,
+    pub(crate) reservation: u64,
+    pub(crate) work: Option<WorkAdmission>,
     pub(crate) is_child: bool,
     pub(crate) parent_delivery: Option<super::delivery::ParentDelivery>,
 }
@@ -40,6 +44,15 @@ impl EffectiveAgentConfig {
             mode_authority: None,
             context: super::AgentContextSnapshot::new(".".into()),
         }
+    }
+
+    pub(crate) fn normalize_initial_mode(mut self) -> Self {
+        if self.mode_def.is_none() && !matches!(self.mode, AgentMode::Custom(_)) {
+            let mut definition = ModeDef::default_for(self.mode.id());
+            definition.restrict_write_to = self.mode.plan_path().map(ToOwned::to_owned);
+            self.mode_def = Some(definition);
+        }
+        self
     }
 
     pub fn model_selection(&self) -> CompleteModelSelection {
@@ -84,6 +97,8 @@ impl ManagedTurnAdmission {
         Self {
             manager,
             agent_id,
+            reservation: 0,
+            work: None,
             is_child: false,
             parent_delivery: None,
         }
@@ -232,12 +247,36 @@ pub type PreparedReadiness = Arc<
         + Sync,
 >;
 
+pub struct TerminalCheckpointSnapshot {
+    pub result: TurnResult,
+    pub history: HistorySnapshot,
+    pub journal: Option<Arc<SessionJournal>>,
+}
+
+pub type TerminalCheckpoint = Arc<
+    dyn Fn(TerminalCheckpointSnapshot) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub trait ActorBackend: Send {
+    fn persist_turn_results(&self) -> bool {
+        true
+    }
+
+    fn terminal_checkpoint(&self) -> Option<TerminalCheckpoint> {
+        None
+    }
+
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         None
     }
 
     fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        None
+    }
+
+    fn context_event_sender(&self) -> Option<crate::EventSender> {
         None
     }
 
@@ -249,7 +288,7 @@ pub trait ActorBackend: Send {
     /// outcome, or `SetupFailed` for a turn that never entered.
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        history: ActorHistory<'a>,
         context: TurnContext,
         input: crate::AgentInput,
         work: WorkKind,
@@ -259,7 +298,7 @@ pub trait ActorBackend: Send {
     /// and must not produce a [`TurnOutcome`].
     fn run_control<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        history: ActorHistory<'a>,
         context: TurnContext,
         control: &'a ControlWork,
     ) -> std::pin::Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>>;
@@ -267,7 +306,7 @@ pub trait ActorBackend: Send {
     /// Executes a compact operation. No [`TurnId`], no outcome.
     fn run_compact<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        history: ActorHistory<'a>,
         context: TurnContext,
         instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>>;

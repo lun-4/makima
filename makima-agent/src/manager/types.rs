@@ -1,14 +1,26 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{ActorSnapshot, AgentActorHandle, AgentId, TurnId, TurnTicket};
+use makima_storage::session_state::{StoredAgentConfig, StoredAgentRecord};
+
+use crate::actor::{EffectiveAgentConfig, TranscriptRequest, TranscriptSnapshot};
+use crate::state::StateAccess;
+use crate::{
+    ActorBackend, ActorSnapshot, AgentActorHandle, AgentId, HistorySnapshot, SharedMessages,
+    TurnId, TurnTicket,
+};
+
+use super::ReactivationError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
     pub max_concurrent_agent_turns: usize,
     pub max_agent_depth: usize,
     pub max_children_per_agent: usize,
-    pub max_live_agents: usize,
+    pub max_active_agents: usize,
+    pub max_retained_agents: usize,
 }
 
 impl Default for AgentLimits {
@@ -17,7 +29,8 @@ impl Default for AgentLimits {
             max_concurrent_agent_turns: 8,
             max_agent_depth: 4,
             max_children_per_agent: 16,
-            max_live_agents: 64,
+            max_active_agents: 64,
+            max_retained_agents: 1024,
         }
     }
 }
@@ -25,9 +38,11 @@ impl Default for AgentLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphLifecycle {
     Reserved,
+    Dormant,
     Live,
     Closing,
     Closed,
+    Retired,
     Removed,
 }
 
@@ -37,10 +52,53 @@ impl GraphLifecycle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentResidency {
+    Dormant,
+    Activating,
+    Resident,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIncarnation {
+    pub agent_id: AgentId,
+    pub manager_generation: u64,
+    pub reservation: u64,
+}
+
+#[derive(Clone)]
+pub struct ReactivationInput {
+    pub record: StoredAgentRecord,
+    pub config: Option<StoredAgentConfig>,
+    pub history: HistorySnapshot,
+}
+
+pub type ResidentInitializer = Box<
+    dyn FnOnce(
+            ResidentInitialization,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReactivationError>> + Send>>
+        + Send,
+>;
+
+pub struct ResidentAgent {
+    pub backend: Box<dyn ActorBackend>,
+    pub config: EffectiveAgentConfig,
+    pub shared_messages: Option<SharedMessages>,
+    pub start: Option<flume::Receiver<()>>,
+    pub initialize: Option<ResidentInitializer>,
+}
+
+pub struct ResidentInitialization {
+    pub agent: AgentRef,
+    pub actor: AgentActorHandle,
+    pub incarnation: AgentIncarnation,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentMetadata {
     pub label: Option<String>,
     pub spawned_by_tool_use_id: Option<String>,
+    pub transcript_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +109,7 @@ pub struct AgentNodeSnapshot {
     pub depth: usize,
     pub children: Vec<AgentId>,
     pub graph_lifecycle: GraphLifecycle,
+    pub residency: AgentResidency,
     pub actor: Option<ActorSnapshot>,
     pub metadata: AgentMetadata,
 }
@@ -72,6 +131,9 @@ impl std::fmt::Debug for AgentRef {
 }
 
 impl AgentRef {
+    pub fn state_access(&self) -> StateAccess {
+        self.manager.journal().state_access(self.agent_id, None)
+    }
     pub fn manager(&self) -> super::AgentManagerHandle {
         self.manager.clone()
     }
@@ -80,8 +142,27 @@ impl AgentRef {
         self.manager.same_manager(&other.manager)
     }
 
+    pub fn transcript(
+        &self,
+        request: TranscriptRequest,
+    ) -> Result<TranscriptSnapshot, crate::ActorError> {
+        self.manager.transcript(self.agent_id, request)
+    }
+
     pub fn turn_ticket(&self, turn_id: TurnId) -> Result<TurnTicket, super::ManagerError> {
         self.manager.retained_turn_ticket(self, turn_id)
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.manager.is_live(self.agent_id)
+    }
+
+    pub fn incarnation(&self) -> Result<AgentIncarnation, super::ManagerError> {
+        self.manager.incarnation(self.agent_id)
+    }
+
+    pub fn retire(&self, current: &CurrentManagedTurn) -> Result<(), super::ManagerError> {
+        self.manager.retire(current, self.agent_id)
     }
 
     pub fn validate_live(&self) -> Result<(), super::ManagerError> {
@@ -137,6 +218,7 @@ pub struct ShutdownReport {
 
 #[derive(Clone)]
 pub struct CurrentManagedTurn {
+    pub(crate) state_access: StateAccess,
     pub(crate) token: ManagedTurnToken,
     pub(crate) lease: TurnPermitLease,
     pub(crate) policy: Option<Arc<crate::RunSettings>>,
@@ -146,6 +228,16 @@ pub struct CurrentManagedTurn {
 }
 
 impl CurrentManagedTurn {
+    pub fn capture_new_invocation_state_access(&self) -> StateAccess {
+        self.token.manager.journal().state_access(
+            self.token.agent_id,
+            Some((self.token.turn_id, self.token.nonce)),
+        )
+    }
+
+    pub fn state_access(&self) -> StateAccess {
+        self.state_access.clone()
+    }
     pub fn manager(&self) -> super::AgentManagerHandle {
         self.token.manager.clone()
     }

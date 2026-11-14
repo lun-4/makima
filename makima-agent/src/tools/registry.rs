@@ -216,8 +216,11 @@ pub trait ToolInvocation: Send + Sync {
     /// normalized path for invocations that expose one: an advisory
     /// in-process lock, never protection for shell commands, other
     /// processes, or paths the tool mutates without declaring them.
-    fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
-        None
+    fn mutable_path<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+        Box::pin(std::future::ready(Ok(None)))
     }
     fn permission_scopes(
         &self,

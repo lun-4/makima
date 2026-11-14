@@ -64,6 +64,7 @@ fn plugin_spec(name: &str, spec: &str) {
     let source = match name {
         "sessions" => Some(include_str!("../../plugins/sessions/init.lua")),
         "thinking" => Some(include_str!("../../plugins/thinking/init.lua")),
+        "task" => Some(include_str!("../../plugins/task/init.lua")),
         _ => None,
     };
     let spec = source.map_or_else(

@@ -1,15 +1,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use makima_providers::{ContentBlock, ConversationEnd, Message, MessageKind, Role};
-use makima_storage::sessions::HistorySnapshot;
+use makima_providers::provider::Provider;
+use makima_providers::{ContentBlock, ConversationEnd, Message, TokenUsage};
+use makima_storage::session_state::StoredAgentConfig;
+use makima_storage::sessions::{HistorySnapshot, next_epoch};
 
 use super::prepared::{CancelPublication, PreparedOperation};
 use super::{
-    ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
-    PreparedOperationTicket, PreparedTransaction,
+    ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, ChildDelivery, ConfigChange,
+    ConfigCommit, PreparedCommit, PreparedModel, PreparedOperationTicket, PreparedTransaction,
+    TurnResult, TurnTicket,
 };
-use crate::{AgentId, History, end_conversation_detached};
+use crate::{AgentId, AgentMode, History, ModeDef, TurnId, end_conversation_detached};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryBoundary {
@@ -24,6 +27,218 @@ pub struct HistoryChange {
     pub epoch: u64,
     pub messages: Arc<Vec<Message>>,
     pub draft: Message,
+}
+
+#[derive(Clone, Default)]
+pub struct AgentStateSnapshot {
+    pub results: Vec<TurnResult>,
+    pub deliveries: Vec<Arc<ChildDelivery>>,
+    pub delivery_seen: Vec<TurnId>,
+    pub usage: TokenUsage,
+}
+
+pub struct PreparedActorRewind {
+    idle: ActorIdleGuard,
+    history: HistorySnapshot<Message>,
+    commit: ConfigCommit,
+    state: AgentStateSnapshot,
+    ended: Option<(Arc<dyn Provider>, Arc<str>)>,
+}
+
+pub struct InstalledActorRewind {
+    idle: ActorIdleGuard,
+    commit: ConfigCommit,
+    history: HistoryChange,
+    ended: Option<(Arc<dyn Provider>, Arc<str>)>,
+}
+
+impl PreparedActorRewind {
+    pub fn config(&self) -> &ConfigCommit {
+        &self.commit
+    }
+
+    pub fn history(&self) -> &HistorySnapshot<Message> {
+        &self.history
+    }
+
+    pub fn agent_id(&self) -> AgentId {
+        self.idle.actor.agent_id()
+    }
+
+    pub fn with_state(mut self, state: AgentStateSnapshot) -> Result<Self, ActorError> {
+        if state
+            .results
+            .iter()
+            .any(|result| result.outcome.agent_id() != self.idle.actor.agent_id())
+        {
+            return Err(ActorError::InvalidConfig(
+                "rewind result belongs to another actor".into(),
+            ));
+        }
+        self.state = state;
+        Ok(self)
+    }
+
+    pub fn install_held(self) -> InstalledActorRewind {
+        self.install_held_inner(
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    fn install_held_inner(
+        self,
+        #[cfg(test)] after_outcomes: impl FnOnce(),
+    ) -> InstalledActorRewind {
+        let Self {
+            idle,
+            history,
+            commit,
+            state: restored,
+            ended,
+        } = self;
+        {
+            let inner = &idle.actor.inner;
+            let mut outcomes = inner
+                .outcomes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            #[cfg(test)]
+            after_outcomes();
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.policy_generation = commit.generation;
+            state.policy = Some(Arc::clone(&commit.config));
+            state.latest = None;
+            state.latest_history_turn = None;
+            state.settled = None;
+            state.usage = restored.usage;
+            state.instructions.clear();
+            state.turn_work.clear();
+            state.deliveries.clear();
+            state.delivery_order.clear();
+            state.delivery_runs.clear();
+            state.delivery_seen = restored.delivery_seen.into();
+            state.delivery_suspended = true;
+            state.delivery_held = true;
+            for delivery in restored.deliveries {
+                super::delivery::restore_pending(&mut state, delivery, Vec::new());
+            }
+            state.retained_order.clear();
+            inner
+                .tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            let mut tickets = inner
+                .retained_tickets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            outcomes.clear();
+            tickets.clear();
+            let previous_history = inner.history.load_full();
+            let shared_prefix_len = previous_history
+                .messages
+                .iter()
+                .zip(history.messages.iter())
+                .take_while(|(previous, restored)| previous == restored)
+                .count();
+            let mut coverage = inner
+                .coverage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for boundary in coverage.values_mut() {
+                *boundary = boundary.and_then(|(epoch, end)| {
+                    (epoch == previous_history.epoch && end <= shared_prefix_len)
+                        .then_some((history.epoch, end))
+                });
+            }
+            for result in restored
+                .results
+                .into_iter()
+                .rev()
+                .take(super::MAX_RETAINED_TURN_RESULTS)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                let turn = result.outcome.turn_id();
+                state.latest = Some(result.outcome.clone());
+                state.retained_order.push_back(turn);
+                outcomes.insert(turn, result.outcome.clone());
+                tickets.insert(
+                    turn,
+                    TurnTicket::from_result_for_actor(result, Arc::clone(&inner.identity)),
+                );
+            }
+            coverage.retain(|turn, _| outcomes.contains_key(turn));
+            for turn in outcomes.keys() {
+                coverage.entry(*turn).or_insert(None);
+            }
+            if let Some(latest) = &state.latest {
+                let turn = latest.turn_id();
+                let boundary = coverage
+                    .entry(turn)
+                    .or_default()
+                    .get_or_insert((history.epoch, history.messages.len()));
+                state.latest_history_turn = Some((turn, boundary.0, boundary.1));
+            }
+            *inner
+                .latest_admitted
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                state.latest.as_ref().map(crate::TurnOutcome::turn_id);
+            inner.history.store(Arc::new(history.clone()));
+            if let Some(reservation) = state.owned_idle(&idle.owner) {
+                reservation.committing = false;
+            }
+        }
+        InstalledActorRewind {
+            history: HistoryChange {
+                agent_id: idle.actor.agent_id(),
+                epoch: history.epoch,
+                messages: history.messages,
+                draft: Message::user(String::new()),
+            },
+            idle,
+            commit,
+            ended,
+        }
+    }
+}
+
+impl InstalledActorRewind {
+    pub fn config(&self) -> &ConfigCommit {
+        &self.commit
+    }
+
+    pub fn notify(self) -> (ActorIdleGuard, ConfigCommit, HistoryChange) {
+        let Self {
+            idle,
+            commit,
+            history,
+            ended,
+        } = self;
+        {
+            let mut state = idle
+                .actor
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state
+                .config_observers
+                .retain(|observer| observer.send(commit.clone()).is_ok());
+            state.emit(super::ActorEvent::Config(commit.clone()));
+        }
+        if let Some((provider, ended)) = ended {
+            end_conversation_detached(&provider, ended, ConversationEnd::Rewound);
+        }
+        idle.actor.inner.policy_changed.notify(usize::MAX);
+        (idle, commit, history)
+    }
 }
 
 pub struct HistoryEditWork {
@@ -91,7 +306,7 @@ impl AgentActorHandle {
         let mut valid = true;
         let mut boundaries = Vec::new();
         for (offset, message) in history.messages.iter().enumerate() {
-            if valid && pending.is_empty() && is_boundary_message(message) {
+            if valid && pending.is_empty() && History::is_boundary_message(message) {
                 boundaries.push((
                     HistoryBoundary {
                         agent_id: self.agent_id(),
@@ -108,6 +323,62 @@ impl AgentActorHandle {
 }
 
 impl ActorIdleGuard {
+    pub async fn prepare_rewind(
+        self,
+        history: HistorySnapshot<Message>,
+        saved: StoredAgentConfig,
+        prepared: PreparedModel,
+        mode: (AgentMode, ModeDef),
+    ) -> Result<PreparedActorRewind, ActorError> {
+        let source = self.source_snapshot()?;
+        let config = ConfigChange::resolved_restore(&saved, prepared, mode, &source.config.config)?;
+        self.actor.inner.validate_mode_config(&config)?;
+        let generation = source.config.generation.checked_add(1).ok_or_else(|| {
+            ActorError::InvalidConfig("configuration generation exhausted".into())
+        })?;
+        let mut history = history;
+        history.epoch = next_epoch();
+        history.conversation = source.history.conversation;
+        let mut replacement = History::restored_exact(history);
+        let ended = if replacement.is_empty() {
+            replacement.restart_conversation()
+        } else {
+            replacement.continue_conversation()
+        }
+        .map(|ended| (Arc::clone(&source.config.config.provider), ended));
+        {
+            let mut state = self
+                .actor
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.lifecycle != ActorLifecycle::Open {
+                return Err(super::lifecycle_error(state.lifecycle));
+            }
+            state
+                .owned_idle(&self.owner)
+                .filter(|reservation| {
+                    !reservation.committing
+                        && reservation.permission.is_none()
+                        && reservation.edit.is_none()
+                })
+                .ok_or(ActorError::Busy)?
+                .committing = true;
+        }
+        Ok(PreparedActorRewind {
+            commit: ConfigCommit {
+                identity: Arc::clone(&self.actor.inner.identity),
+                generation,
+                config: Arc::new(config),
+            },
+            history: replacement.snapshot().clone(),
+            idle: self,
+            state: AgentStateSnapshot::default(),
+            ended,
+        })
+    }
+
     pub async fn commit_prepared_transaction_held(
         mut self,
         operation: PreparedOperationTicket,
@@ -201,6 +472,7 @@ impl HistoryEditWork {
         actor: &AgentActorHandle,
         history: &mut History,
     ) -> HistoryEditCompletion {
+        history.synchronize_prepared_mirror();
         let mut guard = ActorIdleGuard {
             actor: actor.clone(),
             owner: Arc::clone(&self.owner),
@@ -232,7 +504,7 @@ impl HistoryEditWork {
             Ok(finalize) => {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
-                    history.replace_snapshot(snapshot.clone());
+                    history.adopt_prepared_snapshot(snapshot.clone());
                     // Nothing kept is a fresh start, not a rewind to build on.
                     let (ended, reason) = if history.is_empty() {
                         (history.restart_conversation(), ConversationEnd::Closed)
@@ -253,12 +525,14 @@ impl HistoryEditWork {
                 });
                 let committed = (*operation).commit_locked(&actor.inner, &mut state, finalize);
                 state.end_prepared_publication(id);
-                if let Some(reservation) = state.owned_idle(&self.owner) {
+                if committed.is_ok()
+                    && let Some(reservation) = state.owned_idle(&self.owner)
+                {
                     reservation.committing = false;
                     guard.release = false;
                 }
                 super::drive_operations(&actor.inner, &mut state);
-                Ok((committed, change))
+                committed.map(|committed| (committed, change))
             }
         };
         if let Ok((committed, _)) = &result
@@ -307,21 +581,11 @@ fn valid_boundary(messages: &[Message], offset: usize) -> bool {
         return false;
     };
     let mut pending = HashSet::new();
-    is_boundary_message(message)
+    History::is_boundary_message(message)
         && messages[..offset]
             .iter()
             .all(|message| update_pending_tools(message, &mut pending))
         && pending.is_empty()
-}
-
-fn is_boundary_message(message: &Message) -> bool {
-    matches!(message.role, Role::User)
-        && matches!(message.kind, MessageKind::Turn)
-        && !message.content.is_empty()
-        && !message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
 fn update_pending_tools<'a>(message: &'a Message, pending: &mut HashSet<&'a str>) -> bool {
@@ -357,23 +621,23 @@ mod tests {
     use makima_storage::checkpoint::CheckpointPublication;
     use makima_storage::conversation::ConversationState;
     use makima_storage::id::SessionRef;
-    use makima_storage::sessions::HistorySnapshot;
+    use makima_storage::sessions::{HistorySnapshot, next_epoch};
     use serde_json::Value;
     use test_case::test_case;
 
-    use super::{HistoryBoundary, HistoryChange, valid_boundary};
+    use super::{AgentStateSnapshot, HistoryBoundary, HistoryChange, valid_boundary};
     use crate::actor::tests::{ScriptedBackend, input, policy};
     use crate::actor::{
-        ActorBackend, ActorError, AgentActorHandle, BackendResult, ChildDelivery, ConfigChange,
-        ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedPublication, PreparedTransaction,
-        PreparedTurn, TurnContext, TurnResult, WorkKind,
+        ActorBackend, ActorError, ActorHistory, AgentActorHandle, BackendResult, ChildDelivery,
+        ConfigChange, ConfigPatch, ControlWork, EffectiveAgentConfig, PreparedPublication,
+        PreparedTransaction, PreparedTurn, TurnContext, TurnResult, WorkKind,
     };
     use crate::{
-        AgentId, AgentInput, AgentMode, DoneReason, History, TurnCancellationReason, TurnId,
-        TurnOutcome,
+        AgentId, AgentInput, AgentMode, DoneReason, TurnCancellationReason, TurnId, TurnOutcome,
     };
 
     const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
+    const RESTORED_CWD: &str = "/rewind-fixture";
 
     fn idle_actor(messages: Vec<Message>) -> (AgentActorHandle, smol::Task<()>) {
         let (actor, runner) =
@@ -382,6 +646,270 @@ mod tests {
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
         (actor, runner)
+    }
+
+    #[test_case(false; "install_is_silent_until_notified")]
+    #[test_case(true; "dropping_candidate_preserves_live_state")]
+    fn prepared_rewind_installs_exact_candidate_without_journaling(abort: bool) {
+        smol::block_on(async {
+            use crate::actor::PreparedModel;
+            use crate::session_checkpoint::stored_agent_config;
+            use std::collections::BTreeMap;
+
+            const SAVED_CWD: &str = "/rewound";
+            const SAVED_TEXT: &str = "saved boundary";
+            let (actor, runner) = idle_actor(vec![Message::user("displaced".into())]);
+            let source = actor.config_snapshot().unwrap();
+            let before = actor.inner.history.load_full();
+            let observer = actor.subscribe_config_commits();
+            while observer.try_recv().is_ok() {}
+            let mut saved = stored_agent_config(&source.config, BTreeMap::new()).unwrap();
+            saved.cwd = SAVED_CWD.into();
+            saved.fast = true;
+            let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
+            let candidate = actor
+                .prepare_idle()
+                .unwrap()
+                .prepare_rewind(
+                    HistorySnapshot::new(vec![Message::user(SAVED_TEXT.into())]),
+                    saved,
+                    PreparedModel {
+                        provider: Arc::clone(&source.config.provider),
+                        model: source.config.model.clone(),
+                    },
+                    mode,
+                )
+                .await
+                .unwrap();
+            assert_eq!(candidate.config().generation, source.generation + 1);
+            assert_eq!(
+                actor.config_snapshot().unwrap().generation,
+                source.generation
+            );
+            assert!(Arc::ptr_eq(
+                &actor.inner.history.load_full().messages,
+                &before.messages
+            ));
+            if abort {
+                drop(candidate);
+                assert_eq!(
+                    actor.config_snapshot().unwrap().generation,
+                    source.generation
+                );
+                assert!(Arc::ptr_eq(
+                    &actor.inner.history.load_full().messages,
+                    &before.messages
+                ));
+                assert!(observer.try_recv().is_err());
+                drop(actor.prepare_idle().unwrap());
+            } else {
+                let installed = candidate.install_held();
+                assert!(observer.try_recv().is_err());
+                assert_eq!(
+                    actor.inner.history.load_full().messages[0].first_text_content(),
+                    Some(SAVED_TEXT)
+                );
+                let config = actor.config_snapshot().unwrap();
+                assert!(config.config.fast);
+                assert_eq!(config.config.context.cwd(), std::path::Path::new(SAVED_CWD));
+                let (idle, committed, change) = installed.notify();
+                assert_eq!(
+                    observer.try_recv().unwrap().generation,
+                    committed.generation
+                );
+                assert_eq!(change.epoch, actor.inner.history.load_full().epoch);
+                drop(idle);
+            }
+            actor.close();
+            runner.await;
+        });
+    }
+
+    async fn prepared_rewind(
+        actor: &AgentActorHandle,
+        history: HistorySnapshot<Message>,
+        state: AgentStateSnapshot,
+    ) -> super::PreparedActorRewind {
+        use crate::actor::PreparedModel;
+        use crate::session_checkpoint::stored_agent_config;
+        use std::collections::BTreeMap;
+
+        let source = actor.config_snapshot().unwrap();
+        let mut saved = stored_agent_config(&source.config, BTreeMap::new()).unwrap();
+        saved.cwd = RESTORED_CWD.into();
+        let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
+        actor
+            .prepare_idle()
+            .unwrap()
+            .prepare_rewind(
+                history,
+                saved,
+                PreparedModel {
+                    provider: Arc::clone(&source.config.provider),
+                    model: source.config.model.clone(),
+                },
+                mode,
+            )
+            .await
+            .unwrap()
+            .with_state(state)
+            .unwrap()
+    }
+
+    #[test]
+    fn rewind_install_locks_outcomes_before_state() {
+        smol::block_on(async {
+            let (start, rx) = flume::bounded(1);
+            let (actor, runner) = AgentActorHandle::spawn_inner(
+                AgentId::generate(),
+                Vec::new(),
+                None,
+                Box::new(IdleBackend),
+                None,
+                None,
+                Some(rx),
+            );
+            actor
+                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
+                .unwrap();
+            let candidate = prepared_rewind(
+                &actor,
+                HistorySnapshot::new(Vec::new()),
+                AgentStateSnapshot::default(),
+            )
+            .await;
+            let installed = candidate.install_held_inner(|| {
+                assert!(actor.inner.outcomes.try_lock().is_err());
+                assert!(actor.inner.state.try_lock().is_ok());
+            });
+            drop(installed.notify());
+            actor.close();
+            drop(start);
+            runner.await;
+        });
+    }
+
+    #[test_case(false, false, None; "exact_prefix_rebases_older_boundaries")]
+    #[test_case(true, false, None; "divergent_suffix_does_not_expose_later_messages")]
+    #[test_case(false, true, None; "stale_epoch_is_unavailable")]
+    #[test_case(false, false, Some(1); "known_latest_boundary_is_not_widened")]
+    fn rewind_rebuilds_retained_transcript_coverage(
+        divergent: bool,
+        stale: bool,
+        latest_end: Option<usize>,
+    ) {
+        smol::block_on(async {
+            use crate::actor::TranscriptRequest;
+
+            const FIRST: &str = "first retained turn";
+            const SECOND: &str = "second retained turn";
+            const REPLACEMENT: &str = "restored replacement";
+            const DISPLACED: &str = "discarded turn";
+            const LAST_MESSAGES: usize = 10;
+            const MAX_BYTES: usize = 4096;
+            let (actor, runner) = idle_actor(vec![
+                Message::user(FIRST.into()),
+                Message::user(SECOND.into()),
+                Message::user(DISPLACED.into()),
+            ]);
+            let previous_epoch = actor.inner.history.load().epoch;
+            let turns = [TurnId::generate(), TurnId::generate(), TurnId::generate()];
+            let discarded = TurnId::generate();
+            let epoch = if stale { next_epoch() } else { previous_epoch };
+            actor.inner.coverage.lock().unwrap().extend([
+                (turns[0], Some((epoch, 1))),
+                (turns[1], Some((epoch, 2))),
+                (discarded, Some((previous_epoch, 3))),
+            ]);
+            if let Some(end) = latest_end {
+                actor
+                    .inner
+                    .coverage
+                    .lock()
+                    .unwrap()
+                    .insert(turns[2], Some((previous_epoch, end)));
+            }
+            let messages = vec![
+                Message::user(FIRST.into()),
+                Message::user(if divergent { REPLACEMENT } else { SECOND }.into()),
+            ];
+            let results = turns
+                .iter()
+                .map(|turn| TurnResult {
+                    outcome: TurnOutcome::completed(
+                        actor.agent_id(),
+                        *turn,
+                        TokenUsage::default(),
+                        1,
+                        DoneReason::EndTurn,
+                    ),
+                    text: String::new(),
+                    output: Vec::new(),
+                    provenance: Default::default(),
+                    duration_ms: 0,
+                })
+                .collect();
+            let candidate = prepared_rewind(
+                &actor,
+                HistorySnapshot::new(messages.clone()),
+                AgentStateSnapshot {
+                    results,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let epoch = candidate.history().epoch;
+            let installed = candidate.install_held();
+            let request = TranscriptRequest {
+                through_turn: None,
+                last_messages: LAST_MESSAGES,
+                max_bytes: MAX_BYTES,
+            };
+            let snapshot = actor.transcript(request.clone()).unwrap();
+            let latest_end = latest_end.unwrap_or(messages.len());
+            assert_eq!(snapshot.through_turn, Some(turns[2]));
+            assert_eq!(
+                snapshot.messages,
+                serde_json::to_value(&messages[..latest_end]).unwrap()
+            );
+            assert_eq!(snapshot.epoch, epoch);
+            for (index, turn) in turns.iter().enumerate() {
+                assert!(actor.turn_ticket(*turn).unwrap().peek_result().is_some());
+                let snapshot = actor.transcript(TranscriptRequest {
+                    through_turn: Some(*turn),
+                    ..request.clone()
+                });
+                if index == 2 || (!stale && (index == 0 || !divergent)) {
+                    let expected = if index == 2 { latest_end } else { index + 1 };
+                    assert_eq!(
+                        snapshot.unwrap().messages,
+                        serde_json::to_value(&messages[..expected]).unwrap()
+                    );
+                } else {
+                    assert!(matches!(
+                        snapshot,
+                        Err(ActorError::UnavailableTurnHistory(id)) if id == *turn
+                    ));
+                }
+            }
+            assert!(matches!(
+                actor.transcript(TranscriptRequest {
+                    through_turn: Some(discarded),
+                    ..request.clone()
+                }),
+                Err(ActorError::UnknownTurn(id)) if id == discarded
+            ));
+            let mut active_history = actor.committed_history_snapshot();
+            Arc::make_mut(&mut active_history.messages).push(Message::user(DISPLACED.into()));
+            actor.inner.history.store(Arc::new(active_history));
+            assert_eq!(
+                actor.transcript(request).unwrap().messages,
+                serde_json::to_value(&messages[..latest_end]).unwrap()
+            );
+            drop(installed.notify());
+            actor.close();
+            runner.await;
+        });
     }
 
     fn published() -> PreparedPublication {
@@ -404,6 +932,10 @@ mod tests {
         operation.resolve(None)?;
         operation.wait_ready().await?;
         let transaction = PreparedTransaction {
+            state_edits: Vec::new(),
+            options: None,
+            history_changed: true,
+            boundary: false,
             publication: CheckpointPublication::default(),
             publish,
             finalize: Box::new(|_| {}),
@@ -412,6 +944,469 @@ mod tests {
             .commit_prepared_transaction_held(operation, Some(replacement), transaction)
             .await?;
         Ok(change.expect("rewind replaces history"))
+    }
+
+    #[test]
+    fn approval_receipt_round_trips_recovery_and_rewinds_approved_plan() {
+        use crate::{
+            AgentContextSnapshot, AgentManagerHandle, ModeRegistry, ToolOutput, plan_state,
+            session_checkpoint::stored_agent_config, session_recovery::RecoveryCandidate,
+        };
+        use makima_providers::ModelSelection;
+        use makima_storage::plans::PlanSlot;
+        use makima_storage::session_state::{SessionStateView, StateChange};
+        use makima_storage::sessions::Session;
+        smol::block_on(async {
+            const PLAN: &str = "# Approved implementation plan\n";
+            const TEXT: &str = "planning conversation";
+            const LATER: &str = "later conversation";
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("approved.md");
+            std::fs::write(&path, PLAN).unwrap();
+            let mode = AgentMode::Plan(path.clone());
+            let config = EffectiveAgentConfig::new(policy(false), mode.clone())
+                .with_context(AgentContextSnapshot::new(directory.path().to_path_buf()))
+                .with_mode_def(Some(ModeRegistry::builtin().current(&mode)));
+            let manager = AgentManagerHandle::new(Default::default()).unwrap();
+            let root = manager
+                .create_root_with_config(
+                    Some(config),
+                    vec![Message::user(TEXT.into())],
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
+                )
+                .unwrap();
+            let journal = manager.journal();
+            let actor = root.actor().unwrap();
+            let original = actor.committed_history_snapshot();
+            let saved_config =
+                stored_agent_config(&actor.effective_config().unwrap(), Default::default())
+                    .unwrap();
+            let selection = ModelSelection {
+                spec: Some(saved_config.model.clone().into()),
+                ..Default::default()
+            };
+            let edit =
+                plan_state::approval_edit(&root, &path, PLAN.into(), selection.clone()).unwrap();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let committed = operation
+                .commit_durable(
+                    PreparedTransaction {
+                        publication: CheckpointPublication::default(),
+                        options: None,
+                        state_edits: vec![edit],
+                        history_changed: false,
+                        boundary: false,
+                        publish: published(),
+                        finalize: Box::new(|_| {}),
+                    }
+                    .with_boundary(),
+                )
+                .await
+                .unwrap();
+            assert!(committed.ticket.is_none());
+            let receipt = committed.boundary.unwrap();
+            assert_eq!(committed.config.config.mode, mode);
+            let later_config = stored_agent_config(
+                &EffectiveAgentConfig::new(policy(false), AgentMode::Build)
+                    .normalize_initial_mode(),
+                Default::default(),
+            )
+            .unwrap();
+            let mut later_history = original.clone();
+            Arc::make_mut(&mut later_history.messages).push(Message::user(LATER.into()));
+            journal
+                .commit(crate::journal::JournalCommit {
+                    changes: vec![crate::journal::JournalChange {
+                        agent: Some(root.id()),
+                        generation: 1,
+                        change: StateChange::Config(later_config),
+                    }],
+                    histories: [(root.id(), later_history)].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(
+                &saved_config.model,
+                &directory.path().to_string_lossy(),
+            );
+            journal.snapshot().apply_to(&mut session).unwrap();
+            session.save_to(directory.path()).unwrap();
+            let session = Session::load_from(session.id, directory.path()).unwrap();
+            let recovered = RecoveryCandidate::prepare(session)
+                .unwrap()
+                .finalize_after_publication();
+            let journal = recovered.journal();
+            let mut replacement = journal
+                .prepare_rewind(crate::rewind::RewindBoundary {
+                    epoch: journal.snapshot().epoch,
+                    ..receipt
+                })
+                .await
+                .unwrap();
+            let view = SessionStateView::fold(
+                &replacement.snapshot().state,
+                &replacement.snapshot().agent_revisions,
+                replacement.snapshot().seq,
+            )
+            .unwrap();
+            assert_eq!(
+                view.scopes[&Some(root.id())].config.as_ref(),
+                Some(&saved_config)
+            );
+            assert_eq!(
+                replacement.snapshot().histories[&root.id()].messages,
+                original.messages
+            );
+            let plans: PlanSlot = serde_json::from_value(
+                view.scopes[&None].plugins[makima_storage::plans::PLAN_STATE_KEY]
+                    .value
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap();
+            let plan = &plans[&root.id()];
+            assert_eq!(plan.path, path);
+            assert_eq!(plan.approved.as_ref().unwrap().content, PLAN);
+            assert_eq!(plan.staged_model.as_ref(), Some(&selection));
+            replacement.install().unwrap();
+            drop(replacement);
+            actor.shutdown();
+        });
+    }
+
+    #[test_case(false, false; "boundary_only_published")]
+    #[test_case(false, true; "boundary_only_cancelled")]
+    #[test_case(true, false; "approval_and_boundary_published")]
+    #[test_case(true, true; "approval_and_boundary_cancelled")]
+    fn prepared_boundary_receipt_matches_atomic_publication(with_edit: bool, cancel: bool) {
+        smol::block_on(async {
+            use std::time::Duration;
+
+            use crate::{
+                AgentManagerHandle, ModeDef, StateScope, StateSlotSpec, journal::SessionJournal,
+            };
+            use makima_storage::session_state::StateChange;
+
+            const SLOT_KEY: &str = "fixture/approval";
+            const TEXT: &str = "unchanged history";
+            let journal = Arc::new(SessionJournal::default());
+            let manager =
+                AgentManagerHandle::new_with_journal(Default::default(), Arc::clone(&journal))
+                    .unwrap();
+            let config = EffectiveAgentConfig::new(policy(false), AgentMode::Build)
+                .with_mode_def(Some(ModeDef::default_for(AgentMode::Build.id())));
+            let root = manager
+                .create_root_with_config(
+                    Some(config),
+                    vec![Message::user(TEXT.into())],
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let before_config = actor.config_snapshot().unwrap();
+            let before_history = actor.committed_history_snapshot();
+            let before_journal = journal.snapshot();
+            let observer = actor.subscribe_config_commits();
+            while observer.try_recv().is_ok() {}
+            let slot = journal
+                .register_state::<Value>(StateSlotSpec {
+                    key: SLOT_KEY.into(),
+                    scope: StateScope::Session,
+                    version: 1,
+                })
+                .unwrap();
+            let access = root.state_access();
+            let state_edits = if with_edit {
+                vec![slot.edit(&access, Some(Value::Bool(true)), None).unwrap()]
+            } else {
+                Vec::new()
+            };
+            let (captured, capture) = flume::bounded(1);
+            let (finalized, finalization) = flume::bounded(1);
+            let callback_journal = Arc::clone(&journal);
+            let callback_before = before_journal.clone();
+            let final_slot = slot.clone();
+            let final_access = access.clone();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let result = operation
+                .commit_durable(
+                    PreparedTransaction {
+                        state_edits,
+                        options: None,
+                        history_changed: false,
+                        boundary: false,
+                        publication: CheckpointPublication::default(),
+                        publish: Box::new(move |snapshot, publication| {
+                            Box::pin(async move {
+                                let candidate = snapshot.journal.unwrap();
+                                let boundary = snapshot.boundary.unwrap();
+                                assert_eq!(boundary.agent, final_access.target());
+                                assert_eq!(boundary.epoch, candidate.epoch);
+                                assert_eq!(callback_journal.snapshot().state, callback_before.state);
+                                assert_eq!(candidate.state[..callback_before.state.len()], callback_before.state);
+                                let changes = &candidate.state[callback_before.state.len()..];
+                                assert_eq!(changes.len(), usize::from(with_edit) + 1);
+                                if with_edit {
+                                    assert!(matches!(
+                                        &changes[0].change,
+                                        StateChange::Plugin { key, value: Some(Value::Bool(true)), .. }
+                                            if key == SLOT_KEY
+                                    ));
+                                    assert!(changes[0].seq < boundary.seq);
+                                }
+                                let record = changes.last().unwrap();
+                                assert_eq!(record.seq, boundary.seq);
+                                assert_eq!(record.generation, snapshot.commit.generation);
+                                let StateChange::Boundary { offset, lens } = &record.change else {
+                                    panic!("publication must end at its boundary")
+                                };
+                                assert_eq!(*offset, snapshot.history.messages.len());
+                                assert_eq!(
+                                    lens[&boundary.agent],
+                                    (snapshot.history.epoch, snapshot.history.messages.len())
+                                );
+                                for (id, history) in &callback_before.histories {
+                                    let candidate_history = &candidate.histories[id];
+                                    assert_eq!(candidate_history.epoch, history.epoch);
+                                    assert_eq!(candidate_history.compacted, history.compacted);
+                                    assert_eq!(candidate_history.conversation, history.conversation);
+                                    assert!(Arc::ptr_eq(&candidate_history.messages, &history.messages));
+                                }
+                                captured.send((boundary, candidate.state)).unwrap();
+                                if cancel {
+                                    assert!(publication.cancel());
+                                } else {
+                                    assert!(publication.try_publish());
+                                }
+                                Ok(())
+                            })
+                        }),
+                        finalize: Box::new(move |commit| {
+                            assert_eq!(
+                                final_slot.get(&access).unwrap().value,
+                                with_edit.then_some(Value::Bool(true))
+                            );
+                            finalized.send(commit.generation).unwrap();
+                        }),
+                    }
+                    .with_boundary(),
+                )
+                .await;
+            let (boundary, candidate_state) = capture.recv().unwrap();
+            if cancel {
+                assert!(matches!(result, Err(ActorError::PolicyCancelled)));
+                assert_eq!(journal.snapshot().state, before_journal.state);
+                assert_eq!(slot.get(&root.state_access()).unwrap().value, None);
+                assert!(finalization.try_recv().is_err());
+            } else {
+                let committed = result.unwrap();
+                assert_eq!(committed.boundary, Some(boundary));
+                assert!(committed.ticket.is_none());
+                assert_eq!(committed.config.generation, before_config.generation);
+                assert_eq!(journal.snapshot().state, candidate_state);
+                assert_eq!(finalization.recv().unwrap(), before_config.generation);
+                assert_eq!(
+                    slot.get(&root.state_access()).unwrap().value,
+                    with_edit.then_some(Value::Bool(true))
+                );
+                let operation = actor.reserve_prepared_operation(None).unwrap();
+                operation.resolve(None).unwrap();
+                operation.wait_ready().await.unwrap();
+                let committed = operation
+                    .commit_durable(PreparedTransaction {
+                        state_edits: Vec::new(),
+                        options: None,
+                        history_changed: false,
+                        boundary: false,
+                        publication: CheckpointPublication::default(),
+                        publish: Box::new(|snapshot, publication| {
+                            Box::pin(async move {
+                                assert!(snapshot.boundary.is_none());
+                                assert!(publication.try_publish());
+                                Ok(())
+                            })
+                        }),
+                        finalize: Box::new(|_| {}),
+                    })
+                    .await
+                    .unwrap();
+                assert!(committed.boundary.is_none());
+                assert!(committed.ticket.is_none());
+                assert_eq!(journal.snapshot().state, candidate_state);
+            }
+            let after_config = actor.config_snapshot().unwrap();
+            assert_eq!(after_config.generation, before_config.generation);
+            assert!(Arc::ptr_eq(&after_config.config, &before_config.config));
+            let after_history = actor.committed_history_snapshot();
+            assert_eq!(after_history.epoch, before_history.epoch);
+            assert_eq!(after_history.compacted, before_history.compacted);
+            assert_eq!(after_history.conversation, before_history.conversation);
+            assert!(Arc::ptr_eq(
+                &after_history.messages,
+                &before_history.messages
+            ));
+            assert!(observer.try_recv().is_err());
+            manager.shutdown(Duration::from_secs(5)).await;
+        });
+    }
+
+    #[test_case(false; "published")]
+    #[test_case(true; "publication_failed")]
+    fn nonpersistent_prepared_state_installs_only_after_publication(fail: bool) {
+        smol::block_on(async {
+            use crate::{AgentManagerHandle, StateScope, StateSlotSpec, journal::SessionJournal};
+            use makima_storage::session_state::StateChange;
+
+            const SLOT_KEY: &str = "fixture/runtime-state";
+            let journal = Arc::new(SessionJournal::nonpersistent());
+            let manager =
+                AgentManagerHandle::new_with_journal(Default::default(), Arc::clone(&journal))
+                    .unwrap();
+            let root = manager
+                .create_root_with_config(
+                    Some(EffectiveAgentConfig::new(policy(false), AgentMode::Build)),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            assert!(actor.inner.journal.is_none());
+            let access = root.state_access();
+            let slot = journal
+                .register_state::<Value>(StateSlotSpec {
+                    key: SLOT_KEY.into(),
+                    scope: StateScope::Agent,
+                    version: 1,
+                })
+                .unwrap();
+            let edit = slot.edit(&access, Some(Value::Bool(true)), None).unwrap();
+            let operation = actor.reserve_prepared_operation(None).unwrap();
+            operation
+                .resolve(Some(ConfigChange::Patch(ConfigPatch {
+                    fast: Some(true),
+                    ..Default::default()
+                })))
+                .unwrap();
+            operation.wait_ready().await.unwrap();
+            let result = operation
+                .commit_durable(PreparedTransaction {
+                    state_edits: vec![edit],
+                    options: None,
+                    history_changed: false,
+                    boundary: false,
+                    publication: CheckpointPublication::default(),
+                    publish: Box::new(move |snapshot, publication| {
+                        Box::pin(async move {
+                            assert!(snapshot.journal.is_none());
+                            if fail {
+                                return Err(CHECKPOINT_ERROR.into());
+                            }
+                            assert!(publication.try_publish());
+                            Ok(())
+                        })
+                    }),
+                    finalize: Box::new(|_| {}),
+                })
+                .await;
+            assert_eq!(result.is_ok(), !fail);
+            assert_eq!(actor.config_snapshot().unwrap().config.fast, !fail);
+            assert_eq!(
+                slot.get(&access).unwrap().value,
+                (!fail).then_some(Value::Bool(true))
+            );
+            slot.set(&access, Value::Bool(false), None).unwrap();
+            assert!(!journal.snapshot().state.iter().any(|record| matches!(
+                record.change,
+                StateChange::Turn { .. } | StateChange::Delivery { .. }
+            )));
+            manager.shutdown(std::time::Duration::from_secs(5)).await;
+        });
+    }
+
+    #[test_case(false; "installed")]
+    #[test_case(true; "publication_failed")]
+    fn nonpersistent_prepared_identical_history_fences_without_state_edit(fail: bool) {
+        smol::block_on(async {
+            use crate::{
+                AgentManagerHandle, StateError, StateScope, StateSlotSpec, journal::SessionJournal,
+            };
+
+            const SLOT_KEY: &str = "fixture/runtime-history";
+            let journal = Arc::new(SessionJournal::nonpersistent());
+            let manager =
+                AgentManagerHandle::new_with_journal(Default::default(), Arc::clone(&journal))
+                    .unwrap();
+            let root = manager
+                .create_root_with_config(
+                    Some(EffectiveAgentConfig::new(policy(false), AgentMode::Build)),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            assert!(actor.inner.journal.is_none());
+            let slot = journal
+                .register_state::<Value>(StateSlotSpec {
+                    key: SLOT_KEY.into(),
+                    scope: StateScope::Agent,
+                    version: 1,
+                })
+                .unwrap();
+            let old = root.state_access();
+            slot.set(&old, Value::Bool(true), None).unwrap();
+            let before = journal.snapshot().state;
+            let guard = actor.prepare_idle().unwrap();
+            let operation = guard.reserve_prepared_operation(None).unwrap();
+            operation.resolve(None).unwrap();
+            operation.wait_ready().await.unwrap();
+            let snapshot = actor.committed_history_snapshot();
+            let result = guard
+                .commit_prepared_transaction_held(
+                    operation,
+                    Some(snapshot),
+                    PreparedTransaction {
+                        state_edits: Vec::new(),
+                        options: None,
+                        history_changed: true,
+                        boundary: false,
+                        publication: CheckpointPublication::default(),
+                        publish: Box::new(move |snapshot, publication| {
+                            Box::pin(async move {
+                                assert!(snapshot.journal.is_none());
+                                if fail {
+                                    return Err(CHECKPOINT_ERROR.into());
+                                }
+                                assert!(publication.try_publish());
+                                Ok(())
+                            })
+                        }),
+                        finalize: Box::new(|_| {}),
+                    },
+                )
+                .await;
+            assert_eq!(result.is_ok(), !fail);
+            drop(result);
+            assert_eq!(journal.snapshot().state, before);
+            if fail {
+                slot.set(&old, Value::Bool(false), None).unwrap();
+            } else {
+                assert!(matches!(
+                    slot.set(&old, Value::Bool(false), None),
+                    Err(StateError::StaleAccess)
+                ));
+            }
+            slot.set(&root.state_access(), Value::Bool(false), None)
+                .unwrap();
+            manager.shutdown(std::time::Duration::from_secs(5)).await;
+        });
     }
 
     #[test_case(false; "close")]
@@ -437,6 +1432,10 @@ mod tests {
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|_, _| panic!("closed edit must not publish")),
                 finalize: Box::new(|_| panic!("closed edit must not finalize")),
@@ -490,6 +1489,10 @@ mod tests {
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|snapshot, publication| {
                     Box::pin(async move {
@@ -552,6 +1555,10 @@ mod tests {
             operation.wait_ready().await.unwrap();
             let (published, publication) = flume::bounded(1);
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, token| {
                     Box::pin(async move {
@@ -589,14 +1596,14 @@ mod tests {
     impl ActorBackend for IdleBackend {
         fn run_turn<'a>(
             &'a mut self,
-            history: &'a mut History,
+            mut history: ActorHistory<'a>,
             context: TurnContext,
             _: AgentInput,
             _: WorkKind,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             Box::pin(async move {
                 let inbox = context.inbox.unwrap();
-                inbox.commit_completions(&mut |message| history.push(message));
+                inbox.commit_completions(&mut |message| history.push_observation(message).unwrap());
                 assert!(inbox.finish());
                 BackendResult::EnteredRun(TurnOutcome::completed(
                     context.agent_id,
@@ -610,7 +1617,7 @@ mod tests {
 
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: &'a ControlWork,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -619,12 +1626,15 @@ mod tests {
 
         fn run_compact<'a>(
             &'a mut self,
-            history: &'a mut History,
+            mut history: ActorHistory<'a>,
             _: TurnContext,
             _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
             Box::pin(async move {
-                history.replace_compacted(history.as_slice().to_vec());
+                history
+                    .replace_compacted(history.as_slice().to_vec())
+                    .await
+                    .unwrap();
                 BackendResult::CompactDone
             })
         }
@@ -679,6 +1689,10 @@ mod tests {
             ));
             let (saved, checkpointed) = flume::bounded(1);
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -746,6 +1760,10 @@ mod tests {
             );
             let operation = other.reserve_prepared_operation(None).unwrap();
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|_, _| panic!("foreign operation must not publish")),
                 finalize: Box::new(|_| panic!("foreign operation must not finalize")),
@@ -800,6 +1818,10 @@ mod tests {
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -871,6 +1893,10 @@ mod tests {
             }
             let (entered, entry) = flume::bounded(1);
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: publication.clone(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -930,6 +1956,10 @@ mod tests {
             operation.resolve(Some(ConfigChange::ToggleFast)).unwrap();
             operation.wait_ready().await.unwrap();
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1010,6 +2040,10 @@ mod tests {
             let (settled, settlement) = flume::bounded(1);
             let (finalized, finalization) = flume::bounded(1);
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: publication.clone(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1192,6 +2226,10 @@ mod tests {
                 .unwrap();
             operation.wait_ready().await.unwrap();
             let transaction = PreparedTransaction {
+                state_edits: Vec::new(),
+                options: None,
+                history_changed: true,
+                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|snapshot, _| {
                     Box::pin(async move {

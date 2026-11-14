@@ -34,6 +34,7 @@ pub enum TargetCapability {
     InteractiveUi,
     ApplicationLifecycle,
     Reload,
+    ReloadContext,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,6 +53,7 @@ impl TargetCapabilities {
         TargetCapability::InteractiveUi,
         TargetCapability::ApplicationLifecycle,
         TargetCapability::Reload,
+        TargetCapability::ReloadContext,
     ]);
 
     pub const fn from_capability(capability: TargetCapability) -> Self {
@@ -99,6 +101,7 @@ pub enum BuiltinId {
     Workflow,
     Exit,
     Reload,
+    ReloadContext,
     Trust,
 }
 
@@ -138,6 +141,7 @@ pub enum BuiltinOperation {
     ToggleWorkflow,
     Exit,
     Reload,
+    ReloadContext,
     Trust,
 }
 
@@ -282,6 +286,8 @@ const CONFIG: TargetCapabilities =
 const LIFECYCLE: TargetCapabilities =
     TargetCapabilities::from_capability(TargetCapability::ApplicationLifecycle);
 const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
+const RELOAD_CONTEXT: TargetCapabilities =
+    TargetCapabilities::from_capability(TargetCapability::ReloadContext);
 
 macro_rules! builtin {
     ($id:ident, $name:expr, $aliases:expr, $description:expr, typed $arguments:expr, $completions:expr, $hint:expr, $caps:expr $(,)?) => {
@@ -499,6 +505,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         NO_ARGUMENT_COMPLETIONS,
         None,
         RELOAD,
+    ),
+    builtin!(
+        ReloadContext,
+        "/reload-context",
+        &[],
+        "Reload recorded instructions and prompt context for the root agent",
+        typed & [],
+        NO_ARGUMENT_COMPLETIONS,
+        None,
+        RELOAD_CONTEXT,
     ),
     builtin!(
         Trust,

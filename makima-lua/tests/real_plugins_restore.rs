@@ -3,24 +3,35 @@
 //! things only the real views produce (gutters, command headers, truncation).
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::{Error as IoError, Result as IoResult};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use makima_agent::actor::AgentContextSnapshot;
+use makima_agent::actor::{ActorHistory, AgentContextSnapshot, PreparedModel};
+use makima_agent::agent::tool_dispatch;
+use makima_agent::cancel::{CancelToken, CancelTrigger};
+use makima_agent::config_change::unresolved_model;
+use makima_agent::file_restore::{self, RestorePreview, RestoreRequest, RestoreSegment};
+use makima_agent::manager::AgentResidency;
 use makima_agent::permissions::PermissionManager;
 use makima_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
+use makima_agent::session_checkpoint::SessionLogCheckpoint;
 use makima_agent::session_coordinator::{
     SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions,
 };
 use makima_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, YOLO_OPTION_ID};
 use makima_agent::tools::offload::{OffloadStore, is_offload_notice};
-use makima_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
+use makima_agent::tools::{
+    CallOrigin, FILE_TRUNCATED_MARKER, FileWriteLocks, ToolContext, ToolRegistry, TurnToolBindings,
+};
 use makima_agent::{
-    ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, BackendResult, ControlWork,
-    DoneReason, History, SessionMailbox, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle,
+    BackendResult, ControlWork, DoneReason, GraphLifecycle, ManagerError, SessionMailbox,
+    TurnContext, TurnOutcome, WorkKind,
 };
 use makima_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use makima_config::{
@@ -29,9 +40,22 @@ use makima_config::{
 };
 use makima_lua::PluginHost;
 use makima_lua::orchestration::{AgentOrchestration, TrustedTarget};
-use makima_providers::{Message, StreamResponse};
-use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+use makima_lua::test_support::{FsBackend, FsError, FsMeta, InMemoryFs, RealFs, run_command};
+use makima_providers::provider::{BoxFuture, Provider};
+use makima_providers::{
+    AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
+    RequestOptions, StreamResponse,
+};
+use makima_storage::StateDir;
+use makima_storage::blobs::{BlobStore, FileState};
+use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
 use makima_storage::id::MakimaId;
+use makima_storage::id::SessionRef;
+use makima_storage::restore::{
+    PathRestore, RestoreChoice, RestoreEndpoint, RestoreProgress, RestoreStore, RestoreTransition,
+};
+use makima_storage::session_state::{SessionStateView, StateChange, StoredAgentLifecycle};
+use makima_storage::sessions::SESSIONS_DIR;
 use serde_json::{Value, json};
 
 mod common;
@@ -41,6 +65,150 @@ const GLOB_SRC: &str = include_str!("../../plugins/glob/init.lua");
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
 const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TASK_RETIRE_COMMAND: &str = "/task-retire";
+const TASK_RETIRE_FIXTURE: &str = "task_retire_fixture";
+const TASK_RETIRE_RUN: &str = "/task-retire-fixture";
+const TASK_RETIRE_REPLY: &str = "retained retirement result";
+const TASK_RETIRE_IDS: &str = "task-retire-ids.json";
+const TASK_RETIRE_NO_CONTEXT: &str = "task-retire requires an agent context";
+const TASK_RETIRE_RETAINED_LIMIT: usize = 3;
+const TASK_RETIRE_SOURCE: &str = r#"
+makima.api.register_command({
+    name = "/task-retire-fixture", tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx)
+        local input = assert(makima.json.decode(opts.args))
+        if input.action == "create" then
+            local child = assert(makima.agent.spawn(ctx, {
+                silent = true, auto_deliver = false, mcp = false, tools = {},
+            }))
+            local ticket = assert(child:send(ctx, "preserve this task history", { when = "idle" }))
+            local result = assert(ticket:wait(ctx))
+            assert(result.status == "completed", result.error)
+            assert(makima.fs.write(input.path, makima.json.encode({
+                agent_id = child:id(), turn_id = ticket:id(), text = result.text,
+            })))
+        else
+            local ids = assert(makima.json.decode(assert(makima.fs.read(input.path))))
+            local child = assert(makima.agent.get(ctx, ids.agent_id))
+            if input.action == "close" then
+                assert(child:close(ctx))
+            else
+                local status = assert(child:status(ctx))
+                assert(status.status == "closed" and not status.live)
+                local ticket = assert(child:turn(ctx, ids.turn_id))
+                assert(assert(ticket:result(ctx)).text == ids.text)
+                assert(assert(ticket:wait(ctx, { timeout = 0 })).text == ids.text)
+                local transcript = assert(child:transcript(ctx, { last_messages = 100, max_bytes = 65536 }))
+                local history = makima.json.encode(transcript.messages)
+                assert(history:find("preserve this task history", 1, true))
+                assert(history:find(ids.text, 1, true))
+                local sent, err = child:send(ctx, "must not run", { when = "idle" })
+                assert(sent == nil and err:find("retired:", 1, true), tostring(err))
+                assert(not child:is_live())
+            end
+        end
+    end,
+})
+"#;
+const TASK_RESTART_PROBE: &str = "task_restart_probe";
+const TASK_RESTART_COMMAND: &str = "/task-restart-fixture";
+const TASK_RESTART_REPLY: &str = "durable task reply";
+const TASK_RESTART_INSTRUCTIONS: &str = "recorded task startup instructions";
+const TASK_RESTART_CHANGED_INSTRUCTIONS: &str = "unreloaded task startup instructions";
+const TASK_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+const TASK_RESTART_SOURCE: &str = r#"
+local function call(ctx, name, input)
+    if name == "task_wait" then input = { task_id = input.task_id, turn_id = input.turn_id } end
+    local out, err = makima.agent.call_tool(ctx, name, input)
+    assert(out, err)
+    return assert(makima.json.decode(out))
+end
+local function read(path) return assert(makima.json.decode(assert(makima.fs.read(path)))) end
+makima.api.register_tool({
+    name = "task_restart_probe", description = "exercise durable task tools",
+    audiences = { "main", "general_sub" },
+    schema = { type = "object", additionalProperties = true },
+    handler = function(input, ctx)
+        if input.action == "create" then
+            local ids = call(ctx, "task_spawn", {
+                description = input.kind, prompt = "task work", subagent_type = input.kind,
+            })
+            local result = call(ctx, "task_wait", ids)
+            assert(result.result.text == "durable task reply")
+            ids.owner = assert(ctx:agent()):id()
+            assert(makima.fs.write(input.path, makima.json.encode(ids)))
+        elseif input.action == "oversize" then
+            local out, err = makima.agent.call_tool(ctx, "task_spawn", {
+                description = string.rep("x", 256 * 1024), prompt = "must not start",
+            })
+            assert(out == nil and err:find("state value exceeds maximum encoded size", 1, true), tostring(err))
+        else
+            local ids = read(input.path)
+            if input.action == "denied" then
+                for _, name in ipairs({ "task_wait", "task_send", "task_despawn", "task_stop" }) do
+                    local out, err = makima.agent.call_tool(ctx, name, {
+                        task_id = ids.task_id, message = name == "task_send" and "forbidden" or nil,
+                    })
+                    assert(out == nil and err:find("is not a descendant", 1, true), tostring(err))
+                end
+            elseif input.action == "send" then
+                local out, err = makima.agent.call_tool(ctx, "task_send", { task_id = ids.task_id, message = "follow up" })
+                if input.blocked then
+                    assert(out == nil and err:find("general subagents cannot take new work in plan mode", 1, true), tostring(err))
+                else
+                    assert(out, err)
+                    local sent = assert(makima.json.decode(out))
+                    assert(sent.turn_id ~= ids.turn_id)
+                    local result = call(ctx, "task_wait", { task_id = ids.task_id, turn_id = sent.turn_id })
+                    assert(result.result.text == "durable task reply")
+                end
+            elseif input.action == "legacy" then
+                local out, err = makima.agent.call_tool(ctx, "task_wait", { task_id = input.legacy })
+                assert(out == nil and err == "unknown task_id", tostring(err))
+            elseif input.action == "close" or input.action == "retained" then
+                if input.action == "close" then call(ctx, "task_despawn", { task_id = ids.task_id }) end
+                assert(call(ctx, "task_wait", ids).result.text == "durable task reply")
+            else
+                local result = call(ctx, "task_wait", ids)
+                assert(result.result.text == "durable task reply")
+                local latest = call(ctx, "task_wait", { task_id = ids.task_id })
+                assert(latest.result.turn_id == ids.turn_id)
+                local agent = assert(makima.agent.get(ctx, ids.task_id))
+                assert(not agent:is_live())
+            end
+        end
+        return "verified"
+    end,
+})
+makima.api.register_command({
+    name = "/task-restart-fixture", tui_only = false, arguments = { raw = true, required = true },
+    handler = function(opts, ctx)
+        local input = assert(makima.json.decode(opts.args))
+        local driver
+        if input.driver then
+            driver = assert(makima.agent.get(ctx, input.driver))
+        else
+            driver = assert(makima.agent.spawn(ctx, {
+                silent = true, auto_deliver = false, mcp = false, audience = "general_sub",
+                tools = {
+                    { name = "task_restart_probe", description = "probe", input_schema = { type = "object" } },
+                    { name = "task_spawn", description = "spawn", input_schema = { type = "object" } },
+                    { name = "task_wait", description = "wait", input_schema = { type = "object" } },
+                    { name = "task_send", description = "send", input_schema = { type = "object" } },
+                    { name = "task_despawn", description = "close", input_schema = { type = "object" } },
+                    { name = "task_stop", description = "stop", input_schema = { type = "object" } },
+                },
+            }))
+        end
+        if input.mode then assert(driver:set_mode(ctx, input.mode)) end
+        local ticket = assert(driver:send(ctx, makima.json.encode(input), { when = "idle" }))
+        local result = assert(ticket:wait(ctx))
+        assert(result.status == "completed", result.error)
+        assert(result.text == "verified", result.text)
+    end,
+})
+"#;
 const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
 const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
@@ -100,6 +268,550 @@ const TASK_COMPLETED_WITH_DURATION: &str = "Completed · 2s";
 const TASK_INPUT_TOKENS: u64 = 17;
 const TASK_OUTPUT_TOKENS: u64 = 9;
 
+fn task_retire_host(state_dir: &Path) -> common::RestartHost {
+    let state = StateDir::from_path(state_dir.into());
+    let mut session =
+        common::TestSession::new(&common::default_model().spec(), state_dir.to_str().unwrap());
+    session.save(&state).unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    for (name, source) in [
+        ("task", TASK_SRC),
+        (TASK_RETIRE_FIXTURE, TASK_RETIRE_SOURCE),
+    ] {
+        fs.seed(
+            &state_dir.join("plugins").join(format!("{name}.lua")),
+            source.as_bytes().to_vec(),
+        );
+    }
+    common::RestartHost::open_with_provider(
+        state_dir,
+        session.id,
+        fs,
+        vec!["task".into(), TASK_RETIRE_FIXTURE.into()],
+        Arc::new(common::CannedProvider::new(vec![common::canned_reply(
+            TASK_RETIRE_REPLY,
+        )])),
+    )
+}
+
+fn task_retire_command(
+    host: &PluginHost,
+    command: &str,
+    target: Option<TrustedTarget>,
+) -> Result<(), String> {
+    let completed = run_command(&host.command_registry(), command, 0, target);
+    smol::block_on(common::bounded(completed.recv_async())).unwrap()
+}
+
+#[test_case::test_case(false, false; "resident")]
+#[test_case::test_case(true, false; "dormant")]
+#[test_case::test_case(false, true; "closed_resident")]
+#[test_case::test_case(true, true; "closed_dormant")]
+fn task_retire_command_preserves_tombstones_across_restart(dormant: bool, closed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let host = task_retire_host(dir.path());
+    let path = dir.path().join(TASK_RETIRE_IDS);
+    let fixture = |host: &common::RestartHost, action: &str| {
+        task_retire_command(
+            &host.host,
+            &format!(
+                "{TASK_RETIRE_RUN} {}",
+                json!({ "action": action, "path": path })
+            ),
+            Some(host.root.clone()),
+        )
+        .unwrap();
+    };
+    fixture(&host, "create");
+    smol::block_on(common::bounded(host.manager.drain_graph_for_test())).unwrap();
+    if closed {
+        fixture(&host, "close");
+        smol::block_on(common::bounded(host.manager.drain_graph_for_test())).unwrap();
+    }
+    let files = host.fs.files();
+    let ids: Value =
+        serde_json::from_slice(&files.iter().find(|(file, _)| file == &path).unwrap().1).unwrap();
+    let id = ids["agent_id"].as_str().unwrap().parse().unwrap();
+    let host = if dormant {
+        host.restart_host(dir.path())
+    } else {
+        host
+    };
+    assert_eq!(host.manager.is_live(id), !dormant && !closed);
+    let command = format!("{TASK_RETIRE_COMMAND} {id}");
+    task_retire_command(&host.host, &command, Some(host.root.clone())).unwrap();
+    assert_eq!(
+        host.manager.journal().agent(id).unwrap().lifecycle,
+        StoredAgentLifecycle::Retired,
+    );
+    fixture(&host, "inspect");
+    let host = host.restart_host(dir.path());
+    assert_eq!(
+        host.manager.journal().agent(id).unwrap().lifecycle,
+        StoredAgentLifecycle::Retired,
+    );
+    fixture(&host, "inspect");
+    task_retire_command(&host.host, &command, Some(host.root.clone())).unwrap();
+}
+
+struct TaskRestartProvider;
+
+impl Provider for TaskRestartProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+        _: &'a Invocation,
+        _: RequestDelivery,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            if messages.first().is_some_and(|message| {
+                message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "task work"),
+                )
+            }) {
+                assert!(system.contains(TASK_RESTART_INSTRUCTIONS), "{system}");
+                assert!(!system.contains(TASK_RESTART_CHANGED_INSTRUCTIONS));
+            }
+            let message = messages.last().unwrap();
+            if let Some((content, is_error)) =
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => Some((content, is_error)),
+                    _ => None,
+                })
+            {
+                assert!(!is_error, "{content}");
+                return Ok(common::canned_reply("verified"));
+            }
+            let input = message.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => serde_json::from_str::<Value>(text).ok(),
+                _ => None,
+            });
+            Ok(match input {
+                Some(input) => common::canned_tool_use(TASK_RESTART_PROBE, input),
+                None => common::canned_reply(TASK_RESTART_REPLY),
+            })
+        })
+    }
+}
+
+fn task_restart_host(state_dir: &Path) -> common::RestartHost {
+    let state = StateDir::from_path(state_dir.into());
+    let mut session =
+        common::TestSession::new(&common::default_model().spec(), state_dir.to_str().unwrap());
+    session.save(&state).unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    for (name, source) in [("task", TASK_SRC), ("task_restart", TASK_RESTART_SOURCE)] {
+        fs.seed(
+            &state_dir.join("plugins").join(format!("{name}.lua")),
+            source.as_bytes().to_vec(),
+        );
+    }
+    common::RestartHost::open_with_provider(
+        state_dir,
+        session.id,
+        fs,
+        vec!["task".into(), "task_restart".into()],
+        Arc::new(TaskRestartProvider),
+    )
+}
+
+fn task_restart_run(host: &common::RestartHost, input: Value) {
+    let completed = run_command(
+        &host.host.command_registry(),
+        &format!("{TASK_RESTART_COMMAND} {input}"),
+        0,
+        Some(host.root.clone()),
+    );
+    smol::block_on(futures_lite::future::race(
+        async {
+            completed.recv_async().await.unwrap().unwrap();
+        },
+        async {
+            smol::Timer::after(TASK_RESTART_TIMEOUT).await;
+            panic!("task restart fixture timed out");
+        },
+    ));
+    smol::block_on(common::bounded(host.manager.drain_graph_for_test())).unwrap();
+}
+
+fn task_restart_ids(host: &common::RestartHost, path: &Path) -> Value {
+    let files = host.fs.files();
+    serde_json::from_slice(&files.iter().find(|(file, _)| file == path).unwrap().1).unwrap()
+}
+
+#[test_case::test_case("research"; "research")]
+#[test_case::test_case("general"; "general")]
+fn task_tools_restore_policy_and_exact_turns(kind: &str) {
+    use makima_agent::context::root_context;
+
+    let dir = tempfile::tempdir().unwrap();
+    let instructions_path = dir.path().join("AGENTS.md");
+    std::fs::write(&instructions_path, TASK_RESTART_INSTRUCTIONS).unwrap();
+    let host = task_restart_host(dir.path());
+    let access = host.root.target.state_access();
+    assert!(root_context(&access).unwrap().is_none());
+    assert!(host.root.target.actor().unwrap().latest_ticket().is_none());
+    assert!(host.root.template.root_context.is_none());
+    let path = dir.path().join("task-restart.json");
+    task_restart_run(
+        &host,
+        json!({ "action": "create", "kind": kind, "path": path }),
+    );
+    let recorded = root_context(&access).unwrap().unwrap();
+    assert!(
+        recorded
+            .instructions
+            .text
+            .contains(TASK_RESTART_INSTRUCTIONS)
+    );
+    assert!(host.root.target.actor().unwrap().latest_ticket().is_none());
+    assert!(host.history.load().messages.is_empty());
+    let persisted =
+        common::TestSession::load(host.session.id, &StateDir::from_path(dir.path().into()))
+            .unwrap();
+    let persisted_view = persisted.latest_state().unwrap();
+    let snapshot = host.manager.journal().checkpoint_snapshot().unwrap();
+    let folded =
+        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    assert_eq!(
+        persisted_view.scopes[&Some(host.root.target.id())].context,
+        folded.scopes[&Some(host.root.target.id())].context
+    );
+    std::fs::write(&instructions_path, TASK_RESTART_CHANGED_INSTRUCTIONS).unwrap();
+    let ids = task_restart_ids(&host, &path);
+    let id = ids["task_id"].as_str().unwrap().parse().unwrap();
+    let record = host.manager.journal().agent(id).unwrap();
+    assert_ne!(ids["task_id"], record.transcript_key);
+    let policy = &folded.scopes[&None].plugins["task/policy"].value;
+    assert_eq!(
+        policy.as_ref().unwrap()[ids["task_id"].as_str().unwrap()],
+        json!({
+            "description": kind, "writes": kind == "general", "owner": ids["owner"],
+        })
+    );
+    let host = host.restart_host(dir.path());
+    assert!(!host.manager.is_live(id));
+    let driver = &ids["owner"];
+    task_restart_run(
+        &host,
+        json!({ "action": "wait", "driver": driver, "path": path }),
+    );
+    assert!(!host.manager.is_live(id));
+    task_restart_run(
+        &host,
+        json!({ "action": "legacy", "driver": driver, "path": path, "legacy": record.transcript_key }),
+    );
+    task_restart_run(&host, json!({ "action": "denied", "path": path }));
+    task_restart_run(
+        &host,
+        json!({ "action": "send", "driver": driver, "path": path, "mode": "plan", "blocked": kind == "general" }),
+    );
+    task_restart_run(
+        &host,
+        json!({ "action": "send", "driver": driver, "path": path, "mode": "build" }),
+    );
+    task_restart_run(
+        &host,
+        json!({ "action": "close", "driver": driver, "path": path }),
+    );
+    assert_eq!(
+        host.manager.journal().agent(id).unwrap().lifecycle,
+        StoredAgentLifecycle::Closed
+    );
+    task_retire_command(
+        &host.host,
+        &format!("{TASK_RETIRE_COMMAND} {id}"),
+        Some(host.root.clone()),
+    )
+    .unwrap();
+    task_restart_run(
+        &host,
+        json!({ "action": "retained", "driver": driver, "path": path }),
+    );
+    let host = host.restart_host(dir.path());
+    task_restart_run(
+        &host,
+        json!({ "action": "retained", "driver": driver, "path": path }),
+    );
+}
+
+#[test_case::test_case(false; "uninitialized_foreign_context")]
+#[test_case::test_case(true; "recorded_foreign_context")]
+fn trusted_spawn_rejects_foreign_session_coordinator(recorded: bool) {
+    use makima_agent::ActorError;
+    use makima_agent::agent::InstructionSource;
+    use makima_agent::context::{ContextBinding, ContextPolicy};
+    use makima_agent::journal::JournalCommit;
+
+    const COMMAND: &str = "/foreign-context-fixture";
+    const FOREIGN_INSTRUCTIONS: &str = "foreign session instructions";
+    const SOURCE: &str = r#"
+makima.api.register_command({
+    name = "/foreign-context-fixture", tui_only = false,
+    handler = function(_, ctx)
+        local child, err = makima.agent.spawn(ctx, {
+            silent = true, auto_deliver = false, mcp = false, tools = {},
+        })
+        assert(child == nil and err == EXPECTED_ERROR, tostring(err))
+    end,
+})
+"#;
+    let target_dir = tempfile::tempdir().unwrap();
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let target = task_restart_host(target_dir.path());
+    let foreign = task_restart_host(foreign_dir.path());
+    target
+        .host
+        .load_source(
+            "foreign_context",
+            &format!(
+                "local EXPECTED_ERROR = {:?}\n{SOURCE}",
+                ActorError::PolicyCancelled.to_string()
+            ),
+        )
+        .unwrap();
+    if recorded {
+        let instructions = makima_agent::Instructions::from_sources(vec![InstructionSource {
+            path: foreign_dir.path().join("AGENTS.md"),
+            label: "foreign project".into(),
+            content: FOREIGN_INSTRUCTIONS.into(),
+        }]);
+        let (_, update) = ContextBinding::capture(foreign.root.target.state_access())
+            .unwrap()
+            .prepare(
+                &instructions,
+                &Default::default(),
+                true,
+                ContextPolicy::Admission,
+            )
+            .unwrap();
+        foreign
+            .manager
+            .journal()
+            .commit(JournalCommit {
+                context_updates: vec![update],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let target_before = target.manager.journal().snapshot();
+    let foreign_before = foreign.manager.journal().snapshot();
+    let mut mismatched = target.root.clone();
+    mismatched.template.session_id = foreign.root.template.session_id.clone();
+    let completed = run_command(
+        &target.host.command_registry(),
+        COMMAND,
+        0,
+        Some(mismatched),
+    );
+    assert_eq!(
+        smol::block_on(common::bounded(completed.recv_async())).unwrap(),
+        Ok(())
+    );
+    for (host, before) in [(&target, target_before), (&foreign, foreign_before)] {
+        let after = host.manager.journal().snapshot();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.agent_revisions, before.agent_revisions);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(host.manager.snapshot().len(), 1);
+        assert!(host.root.target.actor().unwrap().latest_ticket().is_none());
+    }
+}
+
+#[test]
+fn task_policy_size_rejection_never_admits_orphan_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = task_restart_host(dir.path());
+    task_restart_run(&host, json!({ "action": "oversize" }));
+    let snapshot = host.manager.journal().checkpoint_snapshot().unwrap();
+    let folded =
+        SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq).unwrap();
+    let children: Vec<_> = folded
+        .agents
+        .values()
+        .filter(|record| record.depth == 2)
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].lifecycle, StoredAgentLifecycle::Retired);
+    assert!(
+        !snapshot
+            .state
+            .iter()
+            .any(|record| record.agent == Some(children[0].id)
+                && matches!(record.change, StateChange::Admitted { .. }))
+    );
+    assert!(
+        folded
+            .scopes
+            .get(&None)
+            .is_none_or(|scope| !scope.plugins.contains_key("task/policy"))
+    );
+}
+
+struct RetirementBackend;
+
+impl ActorBackend for RetirementBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let reason = context.cancel_reason.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                0,
+                reason,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+#[test]
+fn task_retire_command_rejects_busy_nonleaf_and_recovers_retained_quota() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("task", TASK_SRC).unwrap();
+    let limits = AgentLimits {
+        max_retained_agents: TASK_RETIRE_RETAINED_LIMIT,
+        ..Default::default()
+    };
+    let manager = AgentManagerHandle::new(limits).unwrap();
+    let (context, _events, _cancel) = common::ctx_with_canned_provider();
+    let config = common::effective_config(&context);
+    let root = manager
+        .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let target = common::install_root(&host, root.clone(), context);
+    let spawn = |parent| {
+        manager.spawn_child_trusted_with_config(
+            parent,
+            config.clone(),
+            Default::default(),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(RetirementBackend) as Box<dyn ActorBackend>),
+        )
+    };
+    let child = spawn(&root).unwrap();
+    let leaf = spawn(&child).unwrap();
+    let quota_error = ManagerError::RetentionLimit {
+        max: limits.max_retained_agents,
+    };
+    assert_eq!(spawn(&root).unwrap_err(), quota_error);
+    let retire = |id| {
+        task_retire_command(
+            &host,
+            &format!("{TASK_RETIRE_COMMAND} {id}"),
+            Some(target.clone()),
+        )
+    };
+    let nonleaf = retire(child.id()).unwrap_err();
+    assert!(
+        nonleaf.contains(&ManagerError::NotLeaf(child.id()).to_string()),
+        "{nonleaf}"
+    );
+    let ticket = leaf
+        .actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput::new("keep retirement busy".into(), Vec::new()),
+            None,
+            "retire busy".into(),
+        )
+        .unwrap();
+    let busy = retire(leaf.id()).unwrap_err();
+    assert!(
+        busy.contains(&ManagerError::BusySubtree(leaf.id()).to_string()),
+        "{busy}"
+    );
+    assert_eq!(
+        manager.journal().agent(leaf.id()).unwrap().lifecycle,
+        StoredAgentLifecycle::Open
+    );
+    assert_eq!(spawn(&root).unwrap_err(), quota_error);
+    leaf.cancel().unwrap();
+    smol::block_on(common::bounded(ticket.wait()));
+    smol::block_on(common::bounded(manager.drain_graph_for_test())).unwrap();
+    manager.close_subtree(leaf.id()).unwrap();
+    smol::block_on(common::bounded(manager.drain_graph_for_test())).unwrap();
+    assert_eq!(spawn(&root).unwrap_err(), quota_error);
+    retire(leaf.id()).unwrap();
+    assert!(ticket.peek().is_some());
+    let replacement = spawn(&root).unwrap();
+    assert_ne!(replacement.id(), leaf.id());
+    retire(child.id()).unwrap();
+    assert_eq!(
+        manager.journal().agent(leaf.id()).unwrap().lifecycle,
+        StoredAgentLifecycle::Retired
+    );
+    let report = smol::block_on(manager.shutdown(MANAGED_SHUTDOWN_TIMEOUT));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
+fn task_retire_command_never_uses_selected_root_without_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = task_retire_host(dir.path());
+    let root = host.root.target.id();
+    let before = serde_json::to_value(host.manager.journal().agent(root).unwrap()).unwrap();
+    let error = task_retire_command(&host.host, &format!("{TASK_RETIRE_COMMAND} {root}"), None)
+        .unwrap_err();
+    assert!(error.contains(TASK_RETIRE_NO_CONTEXT), "{error}");
+    assert_eq!(
+        serde_json::to_value(host.manager.journal().agent(root).unwrap()).unwrap(),
+        before
+    );
+    let unknown = MakimaId::generate();
+    assert!(
+        task_retire_command(
+            &host.host,
+            &format!("{TASK_RETIRE_COMMAND} {unknown}"),
+            Some(host.root.clone()),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        host.manager.journal().agent(root).unwrap().lifecycle,
+        StoredAgentLifecycle::Open,
+    );
+    assert_eq!(
+        serde_json::to_value(host.manager.journal().agent(root).unwrap()).unwrap(),
+        before
+    );
+}
+
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
         other: VIEW_CAP,
@@ -117,6 +829,491 @@ const BATCH_INPUT_GREP_BASH: &str = r#"{ "tool_calls": [
     { "tool": "grep", "parameters": { "pattern": "fn" } },
     { "tool": "bash", "parameters": { "command": "echo hello-from-bash" } }
 ]}"#;
+
+const DISK_BEFORE: &str = "alpha\nbeta\n";
+const DISK_WRITTEN: &str = "written\nbeta\n";
+const DISK_EDITED: &str = "written\nBETA\n";
+const DISK_WRITE_FAILURE: &str = "injected error after disk write";
+type DiskFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct ProjectDiskFs {
+    project: PathBuf,
+    fixtures: InMemoryFs,
+    fail_after_write: AtomicBool,
+}
+
+impl ProjectDiskFs {
+    fn backend(&self, path: &Path) -> &dyn FsBackend {
+        if path.starts_with(&self.project) {
+            &RealFs
+        } else {
+            &self.fixtures
+        }
+    }
+}
+
+impl FsBackend for ProjectDiskFs {
+    fn read(&self, path: PathBuf) -> DiskFuture<'_, IoResult<String>> {
+        self.backend(&path).read(path)
+    }
+    fn read_bytes(&self, path: PathBuf) -> DiskFuture<'_, IoResult<Vec<u8>>> {
+        self.backend(&path).read_bytes(path)
+    }
+    fn stat(&self, path: PathBuf) -> DiskFuture<'_, IoResult<FsMeta>> {
+        self.backend(&path).stat(path)
+    }
+    fn write(&self, path: PathBuf, content: Vec<u8>) -> DiskFuture<'_, IoResult<()>> {
+        self.backend(&path).write(path, content)
+    }
+    fn atomic_write(&self, path: PathBuf, content: Vec<u8>) -> DiskFuture<'_, IoResult<()>> {
+        Box::pin(async move {
+            self.backend(&path).atomic_write(path, content).await?;
+            if self.fail_after_write.swap(false, Ordering::SeqCst) {
+                return Err(IoError::other(DISK_WRITE_FAILURE));
+            }
+            Ok(())
+        })
+    }
+    fn rm(&self, path: PathBuf, recursive: bool, force: bool) -> DiskFuture<'_, IoResult<()>> {
+        self.backend(&path).rm(path, recursive, force)
+    }
+    fn mkdir(&self, path: PathBuf, parents: bool) -> DiskFuture<'_, IoResult<()>> {
+        self.backend(&path).mkdir(path, parents)
+    }
+    fn dir(
+        &self,
+        path: PathBuf,
+        depth: u32,
+    ) -> DiskFuture<'_, Result<Vec<(String, &'static str)>, FsError>> {
+        self.backend(&path).dir(path, depth)
+    }
+    fn glob(
+        &self,
+        patterns: Vec<String>,
+        path: Option<String>,
+        limit: Option<usize>,
+        gitignore: bool,
+        sort_mtime: bool,
+    ) -> DiskFuture<'_, Result<Vec<String>, FsError>> {
+        let backend = if path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).starts_with(&self.project))
+        {
+            &RealFs as &dyn FsBackend
+        } else {
+            &self.fixtures
+        };
+        backend.glob(patterns, path, limit, gitignore, sort_mtime)
+    }
+    fn grep(
+        &self,
+        params: makima_agent::tools::grep::GrepParams,
+    ) -> DiskFuture<'_, Result<(PathBuf, Vec<makima_agent::GrepFileEntry>), FsError>> {
+        self.fixtures.grep(params)
+    }
+}
+
+struct DiskTurnBackend {
+    turn: flume::Sender<makima_agent::CurrentManagedTurn>,
+}
+
+impl ActorBackend for DiskTurnBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        turn: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> DiskFuture<'a, BackendResult> {
+        Box::pin(async move {
+            self.turn.send(turn.managed_turn.unwrap()).unwrap();
+            turn.cancel.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                turn.agent_id,
+                turn.turn_id.unwrap(),
+                Default::default(),
+                0,
+                DoneReason::EndTurn,
+            ))
+        })
+    }
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> DiskFuture<'a, BackendResult> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> DiskFuture<'a, BackendResult> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+struct DiskRestoreHost {
+    _host: PluginHost,
+    manager: AgentManagerHandle,
+    checkpoint: SessionLogCheckpoint,
+    context: ToolContext,
+    backend: Arc<ProjectDiskFs>,
+    state: StateDir,
+    _cancel: CancelTrigger,
+}
+
+impl DiskRestoreHost {
+    fn new(directory: &Path) -> Self {
+        let project = directory.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let state = StateDir::from_path(directory.join("state"));
+        std::fs::create_dir_all(state.path()).unwrap();
+        let mut session =
+            common::TestSession::new(&common::default_model().spec(), project.to_str().unwrap());
+        session.save(&state).unwrap();
+        let registry = Arc::new(ToolRegistry::new());
+        let backend = Arc::new(ProjectDiskFs {
+            project,
+            fixtures: InMemoryFs::new(),
+            fail_after_write: AtomicBool::new(false),
+        });
+        let mut host = PluginHost::with_session_provider_preparer(
+            registry.clone(),
+            Default::default(),
+            true,
+            backend.clone(),
+            Some(state.path().to_path_buf()),
+            None,
+            makima_lua::ui_sink::HostUi::Frontend,
+        )
+        .unwrap();
+        host.load_builtins(&makima_config::PluginsConfig {
+            enabled: true,
+            names: vec!["write".into(), "edit".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut context, cancel) = common::production_like_ctx();
+        context.cwd = backend.project.clone();
+        context.session_id = Some(session.id.into());
+        context.offload = Some(Arc::new(OffloadStore::for_session(
+            state.path(),
+            context.session_id.as_ref().unwrap(),
+        )));
+        context.registry = registry;
+        context.modes = host.mode_registry();
+        context.turn_bindings = Arc::new(TurnToolBindings::capture(
+            &context.registry,
+            &context.local_tools,
+            context.mcp.as_ref(),
+        ));
+        let manager = AgentManagerHandle::new(Default::default()).unwrap();
+        manager.journal().bind_session(session.id).unwrap();
+        let config = common::effective_config(&context)
+            .with_context(AgentContextSnapshot::new(context.cwd.clone()));
+        let (turn_tx, turn_rx) = flume::bounded(1);
+        let root =
+            manager
+                .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                    Ok::<_, String>(
+                        Box::new(DiskTurnBackend { turn: turn_tx }) as Box<dyn ActorBackend>
+                    )
+                })
+                .unwrap();
+        let checkpoint =
+            SessionLogCheckpoint::open_with_session(state.clone(), session, None).unwrap();
+        smol::block_on(common::bounded(checkpoint.bind_journal(manager.journal()))).unwrap();
+        context.execution_agent_id = Some(root.id());
+        root.actor()
+            .unwrap()
+            .admit_turn(
+                AgentInput::new("disk restore acceptance".into(), Vec::new()),
+                None,
+                "disk restore".into(),
+            )
+            .unwrap();
+        context.managed_turn = Some(smol::block_on(common::bounded(turn_rx.recv_async())).unwrap());
+        common::install_root(&host, root, context.clone());
+        Self {
+            _host: host,
+            manager,
+            checkpoint,
+            context,
+            backend,
+            state,
+            _cancel: cancel,
+        }
+    }
+
+    fn dispatch(&self, tool: &str, input: Value) -> makima_agent::ToolDoneEvent {
+        smol::block_on(common::bounded(tool_dispatch::run(
+            "".into(),
+            tool,
+            &input,
+            &self.context,
+            CallOrigin::Nested,
+        )))
+    }
+
+    fn finish(self) -> (StateDir, common::TestSession) {
+        let state = self.state.clone();
+        let id = self.context.session_id.as_ref().unwrap().id();
+        drop(self);
+        let session = common::TestSession::load(id, &state).unwrap();
+        (state, session)
+    }
+}
+
+impl Drop for DiskRestoreHost {
+    fn drop(&mut self) {
+        let report = smol::block_on(common::bounded(
+            self.manager.shutdown(MANAGED_SHUTDOWN_TIMEOUT),
+        ));
+        assert!(report.timed_out.is_empty());
+        smol::block_on(common::bounded(self.checkpoint.drain())).unwrap();
+    }
+}
+
+fn disk_endpoint(session: &common::TestSession) -> RestoreEndpoint {
+    RestoreEndpoint {
+        session: session.id,
+        branch: None,
+        seq: session.sequence_high_water().unwrap_or_default(),
+        digest: file_restore::endpoint_digest(session).unwrap(),
+    }
+}
+
+fn disk_restore_request(
+    state: &StateDir,
+    session: &common::TestSession,
+    preview: RestorePreview,
+) -> RestoreRequest {
+    RestoreRequest {
+        sessions_dir: state.path().join(SESSIONS_DIR),
+        owner: session.id,
+        source: disk_endpoint(session),
+        target: disk_endpoint(session),
+        choice: RestoreChoice::FilesOnly,
+        preview,
+        projection: None,
+        locks: Arc::new(FileWriteLocks::new()),
+        cancel: CancelToken::none(),
+    }
+}
+
+fn disk_preview(session: &common::TestSession, after_seq: u64) -> RestorePreview {
+    file_restore::plan(&[RestoreSegment {
+        session: session.clone(),
+        after_seq,
+        through_seq: session.sequence_high_water().unwrap(),
+        affected: [session.root_agent_id().unwrap()].into(),
+    }])
+    .unwrap()
+}
+
+fn disk_bytes(blobs: &BlobStore, state: &FileState) -> Option<Vec<u8>> {
+    match state {
+        FileState::Absent => None,
+        FileState::Blob(reference) => Some(blobs.read(reference).unwrap()),
+    }
+}
+
+#[test_case::test_case(false, false; "existing_write_edit")]
+#[test_case::test_case(true, false; "creation_write_edit")]
+#[test_case::test_case(false, true; "error_after_write_captures_actual_postimage")]
+fn bundled_disk_mutations_capture_and_restore(created: bool, fail: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = DiskRestoreHost::new(directory.path());
+    let path = fixture.backend.project.join("file.txt");
+    if !created {
+        std::fs::write(&path, DISK_BEFORE).unwrap();
+    }
+    let start = fixture.manager.journal().snapshot().seq;
+    fixture
+        .backend
+        .fail_after_write
+        .store(fail, Ordering::SeqCst);
+    let written = fixture.dispatch("write", json!({ "path": path, "content": DISK_WRITTEN }));
+    assert_eq!(written.is_error, fail, "{}", written.output.as_text());
+    if fail {
+        assert!(written.output.as_text().contains(DISK_WRITE_FAILURE));
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), DISK_WRITTEN);
+    let edited = fixture.dispatch(
+        "edit",
+        json!({ "path": path, "old_string": "beta", "new_string": "BETA" }),
+    );
+    assert!(!edited.is_error, "{}", edited.output.as_text());
+    let (state, mut session) = fixture.finish();
+    let records: Vec<_> = session
+        .state()
+        .iter()
+        .filter_map(|record| match &record.change {
+            StateChange::File {
+                path: recorded,
+                before,
+                after,
+            } if recorded == &path => Some((record.agent, before, after)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(records.len(), 2);
+    let blobs = BlobStore::new(state.clone());
+    assert_eq!(records[0].0, session.root_agent_id());
+    assert_eq!(
+        disk_bytes(&blobs, records[0].1).as_deref(),
+        (!created).then_some(DISK_BEFORE.as_bytes())
+    );
+    assert_eq!(
+        disk_bytes(&blobs, records[0].2).unwrap(),
+        DISK_WRITTEN.as_bytes()
+    );
+    assert_eq!(records[0].2, records[1].1);
+    assert_eq!(
+        disk_bytes(&blobs, records[1].2).unwrap(),
+        DISK_EDITED.as_bytes()
+    );
+    let preview = disk_preview(&session, start);
+    assert_eq!(preview.paths.len(), 1);
+    smol::block_on(common::bounded(async {
+        let mut undo = file_restore::prepare(disk_restore_request(&state, &session, preview))
+            .await
+            .unwrap();
+        assert!(
+            undo.apply(&makima_agent::ModeRegistry::builtin())
+                .unwrap()
+                .warnings
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            (!created).then_some(DISK_BEFORE.as_bytes())
+        );
+        let reference = undo.transition_ref();
+        session.push_restore_ref(reference.clone());
+        session.save(&state).unwrap();
+        undo.complete().unwrap();
+        let inverse =
+            file_restore::plan_inverse(&state.path().join(SESSIONS_DIR), &reference).unwrap();
+        let mut redo = file_restore::prepare(disk_restore_request(&state, &session, inverse))
+            .await
+            .unwrap();
+        redo.apply(&makima_agent::ModeRegistry::builtin()).unwrap();
+        session.push_restore_ref(redo.transition_ref());
+        session.save(&state).unwrap();
+        redo.complete().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DISK_EDITED);
+    }));
+}
+
+#[test_case::test_case(false, false; "existing_unpublished_rolls_back")]
+#[test_case::test_case(false, true; "existing_published_finishes_forward")]
+#[test_case::test_case(true, false; "creation_unpublished_rolls_back")]
+#[test_case::test_case(true, true; "creation_published_finishes_forward")]
+fn bundled_disk_restore_recovers_persisted_manifest_after_restart(created: bool, publish: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = DiskRestoreHost::new(directory.path());
+    let path = fixture.backend.project.join("file.txt");
+    if !created {
+        std::fs::write(&path, DISK_BEFORE).unwrap();
+    }
+    let start = fixture.manager.journal().snapshot().seq;
+    let written = fixture.dispatch("write", json!({ "path": path, "content": DISK_WRITTEN }));
+    assert!(!written.is_error, "{}", written.output.as_text());
+    let edited = fixture.dispatch(
+        "edit",
+        json!({ "path": path, "old_string": "beta", "new_string": "BETA" }),
+    );
+    assert!(!edited.is_error, "{}", edited.output.as_text());
+    let (state, mut session) = fixture.finish();
+    let preview = disk_preview(&session, start);
+    assert_eq!(preview.paths.len(), 1);
+    let blobs = BlobStore::new(state.clone());
+    let transition = RestoreTransition {
+        id: MakimaId::generate(),
+        choice: RestoreChoice::FilesOnly,
+        source: disk_endpoint(&session),
+        target: disk_endpoint(&session),
+        inverse_of: None,
+        paths: preview
+            .paths
+            .into_iter()
+            .map(|file| PathRestore {
+                path: file.path,
+                before: file.expected,
+                after: file.desired,
+            })
+            .collect(),
+        skipped: Vec::new(),
+    };
+    let store = RestoreStore::new(state.clone());
+    let reference = store.prepare(session.id, transition).unwrap();
+    let durable = store.load(&reference).unwrap();
+    let desired = disk_bytes(&blobs, &durable.transition.paths[0].after);
+    match desired {
+        Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+        None => std::fs::remove_file(&path).unwrap(),
+    }
+    assert!(durable.progress.is_empty());
+    if publish {
+        session.push_restore_ref(reference.clone());
+        session.save(&state).unwrap();
+    }
+    let published_state = common::normalized_history_epoch_state(session.state());
+    let id = session.id;
+    drop(store);
+    let restarted_state = StateDir::from_path(directory.path().join("state"));
+    let restarted_session = common::TestSession::load(id, &restarted_state).unwrap();
+    assert_eq!(
+        restarted_session.restore_refs().contains(&reference),
+        publish
+    );
+    let locks = Arc::new(FileWriteLocks::new());
+    smol::block_on(common::bounded(file_restore::reconcile_session(
+        &restarted_state.path().join(SESSIONS_DIR),
+        id,
+        locks.clone(),
+        CancelToken::none(),
+    )))
+    .unwrap();
+    let expected = if publish {
+        (!created).then_some(DISK_BEFORE.as_bytes())
+    } else {
+        Some(DISK_EDITED.as_bytes())
+    };
+    assert_eq!(std::fs::read(&path).ok().as_deref(), expected);
+    let restarted_store = RestoreStore::new(restarted_state.clone());
+    let repaired = restarted_store.load(&reference).unwrap();
+    assert!(repaired.progress.contains(&RestoreProgress::Complete));
+    assert_eq!(
+        repaired.progress.contains(&RestoreProgress::RollbackIntent),
+        !publish
+    );
+    assert!(restarted_store.pending(id).unwrap().is_empty());
+    smol::block_on(common::bounded(file_restore::reconcile_session(
+        &restarted_state.path().join(SESSIONS_DIR),
+        id,
+        locks,
+        CancelToken::none(),
+    )))
+    .unwrap();
+    assert_eq!(std::fs::read(&path).ok().as_deref(), expected);
+    assert_eq!(
+        common::normalized_history_epoch_state(
+            common::TestSession::load(id, &restarted_state)
+                .unwrap()
+                .state()
+        ),
+        published_state
+    );
+    assert_eq!(
+        restarted_store.load(&reference).unwrap().progress,
+        repaired.progress
+    );
+}
 
 fn load_host() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
@@ -165,6 +1362,7 @@ fn restore_as(
     restore_item(
         host,
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: output.to_owned(),
@@ -216,6 +1414,7 @@ fn restore_with_capped_grep(host: &PluginHost, tool: &str, output: &str) -> Rest
     restore_item(
         host,
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: output.to_owned(),
@@ -1156,7 +2355,7 @@ fn batch_read_child_restores_highlighted_and_click_expands_it() {
 
 fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
     let id = MakimaId::generate();
-    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = ClaimingWriter::accept_all();
     SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: id,
         catalog: host.event_handle().session_option_catalog(),
@@ -1225,18 +2424,10 @@ fn prompt_permissions() -> Arc<PermissionManager> {
 /// prompts are skipped, so a classifier deny must reject outright through the
 /// session's `yolo` option in the plugin (never reaching `enforce` at all).
 fn yolo_permissions(session: &SessionCoordinatorHandle) -> Arc<PermissionManager> {
-    smol::block_on(session.set_option(YOLO_OPTION_ID, ENABLED_VALUE)).unwrap();
-    Arc::new(PermissionManager::new(
-        PermissionsConfig {
-            default: DefaultEffect::Prompt,
-            yolo: true,
-            rules: vec![],
-            ..PermissionsConfig::default()
-        },
-        PathBuf::from("/tmp"),
-        ProjectConfig::for_project(std::path::Path::new("/tmp")),
-        Arc::default(),
-    ))
+    let permissions = prompt_permissions();
+    permissions.set_yolo(true);
+    session.bind_permissions(Arc::clone(&permissions)).unwrap();
+    permissions
 }
 
 /// Like [`exec_verdict`], but with a live event channel (so tests can assert
@@ -1380,15 +2571,16 @@ struct BashInvocationBackend {
 impl ActorBackend for BashInvocationBackend {
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         turn: TurnContext,
         _: AgentInput,
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             if let Some(inbox) = &turn.inbox {
+                let mut batch = history.input_batch().await;
                 for instruction in inbox.drain_instructions() {
-                    history.push(Message::user(instruction.message));
+                    batch.push(Message::user(instruction.message));
                 }
                 inbox.instructions_submitted();
             }
@@ -1421,7 +2613,7 @@ impl ActorBackend for BashInvocationBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1430,7 +2622,7 @@ impl ActorBackend for BashInvocationBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1477,6 +2669,36 @@ fn exec_bash_real(
             }) as Box<dyn ActorBackend>)
         })
         .unwrap();
+    session
+        .bind_permissions(Arc::clone(&template.permissions))
+        .unwrap();
+    template
+        .permissions
+        .bind_journal(manager.journal(), None)
+        .unwrap();
+    let prepared_provider = Arc::clone(&template.provider);
+    session
+        .bind_actor(
+            root.clone(),
+            Arc::new(move |spec| {
+                let model = Model::from_spec(&spec);
+                let provider = Arc::clone(&prepared_provider);
+                Box::pin(async move {
+                    Ok(PreparedModel {
+                        model: model.map_err(unresolved_model)?,
+                        provider,
+                    })
+                })
+            }),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+    let yolo = if template.permissions.is_yolo() {
+        ENABLED_VALUE
+    } else {
+        DISABLED_VALUE
+    };
+    smol::block_on(session.set_option(YOLO_OPTION_ID, yolo)).unwrap();
     host.event_handle()
         .install_orchestration_services(Arc::new(AgentOrchestration::bind_root(
             Arc::default(),
@@ -1499,12 +2721,36 @@ fn exec_bash_real(
         async {
             let result = completed.recv_async().await.unwrap();
             assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-            assert!(
-                manager
-                    .list()
-                    .iter()
-                    .all(|agent| agent.snapshot().unwrap().parent_id.is_none())
+            let children = root.snapshot().unwrap().children;
+            assert_eq!(
+                children.len(),
+                usize::from(!provider.captured_tools().is_empty())
             );
+            assert_eq!(manager.snapshot().len(), children.len() + 1);
+            for child_id in children {
+                while !manager.runner_finished(child_id).unwrap() {
+                    smol::future::yield_now().await;
+                }
+                let child = manager.node(child_id).unwrap();
+                assert_eq!(child.parent_id, Some(root.id()));
+                assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+                assert_eq!(child.residency, AgentResidency::Dormant);
+                assert_eq!(
+                    manager.journal().agent(child_id).unwrap().lifecycle,
+                    StoredAgentLifecycle::Closed
+                );
+                assert!(matches!(
+                    manager.actor(child_id),
+                    Err(ManagerError::NonLiveAgent(id)) if id == child_id
+                ));
+                if let Some(actor) = child.actor {
+                    assert_eq!(actor.lifecycle, ActorLifecycle::Closed);
+                    assert!(actor.active_turn.is_none());
+                    assert_eq!(actor.queued, 0);
+                    assert!(matches!(actor.latest, Some(TurnOutcome::Completed { .. })));
+                }
+            }
+            host.load_source("auto_barrier", "").unwrap();
             let report = manager.shutdown(MANAGED_SHUTDOWN_TIMEOUT).await;
             assert!(
                 report.timed_out.is_empty(),
@@ -1528,7 +2774,6 @@ fn exec_bash_real(
     for tools in provider.captured_tools() {
         assert_eq!(common::tool_names(&tools), [CLASSIFIER_TOOL_NAME]);
     }
-    host.load_source("auto_barrier", "").unwrap();
     result
 }
 
@@ -1550,12 +2795,13 @@ fn automode_deny_blocks_and_approve_runs() {
         verdict_tool_use(false, "stub deny reason"),
         common::canned_reply("done"),
     ]));
+    let permissions = yolo_permissions(&session);
     let err = exec_bash_real(
         &host,
         &reg,
         &session,
         Arc::clone(&deny),
-        yolo_permissions(&session),
+        Arc::clone(&permissions),
         json!({ "command": "echo denied-side-effect" }),
     )
     .expect_err("under yolo a deny must fail the tool");
@@ -1569,7 +2815,8 @@ fn automode_deny_blocks_and_approve_runs() {
         "the deny verdict must come from the real classifier"
     );
 
-    smol::block_on(session.set_option(YOLO_OPTION_ID, DISABLED_VALUE)).unwrap();
+    let (host, reg, session) = bash_host_with_real_classifier();
+    let permissions = prompt_permissions();
     let approve = Arc::new(common::CannedProvider::new(vec![
         verdict_tool_use(true, "ok"),
         common::canned_reply("done"),
@@ -1579,7 +2826,7 @@ fn automode_deny_blocks_and_approve_runs() {
         &reg,
         &session,
         Arc::clone(&approve),
-        prompt_permissions(),
+        permissions,
         json!({ "command": "echo approved-side-effect" }),
     )
     .expect("an approve must run the command");

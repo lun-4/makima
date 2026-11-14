@@ -35,7 +35,9 @@ pub use api::util::command::{
 pub use api::util::picker::{PickerConfig, PickerEvent, PickerItemSpec, PickerResult};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::{PluginError, SessionOptionMutationError};
-pub use loader::{EventHandle, PERMISSION_NAME_WARNING, PluginHost, TestCompletionBackend};
+pub use loader::{
+    EventHandle, PERMISSION_NAME_WARNING, PluginHost, PreparedStateRestore, TestCompletionBackend,
+};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{COMMAND_HANDLER_UNAVAILABLE, CommandArgumentContext, CommandArgumentLifecycle};
 pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
@@ -381,7 +383,9 @@ pub mod test_support {
     /// Never created on the real disk; hosts run on the in-memory backend.
     pub const TEST_STATE_DIR: &str = "/makima-test-state";
 
-    pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
+    pub use crate::api::fs::{
+        FsBackend, FsError, FsMeta, InMemoryFs, InMemoryOffloadBackend, RealFs,
+    };
 
     /// Boots a real `PluginHost` (background Lua thread) pre-loading the given
     /// builtins on an in-memory FS backend with a synthetic state dir, so the

@@ -538,10 +538,195 @@ lua_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::util::command::UiAction;
+    use crate::orchestration::OrchestrationServices;
+    use crate::runtime::block_on_or_fail;
+    use crate::test_support::spawn_host_for_tests;
+    use makima_agent::actor::{ActorHistory, EffectiveAgentConfig};
+    use makima_agent::agent::RunSettings;
+    use makima_agent::manager::ResidentAgent;
+    use makima_agent::tools::ToolContext;
+    use makima_agent::tools::test_support::stub_ctx;
+    use makima_agent::{
+        ActorBackend, AgentInput, AgentMode, BackendResult, ControlWork, ManagerError, TurnContext,
+        WorkKind,
+    };
+    use makima_commands::CommandInvocation;
+    use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
     use test_case::test_case;
 
     const PLUGIN: &str = "owner";
     const EVENT: &str = "TurnEnd";
+    const OBSERVER: &str = "independent-observer";
+    const CALLBACK_GATE: &str = "/callback-gate";
+    const STALE_REJECTED: &str = "stale callback rejected";
+    const FRESH_CLOSED: &str = "fresh callback closed replacement";
+    const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+    struct InactiveBackend;
+
+    impl ActorBackend for InactiveBackend {
+        fn run_turn<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: AgentInput,
+            _: WorkKind,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!("callback test must not execute a turn") })
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: &'a ControlWork,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!("callback test must not execute a control") })
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+            Box::pin(async { unreachable!("callback test must not compact") })
+        }
+    }
+
+    struct CallbackTarget(TrustedTarget);
+
+    impl OrchestrationServices for CallbackTarget {
+        fn resolve_target(
+            &self,
+            _: Option<&CommandInvocation>,
+        ) -> Result<Option<TrustedTarget>, String> {
+            Ok(Some(self.0.clone()))
+        }
+
+        fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
+            assert!(self.0.target.same_manager(target));
+            assert_eq!(self.0.target.id(), target.id());
+            Ok(self.0.template.clone())
+        }
+    }
+
+    #[test_case(EVENT; "turn_end")]
+    fn queued_callback_cannot_close_replacement_but_fresh_invocation_can(event: &str) {
+        block_on_or_fail(async {
+            let template = stub_ctx(&AgentMode::Build);
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::clone(&template.provider),
+                    model: (*template.model).clone(),
+                    thinking: template.opts.thinking,
+                    fast: template.opts.fast,
+                    workflow: false,
+                },
+                AgentMode::Build,
+            )
+            .with_mode_def(Some(template.modes.current(&AgentMode::Build)));
+            let manager = AgentManagerHandle::new(Default::default()).unwrap();
+            let agent = manager
+                .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(InactiveBackend))
+                })
+                .unwrap();
+            let old = agent.incarnation().unwrap();
+            let (events, host) = spawn_host_for_tests(&[]);
+            events.install_orchestration_services(Arc::new(CallbackTarget(TrustedTarget {
+                target: agent.clone(),
+                template,
+            })));
+            host.host().load_source(PLUGIN, "").unwrap();
+            host.host()
+                .load_source(
+                    OBSERVER,
+                    &format!(
+                        r#"
+                local durable
+                assert(makima.api.create_autocmd({event:?}, {{
+                    callback = function(ev, ctx)
+                        assert(ctx ~= nil)
+                        if ev.data.fresh then
+                            assert(durable:id() == ev.agent:id())
+                            assert(durable:close(ctx))
+                            makima.ui.flash({FRESH_CLOSED:?})
+                            return
+                        end
+                        durable = ev.agent
+                        assert(durable ~= nil)
+                        assert(makima.ui.open_editor({CALLBACK_GATE:?}) == 0)
+                        local closed, err = durable:close(ctx)
+                        assert(closed == nil and err == ev.data.expected_error, err)
+                        makima.ui.flash({STALE_REJECTED:?})
+                    end,
+                }}))
+            "#,
+                    ),
+                )
+                .unwrap();
+            let actions = host.host().ui_action_rx();
+            events.fire_agent_autocmd(
+                event,
+                agent.clone(),
+                serde_json::json!({
+                    "expected_error": ManagerError::StaleIncarnation(agent.id()).to_string(),
+                }),
+            );
+            let UiAction::OpenEditor {
+                target,
+                path,
+                reply_tx: release,
+            } = actions.recv_timeout(CALLBACK_TIMEOUT).unwrap()
+            else {
+                panic!("callback did not reach its suspension gate");
+            };
+            assert_eq!(target.unwrap().id(), agent.id());
+            assert_eq!(path, PathBuf::from(CALLBACK_GATE));
+            host.host().unload(PLUGIN).unwrap();
+            manager.detach_incarnation(&old).unwrap();
+            let replacement = manager
+                .ensure_resident_with(agent.id(), |_| async {
+                    Ok(ResidentAgent {
+                        backend: Box::new(InactiveBackend),
+                        config,
+                        shared_messages: None,
+                        start: None,
+                        initialize: None,
+                    })
+                })
+                .await
+                .unwrap();
+            let before = manager.journal().checkpoint_snapshot().unwrap();
+            release.send(0).unwrap();
+            assert!(matches!(
+                actions.recv_timeout(CALLBACK_TIMEOUT).unwrap(),
+                UiAction::Flash(message) if message == STALE_REJECTED
+            ));
+            replacement.validate_live().unwrap();
+            let after = manager.journal().checkpoint_snapshot().unwrap();
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.seq, before.seq);
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.agent_revisions, before.agent_revisions);
+
+            events.fire_agent_autocmd(event, agent.clone(), serde_json::json!({ "fresh": true }));
+            assert!(matches!(
+                actions.recv_timeout(CALLBACK_TIMEOUT).unwrap(),
+                UiAction::Flash(message) if message == FRESH_CLOSED
+            ));
+            assert!(!manager.is_live(agent.id()));
+            assert!(
+                manager
+                    .shutdown(CALLBACK_TIMEOUT)
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+        });
+    }
 
     /// A `once` entry fired, or an agent-filtered one whose agent closed,
     /// leaves the store while its callback still runs; unloading its plugin

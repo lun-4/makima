@@ -5,7 +5,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 ## Identity and authority
 
 1. `AgentId` and `TurnId` are nominal, distinct types. Never substitute task ids, provider tool-use ids, TUI `run_id`, `parent_tool_use_id`, labels, or chat indexes.
-2. One actor keeps one stable `AgentId` for its lifetime. Every explicit accepted turn receives one fresh `TurnId`.
+2. One durable agent has at most one resident actor. Its `AgentId` survives restart. Every explicit accepted turn receives one fresh `TurnId`.
 3. Graph topology is descriptive, not authority. Knowing an id or parent edge must not grant spawn, wait, cancellation, or ancestor/sibling control.
 4. Delegated managed operations require a manager-issued capability for the exact active `(manager generation, AgentId, TurnId, nonce)`.
 5. A retained capability becomes invalid as soon as its managed turn guard ends. Lua invocation scope must validate the current task's authority, not creation-time context cached in a handle.

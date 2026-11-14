@@ -3,6 +3,9 @@ name = "makima-interpreter"
 version.workspace = true
 edition.workspace = true
 
+[features]
+memory-profile = []
+
 [dependencies]
 monty = { workspace = true }
 monty-types = { workspace = true }

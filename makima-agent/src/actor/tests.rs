@@ -7,7 +7,7 @@ mod config_tests;
 
 use std::slice;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use makima_providers::provider::{BoxFuture, Provider};
@@ -15,7 +15,12 @@ use makima_providers::{
     ContentBlock, ImageMediaType, ImageSource, Invocation, Message, Model, ProviderEvent,
     RequestDelivery, RequestOptions, Role, StreamResponse, TokenUsage,
 };
+use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::SessionRef;
+use makima_storage::session_state::{
+    MAX_INLINE_TURN_RESULT_BYTES, SessionStateView, StateChange, StoredScopeState,
+    StoredTurnOrigin, StoredTurnProvenance,
+};
 use serde_json::Value;
 
 fn test_image() -> ImageSource {
@@ -28,8 +33,9 @@ use super::types::{
 };
 use super::{
     ActorBackend, ActorError, ActorEvent, ActorWork, AgentActorHandle, ChildDelivery,
-    CompactionStatus, DeliveryStatus,
+    CompactionStatus, DeliveryStatus, TurnOrigin, TurnProvenance,
 };
+use crate::journal::SessionJournal;
 use crate::tools::DescriptionContext;
 use crate::tools::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience, ToolInvocation,
@@ -39,7 +45,7 @@ use crate::types::{
     AgentId, DoneReason, Envelope, EventSender, TurnCancellationReason, TurnFailure,
     TurnFailureKind, TurnId, TurnOutcome,
 };
-use crate::{AgentEvent, AgentInput, AgentMode, SharedMessages};
+use crate::{AgentEvent, AgentInput, AgentManagerHandle, AgentMode, SharedMessages};
 use std::borrow::Cow;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -113,6 +119,7 @@ pub(super) struct ScriptedBackend {
     outcomes: Mutex<Vec<BackendResult>>,
     preparation: Option<super::AdmissionPreparation>,
     readiness: Option<super::PreparedReadiness>,
+    terminal_checkpoint: Option<super::TerminalCheckpoint>,
 }
 
 struct Gate {
@@ -155,6 +162,7 @@ impl ScriptedBackend {
             outcomes: Mutex::new(Vec::new()),
             preparation: None,
             readiness: None,
+            terminal_checkpoint: None,
         }
     }
 
@@ -182,6 +190,625 @@ impl ScriptedBackend {
     }
 }
 
+#[test]
+fn boundary_facade_waits_before_drain_and_rejects_sync_user_messages() {
+    smol::block_on(async {
+        const TEXT: &str = "boundary input";
+        let journal = Arc::new(SessionJournal::default());
+        let agent = AgentId::generate();
+        let history = crate::HistorySnapshot::new(Vec::new());
+        let mut history =
+            crate::History::restored_snapshot(history).with_journal(agent, Arc::clone(&journal));
+        let mut prepared = journal
+            .prepare(crate::journal::JournalCommit {
+                changes: vec![crate::journal::JournalChange {
+                    agent: Some(agent),
+                    generation: 0,
+                    change: StateChange::Admitted {
+                        turn: TurnId::generate(),
+                        origin: StoredTurnOrigin::User,
+                    },
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut facade = super::ActorHistory::new(&mut history);
+        assert!(matches!(
+            facade.push_observation(Message::user(TEXT.into())),
+            Err(super::HistoryMutationError::BoundaryRequiresPermit)
+        ));
+        assert!(facade.is_empty());
+        let mut batch = Box::pin(facade.input_batch());
+        assert!(futures_lite::future::poll_once(&mut batch).await.is_none());
+        prepared.install().unwrap();
+        assert!(futures_lite::future::poll_once(&mut batch).await.is_none());
+        drop(prepared);
+        let mut batch = batch.await;
+        batch.push(Message::user(TEXT.into()));
+        drop(batch);
+        assert_eq!(facade.len(), 1);
+        let snapshot = journal.snapshot();
+        assert!(matches!(
+            snapshot.state.last().unwrap().change,
+            StateChange::Boundary { .. }
+        ));
+    });
+}
+
+#[test_case::test_case(false; "abort_keeps_old_state_before_boundary")]
+#[test_case::test_case(true; "install_orders_new_state_before_boundary")]
+fn prepared_config_allows_observations_but_fences_user_boundaries(install: bool) {
+    smol::block_on(async {
+        const INITIAL: &str = "before config";
+        const STREAMED: &str = "streamed while publishing";
+        const NEXT: &str = "after config";
+        const SLOT: &str = "test/config-state";
+        let journal = Arc::new(SessionJournal::default());
+        let agent = AgentId::generate();
+        let mut history = crate::History::new(Vec::new()).with_journal(agent, Arc::clone(&journal));
+        let mut facade = super::ActorHistory::new(&mut history);
+        facade.push(Message::user(INITIAL.into())).await.unwrap();
+        let captured = facade.snapshot().clone();
+        let mut token = journal
+            .prepare(crate::journal::JournalCommit {
+                changes: vec![crate::journal::JournalChange {
+                    agent: Some(agent),
+                    generation: 1,
+                    change: StateChange::Plugin {
+                        key: SLOT.into(),
+                        version: 1,
+                        value: Some(Value::Bool(true)),
+                    },
+                }],
+                histories: [(agent, captured)].into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        facade
+            .push_observation(Message::observation(STREAMED.into()))
+            .unwrap();
+        assert_eq!(facade.len(), 2);
+        let mut push = Box::pin(facade.push(Message::user(NEXT.into())));
+        assert!(futures_lite::future::poll_once(&mut push).await.is_none());
+        if install {
+            token.install().unwrap();
+        }
+        assert!(futures_lite::future::poll_once(&mut push).await.is_none());
+        drop(token);
+        push.await.unwrap();
+        let snapshot = journal.snapshot();
+        assert_eq!(snapshot.histories[&agent].messages.len(), 3);
+        assert_eq!(
+            snapshot.histories[&agent].messages[1].first_text_content(),
+            Some(STREAMED)
+        );
+        let boundary = snapshot
+            .state
+            .iter()
+            .rev()
+            .find(|record| matches!(record.change, StateChange::Boundary { .. }))
+            .unwrap();
+        let at_boundary =
+            SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, boundary.seq)
+                .unwrap();
+        assert_eq!(
+            at_boundary.scopes[&Some(agent)].plugins.contains_key(SLOT),
+            install
+        );
+    });
+}
+
+#[test_case::test_case(false; "close_before_claim")]
+#[test_case::test_case(true; "close_after_claim")]
+fn unmanaged_actor_publication_registration_observes_close(claimed: bool) {
+    smol::block_on(async {
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            None,
+            None,
+        );
+        let publication = CheckpointPublication::default();
+        let registrations = actor.register_publication(&publication).unwrap();
+        if claimed {
+            assert!(publication.try_publish());
+        }
+        actor.close();
+        assert_eq!(publication.is_cancelled(), !claimed);
+        assert!(actor.register_publication(&publication).is_err());
+        drop(registrations);
+        assert_eq!(publication.is_cancelled(), !claimed);
+        task.await;
+    });
+}
+
+#[test]
+fn config_publication_pins_committed_policy_and_resumes_unresolved_operation() {
+    smol::block_on(async {
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            Some(Arc::new(super::EffectiveAgentConfig::new(
+                policy(false),
+                AgentMode::Build,
+            ))),
+            None,
+        );
+        let pending = actor.reserve_prepared_operation(None).unwrap();
+        let committed = actor.effective_config().unwrap();
+        let guard = actor.reserve_config_publication().unwrap();
+        assert!(Arc::ptr_eq(&committed, &actor.effective_config().unwrap()));
+        pending
+            .resolve(Some(super::ConfigChange::ToggleWorkflow))
+            .unwrap();
+        let mut ready = Box::pin(pending.wait_ready());
+        assert!(
+            futures_lite::future::poll_once(ready.as_mut())
+                .await
+                .is_none()
+        );
+        assert!(!actor.effective_config().unwrap().workflow);
+        drop(guard);
+        futures_lite::future::or(async { ready.await.unwrap() }, async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("{CONDITION_TIMEOUT}");
+        })
+        .await;
+        let commit = pending.commit().unwrap();
+        assert!(commit.config.config.workflow);
+        assert!(
+            actor
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .config_publication
+                .is_none()
+        );
+        actor.shutdown();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "initial_install")]
+#[test_case::test_case(true; "fresh_spawn")]
+fn builtin_initial_config_has_resolved_mode_definition(spawn: bool) {
+    smol::block_on(async {
+        let config = super::EffectiveAgentConfig::new(policy(false), AgentMode::Build);
+        let (actor, task) = AgentActorHandle::spawn_inner(
+            AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            None,
+            spawn.then(|| Arc::new(config.clone())),
+            None,
+        );
+        if !spawn {
+            actor.initialize_config(config).unwrap();
+        }
+        let config = actor.effective_config().unwrap();
+        assert_eq!(
+            config.mode_def,
+            Some(crate::ModeDef::default_for(crate::ModeId::Build))
+        );
+        assert!(
+            crate::session_checkpoint::stored_agent_config(&config, Default::default()).is_ok()
+        );
+        actor.shutdown();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "exact_admission")]
+#[test_case::test_case(true; "batchable_submission")]
+fn work_admission_rejects_before_mutation_and_queued_turns_share_capacity(submit: bool) {
+    smol::block_on(async {
+        const CORRELATION: &str = "reserved work";
+        let ledger = crate::manager::WorkLedger::new(crate::AgentLimits {
+            max_active_agents: 1,
+            ..Default::default()
+        });
+        let other = ledger.register(AgentId::generate(), None, 0, true);
+        let held = other.try_reserve().unwrap();
+        let agent_id = AgentId::generate();
+        let mut managed = super::ManagedTurnAdmission::new(Default::default(), agent_id);
+        managed.work = Some(ledger.register(agent_id, None, 0, true));
+        let (start, ready) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_managed(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            None,
+            Some(ready),
+        );
+        let admit = || {
+            if submit {
+                actor.submit(
+                    input(CORRELATION),
+                    None,
+                    CORRELATION.into(),
+                    Default::default(),
+                )
+            } else {
+                actor.admit_turn(input(CORRELATION), None, CORRELATION.into())
+            }
+        };
+        assert!(matches!(admit(), Err(ActorError::WorkAdmission(_))));
+        assert_eq!(actor.snapshot().queued, 0);
+        {
+            let state = actor.inner.state.lock().unwrap();
+            assert!(state.instructions.is_empty());
+            assert!(state.turn_work.is_empty());
+        }
+        drop(held);
+        let first = admit().unwrap();
+        let second = actor
+            .admit_turn(input(CORRELATION), None, CORRELATION.into())
+            .unwrap();
+        assert_ne!(first.turn_id(), second.turn_id());
+        assert_eq!(ledger.active_agents(), 1);
+        assert_eq!(actor.inner.state.lock().unwrap().turn_work.len(), 2);
+        actor.shutdown();
+        drop(start);
+        task.await;
+        assert!(first.peek().is_some());
+        assert!(second.peek().is_some());
+        assert_eq!(ledger.active_agents(), 0);
+    });
+}
+
+#[test_case::test_case(false, false; "compact_detached")]
+#[test_case::test_case(true, false; "control_detached")]
+#[test_case::test_case(false, true; "compact_replaced")]
+#[test_case::test_case(true, true; "control_replaced")]
+fn controls_reject_inactive_incarnations_before_mutation(control: bool, replaced: bool) {
+    const CORRELATION: &str = "inactive control";
+    const REPLACEMENT: u64 = 1;
+    smol::block_on(async {
+        let ledger = crate::manager::WorkLedger::new(Default::default());
+        let agent_id = AgentId::generate();
+        let mut managed = super::ManagedTurnAdmission::new(Default::default(), agent_id);
+        managed.work = Some(ledger.register(agent_id, None, 0, true));
+        let (start, ready) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_managed(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            None,
+            Some(ready),
+        );
+        if replaced {
+            ledger.bind_incarnation(agent_id, REPLACEMENT).unwrap();
+        } else {
+            ledger.set_open_for_incarnation(agent_id, 0, false).unwrap();
+        }
+        let before = actor.presentation_id();
+        let error = if control {
+            actor.push_control(CORRELATION.into(), CORRELATION.into(), None)
+        } else {
+            actor.push_compact(before, None)
+        }
+        .unwrap_err();
+        assert!(matches!(error, ActorError::WorkAdmission(_)));
+        assert_eq!(actor.presentation_id(), before);
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(actor.inner.state.lock().unwrap().operations.is_empty());
+        actor.shutdown();
+        drop(start);
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, false; "compact_detached")]
+#[test_case::test_case(true, false; "control_detached")]
+#[test_case::test_case(false, true; "compact_replaced")]
+#[test_case::test_case(true, true; "control_replaced")]
+fn queued_controls_recheck_incarnation_before_backend_entry(control: bool, replaced: bool) {
+    const CORRELATION: &str = "queued inactive control";
+    const REPLACEMENT: u64 = 1;
+    smol::block_on(async {
+        let ledger = crate::manager::WorkLedger::new(Default::default());
+        let agent_id = AgentId::generate();
+        let mut managed = super::ManagedTurnAdmission::new(Default::default(), agent_id);
+        managed.work = Some(ledger.register(agent_id, None, 0, true));
+        let backend = ScriptedBackend::new();
+        let observations = Arc::clone(&backend.state);
+        let (actor, task) = AgentActorHandle::spawn_managed(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(backend),
+            managed,
+            None,
+            None,
+        );
+        let (popped, release) = actor.pause_after_next_pop();
+        if control {
+            actor
+                .push_control(CORRELATION.into(), CORRELATION.into(), None)
+                .unwrap();
+        } else {
+            actor.push_compact(actor.presentation_id(), None).unwrap();
+        }
+        futures_lite::future::or(async { popped.recv_async().await.unwrap() }, async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("queued control did not reach execution gate");
+        })
+        .await;
+        if replaced {
+            ledger.bind_incarnation(agent_id, REPLACEMENT).unwrap();
+        } else {
+            ledger.set_open_for_incarnation(agent_id, 0, false).unwrap();
+        }
+        let (probe, settled) = flume::bounded(1);
+        actor.inner.runtime_probes.lock().unwrap().push(probe);
+        release.send(()).unwrap();
+        futures_lite::future::or(async { settled.recv_async().await.unwrap() }, async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("inactive control did not settle");
+        })
+        .await;
+        assert!(observations.controls.lock().unwrap().is_empty());
+        assert_eq!(observations.compacts.load(Ordering::SeqCst), 0);
+        assert!(actor.committed_history().is_empty());
+        actor.shutdown();
+        task.await;
+    });
+}
+
+#[test_case::test_case(false; "detached")]
+#[test_case::test_case(true; "replaced")]
+fn joined_submission_rejects_inactive_incarnation_before_inbox_mutation(replaced: bool) {
+    const INITIAL: &str = "initial instruction";
+    const JOINED: &str = "stale joined instruction";
+    const REPLACEMENT: u64 = 1;
+    smol::block_on(async {
+        let ledger = crate::manager::WorkLedger::new(Default::default());
+        let agent_id = AgentId::generate();
+        let mut managed = super::ManagedTurnAdmission::new(Default::default(), agent_id);
+        managed.work = Some(ledger.register(agent_id, None, 0, true));
+        let (start, ready) = flume::bounded(1);
+        let (actor, task) = AgentActorHandle::spawn_managed(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            None,
+            Some(ready),
+        );
+        actor
+            .submit(input(INITIAL), None, INITIAL.into(), Default::default())
+            .unwrap();
+        let before = actor.pending_submissions();
+        let presentation = actor.presentation_id();
+        if replaced {
+            ledger.bind_incarnation(agent_id, REPLACEMENT).unwrap();
+        } else {
+            ledger.set_open_for_incarnation(agent_id, 0, false).unwrap();
+        }
+        assert!(matches!(
+            actor.submit(input(JOINED), None, JOINED.into(), Default::default()),
+            Err(ActorError::WorkAdmission(_))
+        ));
+        let after = actor.pending_submissions();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].text, INITIAL);
+        assert_eq!(actor.presentation_id(), presentation);
+        actor.shutdown();
+        drop(start);
+        task.await;
+    });
+}
+
+#[test]
+fn prepared_work_reservation_is_released_on_abort_before_publication() {
+    smol::block_on(async {
+        const CORRELATION: &str = "prepared work";
+        let ledger = crate::manager::WorkLedger::new(Default::default());
+        let agent_id = AgentId::generate();
+        let mut managed = super::ManagedTurnAdmission::new(Default::default(), agent_id);
+        managed.work = Some(ledger.register(agent_id, None, 0, true));
+        let (actor, task) = AgentActorHandle::spawn_managed(
+            agent_id,
+            Vec::new(),
+            None,
+            Box::new(ScriptedBackend::new()),
+            managed,
+            None,
+            None,
+        );
+        let prepared = actor
+            .reserve_prepared_operation(Some(super::PreparedTurn {
+                input: input(CORRELATION),
+                event_sender: None,
+                correlation: CORRELATION.into(),
+            }))
+            .unwrap();
+        assert_eq!(ledger.active_agents(), 1);
+        drop(prepared);
+        assert_eq!(ledger.active_agents(), 0);
+        assert!(actor.inner.state.lock().unwrap().turn_work.is_empty());
+        actor.shutdown();
+        task.await;
+    });
+}
+
+#[test]
+fn restored_actor_hydrates_exact_history_and_tickets_before_start() {
+    smol::block_on(async {
+        const TEXT: &str = "restored terminal";
+        const GENERATION: u64 = 9;
+        let manager = AgentManagerHandle::new(Default::default()).unwrap();
+        let agent = AgentId::generate();
+        let history = crate::HistorySnapshot::new(vec![Message::user(TEXT.into())]);
+        let turn = TurnId::generate();
+        let result = super::TurnResult {
+            outcome: TurnOutcome::completed(
+                agent,
+                turn,
+                TokenUsage::default(),
+                1,
+                DoneReason::EndTurn,
+            ),
+            text: TEXT.into(),
+            output: Vec::new(),
+            provenance: Default::default(),
+            duration_ms: 0,
+        };
+        let pending_turn = TurnId::generate();
+        let seen_turn = TurnId::generate();
+        let mut pending_result = result.clone();
+        pending_result.outcome = TurnOutcome::completed(
+            AgentId::generate(),
+            pending_turn,
+            TokenUsage::default(),
+            1,
+            DoneReason::EndTurn,
+        );
+        let pending_delivery = Arc::new(ChildDelivery {
+            label: None,
+            result: pending_result,
+        });
+        let backend = ScriptedBackend::new();
+        let runs = Arc::clone(&backend.state);
+        let (start, ready) = flume::bounded(1);
+        let mut admission = manager.delivery_admission_for_test(agent, AgentId::generate());
+        admission.parent_delivery = None;
+        let before = manager.journal().snapshot().revision;
+        let (actor, task) = AgentActorHandle::spawn_managed_restored(
+            agent,
+            super::ActorRestoration {
+                history: history.clone(),
+                results: vec![result.clone()],
+                deliveries: vec![pending_delivery],
+                delivery_seen: vec![seen_turn],
+                usage: TokenUsage::default(),
+                generation: GENERATION,
+            },
+            None,
+            Box::new(backend),
+            admission,
+            super::EffectiveAgentConfig::new(policy(false), AgentMode::Build),
+            ready,
+        );
+        let snapshot = actor.committed_history_snapshot();
+        assert_eq!(snapshot.epoch, history.epoch);
+        assert_eq!(snapshot.conversation, history.conversation);
+        assert!(Arc::ptr_eq(&snapshot.messages, &history.messages));
+        assert_eq!(manager.journal().snapshot().revision, before);
+        let ticket = actor.turn_ticket(turn).unwrap();
+        assert!(actor.owns_ticket(&ticket));
+        assert_eq!(ticket.wait_result().await.text, TEXT);
+        assert_eq!(actor.wait_outcome(turn).await.unwrap(), result.outcome);
+        assert_eq!(actor.config_snapshot().unwrap().generation, GENERATION);
+        assert!(runs.runs.lock().unwrap().is_empty());
+        assert!(actor.subscribe_events().is_empty());
+        {
+            let state = actor.inner.state.lock().unwrap();
+            assert!(state.delivery_runs.is_empty());
+            assert!(state.turn_work.is_empty());
+            assert_eq!(
+                state.delivery_order.iter().copied().collect::<Vec<_>>(),
+                vec![pending_turn]
+            );
+            assert!(state.deliveries.contains_key(&pending_turn));
+            assert!(state.delivery_seen.contains(&seen_turn));
+            assert!(state.delivery_seen.contains(&pending_turn));
+        }
+        actor.shutdown();
+        drop(start);
+        task.await;
+    });
+}
+
+#[test_case::test_case(false, false; "success_while_open")]
+#[test_case::test_case(true, false; "failure_while_open")]
+#[test_case::test_case(false, true; "success_during_shutdown")]
+#[test_case::test_case(true, true; "failure_during_shutdown")]
+fn terminal_checkpoint_holds_exact_wait_settlement_and_runner_exit(fail: bool, shutdown: bool) {
+    smol::block_on(async {
+        const CHECKPOINT_ERROR: &str = "terminal checkpoint unavailable";
+        let gate = Gate::new();
+        let (entered, checkpoint_entered) = flume::bounded(1);
+        let mut backend = ScriptedBackend::new();
+        let checkpoint_gate = Arc::clone(&gate);
+        backend.terminal_checkpoint = Some(Arc::new(move |_| {
+            let gate = Arc::clone(&checkpoint_gate);
+            let entered = entered.clone();
+            Box::pin(async move {
+                entered.send(()).unwrap();
+                gate.wait().await;
+                if fail {
+                    Err(CHECKPOINT_ERROR.into())
+                } else {
+                    Ok(())
+                }
+            })
+        }));
+        let (actor, task) = AgentActorHandle::spawn(
+            crate::AgentId::generate(),
+            Vec::new(),
+            None,
+            Box::new(backend),
+        );
+        let ticket = actor
+            .admit_turn(input("checkpoint"), None, "checkpoint".into())
+            .unwrap();
+        checkpoint_entered.recv_async().await.unwrap();
+        assert!(ticket.peek().is_none());
+        assert!(!actor.is_settled());
+        let mut exact = Box::pin(actor.wait_outcome(ticket.turn_id()));
+        assert!(futures_lite::future::poll_once(&mut exact).await.is_none());
+        let (probe_sender, probe_receiver) = flume::bounded(1);
+        actor
+            .inner
+            .runtime_probes
+            .lock()
+            .unwrap()
+            .push(probe_sender);
+        if shutdown {
+            actor.shutdown();
+        }
+        actor.inner.queue.notify();
+        let probe = probe_receiver.recv_async().await.unwrap();
+        assert_eq!(probe.pending_publications, 1);
+        assert!(!actor.is_settled());
+        assert!(!task.is_finished());
+        gate.open();
+        let outcome = exact.await.unwrap();
+        if fail {
+            assert!(
+                matches!(&outcome, TurnOutcome::Failed { failure, .. } if failure.diagnostic == CHECKPOINT_ERROR)
+            );
+        } else {
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        }
+        assert_eq!(ticket.peek(), Some(outcome.clone()));
+        assert_eq!(ticket.peek_result().unwrap().outcome, outcome);
+        assert_eq!(actor.outcome(ticket.turn_id()), Some(outcome));
+        if !shutdown {
+            actor.shutdown();
+        }
+        task.await;
+        assert!(actor.is_settled());
+    });
+}
+
 fn default_completed(context: &TurnContext) -> BackendResult {
     ScriptedBackend::completed(
         context,
@@ -195,6 +822,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 }
 
 impl ActorBackend for ScriptedBackend {
+    fn terminal_checkpoint(&self) -> Option<super::TerminalCheckpoint> {
+        self.terminal_checkpoint.clone()
+    }
+
     fn prepared_readiness(&self) -> Option<super::PreparedReadiness> {
         self.readiness.clone()
     }
@@ -205,7 +836,7 @@ impl ActorBackend for ScriptedBackend {
 
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         context: TurnContext,
         input: crate::AgentInput,
         work: WorkKind,
@@ -239,26 +870,27 @@ impl ActorBackend for ScriptedBackend {
             ));
             self.state.entered.fetch_add(1, Ordering::SeqCst);
             for message in input.preamble {
-                history.push(message);
+                history.push(message).await.unwrap();
             }
             if !input.message.is_empty() {
-                history.push(Message::user(input.message));
+                history.push(Message::user(input.message)).await.unwrap();
             }
 
             if let Some(gate) = &self.gate {
                 gate.wait().await;
             }
             if let Some(inbox) = &context.inbox {
+                let mut batch = history.input_batch().await;
                 inbox.take_initial_submission();
                 for input in inbox.drain_instructions() {
                     self.state.folds.lock().unwrap().push(input.message.clone());
                     for message in input.preamble {
-                        history.push(message);
+                        batch.push(message);
                     }
-                    history.push(Message::user(input.message));
+                    batch.push(Message::user(input.message));
                 }
                 for message in inbox.drain_completions() {
-                    history.push(message);
+                    batch.push(message);
                 }
                 inbox.instructions_submitted();
                 assert!(inbox.finish());
@@ -273,7 +905,7 @@ impl ActorBackend for ScriptedBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         _context: TurnContext,
         control: &'a ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -283,14 +915,17 @@ impl ActorBackend for ScriptedBackend {
                 .lock()
                 .unwrap()
                 .push(control.name.clone());
-            history.push(Message::user(format!("control:{}", control.name)));
+            history
+                .push(Message::user(format!("control:{}", control.name)))
+                .await
+                .unwrap();
             BackendResult::ControlDone
         })
     }
 
     fn run_compact<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         context: TurnContext,
         _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -305,7 +940,10 @@ impl ActorBackend for ScriptedBackend {
                 .lock()
                 .unwrap()
                 .push(context.policy.as_ref().map(|policy| policy.mode.clone()));
-            history.push(Message::user("compact".to_owned()));
+            history
+                .push(Message::user("compact".to_owned()))
+                .await
+                .unwrap();
             if self.state.compact_fails.load(Ordering::SeqCst) {
                 BackendResult::ControlFailed
             } else {
@@ -339,22 +977,25 @@ impl CancellableBackend {
 impl ActorBackend for CancellableBackend {
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         context: TurnContext,
         input: crate::AgentInput,
         _work: WorkKind,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            history.push(Message::user(input.message));
+            history.push(Message::user(input.message)).await.unwrap();
             if self.billed_request.is_some() {
                 context.output.append_text(BILLED_RESPONSE);
-                history.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: BILLED_RESPONSE.into(),
-                    }],
-                    ..Default::default()
-                });
+                history
+                    .push(Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: BILLED_RESPONSE.into(),
+                        }],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
             }
             self.state.entered.fetch_add(1, Ordering::SeqCst);
             if self.block_first.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -389,24 +1030,30 @@ impl ActorBackend for CancellableBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         _context: TurnContext,
         control: &'a ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            history.push(Message::user(format!("control:{}", control.name)));
+            history
+                .push(Message::user(format!("control:{}", control.name)))
+                .await
+                .unwrap();
             BackendResult::ControlDone
         })
     }
 
     fn run_compact<'a>(
         &'a mut self,
-        history: &'a mut crate::History,
+        mut history: super::ActorHistory<'a>,
         _context: TurnContext,
         _instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            history.push(Message::user("compact".to_owned()));
+            history
+                .push(Message::user("compact".to_owned()))
+                .await
+                .unwrap();
             BackendResult::CompactDone
         })
     }
@@ -993,11 +1640,9 @@ fn failed_admission_delivers_fifo_predecessor_before_backend(preparation_panic: 
             None,
             Some(parent_rx),
         );
-        let mut managed = super::types::ManagedTurnAdmission::new(Weak::new(), AgentId::generate());
-        managed.parent_delivery = Some(super::delivery::ParentDelivery {
-            parent: Arc::downgrade(&parent.inner),
-            metadata: Default::default(),
-        });
+        let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+        manager.register_delivery_actor_for_test(&parent);
+        let managed = manager.delivery_admission_for_test(AgentId::generate(), parent.agent_id());
         let mut backend = ScriptedBackend::new();
         if preparation_panic {
             backend.preparation = Some(Arc::new(|_, _| panic!("{PANIC_DIAGNOSTIC}")));
@@ -2351,6 +2996,318 @@ fn event_sink_failure_still_retains() {
         );
         handle.close();
         task.await;
+    });
+}
+
+fn managed_actor(
+    backend: ScriptedBackend,
+    start: Option<flume::Receiver<()>>,
+) -> (AgentManagerHandle, AgentActorHandle) {
+    let manager = AgentManagerHandle::new(Default::default()).unwrap();
+    let config = Some(super::EffectiveAgentConfig::new(
+        policy(false),
+        AgentMode::Build,
+    ));
+    let factory = |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend));
+    let root = match start {
+        Some(start) => {
+            manager.create_root_deferred_with_config(config, Vec::new(), None, factory, start)
+        }
+        None => manager.create_root_with_config(config, Vec::new(), None, factory),
+    }
+    .unwrap();
+    (manager, root.actor().unwrap())
+}
+
+fn admission_scope(
+    journal: &SessionJournal,
+    agent: AgentId,
+    expected: &[(TurnId, StoredTurnOrigin)],
+) -> StoredScopeState {
+    let snapshot = journal.snapshot();
+    let admissions: Vec<_> = snapshot
+        .state
+        .iter()
+        .filter(|record| record.agent == Some(agent))
+        .filter_map(|record| match &record.change {
+            StateChange::Admitted { turn, origin } => Some((*turn, origin.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(admissions, expected);
+    SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+        .unwrap()
+        .scopes
+        .remove(&Some(agent))
+        .unwrap()
+}
+
+#[test_case::test_case(TurnOrigin::User, false; "user_submission")]
+#[test_case::test_case(TurnOrigin::Plugin, false; "plugin_submission")]
+#[test_case::test_case(TurnOrigin::Internal, false; "internal_submission")]
+#[test_case::test_case(TurnOrigin::User, true; "user_admission")]
+#[test_case::test_case(TurnOrigin::Plugin, true; "plugin_admission")]
+#[test_case::test_case(TurnOrigin::Internal, true; "internal_admission")]
+fn managed_ticket_journals_origin_once_and_join_adds_no_admission(
+    origin: TurnOrigin,
+    direct: bool,
+) {
+    smol::block_on(async {
+        const INITIAL: &str = "initial journaled input";
+        const JOINED: &str = "joined journaled input";
+        const PLUGIN: &str = "admission-plugin";
+        const GENERATION: u64 = 7;
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (manager, actor) = managed_actor(backend, None);
+        let journal = manager.journal();
+        let provenance = TurnProvenance {
+            plugin: (origin == TurnOrigin::Plugin).then(|| PLUGIN.into()),
+            plugin_generation: (origin == TurnOrigin::Plugin).then_some(GENERATION),
+            origin: origin.clone(),
+            source_agent: Some(AgentId::generate()),
+            source_turn: Some(TurnId::generate()),
+        };
+        let options = super::TurnAdmissionOptions {
+            provenance: provenance.clone(),
+            ..Default::default()
+        };
+        let ticket = if direct {
+            actor.admit_turn_with_options(input(INITIAL), None, INITIAL.into(), options)
+        } else {
+            actor.submit(input(INITIAL), None, INITIAL.into(), options)
+        }
+        .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let expected = [(ticket.turn_id(), StoredTurnOrigin::from(origin))];
+        let admitted = admission_scope(&journal, actor.agent_id(), &expected);
+        assert_eq!(admitted.admitted, expected.clone().into());
+        assert!(admitted.results.is_empty());
+        if !direct {
+            let joined = actor
+                .submit(input(JOINED), None, JOINED.into(), Default::default())
+                .unwrap();
+            assert_eq!(joined.turn_id(), ticket.turn_id());
+            assert_eq!(joined.provenance(), &provenance);
+            let after_join = admission_scope(&journal, actor.agent_id(), &expected);
+            assert_eq!(after_join.admitted, admitted.admitted);
+            assert_eq!(after_join.results, admitted.results);
+        }
+        gate.open();
+        let result = ticket.wait_result().await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(result.provenance, provenance);
+        journal
+            .wait_terminal_conversion(actor.agent_id(), ticket.turn_id())
+            .await
+            .unwrap();
+        let settled = admission_scope(&journal, actor.agent_id(), &expected);
+        assert!(settled.admitted.is_empty());
+        assert_eq!(settled.results.len(), 1);
+        assert_eq!(settled.results[0].0, ticket.turn_id());
+        assert_eq!(
+            settled.results[0].1.provenance,
+            StoredTurnProvenance::from(provenance)
+        );
+        assert_eq!(state.runs.lock().unwrap().len(), 1);
+        let folds = state.folds.lock().unwrap().clone();
+        assert_eq!(
+            folds,
+            if direct {
+                Vec::new()
+            } else {
+                vec![JOINED.to_owned()]
+            }
+        );
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        admission_scope(&journal, actor.agent_id(), &expected);
+    });
+}
+
+#[test_case::test_case(TurnOrigin::User; "user")]
+#[test_case::test_case(TurnOrigin::Plugin; "plugin")]
+#[test_case::test_case(TurnOrigin::Internal; "internal")]
+fn managed_queued_cancellation_keeps_admission_and_terminal_origin(origin: TurnOrigin) {
+    smol::block_on(async {
+        const QUEUED: &str = "cancel before execution";
+        let (start, wait) = flume::bounded(1);
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (manager, actor) = managed_actor(backend, Some(wait));
+        let journal = manager.journal();
+        let provenance = TurnProvenance {
+            origin: origin.clone(),
+            ..Default::default()
+        };
+        let ticket = actor
+            .admit_turn_with_options(
+                input(QUEUED),
+                None,
+                QUEUED.into(),
+                super::TurnAdmissionOptions {
+                    provenance: provenance.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let expected = [(ticket.turn_id(), StoredTurnOrigin::from(origin))];
+        let admitted = admission_scope(&journal, actor.agent_id(), &expected);
+        assert_eq!(admitted.admitted, expected.clone().into());
+        assert!(admitted.results.is_empty());
+        assert_eq!(actor.snapshot().queued, 1);
+        actor.cancel_turn(ticket.turn_id()).unwrap();
+        let result = ticket.wait_result().await;
+        assert!(matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+        assert_eq!(result.provenance, provenance);
+        journal
+            .wait_terminal_conversion(actor.agent_id(), ticket.turn_id())
+            .await
+            .unwrap();
+        let settled = admission_scope(&journal, actor.agent_id(), &expected);
+        assert!(settled.admitted.is_empty());
+        assert_eq!(settled.results.len(), 1);
+        assert_eq!(settled.results[0].0, ticket.turn_id());
+        assert_eq!(
+            settled.results[0].1.provenance,
+            StoredTurnProvenance::from(provenance)
+        );
+        start.send(()).unwrap();
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        assert_eq!(state.entered.load(Ordering::SeqCst), 0);
+        assert!(state.runs.lock().unwrap().is_empty());
+        admission_scope(&journal, actor.agent_id(), &expected);
+    });
+}
+
+#[test]
+fn managed_prepared_turn_journals_internal_admission_only_at_commit() {
+    smol::block_on(async {
+        const PREPARED: &str = "prepared journaled input";
+        let (start, wait) = flume::bounded(1);
+        let (manager, actor) = managed_actor(ScriptedBackend::new(), Some(wait));
+        let journal = manager.journal();
+        let operation = actor
+            .reserve_prepared_operation(Some(super::PreparedTurn {
+                input: input(PREPARED),
+                event_sender: None,
+                correlation: PREPARED.into(),
+            }))
+            .unwrap();
+        let reserved = admission_scope(&journal, actor.agent_id(), &[]);
+        assert!(reserved.admitted.is_empty());
+        assert!(reserved.results.is_empty());
+        let ticket = operation
+            .commit_when_ready(None)
+            .await
+            .unwrap()
+            .ticket
+            .unwrap();
+        let expected = [(ticket.turn_id(), StoredTurnOrigin::Internal)];
+        let admitted = admission_scope(&journal, actor.agent_id(), &expected);
+        assert_eq!(admitted.admitted, expected.clone().into());
+        assert!(admitted.results.is_empty());
+        assert_eq!(ticket.provenance(), &TurnProvenance::default());
+        start.send(()).unwrap();
+        let result = ticket.wait_result().await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(result.provenance, TurnProvenance::default());
+        journal
+            .wait_terminal_conversion(actor.agent_id(), ticket.turn_id())
+            .await
+            .unwrap();
+        let settled = admission_scope(&journal, actor.agent_id(), &expected);
+        assert!(settled.admitted.is_empty());
+        assert_eq!(settled.results.len(), 1);
+        assert_eq!(settled.results[0].0, ticket.turn_id());
+        assert_eq!(
+            settled.results[0].1.provenance,
+            StoredTurnProvenance::from(result.provenance)
+        );
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        admission_scope(&journal, actor.agent_id(), &expected);
+    });
+}
+
+#[test]
+fn managed_child_result_continuation_journals_one_internal_admission() {
+    smol::block_on(async {
+        const CHILD: &str = "child result for journaled continuation";
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
+        let (manager, actor) = managed_actor(backend, None);
+        let journal = manager.journal();
+        let events = actor.subscribe_events();
+        let child_turn = TurnId::generate();
+        manager
+            .deliver(
+                actor.agent_id(),
+                Arc::new(ChildDelivery {
+                    label: None,
+                    result: super::TurnResult {
+                        outcome: TurnOutcome::cancelled(
+                            AgentId::generate(),
+                            child_turn,
+                            TokenUsage::default(),
+                            0,
+                            TurnCancellationReason::User,
+                        ),
+                        text: CHILD.into(),
+                        output: Vec::new(),
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::Plugin,
+                            ..Default::default()
+                        },
+                        duration_ms: 0,
+                    },
+                }),
+            )
+            .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
+        let turn = actor.snapshot().active_turn.unwrap();
+        assert_ne!(turn, child_turn);
+        let ticket = actor.turn_ticket(turn).unwrap();
+        let expected = [(turn, StoredTurnOrigin::Internal)];
+        until(|| journal.pending_revision().is_none()).await;
+        let admitted = admission_scope(&journal, actor.agent_id(), &expected);
+        assert_eq!(admitted.admitted, expected.clone().into());
+        assert!(admitted.results.is_empty());
+        assert_eq!(ticket.provenance(), &TurnProvenance::default());
+        gate.open();
+        let result = ticket.wait_result().await;
+        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+        assert_eq!(result.provenance, TurnProvenance::default());
+        journal
+            .wait_terminal_conversion(actor.agent_id(), turn)
+            .await
+            .unwrap();
+        let settled = admission_scope(&journal, actor.agent_id(), &expected);
+        assert!(settled.admitted.is_empty());
+        assert_eq!(settled.results.len(), 1);
+        assert_eq!(settled.results[0].0, turn);
+        assert_eq!(
+            settled.results[0].1.provenance,
+            StoredTurnProvenance::from(result.provenance)
+        );
+        assert_eq!(
+            delivery_statuses(&events),
+            vec![
+                DeliveryStatus::Accepted,
+                DeliveryStatus::Executed {
+                    parent_turn_id: turn
+                }
+            ]
+        );
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        admission_scope(&journal, actor.agent_id(), &expected);
     });
 }
 
@@ -4848,7 +5805,7 @@ fn cancel_active_compact_cancels_cleanly_without_panic() {
         impl ActorBackend for BlockingCompactBackend {
             fn run_turn<'a>(
                 &'a mut self,
-                _history: &'a mut crate::History,
+                _history: super::ActorHistory<'a>,
                 context: TurnContext,
                 _input: crate::AgentInput,
                 _work: WorkKind,
@@ -4858,7 +5815,7 @@ fn cancel_active_compact_cancels_cleanly_without_panic() {
             }
             fn run_control<'a>(
                 &'a mut self,
-                _history: &'a mut crate::History,
+                _history: super::ActorHistory<'a>,
                 _context: TurnContext,
                 _control: &'a ControlWork,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -4867,7 +5824,7 @@ fn cancel_active_compact_cancels_cleanly_without_panic() {
             }
             fn run_compact<'a>(
                 &'a mut self,
-                _history: &'a mut crate::History,
+                _history: super::ActorHistory<'a>,
                 context: TurnContext,
                 _instructions: Option<&'a str>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -4905,6 +5862,80 @@ fn delivery_statuses(events: &flume::Receiver<ActorEvent>) -> Vec<DeliveryStatus
         .collect()
 }
 
+#[test]
+fn nonpersistent_graph_descendants_deliver_oversized_results_without_journaling() {
+    smol::block_on(async {
+        const TOOL: &str = "print-child";
+        let journal = Arc::new(SessionJournal::nonpersistent());
+        let manager =
+            crate::AgentManagerHandle::new_with_journal(Default::default(), Arc::clone(&journal))
+                .unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, Box::new(ScriptedBackend::new()))
+            .unwrap();
+        let child = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                super::EffectiveAgentConfig::new(policy(false), crate::AgentMode::Build),
+                crate::AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(Box::new(ScriptedBackend::new()) as Box<dyn ActorBackend>),
+            )
+            .unwrap();
+        let descendant = manager
+            .spawn_child_trusted_with_config(
+                &child,
+                super::EffectiveAgentConfig::new(policy(false), crate::AgentMode::Build),
+                crate::AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(Box::new(ScriptedBackend::new()) as Box<dyn ActorBackend>),
+            )
+            .unwrap();
+        for agent in [&root, &child, &descendant] {
+            assert!(agent.actor().unwrap().inner.journal.is_none());
+        }
+        let actor = descendant.actor().unwrap();
+        let (retired, release) = actor.pause_after_next_finalization_retire();
+        let ticket = actor.admit_turn(input(TOOL), None, TOOL.into()).unwrap();
+        smol::unblock(move || retired.recv().unwrap()).await;
+        let text = TOOL.repeat(MAX_INLINE_TURN_RESULT_BYTES);
+        ticket.output().append_text(&text);
+        release.send(()).unwrap();
+        let result = ticket.wait_result().await;
+        assert_eq!(result.text, text);
+        let parent = child.actor().unwrap();
+        let parent_idle = parent.prepare_idle().unwrap();
+        manager
+            .deliver(
+                child.id(),
+                Arc::new(ChildDelivery {
+                    label: None,
+                    result,
+                }),
+            )
+            .unwrap();
+        assert_eq!(parent.inner.state.lock().unwrap().deliveries.len(), 1);
+        parent.clear();
+        drop(parent_idle);
+        parent.runtime_barrier().await.unwrap();
+        assert!(journal.pending_revision().is_none());
+        assert!(journal.persistence_error().is_none());
+        assert!(!journal.snapshot().state.iter().any(|record| matches!(
+            record.change,
+            StateChange::Turn { .. } | StateChange::Delivery { .. }
+        )));
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
 #[derive(Clone, Copy)]
 enum Claim {
     WaitFirst,
@@ -4928,11 +5959,9 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
             None,
             Some(parent_rx),
         );
-        let mut managed = super::ManagedTurnAdmission::new(Weak::new(), AgentId::generate());
-        managed.parent_delivery = Some(super::delivery::ParentDelivery {
-            parent: Arc::downgrade(&parent.inner),
-            metadata: Default::default(),
-        });
+        let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
+        manager.register_delivery_actor_for_test(&parent);
+        let managed = manager.delivery_admission_for_test(AgentId::generate(), parent.agent_id());
         let (_child_start, child_rx) = flume::bounded(1);
         let (child, child_task) = AgentActorHandle::spawn_inner(
             managed.agent_id,
@@ -5005,7 +6034,18 @@ fn wait_and_automatic_delivery_claim_race(first: Claim) {
         assert_eq!(result.duration_ms, 0);
         assert!(parent.inner.state.lock().unwrap().delivery_runs.is_empty());
         assert_eq!(scripted.entered.load(Ordering::SeqCst), 0);
-        assert!(parent.turn_ticket(continuation).is_none());
+        assert_eq!(
+            parent.turn_ticket(continuation).unwrap().peek_result(),
+            Some(result.clone())
+        );
+        assert!(
+            !parent
+                .inner
+                .tickets
+                .lock()
+                .unwrap()
+                .contains_key(&continuation)
+        );
         assert!(
             events
                 .try_iter()

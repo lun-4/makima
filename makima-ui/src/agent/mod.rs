@@ -9,11 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use makima_agent::journal::SessionJournal;
+use makima_agent::manager::ResidentAgent;
 use makima_agent::permissions::PermissionManager;
+use makima_agent::session_recovery::RecoveredSession;
+use makima_agent::tools::FileWriteLocks;
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::{
-    AgentConfig, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot, McpCommand,
-    McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentId, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
+    McpCommand, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use makima_config::ModelPolicy;
 use makima_lua::EventHandle;
@@ -248,6 +252,8 @@ pub(crate) enum AgentCommand {
     CancelSubagent { tool_use_id: String },
 }
 
+type AgentHandlesBuilder = Box<dyn FnOnce(RecoveredSession) -> Result<AgentHandles, String> + Send>;
+
 /// Stale events on the output channel (`agent_tx`/`agent_rx`) are filtered
 /// by `run_id`, not by killing the channel.
 ///
@@ -256,17 +262,67 @@ pub(crate) enum AgentCommand {
 pub(crate) struct PreparedAgentHandles {
     handles: Option<AgentHandles>,
     mailbox: Option<PreparedSessionMailbox>,
+    build: Option<AgentHandlesBuilder>,
 }
 
 impl PreparedAgentHandles {
     #[cfg(test)]
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.handles.is_some()
+    }
+
+    pub(crate) fn initialized(&self) -> &AgentHandles {
+        self.handles.as_ref().expect("initialized agent handles")
+    }
+
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, makima_agent::AgentId) {
-        let handles = self.handles.as_ref().expect("prepared handles");
+        let handles = self.initialized();
         (handles.manager.clone(), handles.root_id)
     }
 
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
-        self.handles.as_ref().expect("prepared handles").mailbox()
+        self.mailbox
+            .as_ref()
+            .map(PreparedSessionMailbox::mailbox)
+            .or_else(|| self.handles.as_ref().and_then(AgentHandles::mailbox))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_initialization_after(
+        &mut self,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        message: &'static str,
+    ) {
+        self.build = Some(Box::new(move |_| {
+            entered.send(()).map_err(|error| error.to_string())?;
+            release.recv().map_err(|error| error.to_string())?;
+            Err(message.into())
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_initialization(
+        &mut self,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    ) {
+        let build = self.build.take().expect("deferred agent builder");
+        self.build = Some(Box::new(move |recovered| {
+            let handles = build(recovered)?;
+            entered.send(()).map_err(|error| error.to_string())?;
+            release.recv().map_err(|error| error.to_string())?;
+            Ok(handles)
+        }));
+    }
+
+    pub(crate) fn initialize(&mut self, recovered: RecoveredSession) -> Result<(), String> {
+        let build = self
+            .build
+            .take()
+            .ok_or_else(|| "agent runtime already initialized".to_owned())?;
+        self.handles = Some(build(recovered)?);
+        Ok(())
     }
 
     pub(crate) fn activate(mut self) -> AgentHandles {
@@ -354,6 +410,8 @@ impl AgentHandles {
             initial_cwd,
             session_id,
             None,
+            Arc::default(),
+            None,
             timeouts,
             lua_handle,
             mcp_handle,
@@ -366,6 +424,7 @@ impl AgentHandles {
         handles
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         model_slot: &Arc<ProviderSlot>,
@@ -376,6 +435,8 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         initial_cwd: PathBuf,
         session_id: Option<SessionRef>,
+        root_id: Option<AgentId>,
+        journal: Arc<SessionJournal>,
         offload: Option<Arc<OffloadStore>>,
         timeouts: makima_providers::Timeouts,
         lua_handle: EventHandle,
@@ -394,13 +455,88 @@ impl AgentHandles {
             Arc::new(ArcSwap::from_pointee(initial_cwd)),
             mcp_handle,
             session_id,
+            root_id,
+            journal,
             offload,
             timeouts,
             lua_handle,
             model_policy,
             providers,
             system_prompt,
+            None,
+            None,
+            Arc::new(FileWriteLocks::new()),
         )
+        .expect("root agent factory")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_recovered(
+        model_slot: &Arc<ProviderSlot>,
+        initial_config: makima_agent::EffectiveAgentConfig,
+        config: AgentConfig,
+        tool_output_lines: ToolOutputLines,
+        permissions: &Arc<PermissionManager>,
+        initial_cwd: PathBuf,
+        session_id: SessionRef,
+        offload: Option<Arc<OffloadStore>>,
+        timeouts: makima_providers::Timeouts,
+        lua_handle: EventHandle,
+        mcp_handle: Option<McpHandle>,
+        model_policy: Arc<ModelPolicy>,
+        providers: Arc<ProviderRegistry>,
+        system_prompt: SystemPromptOverride,
+        file_write_locks: Arc<FileWriteLocks>,
+    ) -> PreparedAgentHandles {
+        let prepared_mailbox = SessionMailbox::prepare(session_id.id());
+        let mailbox = prepared_mailbox.mailbox();
+        let model_slot = Arc::clone(model_slot);
+        let permissions = Arc::clone(permissions);
+        let cwd = Arc::new(ArcSwap::from_pointee(initial_cwd));
+        PreparedAgentHandles {
+            handles: None,
+            mailbox: Some(prepared_mailbox),
+            build: Some(Box::new(move |recovered| {
+                let (session, journal) = recovered.into_parts();
+                let root_id = session
+                    .root_agent_id()
+                    .ok_or_else(|| "recovered root identity is missing".to_owned())?;
+                let snapshot = journal
+                    .checkpoint_snapshot()
+                    .map_err(|error| error.to_string())?;
+                let view = session.latest_state().map_err(|error| error.to_string())?;
+                let manager = AgentManagerHandle::restore_graph(
+                    agent_limits(&config),
+                    Arc::clone(&journal),
+                    view,
+                    snapshot.histories,
+                )
+                .map_err(|error| error.to_string())?;
+                let mut prepared = spawn_agent_internal(
+                    &model_slot,
+                    initial_config,
+                    session.history_snapshot(),
+                    config,
+                    tool_output_lines,
+                    &permissions,
+                    cwd,
+                    mcp_handle,
+                    Some(session_id),
+                    Some(root_id),
+                    journal,
+                    offload,
+                    timeouts,
+                    lua_handle,
+                    model_policy,
+                    providers,
+                    system_prompt,
+                    Some(manager),
+                    Some(mailbox),
+                    file_write_locks,
+                )?;
+                Ok(prepared.handles.take().expect("initialized agent handles"))
+            })),
+        }
     }
 
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
@@ -424,6 +560,7 @@ impl AgentHandles {
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.chats[0].agent_id = Some(self.root_id);
+        app.agent_chat_index.insert(self.root_id, 0);
         app.root_agent = Some(self.manager.reference(self.root_id));
         app.lua_event_handle.observe_agents(&self.manager);
         app.answer_tx = Some(self.answer_tx.clone());
@@ -442,6 +579,7 @@ impl AgentHandles {
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
             chat.set_restore_channel(Some(restore_tx.clone()));
+            chat.set_restore_target(chat.agent_id.map(|id| self.manager.reference(id)));
         }
     }
 
@@ -508,6 +646,16 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
     });
 }
 
+fn agent_limits(config: &AgentConfig) -> AgentLimits {
+    AgentLimits {
+        max_concurrent_agent_turns: config.max_concurrent_agent_turns,
+        max_agent_depth: config.max_agent_depth,
+        max_children_per_agent: config.max_children_per_agent,
+        max_active_agents: config.max_active_agents,
+        max_retained_agents: config.max_retained_agents,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
     model_slot: &Arc<ProviderSlot>,
@@ -519,13 +667,18 @@ fn spawn_agent_internal(
     cwd: Arc<ArcSwap<PathBuf>>,
     mcp_handle: Option<McpHandle>,
     session_id: Option<SessionRef>,
+    root_id: Option<AgentId>,
+    journal: Arc<SessionJournal>,
     offload: Option<Arc<OffloadStore>>,
     timeouts: makima_providers::Timeouts,
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
     providers: Arc<ProviderRegistry>,
     system_prompt: SystemPromptOverride,
-) -> PreparedAgentHandles {
+    restored_manager: Option<AgentManagerHandle>,
+    existing_mailbox: Option<SessionMailbox>,
+    file_write_locks: Arc<FileWriteLocks>,
+) -> Result<PreparedAgentHandles, String> {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -537,64 +690,89 @@ fn spawn_agent_internal(
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let prepared_mailbox = session_id
         .as_ref()
+        .filter(|_| existing_mailbox.is_none())
         .map(|session_id| SessionMailbox::prepare(session_id.id()));
-    let mailbox = prepared_mailbox
-        .as_ref()
-        .map(PreparedSessionMailbox::mailbox);
+    let mailbox = existing_mailbox.or_else(|| {
+        prepared_mailbox
+            .as_ref()
+            .map(PreparedSessionMailbox::mailbox)
+    });
 
     let (init_trigger, init_cancel) = makima_agent::CancelToken::new();
 
-    let limits = AgentLimits {
-        max_concurrent_agent_turns: config.max_concurrent_agent_turns,
-        max_agent_depth: config.max_agent_depth,
-        max_children_per_agent: config.max_children_per_agent,
-        max_live_agents: config.max_live_agents,
+    let restored = restored_manager.is_some();
+    let manager = match restored_manager {
+        Some(manager) => manager,
+        None => AgentManagerHandle::new_with_journal(agent_limits(&config), journal)
+            .map_err(|error| error.to_string())?,
     };
-    let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
     let (runner_start, start_rx) = flume::bounded(1);
     let mut orchestration_template = None;
-    let root = manager
-        .create_root_deferred_with_config(
-            Some(
-                initial_config.with_context(makima_agent::actor::AgentContextSnapshot::new(
-                    (**cwd.load()).clone(),
-                )),
-            ),
+    let initial_config = initial_config.with_context(
+        makima_agent::actor::AgentContextSnapshot::new((**cwd.load()).clone()),
+    );
+    let factory_history = initial_history.clone();
+    let factory = |agent_id| {
+        let backend = new_backend(
+            agent_id,
+            Arc::clone(model_slot),
+            Arc::clone(&cwd),
+            config,
+            tool_output_lines,
+            Arc::clone(&btw_system),
+            mcp_handle.clone(),
+            &factory_history,
+            Arc::clone(permissions),
+            agent_tx.clone(),
+            answer_rx,
+            session_id,
+            mailbox.clone(),
+            timeouts,
+            lua_handle,
+            Arc::clone(&subagent_cancels),
+            Arc::clone(&model_policy),
+            Arc::clone(&providers),
+            system_prompt.clone(),
+            file_write_locks,
+            offload.clone(),
+            init_cancel,
+        );
+        orchestration_template = Some(backend.orchestration_template());
+        Box::new(backend) as Box<dyn makima_agent::ActorBackend>
+    };
+    let root_id = root_id.unwrap_or_else(AgentId::generate);
+    let root = if restored {
+        smol::block_on(manager.ensure_resident_with(root_id, |_| async {
+            Ok(ResidentAgent {
+                backend: factory(root_id),
+                config: initial_config,
+                shared_messages: Some(Arc::clone(&shared_history)),
+                start: Some(start_rx),
+                initialize: None,
+            })
+        }))
+    } else {
+        manager.create_root_deferred_with_id_and_config(
+            root_id,
+            Some(initial_config),
             initial_history.clone(),
             Some(Arc::clone(&shared_history)),
-            |agent_id| {
-                let backend = new_backend(
-                    agent_id,
-                    Arc::clone(model_slot),
-                    Arc::clone(&cwd),
-                    config,
-                    tool_output_lines,
-                    Arc::clone(&btw_system),
-                    mcp_handle.clone(),
-                    &initial_history,
-                    Arc::clone(permissions),
-                    agent_tx.clone(),
-                    answer_rx,
-                    session_id,
-                    mailbox.clone(),
-                    timeouts,
-                    lua_handle,
-                    Arc::clone(&subagent_cancels),
-                    Arc::clone(&model_policy),
-                    Arc::clone(&providers),
-                    system_prompt.clone(),
-                    Arc::new(makima_agent::tools::FileWriteLocks::new()),
-                    offload.clone(),
-                    init_cancel,
-                );
-                orchestration_template = Some(backend.orchestration_template());
-                Ok::<Box<dyn makima_agent::ActorBackend>, String>(Box::new(backend))
-            },
+            |id| Ok::<_, String>(factory(id)),
             start_rx,
         )
-        .expect("root agent factory");
+    }
+    .map_err(|error| error.to_string())?;
     let root_id = root.id();
     let actor = Arc::new(root.actor().expect("committed root actor"));
+    if restored {
+        smol::block_on(
+            actor
+                .reserve_prepared_operation(None)
+                .map_err(|error| error.to_string())?
+                .commit_when_ready(None),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     let queue_tx = actor_queue(Arc::clone(&actor));
 
     spawn_command_router(
@@ -605,7 +783,7 @@ fn spawn_agent_internal(
         init_trigger,
     );
 
-    PreparedAgentHandles {
+    Ok(PreparedAgentHandles {
         handles: Some(AgentHandles {
             cmd_tx,
             agent_rx,
@@ -627,7 +805,8 @@ fn spawn_agent_internal(
             runner_start: Some(runner_start),
         }),
         mailbox: prepared_mailbox,
-    }
+        build: None,
+    })
 }
 
 #[cfg(test)]

@@ -7,14 +7,13 @@ use makima_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use makima_agent::command::command_input;
 use makima_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use makima_agent::headless::{InteractiveControl, InteractiveHandle, RootBinding};
-use makima_agent::permissions::PermissionManager;
+use makima_agent::manager::AgentIncarnation;
 use makima_agent::session_checkpoint::SessionLogCheckpoint;
 use makima_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
-use makima_agent::session_options::YOLO_OPTION_ID;
 use makima_agent::{
-    AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance, modes,
+    AgentActorHandle, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
     tools::ToolContext,
 };
 use makima_commands::{
@@ -24,7 +23,7 @@ use makima_commands::{
 use makima_providers::Message;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::sessions::{HistorySnapshot, SessionMeta, StoredSubagent};
+use makima_storage::sessions::{HistorySnapshot, StoredSubagent};
 use mlua::Lua;
 use std::{
     collections::HashMap,
@@ -108,6 +107,36 @@ impl PluginAuthority {
         claim()
     }
 
+    pub(crate) fn claim_effect<T>(
+        &self,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.is_alive() {
+            return Err(crate::agent_errors::INVOCATION_EXPIRED.into());
+        }
+        effect()
+    }
+
+    pub(crate) fn claim_effect_with<T>(
+        &self,
+        other: Option<&Self>,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(other) = other.filter(|other| !std::ptr::eq(self, *other)) else {
+            return self.claim_effect(effect);
+        };
+        let (first, second) = if self.generation < other.generation {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        first.claim_effect(|| second.claim_effect(effect))
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -123,6 +152,71 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
+#[derive(Clone)]
+pub struct PinnedCommandTarget {
+    trusted: TrustedTarget,
+    incarnation: AgentIncarnation,
+    actor: AgentActorHandle,
+}
+
+impl PinnedCommandTarget {
+    pub fn pin(target: TrustedTarget) -> Result<Self, String> {
+        let incarnation = target
+            .target
+            .incarnation()
+            .map_err(|error| error.to_string())?;
+        Self::pin_incarnation(target, incarnation)
+    }
+
+    pub fn pin_incarnation(
+        target: TrustedTarget,
+        incarnation: AgentIncarnation,
+    ) -> Result<Self, String> {
+        if target.target.id() != incarnation.agent_id {
+            return Err(CLOSED_TARGET_ERR.into());
+        }
+        let actor = target
+            .target
+            .manager()
+            .actor_for_incarnation(&incarnation)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            trusted: target,
+            incarnation,
+            actor,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.target
+            .manager()
+            .actor_for_incarnation(&self.incarnation)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn actor(&self) -> Result<AgentActorHandle, String> {
+        self.validate()?;
+        Ok(self.actor.clone())
+    }
+
+    pub fn trusted(&self) -> TrustedTarget {
+        self.trusted.clone()
+    }
+
+    pub fn incarnation(&self) -> AgentIncarnation {
+        self.incarnation.clone()
+    }
+}
+
+impl std::ops::Deref for PinnedCommandTarget {
+    type Target = TrustedTarget;
+
+    fn deref(&self) -> &Self::Target {
+        &self.trusted
+    }
+}
+
 pub type ConfigMutationReserver = Arc<
     dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>
         + Send
@@ -136,12 +230,12 @@ pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> 
 /// handler has finished and the frontend has taken its outcome; a model turn
 /// or `/compact` it started may still be running.
 pub type CommandRunner =
-    Arc<dyn Fn(String, u8, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
+    Arc<dyn Fn(String, u8, PinnedCommandTarget) -> TurnCompletionFuture + Send + Sync>;
 
 /// Runs the outcome of a plugin-run command that is neither finished nor
 /// failed: a model turn, compaction, an isolated turn or feedback.
 pub type OutcomeExecutor =
-    Arc<dyn Fn(String, CommandOutcome, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
+    Arc<dyn Fn(String, CommandOutcome, PinnedCommandTarget) -> TurnCompletionFuture + Send + Sync>;
 
 pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
 pub const CLOSED_TARGET_ERR: &str = "the agent this command was pinned to has closed";
@@ -157,8 +251,7 @@ pub fn command_runner(
 ) -> CommandRunner {
     Arc::new(move |cmdline, depth, admission| {
         let dispatch = admission
-            .target
-            .validate_live()
+            .validate()
             .map_err(|_| CLOSED_TARGET_ERR.to_owned())
             .and_then(|()| {
                 registry
@@ -210,15 +303,17 @@ pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
         let control = control.clone();
         Box::pin(async move {
             let root = root.get().await?;
-            let target = admission.target;
-            let child = (target.id() != root.id() || !target.same_manager(&root))
-                .then(|| target.actor().map_err(|error| error.to_string()))
-                .transpose()?;
+            let actor = admission.actor()?;
+            let target = admission.target.clone();
+            let child =
+                (target.id() != root.id() || !target.same_manager(&root)).then_some(actor.clone());
             match (outcome, child) {
                 (CommandOutcome::FrontendFeedback(_), _) => Ok(()),
-                (CommandOutcome::AgentTurn(turn), None) => {
-                    admitter.admit(command_input(turn)?).await.map(|_| ())
-                }
+                (CommandOutcome::AgentTurn(turn), None) => admitter
+                    .for_actor(actor)
+                    .submit(command_input(turn)?)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
                 (CommandOutcome::AgentTurn(turn), Some(actor)) => actor
                     .admit_turn_with_options(
                         command_input(turn)?,
@@ -236,13 +331,14 @@ pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
                     .map_err(|error| error.to_string()),
                 (CommandOutcome::ManualCompaction(instructions), None) => {
                     let (output, _) = flume::unbounded();
-                    control
-                        .send(InteractiveControl::ManualCompaction {
+                    control.send_to(
+                        actor,
+                        InteractiveControl::ManualCompaction {
                             instructions,
                             output,
                             cancel: CancelToken::none(),
-                        })
-                        .await
+                        },
+                    )
                 }
                 (CommandOutcome::ManualCompaction(instructions), Some(actor)) => {
                     let run_id = actor.reserve_presentation(actor.presentation_id());
@@ -308,14 +404,19 @@ pub fn child_persistence(
         Ok(Box::new(move |_, claim| {
             Ok(PreparedTransaction {
                 publication,
+                options: None,
+                state_edits: Vec::new(),
+                history_changed: false,
+                boundary: false,
                 publish: Box::new(move |ready, publication| {
                     Box::pin(async move {
                         checkpoint
                             .checkpoint_child_config(
                                 StoredSubagent {
                                     agent_id: Some(agent_id),
-                                    ..child_metadata(key, name, &ready.config)
+                                    ..child_metadata(key, name)
                                 },
+                                ready.journal,
                                 publication,
                                 claim,
                             )
@@ -331,13 +432,9 @@ pub fn child_persistence(
     let completion: TurnCompletion = Arc::new(move |target, history| {
         let child = (|| {
             let (key, name) = completion_destination(target)?;
-            let config = target
-                .effective_config()
-                .map_err(|error| error.to_string())?
-                .ok_or("child agent configuration is unavailable")?;
             Ok::<_, String>(StoredSubagent {
                 agent_id: Some(target.id().to_string()),
-                ..child_metadata(key, name, &config)
+                ..child_metadata(key, name)
             })
         })();
         let checkpoint = Arc::clone(&checkpoint);
@@ -352,22 +449,22 @@ pub fn child_persistence(
     (reserver, completion)
 }
 
-pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
+pub fn child_metadata(key: String, name: String) -> StoredSubagent {
     StoredSubagent {
         agent_id: None,
         ambiguous: false,
         tool_use_id: key,
         name,
-        model: Some(config.model.spec()),
-        thinking: Some(config.thinking.into()),
-        fast: config.fast,
+        model: None,
+        thinking: None,
+        fast: false,
     }
 }
 
 /// A root binding that hands the bound root and its template to the frontend.
 pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
     let (ready, root) = flume::bounded(1);
-    let binding: RootBinding = Box::new(move |_, target, template| {
+    let binding: RootBinding = Box::new(move |_, target, template, _| {
         Box::pin(async move {
             ready
                 .send(TrustedTarget { target, template })
@@ -386,9 +483,11 @@ pub async fn bind_frontend_root(
     root_binding: &flume::Receiver<TrustedTarget>,
     prepare_model: ModelPreparer,
 ) -> Result<TrustedTarget, String> {
+    coordinator
+        .bind_permissions(Arc::clone(&handle.permissions))
+        .map_err(|error| error.to_string())?;
     let root = handle.initialized_root().await?;
     let model = handle.model.clone();
-    project_yolo(coordinator, Arc::clone(&handle.permissions));
     let permissions = Arc::clone(&handle.permissions);
     coordinator
         .bind_actor(
@@ -409,18 +508,6 @@ pub async fn bind_frontend_root(
         .map_err(|error| error.to_string())
 }
 
-/// Keeps {permissions}' YOLO state on {coordinator}'s committed option,
-/// inside the commit. An unchanged value leaves a session that never chose
-/// YOLO on its seed.
-pub fn project_yolo(coordinator: &SessionCoordinatorHandle, permissions: Arc<PermissionManager>) {
-    coordinator.read().project_options(move |options| {
-        let enabled = options.enabled(YOLO_OPTION_ID);
-        if permissions.is_yolo() != enabled {
-            permissions.set_yolo(enabled);
-        }
-    });
-}
-
 /// The orchestration a non-UI frontend binds to its root graph: the root's
 /// config commits through {coordinator} and its children persist to
 /// {checkpoint}, and {catalog}'s discovery refreshes it. `label` names the
@@ -432,12 +519,10 @@ pub fn durable_frontend(
     coordinator: SessionCoordinatorHandle,
     checkpoint: Arc<SessionLogCheckpoint>,
 ) -> Arc<AgentOrchestration> {
-    let orchestration = Arc::new_cyclic(|services| {
+    Arc::new_cyclic(|services| {
         let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
         frontend_root(catalog, root, child_config, coordinator).with_completion(completion)
-    });
-    catalog.attach(&orchestration);
-    orchestration
+    })
 }
 
 /// The root half of [`durable_frontend`]: root config goes through
@@ -518,35 +603,14 @@ pub async fn set_mode(
         .await
 }
 
-/// Puts a resumed session's root back in the mode it was saved in, keeping a
-/// plan's file while it still exists. Every frontend that resumes calls it.
-pub async fn restore_mode(
-    services: &(impl OrchestrationServices + ?Sized),
-    target: &AgentRef,
-    registry: &ModeRegistry,
-    meta: &SessionMeta,
-    state_dir: &StateDir,
-) -> Result<(), ConfigChangeError> {
-    let Some((key, saved_plan)) = modes::saved(meta) else {
-        return Ok(());
-    };
-    reserve_config_change(services, target)?
-        .commit_mode(
-            target,
-            registry,
-            key,
-            state_dir,
-            saved_plan,
-            async |_, _| Ok(publication_claim()),
-        )
-        .await?;
-    Ok(())
-}
-
 pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {
     Box::new(move |_, claim| {
         Ok(PreparedTransaction {
             publication,
+            options: None,
+            state_edits: Vec::new(),
+            history_changed: false,
+            boundary: false,
             publish: Box::new(move |_, publication| {
                 Box::pin(async move { claim(&publication).map_err(|error| error.to_string()) })
             }),
@@ -583,6 +647,23 @@ pub trait OrchestrationServices: Send + Sync + 'static {
     ) -> TurnCompletionFuture {
         Box::pin(async { Ok(()) })
     }
+
+    fn register_child_activation(
+        &self,
+        target: TrustedTarget,
+        history_key: String,
+        _actor: &AgentActorHandle,
+        incarnation: &AgentIncarnation,
+    ) -> Result<(), String> {
+        target
+            .target
+            .manager()
+            .validate_activation(incarnation)
+            .map_err(|error| error.to_string())?;
+        self.register_child_target(target, history_key)
+    }
+
+    fn unregister_child_target(&self, _target: &AgentRef, _identity: &Arc<()>) {}
 
     fn register_child_target(
         &self,
@@ -674,6 +755,7 @@ pub(crate) struct TrustedContext {
     pub(crate) template: ToolContext,
     pub(crate) plugin: Arc<str>,
     pub(crate) generation: u64,
+    incarnation: Result<AgentIncarnation, String>,
     services: Option<Arc<dyn OrchestrationServices>>,
     authority: ScopeAuthority,
 }
@@ -691,10 +773,12 @@ impl TrustedContext {
         task: &TaskHandle,
         plugin: Arc<str>,
         owner: Arc<PluginAuthority>,
+        incarnation: Result<AgentIncarnation, String>,
     ) -> Self {
         Self {
             target: target.target,
             template: target.template,
+            incarnation,
             plugin,
             generation: owner.generation,
             services: services(lua),
@@ -717,8 +801,25 @@ impl TrustedContext {
         Ok(())
     }
 
+    pub(crate) fn target_incarnation(&self, target: &AgentRef) -> Result<AgentIncarnation, String> {
+        self.validate_incarnation()?;
+        if self.target.same_manager(target) && self.target.id() == target.id() {
+            return self.incarnation.clone();
+        }
+        target.incarnation().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn validate_incarnation(&self) -> Result<(), String> {
+        let incarnation = self.incarnation.as_ref().map_err(Clone::clone)?;
+        self.target
+            .manager()
+            .validate_incarnation(incarnation)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn validate_target(&self, lua: &Lua, target: &AgentRef) -> Result<(), String> {
         self.validate(lua)?;
+        self.validate_incarnation()?;
         self.services
             .as_ref()
             .ok_or(NO_ORCHESTRATION_SERVICES)?
@@ -775,14 +876,24 @@ pub(crate) fn validate_pinned_target(
 mod tests {
     use super::{
         CommandContent, CommandError, CommandOutcome, InputDispatch, NEEDS_FRONTEND,
-        ScopeAuthority, WRONG_TASK, detached_outcome, install_plugin_authority, plugin_authority,
-        revoke_plugin,
+        ScopeAuthority, WRONG_TASK, child_metadata, detached_outcome, install_plugin_authority,
+        plugin_authority, revoke_plugin,
     };
     use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
     use makima_agent::cancel::CancelToken;
     use mlua::Lua;
     use std::sync::Arc;
+
+    #[test]
+    fn child_metadata_contains_identity_only() {
+        let child = child_metadata("call-child".into(), "worker".into());
+        assert_eq!(child.tool_use_id, "call-child");
+        assert_eq!(child.name, "worker");
+        assert!(child.model.is_none());
+        assert!(child.thinking.is_none());
+        assert!(!child.fast);
+    }
 
     #[test]
     fn authority_rejects_sibling_scope_reload_and_scope_exit() {

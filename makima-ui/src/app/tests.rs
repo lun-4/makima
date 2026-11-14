@@ -6,12 +6,14 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::restore_form::{RestoreChoice, RestorePreview};
 use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
 use crate::model_capabilities::test_support::seeded;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use makima_agent::actor::ActorHistory;
 use makima_agent::actor::HistoryChange;
 use makima_agent::agent::estimate_message_tokens;
 use makima_agent::command::{CommandScope, CustomCommand};
@@ -31,13 +33,15 @@ use makima_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use makima_providers::model::FastSupport;
 use makima_providers::test_util::offline_ids;
 use makima_providers::{
-    ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
-    TokenUsage,
+    ContentBlock, Effort, Message, ModelCapabilities, RequestOptions, Role, ThinkingConfig,
+    ThinkingSupport, TokenUsage,
 };
+use makima_storage::id::MakimaId;
+use makima_storage::session_state::StoredBranch;
 use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -593,6 +597,21 @@ fn set_root_mode(app: &mut App, mode: Mode) {
             mode_def: Some(mode_def),
         },
     );
+    if let Some(path) = agent_mode.plan_path() {
+        let root = app
+            .command_runtime
+            .target_agent(&app.command_target)
+            .unwrap();
+        if let Some(edit) = makima_agent::plan_state::allocation_edit(&root, path).unwrap() {
+            root.manager()
+                .journal()
+                .commit(makima_agent::journal::JournalCommit {
+                    state_edits: vec![edit],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
     app.project_root_mode(&previous, &agent_mode);
 }
 
@@ -626,7 +645,7 @@ struct ParkedBackend(#[allow(dead_code)] flume::Sender<()>);
 impl ActorBackend for ParkedBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: AgentInput,
         _: makima_agent::WorkKind,
@@ -636,7 +655,7 @@ impl ActorBackend for ParkedBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a makima_agent::ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -645,7 +664,7 @@ impl ActorBackend for ParkedBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -866,6 +885,195 @@ fn assert_last_is_post(chat: &Chat) {
     );
 }
 
+#[test_case(false; "unique_legacy_link")]
+#[test_case(true; "ambiguous_legacy_link")]
+fn legacy_post_link_opens_migrated_chat_after_disk_restore(ambiguous: bool) {
+    const TRANSCRIPT: &str = "legacy-linked-transcript";
+    let tmp = TempDir::new().unwrap();
+    let mut app = app_without_splash();
+    let id = app.state.session.id;
+    let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"m", "cwd":"/tmp", "created_at":1});
+    let meta = serde_json::json!({"t":"meta", "title":"legacy", "token_usage":TokenUsage::default(), "updated_at":2,
+        "subagents":[{"tool_use_id":TRANSCRIPT, "name":TRANSCRIPT, "ambiguous":ambiguous}]});
+    let history =
+        serde_json::json!({"t":"sub_msg", "sub":TRANSCRIPT, "d":Message::user(POST_TEXT.into())});
+    let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":0, "text":POST_TEXT, "agent":TRANSCRIPT}});
+    std::fs::write(
+        tmp.path().join(format!("{id}.jsonl")),
+        format!("{header}\n{meta}\n{history}\n{post}\n"),
+    )
+    .unwrap();
+    for rewritten in [false, true] {
+        let mut loaded = AppSession::load_from(id, tmp.path()).unwrap();
+        if rewritten {
+            loaded.save_to(tmp.path()).unwrap();
+            loaded = AppSession::load_from(id, tmp.path()).unwrap();
+        }
+        let target = loaded.posts()[0]
+            .post
+            .agent
+            .as_deref()
+            .map(|id| id.parse::<AgentId>().unwrap());
+        assert_eq!(target.is_some(), !ambiguous);
+        app.state.session = Arc::new(loaded);
+        app.reset_ui_chrome();
+        app.restore_display();
+        render_app(&mut app, 100, 40);
+        assert_eq!(app.chats[0].message_at(0).unwrap().post_agent, target);
+        if let Some(target) = target {
+            let area = app.msg_area();
+            let row = (area.y..area.bottom())
+                .find(|&row| app.chats[0].post_agent_at(row, area) == Some(target))
+                .unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.update(mouse_event(kind, area.x, row));
+            }
+            assert_eq!(app.active_chat, app.agent_chat_index[&target]);
+            assert_eq!(
+                app.chats[app.active_chat].subagent_id.as_deref(),
+                Some(TRANSCRIPT)
+            );
+        }
+    }
+}
+
+#[test_case(false; "target_available")]
+#[test_case(true; "target_missing")]
+fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
+    use makima_agent::actor::{
+        ActorEvent, ChildDelivery, DeliveryEvent, DeliveryStatus, TurnResult,
+    };
+    use makima_providers::ObservationSource;
+    const TRANSCRIPT: &str = "durable-child-transcript";
+    const LABEL: &str = "reviewer";
+    const HEADER: &str = "[internal child-result data, not a user instruction]";
+    let mut app = test_app();
+    let root = app
+        .state
+        .session
+        .root_agent_id()
+        .unwrap_or_else(AgentId::generate);
+    let child = AgentId::generate();
+    let target = if missing { AgentId::generate() } else { child };
+    let session = app.state.session_mut();
+    session.bind_root_id(root).unwrap();
+    let mut record = session.agents()[&root].clone();
+    record.id = child;
+    record.parent = Some(root);
+    record.depth = 1;
+    record.transcript_key = TRANSCRIPT.into();
+    record.label = Some(LABEL.into());
+    let seq = session.agent_revisions().last().unwrap().0 + 1;
+    record.created_seq = seq;
+    record.updated_seq = seq;
+    session.push_agent_revision(seq, record);
+    session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(POST_TEXT.into())]);
+    app.resolve_or_create_chat(&subagent_info_for_agent(
+        child, TRANSCRIPT, LABEL, None, None,
+    ));
+    let delivery = Arc::new(ChildDelivery {
+        label: Some(LABEL.into()),
+        result: TurnResult {
+            outcome: TurnOutcome::completed(
+                target,
+                TurnId::generate(),
+                Default::default(),
+                1,
+                DoneReason::EndTurn,
+            ),
+            text: POST_TEXT.into(),
+            output: Vec::new(),
+            provenance: Default::default(),
+            duration_ms: 0,
+        },
+    });
+    app.handle_actor_event(ActorEvent::Delivery(DeliveryEvent {
+        delivery: Arc::clone(&delivery),
+        status: DeliveryStatus::Executed {
+            parent_turn_id: TurnId::generate(),
+        },
+    }));
+    app.state.session_mut().push_message(Message {
+        observation_source: Some(ObservationSource::ChildResult {
+            agent_id: target.to_string(),
+            turn_id: delivery.result.outcome.turn_id().to_string(),
+        }),
+        ..Message::observation(format!("{HEADER}\n{}", delivery.to_json()))
+    });
+    app.push_post(
+        None,
+        Post {
+            text: POST_TEXT.into(),
+            level: PostLevel::Info,
+            agent: Some(target.to_string()),
+        },
+        None,
+    );
+    let before: Vec<_> = (0..app.chats[0].message_count())
+        .map(|index| app.chats[0].message_at(index).unwrap().clone())
+        .collect();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].result_agent, Some(target));
+    assert_eq!(before[1].post_agent, Some(target));
+    let tmp = TempDir::new().unwrap();
+    for restored in [false, true] {
+        if restored {
+            app.state.session_mut().save_to(tmp.path()).unwrap();
+            let loaded = AppSession::load_from(app.state.session.id, tmp.path()).unwrap();
+            app.state.session = Arc::new(loaded);
+            app.reset_ui_chrome();
+            app.restore_display();
+        }
+        assert_eq!(app.chats[0].message_count(), before.len());
+        for (index, original) in before.iter().enumerate() {
+            let message = app.chats[0].message_at(index).unwrap();
+            assert_eq!(message.text, original.text);
+            assert_eq!(message.result_agent, original.result_agent);
+            assert_eq!(message.post_agent, original.post_agent);
+        }
+        for post in [true, false] {
+            app.active_chat = 0;
+            render_app(&mut app, 100, 40);
+            let area = app.msg_area();
+            let row = (area.y..area.bottom())
+                .find(|&row| {
+                    if post {
+                        app.chats[0].post_agent_at(row, area) == Some(target)
+                    } else {
+                        app.chats[0].result_navigation_at(row, area) == Some(target)
+                    }
+                })
+                .unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.update(mouse_event(kind, area.x, row));
+            }
+            assert_eq!(
+                app.active_chat,
+                if missing {
+                    0
+                } else {
+                    app.agent_chat_index[&target]
+                }
+            );
+            if missing {
+                assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
+            } else {
+                assert_eq!(app.chats[app.active_chat].agent_id, Some(target));
+                assert_eq!(
+                    app.chats[app.active_chat].subagent_id.as_deref(),
+                    Some(TRANSCRIPT)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn main_chat_post_is_recorded_and_restored() {
     let mut app = test_app();
@@ -890,11 +1098,14 @@ fn main_chat_post_is_recorded_and_restored() {
 #[test_case(true, false, false, false ; "restored_link")]
 #[test_case(false, true, false, false ; "missing_target")]
 #[test_case(false, false, true, false ; "drag_selects_text")]
-#[test_case(false, false, false, true ; "ambiguous_target")]
-fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, ambiguous: bool) {
+#[test_case(false, false, false, true ; "shared_transcript_key")]
+#[test_case(true, true, false, false ; "restored_missing_target")]
+fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared_key: bool) {
     let mut app = test_app();
-    app.resolve_or_create_chat(&subagent_info(TASK_ID, "reviewer"));
-    if ambiguous {
+    let info = subagent_info(TASK_ID, "reviewer");
+    let agent_id = info.agent_id;
+    app.resolve_or_create_chat(&info);
+    if shared_key {
         app.resolve_or_create_chat(&subagent_info_for_agent(
             AgentId::generate(),
             TASK_ID,
@@ -908,7 +1119,14 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, ambigu
         Post {
             text: POST_TEXT.into(),
             level: PostLevel::Warn,
-            agent: Some(if missing { SUB_TOOL_ID } else { TASK_ID }.into()),
+            agent: Some(
+                if missing {
+                    AgentId::generate()
+                } else {
+                    agent_id
+                }
+                .to_string(),
+            ),
         },
         None,
     );
@@ -940,11 +1158,8 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, ambigu
         end_column,
         row,
     ));
-    assert_eq!(
-        app.active_chat,
-        usize::from(!missing && !drag && !ambiguous)
-    );
-    if missing || ambiguous {
+    assert_eq!(app.active_chat, usize::from(!missing && !drag));
+    if missing {
         assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
     }
     if drag {
@@ -1419,7 +1634,7 @@ fn completion_notice_navigates_to_child(
         }
     }
     if unavailable {
-        app.live_chat_index.remove(&agent_id);
+        app.agent_chat_index.remove(&agent_id);
     }
     if !drag {
         let action_row = (area.y..area.bottom())
@@ -1467,72 +1682,8 @@ fn completion_notice_navigates_to_child(
         ));
     }
     if unavailable {
-        assert_eq!(
-            app.status_bar.flash_text(),
-            Some(format!("Child transcript unavailable for {agent_id}").as_str())
-        );
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
     }
-}
-
-#[test_case("valid", true; "unique_mapping")]
-#[test_case("ambiguous", false; "marked_ambiguous")]
-#[test_case("duplicate_id", false; "duplicate_agent_id")]
-#[test_case("duplicate_key", false; "duplicate_transcript_key")]
-#[test_case("missing_transcript", false; "missing_transcript")]
-#[test_case("duplicate_chat", false; "duplicate_chat")]
-#[test_case("live_chat", false; "live_chat")]
-fn historical_result_lookup_fails_closed(case: &str, expected: bool) {
-    const KEY: &str = "historical-task";
-    const OTHER: &str = "other-task";
-    let mut app = test_app();
-    let agent_id = AgentId::generate();
-    let entry = StoredSubagent {
-        tool_use_id: KEY.into(),
-        agent_id: Some(agent_id.to_string()),
-        ambiguous: case == "ambiguous",
-        name: KEY.into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    };
-    let mut entries = vec![entry.clone()];
-    if case == "duplicate_id" {
-        let mut other = entry.clone();
-        other.tool_use_id = OTHER.into();
-        entries.push(other);
-    } else if case == "duplicate_key" {
-        let mut other = entry;
-        other.agent_id = Some(AgentId::generate().to_string());
-        entries.push(other);
-    }
-    app.state.session_mut().set_subagents(entries);
-    if case != "missing_transcript" {
-        app.state
-            .session_mut()
-            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
-    }
-    let mut chat = Chat::new(
-        KEY.into(),
-        app.ui_config.clone(),
-        app.lua_event_handle.clone(),
-        Arc::clone(&app.theme_provider),
-    );
-    chat.subagent_id = Some(KEY.into());
-    if case == "live_chat" {
-        chat.agent_id = Some(agent_id);
-    }
-    app.chats.push(chat);
-    if case == "duplicate_chat" {
-        let mut other = Chat::new(
-            OTHER.into(),
-            app.ui_config.clone(),
-            app.lua_event_handle.clone(),
-            Arc::clone(&app.theme_provider),
-        );
-        other.subagent_id = Some(KEY.into());
-        app.chats.push(other);
-    }
-    assert_eq!(app.historical_chat_index(agent_id), expected.then_some(1));
 }
 
 #[test_case(false, "available"; "main_available")]
@@ -1541,7 +1692,7 @@ fn historical_result_lookup_fails_closed(case: &str, expected: bool) {
 #[test_case(true, "ambiguous"; "nested_ambiguous")]
 #[test_case(false, "missing"; "main_missing")]
 #[test_case(true, "missing"; "nested_missing")]
-fn restored_notice_shows_actual_transcript_availability(nested: bool, case: &str) {
+fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
     use makima_providers::ObservationSource;
     const KEY: &str = "target-task";
     const PARENT: &str = "parent-task";
@@ -1588,20 +1739,33 @@ fn restored_notice_shows_actual_transcript_availability(nested: bool, case: &str
     let chat_index = if nested { 1 } else { 0 };
     let notice = app.chats[chat_index].message_at(0).unwrap();
     let available = case == "available";
-    assert_eq!(notice.result_agent, available.then_some(agent_id));
-    assert_eq!(notice.text.contains("[View child transcript]"), available);
-    assert_eq!(
-        notice.text.contains("[Child transcript unavailable;"),
-        !available
-    );
-    assert_eq!(
+    assert_eq!(notice.result_agent, Some(agent_id));
+    assert!(notice.text.contains("[View child transcript]"));
+    assert!(
         notice
             .result_preview
             .as_ref()
             .unwrap()
-            .contains("[View child transcript]"),
-        available
+            .contains("[View child transcript]")
     );
+    app.active_chat = chat_index;
+    render_app(&mut app, 100, 40);
+    let area = app.msg_area();
+    let row = (area.y..area.bottom())
+        .find(|&row| app.chats[chat_index].result_navigation_at(row, area) == Some(agent_id))
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.update(mouse_event(kind, area.x, row));
+    }
+    if available {
+        assert_eq!(app.active_chat, app.agent_chat_index[&agent_id]);
+    } else {
+        assert_eq!(app.active_chat, chat_index);
+        assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
+    }
 }
 
 #[test_case(false; "duplicate_key")]
@@ -1631,7 +1795,7 @@ fn restore_preserves_duplicate_identity_ambiguity(duplicate_id: bool) {
         .session_mut()
         .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
     app.restore_display();
-    assert!(app.historical_chat_index(agent_id).is_none());
+    assert!(!app.agent_chat_index.contains_key(&agent_id));
     assert!(
         app.state
             .session
@@ -1665,57 +1829,6 @@ fn sync_subagents_legacy_identity_depends_on_history(has_history: bool) {
     let entry = &app.state.session.subagents()[0];
     assert_eq!(entry.ambiguous, has_history);
     assert_eq!(entry.agent_id, (!has_history).then(|| agent_id.to_string()));
-}
-
-#[test_case(false; "historical_transcript")]
-#[test_case(true; "historical_id_does_not_select_live_actor")]
-fn historical_result_click_resolves_only_restored_chat(live_only: bool) {
-    const KEY: &str = "historical-task";
-    let mut app = app_without_splash();
-    let agent_id = AgentId::generate();
-    let mut notice = crate::chat::format_child_result_notice(KEY, KEY, &[], Some(agent_id));
-    notice.result_historical = true;
-    app.chats[0].push(notice);
-    let index =
-        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
-    if !live_only {
-        app.live_chat_index.remove(&agent_id);
-        app.chats[index].agent_id = None;
-        app.state.session_mut().set_subagents(vec![StoredSubagent {
-            tool_use_id: KEY.into(),
-            agent_id: Some(agent_id.to_string()),
-            ambiguous: false,
-            name: KEY.into(),
-            model: None,
-            thinking: None,
-            fast: false,
-        }]);
-        app.state
-            .session_mut()
-            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
-    }
-    render_app(&mut app, 80, 60);
-    let area = app.msg_area();
-    let row = (area.y..area.bottom())
-        .find(|&row| app.chats[0].result_navigation_at(row, area) == Some(agent_id))
-        .unwrap();
-    app.update(mouse_event(
-        MouseEventKind::Down(MouseButton::Left),
-        area.x,
-        row,
-    ));
-    app.update(mouse_event(
-        MouseEventKind::Up(MouseButton::Left),
-        area.x,
-        row,
-    ));
-    assert_eq!(app.active_chat, if live_only { 0 } else { index });
-    if live_only {
-        assert_eq!(
-            app.status_bar.flash_text(),
-            Some(format!("Child transcript unavailable for {agent_id}").as_str())
-        );
-    }
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]
@@ -2388,7 +2501,7 @@ fn reset_session_request_defers_autocmd_and_names_ended_session() {
 }
 
 #[test]
-fn reset_session_carries_current_yolo() {
+fn reset_session_request_does_not_author_yolo_metadata() {
     let mut app = test_app();
     app.permissions.set_yolo(true);
 
@@ -2397,7 +2510,8 @@ fn reset_session_carries_current_yolo() {
         panic!("expected replacement request");
     };
 
-    assert_eq!(request.session.meta.yolo, Some(true));
+    assert!(request.session.meta.yolo.is_none());
+    assert!(app.permissions.is_yolo());
 }
 
 #[test]
@@ -2440,8 +2554,13 @@ fn reset_session_assigns_new_plan_path_in_plan_mode() {
         panic!("expected replacement request");
     };
     assert_eq!(app.state.plan.path(), Some(Path::new("old-plan.md")));
-    assert_eq!(request.session.meta.mode, Some(StoredMode::Plan));
-    assert!(request.session.meta.plan_path.is_none());
+    assert_eq!(request.session.meta.mode, Some(StoredMode::Build));
+    assert!(request.session.state().is_empty());
+    assert!(
+        makima_agent::plan_state::plan_entries(&request.session.latest_state().unwrap())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2458,7 +2577,11 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
         PlanState::Drafting(PathBuf::from("leftover.md"))
     );
     assert_eq!(request.session.meta.mode, Some(StoredMode::Build));
-    assert!(request.session.meta.plan_path.is_none());
+    assert!(
+        makima_agent::plan_state::plan_entries(&request.session.latest_state().unwrap())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2475,9 +2598,17 @@ fn load_session_clears_plan() {
     let Action::ReplaceSession(request) = &actions[0] else {
         panic!("expected replacement request");
     };
-    assert_eq!(app.state.plan.path(), Some(Path::new("old-plan.md")));
-    assert_eq!(request.session.meta.mode, Some(StoredMode::Build));
-    assert!(request.session.meta.plan_path.is_none());
+    assert_eq!(
+        app.state.plan,
+        PlanState::Ready(PathBuf::from("old-plan.md"))
+    );
+    assert_eq!(app.root_config().mode, AgentMode::Build);
+    assert_eq!(request.session.meta.mode, None);
+    assert!(
+        makima_agent::plan_state::plan_entries(&request.session.latest_state().unwrap())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3954,6 +4085,58 @@ fn rendered_outside_click_dismisses_only_upper_modal() {
     assert!(app.selection_state.is_none());
 }
 
+#[test]
+fn restore_preview_mouse_selection_requires_confirmation_and_blocks_input() {
+    const DRAFT: &str = "draft kept while choosing restore mode";
+    let mut app = test_app();
+    app.input_box.set_input(DRAFT.into());
+    let (reply, choice) = flume::bounded(1);
+    app.open_restore_preview(
+        RestorePreview::default(),
+        RestoreChoice::ConversationAndFiles,
+        reply,
+    );
+    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+    assert_eq!(
+        app.hits.modal().map(|(surface, _)| surface),
+        Some(Surface::Restore)
+    );
+    assert!(
+        app.active_keybind_contexts()
+            .contains(&KeybindContext::FormInput)
+    );
+    app.update(Msg::Paste(DRAFT.into()));
+    assert_eq!(app.input_box.buffer.value(), DRAFT);
+    assert!(click_target(&mut app, ClickTarget::KeyHint(key(KeyCode::Char('3')))).is_empty());
+    assert!(choice.is_empty());
+    assert!(click_target(&mut app, ClickTarget::KeyHint(key(KeyCode::Enter))).is_empty());
+    assert_eq!(choice.try_recv().unwrap(), RestoreChoice::FilesOnly);
+    assert!(!app.restore_form.is_open());
+    assert_eq!(app.input_box.buffer.value(), DRAFT);
+}
+
+#[test_case(false; "outside_click")]
+#[test_case(true; "close_all_overlays")]
+fn cancelling_restore_preview_drops_confirmation(close_all: bool) {
+    let mut app = test_app();
+    let (reply, choice) = flume::bounded(1);
+    app.open_restore_preview(
+        RestorePreview::default(),
+        RestoreChoice::ConversationOnly,
+        reply,
+    );
+    if close_all {
+        app.close_all_overlays();
+    } else {
+        render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+        app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
+        app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+    }
+    assert!(!app.restore_form.is_open());
+    assert!(choice.is_disconnected());
+}
+
 #[test_case(false, false; "normal_current_choice")]
 #[test_case(false, true; "normal_to_yolo")]
 #[test_case(true, true; "yolo_current_choice")]
@@ -4392,7 +4575,7 @@ fn task_entries_preserve_hierarchy_with_unknown_ancestry(
     if !parent_arrives_late {
         add_picker_agent(&mut app, grandchild, child, "grandchild");
     }
-    let child_index = app.live_chat_index[&child];
+    let child_index = app.agent_chat_index[&child];
     app.chats[child_index].mark_finished(DisplayRole::Assistant, DONE_TEXT);
     add_picker_agent(&mut app, AgentId::generate(), root, "sibling");
 
@@ -4440,7 +4623,7 @@ fn task_picker_inserts_descendants_in_subtree_preserving_selection(filtered: boo
     assert_eq!(app.task_picker.selected_item().unwrap().name, "branch leaf");
     assert_eq!(app.task_picker.selected_item().unwrap().depth(), 2);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.active_chat, app.live_chat_index[&grandchild]);
+    assert_eq!(app.active_chat, app.agent_chat_index[&grandchild]);
 }
 
 #[test]
@@ -4453,7 +4636,7 @@ fn task_picker_nested_siblings_sort_on_open_and_stay_stable_during_refresh() {
     add_picker_agent(&mut app, parent, root, "parent");
     add_picker_agent(&mut app, older, parent, "older");
     add_picker_agent(&mut app, newer, parent, "newer");
-    app.chats[app.live_chat_index[&newer]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.chats[app.agent_chat_index[&newer]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
     app.open_tasks();
     assert_eq!(app.task_picker.item(2).unwrap().name, "older");
     app.task_picker
@@ -4462,7 +4645,7 @@ fn task_picker_nested_siblings_sort_on_open_and_stay_stable_during_refresh() {
     assert_eq!(app.task_picker.selected_item().unwrap().name, "newer");
     assert_eq!(app.task_picker.item(3).unwrap().name, "new leaf");
 
-    app.chats[app.live_chat_index[&older]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
+    app.chats[app.agent_chat_index[&older]].mark_finished(DisplayRole::Assistant, DONE_TEXT);
     app.sync_task_picker();
     assert_eq!(app.task_picker.item(2).unwrap().name, "older");
     app.task_picker.close();
@@ -6288,6 +6471,28 @@ fn session_has_content_covers_each_branch() {
     session.meta.mode = Some(StoredMode::Plan);
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
+    session.push_state(makima_storage::session_state::StoredStateRecord {
+        seq: 0,
+        agent: None,
+        generation: 0,
+        change: makima_storage::session_state::StateChange::Plugin {
+            key: makima_storage::plans::PLAN_STATE_KEY.into(),
+            version: makima_storage::plans::PLAN_STATE_VERSION,
+            value: Some(serde_json::json!({})),
+        },
+    });
+    assert!(session_has_content(&session));
+    session.push_state(makima_storage::session_state::StoredStateRecord {
+        seq: 1,
+        agent: None,
+        generation: 0,
+        change: makima_storage::session_state::StateChange::Plugin {
+            key: makima_storage::plans::PLAN_STATE_KEY.into(),
+            version: makima_storage::plans::PLAN_STATE_VERSION,
+            value: None,
+        },
+    });
+    assert!(!session_has_content(&session));
 
     session.push_message(Message::user("hello".into()));
     assert!(session_has_content(&session));
@@ -6309,8 +6514,18 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(!session_has_content(&app.state.session));
 
     set_root_mode(&mut app, Mode::from_id("plan"));
+    let root = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap();
+    let snapshot = root.manager().journal().snapshot();
+    let session = app.state.session_mut();
+    session.replace_state(snapshot.state);
+    session.replace_agent_revisions(snapshot.agent_revisions);
     app.checkpoint();
-    assert_eq!(app.state.session.meta.mode, Some(StoredMode::Plan));
+    assert!(app.state.session.meta.mode.is_none());
+    assert!(app.state.plan.path().is_some());
+    assert!(app.state.session.meta.thinking.is_none());
     assert!(session_has_content(&app.state.session));
 
     let mut queued = app_with_queued_message();
@@ -6318,7 +6533,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     let session = &queued.state.session;
     assert!(session.messages().is_empty());
     assert!(session.meta.input_draft.is_none());
-    assert_eq!(session.meta.mode, Some(StoredMode::Build));
+    assert!(session.meta.mode.is_none());
     assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
     assert!(session_has_content(session));
 }
@@ -6356,6 +6571,59 @@ fn drain_writer(app: App, writer: Arc<StorageWriter>) {
         .shutdown(WRITER_DRAIN_TIMEOUT);
 }
 
+#[test_case(false; "plain_post")]
+#[test_case(true; "root_linked_post")]
+fn checkpoint_saves_post_only_session(linked: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let root = app
+        .state
+        .session
+        .root_agent_id()
+        .unwrap_or_else(AgentId::generate);
+    app.state.session_mut().bind_root_id(root).unwrap();
+    let post = Post {
+        text: POST_TEXT.into(),
+        level: PostLevel::Info,
+        agent: linked.then(|| root.to_string()),
+    };
+    app.push_post(None, post.clone(), None);
+    assert!(app.state.session.messages().is_empty());
+    assert!(session_has_content(&app.state.session));
+    app.checkpoint_now();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert!(loaded.messages().is_empty());
+    assert_eq!(
+        loaded.posts(),
+        [StoredPost {
+            chat: None,
+            after_message: 0,
+            post
+        }]
+    );
+    let mut restored = test_app();
+    restored.state.session = Arc::new(loaded);
+    restored.reset_ui_chrome();
+    restored.restore_display();
+    assert_eq!(restored.chats[0].message_at(0).unwrap().text, POST_TEXT);
+    if linked {
+        render_app(&mut restored, 100, 40);
+        let area = restored.msg_area();
+        let row = (area.y..area.bottom())
+            .find(|&row| restored.chats[0].post_agent_at(row, area) == Some(root))
+            .unwrap();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            restored.update(mouse_event(kind, area.x, row));
+        }
+        assert_eq!(restored.active_chat, 0);
+        assert_eq!(restored.status_bar.flash_text(), None);
+    }
+}
+
 #[test]
 fn reload_persists_session_with_content_to_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
@@ -6386,15 +6654,18 @@ fn reload_leaves_empty_session_unpersisted_on_disk() {
 }
 
 #[test]
-fn restore_resumed_session_flushes_queued_messages_and_round_trips() {
+fn restore_resumed_session_keeps_recovered_draft_inactive() {
+    const DRAFT: &str = "q1\n\nq2";
     let mut app = test_app();
-    app.state.session_mut().meta.queued_messages = vec!["q1".into(), "q2".into()];
+    app.state.session_mut().meta.input_draft = Some(DRAFT.into());
 
     app.restore_resumed_session();
-    assert_eq!(app.queue.text_messages(), ["q1", "q2"]);
+    assert!(app.queue.is_empty());
+    assert_eq!(app.input_box.buffer.value(), DRAFT);
 
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["q1", "q2"]);
+    assert_eq!(app.state.session.meta.input_draft.as_deref(), Some(DRAFT));
+    assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
 #[test]
@@ -7071,8 +7342,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
 fn focused_plan_state_is_isolated() {
     let mut app = test_app();
     set_root_mode(&mut app, Mode::Plan);
-    app.state.plan = PlanState::Drafting("root-plan.md".into());
-    app.plan_form.on_plan_ready();
+    ready_root_plan(&mut app, "root-plan.md");
     let (target, _) = spawn_input_child_with_mode(
         &mut app,
         TASK_ID,
@@ -7080,13 +7350,14 @@ fn focused_plan_state_is_isolated() {
         AgentMode::Plan("child-plan.md".into()),
     );
     app.active_chat = 1;
-    bind_actor_target(&app, target);
+    bind_actor_target(&app, target.clone());
     app.sync_focused_queue();
     assert!(!app.plan_form.is_visible());
     assert_eq!(
         app.focused_plan_path(),
         Some(PathBuf::from("child-plan.md"))
     );
+    makima_agent::plan_state::set_written(&target, Path::new("child-plan.md"), true).unwrap();
     app.plan_form.on_plan_ready();
     app.plan_approval_pending = true;
     app.update(Msg::Paste("not a draft".into()));
@@ -7205,10 +7476,13 @@ fn rejected_command_turn_retains_pending_shell_results(root: bool) {
     }
     let target_before = serde_json::to_value(app.shell.results_for(Some(target.id()))).unwrap();
     let root_before = serde_json::to_value(app.shell.results_for(None)).unwrap();
-    let admission = makima_lua::orchestration::TrustedTarget {
-        target: target.clone(),
-        template: cli_tool_ctx(std::env::current_dir().unwrap()),
-    };
+    let admission = makima_lua::orchestration::PinnedCommandTarget::pin(
+        makima_lua::orchestration::TrustedTarget {
+            target: target.clone(),
+            template: cli_tool_ctx(std::env::current_dir().unwrap()),
+        },
+    )
+    .unwrap();
     let turn = makima_commands::AgentTurn {
         content: makima_commands::CommandContent {
             text: "x".repeat(256 * 1024 + 1).into(),
@@ -7291,7 +7565,10 @@ fn focused_queue_preserves_compact_and_stale_removal_identity() {
 
 fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
     let mut actions = actions.into_iter();
-    let Action::RewindAgent { target, boundary } = actions.next().expect("rewind action") else {
+    let Action::RewindAgent {
+        target, boundary, ..
+    } = actions.next().expect("rewind action")
+    else {
         panic!("expected actor rewind");
     };
     assert!(actions.next().is_none());
@@ -7301,6 +7578,10 @@ fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
     let operation = guard.reserve_prepared_operation(None).unwrap();
     let transaction = makima_agent::actor::PreparedTransaction {
         publication: Default::default(),
+        options: None,
+        state_edits: Vec::new(),
+        boundary: false,
+        history_changed: true,
         publish: Box::new(|_, publication| {
             Box::pin(async move {
                 assert!(publication.try_publish());
@@ -7353,6 +7634,218 @@ fn build_rewind_app() -> App {
     app
 }
 
+fn full_restore_child(app: &mut App, parent: AgentId, key: &str, text: &str) -> AgentId {
+    let id = AgentId::generate();
+    let session = app.state.session_mut();
+    let mut record = session.agents()[&parent].clone();
+    let seq = session.sequence_high_water().unwrap() + 1;
+    record.id = id;
+    record.parent = Some(parent);
+    record.depth += 1;
+    record.transcript_key = key.into();
+    record.label = Some(key.into());
+    record.created_seq = seq;
+    record.updated_seq = seq;
+    session.push_agent_revision(seq, record);
+    session.set_subagent_messages(key.into(), vec![Message::user(text.into())]);
+    let index = app.resolve_or_create_chat(&subagent_info_for_agent(id, key, key, None, None));
+    app.chats[index].parent_agent_id = Some(parent);
+    app.chats[index].push_user_message(text);
+    app.sync_subagents();
+    id
+}
+
+fn full_restore_app() -> (App, AgentId) {
+    let mut app = app_without_splash();
+    let root = bind_history_actor(&mut app, vec![Message::user(TYPED_DRAFT.into())]);
+    app.state.session_mut().bind_root_id(root.id()).unwrap();
+    bind_root(&mut app, root.clone());
+    app.agent_chat_index.insert(root.id(), 0);
+    app.main_chat().push_user_message(TYPED_DRAFT);
+    (app, root.id())
+}
+
+#[test_case(false; "root_selected")]
+#[test_case(true; "removed_child_selected")]
+fn full_root_restore_removes_later_child_chats_and_navigation(child_selected: bool) {
+    const KEPT_CHILD: &str = "kept child";
+    const LATER_CHILD: &str = "later child";
+    let (mut app, root) = full_restore_app();
+    let kept = full_restore_child(&mut app, root, TASK_ID, KEPT_CHILD);
+    let restored = app.state.session.as_ref().clone();
+    let later = full_restore_child(&mut app, root, SUB_TOOL_ID, LATER_CHILD);
+    app.main_chat().push_user_message(LIVE_AGENT_TEXT);
+    app.terminal_subagents.insert(later);
+    app.status = Status::Streaming;
+    app.active_chat = if child_selected {
+        app.agent_chat_index[&later]
+    } else {
+        0
+    };
+    app.input_box.set_input(UNSENT_DRAFT.into());
+    let run_id = app.run_id;
+    app.apply_full_restore(
+        restored,
+        &BTreeSet::from([root, kept, later]),
+        root,
+        Some(TYPED_DRAFT.into()),
+    );
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.active_chat, 0);
+    assert_eq!(app.status, Status::Idle);
+    assert_eq!(app.selected_agent_id(), Some(root));
+    assert_eq!(app.chats[0].message_count(), 1);
+    assert_eq!(app.chats[0].last_message_text(), TYPED_DRAFT);
+    assert!(app.agent_chat_index.contains_key(&kept));
+    assert!(!app.agent_chat_index.contains_key(&later));
+    assert!(!app.chat_index.contains_key(SUB_TOOL_ID));
+    assert!(!app.terminal_subagents.contains(&later));
+    assert!(!app.subagent_channels.contains_key(&later));
+    assert!(!app.subagent_channels.contains_key(&kept));
+    assert!(!app.state.session.agents().contains_key(&later));
+    assert!(
+        !app.state
+            .session
+            .subagent_messages()
+            .contains_key(SUB_TOOL_ID)
+    );
+    assert_eq!(app.state.session.subagents().len(), 1);
+    assert_eq!(app.state.session.subagents()[0].tool_use_id, TASK_ID);
+    assert_eq!(app.input_box.buffer.value(), TYPED_DRAFT);
+    assert_eq!(app.run_id, run_id);
+}
+
+#[test_case(0; "target_selected")]
+#[test_case(1; "root_selected")]
+#[test_case(2; "sibling_selected")]
+fn full_child_restore_preserves_outside_chats_and_target_draft(selected: usize) {
+    const TARGET_TEXT: &str = "restored child transcript";
+    const SIBLING_TEXT: &str = "sibling live transcript";
+    const RESTORED_SIBLING: &str = "older sibling transcript";
+    const ROOT_SCROLL: u16 = 3;
+    const SIBLING_SCROLL: u16 = 7;
+    let (mut app, root) = full_restore_app();
+    let target = full_restore_child(&mut app, root, TASK_ID, TARGET_TEXT);
+    let sibling = full_restore_child(&mut app, root, SUB_TOOL_ID, RESTORED_SIBLING);
+    let mut restored = app.state.session.as_ref().clone();
+    restored.meta.input_draft = Some(STORED_SESSION_TEXT.into());
+    let target_index = app.agent_chat_index[&target];
+    let sibling_index = app.agent_chat_index[&sibling];
+    app.chats[target_index].push_user_message(LIVE_AGENT_TEXT);
+    app.chats[0].push_user_message(LIVE_AGENT_TEXT);
+    app.chats[sibling_index].push_user_message(SIBLING_TEXT);
+    app.chats[sibling_index].mark_finished(DisplayRole::Done, DONE_TEXT);
+    for (index, scroll, model, thinking) in [
+        (0, ROOT_SCROLL, MODEL_SPEC_GLM4, ThinkingConfig::Off),
+        (
+            sibling_index,
+            SIBLING_SCROLL,
+            MODEL_SPEC_GPT9,
+            ThinkingConfig::Effort(Effort::High),
+        ),
+    ] {
+        app.chats[index].restore_scroll(scroll, false);
+        app.chats[index].model_id = Some(model.into());
+        app.chats[index].opts = Some(RequestOptions {
+            thinking,
+            fast: true,
+        });
+    }
+    let outside: Vec<_> = [root, sibling]
+        .into_iter()
+        .map(|id| {
+            let chat = &app.chats[app.agent_chat_index[&id]];
+            (
+                id,
+                (0..chat.message_count())
+                    .map(|offset| {
+                        let message = chat.message_at(offset).unwrap();
+                        (message.role.clone(), message.text.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                chat.message_count(),
+                chat.scroll_top(),
+                chat.auto_scroll(),
+                chat.model_id.clone(),
+                chat.opts,
+                chat.is_finished(),
+            )
+        })
+        .collect();
+    let selected = [target, root, sibling][selected];
+    app.active_chat = app.agent_chat_index[&selected];
+    app.status = Status::Streaming;
+    app.input_box.set_input(UNSENT_DRAFT.into());
+    app.apply_full_restore(
+        restored,
+        &BTreeSet::from([target]),
+        target,
+        Some(TYPED_DRAFT.into()),
+    );
+    assert_eq!(app.selected_agent_id(), Some(selected));
+    assert_eq!(app.status, Status::Streaming);
+    for (id, text, count, scroll, auto_scroll, model, opts, finished) in outside {
+        let chat = &app.chats[app.agent_chat_index[&id]];
+        assert_eq!(
+            (0..chat.message_count())
+                .map(|offset| {
+                    let message = chat.message_at(offset).unwrap();
+                    (message.role.clone(), message.text.clone())
+                })
+                .collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(chat.message_count(), count);
+        assert_eq!(chat.scroll_top(), scroll);
+        assert_eq!(chat.auto_scroll(), auto_scroll);
+        assert_eq!(chat.model_id, model);
+        assert_eq!(chat.opts, opts);
+        assert_eq!(chat.is_finished(), finished);
+    }
+    let chat = &app.chats[app.agent_chat_index[&target]];
+    assert_eq!(chat.message_at(0).unwrap().text, TARGET_TEXT);
+    assert!(
+        !(0..chat.message_count())
+            .any(|offset| chat.message_at(offset).unwrap().text == LIVE_AGENT_TEXT)
+    );
+    assert_eq!(
+        app.input_box.buffer.value(),
+        if selected == target {
+            TYPED_DRAFT
+        } else {
+            UNSENT_DRAFT
+        }
+    );
+}
+
+#[test]
+fn expired_branch_selection_emits_no_restore_action() {
+    const EXPIRED_BRANCH: &str = "branch_expired";
+    let mut app = build_rewind_app();
+    let selected = app.selected_agent_id();
+    let run_id = app.run_id;
+    let branch = StoredBranch {
+        id: MakimaId::generate(),
+        created_at: app.state.session.updated_at,
+        at_seq: app.state.session.sequence_high_water().unwrap_or_default(),
+        agent: selected.unwrap(),
+        offset: 0,
+        transition: None,
+    };
+    app.state.session_mut().push_branch(branch.clone());
+    let session = Arc::clone(&app.state.session);
+    app.input_box.set_input(UNSENT_DRAFT.into());
+    assert!(app.open_rewind_picker().is_empty());
+    assert!(app.rewind_picker.handle_paste(&branch.id.to_string()));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(EXPIRED_BRANCH));
+    assert_eq!(app.selected_agent_id(), selected);
+    assert!(Arc::ptr_eq(&app.state.session, &session));
+    assert_eq!(app.input_box.buffer.value(), UNSENT_DRAFT);
+    assert_eq!(app.run_id, run_id);
+}
+
 #[test]
 fn history_replacement_preserves_live_child_navigation() {
     use makima_providers::ObservationSource;
@@ -7381,7 +7874,6 @@ fn history_replacement_preserves_live_child_navigation() {
     });
     let notice = app.chats[0].message_at(0).unwrap();
     assert_eq!(notice.result_agent, Some(agent_id));
-    assert!(!notice.result_historical);
     render_app(&mut app, 80, 60);
     let area = app.msg_area();
     let row = (area.y..area.bottom())
@@ -7483,10 +7975,7 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
 fn rewind_to_middle_truncates_and_populates_input() {
     let mut app = build_rewind_app();
     let old_run_id = app.run_id;
-    let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 2,
-        prompt_preview: "2: second".into(),
-    };
+    let entry = app.rewind_picker.entry_at_offset(2).unwrap();
     let actions = app.rewind_to(entry);
 
     assert_eq!(app.state.session.messages().len(), 5);
@@ -7508,10 +7997,7 @@ fn rewind_to_first_turn_clears_everything() {
     app.state.context_size = 100_000;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
-    let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 0,
-        prompt_preview: "1: first".into(),
-    };
+    let entry = app.rewind_picker.entry_at_offset(0).unwrap();
     let actions = app.rewind_to(entry);
 
     assert!(!app.state.session.messages().is_empty());
@@ -8093,11 +8579,24 @@ fn parent_error_preserves_running_and_completed_children() {
     assert_eq!(
         saved,
         vec![
-            ("task1", "first", Some("model-a")),
-            ("task2", "second", Some("model-b")),
-            ("task3", "third", Some("model-c")),
+            ("task1", "first", None),
+            ("task2", "second", None),
+            ("task3", "third", None),
         ]
     );
+    for (index, (id, model, finished)) in [
+        ("task1", "model-a", true),
+        ("task2", "model-b", false),
+        ("task3", "model-c", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let chat_index = index + 1;
+        assert_eq!(app.chat_index.get(id), Some(&chat_index));
+        assert_eq!(app.chats[chat_index].model_id.as_deref(), Some(model));
+        assert_eq!(app.chats[chat_index].is_finished(), finished);
+    }
 }
 
 #[test]
@@ -8290,22 +8789,22 @@ fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: boo
 }
 
 #[test]
-fn flush_restored_queue_drops_recovery_snapshot() {
+fn clearing_recovery_snapshot_does_not_admit_queued_text() {
+    const PENDING: &str = "next";
+    const FAILURE: &str = "boom";
     let mut app = with_history(idle_busy_app());
-    app.queue_and_notify(queued_msg("next"));
+    app.queue_and_notify(queued_msg(PENDING));
     app.update(agent_msg(AgentEvent::ControlError {
-        message: "boom".into(),
+        message: FAILURE.into(),
     }));
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
+    assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
+    assert!(app.queue.is_empty());
 
-    app.flush_restored_queue();
+    app.clear_recoverable_queue();
     app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
     assert!(app.recoverable_queue.is_empty());
-
-    app.queue.clear_root_user_work();
-    app.checkpoint();
+    assert!(app.queue.is_empty());
     assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
@@ -8362,6 +8861,17 @@ fn configure_model_options(
     .unwrap();
 }
 
+fn ready_root_plan(app: &mut App, path: &str) {
+    let root = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap();
+    commit_target_plan_path(app, &root, path, true);
+    makima_agent::plan_state::set_written(&root, Path::new(path), true).unwrap();
+    app.state.plan = PlanState::Ready(path.into());
+    app.plan_form.on_plan_ready();
+}
+
 fn commit_target_plan_path(app: &mut App, target: &AgentRef, path: &str, root: bool) {
     let actor = target.actor().unwrap();
     let previous = target.effective_config().unwrap().unwrap().mode.clone();
@@ -8376,6 +8886,17 @@ fn commit_target_plan_path(app: &mut App, target: &AgentRef, path: &str, root: b
             })),
     )
     .unwrap();
+    if let Some(edit) = makima_agent::plan_state::allocation_edit(target, Path::new(path)).unwrap()
+    {
+        target
+            .manager()
+            .journal()
+            .commit(makima_agent::journal::JournalCommit {
+                state_edits: vec![edit],
+                ..Default::default()
+            })
+            .unwrap();
+    }
     if root {
         app.project_root_mode(&previous, &mode);
     }
@@ -8414,10 +8935,14 @@ struct StagedForms {
 fn stage_root_and_child_forms(app: &mut App) -> StagedForms {
     app.sync_focused_queue();
     let root_stage = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    app.plan_form
-        .set_implementation_selection(root_stage.clone());
+    app.stage_plan_selection(root_stage.clone());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
-    let (child, child_input) = spawn_input_child(app, TASK_ID, SUBAGENT_NAME);
+    let root = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap();
+    let (child, child_input) =
+        spawn_input_child_under(app, TASK_ID, SUBAGENT_NAME, AgentMode::Build, Some(root));
     configure_model_options(
         &child,
         PLAN_OPTIONS_OTHER,
@@ -8427,10 +8952,11 @@ fn stage_root_and_child_forms(app: &mut App) -> StagedForms {
     );
     commit_target_plan_path(app, &child, PLAN_OPTIONS_CHILD_PATH, false);
     focus_chat(app, 1, &child);
+    makima_agent::plan_state::set_written(&child, Path::new(PLAN_OPTIONS_CHILD_PATH), true)
+        .unwrap();
     app.plan_form.on_plan_ready();
     let child_stage = model_selection(None, Some(ThinkingConfig::Adaptive), Some(true));
-    app.plan_form
-        .set_implementation_selection(child_stage.clone());
+    app.stage_plan_selection(child_stage.clone());
     app.update(Msg::Key(key(KeyCode::Char(' '))));
     StagedForms {
         child,
@@ -8449,6 +8975,8 @@ fn model_options_app(child: bool, plan: bool) -> (TempDir, App, AgentRef) {
     configure_model_options(&root, PLAN_OPTIONS_MODEL, ThinkingConfig::Off, false, true);
     if plan {
         set_root_mode(&mut app, Mode::Plan);
+        commit_target_plan_path(&mut app, &root, PLAN_OPTIONS_PATH, true);
+        makima_agent::plan_state::set_written(&root, Path::new(PLAN_OPTIONS_PATH), true).unwrap();
         app.state.plan = PlanState::Ready(PLAN_OPTIONS_PATH.into());
         app.plan_form.on_plan_ready();
     }
@@ -8472,6 +9000,12 @@ fn model_options_app(child: bool, plan: bool) -> (TempDir, App, AgentRef) {
         );
         focus_chat(&mut app, 1, &target);
         if plan {
+            makima_agent::plan_state::set_written(
+                &target,
+                Path::new(PLAN_OPTIONS_CHILD_PATH),
+                true,
+            )
+            .unwrap();
             app.plan_form.on_plan_ready();
         }
         target
@@ -8511,6 +9045,12 @@ fn model_persistence(app: &App) -> serde_json::Value {
 fn plan_app() -> App {
     let mut app = streaming_app();
     set_root_mode(&mut app, Mode::Plan);
+    let root = app
+        .command_runtime
+        .target_agent(&app.command_target)
+        .unwrap();
+    commit_target_plan_path(&mut app, &root, "test-plan.md", true);
+    makima_agent::plan_state::set_written(&root, Path::new("test-plan.md"), true).unwrap();
     app.state.plan = PlanState::Drafting(PathBuf::from("test-plan.md"));
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: "t1".into(),
@@ -8747,7 +9287,7 @@ fn shared_model_picker_applies_or_stages_same_selection(
         assert!(matches!(
             actions.as_slice(),
             [Action::SelectPinnedModel { target: selected_target, selection: selected }]
-                if selected_target.id() == target.id() && selected_target.same_manager(&target) && selected == &selection
+                if selected_target.target.id() == target.id() && selected_target.target.same_manager(&target) && selected == &selection
         ));
         assert!(app.plan_form.implementation_selection().is_empty());
     }
@@ -8818,7 +9358,7 @@ fn plan_picker_cancel_retains_staged_options(undiscovered: bool, cancel: KeyEven
     );
     let config = target.effective_config().unwrap().unwrap();
     let original = config.model_selection();
-    app.plan_form.set_implementation_selection(staged.clone());
+    app.stage_plan_selection(staged.clone());
     let persisted = model_persistence(&app);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     app.update(Msg::Key(key(KeyCode::Tab)));
@@ -8896,6 +9436,38 @@ fn child_plan_stage_survives_focus_before_command_target_rebind() {
     assert_eq!(app.plan_form.implementation_selection(), &child_stage);
     assert!(app.plan_form.parallel());
     assert!(app.plan_approval_pending);
+}
+
+#[test]
+fn staged_plan_forms_restore_from_canonical_agent_map() {
+    let (_tmp, mut app, root) = model_options_app(false, true);
+    let staged = stage_root_and_child_forms(&mut app);
+    let access = root.state_access();
+    let plans = makima_agent::plan_state::slot(&access)
+        .unwrap()
+        .get(&access)
+        .unwrap()
+        .value
+        .unwrap();
+    assert_eq!(
+        plans[&root.id()].staged_model,
+        Some(staged.root_stage.clone())
+    );
+    assert_eq!(
+        plans[&staged.child.id()].staged_model,
+        Some(staged.child_stage.clone())
+    );
+    app.plan_forms.clear();
+    app.plan_form.reset();
+    app.sync_focused_queue();
+    assert_eq!(
+        app.plan_form.implementation_selection(),
+        &staged.child_stage
+    );
+    assert!(app.plan_form.is_visible());
+    focus_chat(&mut app, 0, &root);
+    assert_eq!(app.plan_form.implementation_selection(), &staged.root_stage);
+    assert!(app.plan_form.is_visible());
 }
 
 #[test_case(false, false ; "root_active")]
@@ -8987,7 +9559,7 @@ fn ordinary_model_picker_keeps_owner_after_focus_change() {
     assert!(matches!(
         actions.as_slice(),
         [Action::SelectPinnedModel { target, selection }]
-            if target.id() == child.id() && target.same_manager(&child)
+            if target.target.id() == child.id() && target.target.same_manager(&child)
                 && selection == &model_selection(None, Some(ThinkingConfig::Off), Some(false))
     ));
     assert_eq!(
@@ -9002,7 +9574,7 @@ fn ordinary_model_picker_keeps_owner_after_focus_change() {
 fn plan_picker_retirement_discards_open_draft(child: bool, closed: bool) {
     let (_tmp, mut app, target) = model_options_app(child, true);
     let staged = model_selection(None, Some(ThinkingConfig::Off), Some(false));
-    app.plan_form.set_implementation_selection(staged);
+    app.stage_plan_selection(staged);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     edit_picker_options(&mut app, "adaptive", true);
     if closed {
@@ -9060,8 +9632,7 @@ fn plan_model_picker_stages_without_switching(row: bool) {
     const MODEL: &str = "ollama/glm-5";
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
-    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
-    app.plan_form.on_plan_ready();
+    ready_root_plan(&mut app, "test-plan.md");
     let original = app.root_config().model.spec();
     let persisted_model = makima_storage::model::read_model(&app.storage);
     let recents = makima_storage::model::read_recents(&app.storage);
@@ -9155,8 +9726,8 @@ fn open_session_model_picker_keeps_keys_when_plan_form_appears() {
     models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
     set_root_mode(&mut app, Mode::Plan);
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
-    app.state.plan.mark_ready();
-    app.plan_form.on_plan_ready();
+    let path = app.state.plan.path().unwrap().display().to_string();
+    ready_root_plan(&mut app, &path);
     let contexts = app.active_keybind_contexts();
     assert!(contexts.contains(&KeybindContext::ModelPicker));
     assert!(!contexts.contains(&KeybindContext::FormInput));
@@ -9195,8 +9766,7 @@ fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
     let models = install_model_slot(&mut app);
     models.store(Some(Arc::new(vec![MODEL.into()])));
     set_root_mode(&mut app, Mode::Plan);
-    app.state.plan = PlanState::Ready(PathBuf::from("test-plan.md"));
-    app.plan_form.on_plan_ready();
+    ready_root_plan(&mut app, "test-plan.md");
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     app.route_paste(MODEL.split_once('/').unwrap().1);
     assert_eq!(app.model_picker.highlighted_spec(), Some(MODEL));
@@ -9277,8 +9847,7 @@ fn plan_form_yields_escape_to_blocking_modal(btw: bool) {
 #[test_case("custom" ; "custom")]
 fn plan_mode_exit_clears_staging_and_picker(mode: &str) {
     let mut app = plan_app();
-    app.plan_form
-        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
+    app.stage_plan_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     app.update(Msg::Key(kb::MODEL_PICKER.to_key_event()));
     set_root_mode(&mut app, Mode::from_id(mode));
     assert!(app.plan_form.implementation_selection().is_empty());
@@ -9330,8 +9899,7 @@ fn normal_model_picker_still_requests_model_change() {
 #[test]
 fn plan_approval_pending_blocks_edits_and_requests_cancellation() {
     let mut app = plan_app();
-    app.plan_form
-        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
+    app.stage_plan_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -9367,7 +9935,7 @@ fn rendered_plan_rows(app: &mut App) -> Vec<String> {
 fn pending_plan_footer_blocks_space_and_requests_cancellation() {
     let mut app = plan_app();
     let staged = model_selection(Some(LATE_MODEL_SPEC), None, None);
-    app.plan_form.set_implementation_selection(staged.clone());
+    app.stage_plan_selection(staged.clone());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -9393,8 +9961,7 @@ fn pending_plan_footer_blocks_space_and_requests_cancellation() {
 #[test_case(4 ; "use_current")]
 fn pending_plan_row_cannot_change_selection_or_submit(row: u16) {
     let mut app = plan_app();
-    app.plan_form
-        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
+    app.stage_plan_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.plan_approval_pending);
@@ -9426,8 +9993,7 @@ fn image_path_paste_follows_plan_ownership(approval_pending: bool) {
 #[test]
 fn staged_model_matching_session_model_approves_without_override() {
     let mut app = plan_app();
-    app.plan_form
-        .set_implementation_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
+    app.stage_plan_selection(model_selection(Some(LATE_MODEL_SPEC), None, None));
     commit_root_model(&app, Model::from_spec(LATE_MODEL_SPEC).unwrap());
     app.update(Msg::Key(key(KeyCode::Down)));
     app.update(Msg::Key(key(KeyCode::Down)));
@@ -10766,10 +11332,7 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
     app.open_rewind_picker();
     app.checkpoint();
 
-    let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 1,
-        prompt_preview: "2: second".into(),
-    };
+    let entry = app.rewind_picker.entry_at_offset(1).unwrap();
     let actions = app.rewind_to(entry);
     assert!(
         app.shared_history.is_some(),
@@ -12266,7 +12829,7 @@ struct FocusedInputBackend(flume::Sender<AgentInput>);
 impl ActorBackend for FocusedInputBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         input: AgentInput,
         _: makima_agent::WorkKind,
@@ -12282,7 +12845,7 @@ impl ActorBackend for FocusedInputBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a makima_agent::ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -12291,7 +12854,7 @@ impl ActorBackend for FocusedInputBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -12323,6 +12886,16 @@ fn spawn_input_child_with_mode(
     name: &str,
     mode: AgentMode,
 ) -> (AgentRef, flume::Receiver<AgentInput>) {
+    spawn_input_child_under(app, id, name, mode, None)
+}
+
+fn spawn_input_child_under(
+    app: &mut App,
+    id: &str,
+    name: &str,
+    mode: AgentMode,
+    parent: Option<AgentRef>,
+) -> (AgentRef, flume::Receiver<AgentInput>) {
     let template = cli_tool_ctx(std::env::current_dir().unwrap());
     let config = EffectiveAgentConfig::new(
         makima_agent::RunSettings {
@@ -12334,15 +12907,16 @@ fn spawn_input_child_with_mode(
         },
         mode,
     );
-    let manager = AgentManagerHandle::new(Default::default()).unwrap();
-    let (unused_tx, _) = flume::unbounded();
-    let root = manager
-        .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-            Ok::<_, String>(
-                Box::new(FocusedInputBackend(unused_tx)) as Box<dyn makima_agent::ActorBackend>
-            )
-        })
-        .unwrap();
+    let root = parent.unwrap_or_else(|| {
+        let manager = AgentManagerHandle::new(Default::default()).unwrap();
+        let (unused_tx, _) = flume::unbounded();
+        manager
+            .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(FocusedInputBackend(unused_tx)) as Box<dyn ActorBackend>)
+            })
+            .unwrap()
+    });
+    let manager = root.manager();
     let (tx, rx) = flume::unbounded();
     let target = manager
         .spawn_child_trusted_with_config(
@@ -12396,8 +12970,8 @@ fn duplicate_child_labels_route_by_agent_id() {
     let mut app = streaming_app();
     let (first, first_rx) = spawn_input_child(&mut app, "duplicate", "first");
     let (second, second_rx) = spawn_input_child(&mut app, "duplicate", "second");
-    let first_index = app.live_chat_index[&first.id()];
-    let second_index = app.live_chat_index[&second.id()];
+    let first_index = app.agent_chat_index[&first.id()];
+    let second_index = app.agent_chat_index[&second.id()];
     assert_ne!(first_index, second_index);
     app.active_chat = second_index;
     bind_actor_target(&app, second.clone());
@@ -12715,7 +13289,7 @@ fn final_history_after_subagent_closed_only_persists_messages() {
         serde_json::to_value(&messages).unwrap()
     );
     assert_eq!(app.chats.len(), chat_count);
-    assert_eq!(app.live_chat_index.get(&agent_id), Some(&chat_idx));
+    assert_eq!(app.agent_chat_index.get(&agent_id), Some(&chat_idx));
     assert!(app.chats[chat_idx].is_finished());
     assert!(app.active_subagent_closed());
     assert!(app.queue.text_messages().is_empty());
@@ -12784,7 +13358,7 @@ fn turn_complete_after_root_cancel_preserves_child() {
 
     app.active_chat = 0;
     app.handle_cancel();
-    assert!(app.live_chat_index.contains_key(&agent_id));
+    assert!(app.agent_chat_index.contains_key(&agent_id));
     app.update(Msg::Agent(Box::new(Envelope {
         event: turn_complete(usage, MODEL, Some(COST)),
         subagent: Some(info),
@@ -12796,7 +13370,7 @@ fn turn_complete_after_root_cancel_preserves_child() {
         app.state.session.usage_by_model()[MODEL],
         usage.billed(Some(COST))
     );
-    assert!(app.live_chat_index.contains_key(&agent_id));
+    assert!(app.agent_chat_index.contains_key(&agent_id));
     assert!(!app.chats[chat_idx].is_finished());
     assert!(app.queue.text_messages().is_empty());
 }
@@ -12894,7 +13468,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     app.active_chat = 0;
     app.handle_cancel();
     assert!(!app.chats[child_index].is_finished());
-    assert_eq!(app.live_chat_index.get(&agent_id), Some(&child_index));
+    assert_eq!(app.agent_chat_index.get(&agent_id), Some(&child_index));
     let chat_count = app.chats.len();
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
@@ -12903,7 +13477,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     })));
 
     assert_eq!(app.chats.len(), chat_count);
-    assert_eq!(app.live_chat_index.get(&agent_id), Some(&child_index));
+    assert_eq!(app.agent_chat_index.get(&agent_id), Some(&child_index));
     assert!(app.chats[child_index].is_finished());
     assert!(app.subagent_channels.get(&agent_id).unwrap().closed);
 }

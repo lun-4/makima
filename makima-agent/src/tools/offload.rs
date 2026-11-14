@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::fs::File;
 #[cfg(unix)]
 use std::io::Write;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read};
 #[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,10 @@ pub const LINE_CUT_PREFIX: &str = "[line cut: ";
 pub const OFFLOAD_FOOTER_PREFIX: &str = "[output truncated: ";
 const CLIPPED_NOTE: &str = "; saved search results also contain clipped lines";
 const INSPECTION_ADVICE: &str = "inspect with read or grep; use bash for long lines";
+const READ_UNSUPPORTED: &str = "secure offload reads are unsupported by this backend";
+const READ_CLOSED: &str = "the session's offload store is closed";
+const READ_NOT_REGULAR: &str = "offload artifact must be a regular file";
+const READ_TOO_LARGE: &str = "offload artifact exceeds the read byte limit";
 #[cfg(unix)]
 const DIR_MODE: Mode = Mode::RWXU;
 
@@ -52,6 +56,9 @@ pub enum OffloadError {
 pub trait OffloadBackend: Send + Sync {
     /// Writes `bytes` under `name` unless the name is taken; false if taken.
     fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<bool>;
+    fn read(&self, _name: &str, _max_bytes: u64) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(ErrorKind::Unsupported, READ_UNSUPPORTED))
+    }
     fn total_bytes(&self) -> io::Result<u64>;
     fn remove_all(&self) -> io::Result<()>;
     fn path(&self, name: &str) -> PathBuf;
@@ -126,10 +133,23 @@ impl OffloadStore {
         if self.closed.load(Ordering::Acquire) {
             return Err(OffloadError::Closed);
         }
-        self.put_serialized(body)
+        self.put_serialized(body, body.floor_char_boundary(MAX_OFFLOAD_FILE_BYTES))
     }
 
-    fn put_serialized(&self, body: &str) -> Result<Saved, OffloadError> {
+    pub fn put_exact(&self, body: &str) -> Result<Saved, OffloadError> {
+        self.put_serialized(body, body.len())
+    }
+
+    pub fn read(&self, name: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
+        DiskBackend::validate_name(name)?;
+        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(ErrorKind::NotConnected, READ_CLOSED));
+        }
+        self.backend.read(name, max_bytes)
+    }
+
+    fn put_serialized(&self, body: &str, saved_bytes: usize) -> Result<Saved, OffloadError> {
         let mut usage = self.operation.lock().unwrap_or_else(|e| e.into_inner());
         if self.closed.load(Ordering::Acquire) {
             return Err(OffloadError::Closed);
@@ -142,7 +162,6 @@ impl OffloadStore {
                 used
             }
         };
-        let saved_bytes = body.floor_char_boundary(MAX_OFFLOAD_FILE_BYTES);
         let stored = stored_form(body, saved_bytes);
         let total = used.saturating_add(stored.len() as u64);
         if total > MAX_OFFLOAD_SESSION_BYTES {
@@ -416,6 +435,40 @@ impl OffloadBackend for DiskBackend {
         }
     }
 
+    fn read(&self, name: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
+        Self::validate_name(name)?;
+        let dir = self.open_dir(false)?;
+        #[cfg(unix)]
+        let file = File::from(anchored::openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        #[cfg(windows)]
+        let file = windows::open_read(&dir, name)?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (dir, max_bytes);
+            Err(io::Error::new(ErrorKind::Unsupported, READ_UNSUPPORTED))
+        }
+        #[cfg(any(unix, windows))]
+        {
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::new(ErrorKind::InvalidData, READ_NOT_REGULAR));
+            }
+            let limit = max_bytes
+                .checked_add(1)
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, READ_TOO_LARGE))?;
+            let mut bytes = Vec::new();
+            file.take(limit).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(io::Error::new(ErrorKind::InvalidData, READ_TOO_LARGE));
+            }
+            Ok(bytes)
+        }
+    }
+
     fn total_bytes(&self) -> io::Result<u64> {
         let dir = match self.open_dir(false) {
             Ok(dir) => dir,
@@ -464,7 +517,11 @@ impl OffloadBackend for DiskBackend {
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
+        if name.is_empty() {
+            self.dir.clone()
+        } else {
+            self.dir.join(name)
+        }
     }
 }
 
@@ -727,7 +784,7 @@ fn head_tail(body: &str, budget: Budget) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::fs;
     use std::io;
     #[cfg(unix)]
@@ -752,7 +809,8 @@ mod tests {
     use super::{
         CLIPPED_NOTE, LINE_CUT_PREFIX, LimitOpts, MAX_OFFLOAD_FILE_BYTES,
         MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError, OffloadStore, OutputLimitOptions,
-        OutputLimits, PreviewShape, cut_line, limit_output, line_count,
+        OutputLimits, PreviewShape, READ_CLOSED, READ_TOO_LARGE, READ_UNSUPPORTED, cut_line,
+        limit_output, line_count,
     };
     use crate::tools::FILE_TRUNCATED_MARKER;
 
@@ -818,6 +876,43 @@ mod tests {
         });
         let store = OffloadStore::new(Box::new(Arc::clone(&backend)));
         (backend, store)
+    }
+
+    #[test_case(false; "successful_write")]
+    #[test_case(true; "failed_write")]
+    fn exact_offload_uses_existing_backend_errors(fail: bool) {
+        let (backend, store) = memory_store(0);
+        backend.fail.store(fail, Ordering::Relaxed);
+        let saved = store.put_exact(TEST_BODY);
+        if fail {
+            assert!(
+                matches!(saved, Err(OffloadError::Io(error)) if error.to_string() == CREATE_ERROR)
+            );
+            assert!(backend.files.lock().unwrap().is_empty());
+        } else {
+            let saved = saved.unwrap();
+            assert_eq!(saved.original_bytes, TEST_BODY.len());
+            assert_eq!(saved.saved_bytes, TEST_BODY.len());
+            assert_eq!(
+                backend.files.lock().unwrap()[&saved.name],
+                TEST_BODY.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_offload_respects_quota_and_closed_state() {
+        let (backend, store) = memory_store(MAX_OFFLOAD_SESSION_BYTES);
+        assert!(matches!(
+            store.put_exact(TEST_BODY),
+            Err(OffloadError::Quota)
+        ));
+        assert!(backend.files.lock().unwrap().is_empty());
+        store.request_close();
+        assert!(matches!(
+            store.put_exact(TEST_BODY),
+            Err(OffloadError::Closed)
+        ));
     }
 
     fn numbered(lines: usize) -> String {
@@ -1036,6 +1131,115 @@ mod tests {
         assert_eq!(saved, QUOTA_WRITES);
         assert_eq!(backend.scans.load(Ordering::Relaxed), 1);
         assert_eq!(backend.files.lock().unwrap().len(), QUOTA_WRITES);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(""; "empty")]
+    #[test_case(TEST_BODY; "exact_bytes")]
+    #[test_case("\0héllo\r\n"; "binary_and_unicode")]
+    fn disk_read_returns_exact_bytes(body: &str) {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().canonicalize().unwrap().join("store"));
+        let saved = store.put_exact(body).unwrap();
+        assert_eq!(
+            store.read(&saved.name, body.len() as u64).unwrap(),
+            body.as_bytes()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test_case(0; "zero_limit")]
+    #[test_case(TEST_BODY.len() as u64 - 1; "one_byte_short")]
+    fn disk_read_rejects_oversized_artifact(max_bytes: u64) {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().canonicalize().unwrap().join("store"));
+        let saved = store.put_exact(TEST_BODY).unwrap();
+        let error = store.read(&saved.name, max_bytes).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), READ_TOO_LARGE);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn disk_read_rejects_deleted_artifact() {
+        let root = TempDir::new().unwrap();
+        let store = OffloadStore::on_disk(root.path().canonicalize().unwrap().join("store"));
+        let saved = store.put_exact(TEST_BODY).unwrap();
+        fs::remove_file(store.path_of(&saved)).unwrap();
+        assert_eq!(
+            store
+                .read(&saved.name, saved.saved_bytes as u64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test_case(false; "artifact_symlink")]
+    #[test_case(true; "directory_symlink")]
+    fn disk_read_rejects_symlinks(directory: bool) {
+        let root = TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let store = OffloadStore::on_disk(base.join("store"));
+        let saved = store.put_exact(TEST_BODY).unwrap();
+        if directory {
+            let moved = base.join("moved");
+            fs::rename(store.dir(), &moved).unwrap();
+            symlink_dir(moved, store.dir()).unwrap();
+        } else {
+            let target = base.join("target");
+            fs::rename(store.path_of(&saved), &target).unwrap();
+            symlink_dir(target, store.path_of(&saved)).unwrap();
+        }
+        assert!(store.read(&saved.name, saved.saved_bytes as u64).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_read_rejects_replaced_ancestor_symlink() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let session = SessionRef::from(MakimaId::generate());
+        let store = OffloadStore::for_session(&base, &session);
+        let saved = store.put_exact(TEST_BODY).unwrap();
+        let sessions = base.join(SESSIONS_DIR);
+        let moved = base.join("moved");
+        fs::rename(&sessions, &moved).unwrap();
+        symlink_dir(moved, sessions).unwrap();
+        assert!(store.read(&saved.name, saved.saved_bytes as u64).is_err());
+    }
+
+    #[test]
+    fn custom_backend_read_defaults_to_unsupported_and_closed_store_rejects_read() {
+        let (_, store) = memory_store(0);
+        let saved = store.put(TEST_BODY).unwrap();
+        let error = store
+            .read(&saved.name, saved.saved_bytes as u64)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), READ_UNSUPPORTED);
+        store.request_close();
+        let error = store
+            .read(&saved.name, saved.saved_bytes as u64)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), READ_CLOSED);
+    }
+
+    #[test_case(""; "empty")]
+    #[test_case("."; "dot")]
+    #[test_case(".."; "parent")]
+    #[test_case("../artifact"; "parent_path")]
+    #[test_case("dir\\artifact"; "backslash")]
+    #[test_case("artifact:stream"; "alternate_stream")]
+    #[test_case("artifact\0"; "nul")]
+    fn read_rejects_invalid_names(name: &str) {
+        let (_, store) = memory_store(0);
+        assert_eq!(
+            store.read(name, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(unix)]

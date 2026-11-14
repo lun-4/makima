@@ -1,16 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use makima_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    ProjectConfig, ToolKey, append_permission_rule,
+    ProjectConfig, ToolKey, ToolKeyParseError, append_permission_rule,
 };
+use makima_storage::checkpoint::CheckpointPublication;
+use makima_storage::session_state::StateChange;
+use makima_storage::sessions::{StoredEffect, StoredRule};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::{AgentEvent, EventSender};
+use crate::journal::{
+    JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
+};
+use crate::{AgentEvent, CancelToken, EventSender};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -256,12 +261,66 @@ impl PluginRuleStore {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PermissionSnapshot {
+    pub rules: Vec<PermissionRule>,
+    pub yolo: Option<bool>,
+}
+
+impl PermissionSnapshot {
+    pub fn from_stored(
+        rules: &[StoredRule],
+        yolo: Option<bool>,
+    ) -> Result<Self, ToolKeyParseError> {
+        Ok(Self {
+            rules: rules
+                .iter()
+                .map(|rule| {
+                    Ok(PermissionRule {
+                        tool: ToolKey::parse(&rule.tool)?,
+                        scope: rule.scope.clone(),
+                        effect: match rule.effect {
+                            StoredEffect::Allow => Effect::Allow,
+                            StoredEffect::Deny => Effect::Deny,
+                        },
+                    })
+                })
+                .collect::<Result<_, ToolKeyParseError>>()?,
+            yolo,
+        })
+    }
+
+    pub fn stored_rules(&self) -> Vec<StoredRule> {
+        self.rules
+            .iter()
+            .map(|rule| StoredRule {
+                tool: rule.tool.to_string(),
+                scope: rule.scope.clone(),
+                effect: match rule.effect {
+                    Effect::Allow => StoredEffect::Allow,
+                    Effect::Deny => StoredEffect::Deny,
+                },
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct PermissionJournal {
+    journal: Arc<SessionJournal>,
+    incarnation: Option<JournalIncarnation>,
+}
+
+#[derive(Default)]
+struct SessionPermissions {
+    snapshot: PermissionSnapshot,
+    binding: Option<PermissionJournal>,
+}
+
 pub struct PermissionManager {
-    session_rules: Mutex<Vec<PermissionRule>>,
+    session: Mutex<SessionPermissions>,
     config_rules: Vec<PermissionRule>,
     builtin_rules: Mutex<Vec<PermissionRule>>,
-    yolo: AtomicBool,
-    yolo_explicit: AtomicBool,
     seed_yolo: bool,
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
@@ -305,10 +364,8 @@ impl PermissionManager {
 
         Self {
             builtin_rules: Mutex::new(builtin_rules),
-            session_rules: Mutex::new(Vec::new()),
+            session: Mutex::default(),
             config_rules,
-            yolo: AtomicBool::new(config.yolo),
-            yolo_explicit: AtomicBool::new(false),
             seed_yolo: config.yolo,
             default: config.default,
             tool_defaults: config.tool_defaults,
@@ -323,7 +380,13 @@ impl PermissionManager {
     /// restoring one session never clobbers another's grants.
     pub fn fork(&self) -> Self {
         Self {
-            session_rules: Mutex::new(Vec::new()),
+            session: Mutex::new(SessionPermissions {
+                snapshot: PermissionSnapshot {
+                    rules: Vec::new(),
+                    yolo: self.persisted_yolo(),
+                },
+                binding: None,
+            }),
             config_rules: self.config_rules.clone(),
             builtin_rules: Mutex::new(
                 self.builtin_rules
@@ -331,8 +394,6 @@ impl PermissionManager {
                     .unwrap_or_else(|error| error.into_inner())
                     .clone(),
             ),
-            yolo: AtomicBool::new(self.is_yolo()),
-            yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
             seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
@@ -347,8 +408,8 @@ impl PermissionManager {
         }
     }
 
-    fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
-        self.session_rules.lock().unwrap_or_else(|e| {
+    fn session(&self) -> MutexGuard<'_, SessionPermissions> {
+        self.session.lock().unwrap_or_else(|e| {
             warn!("permission mutex was poisoned, recovering");
             e.into_inner()
         })
@@ -364,7 +425,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        let session = self.session_rules();
+        let session = self.session();
         let plugin = self.plugin_rules.snapshot();
         let builtin = self
             .builtin_rules
@@ -380,6 +441,8 @@ impl PermissionManager {
         for scope in scopes {
             let mut has_allow = false;
             for r in session
+                .snapshot
+                .rules
                 .iter()
                 .chain(&self.config_rules)
                 .chain(builtin.iter())
@@ -405,7 +468,7 @@ impl PermissionManager {
             // force_prompt: all scopes will be prompted anyway
         }
 
-        if self.yolo.load(Ordering::Relaxed) {
+        if session.snapshot.yolo.unwrap_or(self.seed_yolo) {
             return PermissionCheck::Allowed;
         }
 
@@ -482,47 +545,235 @@ impl PermissionManager {
         self.check_inner(tool, scopes, force_prompt, plan_path)
     }
 
-    pub fn add_session_rule(&self, rule: PermissionRule) {
-        let mut rules = self.session_rules();
-        let exists = rules
-            .iter()
-            .any(|r| r.tool == rule.tool && r.scope == rule.scope && r.effect == rule.effect);
-        if !exists {
-            rules.push(rule);
+    pub fn bind_journal(
+        &self,
+        journal: Arc<SessionJournal>,
+        incarnation: Option<JournalIncarnation>,
+    ) -> Result<(), JournalError> {
+        let mut session = self.session();
+        let incarnations = incarnation.clone().into_iter().collect();
+        journal.commit_with_apply(
+            |_| JournalCommit {
+                incarnations,
+                ..Default::default()
+            },
+            || {
+                session.binding = Some(PermissionJournal {
+                    journal: Arc::clone(&journal),
+                    incarnation,
+                });
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_startup(&self, mut commit: JournalCommit) -> Result<u64, JournalError> {
+        let binding = self.session().binding.clone().ok_or_else(|| {
+            JournalError::Preparation("session permissions journal is not bound".into())
+        })?;
+        let _publication = binding.journal.try_publication_read().ok_or_else(|| {
+            JournalError::Preparation(
+                "startup checkpoint conflicts with prepared publication".into(),
+            )
+        })?;
+        let session = self.session();
+        if !same_permission_binding(session.binding.as_ref(), Some(&binding)) {
+            return Err(JournalError::Preparation(
+                "permission journal binding changed".into(),
+            ));
         }
+        let rules = session.snapshot.stored_rules();
+        let yolo = session.snapshot.yolo;
+        commit.incarnations.extend(binding.incarnation.clone());
+        binding.journal.commit_with_apply(
+            |current| {
+                commit.histories.retain(|agent, history| {
+                    current.histories.get(agent).is_none_or(|stored| {
+                        stored.epoch != history.epoch
+                            || stored.compacted != history.compacted
+                            || stored.conversation != history.conversation
+                            || stored.messages != history.messages
+                    })
+                });
+                commit
+                    .managed_histories
+                    .retain(|agent| !current.managed_histories.contains(agent));
+                commit.changes.retain(|change| match &change.change {
+                    StateChange::Config(config) => {
+                        current
+                            .state
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.change {
+                                StateChange::Config(config) if record.agent == change.agent => {
+                                    Some(config)
+                                }
+                                _ => None,
+                            })
+                            != Some(config)
+                    }
+                    StateChange::Rules { .. } => false,
+                    _ => true,
+                });
+                let latest = current
+                    .state
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.change {
+                        StateChange::Rules { rules, yolo } if record.agent.is_none() => {
+                            Some((rules, *yolo))
+                        }
+                        _ => None,
+                    });
+                if latest != Some((&rules, yolo)) {
+                    commit.changes.push(JournalChange {
+                        agent: None,
+                        generation: 0,
+                        change: StateChange::Rules { rules, yolo },
+                    });
+                }
+                commit
+            },
+            || (),
+        )
+    }
+
+    pub fn snapshot(&self) -> PermissionSnapshot {
+        self.session().snapshot.clone()
+    }
+
+    pub fn restore(&self, snapshot: PermissionSnapshot) {
+        self.session().snapshot = snapshot;
+    }
+
+    pub fn restore_stored(
+        &self,
+        rules: &[StoredRule],
+        yolo: Option<bool>,
+    ) -> Result<(), ToolKeyParseError> {
+        self.restore(PermissionSnapshot::from_stored(rules, yolo)?);
+        Ok(())
+    }
+
+    fn update_session<T>(
+        &self,
+        update: impl FnOnce(&mut PermissionSnapshot) -> T,
+    ) -> Result<T, JournalError> {
+        let binding = self.session().binding.clone();
+        let _publication = binding
+            .as_ref()
+            .map(|binding| {
+                binding.journal.try_publication_read().ok_or_else(|| {
+                    JournalError::Preparation(
+                        "permission mutation conflicts with prepared publication".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        self.update_session_bound(binding.as_ref(), update)
+    }
+
+    fn update_session_bound<T>(
+        &self,
+        expected: Option<&PermissionJournal>,
+        update: impl FnOnce(&mut PermissionSnapshot) -> T,
+    ) -> Result<T, JournalError> {
+        let mut session = self.session();
+        if !same_permission_binding(session.binding.as_ref(), expected) {
+            return Err(JournalError::Preparation(
+                "permission journal binding changed".into(),
+            ));
+        }
+        let mut snapshot = session.snapshot.clone();
+        let result = update(&mut snapshot);
+        if snapshot.yolo == session.snapshot.yolo
+            && snapshot.rules.len() == session.snapshot.rules.len()
+            && snapshot
+                .rules
+                .iter()
+                .zip(&session.snapshot.rules)
+                .all(|(a, b)| a.tool == b.tool && a.scope == b.scope && a.effect == b.effect)
+        {
+            if let Some(binding) = &session.binding {
+                binding.journal.commit(JournalCommit {
+                    incarnations: binding.incarnation.clone().into_iter().collect(),
+                    ..Default::default()
+                })?;
+            }
+            return Ok(result);
+        }
+        if let Some(binding) = &session.binding {
+            let journal = Arc::clone(&binding.journal);
+            journal.record_rules_with_apply(
+                binding.incarnation.clone(),
+                snapshot.stored_rules(),
+                snapshot.yolo,
+                || session.snapshot = snapshot,
+            )?;
+        } else {
+            session.snapshot = snapshot;
+        }
+        Ok(result)
+    }
+
+    fn add_session_rules(&self, rules: impl IntoIterator<Item = PermissionRule>) -> bool {
+        let result = self.update_session(|snapshot| insert_session_rules(snapshot, rules));
+        if let Err(error) = result {
+            warn!(%error, "failed to commit session permission rules");
+            return false;
+        }
+        true
+    }
+
+    pub fn add_session_rule(&self, rule: PermissionRule) {
+        self.add_session_rules([rule]);
+    }
+
+    pub fn try_add_session_rule(&self, rule: PermissionRule) -> Result<(), JournalError> {
+        self.update_session(|snapshot| insert_session_rules(snapshot, [rule]))
+    }
+
+    pub fn try_toggle_yolo(&self) -> Result<bool, JournalError> {
+        self.update_session(|snapshot| {
+            let enabled = !snapshot.yolo.unwrap_or(self.seed_yolo);
+            snapshot.yolo = Some(enabled);
+            enabled
+        })
+    }
+
+    pub fn try_set_yolo(&self, enabled: bool) -> Result<(), JournalError> {
+        self.update_session(|snapshot| snapshot.yolo = Some(enabled))
     }
 
     pub fn toggle_yolo(&self) -> bool {
-        let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
-        self.yolo_explicit.store(true, Ordering::Relaxed);
-        enabled
+        match self.try_toggle_yolo() {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                warn!(%error, "failed to commit session yolo intent");
+                self.is_yolo()
+            }
+        }
     }
 
     pub fn set_yolo(&self, enabled: bool) {
-        self.yolo.store(enabled, Ordering::Relaxed);
-        self.yolo_explicit.store(true, Ordering::Relaxed);
+        if let Err(error) = self.try_set_yolo(enabled) {
+            warn!(%error, "failed to commit session yolo intent");
+        }
     }
 
-    /// Replaces whatever this session was running with: `Some` is the user's
-    /// stored intent, `None` means they never expressed one and the seed
-    /// applies again.
+    /// Replaces stored intent without journaling during session restoration.
     pub fn set_session_yolo(&self, stored: Option<bool>) {
-        self.yolo
-            .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
-        self.yolo_explicit
-            .store(stored.is_some(), Ordering::Relaxed);
+        self.session().snapshot.yolo = stored;
     }
 
     pub fn is_yolo(&self) -> bool {
-        self.yolo.load(Ordering::Relaxed)
+        self.session().snapshot.yolo.unwrap_or(self.seed_yolo)
     }
 
     /// What the session may persist. A one-shot `--yolo` is a property of the
     /// invocation, so on its own it stores nothing.
     pub fn persisted_yolo(&self) -> Option<bool> {
-        self.yolo_explicit
-            .load(Ordering::Relaxed)
-            .then(|| self.is_yolo())
+        self.session().snapshot.yolo
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {
@@ -549,11 +800,11 @@ impl PermissionManager {
     }
 
     pub fn session_rules_snapshot(&self) -> Vec<PermissionRule> {
-        self.session_rules().clone()
+        self.session().snapshot.rules.clone()
     }
 
     pub fn load_session_rules(&self, rules: Vec<PermissionRule>) {
-        *self.session_rules() = rules;
+        self.session().snapshot.rules = rules;
     }
 
     pub fn project_is_trusted(&self) -> bool {
@@ -583,6 +834,48 @@ impl PermissionManager {
     }
 
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
+        if let Err(error) = self.try_apply_decision(tool, scopes, answer) {
+            warn!(%error, "failed to commit permission decision");
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_decision_checked(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+    ) -> bool {
+        self.try_apply_decision(tool, scopes, answer).is_ok()
+    }
+
+    pub fn try_apply_decision(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+    ) -> Result<(), JournalError> {
+        let binding = self.session().binding.clone();
+        let _publication = binding
+            .as_ref()
+            .map(|binding| {
+                binding.journal.try_publication_read().ok_or_else(|| {
+                    JournalError::Preparation(
+                        "permission mutation conflicts with prepared publication".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        self.apply_decision_bound(tool, scopes, answer, binding.as_ref())
+    }
+
+    fn apply_decision_bound(
+        &self,
+        tool: &ToolKey,
+        scopes: &[String],
+        answer: &PermissionAnswer,
+        binding: Option<&PermissionJournal>,
+    ) -> Result<(), JournalError> {
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
             // This makes session and persisted rules consistent: a deny on an MCP tool
@@ -595,16 +888,17 @@ impl PermissionManager {
         match answer {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => {}
-            PermissionAnswer::AllowSession => {
-                for s in &resolved {
-                    self.add_session_rule(PermissionRule {
+            | PermissionAnswer::DenyWithGuidance(_) => self.update_session_bound(binding, |_| ()),
+            PermissionAnswer::AllowSession => self.update_session_bound(binding, |snapshot| {
+                insert_session_rules(
+                    snapshot,
+                    resolved.iter().map(|scope| PermissionRule {
                         tool: tool.clone(),
-                        scope: Some(s.clone()),
+                        scope: Some(scope.clone()),
                         effect: Effect::Allow,
-                    });
-                }
-            }
+                    }),
+                );
+            }),
             PermissionAnswer::AllowAlwaysProject
             | PermissionAnswer::AllowAlwaysLocal
             | PermissionAnswer::AllowAlwaysGlobal
@@ -623,18 +917,24 @@ impl PermissionManager {
                         "project answer stays in this session because the folder is not trusted, the global answer is the one that lasts"
                     );
                 }
+                self.update_session_bound(binding, |snapshot| {
+                    insert_session_rules(
+                        snapshot,
+                        resolved.iter().map(|scope| PermissionRule {
+                            tool: tool.clone(),
+                            scope: Some(scope.clone()),
+                            effect,
+                        }),
+                    );
+                })?;
                 for s in &resolved {
-                    self.add_session_rule(PermissionRule {
-                        tool: tool.clone(),
-                        scope: Some(s.clone()),
-                        effect,
-                    });
                     if let Some(target) = &target
                         && let Err(e) = append_permission_rule(tool, Some(s), effect, target)
                     {
                         tracing::warn!(error = %e, "failed to persist permission rule");
                     }
                 }
+                Ok(())
             }
         }
     }
@@ -647,7 +947,7 @@ impl PermissionManager {
         event_tx: &EventSender,
         user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
         request_id: &str,
-        cancel: &crate::CancelToken,
+        cancel: &CancelToken,
         plan_path: Option<&Path>,
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
@@ -682,6 +982,7 @@ impl PermissionManager {
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
 
+        let prompt_binding = self.session().binding.clone();
         let _ = event_tx.send(AgentEvent::PermissionRequest {
             id: request_id.to_owned(),
             tool: t2.clone(),
@@ -716,12 +1017,67 @@ impl PermissionManager {
             }
         };
         drop(guard);
-        self.apply_decision(&t2, &s2, &answer);
+        let journal = prompt_binding
+            .as_ref()
+            .map(|binding| Arc::clone(&binding.journal));
+        let _publication = if let Some(journal) = &journal {
+            match cancel.race(journal.publication_read()).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return Err(deny(None)),
+            }
+        } else {
+            None
+        };
+        {
+            let session = self.session();
+            if !same_permission_binding(session.binding.as_ref(), prompt_binding.as_ref()) {
+                return Err(deny(None));
+            }
+            if let Some(binding) = &prompt_binding
+                && let Err(error) = binding.journal.commit(JournalCommit {
+                    incarnations: binding.incarnation.clone().into_iter().collect(),
+                    ..Default::default()
+                })
+            {
+                warn!(%error, "discarding permission answer from stale incarnation");
+                return Err(deny(None));
+            }
+        }
+        if !cancel.claim_publication(&CheckpointPublication::default())
+            || self
+                .apply_decision_bound(&t2, &s2, &answer, prompt_binding.as_ref())
+                .is_err()
+        {
+            return Err(deny(None));
+        }
         if answer.is_allow() {
             Ok(())
         } else {
             Err(deny(answer.guidance().map(String::from)))
         }
+    }
+}
+
+fn insert_session_rules(
+    snapshot: &mut PermissionSnapshot,
+    rules: impl IntoIterator<Item = PermissionRule>,
+) {
+    for rule in rules {
+        if !snapshot.rules.iter().any(|existing| {
+            existing.tool == rule.tool
+                && existing.scope == rule.scope
+                && existing.effect == rule.effect
+        }) {
+            snapshot.rules.push(rule);
+        }
+    }
+}
+
+fn same_permission_binding(a: Option<&PermissionJournal>, b: Option<&PermissionJournal>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(&a.journal, &b.journal) && a.incarnation == b.incarnation,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -887,6 +1243,13 @@ fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::JournalChange;
+    use makima_providers::{Message, TokenUsage};
+    use makima_storage::id::AgentId;
+    use makima_storage::session_state::StateChange;
+    use makima_storage::sessions::Session;
+    use std::sync::Barrier;
+    use std::thread;
     use test_case::test_case;
 
     const PLAN_FILE: &str = "/home/user/.local/state/makima/plans/test.md";
@@ -1639,6 +2002,423 @@ mod tests {
             mgr.check(&ToolKey::native("bash"), "rm -rf /", None),
             PermissionCheck::Denied
         ));
+    }
+
+    #[test]
+    fn rules_journal_batches_decisions_and_ignores_noops_and_restore() {
+        let manager = seeded_mgr(true);
+        let journal = Arc::new(SessionJournal::default());
+        manager.bind_journal(Arc::clone(&journal), None).unwrap();
+        let restored = PermissionSnapshot {
+            rules: vec![deny_rule("rm *")],
+            yolo: Some(false),
+        };
+        manager.restore(restored.clone());
+        manager.load_session_rules(restored.rules.clone());
+        manager.set_session_yolo(restored.yolo);
+        manager.set_yolo(false);
+        for answer in [PermissionAnswer::AllowOnce, PermissionAnswer::Deny] {
+            manager.apply_decision(&ToolKey::native(BASH_TOOL), &["cargo test".into()], &answer);
+        }
+        assert_eq!(journal.snapshot().revision, 0);
+
+        let scopes = [
+            "cargo test".into(),
+            "git status".into(),
+            "cargo check".into(),
+        ];
+        manager.apply_decision(
+            &ToolKey::native(BASH_TOOL),
+            &scopes,
+            &PermissionAnswer::AllowSession,
+        );
+        let committed = journal.snapshot();
+        assert_eq!(committed.revision, 1);
+        assert_eq!(committed.state.len(), 1);
+        assert!(committed.state[0].agent.is_none());
+        match &committed.state[0].change {
+            StateChange::Rules { rules, yolo } => {
+                assert_eq!(rules, &manager.snapshot().stored_rules());
+                assert_eq!(rules.len(), 3);
+                assert_eq!(*yolo, Some(false));
+            }
+            other => panic!("unexpected permission change: {other:?}"),
+        }
+        manager.apply_decision(
+            &ToolKey::native(BASH_TOOL),
+            &scopes,
+            &PermissionAnswer::AllowSession,
+        );
+        manager.set_yolo(false);
+        assert_eq!(journal.snapshot().revision, committed.revision);
+        manager.set_yolo(true);
+        assert_eq!(journal.snapshot().revision, committed.revision + 1);
+    }
+
+    #[test]
+    fn permission_snapshots_remain_coherent_during_concurrent_restore() {
+        const ITERATIONS: usize = 256;
+        let manager = Arc::new(default_mgr());
+        let states = [
+            PermissionSnapshot {
+                rules: vec![deny_rule("rm *")],
+                yolo: Some(false),
+            },
+            PermissionSnapshot {
+                rules: vec![allow_rule("cargo *")],
+                yolo: Some(true),
+            },
+        ];
+        manager.restore(states[0].clone());
+        let barrier = Arc::new(Barrier::new(2));
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for index in 0..ITERATIONS {
+                    barrier.wait();
+                    manager.restore(states[index % states.len()].clone());
+                    barrier.wait();
+                }
+            });
+            for _ in 0..ITERATIONS {
+                barrier.wait();
+                let snapshot = manager.snapshot();
+                let expected = &states[usize::from(snapshot.yolo.unwrap())];
+                assert_eq!(snapshot.stored_rules(), expected.stored_rules());
+                barrier.wait();
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_permission_mutations_journal_complete_snapshots() {
+        const WORKERS: usize = 8;
+        let manager = Arc::new(default_mgr());
+        let journal = Arc::new(SessionJournal::default());
+        manager.bind_journal(Arc::clone(&journal), None).unwrap();
+        let barrier = Barrier::new(WORKERS);
+        thread::scope(|scope| {
+            for index in 0..WORKERS {
+                let barrier = &barrier;
+                let manager = &manager;
+                scope.spawn(move || {
+                    barrier.wait();
+                    manager.add_session_rule(allow_rule(&format!("command-{index} *")));
+                    manager.toggle_yolo();
+                });
+            }
+        });
+        let snapshot = journal.snapshot();
+        assert_eq!(snapshot.state.len(), WORKERS * 2);
+        let mut previous_rule_count = 0;
+        for record in &snapshot.state {
+            let StateChange::Rules { rules, .. } = &record.change else {
+                panic!("unexpected permission change");
+            };
+            assert!(rules.len() >= previous_rule_count);
+            assert!(rules.len() <= previous_rule_count + 1);
+            previous_rule_count = rules.len();
+        }
+        let StateChange::Rules { rules, yolo } = &snapshot.state.last().unwrap().change else {
+            panic!("unexpected permission change");
+        };
+        assert_eq!(rules, &manager.snapshot().stored_rules());
+        assert_eq!(rules.len(), WORKERS);
+        assert_eq!(*yolo, Some(false));
+        assert_eq!(manager.persisted_yolo(), *yolo);
+    }
+
+    #[test]
+    fn forked_permissions_do_not_share_rules_or_journal_bindings() {
+        let original = default_mgr();
+        let journal = Arc::new(SessionJournal::default());
+        original.bind_journal(Arc::clone(&journal), None).unwrap();
+        original.add_session_rule(deny_rule("rm *"));
+        original.set_yolo(true);
+        let fork = original.fork();
+        assert!(fork.snapshot().rules.is_empty());
+        assert_eq!(fork.snapshot().yolo, Some(true));
+        let original_rules = original.snapshot().stored_rules();
+        let committed = journal.snapshot().revision;
+        fork.add_session_rule(allow_rule("git *"));
+        fork.set_yolo(false);
+        assert_eq!(journal.snapshot().revision, committed);
+        assert_eq!(original.snapshot().stored_rules(), original_rules);
+        assert_eq!(original.persisted_yolo(), Some(true));
+        assert_eq!(fork.persisted_yolo(), Some(false));
+    }
+
+    #[test]
+    fn restore_rebuilds_ambient_permissions_instead_of_persisting_them() {
+        let plugins = Arc::new(PluginRuleStore::default());
+        plugins.replace("permission-test", vec![allow_rule("git *")]);
+        let original = PermissionManager::new(
+            make_config(vec![deny_rule("rm *")]),
+            PathBuf::from(TEST_CWD),
+            ProjectConfig::for_project(Path::new(TEST_CWD)),
+            plugins,
+        );
+        original.add_session_rule(allow_rule("cargo *"));
+        let stored = original.snapshot();
+        assert_eq!(stored.rules.len(), 1);
+        let restored_plugins = Arc::new(PluginRuleStore::default());
+        restored_plugins.replace("permission-test", vec![deny_rule("git *")]);
+        let directory = tempfile::tempdir().unwrap();
+        let restored = PermissionManager::new(
+            make_config(vec![deny_rule("cargo *")]),
+            directory.path().to_path_buf(),
+            ProjectConfig::for_project(directory.path()),
+            restored_plugins,
+        );
+        restored.restore(stored);
+        assert_eq!(
+            outcome(restored.check(&ToolKey::native(BASH_TOOL), "cargo test", None)),
+            DENIED
+        );
+        assert_eq!(
+            outcome(restored.check(&ToolKey::native(BASH_TOOL), "git status", None)),
+            DENIED
+        );
+        assert_eq!(
+            outcome(restored.check(&ToolKey::native(BASH_TOOL), "rm file", None)),
+            PROMPTS
+        );
+        let path = directory.path().join("restored.txt");
+        assert_eq!(
+            outcome(restored.check(&ToolKey::native("write"), &path.to_string_lossy(), None)),
+            ALLOWED
+        );
+        assert_eq!(restored.snapshot().rules.len(), 1);
+    }
+
+    #[test]
+    fn stale_permission_binding_cannot_mutate_runtime_or_journal() {
+        let manager = default_mgr();
+        let journal = Arc::new(SessionJournal::default());
+        let agent = AgentId::generate();
+        journal.set_incarnation(agent, 1);
+        manager
+            .bind_journal(Arc::clone(&journal), Some(journal.incarnation(agent)))
+            .unwrap();
+        journal.set_incarnation(agent, 2);
+        manager.add_session_rule(allow_rule("cargo *"));
+        manager.set_yolo(true);
+        assert!(!manager.apply_decision_checked(
+            &ToolKey::native(BASH_TOOL),
+            &["git status".into()],
+            &PermissionAnswer::AllowSession
+        ));
+        assert!(manager.snapshot().rules.is_empty());
+        assert_eq!(manager.persisted_yolo(), None);
+        assert_eq!(journal.snapshot().revision, 0);
+    }
+
+    #[test]
+    fn prepared_rules_publish_before_runtime_and_reject_direct_mutations() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let journal = Arc::new(SessionJournal::default());
+            manager.bind_journal(Arc::clone(&journal), None).unwrap();
+            let candidate = PermissionSnapshot {
+                rules: vec![deny_rule("rm *")],
+                yolo: Some(false),
+            };
+            let stored = candidate.stored_rules();
+            let mut prepared = journal
+                .prepare(JournalCommit {
+                    changes: vec![crate::journal::JournalChange {
+                        agent: None,
+                        generation: 0,
+                        change: StateChange::Rules {
+                            rules: stored.clone(),
+                            yolo: candidate.yolo,
+                        },
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(manager.try_add_session_rule(allow_rule("cargo *")).is_err());
+            assert!(manager.try_set_yolo(true).is_err());
+            assert!(manager.try_toggle_yolo().is_err());
+            assert!(
+                manager
+                    .try_apply_decision(
+                        &ToolKey::native(BASH_TOOL),
+                        &["cargo test".into()],
+                        &PermissionAnswer::AllowSession
+                    )
+                    .is_err()
+            );
+            assert!(manager.snapshot().rules.is_empty());
+            assert_eq!(manager.persisted_yolo(), None);
+            assert_eq!(prepared.snapshot().state.len(), 1);
+            prepared.install().unwrap();
+            manager.restore_stored(&stored, candidate.yolo).unwrap();
+            assert_eq!(manager.snapshot().stored_rules(), stored);
+            assert_eq!(manager.persisted_yolo(), candidate.yolo);
+            drop(prepared);
+            manager.set_yolo(true);
+            assert_eq!(journal.snapshot().state.len(), 2);
+        });
+    }
+
+    #[test]
+    fn permission_answer_waits_for_prepared_publication_before_committing_grant() {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let journal = Arc::new(SessionJournal::default());
+            manager.bind_journal(Arc::clone(&journal), None).unwrap();
+            let (event_tx, events) = flume::unbounded();
+            let event_tx = EventSender::new(event_tx);
+            let (answers, receiver) = flume::unbounded();
+            let receiver = async_lock::Mutex::new(receiver);
+            let tool = ToolKey::native(BASH_TOOL);
+            let scopes = crate::tools::PermissionScopes::single("cargo test".into());
+            let cancel = CancelToken::none();
+            let mut pending = Box::pin(manager.enforce(
+                &tool,
+                &scopes,
+                &event_tx,
+                Some(&receiver),
+                "permission-test",
+                &cancel,
+                None,
+            ));
+            assert!(
+                futures_lite::future::poll_once(pending.as_mut())
+                    .await
+                    .is_none()
+            );
+            assert!(!events.is_empty());
+            let mut prepared = journal
+                .prepare(JournalCommit {
+                    changes: vec![JournalChange {
+                        agent: None,
+                        generation: 0,
+                        change: StateChange::Rules {
+                            rules: Vec::new(),
+                            yolo: Some(false),
+                        },
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            answers
+                .send(TaggedAnswer::new("permission-test", PermissionAnswer::AllowSession).encode())
+                .unwrap();
+            assert!(
+                futures_lite::future::poll_once(pending.as_mut())
+                    .await
+                    .is_none()
+            );
+            assert!(manager.snapshot().rules.is_empty());
+            prepared.install().unwrap();
+            manager.restore_stored(&[], Some(false)).unwrap();
+            drop(prepared);
+            pending.await.unwrap();
+            assert_eq!(manager.snapshot().rules.len(), 1);
+            assert_eq!(manager.persisted_yolo(), Some(false));
+            assert_eq!(journal.snapshot().state.len(), 2);
+        });
+    }
+
+    #[test_case(0; "cancelled")]
+    #[test_case(1; "replaced_incarnation")]
+    #[test_case(2; "rebound_manager")]
+    fn interrupted_permission_prompt_discards_once_and_session_answers(interruption: usize) {
+        smol::block_on(async {
+            for answer in [PermissionAnswer::AllowOnce, PermissionAnswer::AllowSession] {
+                let manager = default_mgr();
+                let journal = Arc::new(SessionJournal::default());
+                let agent = AgentId::generate();
+                journal.set_incarnation(agent, 1);
+                manager
+                    .bind_journal(Arc::clone(&journal), Some(journal.incarnation(agent)))
+                    .unwrap();
+                let (trigger, cancel) = CancelToken::new();
+                let (event_tx, events) = flume::unbounded();
+                let event_tx = EventSender::new(event_tx);
+                let (answers, receiver) = flume::unbounded();
+                let receiver = async_lock::Mutex::new(receiver);
+                let tool = ToolKey::native(BASH_TOOL);
+                let scopes = crate::tools::PermissionScopes {
+                    scopes: vec!["cargo test".into()],
+                    force_prompt: false,
+                };
+                let mut pending = Box::pin(manager.enforce(
+                    &tool,
+                    &scopes,
+                    &event_tx,
+                    Some(&receiver),
+                    "permission-test",
+                    &cancel,
+                    None,
+                ));
+                assert!(
+                    futures_lite::future::poll_once(pending.as_mut())
+                        .await
+                        .is_none()
+                );
+                assert!(!events.is_empty());
+                match interruption {
+                    0 => trigger.cancel(),
+                    1 => journal.set_incarnation(agent, 2),
+                    2 => {
+                        journal.set_incarnation(agent, 2);
+                        manager
+                            .bind_journal(Arc::clone(&journal), Some(journal.incarnation(agent)))
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                answers
+                    .send(TaggedAnswer::new("permission-test", answer).encode())
+                    .unwrap();
+                assert!(pending.await.is_err());
+                assert!(manager.snapshot().rules.is_empty());
+                assert_eq!(journal.snapshot().revision, 0);
+            }
+        });
+    }
+
+    #[test_case(None; "seed_only")]
+    #[test_case(Some(false); "explicit_off")]
+    #[test_case(Some(true); "explicit_on")]
+    fn permission_rules_restart_from_disk_without_duplicate_records(yolo: Option<bool>) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session =
+            Session::<Message, TokenUsage, crate::ToolOutput>::new("test/model", TEST_CWD);
+        let manager = seeded_mgr(true);
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        manager.restore(PermissionSnapshot {
+            rules: Vec::new(),
+            yolo,
+        });
+        manager.bind_journal(Arc::clone(&journal), None).unwrap();
+        manager.add_session_rule(allow_rule("cargo *"));
+        journal.snapshot().apply_to(&mut session).unwrap();
+        session.save_to(directory.path()).unwrap();
+        let loaded = Session::<Message, TokenUsage, crate::ToolOutput>::load_from(
+            session.id,
+            directory.path(),
+        )
+        .unwrap();
+        let folded = loaded.latest_state().unwrap();
+        let restored = seeded_mgr(false);
+        let folded = folded.scopes.get(&None).unwrap();
+        restored.restore(PermissionSnapshot::from_stored(&folded.rules, folded.yolo).unwrap());
+        let rebuilt = Arc::new(SessionJournal::from_session(&loaded).unwrap());
+        restored.bind_journal(Arc::clone(&rebuilt), None).unwrap();
+        assert_eq!(
+            restored.snapshot().stored_rules(),
+            manager.snapshot().stored_rules()
+        );
+        assert_eq!(restored.persisted_yolo(), yolo);
+        assert_eq!(restored.is_yolo(), yolo.unwrap_or(false));
+        restored.add_session_rule(allow_rule("cargo *"));
+        assert_eq!(rebuilt.snapshot().revision, 0);
+        assert_eq!(rebuilt.snapshot().state, journal.snapshot().state);
     }
 
     #[test]

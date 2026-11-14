@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 test-support = ["dep:globset"]
+memory-profile = ["test-support", "makima-interpreter/memory-profile"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -94,6 +95,7 @@ tree-sitter-make = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+makima-domain = { workspace = true }
 makima-providers = { workspace = true, features = ["test-util"] }
 makima-config = { workspace = true, features = ["test-util"] }
 makima-lua = { path = ".", features = ["test-support"] }

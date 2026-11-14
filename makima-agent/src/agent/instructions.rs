@@ -38,10 +38,34 @@ impl LoadedInstructions {
     }
 }
 
+#[derive(Clone)]
+pub struct InstructionSource {
+    pub path: PathBuf,
+    pub label: String,
+    pub content: String,
+}
+
 #[derive(Clone, Default)]
 pub struct Instructions {
     pub text: String,
     pub loaded: LoadedInstructions,
+    pub sources: Vec<InstructionSource>,
+}
+
+impl Instructions {
+    pub fn from_sources(sources: Vec<InstructionSource>) -> Self {
+        let mut text = String::new();
+        let loaded = LoadedInstructions::new();
+        for source in &sources {
+            loaded.contains_or_insert(source.path.clone());
+            text.push_str(&format!("\n\n{}:\n{}", source.label, source.content));
+        }
+        Self {
+            text,
+            loaded,
+            sources,
+        }
+    }
 }
 
 pub fn is_instruction_file(name: &str) -> bool {
@@ -105,7 +129,7 @@ fn collect_instruction_files(
     cwd: &str,
     global_config: Option<&Path>,
     loaded: &LoadedInstructions,
-) -> Vec<(String, String)> {
+) -> Vec<InstructionSource> {
     let mut out = Vec::new();
 
     let ancestor_dirs: Vec<_> = find_project_ancestor_dirs(Path::new(cwd)).collect();
@@ -120,10 +144,11 @@ fn collect_instruction_files(
     for dir in project_dirs.into_iter().rev() {
         for filename in INSTRUCTION_FILES {
             if let Some((canonical, content)) = read_instruction(&dir.join(filename), loaded) {
-                out.push((
-                    format!("Project instructions ({})", canonical.display()),
+                out.push(InstructionSource {
+                    label: format!("Project instructions ({})", canonical.display()),
+                    path: canonical,
                     content,
-                ));
+                });
                 break;
             }
         }
@@ -131,10 +156,11 @@ fn collect_instruction_files(
         if let Some((canonical, content)) =
             read_instruction(&dir.join(LOCAL_INSTRUCTION_FILE), loaded)
         {
-            out.push((
-                format!("Local instructions ({})", canonical.display()),
+            out.push(InstructionSource {
+                label: format!("Local instructions ({})", canonical.display()),
+                path: canonical,
                 content,
-            ));
+            });
         }
     }
 
@@ -142,10 +168,11 @@ fn collect_instruction_files(
         && let Some((canonical, content)) =
             read_instruction(&dir.join(GLOBAL_INSTRUCTION_FILE), loaded)
     {
-        out.push((
-            format!("Global instructions ({})", canonical.display()),
+        out.push(InstructionSource {
+            label: format!("Global instructions ({})", canonical.display()),
+            path: canonical,
             content,
-        ));
+        });
     }
 
     out
@@ -156,14 +183,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
 }
 
 pub(crate) fn load_instruction_text_with_global(cwd: &str, global_config: Option<&Path>) -> String {
-    let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, global_config, &loaded);
-
-    let mut text = String::new();
-    for (label, content) in files {
-        text.push_str(&format!("\n\n{label}:\n{content}"));
-    }
-    text
+    load_instructions_with_global(cwd, global_config).text
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
@@ -174,14 +194,11 @@ pub(crate) fn load_instructions_with_global(
     cwd: &str,
     global_config: Option<&Path>,
 ) -> Instructions {
-    let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, global_config, &instr.loaded);
-
-    for (label, content) in files {
-        instr.text.push_str(&format!("\n\n{label}:\n{content}"));
-    }
-
-    instr
+    let loaded = LoadedInstructions::new();
+    let sources = collect_instruction_files(cwd, global_config, &loaded);
+    let mut instructions = Instructions::from_sources(sources);
+    instructions.loaded = loaded;
+    instructions
 }
 
 pub fn find_subdirectory_instructions(
@@ -326,6 +343,7 @@ mod tests {
             crate::prompt::Slot::AfterInstructions,
             crate::prompt::SlotEntry {
                 plugin: Arc::from("memory"),
+                registration: 0,
                 content: EXTRA.into(),
             },
         );
@@ -352,6 +370,97 @@ mod tests {
     #[test_case("not-AGENTS.md",            false ; "partial_match")]
     fn is_instruction_file_cases(name: &str, expected: bool) {
         assert_eq!(is_instruction_file(name), expected);
+    }
+
+    #[test]
+    fn from_sources_keeps_deleted_identities_and_exact_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = Vec::new();
+        for (filename, label, content) in [
+            ("AGENTS.md", "recorded project", "first\n"),
+            ("AGENTS.local.md", "recorded local", "\nsecond"),
+        ] {
+            let path = dir.path().join(filename);
+            fs::write(&path, content).unwrap();
+            let canonical = path.canonicalize().unwrap();
+            fs::remove_file(&path).unwrap();
+            sources.push(InstructionSource {
+                path: canonical,
+                label: label.into(),
+                content: content.into(),
+            });
+        }
+        let instructions = Instructions::from_sources(sources.clone());
+        assert_eq!(
+            instructions.text,
+            "\n\nrecorded project:\nfirst\n\n\nrecorded local:\n\nsecond"
+        );
+        assert_eq!(instructions.sources.len(), sources.len());
+        for (recorded, source) in instructions.sources.iter().zip(&sources) {
+            assert_eq!(recorded.path, source.path);
+            assert_eq!(recorded.label, source.label);
+            assert_eq!(recorded.content, source.content);
+            assert!(!source.path.exists());
+            assert!(instructions.loaded.contains_or_insert(source.path.clone()));
+        }
+    }
+
+    #[test_case(false ; "distinct_global")]
+    #[test_case(true ; "global_deduplicates_project")]
+    fn instruction_sources_preserve_load_order_and_canonical_identity(global_is_project: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let sub = root.path().join("src");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir(&sub).unwrap();
+        let mut expected = Vec::new();
+        for (dir, filename, kind, content) in [
+            (root.path(), "AGENTS.md", "Project", "root"),
+            (root.path(), "AGENTS.local.md", "Local", "root local"),
+            (sub.as_path(), "AGENTS.md", "Project", "child"),
+            (sub.as_path(), "AGENTS.local.md", "Local", "child local"),
+            (global.path(), "AGENTS.md", "Global", "global"),
+        ] {
+            let path = dir.join(filename);
+            fs::write(&path, content).unwrap();
+            let path = path.canonicalize().unwrap();
+            let label = format!("{kind} instructions ({})", path.display());
+            expected.push((path, label, content.to_string()));
+        }
+        fs::write(sub.join("CLAUDE.md"), "not selected").unwrap();
+        let global_dir = if global_is_project {
+            expected.pop();
+            root.path()
+        } else {
+            global.path()
+        };
+        let instructions = load_instructions_with_global(sub.to_str().unwrap(), Some(global_dir));
+        let actual: Vec<_> = instructions
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.path.clone(),
+                    source.label.clone(),
+                    source.content.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            instructions.text,
+            expected
+                .iter()
+                .map(|(_, label, content)| format!("\n\n{label}:\n{content}"))
+                .collect::<String>()
+        );
+        assert_eq!(
+            load_instruction_text_with_global(sub.to_str().unwrap(), Some(global_dir)),
+            instructions.text
+        );
+        for (path, _, _) in expected {
+            assert!(instructions.loaded.contains_or_insert(path));
+        }
     }
 
     #[test]

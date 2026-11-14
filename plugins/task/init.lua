@@ -1,21 +1,16 @@
--- Async tasks retain exact turn tickets, not invocation authority.
--- Completion delivery belongs to the runtime; a wait in the parent's own turn withdraws it.
 local ToolView = require("makima.tool_view")
 local output_limits = require("makima.output_limits")
 local plan_spec = require("makima.plan_spec")
 
-local MAX_RETAINED_TASKS = 128
-local MAX_RETAINED_TURNS = 64
 local TURN_UNAVAILABLE_ERR = "turn_result_unavailable"
-local TASK_LIMIT_ERR = "task record limit reached; despawn unused tasks"
 local GENERAL_SEND_IN_PLAN_ERR =
   "general subagents cannot take new work in plan mode; despawn the task or switch to build mode"
 local GENERAL_BLOCKED_IN_PLAN_ERR =
   "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)"
 local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
+local RETIRE_CONTEXT_ERR = "task-retire requires an agent context"
 local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
-local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local QUOTE_BAR = "│ "
 local SEND_FAILED_PREFIX = "Send failed: "
 local SPAWN_FAILED_PREFIX = "Spawn failed: "
@@ -115,9 +110,15 @@ if opts.allow_model then
   }
 end
 
--- Live tasks keyed by task_id.
-local tasks = {}
-local task_order = {}
+local policy = makima.state.register("policy", { scope = "session", version = 1 })
+
+local function task_policy(ctx)
+  local value, revision = policy:get(ctx)
+  if type(revision) == "string" then
+    return nil, revision
+  end
+  return value or {}
+end
 
 -- The executing agent's own mode, never the focused session's. Plan-specific
 -- gating stays here until plan mode becomes a guest plugin.
@@ -214,167 +215,67 @@ local function project_result(result)
   }
 end
 
-local function spawn_agent(ctx, options)
-  local agent, err = makima.agent.spawn(ctx, options)
-  if not agent then
-    return nil, err
-  end
-  local latest
-  local tickets = {}
-  local order = {}
-  local turns = {}
-  local function make_ticket_room(call_ctx)
-    for index, id in ipairs(order) do
-      if #order < MAX_RETAINED_TURNS then
-        break
-      end
-      if tickets[id]:result(call_ctx) then
-        tickets[id] = nil
-        table.remove(order, index)
-        break
-      end
-    end
-  end
-  local function retain_ticket(ticket, call_ctx)
-    local id = ticket:id()
-    if not tickets[id] then
-      make_ticket_room(call_ctx)
-      if #order >= MAX_RETAINED_TURNS then
-        return nil
-      end
-      tickets[id] = ticket
-      order[#order + 1] = id
-    end
-    return ticket
-  end
-  function turns:send(message, call_ctx)
-    local authorized, auth_err = agent:status(call_ctx)
-    if not authorized then
-      return nil, auth_err, true
-    end
-    make_ticket_room(call_ctx)
-    local ticket, send_err =
-      agent:send(call_ctx, message, { when = "join", existing_only = #order >= MAX_RETAINED_TURNS })
-    if not ticket then
-      return nil, send_err, true
-    end
-    if not retain_ticket(ticket, call_ctx) then
-      return nil, TURN_UNAVAILABLE_ERR, true
-    end
-    latest = ticket:id()
-    return latest
-  end
-  function turns:wait(call_ctx, turn_id, timeout)
-    -- Without an id, wait on the child's latest turn, which may be one the
-    -- runtime admitted to hand it a result from its own subagents.
-    local ticket
-    if turn_id then
-      ticket = tickets[turn_id]
-    else
-      ticket = agent:latest_turn(call_ctx) or tickets[latest]
-      if ticket then
-        ticket = retain_ticket(ticket, call_ctx)
-      end
-    end
-    if not ticket then
-      return nil, TURN_UNAVAILABLE_ERR
-    end
-    local result, wait_err = ticket:wait(call_ctx, { timeout = timeout })
-    if not result then
-      return nil, wait_err
-    end
-    return project_result(result)
-  end
-  function turns:idle(call_ctx)
-    local status = agent:status(call_ctx)
-    return status ~= nil and status.status ~= "working" and status.queued == 0
-  end
-  return agent, turns
-end
-local function fail_task(task, err, ctx)
-  if task.closed then
-    return
-  end
-  task.closed = true
-  task.error = err
-  task.agent:close(ctx)
-end
-
-local function enqueue(task, message, ctx)
-  if task.closed then
-    return nil, task.error or TASK_CLOSED_ERR
-  end
-  local ok, admitted, admission_err, nonfatal = pcall(function()
-    return task.turns:send(message, ctx)
-  end)
+local function enqueue(agent, message, ctx)
+  local ok, ticket, err = pcall(agent.send, agent, ctx, message, { when = "join" })
   if not ok then
-    fail_task(task, admitted or TASK_CLOSED_ERR, ctx)
-    return nil, admitted or TASK_CLOSED_ERR
+    return nil, tostring(ticket)
   end
-  if not admitted then
-    if not nonfatal then
-      fail_task(task, admission_err or TASK_CLOSED_ERR, ctx)
-    end
-    return nil, admission_err or TASK_CLOSED_ERR
-  end
-  return admitted, nil
+  return ticket and ticket:id(), err
 end
 
 local function spawn(spec, input, ctx)
-  local i = 1
-  while i <= #task_order do
-    local id = task_order[i]
-    local task = tasks[id]
-    if not task or task.owner:_makima_retired() then
-      tasks[id] = nil
-      table.remove(task_order, i)
-    elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_makima_can_control() then
-      if task.closed or task.turns:idle(ctx) then
-        task.agent:close(ctx)
-        tasks[id] = nil
-        table.remove(task_order, i)
-      else
-        i = i + 1
-      end
-    else
-      i = i + 1
-    end
+  local owner, owner_err = ctx:agent()
+  if not owner then
+    return nil, owner_err
   end
-  if #task_order >= MAX_RETAINED_TASKS then
-    return nil, TASK_LIMIT_ERR
-  end
-  local ok, agent, turns = pcall(function()
-    return spawn_agent(ctx, spawn_options(spec, input))
-  end)
-  if not ok then
-    return nil, tostring(agent)
-  end
+  local agent, spawn_err = makima.agent.spawn(ctx, spawn_options(spec, input))
   if not agent then
-    return nil, turns
+    return nil, spawn_err
   end
-  local task_id = agent:_makima_session_id()
-  if tasks[task_id] then
-    agent:close(ctx)
-    return nil, "duplicate task_id"
+  local task_id = agent:id()
+  local committed = false
+  local ok, admitted, err = pcall(function()
+    local value, revision = policy:update(ctx, function(tasks)
+      tasks = tasks or {}
+      if tasks[task_id] then
+        error("duplicate task_id")
+      end
+      tasks[task_id] = {
+        description = input.description,
+        writes = spec.subagent_type == "general",
+        owner = owner:id(),
+      }
+      return tasks
+    end)
+    if not value then
+      return nil, revision
+    end
+    committed = true
+    return enqueue(agent, input.prompt, ctx)
+  end)
+  if not ok or not admitted then
+    local failure = tostring(ok and err or admitted)
+    local closed, close_err = agent:close(ctx)
+    if not closed then
+      failure = failure .. "; cleanup close failed for " .. task_id .. ": " .. tostring(close_err)
+    else
+      local retired, retire_err = agent:retire(ctx)
+      if not retired then
+        failure = failure .. "; cleanup retire failed for " .. task_id .. ": " .. tostring(retire_err)
+      end
+    end
+    if committed then
+      local removed, remove_err = policy:update(ctx, function(tasks)
+        tasks[task_id] = nil
+        return tasks
+      end)
+      if not removed then
+        failure = failure .. "; policy cleanup failed: " .. tostring(remove_err)
+      end
+    end
+    return nil, failure
   end
-  local task = {
-    agent = agent,
-    turns = turns,
-    owner = agent:_makima_task_owner(ctx),
-    description = input.description,
-    closed = false,
-    writes = spec.subagent_type == "general",
-  }
-  tasks[task_id] = task
-  task_order[#task_order + 1] = task_id
-  local admitted, enqueue_err = enqueue(task, input.prompt, ctx)
-  if not admitted then
-    fail_task(task, enqueue_err, ctx)
-    tasks[task_id] = nil
-    table.remove(task_order)
-    return nil, enqueue_err
-  end
-  return { task_id = task_id, turn_id = admitted }, nil
+  return { task_id = task_id, turn_id = admitted }
 end
 
 local function rendered_reply(rendered, output, is_error, state)
@@ -390,16 +291,46 @@ local function label_buf(text)
   return buf
 end
 
-local function resolve_task(task_id)
+local function resolve_task(task_id, ctx)
+  local tasks, policy_err = task_policy(ctx)
+  if not tasks then
+    return nil, policy_err
+  end
   local task = tasks[task_id]
   if not task then
     return nil, UNKNOWN_TASK_ERR
   end
-  if not task.owner:_makima_can_control() then
-    return nil, TASK_ACCESS_ERR
+  local agent, err = makima.agent.get(ctx, task_id)
+  if not agent then
+    return nil, err
   end
-  return task, nil
+  return task, nil, agent
 end
+
+makima.api.register_command({
+  name = "/task-retire",
+  description = "Retire an accessible quiescent leaf agent, preserving its history and results.",
+  tui_only = false,
+  argument_hint = "<task_or_agent_id>",
+  arguments = {
+    { name = "task_or_agent_id", type = "string" },
+  },
+  handler = function(opts, ctx)
+    if not ctx then
+      error(RETIRE_CONTEXT_ERR)
+    end
+    local id = opts.values.task_or_agent_id
+    local agent, err = makima.agent.get(ctx, id)
+    if not agent then
+      error(err)
+    end
+    local ok
+    ok, err = agent:retire(ctx)
+    if not ok then
+      error(err)
+    end
+  end,
+})
 
 -- task_despawn ---------------------------------------------------------------
 
@@ -642,7 +573,7 @@ local send_schema = {
 }
 
 local function send_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
+  local task, access_err, agent = resolve_task(input.task_id, ctx)
   local state = task and { description = task.description } or nil
   local finish_view = send_view(input, ctx, state)
   local function reply(output, is_error)
@@ -658,7 +589,7 @@ local function send_handler(input, ctx)
   if task.writes and mode == "plan" then
     return reply(GENERAL_SEND_IN_PLAN_ERR, true)
   end
-  local ok, err = enqueue(task, input.message, ctx)
+  local ok, err = enqueue(agent, input.message, ctx)
   if not ok then
     return reply(err, true)
   end
@@ -685,7 +616,7 @@ local function spawn_handler(input, ctx)
 end
 
 local function despawn_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
+  local task, access_err, agent = resolve_task(input.task_id, ctx)
   local state = task and { description = task.description } or nil
   local function reply(output, is_error)
     return rendered_reply(despawn_view(input, output, is_error, state), output, is_error, state)
@@ -693,32 +624,24 @@ local function despawn_handler(input, ctx)
   if not task then
     return reply(access_err, true)
   end
-  fail_task(task, TASK_CLOSED_ERR, ctx)
-  tasks[input.task_id] = nil
-  for i, id in ipairs(task_order) do
-    if id == input.task_id then
-      table.remove(task_order, i)
-      break
-    end
+  local closed, err = agent:close(ctx)
+  if not closed then
+    return reply(err, true)
   end
   return reply(makima.json.encode({ ok = true }))
 end
 
 local function stop_handler(input, ctx)
-  local task = tasks[input.task_id]
+  local task, access_err, agent = resolve_task(input.task_id, ctx)
   if task then
-    if not task.owner:_makima_can_control() then
-      return { llm_output = TASK_ACCESS_ERR, is_error = true }
-    end
-    fail_task(task, TASK_CLOSED_ERR, ctx)
-    tasks[input.task_id] = nil
-    for i, id in ipairs(task_order) do
-      if id == input.task_id then
-        table.remove(task_order, i)
-        break
-      end
+    local closed, err = agent:close(ctx)
+    if not closed then
+      return { llm_output = err, is_error = true }
     end
     return makima.json.encode({ ok = true, task_id = input.task_id })
+  end
+  if access_err ~= UNKNOWN_TASK_ERR then
+    return { llm_output = access_err, is_error = true }
   end
   local ok, err = ctx:stop_background(input.task_id)
   if not ok then
@@ -738,7 +661,7 @@ local function restore_stop(input, output, is_error, ctx)
 end
 
 local function wait_handler(input, ctx)
-  local task, access_err = resolve_task(input.task_id)
+  local task, access_err, agent = resolve_task(input.task_id, ctx)
   local state = task and { description = task.description } or nil
   local function reply(output, is_error)
     return rendered_reply(wait_view(input, output, is_error, ctx, state), output, is_error, state)
@@ -753,7 +676,22 @@ local function wait_handler(input, ctx)
   makima.async.on_cancel(function(reason)
     waiting:set_lines({ { { "Wait failed: " .. reason, "error" } } })
   end)
-  local result, wait_err = task.turns:wait(ctx, input.turn_id, input.timeout)
+  local ticket, turn_err
+  if input.turn_id then
+    ticket, turn_err = agent:turn(ctx, input.turn_id)
+  else
+    ticket, turn_err = agent:latest_turn(ctx)
+  end
+  if not ticket then
+    if turn_err and turn_err:sub(1, #TURN_UNAVAILABLE_ERR) == TURN_UNAVAILABLE_ERR then
+      turn_err = TURN_UNAVAILABLE_ERR
+    end
+    return reply(turn_err or TURN_UNAVAILABLE_ERR, true)
+  end
+  local result, wait_err = ticket:wait(ctx, { timeout = input.timeout })
+  if result then
+    result = project_result(result)
+  end
   if wait_err == TURN_WAIT_TIMEOUT then
     return reply(makima.json.encode({ status = "running" }))
   end
@@ -780,7 +718,7 @@ local function restore_spawn(input, output, is_error, ctx)
 end
 
 local function task_header(input)
-  return wait_label(input, resolve_task(input.task_id))
+  return wait_label(input)
 end
 local function header(input)
   return input.description
@@ -823,14 +761,14 @@ makima.api.register_tool({
   schema = send_schema,
   handler = send_handler,
   header = function(input)
-    return send_label(input, resolve_task(input.task_id))
+    return send_label(input)
   end,
   restore = restore_send,
 })
 
 makima.api.register_tool({
   name = "task_despawn",
-  description = "Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. Unlike local UI cancellation, this retires the subtree. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
+  description = "Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. This does not retire their durable identities. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},

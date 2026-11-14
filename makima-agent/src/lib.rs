@@ -7,6 +7,7 @@ pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
+pub mod journal;
 pub mod mailbox;
 pub mod manager;
 pub mod mcp;
@@ -39,7 +40,7 @@ pub use makima_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOut
 pub use manager::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
     CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
-    PromptWaitError, ShutdownReport, TurnPermitLease,
+    PromptWaitError, ShutdownReport, TurnPermitLease, WeakAgentManagerHandle,
 };
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
@@ -47,13 +48,26 @@ pub use mcp::{
 pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub mod command;
 pub mod config_change;
+pub mod context;
+#[cfg(test)]
+mod context_journal_tests;
 pub mod diff;
+pub mod file_restore;
+pub mod parent_rewind;
 pub mod permissions;
+pub mod plan_state;
 pub mod prompt;
+pub mod rewind;
 pub mod session_checkpoint;
 pub mod session_coordinator;
 pub mod session_defaults;
 pub mod session_options;
+pub mod session_recovery;
+pub mod state;
+pub use state::{
+    RawStateSnapshot, StateAccess, StateChangeEvent, StateChangeReason, StateEdit, StateError,
+    StateRevision, StateScope, StateSlot, StateSlotSpec, StateSnapshot,
+};
 pub mod template;
 pub mod tools;
 pub use tools::ToolFilter;

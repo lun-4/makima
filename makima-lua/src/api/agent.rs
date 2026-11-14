@@ -3,10 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 mod handles;
+mod reactivation;
 mod structured_output;
 use structured_output::StructuredOutput;
 
@@ -22,14 +24,19 @@ use handles::{
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use makima_agent::actor::{
-    ActorBackend, AdmissionPreparation, AgentContextSnapshot, BackendResult, EffectiveAgentConfig,
-    ModeCeiling, PreparedModel, PreparedReadiness, TurnContext, WorkKind,
+    ActorBackend, ActorHistory, AdmissionPreparation, AgentContextSnapshot, BackendResult,
+    ConfigChange, EffectiveAgentConfig, ModeCeiling, PreparedModel, PreparedReadiness, TurnContext,
+    WorkKind,
 };
 use makima_agent::agent::{PromptSlotSource, TurnSetup, build_mode_system_prompt, tool_dispatch};
 use makima_agent::cancel::CancelMap;
-use makima_agent::config_change::{ConfigChangeError, prepare_model, unresolved_model};
+use makima_agent::config_change::{
+    ConfigChangeError, ConfigChangeTicket, prepare_model, unresolved_model,
+};
+use makima_agent::context::root_context;
 use makima_agent::headless::default_model_preparer;
-use makima_agent::session_coordinator::ModelPreparer;
+use makima_agent::manager::{AgentIncarnation, ReactivationError, ResidentAgent};
+use makima_agent::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use makima_agent::template::env_vars_for;
 use makima_agent::tools::interpreter_bridge;
 use makima_agent::tools::offload::OffloadStore;
@@ -51,7 +58,9 @@ use makima_lua_macro::{lua_fn, lua_table};
 use makima_providers::model::ModelTier;
 use makima_providers::provider;
 use makima_providers::{Model, ModelError, ModelSelection, RequestOptions, TokenUsage, add_cost};
+use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::MakimaId;
+use makima_storage::session_state::{SessionStateView, StoredAgentSpec, StoredModeCeiling};
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -69,12 +78,15 @@ use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::orchestration::{OrchestrationServices, TrustedContext};
 use crate::runtime::Request;
 
+const RECORDED_INSTRUCTIONS_UNAVAILABLE: &str =
+    "recorded instructions are unavailable for this invocation";
 const MANAGED_POLICY_MISSING_ERR: &str = "managed agent turn is missing its admitted configuration";
 const COMPACT_PARAMS_MISSING_ERR: &str = "compaction requires initialized agent parameters";
 const COMPACT_CONFIG_MISSING_ERR: &str =
     "compaction was admitted without an effective agent configuration";
 const INVALID_SHOW_OPTION: &str = "show must be a boolean or string";
 const UNNAMED_AGENT_LABEL: &str = "agent";
+const LOCAL_TOOLS_NOT_RESTORABLE: &str = "agent uses plugin-local tools";
 const SPAWN_OPTIONS: &[&str] = &[
     "audience",
     "auto_deliver",
@@ -172,6 +184,7 @@ struct LuaActorState {
     history_relayed: std::sync::atomic::AtomicBool,
     close_notified: std::sync::atomic::AtomicBool,
     relay_snapshot: Mutex<HistorySnapshot>,
+    detached: AtomicBool,
 }
 
 impl LuaActorState {
@@ -211,7 +224,7 @@ impl LuaActorState {
     /// Close-time fallback: emit an existing transcript exactly once, but
     /// never an empty snapshot or one belonging to queued-only work.
     fn relay_snapshot_if_pending(&self) {
-        if self.silent {
+        if self.silent || self.detached.load(Ordering::Acquire) {
             return;
         }
         if self
@@ -248,6 +261,7 @@ impl LuaActorState {
     fn take_close_notification(&self) -> Option<Envelope> {
         let subagent = self.subagent_info.get()?;
         if self.silent
+            || self.detached.load(Ordering::Acquire)
             || self
                 .close_notified
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -333,7 +347,7 @@ impl ActorBackend for LuaActorBackend {
 
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         mut input: AgentInput,
         _work: WorkKind,
@@ -447,7 +461,7 @@ impl ActorBackend for LuaActorBackend {
             let mut agent = Agent::for_actor_turn(
                 params,
                 AgentRunParams {
-                    history,
+                    history: history.reborrow(),
                     system,
                     event_tx,
                     tools: state.tools.clone(),
@@ -486,7 +500,8 @@ impl ActorBackend for LuaActorBackend {
             {
                 context.output.append_output(value.clone());
             }
-            if let Some(completion) = &self.completion
+            if !state.detached.load(Ordering::Acquire)
+                && let Some(completion) = &self.completion
                 && let Some(current) = &context.managed_turn
             {
                 let result = match current.agent_ref() {
@@ -504,14 +519,14 @@ impl ActorBackend for LuaActorBackend {
                     }
                 }
             }
-            state.relay_history(history);
+            state.relay_history(&history);
             BackendResult::EnteredRun(outcome)
         })
     }
 
     fn run_control<'a>(
         &'a mut self,
-        _history: &'a mut History,
+        _history: ActorHistory<'a>,
         _context: TurnContext,
         control: &'a makima_agent::ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -524,7 +539,7 @@ impl ActorBackend for LuaActorBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -557,7 +572,7 @@ impl ActorBackend for LuaActorBackend {
                 &provider,
                 &settings.provider,
                 &model,
-                history,
+                history.reborrow(),
                 &event_tx,
                 &context.cancel,
                 &params.config,
@@ -567,7 +582,7 @@ impl ActorBackend for LuaActorBackend {
             .await
             {
                 Ok(()) => {
-                    state.relay_history(history);
+                    state.relay_history(&history);
                     BackendResult::CompactDone
                 }
                 Err(error) => {
@@ -627,6 +642,7 @@ fn resolve_ctx<'a>(lua: &Lua, ctx: &'a LuaCtx) -> Result<&'a AgentContext, Strin
 }
 
 /// Forwards subagent events to the parent, stamped with the subagent identity.
+#[cfg(test)]
 async fn relay_session_events(
     sub_rx: flume::Receiver<Envelope>,
     parent_tx: EventSender,
@@ -634,9 +650,26 @@ async fn relay_session_events(
     live_sink: Option<flume::Sender<ToolLive>>,
     silent: bool,
 ) {
+    relay_session_events_scoped(sub_rx, parent_tx, subagent_info, live_sink, silent, None).await;
+}
+
+async fn relay_session_events_scoped(
+    sub_rx: flume::Receiver<Envelope>,
+    parent_tx: EventSender,
+    subagent_info: Arc<OnceLock<SubagentInfo>>,
+    live_sink: Option<flume::Sender<ToolLive>>,
+    silent: bool,
+    state: Option<Weak<LuaActorState>>,
+) {
     let mut cost = None;
     while let Ok(mut envelope) = sub_rx.recv_async().await {
-        if silent {
+        if silent
+            || state.as_ref().is_some_and(|state| {
+                state
+                    .upgrade()
+                    .is_none_or(|state| state.detached.load(Ordering::Acquire))
+            })
+        {
             continue;
         }
         match &envelope.event {
@@ -706,7 +739,7 @@ async fn resolve_model(
 ///   `prompt_id` (string) - one of `"research"`, `"general"`, `"system"`.
 /// Optional fields:
 ///   `instructions` (string|boolean?) - extra text appended to the prompt.
-///     `true` loads instructions from the project `.makima/instructions` file.
+///     `true` uses the invoking turn's recorded instructions.
 ///     `false` or nil omits them.
 /// @return (string?, string?) The assembled prompt string, or `(nil, err)` on failure.
 /// @example
@@ -722,11 +755,13 @@ async fn system_prompt(
     opts: Table,
 ) -> LuaResult<Pair<String>> {
     let agent = try_pair!(dispatch_ctx(&lua, &ctx, "system_prompt"));
-    let slots = Arc::clone(&agent.prompt_slots);
+    let root_context = agent.root_context.clone();
+    let slots = root_context.as_ref().map_or_else(
+        || Arc::clone(&agent.prompt_slots),
+        |context| Arc::clone(&context.slots),
+    );
     let vars = env_vars_for(&agent.cwd);
     let invocation = try_pair!(InvocationGuard::capture(&lua));
-    // Nothing may hold the ctx borrow across the wait: a cancel hook firing
-    // meanwhile needs `ctx:finish`, which takes it mutably.
     drop(ctx);
     let prompt_id_str: String = opts.get("prompt_id")?;
     let prompt_id = match prompt_id_str.as_str() {
@@ -738,10 +773,12 @@ async fn system_prompt(
 
     let instructions_val: LuaValue = opts.get("instructions")?;
     let instructions = match instructions_val {
-        LuaValue::Boolean(true) => {
-            let cwd = vars.apply("{cwd}").into_owned();
-            smol::unblock(move || makima_agent::agent::load_instruction_text(&cwd)).await
-        }
+        LuaValue::Boolean(true) => try_pair!(
+            root_context
+                .as_ref()
+                .map(|context| context.instructions.text.clone())
+                .ok_or(RECORDED_INSTRUCTIONS_UNAVAILABLE)
+        ),
         LuaValue::Boolean(false) | LuaValue::Nil => String::new(),
         LuaValue::String(s) => s.to_str()?.to_owned(),
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
@@ -1102,9 +1139,37 @@ impl SessionParent {
                 template.apply_effective_config(&config);
                 template.cwd = config.context.cwd().to_path_buf();
             }
+            if template.root_context.is_none() {
+                template.root_context = root_context(&trusted.target.state_access())
+                    .map_err(|error| error.to_string())?;
+            }
             return Ok(AgentContext::from(&template));
         }
         dispatch_ctx(lua, ctx, "session").cloned()
+    }
+
+    async fn ensure_root_context(&mut self, lua: &Lua, ctx: &LuaCtx) -> Result<(), String> {
+        if let Some(trusted) = &self.trusted
+            && self.context.root_context.is_none()
+            && let Some(session) = &self.context.session_id
+            && let Ok(coordinator) = SessionCoordinatorHandle::resolve(session.id())
+        {
+            let root = trusted
+                .target
+                .manager()
+                .root()
+                .map_err(|error| error.to_string())?;
+            let actor = root.actor().map_err(|error| error.to_string())?;
+            let recorded = coordinator
+                .ensure_root_context_for_actor(&actor)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.revalidate(lua, ctx)?;
+            let mut template = self.context.to_tool_context();
+            template.root_context = Some(recorded);
+            self.context = AgentContext::from(&template);
+        }
+        Ok(())
     }
 
     fn revalidate(&self, lua: &Lua, ctx: &LuaCtx) -> Result<(), String> {
@@ -1430,6 +1495,14 @@ fn add_lua_local_tools(
         let audience =
             parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
         let weak = lua.weak();
+        let owner = crate::runtime::current_plugin(lua)
+            .map(|(plugin, _)| crate::orchestration::plugin_authority(lua, plugin));
+        let handler = lua.create_function(move |_, input: LuaValue| {
+            if owner.as_ref().is_some_and(|owner| !owner.is_alive()) {
+                return Err(mlua::Error::runtime(INVOCATION_EXPIRED));
+            }
+            handler.call::<mlua::MultiValue>(input)
+        })?;
         local.insert(
             name,
             makima_agent::tools::local_tool(audience, move |input, ctx| {
@@ -1583,6 +1656,7 @@ fn agent_params(
         timeouts: context.timeouts,
         file_tracker: FileReadTracker::fresh(),
         prompt_slots: Arc::clone(&context.prompt_slots),
+        root_context: context.root_context.clone(),
         modes: Arc::clone(&context.modes),
         subagent_cancels: Arc::new(CancelMap::new()),
         registry: Arc::clone(&context.registry),
@@ -1617,6 +1691,7 @@ fn spawn_session_actor(
         );
     };
     let metadata = makima_agent::AgentMetadata {
+        transcript_key: Some(state.ui_id.clone()),
         label: (!state.name.is_empty()).then_some(state.name.clone()),
         spawned_by_tool_use_id: parent.context.tool_use_id.clone(),
     };
@@ -1670,7 +1745,7 @@ async fn build_session(
     ctx: mlua::UserDataRef<LuaCtx>,
     opts: Table,
 ) -> LuaResult<Pair<LuaSession>> {
-    let parent = try_pair!(SessionParent::resolve(&lua, &ctx));
+    let mut parent = try_pair!(SessionParent::resolve(&lua, &ctx));
     let mut options = try_pair!(SessionOptions::parse(&lua, &opts, &parent)?);
 
     let required_output = opts.get::<Option<LuaValue>>("output_schema")?.is_some();
@@ -1684,6 +1759,7 @@ async fn build_session(
         required_output,
         Some(&initial_mode_def)
     ));
+    try_pair!(parent.ensure_root_context(&lua, &ctx).await);
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
         .map(|p| Arc::clone(&p));
@@ -1713,6 +1789,41 @@ async fn build_session(
         initial_config.mode_def.as_ref(),
     ));
 
+    let spec = StoredAgentSpec {
+        model: ModelSelection {
+            spec: Some(child.model.spec().into()),
+            thinking: Some(child.opts.thinking),
+            fast: Some(child.opts.fast),
+        },
+        system: options.system.clone().unwrap_or_default(),
+        tools: tools
+            .request
+            .definitions()
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        audience: options.audience.name().unwrap_or("model").into(),
+        mcp: options.mcp,
+        output_schema: opts
+            .get::<Option<LuaValue>>("output_schema")?
+            .map(|value| lua_to_json(&lua, &value))
+            .transpose()?,
+        name: (!options.name.is_empty()).then(|| options.name.clone()),
+        silent: options.silent,
+        auto_deliver: options.auto_deliver,
+        inherit_provider: options.inherit_provider,
+        mode_ceiling: StoredModeCeiling::from(&initial_config.mode_authority().unwrap_or_default()),
+        plugin: crate::runtime::current_plugin(&lua).map(|(plugin, _)| plugin.to_string()),
+    };
+    let restorable = if tools
+        .local
+        .keys()
+        .any(|name| name != structured_output::TOOL_NAME || tools.structured.is_none())
+    {
+        Err(LOCAL_TOOLS_NOT_RESTORABLE.to_owned())
+    } else {
+        Ok(())
+    };
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let (answer_tx, answer_rx) = match parent.context.user_response_rx {
         Some(_) => {
@@ -1726,6 +1837,19 @@ async fn build_session(
         .context
         .tool_use_id
         .clone()
+        .filter(|key| {
+            let manager = parent
+                .managed_turn
+                .as_ref()
+                .map(CurrentManagedTurn::manager)
+                .or_else(|| {
+                    parent
+                        .trusted
+                        .as_ref()
+                        .map(|trusted| trusted.target.manager())
+                });
+            manager.is_none_or(|manager| !manager.transcript_key_in_use(key))
+        })
         .unwrap_or_else(|| format!("session-{}", MakimaId::generate()));
     let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
     let cancel = SubagentCancel::new({
@@ -1777,6 +1901,7 @@ async fn build_session(
         history_relayed: std::sync::atomic::AtomicBool::new(false),
         close_notified: std::sync::atomic::AtomicBool::new(false),
         relay_snapshot: Mutex::default(),
+        detached: AtomicBool::new(false),
     });
     let (actor, agent) = try_pair!(spawn_session_actor(
         &lua,
@@ -1791,6 +1916,14 @@ async fn build_session(
             &options
         ),
     ));
+    let incarnation = try_pair!(agent.manager().incarnation(agent.id()));
+    if let Err(error) = agent
+        .manager()
+        .set_agent_restoration(&incarnation, spec, restorable)
+    {
+        let _ = agent.close_subtree();
+        return Ok(err_pair(error));
+    }
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
     if !options.silent
@@ -1799,12 +1932,13 @@ async fn build_session(
         let _ = sink.send(ToolLive::Annotation(model_annotation));
     }
     info!(name = %options.name, model = %model_id, "subagent session opened");
-    smol::spawn(relay_session_events(
+    smol::spawn(relay_session_events_scoped(
         sub_rx,
         parent.context.event_tx.clone(),
         subagent_info,
         parent.context.live_sink.clone(),
         options.silent,
+        Some(Arc::downgrade(&state)),
     ))
     .detach();
 
@@ -1814,7 +1948,9 @@ async fn build_session(
         agent_id: actor.agent_id(),
         actor: Arc::new(actor),
         state,
+        incarnation,
         agent,
+        services: crate::orchestration::services(&lua),
     };
     let session = try_pair!(register_session(&lua, sess, child_template));
     if let (Some(description), Some(trusted)) = (options.show, &parent.trusted) {
@@ -1826,7 +1962,7 @@ async fn build_session(
         let post = Post {
             text: description.map_or_else(|| label.to_owned(), |text| format!("{label}: {text}")),
             level: Default::default(),
-            agent: Some(session.state.ui_id.clone()),
+            agent: Some(session.agent_id.to_string()),
         };
         if let Err(error) = send_post(&lua, trusted, post) {
             warn!(name = %options.name, %error, "could not show spawned agent");
@@ -1840,10 +1976,34 @@ async fn build_session(
 pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Result<(), String> {
     let event = AgentEvent::Post(post);
     let Some(state) = handles::session_state(lua, target.target.id()) else {
+        let record = target.target.manager().journal().agent(target.target.id());
+        if record
+            .as_ref()
+            .is_some_and(|record| record.spec.as_ref().is_some_and(|spec| spec.silent))
+        {
+            return Err(POST_TARGET_SILENT.into());
+        }
+        let subagent = record
+            .filter(|record| record.parent.is_some())
+            .map(|record| SubagentInfo {
+                agent_id: record.id,
+                parent_agent_id: record.parent,
+                parent_tool_use_id: record.transcript_key,
+                name: record.label.unwrap_or_else(|| record.id.to_string()),
+                prompt: None,
+                model: None,
+                opts: None,
+                answer_tx: None,
+                cancel: None,
+            });
         return target
             .template
             .event_tx
-            .send(event)
+            .send_envelope(Envelope {
+                event,
+                subagent,
+                identity: target.template.event_tx.identity(),
+            })
             .map_err(|error| error.to_string());
     };
     if state.silent {
@@ -1975,6 +2135,28 @@ impl InvocationGuard {
         Ok(guard)
     }
 
+    fn claim<T>(
+        &self,
+        owner: Option<&crate::orchestration::PluginAuthority>,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let task = self.task.upgrade().ok_or(INVOCATION_EXPIRED)?;
+        let effect = || {
+            let cell = crate::runtime::lock_cell(&task);
+            if !cell.is_live() {
+                return Err(INVOCATION_EXPIRED.into());
+            }
+            effect()
+        };
+        match &self.plugin {
+            Some((_, caller)) => caller.claim_effect_with(owner, effect),
+            None => match owner {
+                Some(owner) => owner.claim_effect(effect),
+                None => effect(),
+            },
+        }
+    }
+
     fn validate(&self, lua: &Lua) -> Result<(), String> {
         let task = self.task.upgrade().ok_or(INVOCATION_EXPIRED)?;
         {
@@ -1998,6 +2180,244 @@ impl InvocationGuard {
     }
 }
 
+async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Result<(), String> {
+    handles::authorize_agent(lua, ctx, agent)?;
+    if agent.manager.is_live(agent.id) {
+        return Ok(());
+    }
+    let guard = InvocationGuard::capture(lua)?;
+    let activation_ctx = ctx.clone();
+    let manager = agent.manager.clone();
+    let activation_manager = manager.clone();
+    let activation_lua = lua.clone();
+    let activation_journal = manager.journal();
+    manager
+        .ensure_resident_with(agent.id, |input| async move {
+            let lua = activation_lua;
+            let services = crate::orchestration::services(&lua).ok_or_else(|| {
+                ReactivationError::Initialization("agent host is unavailable".into())
+            })?;
+            let root = activation_manager
+                .root()
+                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            let mut template = services
+                .template(&root)
+                .map_err(ReactivationError::Initialization)?;
+            template.root_context = root_context(&root.state_access())
+                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            let context = AgentContext::from(&template);
+            let owner = input
+                .record
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.plugin.as_deref())
+                .map(Arc::<str>::from);
+            let authority = owner
+                .as_ref()
+                .map(|plugin| crate::orchestration::plugin_authority(&lua, plugin.clone()));
+            let snapshot = activation_journal.snapshot();
+            let view =
+                SessionStateView::fold(&snapshot.state, &snapshot.agent_revisions, snapshot.seq)
+                    .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            let prepared =
+                reactivation::prepare(&lua, &input.record, input.config.as_ref(), context, &view)
+                    .await?;
+            guard
+                .validate(&lua)
+                .map_err(ReactivationError::Initialization)?;
+            if let Some((plugin, authority)) = owner.as_ref().zip(authority.as_ref())
+                && (!authority.is_alive()
+                    || !Arc::ptr_eq(
+                        authority,
+                        &crate::orchestration::plugin_authority(&lua, plugin.clone()),
+                    ))
+            {
+                return Err(ReactivationError::Initialization(INVOCATION_EXPIRED.into()));
+            }
+            let reactivation::PreparedReactivation {
+                mut options,
+                tools,
+                child,
+                config,
+                template,
+                context,
+                commit,
+                warning,
+                prompt_slots,
+            } = prepared;
+            let (sub_tx, sub_rx) = flume::unbounded();
+            let (answer_tx, answer_rx) = if context.user_response_rx.is_some() {
+                let (tx, rx) = flume::unbounded();
+                (Some(tx), Some(Arc::new(AsyncMutex::new(rx))))
+            } else {
+                (None, None)
+            };
+            let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
+            let cancel = SubagentCancel::new({
+                let actor = cancel_actor.clone();
+                move || {
+                    if let Some(actor) = actor.lock().unwrap().as_ref() {
+                        actor.cancel_all();
+                    }
+                }
+            });
+            let state = Arc::new(LuaActorState {
+                template: OnceLock::from(template.clone()),
+                params: OnceLock::from(agent_params(
+                    &context,
+                    input.record.id,
+                    child.model,
+                    child.provider,
+                    &options,
+                )),
+                prompt_slots,
+                custom_system: options.system.take().unwrap_or_default(),
+                tools: tools.request,
+                opts: child.opts,
+                mcp: template.mcp.clone(),
+                chip_event_tx: EventSender::with_identity(sub_tx, context.event_tx.identity()),
+                answer_rx,
+                answer_tx,
+                ui_id: input.record.transcript_key.clone(),
+                parent_event_tx: context.event_tx.clone(),
+                cancel,
+                parent_agent_id: input.record.parent,
+                auto_deliver: options.auto_deliver,
+                silent: options.silent,
+                subagent_info: Arc::new(OnceLock::new()),
+                local_tools: Arc::new(tools.local),
+                structured: tools.structured,
+                name: options.name,
+                commit,
+                start: Instant::now(),
+                history_relayed: AtomicBool::new(true),
+                close_notified: AtomicBool::new(false),
+                relay_snapshot: Mutex::new(input.history),
+                detached: AtomicBool::new(false),
+            });
+            let mut backend = LuaActorBackend::new(state.clone());
+            backend.offload = context.offload.clone();
+            backend.completion = Some(services.clone());
+            Ok(ResidentAgent {
+                backend: Box::new(backend),
+                config,
+                shared_messages: None,
+                start: None,
+                initialize: Some(Box::new(move |initialization| {
+                    Box::pin(async move {
+                        guard
+                            .validate(&lua)
+                            .map_err(ReactivationError::Initialization)?;
+                        initialization
+                            .actor
+                            .configure_parent_delivery(state.auto_deliver && !state.silent)
+                            .map_err(|error| {
+                                ReactivationError::Initialization(error.to_string())
+                            })?;
+                        if warning.is_some() {
+                            let actor = initialization.actor.clone();
+                            let target = initialization.agent.clone();
+                            let incarnation = initialization.incarnation.clone();
+                            let ticket = ConfigChangeTicket::reserve_for_actor(
+                                actor,
+                                CheckpointPublication::default(),
+                                |publication| {
+                                    target.manager().validate_activation(&incarnation)?;
+                                    services.reserve_config_mutation(&target, publication)
+                                },
+                            )
+                            .map_err(|error| {
+                                ReactivationError::Initialization(error.to_string())
+                            })?;
+                            ticket
+                                .commit(async |publication, config| {
+                                    let claim =
+                                        activation_ctx.publication_claim(&lua, &publication)?;
+                                    target.manager().validate_activation(&incarnation)?;
+                                    let owner_registration = authority
+                                        .as_ref()
+                                        .map(|owner| owner.register_publication(&publication));
+                                    let guarded: CheckpointClaim = Arc::new(move |publication| {
+                                        let _registration = &owner_registration;
+                                        claim(publication)
+                                    });
+                                    Ok((
+                                        guarded,
+                                        ConfigChange::Mode {
+                                            mode: config.mode.clone(),
+                                            mode_def: config.mode_def.clone(),
+                                        },
+                                    ))
+                                })
+                                .await
+                                .map_err(|error| {
+                                    ReactivationError::Initialization(error.to_string())
+                                })?;
+                        }
+                        let install = || {
+                            let current = crate::orchestration::services(&lua)
+                                .ok_or("agent host is unavailable")?;
+                            if !Arc::ptr_eq(&services, &current) {
+                                return Err("agent host changed during activation".into());
+                            }
+                            services.validate_target(&initialization.agent)?;
+                            initialization
+                                .agent
+                                .manager()
+                                .validate_incarnation(&initialization.incarnation)
+                                .map_err(|error| error.to_string())?;
+                            services.register_child_activation(
+                                crate::orchestration::TrustedTarget {
+                                    target: initialization.agent.clone(),
+                                    template,
+                                },
+                                state.ui_id.clone(),
+                                &initialization.actor,
+                                &initialization.incarnation,
+                            )?;
+                            *cancel_actor.lock().unwrap() = Some(initialization.actor.clone());
+                            let session = LuaSession {
+                                agent_id: initialization.agent.id(),
+                                actor: Arc::new(initialization.actor),
+                                state: state.clone(),
+                                agent: initialization.agent,
+                                incarnation: initialization.incarnation,
+                                services: Some(services.clone()),
+                            };
+                            handles::retain_session(&lua, session, owner);
+                            smol::spawn(relay_session_events_scoped(
+                                sub_rx,
+                                state.parent_event_tx.clone(),
+                                state.subagent_info.clone(),
+                                None,
+                                state.silent,
+                                Some(Arc::downgrade(&state)),
+                            ))
+                            .detach();
+                            if let Some(message) = warning {
+                                let _ = state
+                                    .parent_event_tx
+                                    .send(AgentEvent::ControlError { message });
+                            }
+                            Ok(())
+                        };
+                        guard
+                            .claim(authority.as_deref(), install)
+                            .map_err(ReactivationError::Initialization)
+                    })
+                })),
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    handles::authorize_agent(lua, ctx, agent)?;
+    Ok(())
+}
+
+pub(crate) fn detach_all_agents(lua: &Lua) {
+    handles::detach_all_agents(lua);
+}
+
 pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
     handles::close_plugin_agents(lua, plugin);
 }
@@ -2007,21 +2427,31 @@ struct LuaSession {
     actor: Arc<AgentActorHandle>,
     state: Arc<LuaActorState>,
     agent: AgentRef,
+    incarnation: AgentIncarnation,
+    services: Option<Arc<dyn OrchestrationServices>>,
 }
 
 impl LuaSession {
     fn close_controlled(&self) {
+        if self
+            .agent
+            .manager()
+            .close_incarnation(&self.incarnation)
+            .is_err()
+        {
+            return;
+        }
         self.state.notify_closed_ordered();
-        let _ = self.agent.close_subtree();
     }
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
-        // The actor retains every terminal outcome; closing it first would
-        // terminalize queued turns. The history fallback fires once, only if
-        // no executed turn relayed already.
-        self.close_controlled();
+        self.state.detached.store(true, Ordering::Release);
+        if let Some(services) = &self.services {
+            services.unregister_child_target(&self.agent, &self.actor.identity());
+        }
+        let _ = self.agent.manager().detach_incarnation(&self.incarnation);
         let snapshot = self.actor.snapshot();
         info!(
             name = %self.state.name,
@@ -2297,7 +2727,7 @@ mod tests {
             let mut history = History::new(vec![Message::user("original child prompt".into())]);
             let original = serde_json::to_value(history.as_slice()).unwrap();
             let result = LuaActorBackend::new(Arc::clone(&state))
-                .run_compact(&mut history, context, None)
+                .run_compact(ActorHistory::new(&mut history), context, None)
                 .await;
             if configured {
                 assert!(matches!(result, BackendResult::CompactDone));
@@ -2482,6 +2912,7 @@ mod tests {
             timeouts: ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&ctx.prompt_slots),
+            root_context: ctx.root_context.clone(),
             modes: Arc::clone(&ctx.modes),
             subagent_cancels: Arc::new(CancelMap::new()),
             registry: Arc::clone(makima_agent::tools::ToolRegistry::global_arc()),
@@ -2532,6 +2963,7 @@ mod tests {
             history_relayed: std::sync::atomic::AtomicBool::new(false),
             close_notified: std::sync::atomic::AtomicBool::new(false),
             relay_snapshot: Mutex::default(),
+            detached: AtomicBool::new(false),
         });
         if let Some((sub_rx, gate)) = relay {
             let relay = relay_session_events(
@@ -2608,7 +3040,7 @@ mod tests {
     impl ActorBackend for MissingPolicyBackend {
         fn run_turn<'a>(
             &'a mut self,
-            history: &'a mut History,
+            history: ActorHistory<'a>,
             mut context: TurnContext,
             input: AgentInput,
             work: WorkKind,
@@ -2621,7 +3053,7 @@ mod tests {
 
         fn run_control<'a>(
             &'a mut self,
-            history: &'a mut History,
+            history: ActorHistory<'a>,
             context: TurnContext,
             control: &'a makima_agent::ControlWork,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -2631,7 +3063,7 @@ mod tests {
 
         fn run_compact<'a>(
             &'a mut self,
-            history: &'a mut History,
+            history: ActorHistory<'a>,
             context: TurnContext,
             instructions: Option<&'a str>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -3217,7 +3649,7 @@ mod tests {
         let agent = Agent::new(
             params.clone(),
             AgentRunParams {
-                history: &mut history,
+                history: ActorHistory::new(&mut history),
                 system: String::new(),
                 event_tx: state.chip_event_tx.clone(),
                 tools: state.tools.clone(),

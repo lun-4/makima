@@ -17,7 +17,7 @@
 //! from inside a locked mutable tool), acquisition fails immediately with
 //! `SAME_PATH_MUTATION_IN_PROGRESS` instead of waiting on its own lock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -92,6 +92,36 @@ impl FileWriteLocks {
                 })
             })
             .clone()
+    }
+
+    pub(crate) async fn acquire_all(
+        &self,
+        keys: BTreeSet<PathBuf>,
+        cancel: &CancelToken,
+    ) -> Result<Vec<WriteLockGuard>, String> {
+        loop {
+            let mut guards = Vec::with_capacity(keys.len());
+            let mut busy = None;
+            for key in &keys {
+                if cancel.is_cancelled() {
+                    return Err(CANCELLED.into());
+                }
+                let entry = self.entry(key.clone());
+                let Some(gate) = entry.gate.try_lock_arc() else {
+                    busy = Some(entry);
+                    break;
+                };
+                let owner = self.inner.next_owner.fetch_add(1, Ordering::Relaxed);
+                *entry.holder.lock().expect("lock holder poisoned") = Some(owner);
+                guards.push(WriteLockGuard { entry, owner, gate });
+            }
+            if cancel.is_cancelled() {
+                return Err(CANCELLED.into());
+            }
+            let Some(entry) = busy else { return Ok(guards) };
+            drop(guards);
+            drop(wait_for_gate(&entry, cancel, Deadline::None).await?);
+        }
     }
 
     /// Acquire the gate for `key`, waiting like an independent owner unless
@@ -268,6 +298,82 @@ mod tests {
             assert!(
                 entries.contains_key(&held),
                 "the held entry must survive reclamation"
+            );
+        });
+    }
+
+    #[test]
+    fn lock_set_releases_partial_acquisition_before_waiting_for_nested_writer() {
+        smol::block_on(async {
+            let locks = FileWriteLocks::new();
+            let cancel = CancelToken::none();
+            let first = key("restore-set-a");
+            let second = key("restore-set-b");
+            let outer = locks
+                .acquire(second.clone(), &[], &cancel, Deadline::None)
+                .await
+                .unwrap();
+            let mut restore = Box::pin(
+                locks.acquire_all(BTreeSet::from([first.clone(), second.clone()]), &cancel),
+            );
+            assert!(
+                futures_lite::future::poll_once(restore.as_mut())
+                    .await
+                    .is_none()
+            );
+            let ancestors = [outer.owner()];
+            let mut nested = Box::pin(locks.acquire(first, &ancestors, &cancel, Deadline::None));
+            let inner = futures_lite::future::poll_once(nested.as_mut())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                futures_lite::future::poll_once(restore.as_mut())
+                    .await
+                    .is_none()
+            );
+            drop(inner);
+            drop(outer);
+            let guards = restore.await.unwrap();
+            assert_eq!(guards.len(), 2);
+            let mut writer = Box::pin(locks.acquire(second, &[], &cancel, Deadline::None));
+            assert!(
+                futures_lite::future::poll_once(writer.as_mut())
+                    .await
+                    .is_none()
+            );
+            drop(guards);
+            let _writer = writer.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelled_lock_set_wait_releases_all_partial_guards() {
+        smol::block_on(async {
+            let locks = FileWriteLocks::new();
+            let (trigger, cancel) = CancelToken::new();
+            let independent = CancelToken::none();
+            let first = key("cancel-set-a");
+            let second = key("cancel-set-b");
+            let _outer = locks
+                .acquire(second.clone(), &[], &independent, Deadline::None)
+                .await
+                .unwrap();
+            let mut restore =
+                Box::pin(locks.acquire_all(BTreeSet::from([first.clone(), second]), &cancel));
+            assert!(
+                futures_lite::future::poll_once(restore.as_mut())
+                    .await
+                    .is_none()
+            );
+            trigger.cancel();
+            assert!(matches!(restore.await, Err(message) if message == CANCELLED));
+            let mut writer = Box::pin(locks.acquire(first, &[], &independent, Deadline::None));
+            assert!(
+                futures_lite::future::poll_once(writer.as_mut())
+                    .await
+                    .unwrap()
+                    .is_ok()
             );
         });
     }
