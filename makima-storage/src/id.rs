@@ -57,10 +57,6 @@ macro_rules! lifecycle_id {
             pub fn generate() -> Self {
                 Self(MakimaId::generate())
             }
-
-            pub fn as_makima_id(self) -> MakimaId {
-                self.0
-            }
         }
 
         impl fmt::Display for $name {
@@ -97,10 +93,6 @@ pub struct TurnId(MakimaId);
 impl TurnId {
     pub fn generate() -> Self {
         Self(MakimaId::generate())
-    }
-
-    pub fn as_makima_id(self) -> MakimaId {
-        self.0
     }
 }
 

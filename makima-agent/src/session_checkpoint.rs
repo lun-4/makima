@@ -94,37 +94,7 @@ impl SessionLogCheckpoint {
         cwd: &str,
         publication_guard: Option<SessionPublicationGuard>,
     ) -> Result<Self, CheckpointError> {
-        Self::open_bound(dir, session_id, model, cwd, publication_guard, None)
-    }
-
-    pub fn open_with_root(
-        dir: StateDir,
-        session_id: MakimaId,
-        model: &str,
-        cwd: &str,
-        publication_guard: Option<SessionPublicationGuard>,
-        root: AgentId,
-        parent: Option<ParentLink>,
-    ) -> Result<Self, CheckpointError> {
-        Self::open_bound(
-            dir,
-            session_id,
-            model,
-            cwd,
-            publication_guard,
-            Some((root, parent)),
-        )
-    }
-
-    fn open_bound(
-        dir: StateDir,
-        session_id: MakimaId,
-        model: &str,
-        cwd: &str,
-        publication_guard: Option<SessionPublicationGuard>,
-        root: Option<(AgentId, Option<ParentLink>)>,
-    ) -> Result<Self, CheckpointError> {
-        let mut session = match StoredSession::load(session_id, &dir) {
+        let session = match StoredSession::load(session_id, &dir) {
             Ok(session) => session,
             Err(SessionError::Storage(StorageError::NotFound(_))) => {
                 let mut session = StoredSession::new(model, cwd);
@@ -138,12 +108,6 @@ impl SessionLogCheckpoint {
                 });
             }
         };
-        if let Some((root, parent)) = root {
-            bind_root(&mut session, root, parent).map_err(|error| CheckpointError::Save {
-                session_id,
-                message: Arc::from(error.to_string()),
-            })?;
-        }
         Self::open_with_session(dir, session, publication_guard)
     }
 
@@ -428,40 +392,6 @@ impl SessionLogCheckpoint {
         .await
     }
 
-    pub async fn create_journal(&self) -> Result<Arc<SessionJournal>, CheckpointError> {
-        let binding = Arc::clone(&self.journal);
-        let session_id = self.session_id;
-        self.submit(move |_, session, _| {
-            let mut binding = lock(&binding);
-            if let Some(journal) = binding.as_ref() {
-                journal
-                    .bind_session(session_id)
-                    .map_err(|error| CheckpointError::Save {
-                        session_id,
-                        message: Arc::from(error.to_string()),
-                    })?;
-                return Ok(Arc::clone(journal));
-            }
-            let journal = Arc::new(
-                SessionJournal::from_session(&lock(session).session).map_err(|error| {
-                    CheckpointError::Save {
-                        session_id,
-                        message: Arc::from(error.to_string()),
-                    }
-                })?,
-            );
-            journal
-                .bind_session(session_id)
-                .map_err(|error| CheckpointError::Save {
-                    session_id,
-                    message: Arc::from(error.to_string()),
-                })?;
-            *binding = Some(Arc::clone(&journal));
-            Ok(journal)
-        })
-        .await
-    }
-
     pub async fn bind_journal(&self, journal: Arc<SessionJournal>) -> Result<(), CheckpointError> {
         let binding = Arc::clone(&self.journal);
         let session_id = self.session_id;
@@ -635,29 +565,6 @@ impl SessionLogCheckpoint {
                     message: Arc::from(error.to_string()),
                 }
             })
-        })
-        .await
-    }
-
-    pub async fn resolve_mode(&self, config: &EffectiveAgentConfig) -> Result<(), CheckpointError> {
-        let config = config.clone();
-        let session_id = self.session_id;
-        self.submit(move |_, session, _| {
-            let mut retained = lock(session);
-            let options = retained.session.meta.session_options.clone();
-            let config =
-                stored_agent_config(&config, options).map_err(|error| CheckpointError::Save {
-                    session_id,
-                    message: Arc::from(error.to_string()),
-                })?;
-            retained
-                .session
-                .resolve_legacy_config(config)
-                .map_err(|error| CheckpointError::Save {
-                    session_id,
-                    message: Arc::from(error.to_string()),
-                })?;
-            Ok(())
         })
         .await
     }
@@ -1188,6 +1095,96 @@ mod tests {
     const SIBLING_KEY: &str = "task/sibling";
     const CHILD_NAME: &str = "child";
     const POST_TEXT: &str = "child observation";
+
+    impl SessionLogCheckpoint {
+        fn open_with_root(
+            dir: StateDir,
+            session_id: MakimaId,
+            model: &str,
+            cwd: &str,
+            publication_guard: Option<SessionPublicationGuard>,
+            root: AgentId,
+            parent: Option<ParentLink>,
+        ) -> Result<Self, CheckpointError> {
+            let mut session = match StoredSession::load(session_id, &dir) {
+                Ok(session) => session,
+                Err(SessionError::Storage(StorageError::NotFound(_))) => {
+                    let mut session = StoredSession::new(model, cwd);
+                    session.id = session_id;
+                    session
+                }
+                Err(error) => {
+                    return Err(CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(error.to_string()),
+                    });
+                }
+            };
+            bind_root(&mut session, root, parent).map_err(|error| CheckpointError::Save {
+                session_id,
+                message: Arc::from(error.to_string()),
+            })?;
+            Self::open_with_session(dir, session, publication_guard)
+        }
+
+        async fn create_journal(&self) -> Result<Arc<SessionJournal>, CheckpointError> {
+            let binding = Arc::clone(&self.journal);
+            let session_id = self.session_id;
+            self.submit(move |_, session, _| {
+                let mut binding = lock(&binding);
+                if let Some(journal) = binding.as_ref() {
+                    journal
+                        .bind_session(session_id)
+                        .map_err(|error| CheckpointError::Save {
+                            session_id,
+                            message: Arc::from(error.to_string()),
+                        })?;
+                    return Ok(Arc::clone(journal));
+                }
+                let journal = Arc::new(
+                    SessionJournal::from_session(&lock(session).session).map_err(|error| {
+                        CheckpointError::Save {
+                            session_id,
+                            message: Arc::from(error.to_string()),
+                        }
+                    })?,
+                );
+                journal
+                    .bind_session(session_id)
+                    .map_err(|error| CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(error.to_string()),
+                    })?;
+                *binding = Some(Arc::clone(&journal));
+                Ok(journal)
+            })
+            .await
+        }
+
+        async fn resolve_mode(&self, config: &EffectiveAgentConfig) -> Result<(), CheckpointError> {
+            let config = config.clone();
+            let session_id = self.session_id;
+            self.submit(move |_, session, _| {
+                let mut retained = lock(session);
+                let options = retained.session.meta.session_options.clone();
+                let config = stored_agent_config(&config, options).map_err(|error| {
+                    CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(error.to_string()),
+                    }
+                })?;
+                retained
+                    .session
+                    .resolve_legacy_config(config)
+                    .map_err(|error| CheckpointError::Save {
+                        session_id,
+                        message: Arc::from(error.to_string()),
+                    })?;
+                Ok(())
+            })
+            .await
+        }
+    }
 
     fn child(key: &str) -> StoredSubagent {
         StoredSubagent {
@@ -3002,8 +2999,8 @@ mod tests {
                     .take(original_agents.len())
                     .eq(original_agents.iter())
             );
-            assert!(snapshot.agent_revisions.len() > original_agents.len());
-            assert!(!snapshot.state.is_empty());
+            assert!(snapshot.agent_revisions.iter().len() > original_agents.len());
+            assert!(snapshot.state.iter().next().is_some());
             writer.bind_journal(Arc::clone(&journal)).await.unwrap();
             {
                 let retained = lock(&writer.session);

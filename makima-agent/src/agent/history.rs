@@ -420,15 +420,6 @@ impl History {
         self.publish();
     }
 
-    pub(crate) fn restore_snapshot(&mut self, snapshot: HistorySnapshot) {
-        if let Some(conversation) = &snapshot.conversation {
-            self.conversation = conversation.clone();
-        }
-        self.snapshot = snapshot;
-        self.snapshot.conversation = Some(self.conversation.clone());
-        self.publish_replacement();
-    }
-
     /// Returns the conversation id the compacted history leaves behind, when
     /// a request under it was delivered.
     pub fn replace_compacted(
@@ -828,7 +819,10 @@ mod tests {
         );
         let observed = journal.snapshot();
         assert_eq!(observed.revision, boundary_snapshot.revision + 1);
-        assert_eq!(observed.state.len(), boundary_snapshot.state.len() + 1);
+        assert_eq!(
+            observed.state.iter().len(),
+            boundary_snapshot.state.iter().len() + 1
+        );
         assert_eq!(observed.histories[&root].messages.len(), 2);
         assert!(observed.managed_histories.contains(&root));
         assert_eq!(boundary_snapshot.histories[&root].messages.len(), 1);

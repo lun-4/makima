@@ -217,9 +217,6 @@ impl StateRuntime {
 }
 
 impl<T> StateSlot<T> {
-    pub fn spec(&self) -> &StateSlotSpec {
-        &self.spec
-    }
     pub fn get_raw(&self, access: &StateAccess) -> Result<RawStateSnapshot, StateError> {
         if !Arc::ptr_eq(&self.journal, &access.journal) {
             return Err(StateError::StaleAccess);
@@ -397,7 +394,7 @@ pub(crate) fn validate_record(change: &JournalChange, seq: u64) -> Result<(), St
             "stored record does not round trip".into(),
         ));
     }
-    makima_storage::session_state::SessionStateView::fold(&[decoded], &[], seq)
+    makima_storage::session_state::validate_record(&decoded)
         .map_err(|error| StateError::InvalidValue(error.to_string()))?;
     Ok(())
 }
@@ -613,7 +610,8 @@ mod tests {
         AgentId, CancelToken, History, HistorySnapshot, TurnId,
         journal::{JournalChange, JournalCommit, SessionJournal},
     };
-    use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
+    use makima_storage::session_state::{StateChange, StoredAgentRecord};
+    use makima_storage::test_util::test_record;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use test_case::test_case;
@@ -623,22 +621,7 @@ mod tests {
     const MIGRATION_FAILED: &str = "migration failed";
 
     fn record(agent: AgentId) -> StoredAgentRecord {
-        StoredAgentRecord {
-            id: agent,
-            parent: None,
-            depth: 0,
-            transcript_key: String::new(),
-            lifecycle: StoredAgentLifecycle::Open,
-            ancestry_unknown: false,
-            label: None,
-            spawned_by_tool_use_id: None,
-            spec: None,
-            restorable: Ok(()),
-            usage: Default::default(),
-            created_seq: 0,
-            updated_seq: 0,
-            legacy: false,
-        }
+        test_record(agent, None)
     }
 
     fn fixture() -> (Arc<SessionJournal>, AgentId) {

@@ -1048,30 +1048,6 @@ pub(crate) fn prepare_rewind_projection_with(
     Ok((changes, warnings))
 }
 
-pub fn restore_plan_files(view: &SessionStateView) -> Result<Vec<(AgentId, String)>, String> {
-    Ok(plan_entries(view)?
-        .into_iter()
-        .filter_map(|(agent, entry)| {
-            let snapshot = view
-                .scopes
-                .get(&Some(agent))
-                .and_then(|scope| scope.config.as_ref())
-                .map(|config| &config.mode);
-            project_plan_entry(view, agent, &entry, snapshot)
-                .err()
-                .map(|error| {
-                    (
-                        agent,
-                        format!(
-                            "Cannot restore plan file {}: {error}. Resuming in Build mode",
-                            entry.path.display()
-                        ),
-                    )
-                })
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{content_sha256, plan_entries, restore_plan_file};
@@ -1085,10 +1061,9 @@ mod tests {
     use makima_domain::{ModelSelection, ThinkingConfig};
     use makima_providers::{Message, TokenUsage};
     use makima_storage::session_state::StoredAgentConfig;
-    use makima_storage::session_state::{
-        MAX_PLUGIN_VALUE_BYTES, StoredAgentLifecycle, StoredAgentRecord,
-    };
+    use makima_storage::session_state::{MAX_PLUGIN_VALUE_BYTES, StoredAgentRecord};
     use makima_storage::sessions::Session;
+    use makima_storage::test_util::test_record;
     use makima_storage::{
         id::AgentId,
         plans::{ApprovedPlan, PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot},
@@ -1765,20 +1740,9 @@ mod tests {
             session.push_agent_revision(
                 1,
                 StoredAgentRecord {
-                    id: agent,
-                    parent: Some(root),
-                    depth: 1,
-                    transcript_key: agent.to_string(),
-                    lifecycle: StoredAgentLifecycle::Open,
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
                     created_seq: 1,
                     updated_seq: 1,
-                    legacy: false,
+                    ..test_record(agent, Some(root))
                 },
             );
         }
@@ -1904,22 +1868,7 @@ mod tests {
         let root = AgentId::generate();
         journal
             .commit(JournalCommit {
-                agents: vec![StoredAgentRecord {
-                    id: root,
-                    parent: None,
-                    depth: 0,
-                    transcript_key: String::new(),
-                    lifecycle: StoredAgentLifecycle::Open,
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
-                    created_seq: 0,
-                    updated_seq: 0,
-                    legacy: false,
-                }],
+                agents: vec![test_record(root, None)],
                 ..Default::default()
             })
             .unwrap();

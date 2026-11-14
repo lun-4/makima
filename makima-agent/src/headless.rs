@@ -1180,7 +1180,7 @@ fn spawn_interactive(
         Arc::new(SessionJournal::nonpersistent())
     };
     let snapshot = journal.snapshot();
-    let restored_graph = !snapshot.agent_revisions.is_empty();
+    let restored_graph = snapshot.agent_revisions.iter().next().is_some();
     let mut restored_config = None;
     let mut restored_permissions = PermissionSnapshot::default();
     let manager = if restored_graph {
@@ -1601,6 +1601,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
     use crate::session_checkpoint::SessionLogCheckpoint;
+    use crate::session_coordinator::tests::bind_initializing_actor;
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
@@ -2036,7 +2037,8 @@ pub(crate) mod tests {
                     Box::pin(async move { Ok(PreparedModel { provider, model }) })
                 });
                 match initialization {
-                    Some(initialization) => coordinator.bind_initializing_actor(
+                    Some(initialization) => bind_initializing_actor(
+                        &coordinator,
                         initialization,
                         prepare,
                         Arc::new(|_| {}),
@@ -2318,7 +2320,7 @@ pub(crate) mod tests {
                 .try_set_yolo(!stored_yolo.unwrap_or(seed_yolo))
                 .unwrap();
             let snapshot = handle.manager.journal().snapshot();
-            assert_eq!(snapshot.state.len(), before.len() + 1);
+            assert_eq!(snapshot.state.iter().len(), before.iter().len() + 1);
             let view = snapshot.fold(snapshot.seq).unwrap();
             assert_eq!(view.scopes[&None].rules, rules);
             assert_eq!(
@@ -2708,13 +2710,11 @@ pub(crate) mod tests {
                 scope.spawn(move || {
                     for index in 0..GRANTS {
                         barrier.wait();
-                        permissions
-                            .try_add_session_rule(makima_config::PermissionRule {
-                                tool: makima_config::ToolKey::native(RULE_TOOL),
-                                scope: Some(format!("{RULE_SCOPE}{index}")),
-                                effect: makima_config::Effect::Allow,
-                            })
-                            .unwrap();
+                        permissions.add_session_rule(makima_config::PermissionRule {
+                            tool: makima_config::ToolKey::native(RULE_TOOL),
+                            scope: Some(format!("{RULE_SCOPE}{index}")),
+                            effect: makima_config::Effect::Allow,
+                        });
                     }
                 });
                 for _ in 0..GRANTS {

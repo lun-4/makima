@@ -69,6 +69,8 @@ pub use state::{
     StateRevision, StateScope, StateSlot, StateSlotSpec, StateSnapshot,
 };
 pub mod template;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;

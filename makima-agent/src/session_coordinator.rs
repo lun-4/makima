@@ -32,7 +32,7 @@ use crate::journal::{
     JournalChange, JournalCommit, JournalPrepared, JournalPublication, SessionJournal,
     SessionJournalSnapshot,
 };
-use crate::manager::{AgentRef, ResidentInitialization};
+use crate::manager::AgentRef;
 use crate::permissions::{PermissionManager, PermissionSnapshot};
 use crate::session_checkpoint::stored_agent_config;
 use crate::session_options::{
@@ -880,42 +880,6 @@ impl SessionCoordinatorHandle {
         )
     }
 
-    pub fn bind_initializing_actor(
-        &self,
-        initialization: ResidentInitialization,
-        prepare_model: ModelPreparer,
-        project_config: ConfigProjector,
-    ) -> Result<(), ConfigChangeError> {
-        self.ensure_bindable()?;
-        let manager = initialization.agent.manager();
-        manager.validate_activation(&initialization.incarnation)?;
-        if initialization.actor.agent_id() != initialization.agent.id()
-            || initialization.incarnation.agent_id != initialization.agent.id()
-            || initialization
-                .actor
-                .inner
-                .journal_incarnation
-                .as_ref()
-                .is_none_or(|binding| {
-                    binding.agent != initialization.incarnation.agent_id
-                        || binding.reservation != initialization.incarnation.reservation
-                })
-        {
-            return Err(
-                ActorError::InvalidConfig("initializing actor identity mismatch".into()).into(),
-            );
-        }
-        let config = initialization.actor.config_snapshot().ok_or_else(|| {
-            ActorError::InvalidConfig("actor configuration is not initialized".into())
-        })?;
-        self.bind_actor_config(
-            initialization.agent,
-            config.config,
-            prepare_model,
-            project_config,
-        )
-    }
-
     fn bind_actor_config(
         &self,
         agent: AgentRef,
@@ -1295,20 +1259,6 @@ impl SessionCoordinatorHandle {
         Ok((enabled, self.read.options()))
     }
 
-    pub async fn toggle_yolo_for_actor(
-        &self,
-        actor: AgentActorHandle,
-        validate: impl Fn() -> Result<(), ConfigChangeError> + Send + Sync + 'static,
-    ) -> Result<(bool, SessionOptionsSnapshot), ConfigChangeError> {
-        self.toggle_yolo_for_actor_with_claim(
-            actor,
-            validate,
-            CheckpointPublication::default(),
-            publication_claim(),
-        )
-        .await
-    }
-
     pub async fn toggle_yolo_for_actor_with_claim(
         &self,
         actor: AgentActorHandle,
@@ -1412,11 +1362,6 @@ impl SessionCoordinatorHandle {
         }
         ticket.queued = Some(QueuedChange::enqueue(actor));
         Ok(ticket)
-    }
-
-    pub async fn ensure_root_context(&self) -> Result<Arc<RootContext>, ConfigChangeError> {
-        let actor = self.actor_binding()?.agent.actor()?;
-        self.ensure_root_context_for_actor(&actor).await
     }
 
     pub async fn ensure_root_context_for_actor(
@@ -2911,7 +2856,7 @@ fn toggle_definition(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::actor::{
         ActorBackend, ActorHistory, AdmissionPreparation, AgentContextSnapshot, BackendResult,
@@ -2919,8 +2864,9 @@ mod tests {
     };
     use crate::agent::{PromptSlotSource, TurnSetup};
     use crate::context::root_context;
-    use crate::manager::{AgentLimits, AgentManagerHandle};
+    use crate::manager::{AgentLimits, AgentManagerHandle, ResidentInitialization};
     use crate::modes::{ModeDef, ModeId};
+    use crate::test_util::StubBackend;
     use crate::tools::{LocalTools, NullProvider, ToolRegistry};
     use crate::{AgentInput, AgentMode, ModeRegistry, RunSettings, TurnContext};
     use makima_providers::Effort;
@@ -2968,6 +2914,42 @@ mod tests {
         }
     }
 
+    pub(crate) fn bind_initializing_actor(
+        coordinator: &SessionCoordinatorHandle,
+        initialization: ResidentInitialization,
+        prepare_model: ModelPreparer,
+        project_config: ConfigProjector,
+    ) -> Result<(), ConfigChangeError> {
+        coordinator.ensure_bindable()?;
+        let manager = initialization.agent.manager();
+        manager.validate_activation(&initialization.incarnation)?;
+        if initialization.actor.agent_id() != initialization.agent.id()
+            || initialization.incarnation.agent_id != initialization.agent.id()
+            || initialization
+                .actor
+                .inner
+                .journal_incarnation
+                .as_ref()
+                .is_none_or(|binding| {
+                    binding.agent != initialization.incarnation.agent_id
+                        || binding.reservation != initialization.incarnation.reservation
+                })
+        {
+            return Err(
+                ActorError::InvalidConfig("initializing actor identity mismatch".into()).into(),
+            );
+        }
+        let config = initialization.actor.config_snapshot().ok_or_else(|| {
+            ActorError::InvalidConfig("actor configuration is not initialized".into())
+        })?;
+        coordinator.bind_actor_config(
+            initialization.agent,
+            config.config,
+            prepare_model,
+            project_config,
+        )
+    }
+
     fn projection_config(workflow: bool) -> Arc<EffectiveAgentConfig> {
         let mut config = EffectiveAgentConfig::new(
             RunSettings {
@@ -2982,35 +2964,6 @@ mod tests {
         config.mode_def = Some(ModeDef::default_for(ModeId::parse("build")));
         config.context = AgentContextSnapshot::new(PathBuf::from("/project"));
         Arc::new(config)
-    }
-
-    struct TestBackend;
-    impl ActorBackend for TestBackend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async { unreachable!() })
-        }
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async { unreachable!() })
-        }
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async { unreachable!() })
-        }
     }
 
     struct ContextBackend(TurnSetup);
@@ -3193,7 +3146,7 @@ mod tests {
     ) -> AgentRef {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let agent = manager
-            .create_root(Vec::new(), None, Box::new(TestBackend))
+            .create_root(Vec::new(), None, Box::new(StubBackend))
             .unwrap();
         agent.actor().unwrap().initialize_config(config).unwrap();
         bind_test_permissions(coordinator, &agent);
@@ -3366,7 +3319,7 @@ mod tests {
                 .await
                 .unwrap();
             let after = journal.snapshot();
-            assert_eq!(after.state.len(), before.state.len() + 1);
+            assert_eq!(after.state.iter().len(), before.state.iter().len() + 1);
             let StateChange::Config(config) = &after.state.iter().next_back().unwrap().change
             else {
                 panic!("expected configuration record");
@@ -3845,7 +3798,7 @@ mod tests {
                 .unwrap();
             let reserved = prepared.reserve_activation().unwrap();
             assert_eq!(
-                reserved.handle().read().options().plugin_values()["test.choice"],
+                reserved.handle().read().options().values()["test.choice"],
                 "a"
             );
             assert_eq!(
@@ -3865,7 +3818,7 @@ mod tests {
                 .await
                 .unwrap();
             if let Some(handle) = handle {
-                assert_eq!(handle.read().options().plugin_values()["test.choice"], "b");
+                assert_eq!(handle.read().options().values()["test.choice"], "b");
                 handle.close().await.unwrap();
             }
         });
@@ -4066,7 +4019,7 @@ mod tests {
                         Default::default(),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(TestBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                     )
                     .unwrap();
                 second
@@ -4395,7 +4348,10 @@ mod tests {
                 let candidate = saved[0].journal.as_ref().unwrap();
                 let installed = journal.snapshot();
                 assert_eq!(candidate.state, installed.state);
-                assert_eq!(installed.state.len(), before_journal.len() + 1);
+                assert_eq!(
+                    installed.state.iter().len(),
+                    before_journal.iter().len() + 1
+                );
                 let StateChange::Config(config) =
                     &installed.state.iter().next_back().unwrap().change
                 else {
@@ -5007,7 +4963,11 @@ mod tests {
             let fixture = ContextReloadFixture::new().await;
             let other = ContextReloadFixture::new().await;
             if recorded {
-                fixture.coordinator.ensure_root_context().await.unwrap();
+                fixture
+                    .coordinator
+                    .ensure_root_context_for_actor(&fixture.agent.actor().unwrap())
+                    .await
+                    .unwrap();
             }
             let journal = fixture.agent.manager().journal();
             let other_journal = other.agent.manager().journal();
@@ -5075,7 +5035,11 @@ mod tests {
             let generation = actor.config_snapshot().unwrap().generation;
             assert!(root_context(&access).unwrap().is_none());
             assert!(actor.latest_ticket().is_none());
-            let initialized = fixture.coordinator.ensure_root_context().await.unwrap();
+            let initialized = fixture
+                .coordinator
+                .ensure_root_context_for_actor(&actor)
+                .await
+                .unwrap();
             assert!(initialized.instructions.text.contains(RELOAD_INSTRUCTIONS));
             assert_eq!(
                 root_context(&access).unwrap().unwrap().instructions.text,
@@ -5096,7 +5060,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let reused = fixture.coordinator.ensure_root_context().await.unwrap();
+            let reused = fixture
+                .coordinator
+                .ensure_root_context_for_actor(&actor)
+                .await
+                .unwrap();
             assert_eq!(reused.instructions.text, initialized.instructions.text);
             assert!(!reused.instructions.text.contains(CHANGED_INSTRUCTIONS));
             assert_eq!(journal.snapshot().state, recorded.state);
@@ -5140,11 +5108,12 @@ mod tests {
                 .unwrap();
             let first = smol::spawn({
                 let coordinator = fixture.coordinator.clone();
-                async move { coordinator.ensure_root_context().await }
+                let actor = actor.clone();
+                async move { coordinator.ensure_root_context_for_actor(&actor).await }
             });
             waiting.recv_async().await.unwrap();
             assert!(root_context(&access).unwrap().is_none());
-            let mut second = Box::pin(fixture.coordinator.ensure_root_context());
+            let mut second = Box::pin(fixture.coordinator.ensure_root_context_for_actor(&actor));
             assert!(
                 futures_lite::future::poll_once(second.as_mut())
                     .await
@@ -5210,7 +5179,8 @@ mod tests {
                 .unwrap();
             let ensure = smol::spawn({
                 let coordinator = fixture.coordinator.clone();
-                async move { coordinator.ensure_root_context().await }
+                let actor = actor.clone();
+                async move { coordinator.ensure_root_context_for_actor(&actor).await }
             });
             waiting.recv_async().await.unwrap();
             assert!(root_context(&access).unwrap().is_none());
@@ -5234,7 +5204,11 @@ mod tests {
                     saved: Arc::clone(&fixture.saved),
                 }))
                 .unwrap();
-            let initialized = fixture.coordinator.ensure_root_context().await.unwrap();
+            let initialized = fixture
+                .coordinator
+                .ensure_root_context_for_actor(&actor)
+                .await
+                .unwrap();
             assert!(initialized.instructions.text.contains(RELOAD_INSTRUCTIONS));
             assert!(root_context(&access).unwrap().is_some());
             assert_eq!(lock(&fixture.saved).len(), 1);
@@ -5355,7 +5329,12 @@ mod tests {
                 waiting.recv_async().await.unwrap();
                 assert!(!agent.effective_config().unwrap().unwrap().fast);
                 assert_eq!(
-                    coordinator.read().options().pending_fast_model(),
+                    coordinator
+                        .read()
+                        .options()
+                        .values()
+                        .get(FAST_PENDING_MODEL_OPTION_ID)
+                        .map(String::as_str),
                     Some(MODEL)
                 );
                 assert_eq!(journal.snapshot().state, before);
@@ -5364,7 +5343,12 @@ mod tests {
                 if fail {
                     assert!(result.is_err());
                     assert_eq!(
-                        coordinator.read().options().pending_fast_model(),
+                        coordinator
+                            .read()
+                            .options()
+                            .values()
+                            .get(FAST_PENDING_MODEL_OPTION_ID)
+                            .map(String::as_str),
                         Some(MODEL)
                     );
                     assert_eq!(journal.snapshot().state, before);
@@ -5372,10 +5356,10 @@ mod tests {
                 } else {
                     let (enabled, snapshot) = result.unwrap();
                     assert!(!enabled);
-                    assert!(snapshot.pending_fast_model().is_none());
+                    assert!(!snapshot.values().contains_key(FAST_PENDING_MODEL_OPTION_ID));
                     assert!(!agent.effective_config().unwrap().unwrap().fast);
                     let after = journal.snapshot();
-                    assert_eq!(after.state.len(), before.len() + 1);
+                    assert_eq!(after.state.iter().len(), before.iter().len() + 1);
                     let StateChange::Config(config) =
                         &after.state.iter().next_back().unwrap().change
                     else {
@@ -5383,7 +5367,12 @@ mod tests {
                     };
                     assert!(!config.fast);
                     assert!(!config.options.contains_key(FAST_PENDING_MODEL_OPTION_ID));
-                    assert!(lock(&saved)[0].options.pending_fast_model().is_none());
+                    assert!(
+                        !lock(&saved)[0]
+                            .options
+                            .values()
+                            .contains_key(FAST_PENDING_MODEL_OPTION_ID)
+                    );
                 }
                 coordinator.close().await.unwrap();
             },
@@ -5429,13 +5418,23 @@ mod tests {
             if fail {
                 assert!(result.is_err());
                 assert_eq!(
-                    coordinator.read().options().pending_fast_model(),
+                    coordinator
+                        .read()
+                        .options()
+                        .values()
+                        .get(FAST_PENDING_MODEL_OPTION_ID)
+                        .map(String::as_str),
                     Some(MODEL)
                 );
                 assert_eq!(journal.snapshot().state, before.state);
                 assert!(lock(&saved).is_empty());
             } else {
-                assert!(result.unwrap().pending_fast_model().is_none());
+                assert!(
+                    !result
+                        .unwrap()
+                        .values()
+                        .contains_key(FAST_PENDING_MODEL_OPTION_ID)
+                );
                 let snapshot = journal.snapshot();
                 let StateChange::Config(config) =
                     &snapshot.state.iter().next_back().unwrap().change
@@ -5448,8 +5447,13 @@ mod tests {
                         .options
                         .contains_key(crate::session_options::FAST_PENDING_MODEL_OPTION_ID)
                 );
-                assert_eq!(snapshot.state.len(), before.state.len() + 1);
-                assert!(lock(&saved)[0].options.pending_fast_model().is_none());
+                assert_eq!(snapshot.state.iter().len(), before.state.iter().len() + 1);
+                assert!(
+                    !lock(&saved)[0]
+                        .options
+                        .values()
+                        .contains_key(FAST_PENDING_MODEL_OPTION_ID)
+                );
             }
             coordinator.close().await.unwrap();
         });
@@ -5489,7 +5493,12 @@ mod tests {
             let mut operation = Box::pin(async {
                 if toggle {
                     coordinator
-                        .toggle_yolo_for_actor(actor.clone(), || Ok(()))
+                        .toggle_yolo_for_actor_with_claim(
+                            actor.clone(),
+                            || Ok(()),
+                            CheckpointPublication::default(),
+                            publication_claim(),
+                        )
                         .await
                         .map(|(_, options)| options)
                 } else {
@@ -5697,10 +5706,15 @@ mod tests {
                 let validating = Arc::clone(&validating);
                 async move {
                     coordinator
-                        .toggle_yolo_for_actor(actor, move || {
-                            assert!(validating.load(Ordering::SeqCst));
-                            Ok(())
-                        })
+                        .toggle_yolo_for_actor_with_claim(
+                            actor,
+                            move || {
+                                assert!(validating.load(Ordering::SeqCst));
+                                Ok(())
+                            },
+                            CheckpointPublication::default(),
+                            publication_claim(),
+                        )
                         .await
                 }
             });
@@ -5750,7 +5764,7 @@ mod tests {
                         Some((*projection_config(false)).clone()),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(TestBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                     )
                     .unwrap();
                 assert!(root.actor().unwrap().inner.journal.is_none());
@@ -5780,7 +5794,12 @@ mod tests {
                 assert!(!coordinator.read.options.snapshot().enabled(YOLO_OPTION_ID));
                 assert!(coordinator.read().options().enabled(YOLO_OPTION_ID));
                 let result = coordinator
-                    .toggle_yolo_for_actor(root.actor().unwrap(), || Ok(()))
+                    .toggle_yolo_for_actor_with_claim(
+                        root.actor().unwrap(),
+                        || Ok(()),
+                        CheckpointPublication::default(),
+                        publication_claim(),
+                    )
                     .await;
                 if fail {
                     assert!(result.is_err());
@@ -5837,7 +5856,7 @@ mod tests {
                     Some((*projection_config(false)).clone()),
                     Vec::new(),
                     None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(TestBackend)),
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                 )
                 .unwrap();
             let cwd = PathBuf::from("/project");
@@ -5882,7 +5901,7 @@ mod tests {
                 Arc::default(),
             );
             assert!(!restarted.is_yolo());
-            restarted.restore_stored(&rules.rules, rules.yolo).unwrap();
+            restarted.restore(PermissionSnapshot::from_stored(&rules.rules, rules.yolo).unwrap());
             assert_eq!(restarted.is_yolo(), seed);
             assert_eq!(restarted.snapshot().yolo, Some(seed));
             let before = manager.journal().snapshot().state;
@@ -5918,7 +5937,7 @@ mod tests {
                 scope: Some("/allowed".into()),
                 effect: makima_config::Effect::Allow,
             };
-            permissions.try_add_session_rule(rule).unwrap();
+            permissions.add_session_rule(rule);
             let options = coordinator.read().options().config_values();
             let config =
                 stored_agent_config(&agent.effective_config().unwrap().unwrap(), options.clone())
@@ -5938,7 +5957,7 @@ mod tests {
                 result.unwrap();
                 assert!(permissions.is_yolo());
                 let after = journal.snapshot();
-                assert_eq!(after.state.len(), before.state.len() + 1);
+                assert_eq!(after.state.iter().len(), before.state.iter().len() + 1);
                 let last = after.state.iter().next_back().unwrap();
                 assert!(last.agent.is_none());
                 let StateChange::Rules { rules, yolo } = &last.change else {

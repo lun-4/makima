@@ -85,10 +85,6 @@ impl SessionOptionsSnapshot {
         self.pending_fast_model = model.map(Arc::from);
     }
 
-    pub fn pending_fast_model(&self) -> Option<&str> {
-        self.pending_fast_model.as_deref()
-    }
-
     pub fn values(&self) -> BTreeMap<String, String> {
         let mut values: BTreeMap<_, _> = self
             .options
@@ -125,19 +121,6 @@ impl SessionOptionsSnapshot {
             });
         }
         self.options = options.into();
-    }
-
-    pub fn plugin_values(&self) -> BTreeMap<String, String> {
-        self.options
-            .iter()
-            .filter(|option| matches!(option.definition.owner, SessionOptionOwner::Plugin { .. }))
-            .map(|option| {
-                (
-                    option.definition.id.to_string(),
-                    option.current_value.to_string(),
-                )
-            })
-            .collect()
     }
 
     /// Whether boolean option {id} is on; an absent option is off.
@@ -948,41 +931,35 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        let before = options.snapshot().plugin_values();
+        let before = options.snapshot().values();
         assert_eq!(
-            options.snapshot().values(),
+            before,
             BTreeMap::from([
                 (PERSISTENT.into(), DISABLED_VALUE.into()),
                 (TRANSIENT.into(), DISABLED_VALUE.into()),
                 (YOLO_OPTION_ID.into(), ENABLED_VALUE.into()),
             ])
         );
-        assert_eq!(
-            before,
-            BTreeMap::from([
-                (PERSISTENT.into(), DISABLED_VALUE.into()),
-                (TRANSIENT.into(), DISABLED_VALUE.into()),
-            ])
-        );
         let candidate = options
             .prepare_set_values(&[(PERSISTENT, ENABLED_VALUE), (TRANSIENT, ENABLED_VALUE)])
             .unwrap()
             .unwrap();
-        let values = SessionOptions::candidate_snapshot(&candidate).plugin_values();
+        let values = SessionOptions::candidate_snapshot(&candidate).values();
         assert_eq!(
             values,
             BTreeMap::from([
                 (PERSISTENT.into(), ENABLED_VALUE.into()),
                 (TRANSIENT.into(), ENABLED_VALUE.into()),
+                (YOLO_OPTION_ID.into(), ENABLED_VALUE.into()),
             ])
         );
-        assert_eq!(options.snapshot().plugin_values(), before);
+        assert_eq!(options.snapshot().values(), before);
         assert_eq!(
             options
                 .reserve(&candidate)
                 .unwrap()
                 .commit(candidate)
-                .plugin_values(),
+                .values(),
             values
         );
     }
@@ -1068,9 +1045,14 @@ mod tests {
         )
         .unwrap();
         let before = options.snapshot();
-        assert_eq!(before.pending_fast_model(), Some(MODEL));
+        assert_eq!(before.pending_fast_model.as_deref(), Some(MODEL));
         assert_eq!(before.values()[FAST_PENDING_MODEL_OPTION_ID], MODEL);
-        assert!(before.plugin_values().is_empty());
+        assert!(
+            before
+                .options
+                .iter()
+                .all(|option| matches!(option.definition.owner, SessionOptionOwner::Builtin))
+        );
         assert!(matches!(
             options.prepare_set(FAST_PENDING_MODEL_OPTION_ID, "other"),
             Err(SessionOptionError::UnknownId(_))
@@ -1080,7 +1062,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SessionOptions::candidate_snapshot(&candidate).pending_fast_model(),
+            SessionOptions::candidate_snapshot(&candidate)
+                .pending_fast_model
+                .as_deref(),
             Some(MODEL)
         );
         options.reserve(&candidate).unwrap().commit(candidate);
@@ -1088,10 +1072,14 @@ mod tests {
         candidate.clear_pending_fast();
         assert!(
             SessionOptions::candidate_snapshot(&candidate)
-                .pending_fast_model()
+                .pending_fast_model
+                .as_deref()
                 .is_none()
         );
-        assert_eq!(options.snapshot().pending_fast_model(), Some(MODEL));
+        assert_eq!(
+            options.snapshot().pending_fast_model.as_deref(),
+            Some(MODEL)
+        );
         options.reserve(&candidate).unwrap().commit(candidate);
         assert!(
             !options
@@ -1135,12 +1123,16 @@ mod tests {
             .unwrap();
         assert!(
             SessionOptions::candidate_snapshot(&candidate)
-                .pending_fast_model()
+                .pending_fast_model
+                .as_deref()
                 .is_none()
         );
-        assert_eq!(options.snapshot().pending_fast_model(), Some(MODEL));
+        assert_eq!(
+            options.snapshot().pending_fast_model.as_deref(),
+            Some(MODEL)
+        );
         options.reserve(&candidate).unwrap().commit(candidate);
-        assert!(options.snapshot().pending_fast_model().is_none());
+        assert!(options.snapshot().pending_fast_model.as_deref().is_none());
     }
 
     #[test]

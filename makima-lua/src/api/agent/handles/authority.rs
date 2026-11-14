@@ -191,6 +191,7 @@ mod tests {
     use makima_agent::agent::RunSettings;
     use makima_agent::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_agent::manager::ResidentAgent;
+    use makima_agent::test_util::StubBackend;
     use makima_agent::tools::test_support::stub_ctx;
     use makima_agent::{
         ActorBackend, ActorEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
@@ -228,38 +229,6 @@ mod tests {
     const QUEUED_COMPACT_COMMAND: &str = "/queued-compact";
     const COMPACT_INSTRUCTIONS: &str = "retain the authority boundary";
 
-    struct InactiveBackend;
-
-    impl ActorBackend for InactiveBackend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("authority test must not execute a turn") })
-        }
-
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("authority test must not execute a control") })
-        }
-
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("authority test must not compact") })
-        }
-    }
-
     fn inactive_target() -> (TrustedTarget, EffectiveAgentConfig) {
         let template = stub_ctx(&AgentMode::Build);
         let config = EffectiveAgentConfig::new(
@@ -279,7 +248,7 @@ mod tests {
                 Some(config.clone()),
                 vec![Message::user(COMPACT_INSTRUCTIONS.into())],
                 None,
-                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(InactiveBackend)),
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
             )
             .unwrap();
         (TrustedTarget { target, template }, config)
@@ -381,7 +350,7 @@ mod tests {
             let replacement = manager
                 .ensure_resident_with(agent.id(), |_| async {
                     Ok(ResidentAgent {
-                        backend: Box::new(InactiveBackend),
+                        backend: Box::new(StubBackend),
                         config,
                         shared_messages: None,
                         start: Some(start_rx),
@@ -500,7 +469,7 @@ mod tests {
             let replacement = manager
                 .ensure_resident_with(agent.id(), |_| async {
                     Ok(ResidentAgent {
-                        backend: Box::new(InactiveBackend),
+                        backend: Box::new(StubBackend),
                         config,
                         shared_messages: None,
                         start: None,

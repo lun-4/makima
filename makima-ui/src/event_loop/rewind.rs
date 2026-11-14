@@ -35,6 +35,7 @@ use makima_storage::now_epoch;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use makima_storage::restore::RestoreStore;
 use makima_storage::restore::{RestoreChoice, RestoreEndpoint, TransitionRef};
+use makima_storage::restore_digest::session_digest;
 use makima_storage::session_lock;
 use makima_storage::session_lock::ClaimedSessionLock;
 use makima_storage::session_state::StoredBranch;
@@ -1291,7 +1292,9 @@ fn endpoint(session: &AppSession, branch: Option<MakimaId>) -> Result<RestoreEnd
         session: session.id,
         branch,
         seq: session.sequence_high_water().unwrap_or_default(),
-        digest: file_restore::endpoint_digest(session).map_err(|error| error.to_string())?,
+        digest: session_digest(session)
+            .map_err(file_restore::RestoreError::from)
+            .map_err(|error| error.to_string())?,
     })
 }
 
@@ -1627,8 +1630,12 @@ fn parent_route(
     }
     for session in route.iter().filter(|session| session.id != source.id) {
         let reloaded = AppSession::load(session.id, storage).map_err(|error| error.to_string())?;
-        if file_restore::endpoint_digest(session).map_err(|error| error.to_string())?
-            != file_restore::endpoint_digest(&reloaded).map_err(|error| error.to_string())?
+        if session_digest(session)
+            .map_err(file_restore::RestoreError::from)
+            .map_err(|error| error.to_string())?
+            != session_digest(&reloaded)
+                .map_err(file_restore::RestoreError::from)
+                .map_err(|error| error.to_string())?
             || session.parent() != reloaded.parent()
         {
             return Err(INVALID_PARENT_ROUTE.into());

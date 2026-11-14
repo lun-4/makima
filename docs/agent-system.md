@@ -124,7 +124,7 @@ Decision: retain v2 import ambiguity markers and presentation fallbacks where du
 
 ### History epochs and restoration points
 
-A restoration boundary names an agent, journal sequence, journal identity, and per-agent history epoch and length. Pinned boundary snapshots preserve the history needed across compaction. Conversation rewind replaces the selected agent and its recorded descendants, their configurations and state, and the applicable session-scoped state. Branch checkpoints preserve the displaced state for later restoration. Missing or pruned branch files are reported as expired.
+A restoration boundary names an agent, journal sequence, journal identity, and per-agent history epoch and length. Child rewind writes pinned boundary snapshots to preserve root boundaries that the child history replacement would otherwise make unreachable. Compaction does not create pins. A root rewind across a later compaction is refused unless an earlier child rewind already pinned that boundary. Conversation rewind replaces the selected agent and its recorded descendants, their configurations and state, and the applicable session-scoped state. Branch checkpoints preserve the displaced state for later restoration. Missing or pruned branch files are reported as expired.
 
 Grouped snapshots store a shared canonical state and agent-revision prefix, raw histories, and an ordered list of covered boundary sequences. Each boundary lens records an epoch and exact prefix length for every identity retained at that boundary, including closed and retired agents. A later cleanup append cannot extend that cutoff. Old boundaries without an unambiguous durable cutoff are not added to a group. Pools contain no nested boundary snapshots or external pool/history dependencies. Copied state can still contain blob or offload references.
 
@@ -359,7 +359,7 @@ TUI, print, ACP and SDK all execute through a manager-owned root created by the 
 
 ## Boundary snapshot measurements
 
-The ignored `manager::rewind_tests::boundary_pin_profile::boundary_pin_growth_profile` fixture measures one child rewind while preserving 10, 100, or 500 boundaries from two outside agents. Each outside-agent turn contributes 1 KiB of response text. These are single debug-profile CPU runs on the same remote build box, with debug assertions enabled, not release-build latency targets. Log sizes and RSS use decimal MB.
+The `makima-agent/benches/boundary_pin_profile.rs` benchmark's `pins` mode measures one child rewind while preserving 10, 100, or 500 boundaries from two outside agents. Run it on Linux with `cargo bench -p makima-agent --bench boundary_pin_profile --profile dev -- pins`. Each outside-agent turn contributes 1 KiB of response text. These are single debug-profile CPU runs on the same remote build box, with debug assertions enabled, not release-build latency targets. Log sizes and RSS use decimal MB.
 
 | Outside boundaries | Initial log MB | Inline pins log MB | Grouped pool log MB | Inline peak RSS MB | Grouped peak RSS MB | Inline transition ms | Grouped transition ms | Inline load + recovery ms | Grouped load + recovery ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -371,7 +371,7 @@ Inline pins serialize one prefix per covered boundary; the grouped fixture write
 
 ### Normal journal commit measurements
 
-The ignored `manager::rewind_tests::boundary_pin_profile::journal_commit_growth_profile` fixture measures fixed-size normal journal mutations with one grouped boundary pool. The following before/after measurements were recorded before the subsequent compatibility and API cleanup. Before uses full-snapshot cloning and folding; after uses the incremental reducer.
+The same benchmark's `commits` mode measures fixed-size normal journal mutations with one grouped boundary pool. Run it on Linux with `cargo bench -p makima-agent --bench boundary_pin_profile --profile dev -- commits`. The following before/after measurements were recorded before the subsequent compatibility and API cleanup. Before uses full-snapshot cloning and folding; after uses the incremental reducer.
 
 | Retained boundaries | Before mean ms | After mean ms | Before allocated B/commit | After allocated B/commit | Before allocation calls/commit | After allocation calls/commit |
 |---:|---:|---:|---:|---:|---:|---:|

@@ -414,15 +414,41 @@ impl SessionStateReducer {
         state: &[StoredStateRecord],
         revisions: &[(u64, StoredAgentRecord)],
     ) -> Result<Self, StateFoldError> {
-        SessionStateView::fold(state, revisions, u64::MAX)?;
+        Self::through(state, revisions, u64::MAX)
+    }
+
+    fn through(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+        through: u64,
+    ) -> Result<Self, StateFoldError> {
+        Self::validate_structure(state, revisions)?;
         let mut reducer = Self::default();
-        for (seq, agent) in revisions {
+        for (seq, agent) in revisions.iter().take_while(|(seq, _)| *seq <= through) {
             reducer.apply_agent(*seq, agent)?;
         }
-        for record in state {
+        for record in state.iter().take_while(|record| record.seq <= through) {
             reducer.apply_record(record)?;
         }
         Ok(reducer)
+    }
+
+    pub fn validate_structure(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+    ) -> Result<(), StateFoldError> {
+        validate_sequence("state", state.iter().map(|record| record.seq))?;
+        validate_sequence("agent", revisions.iter().map(|(seq, _)| *seq))?;
+        let state_sequences: BTreeSet<_> = state.iter().map(|record| record.seq).collect();
+        for (seq, agent) in revisions {
+            if state_sequences.contains(seq) {
+                return Err(StateFoldError::DuplicateSequence { seq: *seq });
+            }
+            if agent.updated_seq != *seq || agent.created_seq > agent.updated_seq {
+                return Err(StateFoldError::InvalidAgentRevision { seq: *seq });
+            }
+        }
+        Ok(())
     }
 
     pub fn materialize(&self) -> SessionStateView {
@@ -510,6 +536,7 @@ impl SessionStateReducer {
         if self.state_sequences.contains(&seq) || self.agent_sequences.contains(&seq) {
             return Err(StateFoldError::DuplicateSequence { seq });
         }
+        validate_record(record)?;
         let mut candidate = self.clone();
         candidate.apply_change(record)?;
         candidate.state_sequences.insert(seq);
@@ -576,9 +603,6 @@ impl SessionStateReducer {
                 version,
                 value,
             } => {
-                if let Some(value) = value {
-                    validate_plugin_value(value, seq)?;
-                }
                 scope.plugins.insert(
                     key.clone(),
                     Arc::new(StoredPluginValue {
@@ -589,10 +613,6 @@ impl SessionStateReducer {
                 );
             }
             StateChange::Turn { turn, result } => {
-                if result.outcome.turn_id != *turn || record.agent != Some(result.outcome.agent_id)
-                {
-                    return Err(StateFoldError::TurnIdentityMismatch { seq });
-                }
                 scope.admitted.remove(turn);
                 let results = Arc::make_mut(&mut scope.results);
                 results.retain(|(id, _)| id != turn);
@@ -602,14 +622,6 @@ impl SessionStateReducer {
                 }
             }
             StateChange::Delivery { id, op } => {
-                if let StoredDeliveryOp::Queued(delivery) = op
-                    && (
-                        delivery.result.outcome.agent_id,
-                        delivery.result.outcome.turn_id,
-                    ) != *id
-                {
-                    return Err(StateFoldError::DeliveryIdentityMismatch { seq });
-                }
                 scope.delivery_sequences.insert(*id, seq);
                 if !scope.deliveries.get(id).is_some_and(|previous| {
                     !matches!(previous.as_ref(), StoredDeliveryOp::Queued(_))
@@ -677,149 +689,7 @@ impl SessionStateView {
         revisions: &[(u64, StoredAgentRecord)],
         through: u64,
     ) -> Result<Self, StateFoldError> {
-        validate_sequence("state", state.iter().map(|record| record.seq))?;
-        validate_sequence("agent", revisions.iter().map(|(seq, _)| *seq))?;
-        let state_sequences: BTreeSet<_> = state.iter().map(|record| record.seq).collect();
-        for (seq, agent) in revisions {
-            if state_sequences.contains(seq) {
-                return Err(StateFoldError::DuplicateSequence { seq: *seq });
-            }
-            if agent.updated_seq != *seq || agent.created_seq > agent.updated_seq {
-                return Err(StateFoldError::InvalidAgentRevision { seq: *seq });
-            }
-        }
-        let mut view = Self::default();
-        for (_, agent) in revisions.iter().take_while(|(seq, _)| *seq <= through) {
-            view.agents.insert(agent.id, agent.clone());
-        }
-        for record in state.iter().take_while(|record| record.seq <= through) {
-            view.apply(record)?;
-        }
-        Ok(view)
-    }
-
-    fn apply(&mut self, record: &StoredStateRecord) -> Result<(), StateFoldError> {
-        let seq = record.seq;
-        if let StateChange::BoundarySnapshot { boundary, snapshot } = &record.change {
-            return if *boundary < seq
-                && self.boundaries.contains_key(boundary)
-                && snapshot.is_object()
-                && valid_boundary_pool(*boundary, seq, snapshot)
-            {
-                Ok(())
-            } else {
-                Err(StateFoldError::InvalidBoundarySnapshot {
-                    seq,
-                    boundary: *boundary,
-                })
-            };
-        }
-        let scope = self.scopes.entry(record.agent).or_default();
-        scope.generation = record.generation;
-        match &record.change {
-            StateChange::Boundary { offset, lens } => {
-                self.boundaries.insert(
-                    seq,
-                    StoredBoundary {
-                        agent: record.agent,
-                        generation: record.generation,
-                        offset: *offset,
-                        lens: lens.clone(),
-                    },
-                );
-            }
-            StateChange::BoundarySnapshot { .. } => {}
-            StateChange::Admitted { turn, origin } => {
-                if !scope.results.iter().any(|(id, _)| id == turn) {
-                    scope.admitted.insert(*turn, origin.clone());
-                }
-            }
-            StateChange::Config(config) => scope.config = Some(config.clone()),
-            StateChange::Rules { rules, yolo } => {
-                scope.rules.clone_from(rules);
-                scope.yolo = *yolo;
-            }
-            StateChange::Context {
-                source,
-                hash,
-                content,
-            } => {
-                scope.context.insert(
-                    source.clone(),
-                    StoredContext {
-                        hash: hash.clone(),
-                        content: content.clone(),
-                    },
-                );
-            }
-            StateChange::Plugin {
-                key,
-                version,
-                value,
-            } => {
-                if let Some(value) = value {
-                    validate_plugin_value(value, seq)?;
-                }
-                scope.plugins.insert(
-                    key.clone(),
-                    StoredPluginValue {
-                        revision: seq,
-                        version: *version,
-                        value: value.clone(),
-                    },
-                );
-            }
-            StateChange::Turn { turn, result } => {
-                if result.outcome.turn_id != *turn || record.agent != Some(result.outcome.agent_id)
-                {
-                    return Err(StateFoldError::TurnIdentityMismatch { seq });
-                }
-                scope.admitted.remove(turn);
-                scope.results.retain(|(id, _)| id != turn);
-                scope.results.push_back((*turn, result.clone()));
-                if scope.results.len() > MAX_STORED_TURN_RESULTS {
-                    scope.results.pop_front();
-                }
-            }
-            StateChange::Delivery { id, op } => {
-                if let StoredDeliveryOp::Queued(delivery) = op
-                    && (
-                        delivery.result.outcome.agent_id,
-                        delivery.result.outcome.turn_id,
-                    ) != *id
-                {
-                    return Err(StateFoldError::DeliveryIdentityMismatch { seq });
-                }
-                if !scope
-                    .deliveries
-                    .get(id)
-                    .is_some_and(|previous| !matches!(previous, StoredDeliveryOp::Queued(_)))
-                {
-                    scope.deliveries.insert(*id, op.clone());
-                }
-            }
-            StateChange::File {
-                path,
-                before,
-                after,
-            } => {
-                scope.files.insert(
-                    path.clone(),
-                    StoredFileState {
-                        before: before.clone(),
-                        after: after.clone(),
-                    },
-                );
-            }
-            StateChange::ToolExecution { .. } => {}
-            StateChange::Compaction { epoch } => {
-                let agent = record
-                    .agent
-                    .ok_or(StateFoldError::MissingCompactionAgent { seq })?;
-                self.compactions.insert(agent, (seq, *epoch));
-            }
-        }
-        Ok(())
+        Ok(SessionStateReducer::through(state, revisions, through)?.materialize())
     }
 
     #[cfg(test)]
@@ -831,6 +701,34 @@ impl SessionStateView {
                     .is_none_or(|(barrier, _)| *barrier <= seq)
             })
         })
+    }
+}
+
+pub fn validate_record(record: &StoredStateRecord) -> Result<(), StateFoldError> {
+    let seq = record.seq;
+    match &record.change {
+        StateChange::Plugin {
+            value: Some(value), ..
+        } => validate_plugin_value(value, seq),
+        StateChange::Turn { turn, result }
+            if result.outcome.turn_id != *turn || record.agent != Some(result.outcome.agent_id) =>
+        {
+            Err(StateFoldError::TurnIdentityMismatch { seq })
+        }
+        StateChange::Delivery {
+            id,
+            op: StoredDeliveryOp::Queued(delivery),
+        } if (
+            delivery.result.outcome.agent_id,
+            delivery.result.outcome.turn_id,
+        ) != *id =>
+        {
+            Err(StateFoldError::DeliveryIdentityMismatch { seq })
+        }
+        StateChange::Compaction { .. } if record.agent.is_none() => {
+            Err(StateFoldError::MissingCompactionAgent { seq })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -956,11 +854,12 @@ mod tests {
     };
     use crate::{
         blobs::FileState,
-        id::{AgentId, TurnId},
+        id::{AgentId, MakimaId, TurnId},
     };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::path::Path;
+    use std::slice::from_ref;
     use test_case::test_case;
 
     const SLOT: &str = "test.slot";
@@ -1004,75 +903,6 @@ mod tests {
     }
     fn fold(state: &[StoredStateRecord]) -> SessionStateView {
         SessionStateView::fold(state, &[], u64::MAX).unwrap()
-    }
-
-    #[test_case(false; "single_scope")]
-    #[test_case(true; "interleaved_scopes")]
-    fn incremental_reducer_matches_full_fold_at_every_prefix(interleaved: bool) {
-        let root = AgentId::generate();
-        let other = AgentId::generate();
-        let turn = TurnId::generate();
-        let revisions = vec![(1, agent(root, 1)), (2, agent(other, 2))];
-        let mut reducer = SessionStateReducer::default();
-        for (seq, agent) in &revisions {
-            reducer.apply_agent(*seq, agent).unwrap();
-        }
-        let changes = vec![
-            serde_json::to_value(StateChange::Config(
-                serde_json::from_value(config()).unwrap(),
-            ))
-            .unwrap(),
-            json!({"kind":"plugin", "key":SLOT, "version":1, "value":{"before":true}}),
-            json!({"kind":"context", "source":SLOT, "hash":SLOT, "content":SLOT}),
-            json!({"kind":"admitted", "turn":turn, "origin":"user"}),
-            json!({"kind":"turn", "turn":turn, "result":result(root, turn)}),
-            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"queued", "delivery":{"label":null,"result":result(root,turn),"held":false}}}),
-            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"consumed"}}),
-            json!({"kind":"delivery", "id":[root, turn], "op":{"op":"queued", "delivery":{"label":null,"result":result(root,turn),"held":true}}}),
-            json!({"kind":"plugin", "key":SLOT, "version":2, "value":null}),
-            json!({"kind":"compaction", "epoch":7}),
-        ];
-        let mut records = Vec::new();
-        for (index, change) in changes.into_iter().enumerate() {
-            let owner = if interleaved && matches!(index, 1 | 2 | 8 | 9) {
-                other
-            } else {
-                root
-            };
-            let record = state(index as u64 + 3, Some(owner), change);
-            let before = reducer.materialize();
-            reducer.apply_record(&record).unwrap();
-            records.push(record);
-            assert_eq!(
-                reducer.materialize(),
-                SessionStateView::fold(&records, &revisions, u64::MAX).unwrap()
-            );
-            for (id, op, seq) in reducer.deliveries(root) {
-                assert_eq!(reducer.delivery(root, id), Some(op));
-                let latest = records.iter().rev().find(|record| matches!(&record.change, StateChange::Delivery { id: saved, .. } if *saved == id)).unwrap();
-                assert_eq!(seq, latest.seq);
-            }
-            if records.len() >= 5 {
-                assert_eq!(
-                    reducer.result(root, turn),
-                    Some(&serde_json::from_value::<StoredTurnResult>(result(root, turn)).unwrap())
-                );
-            }
-            let saved = reducer.clone();
-            let invalid = state(
-                records.last().unwrap().seq + 1,
-                None,
-                json!({"kind":"compaction", "epoch":8}),
-            );
-            assert!(matches!(
-                reducer.apply_record(&invalid),
-                Err(StateFoldError::MissingCompactionAgent { .. })
-            ));
-            assert_eq!(reducer.materialize(), saved.materialize());
-            if records.len() != 8 {
-                assert_ne!(reducer.materialize(), before);
-            }
-        }
     }
 
     #[test]
@@ -1490,6 +1320,51 @@ mod tests {
         }
     }
 
+    #[test_case(false; "state_suffix")]
+    #[test_case(true; "agent_suffix")]
+    fn cutoff_still_validates_raw_suffix_order(agent_stream: bool) {
+        let root = AgentId::generate();
+        let state_records = [
+            state(2, Some(root), json!({"kind":"compaction","epoch":2})),
+            state(1, Some(root), json!({"kind":"compaction","epoch":1})),
+        ];
+        let revisions = [(2, agent(root, 2)), (1, agent(root, 1))];
+        let (state, agents) = if agent_stream {
+            (&[][..], &revisions[..])
+        } else {
+            (&state_records[..], &[][..])
+        };
+        assert_eq!(
+            SessionStateView::fold(state, agents, 0),
+            Err(StateFoldError::UnorderedSequence {
+                stream: if agent_stream { "agent" } else { "state" },
+                previous: 2,
+                seq: 1
+            })
+        );
+    }
+
+    #[test]
+    fn cutoff_ignores_invalid_payload_but_reducer_failure_is_atomic() {
+        let valid = state(
+            1,
+            None,
+            json!({"kind":"plugin","key":SLOT,"version":1,"value":true}),
+        );
+        let invalid = state(2, None, json!({"kind":"compaction","epoch":2}));
+        let mut reducer = SessionStateReducer::from_ordered(from_ref(&valid), &[]).unwrap();
+        let expected = reducer.materialize();
+        assert_eq!(
+            SessionStateView::fold(&[valid, invalid.clone()], &[], 1).unwrap(),
+            expected
+        );
+        assert_eq!(
+            reducer.apply_record(&invalid),
+            Err(StateFoldError::MissingCompactionAgent { seq: 2 })
+        );
+        assert_eq!(reducer.materialize(), expected);
+    }
+
     #[test]
     fn invalid_records_return_typed_errors() {
         let root = AgentId::generate();
@@ -1513,10 +1388,9 @@ mod tests {
             ),
         ];
         for (agent, change, error) in cases {
-            assert_eq!(
-                SessionStateView::fold(&[state(1, agent, change)], &[], 1),
-                Err(error)
-            );
+            let record = state(1, agent, change);
+            assert_eq!(super::validate_record(&record), Err(error.clone()));
+            assert_eq!(SessionStateView::fold(&[record], &[], 1), Err(error));
         }
         let records = [state(1, Some(root), json!({"kind":"compaction","epoch":2}))];
         assert_eq!(
@@ -1559,18 +1433,19 @@ mod tests {
                 value: Some(value),
             },
         };
+        let validation = super::validate_record(&record);
         let folded = SessionStateView::fold(&[record], &[], 1);
         if accepted {
+            assert!(validation.is_ok());
             assert!(folded.is_ok());
         } else {
-            assert_eq!(
-                folded,
-                Err(if depth {
-                    StateFoldError::PluginDepth { seq: 1 }
-                } else {
-                    StateFoldError::PluginSize { seq: 1 }
-                })
-            );
+            let expected = if depth {
+                StateFoldError::PluginDepth { seq: 1 }
+            } else {
+                StateFoldError::PluginSize { seq: 1 }
+            };
+            assert_eq!(validation, Err(expected.clone()));
+            assert_eq!(folded, Err(expected));
         }
     }
 
@@ -1598,7 +1473,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .extend(status.as_object().unwrap().clone());
-        let offload = json!({"storage":"offloaded","value":{"session":root.as_makima_id(),"path":"result.json","bytes":100000}});
+        let offload = json!({"storage":"offloaded","value":{"session":MakimaId::generate(),"path":"result.json","bytes":100000}});
         encoded["text"] = offload.clone();
         encoded["output"] = offload;
         let result: StoredTurnResult = serde_json::from_value(encoded.clone()).unwrap();

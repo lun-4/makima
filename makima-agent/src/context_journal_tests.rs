@@ -6,7 +6,8 @@ use crate::prompt::ResolvedSlots;
 use crate::state::{StateAccess, StateError, StateScope, StateSlotSpec};
 use makima_providers::Message;
 use makima_storage::id::AgentId;
-use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
+use makima_storage::session_state::StateChange;
+use makima_storage::test_util::test_record;
 use std::path::PathBuf;
 use std::sync::Arc;
 use test_case::test_case;
@@ -23,22 +24,7 @@ fn root_fixture() -> (Arc<SessionJournal>, AgentId, StateAccess) {
     let root = AgentId::generate();
     journal
         .commit(JournalCommit {
-            agents: vec![StoredAgentRecord {
-                id: root,
-                parent: None,
-                depth: 0,
-                transcript_key: String::new(),
-                lifecycle: StoredAgentLifecycle::Open,
-                ancestry_unknown: false,
-                label: None,
-                spawned_by_tool_use_id: None,
-                spec: None,
-                restorable: Ok(()),
-                usage: Default::default(),
-                created_seq: 0,
-                updated_seq: 0,
-                legacy: false,
-            }],
+            agents: vec![test_record(root, None)],
             histories: [(
                 root,
                 HistorySnapshot::new(vec![Message::user(FIRST.into())]),
@@ -254,41 +240,6 @@ fn prepared_context_reservations_cover_stage_and_complete(install: bool) {
     });
 }
 
-#[test]
-fn no_write_context_proposal_still_validates_manifest_after_reload() {
-    let (journal, _, access) = root_fixture();
-    journal
-        .commit(context_commit(proposal(
-            &access,
-            FIRST,
-            ContextPolicy::Admission,
-        )))
-        .unwrap();
-    let unchanged = proposal(&access, FIRST, ContextPolicy::Admission);
-    assert!(unchanged.changes.is_empty());
-    let baseline = journal.snapshot();
-    assert_eq!(
-        journal.commit(context_commit(unchanged.clone())).unwrap(),
-        baseline.revision
-    );
-    assert_eq!(journal.snapshot().state, baseline.state);
-    journal
-        .commit(context_commit(proposal(
-            &access,
-            SECOND,
-            ContextPolicy::Reload,
-        )))
-        .unwrap();
-    let reloaded = journal.snapshot();
-    assert!(matches!(
-        journal.commit(context_commit(unchanged)),
-        Err(JournalError::State(StateError::Conflict))
-    ));
-    assert_eq!(journal.snapshot().state, reloaded.state);
-    assert_eq!(journal.snapshot().revision, reloaded.revision);
-    assert_context(&access, SECOND);
-}
-
 #[test_case(false; "ordinary_commit_rejects_stale_content_baseline")]
 #[test_case(true; "prepare_rejects_stale_content_baseline")]
 fn content_only_reload_invalidates_no_write_and_competing_reload_proposals(prepared: bool) {
@@ -303,6 +254,12 @@ fn content_only_reload_invalidates_no_write_and_competing_reload_proposals(prepa
             .unwrap();
         let unchanged = proposal(&access, FIRST, ContextPolicy::Admission);
         assert!(unchanged.changes.is_empty());
+        let baseline = journal.snapshot();
+        assert_eq!(
+            journal.commit(context_commit(unchanged.clone())).unwrap(),
+            baseline.revision
+        );
+        assert_eq!(journal.snapshot().state, baseline.state);
         let competing = proposal(&access, THIRD, ContextPolicy::Reload);
         assert_eq!(competing.expected, unchanged.expected);
         assert!(!competing.changes.is_empty());

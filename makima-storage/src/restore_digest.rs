@@ -189,6 +189,7 @@ mod tests {
             StoredModeSnapshot, StoredStateRecord,
         },
         sessions::{HistorySnapshot, Session, next_epoch},
+        test_util::test_record,
     };
     use serde_json::{Value, json};
     use std::{mem, sync::Arc};
@@ -220,10 +221,7 @@ mod tests {
         let root = AgentId::generate();
         session.bind_root_id(root).unwrap();
         let child = AgentId::generate();
-        let mut record = session.agents()[&root].clone();
-        record.id = child;
-        record.parent = Some(root);
-        record.depth = 1;
+        let mut record = test_record(child, Some(root));
         record.transcript_key = CHILD.into();
         record.created_seq = session.next_state_seq();
         record.updated_seq = record.created_seq;

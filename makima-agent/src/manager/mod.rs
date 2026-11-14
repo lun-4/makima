@@ -52,8 +52,6 @@ use crate::actor::{
     ActorCloseCut, ActorIdleGuard, ActorRestoration, ManagedTurnAdmission, TranscriptRequest,
     TranscriptSnapshot,
 };
-#[cfg(any(test, feature = "test-util"))]
-use crate::journal::{GraphRestartError, GraphStore};
 use crate::journal::{
     JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
 };
@@ -316,22 +314,6 @@ impl AgentManagerHandle {
     pub fn downgrade(&self) -> WeakAgentManagerHandle {
         WeakAgentManagerHandle(Arc::downgrade(&self.0))
     }
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn restore_empty_graph<S: GraphStore>(
-        limits: AgentLimits,
-        store: &S,
-    ) -> Result<Self, GraphRestartError<S::Error>> {
-        if !store
-            .load()
-            .map_err(GraphRestartError::Store)?
-            .records()
-            .is_empty()
-        {
-            return Err(GraphRestartError::NonemptyGraph);
-        }
-        Ok(Self::new(limits)?)
-    }
-
     pub fn new(limits: AgentLimits) -> Result<Self, ManagerError> {
         Self::new_with_journal(limits, Arc::new(SessionJournal::default()))
     }
@@ -2045,22 +2027,6 @@ impl AgentManagerHandle {
             shared_messages,
             factory,
             start,
-        )
-    }
-
-    pub fn create_root_with_id(
-        &self,
-        agent_id: AgentId,
-        initial_messages: Vec<Message>,
-        shared_messages: Option<SharedMessages>,
-        backend: Box<dyn ActorBackend>,
-    ) -> Result<AgentRef, ManagerError> {
-        self.create_root_with_id_and_config(
-            agent_id,
-            None,
-            initial_messages,
-            shared_messages,
-            |_| Ok::<_, String>(backend),
         )
     }
 

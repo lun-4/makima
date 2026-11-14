@@ -10,8 +10,8 @@ use crate::{
 };
 use makima_providers::{Message, TokenUsage};
 use makima_storage::{
-    StateDir, StorageError,
-    blobs::{BlobError, BlobHash, BlobStore, FileState},
+    RootResource, StateDir, StorageError,
+    blobs::{BlobError, BlobStore, FileState},
     id::{AgentId, MakimaId},
     restore::{
         PathConflict, PathRestore, RestoreChoice, RestoreEndpoint,
@@ -42,8 +42,15 @@ const UNPUBLISHED: &str = "restore transition is not present in the durable targ
 const PUBLISHED: &str = "published restore cannot be rolled back";
 const INCOMPLETE: &str = "restore transition still requires repair";
 
-static RETAINED: Mutex<Vec<RestoreLease>> = Mutex::new(Vec::new());
-static STARTUP_LEASES: Mutex<Vec<(MakimaId, StartupLeases)>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct RestoreRetention(Mutex<RetainedRestores>);
+
+#[derive(Default)]
+struct RetainedRestores {
+    // Entries retain the root until explicit repair releases their guards.
+    receipts: Vec<RestoreLease>,
+    startups: Vec<StartupRepair>,
+}
 
 type FileBytes = Option<Vec<u8>>;
 type PathBytes = (FileBytes, FileBytes);
@@ -126,6 +133,7 @@ pub struct PreparedRestore {
 }
 
 struct RestoreLease {
+    retention: RootResource<RestoreRetention>,
     sessions_dir: PathBuf,
     store: RestoreStore,
     blobs: BlobStore,
@@ -133,7 +141,6 @@ struct RestoreLease {
     manifest: RestoreTransition,
     anchors: Vec<Option<AnchoredPath>>,
     projection: Option<PlanProjection>,
-    paths: BTreeSet<PathBuf>,
     read_only: BTreeMap<PathBuf, Result<AnchoredPath, String>>,
     cancel: CancelToken,
     _guards: Vec<WriteLockGuard>,
@@ -150,10 +157,6 @@ impl fmt::Debug for PreparedRestore {
             )
             .finish_non_exhaustive()
     }
-}
-
-pub fn endpoint_digest(session: &StoredSession) -> Result<BlobHash, RestoreError> {
-    Ok(session_digest(session)?)
 }
 
 pub fn plan(segments: &[RestoreSegment]) -> Result<RestorePreview, RestoreError> {
@@ -347,6 +350,7 @@ async fn prepare_with(
         request.preview.paths.clear();
     }
     let state = state_dir(&request.sessions_dir)?;
+    let retention = state.resource::<RestoreRetention>()?;
     let store = RestoreStore::new(state.clone());
     let blobs = BlobStore::new(state);
     let mut planned = BTreeMap::new();
@@ -491,6 +495,7 @@ async fn prepare_with(
         };
         let receipt = PreparedRestore {
             lease: Some(RestoreLease {
+                retention,
                 sessions_dir: request.sessions_dir,
                 store,
                 blobs,
@@ -498,7 +503,6 @@ async fn prepare_with(
                 manifest,
                 anchors,
                 projection: request.projection,
-                paths,
                 read_only,
                 cancel: request.cancel,
                 _guards: guards,
@@ -521,22 +525,24 @@ impl PreparedRestore {
         self.inner().reference.clone()
     }
 
-    pub fn paths(&self) -> BTreeSet<PathBuf> {
-        self.inner().paths.clone()
-    }
-
     pub fn retain_barrier(&mut self, guard: impl Any + Send) {
         self.inner_mut().barriers.push(Box::new(guard));
     }
 
-    pub fn take_retained(reference: &TransitionRef) -> Option<Self> {
-        let mut retained = RETAINED.lock().unwrap_or_else(|error| error.into_inner());
-        let index = retained
-            .iter()
-            .position(|lease| &lease.reference == reference)?;
-        Some(Self {
-            lease: Some(retained.swap_remove(index)),
-        })
+    pub fn take_retained(state: &StateDir, reference: &TransitionRef) -> io::Result<Option<Self>> {
+        let retention = state.resource::<RestoreRetention>()?;
+        let lease = {
+            let mut retained = retention
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            retained
+                .receipts
+                .iter()
+                .position(|lease| &lease.reference == reference)
+                .map(|index| retained.receipts.swap_remove(index))
+        };
+        Ok(lease.map(|lease| Self { lease: Some(lease) }))
     }
 
     pub fn apply(&mut self, registry: &ModeRegistry) -> Result<AppliedRestore, RestoreError> {
@@ -668,9 +674,12 @@ impl Drop for PreparedRestore {
         if let Some(lease) = self.lease.take() {
             tracing::error!(session = %lease.reference.session, transition = %lease.reference.transition,
                 "unresolved file restore retained with write locks and transition barriers");
-            RETAINED
+            let retention = lease.retention.clone();
+            retention
+                .0
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
+                .receipts
                 .push(lease);
         }
     }
@@ -846,17 +855,26 @@ pub struct OwnedRestoreLease {
 type StartupLeases = BTreeMap<MakimaId, OwnedRestoreLease>;
 
 struct StartupRepair {
+    retention: RootResource<RestoreRetention>,
     session: MakimaId,
     leases: Option<StartupLeases>,
 }
 
 impl Drop for StartupRepair {
     fn drop(&mut self) {
-        if let Some(leases) = self.leases.take() {
-            STARTUP_LEASES
+        if let Some(leases) = self.leases.take()
+            && !leases.is_empty()
+        {
+            self.retention
+                .0
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .push((self.session, leases));
+                .startups
+                .push(Self {
+                    retention: self.retention.clone(),
+                    session: self.session,
+                    leases: Some(leases),
+                });
         }
     }
 }
@@ -869,19 +887,26 @@ pub async fn reconcile_session_guarded(
     cancel: CancelToken,
 ) -> Result<(), RestoreError> {
     let sessions_dir = sessions_dir.to_path_buf();
-    let store = RestoreStore::new(state_dir(&sessions_dir)?);
-    let mut leases = {
-        let mut retained = STARTUP_LEASES
+    let state = state_dir(&sessions_dir)?;
+    let retention = state.resource::<RestoreRetention>()?;
+    let store = RestoreStore::new(state);
+    let previous = {
+        let mut retained = retention
+            .0
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         retained
+            .startups
             .iter()
-            .position(|(id, _)| *id == session)
-            .map(|index| retained.swap_remove(index).1)
-            .unwrap_or_default()
+            .position(|repair| repair.session == session)
+            .map(|index| retained.startups.swap_remove(index))
     };
+    let mut leases = previous
+        .and_then(|mut repair| repair.leases.take())
+        .unwrap_or_default();
     leases.extend(supplied);
     let repair = StartupRepair {
+        retention,
         session,
         leases: Some(leases),
     };
@@ -966,32 +991,19 @@ fn validate_startup_leases(leases: &StartupLeases) -> Result<(), RestoreError> {
     Ok(())
 }
 
-pub async fn reconcile_session(
-    sessions_dir: &Path,
-    session: MakimaId,
-    locks: Arc<FileWriteLocks>,
-    cancel: CancelToken,
-) -> Result<(), RestoreError> {
-    let store = RestoreStore::new(state_dir(sessions_dir)?);
-    let pending = smol::unblock(move || store.pending_for_session(session)).await?;
-    for reference in pending {
-        reconcile(sessions_dir, &reference, Arc::clone(&locks), cancel.clone()).await?;
-    }
-    Ok(())
-}
-
 pub async fn reconcile(
     sessions_dir: &Path,
     reference: &TransitionRef,
     locks: Arc<FileWriteLocks>,
     cancel: CancelToken,
 ) -> Result<(), RestoreError> {
-    if let Some(receipt) = PreparedRestore::take_retained(reference) {
+    let state = state_dir(sessions_dir)?;
+    if let Some(receipt) = PreparedRestore::take_retained(&state, reference)? {
         return smol::unblock(move || reconcile_receipt(receipt)).await;
     }
+    let retention = state.resource::<RestoreRetention>()?;
     let sessions_dir = sessions_dir.to_path_buf();
     let reference = reference.clone();
-    let state = state_dir(&sessions_dir)?;
     let store = RestoreStore::new(state.clone());
     let (store, snapshot, keys) = {
         let reference = reference.clone();
@@ -1021,24 +1033,12 @@ pub async fn reconcile(
         .map_err(RestoreError::Invalid)?;
     let receipt = PreparedRestore {
         lease: Some(RestoreLease {
+            retention,
             sessions_dir: sessions_dir.to_path_buf(),
             store,
             blobs: BlobStore::new(state),
             reference: reference.clone(),
             anchors: (0..snapshot.transition.paths.len()).map(|_| None).collect(),
-            paths: snapshot
-                .transition
-                .paths
-                .iter()
-                .map(|path| path.path.clone())
-                .chain(
-                    snapshot
-                        .transition
-                        .skipped
-                        .iter()
-                        .map(|path| path.path.clone()),
-                )
-                .collect(),
             read_only: BTreeMap::new(),
             manifest: snapshot.transition,
             projection: None,
@@ -1136,7 +1136,7 @@ fn validate_endpoint(sessions_dir: &Path, endpoint: &RestoreEndpoint) -> Result<
         current
     };
     if checkpoint.sequence_high_water().unwrap_or_default() != endpoint.seq
-        || endpoint_digest(&checkpoint)? != endpoint.digest
+        || session_digest(&checkpoint)? != endpoint.digest
     {
         return Err(RestoreError::Invalid(
             "restore endpoint no longer matches its checkpoint".into(),
@@ -1286,8 +1286,8 @@ mod tests {
     use super::{
         CONTENT_CONFLICT, DISCONTINUOUS, OwnedRestoreLease, PlanProjection, PlannedFile,
         PreparedRestore, RestorePreview, RestoreRequest, RestoreSegment, SHELL_KIND, StoredSession,
-        endpoint_digest, plan, plan_inverse, prepare, prepare_with, reconcile,
-        reconcile_session_guarded, save_state, state_dir,
+        plan, plan_inverse, prepare, prepare_with, reconcile, reconcile_session_guarded,
+        save_state, state_dir,
     };
     use crate::journal::SessionJournal;
     use crate::tools::FileWriteLocks;
@@ -1300,12 +1300,18 @@ mod tests {
             RestoreChoice, RestoreEndpoint, RestoreError as RestoreStorageError, RestoreProgress,
             RestoreStore,
         },
+        restore_digest::session_digest,
         session_lock::{LockHeartbeat, claim},
         session_state::{
             ParentLink, StateChange, StoredAgentConfig, StoredModeSnapshot, StoredStateRecord,
         },
     };
-    use std::{collections::BTreeMap, fs, io, path::PathBuf, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        fs, io,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1355,7 +1361,7 @@ mod tests {
                 session: self.session.id,
                 branch: None,
                 seq: self.session.sequence_high_water().unwrap_or_default(),
-                digest: endpoint_digest(&self.session).unwrap(),
+                digest: session_digest(&self.session).unwrap(),
             }
         }
 
@@ -1602,7 +1608,7 @@ mod tests {
                 session: source.id,
                 branch: None,
                 seq: source.sequence_high_water().unwrap_or_default(),
-                digest: endpoint_digest(&source).unwrap(),
+                digest: session_digest(&source).unwrap(),
             };
             let mut receipt = prepare(request).await.unwrap();
             receipt.apply(&ModeRegistry::builtin()).unwrap();
@@ -1751,7 +1757,14 @@ mod tests {
                 affected: [agent].into(),
             });
             let mut receipt = prepare(request).await.unwrap();
-            assert!(receipt.paths().contains(&fixture.path));
+            assert_eq!(
+                if invalid_hash {
+                    &receipt.inner().manifest.skipped[0].path
+                } else {
+                    &receipt.inner().manifest.paths[0].path
+                },
+                &fixture.path
+            );
             let applied = receipt.apply(&ModeRegistry::builtin()).unwrap();
             assert_eq!(
                 fs::read(&fixture.path).unwrap(),
@@ -2006,7 +2019,12 @@ mod tests {
                         .await
                         .is_none()
                 );
-                PreparedRestore::take_retained(&reference).unwrap()
+                PreparedRestore::take_retained(
+                    &state_dir(&fixture.sessions_dir).unwrap(),
+                    &reference,
+                )
+                .unwrap()
+                .unwrap()
             } else {
                 *receipt
             };
@@ -2034,6 +2052,229 @@ mod tests {
     }
 
     #[test]
+    fn retained_receipts_are_root_scoped_and_outlive_original_handles() {
+        smol::block_on(async {
+            let first = Fixture::new();
+            let mut second = Fixture::new();
+            second.session.id = first.session.id;
+            second.session.save_to(&second.sessions_dir).unwrap();
+            fs::write(&first.path, AFTER).unwrap();
+            fs::write(&second.path, AFTER).unwrap();
+            let mut first_receipt = prepare(first.request(Some(AFTER), Some(BEFORE)))
+                .await
+                .unwrap();
+            let reference = first_receipt.transition_ref();
+            let transition = reference.transition;
+            let mut second_receipt = prepare_with(
+                second.request(Some(AFTER), Some(BEFORE)),
+                move |store, owner, mut manifest| {
+                    manifest.id = transition;
+                    store.prepare(owner, manifest)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(second_receipt.transition_ref(), reference);
+            let mut lifetimes = Vec::new();
+            for (fixture, receipt) in [(&first, &mut first_receipt), (&second, &mut second_receipt)]
+            {
+                let state = state_dir(&fixture.sessions_dir).unwrap();
+                let witness = state.resource::<Mutex<Option<Arc<()>>>>().unwrap();
+                let alive = Arc::new(());
+                lifetimes.push(Arc::downgrade(&alive));
+                *witness.lock().unwrap() = Some(alive);
+                let heartbeat = Arc::new(LockHeartbeat::spawn(
+                    claim(&fixture.sessions_dir, &fixture.session.id)
+                        .unwrap()
+                        .unwrap(),
+                    || {},
+                ));
+                receipt.retain_barrier(heartbeat);
+            }
+            drop(first_receipt);
+            drop(second_receipt);
+            let Fixture {
+                _directory: first_directory,
+                sessions_dir: first_sessions,
+                session: first_session,
+                path: first_path,
+                locks: first_locks,
+                ..
+            } = first;
+            let Fixture {
+                _directory: second_directory,
+                sessions_dir: second_sessions,
+                session: second_session,
+                path: second_path,
+                locks: second_locks,
+                ..
+            } = second;
+            let cancel = CancelToken::none();
+            let mut first_writer =
+                Box::pin(first_locks.acquire_all([first_path.clone()].into(), &cancel));
+            let mut second_writer =
+                Box::pin(second_locks.acquire_all([second_path.clone()].into(), &cancel));
+            assert!(
+                futures_lite::future::poll_once(first_writer.as_mut())
+                    .await
+                    .is_none()
+            );
+            assert!(
+                futures_lite::future::poll_once(second_writer.as_mut())
+                    .await
+                    .is_none()
+            );
+            for lifetime in &lifetimes {
+                assert!(lifetime.upgrade().is_some());
+            }
+            reconcile(
+                &second_sessions,
+                &reference,
+                second_locks.clone(),
+                CancelToken::none(),
+            )
+            .await
+            .unwrap();
+            drop(second_writer.await.unwrap());
+            assert!(lifetimes[1].upgrade().is_none());
+            assert!(lifetimes[0].upgrade().is_some());
+            assert!(
+                claim(&second_sessions, &second_session.id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(claim(&first_sessions, &first_session.id).unwrap().is_none());
+            assert!(
+                futures_lite::future::poll_once(first_writer.as_mut())
+                    .await
+                    .is_none()
+            );
+            reconcile(
+                &first_sessions,
+                &reference,
+                first_locks.clone(),
+                CancelToken::none(),
+            )
+            .await
+            .unwrap();
+            drop(first_writer.await.unwrap());
+            assert!(lifetimes[0].upgrade().is_none());
+            assert!(claim(&first_sessions, &first_session.id).unwrap().is_some());
+            assert_eq!(fs::read(first_path).unwrap(), AFTER);
+            assert_eq!(fs::read(second_path).unwrap(), AFTER);
+            drop((first_directory, second_directory));
+        });
+    }
+
+    #[test_case(false; "conflict_then_retry")]
+    #[test_case(true; "cancelled_retry")]
+    fn startup_repairs_are_root_scoped_and_retry_after_original_handles_drop(cancel_retry: bool) {
+        smol::block_on(async {
+            let first = Fixture::new();
+            let mut second = Fixture::new();
+            second.session.id = first.session.id;
+            second.session.save_to(&second.sessions_dir).unwrap();
+            fs::write(&first.path, AFTER).unwrap();
+            let mut receipt = prepare(first.request(Some(AFTER), Some(BEFORE)))
+                .await
+                .unwrap();
+            receipt.apply(&ModeRegistry::builtin()).unwrap();
+            drop(receipt.lease.take());
+            fs::write(&first.path, EXTERNAL).unwrap();
+            let state = state_dir(&first.sessions_dir).unwrap();
+            let witness = state.resource::<Mutex<Option<Arc<()>>>>().unwrap();
+            let alive = Arc::new(());
+            let lifetime = Arc::downgrade(&alive);
+            *witness.lock().unwrap() = Some(alive);
+            let heartbeat = Arc::new(LockHeartbeat::spawn(
+                claim(&first.sessions_dir, &first.session.id)
+                    .unwrap()
+                    .unwrap(),
+                || {},
+            ));
+            let heartbeat_lifetime = Arc::downgrade(&heartbeat);
+            let supplied = BTreeMap::from([(
+                first.session.id,
+                OwnedRestoreLease {
+                    guard: heartbeat.publication_guard(),
+                    keepalive: heartbeat,
+                },
+            )]);
+            let error = reconcile_session_guarded(
+                &first.sessions_dir,
+                first.session.id,
+                supplied,
+                first.locks.clone(),
+                CancelToken::none(),
+            )
+            .await
+            .unwrap_err();
+            drop(error);
+            drop((witness, state, receipt));
+            let Fixture {
+                _directory: directory,
+                sessions_dir,
+                session,
+                path,
+                locks,
+                ..
+            } = first;
+            assert!(lifetime.upgrade().is_some());
+            assert!(heartbeat_lifetime.upgrade().is_some());
+            assert!(claim(&sessions_dir, &session.id).unwrap().is_none());
+            reconcile_session_guarded(
+                &second.sessions_dir,
+                second.session.id,
+                BTreeMap::new(),
+                second.locks.clone(),
+                CancelToken::none(),
+            )
+            .await
+            .unwrap();
+            assert!(heartbeat_lifetime.upgrade().is_some());
+            assert!(claim(&sessions_dir, &session.id).unwrap().is_none());
+            assert!(
+                claim(&second.sessions_dir, &second.session.id)
+                    .unwrap()
+                    .is_some()
+            );
+            if cancel_retry {
+                let (trigger, cancel) = CancelToken::new();
+                trigger.cancel();
+                let error = reconcile_session_guarded(
+                    &sessions_dir,
+                    session.id,
+                    BTreeMap::new(),
+                    locks.clone(),
+                    cancel,
+                )
+                .await
+                .unwrap_err();
+                drop(error);
+                assert!(heartbeat_lifetime.upgrade().is_some());
+                assert!(claim(&sessions_dir, &session.id).unwrap().is_none());
+            }
+            fs::write(&path, BEFORE).unwrap();
+            reconcile_session_guarded(
+                &sessions_dir,
+                session.id,
+                BTreeMap::new(),
+                locks.clone(),
+                CancelToken::none(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), AFTER);
+            assert!(heartbeat_lifetime.upgrade().is_none());
+            assert!(lifetime.upgrade().is_none());
+            assert!(claim(&sessions_dir, &session.id).unwrap().is_some());
+            let cancel = CancelToken::none();
+            drop(locks.acquire_all([path].into(), &cancel).await.unwrap());
+            drop(directory);
+        });
+    }
+
+    #[test]
     fn dropped_receipt_retains_locks_and_barrier_until_explicit_abort() {
         smol::block_on(async {
             let fixture = Fixture::new();
@@ -2046,7 +2287,12 @@ mod tests {
             let reference = receipt.transition_ref();
             drop(receipt);
             assert_eq!(Arc::strong_count(&barrier), 2);
-            let receipt = PreparedRestore::take_retained(&reference).unwrap();
+            let receipt = PreparedRestore::take_retained(
+                &state_dir(&fixture.sessions_dir).unwrap(),
+                &reference,
+            )
+            .unwrap()
+            .unwrap();
             receipt.abort().unwrap();
             assert_eq!(Arc::strong_count(&barrier), 1);
         });

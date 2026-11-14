@@ -595,6 +595,7 @@ mod tests {
     };
     use makima_domain::PostLevel;
     use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
+    use makima_storage::test_util::test_record;
     use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
     use test_case::test_case;
 
@@ -614,20 +615,8 @@ mod tests {
 
     fn record(id: AgentId, parent: Option<AgentId>) -> StoredAgentRecord {
         StoredAgentRecord {
-            id,
-            parent,
-            depth: u32::from(parent.is_some()),
             transcript_key: id.to_string(),
-            lifecycle: StoredAgentLifecycle::Open,
-            ancestry_unknown: false,
-            label: None,
-            spawned_by_tool_use_id: None,
-            spec: None,
-            restorable: Ok(()),
-            usage: Default::default(),
-            created_seq: 0,
-            updated_seq: 0,
-            legacy: false,
+            ..test_record(id, parent)
         }
     }
 
@@ -1218,7 +1207,7 @@ mod tests {
             unreachable!()
         };
         *hash = INVALID_HASH.into();
-        state.snapshot.state.insert(record.seq, record);
+        state.snapshot.state.push(record);
         drop(state);
         assert!(matches!(
             root_context(&fixture.journal.state_access(fixture.root, None)),

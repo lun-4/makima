@@ -54,6 +54,7 @@ use makima_storage::id::SessionRef;
 use makima_storage::restore::{
     PathRestore, RestoreChoice, RestoreEndpoint, RestoreProgress, RestoreStore, RestoreTransition,
 };
+use makima_storage::restore_digest::session_digest;
 use makima_storage::session_state::{StateChange, StoredAgentLifecycle};
 use makima_storage::sessions::SESSIONS_DIR;
 use serde_json::{Value, json};
@@ -1080,7 +1081,7 @@ fn disk_endpoint(session: &common::TestSession) -> RestoreEndpoint {
         session: session.id,
         branch: None,
         seq: session.sequence_high_water().unwrap_or_default(),
-        digest: file_restore::endpoint_digest(session).unwrap(),
+        digest: session_digest(session).unwrap(),
     }
 }
 
@@ -1270,9 +1271,10 @@ fn bundled_disk_restore_recovers_persisted_manifest_after_restart(created: bool,
         publish
     );
     let locks = Arc::new(FileWriteLocks::new());
-    smol::block_on(common::bounded(file_restore::reconcile_session(
+    smol::block_on(common::bounded(file_restore::reconcile_session_guarded(
         &restarted_state.path().join(SESSIONS_DIR),
         id,
+        Default::default(),
         locks.clone(),
         CancelToken::none(),
     )))
@@ -1291,9 +1293,10 @@ fn bundled_disk_restore_recovers_persisted_manifest_after_restart(created: bool,
         !publish
     );
     assert!(restarted_store.pending(id).unwrap().is_empty());
-    smol::block_on(common::bounded(file_restore::reconcile_session(
+    smol::block_on(common::bounded(file_restore::reconcile_session_guarded(
         &restarted_state.path().join(SESSIONS_DIR),
         id,
+        Default::default(),
         locks,
         CancelToken::none(),
     )))

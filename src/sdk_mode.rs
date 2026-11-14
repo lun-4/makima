@@ -2717,15 +2717,11 @@ mod tests {
         ContentBlock, Invocation, ProviderEvent, RequestDelivery, RequestOptions, Role,
         StreamResponse,
     };
-    use makima_storage::blobs::{BlobStore, FileState};
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
-    use makima_storage::restore::{
-        PathRestore, RestoreChoice, RestoreEndpoint, RestoreProgress, RestoreStore,
-        RestoreTransition, TransitionRef,
-    };
-    use makima_storage::restore_digest::session_digest;
+    use makima_storage::restore::{RestoreProgress, RestoreStore};
     use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
     use makima_storage::sessions::Prefs;
+    use makima_storage::test_util::pending_restore;
     use std::path::PathBuf;
     use std::time::Duration;
     use test_case::test_case;
@@ -2764,44 +2760,6 @@ mod tests {
     const LEGACY_PLAN_CONTENT: &str = "preserved legacy SDK plan";
     const RESTORE_CHANGED: &str = "pending SDK restore content";
     const RESTORE_CONFLICT: &str = "independent SDK edit";
-
-    fn pending_sdk_restore(
-        storage: &StateDir,
-        session: &StoredSession,
-        path: &Path,
-    ) -> TransitionRef {
-        let blobs = BlobStore::new(storage.clone());
-        let endpoint = RestoreEndpoint {
-            session: session.id,
-            branch: None,
-            seq: session.sequence_high_water().unwrap_or_default(),
-            digest: session_digest(session).unwrap(),
-        };
-        RestoreStore::new(storage.clone())
-            .prepare(
-                session.id,
-                RestoreTransition {
-                    id: MakimaId::generate(),
-                    choice: RestoreChoice::FilesOnly,
-                    source: endpoint.clone(),
-                    target: endpoint,
-                    inverse_of: None,
-                    paths: vec![PathRestore {
-                        path: path.to_path_buf(),
-                        before: FileState::Blob(
-                            blobs
-                                .put(session.id, LEGACY_PLAN_CONTENT.as_bytes())
-                                .unwrap(),
-                        ),
-                        after: FileState::Blob(
-                            blobs.put(session.id, RESTORE_CHANGED.as_bytes()).unwrap(),
-                        ),
-                    }],
-                    skipped: Vec::new(),
-                },
-            )
-            .unwrap()
-    }
 
     fn reset_sdk_params(cwd: PathBuf) -> SdkParams {
         use clap::Parser;
@@ -3026,7 +2984,13 @@ mod tests {
             let mut stored = StoredSession::load(saved.id, &storage).unwrap();
             stored.save(&storage).unwrap();
             let stored = StoredSession::load(saved.id, &storage).unwrap();
-            let reference = pending_sdk_restore(&storage, &stored, &plan);
+            let reference = pending_restore(
+                &storage,
+                &stored,
+                &plan,
+                LEGACY_PLAN_CONTENT.as_bytes(),
+                RESTORE_CHANGED.as_bytes(),
+            );
             std::fs::write(&plan, RESTORE_CHANGED).unwrap();
             reference
         });
@@ -3162,7 +3126,13 @@ mod tests {
             saved.save(&storage).unwrap();
             let path = directory.path().join(LEGACY_PLAN_FILE);
             let reference = pending.then(|| {
-                let reference = pending_sdk_restore(&storage, &saved, &path);
+                let reference = pending_restore(
+                    &storage,
+                    &saved,
+                    &path,
+                    LEGACY_PLAN_CONTENT.as_bytes(),
+                    RESTORE_CHANGED.as_bytes(),
+                );
                 saved.push_restore_ref(reference.clone());
                 saved.save(&storage).unwrap();
                 std::fs::write(&path, LEGACY_PLAN_CONTENT).unwrap();
@@ -3323,7 +3293,13 @@ mod tests {
             saved.bind_root_id(root).unwrap();
             saved.save(&storage).unwrap();
             let path = directory.path().join(LEGACY_PLAN_FILE);
-            let reference = pending_sdk_restore(&storage, &saved, &path);
+            let reference = pending_restore(
+                &storage,
+                &saved,
+                &path,
+                LEGACY_PLAN_CONTENT.as_bytes(),
+                RESTORE_CHANGED.as_bytes(),
+            );
             saved.push_restore_ref(reference.clone());
             saved.save(&storage).unwrap();
             std::fs::write(

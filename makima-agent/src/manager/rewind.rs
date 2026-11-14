@@ -172,14 +172,6 @@ impl ManagerRewindGuard {
         &self.affected
     }
 
-    pub fn actor_guards(&self) -> &BTreeMap<AgentId, ActorIdleGuard> {
-        &self.guards
-    }
-
-    pub fn actor_guard(&self, agent: AgentId) -> Option<&ActorIdleGuard> {
-        self.guards.get(&agent)
-    }
-
     pub fn take_actor_guard(&mut self, agent: AgentId) -> Option<ActorIdleGuard> {
         self.guards.remove(&agent)
     }
@@ -555,5 +547,22 @@ impl Drop for ManagerRewindGuard {
         graph.rewind_quiescent = false;
         graph.revision += 1;
         self.manager.0.reaped.notify(usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ManagerRewindGuard;
+    use crate::{AgentId, actor::ActorIdleGuard};
+    use std::collections::BTreeMap;
+
+    impl ManagerRewindGuard {
+        pub(crate) fn actor_guards(&self) -> &BTreeMap<AgentId, ActorIdleGuard> {
+            &self.guards
+        }
+
+        pub(crate) fn actor_guard(&self, agent: AgentId) -> Option<&ActorIdleGuard> {
+            self.guards.get(&agent)
+        }
     }
 }

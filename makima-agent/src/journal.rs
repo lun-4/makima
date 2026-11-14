@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::error::Error;
 use std::mem::take;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -172,28 +171,7 @@ struct ReducerCache {
 }
 
 impl SessionJournalSnapshot {
-    pub fn from_records(
-        state: Vec<StoredStateRecord>,
-        agents: Vec<(u64, StoredAgentRecord)>,
-    ) -> Result<Self, StateFoldError> {
-        let reduced = SessionStateReducer::from_ordered(&state, &agents)?;
-        let seq = state
-            .iter()
-            .map(|record| record.seq)
-            .chain(agents.iter().map(|(seq, _)| *seq))
-            .max()
-            .unwrap_or(0);
-        let mut snapshot = Self::empty();
-        snapshot.seq = seq;
-        snapshot.state = JournalRecords::try_from_ordered(state, "state")?;
-        snapshot.agent_revisions = JournalRecords::try_from_ordered(agents, "agent")?;
-        snapshot.cache_reducer(reduced);
-        Ok(snapshot)
-    }
-
     fn reduced(&self) -> Result<SessionStateReducer, StateFoldError> {
-        self.state.validate()?;
-        self.agent_revisions.validate()?;
         if let Some(cache) = &self.reducer
             && self.state.same_root(&cache.state)
             && self.agent_revisions.same_root(&cache.agents)
@@ -212,8 +190,6 @@ impl SessionJournalSnapshot {
     }
 
     pub fn fold(&self, through: u64) -> Result<SessionStateView, StateFoldError> {
-        self.state.validate()?;
-        self.agent_revisions.validate()?;
         if through >= self.seq {
             return Ok(self.reduced()?.materialize());
         }
@@ -294,9 +270,7 @@ impl SessionJournalSnapshot {
             );
             return Ok(());
         }
-        self.state.validate()?;
-        self.agent_revisions.validate()?;
-        SessionStateView::fold(session.state(), session.agent_revisions(), u64::MAX)?;
+        SessionStateReducer::validate_structure(session.state(), session.agent_revisions())?;
         let mut state: BTreeMap<_, _> = session
             .state()
             .iter()
@@ -392,17 +366,6 @@ pub(crate) struct JournalState {
     aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
     replacement: Option<MakimaId>,
-}
-
-pub struct JournalCheckpoint {
-    snapshot: SessionJournalSnapshot,
-    _publication: RwLockReadGuardArc<()>,
-}
-
-impl JournalCheckpoint {
-    pub fn snapshot(&self) -> &SessionJournalSnapshot {
-        &self.snapshot
-    }
 }
 
 /// An owned publication lane, acquired before reading runtime state that the
@@ -764,7 +727,7 @@ impl JournalReplacement {
             && let StateChange::Boundary { lens: saved, .. } = &mut record.change
         {
             *saved = lens;
-            self.candidate.state.insert(record.seq, record);
+            self.candidate.state.push(record);
         }
         Ok(self)
     }
@@ -940,7 +903,6 @@ impl SessionJournal {
     }
 
     pub fn from_session(session: &StoredSession) -> Result<Self, JournalError> {
-        SessionStateView::fold(session.state(), session.agent_revisions(), u64::MAX)?;
         let journal = Self::default();
         {
             let mut state = journal.lock();
@@ -1189,13 +1151,6 @@ impl SessionJournal {
         }
     }
 
-    pub fn pending_revision(&self) -> Option<u64> {
-        self.lock()
-            .staged
-            .front()
-            .map(|entry| entry.snapshot.revision)
-    }
-
     pub fn transcript_key_in_use(&self, key: &str, except: Option<AgentId>) -> bool {
         self.lock()
             .snapshot
@@ -1206,10 +1161,6 @@ impl SessionJournal {
 
     pub fn agent(&self, id: AgentId) -> Option<StoredAgentRecord> {
         self.lock().snapshot.latest_agent(id)
-    }
-
-    pub fn replace_terminal_outcome(&self, outcome: &TurnOutcome) -> Result<(), JournalError> {
-        self.replace_terminal_outcome_for(None, outcome)
     }
 
     pub fn replace_terminal_outcome_for(
@@ -1363,15 +1314,6 @@ impl SessionJournal {
             .into_iter()
             .map(|(_, child, turn, delivery)| (child, turn, delivery))
             .collect())
-    }
-
-    pub fn queue_delivery(
-        self: &Arc<Self>,
-        parent: AgentId,
-        delivery: Arc<ChildDelivery>,
-        preview_bytes: usize,
-    ) -> Result<bool, DeliveryRejection> {
-        self.queue_delivery_for(parent, delivery, preview_bytes, &[])
     }
 
     pub fn queue_delivery_for(
@@ -1647,15 +1589,6 @@ impl SessionJournal {
 
     pub async fn publication_read(&self) -> RwLockReadGuardArc<()> {
         self.publication.read_arc().await
-    }
-
-    pub async fn capture_checkpoint(&self) -> Result<JournalCheckpoint, String> {
-        let publication = self.publication_read().await;
-        let snapshot = self.checkpoint_snapshot()?;
-        Ok(JournalCheckpoint {
-            snapshot,
-            _publication: publication,
-        })
     }
 
     pub async fn boundary_read(&self) -> RwLockReadGuardArc<()> {
@@ -1948,26 +1881,6 @@ impl SessionJournal {
             }
             listener.await;
         }
-    }
-
-    pub fn record_config(
-        &self,
-        agent: AgentId,
-        generation: u64,
-        config: StoredAgentConfig,
-        options: Option<BTreeMap<String, String>>,
-    ) -> Result<u64, JournalError> {
-        self.record_config_bound(None, agent, generation, config, options, Vec::new())
-    }
-
-    pub fn record_config_for(
-        &self,
-        incarnation: JournalIncarnation,
-        generation: u64,
-        config: StoredAgentConfig,
-        options: Option<BTreeMap<String, String>>,
-    ) -> Result<u64, JournalError> {
-        self.record_config_with_context_for(incarnation, generation, config, options, Vec::new())
     }
 
     pub(crate) fn record_config_with_context_for(
@@ -2649,8 +2562,13 @@ impl SessionJournal {
 
 #[cfg(test)]
 mod tests {
-    use super::{JournalChange, JournalCommit, SessionJournal, restored_preview_bytes};
-    use crate::actor::{ChildDelivery, MAX_PENDING_DELIVERIES, TurnProvenance, TurnResult};
+    use super::{
+        JournalChange, JournalCommit, JournalError, SessionJournal, SessionJournalSnapshot,
+        restored_preview_bytes,
+    };
+    use crate::actor::{
+        ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES, TurnProvenance, TurnResult,
+    };
     use crate::tools::offload::OffloadStore;
     use crate::{HistorySnapshot, ToolOutput, TurnCancellationReason, TurnOutcome};
     use makima_providers::{Message, TokenUsage};
@@ -2660,9 +2578,61 @@ mod tests {
         StoredDeliveryOp, StoredModeSnapshot, StoredTurnOrigin,
     };
     use makima_storage::sessions::Session;
+    use makima_storage::test_util::test_record;
     use serde_json::json;
     use std::sync::Arc;
     use test_case::test_case;
+
+    use async_lock::RwLockReadGuardArc;
+    use std::collections::BTreeMap;
+
+    pub(crate) struct JournalCheckpoint {
+        snapshot: SessionJournalSnapshot,
+        _publication: RwLockReadGuardArc<()>,
+    }
+
+    impl JournalCheckpoint {
+        pub(crate) fn snapshot(&self) -> &SessionJournalSnapshot {
+            &self.snapshot
+        }
+    }
+
+    impl SessionJournal {
+        pub(crate) fn pending_revision(&self) -> Option<u64> {
+            self.lock()
+                .staged
+                .front()
+                .map(|entry| entry.snapshot.revision)
+        }
+
+        pub(crate) fn queue_delivery(
+            self: &Arc<Self>,
+            parent: AgentId,
+            delivery: Arc<ChildDelivery>,
+            preview_bytes: usize,
+        ) -> Result<bool, DeliveryRejection> {
+            self.queue_delivery_for(parent, delivery, preview_bytes, &[])
+        }
+
+        pub(crate) async fn capture_checkpoint(&self) -> Result<JournalCheckpoint, String> {
+            let publication = self.publication_read().await;
+            let snapshot = self.checkpoint_snapshot()?;
+            Ok(JournalCheckpoint {
+                snapshot,
+                _publication: publication,
+            })
+        }
+
+        pub(crate) fn record_config(
+            &self,
+            agent: AgentId,
+            generation: u64,
+            config: StoredAgentConfig,
+            options: Option<BTreeMap<String, String>>,
+        ) -> Result<u64, JournalError> {
+            self.record_config_bound(None, agent, generation, config, options, Vec::new())
+        }
+    }
 
     const FIRST: &str = "first";
     const SECOND: &str = "second";
@@ -2679,15 +2649,12 @@ mod tests {
         assert_eq!(snapshot.fold(snapshot.seq).unwrap(), full);
     }
 
-    #[test_case(vec![1, 1], false; "duplicate_candidate")]
-    #[test_case(vec![2, 1], false; "unordered_candidate")]
-    #[test_case(vec![1, 1], true; "duplicate_durable_target")]
-    #[test_case(vec![2, 1], true; "unordered_durable_target")]
+    #[test_case(vec![1, 1]; "duplicate_durable_target")]
+    #[test_case(vec![2, 1]; "unordered_durable_target")]
     fn nonauthoritative_publication_rejects_invalid_raw_stream_without_mutation(
         sequences: Vec<u64>,
-        invalid_target: bool,
     ) {
-        let mut snapshot = super::SessionJournalSnapshot::empty();
+        let snapshot = super::SessionJournalSnapshot::empty();
         let mut session = super::StoredSession::new(FIRST, "/");
         let records: Vec<_> = sequences
             .into_iter()
@@ -2698,11 +2665,7 @@ mod tests {
                 change: StateChange::ToolExecution { kind: SLOT.into() },
             })
             .collect();
-        if invalid_target {
-            session.replace_state(records);
-        } else {
-            snapshot.state = records.into();
-        }
+        session.replace_state(records);
         let before = session.state().to_vec();
         let error = snapshot.apply_to(&mut session).unwrap_err();
         assert!(matches!(
@@ -2737,7 +2700,7 @@ mod tests {
             journal.commit(JournalCommit { changes: vec![JournalChange {
                 agent: None, generation: 0, change: StateChange::BoundarySnapshot {
                     boundary,
-                    snapshot: json!({"format":"boundary-pool-v1","boundaries":[boundary],"state":snapshot.state,"agents":[],"histories":{agent.to_string():{"epoch":snapshot.histories[&agent].epoch,"compacted":false,"messages":[]}}}),
+                    snapshot: json!({"format":"boundary-pool-v1","boundaries":[boundary],"state":snapshot.state.to_vec(),"agents":[],"histories":{agent.to_string():{"epoch":snapshot.histories[&agent].epoch,"compacted":false,"messages":[]}}}),
                 },
             }], ..Default::default() }).unwrap();
         }
@@ -2792,7 +2755,11 @@ mod tests {
         for previous in before.state.iter() {
             assert!(std::ptr::eq(
                 previous,
-                accepted.state.get(previous.seq).unwrap()
+                accepted
+                    .state
+                    .iter()
+                    .find(|record| record.seq == previous.seq)
+                    .unwrap()
             ));
         }
         assert_eq!(
@@ -2852,7 +2819,6 @@ mod tests {
     #[test_case(true; "anchor_folds_resolved_approval_edit")]
     fn prepared_boundary_follows_state_edit_without_changing_history(install: bool) {
         use crate::state::{StateScope, StateSlotSpec};
-        use makima_storage::session_state::{StoredAgentLifecycle, StoredAgentRecord};
         use serde_json::Value;
         smol::block_on(async {
             const SLOT: &str = "approval/plan";
@@ -2861,22 +2827,7 @@ mod tests {
             let history = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
             journal
                 .commit(JournalCommit {
-                    agents: vec![StoredAgentRecord {
-                        id: agent,
-                        parent: None,
-                        depth: 0,
-                        transcript_key: String::new(),
-                        lifecycle: StoredAgentLifecycle::Open,
-                        ancestry_unknown: false,
-                        label: None,
-                        spawned_by_tool_use_id: None,
-                        spec: None,
-                        restorable: Ok(()),
-                        usage: Default::default(),
-                        created_seq: 0,
-                        updated_seq: 0,
-                        legacy: false,
-                    }],
+                    agents: vec![test_record(agent, None)],
                     histories: [(agent, history.clone())].into(),
                     ..Default::default()
                 })
@@ -2981,7 +2932,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(journal.pending_revision().is_none());
-            assert_eq!(journal.snapshot().state.len(), 1);
+            assert_eq!(journal.snapshot().state.iter().len(), 1);
         });
     }
 
@@ -3013,7 +2964,7 @@ mod tests {
         journal
             .queue_delivery(parent, Arc::clone(&delivery), FIRST.len())
             .unwrap();
-        assert!(journal.snapshot().state.is_empty());
+        assert!(journal.snapshot().state.iter().next().is_none());
         let pending = journal.pending_deliveries(parent).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!((pending[0].0, pending[0].1), (child, turn));
@@ -3075,7 +3026,7 @@ mod tests {
                 .unwrap()
         );
         assert!(journal.pending_revision().is_none());
-        assert_eq!(journal.snapshot().state.len(), 1);
+        assert_eq!(journal.snapshot().state.iter().len(), 1);
     }
 
     #[test]
@@ -3159,7 +3110,7 @@ mod tests {
             let result = super::JournalPrepared::install_batch(&mut references);
             assert_eq!(result.is_err(), stale);
             for journal in &journals {
-                assert_eq!(journal.snapshot().state.len(), usize::from(!stale));
+                assert_eq!(journal.snapshot().state.iter().len(), usize::from(!stale));
                 assert_eq!(journal.published_revision() == 0, stale);
             }
             drop(references);
@@ -3196,13 +3147,13 @@ mod tests {
             });
             assert!(futures_lite::future::poll_once(&mut detach).await.is_none());
             token.install().unwrap();
-            assert_eq!(journal.snapshot().state.len(), 1);
+            assert_eq!(journal.snapshot().state.iter().len(), 1);
             assert_eq!(journal.incarnation(agent).reservation, 1);
             assert!(futures_lite::future::poll_once(&mut detach).await.is_none());
             drop(token);
             detach.await;
             assert_eq!(journal.incarnation(agent).reservation, 2);
-            assert_eq!(journal.snapshot().state.len(), 1);
+            assert_eq!(journal.snapshot().state.iter().len(), 1);
         });
     }
 
@@ -3256,7 +3207,7 @@ mod tests {
             }
             drop(token);
             let ordinary = capture.await.unwrap();
-            assert_eq!(ordinary.snapshot().state.len(), usize::from(install));
+            assert_eq!(ordinary.snapshot().state.iter().len(), usize::from(install));
             if install {
                 assert_eq!(ordinary.snapshot().revision, candidate.revision);
             } else {
@@ -3337,7 +3288,7 @@ mod tests {
                 .await
                 .unwrap();
             let candidate = token.snapshot().clone();
-            assert_eq!(candidate.state.len(), 1);
+            assert_eq!(candidate.state.iter().len(), 1);
             assert_eq!(journal.snapshot().revision, before.revision);
             let mut read = Box::pin(journal.boundary_read());
             assert!(futures_lite::future::poll_once(&mut read).await.is_none());
@@ -3347,17 +3298,17 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            assert!(journal.snapshot().state.is_empty());
+            assert!(journal.snapshot().state.iter().next().is_none());
             if install {
                 token.install().unwrap();
                 assert_eq!(journal.published_revision(), candidate.revision);
-                assert_eq!(journal.snapshot().state.len(), 2);
+                assert_eq!(journal.snapshot().state.iter().len(), 2);
                 assert!(futures_lite::future::poll_once(&mut read).await.is_none());
             }
             drop(token);
             drop(read.await);
             let ready = journal.snapshot();
-            assert_eq!(ready.state.len(), if install { 2 } else { 1 });
+            assert_eq!(ready.state.iter().len(), if install { 2 } else { 1 });
             assert!(ready.seq > candidate.seq);
             if !install {
                 assert!(ready.state.iter().all(|record| record.seq > candidate.seq));
@@ -3580,11 +3531,11 @@ mod tests {
                 prefix.histories[&agent].messages[0].user_text(),
                 Some(FIRST)
             );
-            assert_eq!(prefix.state.len(), 1);
+            assert_eq!(prefix.state.iter().len(), 1);
             journal.complete(second, vec![second_change]).unwrap();
         }
         let ready = journal.snapshot();
-        assert_eq!(ready.state.len(), 3);
+        assert_eq!(ready.state.iter().len(), 3);
         assert!(
             ready
                 .state
@@ -3611,195 +3562,6 @@ mod tests {
         assert_eq!(journal.snapshot().seq, 0);
         assert!(journal.pending_revision().is_some());
         journal.complete(pending, vec![admitted(agent)]).unwrap();
-        assert_eq!(journal.snapshot().state.len(), 1);
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-use crate::ManagerError;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GraphMutation<A, S> {
-    Agent(A),
-    State(S),
-}
-
-#[derive(Debug, Clone)]
-pub struct GraphCheckpoint<A, S> {
-    epoch: MakimaId,
-    records: Arc<[GraphMutation<A, S>]>,
-}
-
-impl<A, S> GraphCheckpoint<A, S> {
-    pub fn new(epoch: MakimaId, records: Vec<GraphMutation<A, S>>) -> Self {
-        Self {
-            epoch,
-            records: records.into(),
-        }
-    }
-
-    pub fn epoch(&self) -> MakimaId {
-        self.epoch
-    }
-
-    pub fn records(&self) -> &[GraphMutation<A, S>] {
-        &self.records
-    }
-
-    pub fn revision(&self) -> usize {
-        self.records.len()
-    }
-}
-
-pub trait GraphStore: Send + Sync {
-    type AgentRecord: Clone + Send + Sync;
-    type StateRecord: Clone + Send + Sync;
-    type Error: Error + Send + Sync + 'static;
-
-    fn put_agent(&self, record: Self::AgentRecord) -> Result<usize, Self::Error>;
-    fn append_state(&self, record: Self::StateRecord) -> Result<usize, Self::Error>;
-    fn snapshot(
-        &self,
-    ) -> Result<GraphCheckpoint<Self::AgentRecord, Self::StateRecord>, Self::Error>;
-    fn publish(
-        &self,
-        checkpoint: &GraphCheckpoint<Self::AgentRecord, Self::StateRecord>,
-    ) -> Result<(), Self::Error>;
-    fn load(&self) -> Result<GraphCheckpoint<Self::AgentRecord, Self::StateRecord>, Self::Error>;
-}
-
-#[cfg(any(test, feature = "test-util"))]
-#[derive(Debug, Error)]
-pub enum GraphRestartError<E: Error + 'static> {
-    #[error("could not load the graph checkpoint: {0}")]
-    Store(#[source] E),
-    #[error("nonempty graph restoration requires dormant-node reconstruction")]
-    NonemptyGraph,
-    #[error(transparent)]
-    Manager(#[from] ManagerError),
-}
-
-#[cfg(any(test, feature = "test-util"))]
-pub use memory::{MemoryGraphStore, MemoryGraphStoreError};
-
-#[cfg(any(test, feature = "test-util"))]
-mod memory {
-    use std::sync::{Mutex, MutexGuard};
-
-    use super::{GraphCheckpoint, GraphMutation, GraphStore};
-    use makima_storage::id::MakimaId;
-    use thiserror::Error;
-
-    #[derive(Debug, Error, PartialEq, Eq)]
-    pub enum MemoryGraphStoreError {
-        #[error("graph store mutex poisoned")]
-        Poisoned,
-        #[error("graph checkpoint belongs to a previous store incarnation")]
-        StaleCheckpoint,
-        #[error("graph checkpoint does not match the buffered prefix")]
-        InvalidCheckpoint,
-        #[error("injected graph publication failure")]
-        PublicationFailed,
-    }
-
-    struct MemoryState<A, S> {
-        epoch: MakimaId,
-        records: Vec<GraphMutation<A, S>>,
-        persisted: usize,
-        fail_next_publication: bool,
-    }
-
-    pub struct MemoryGraphStore<A, S> {
-        state: Mutex<MemoryState<A, S>>,
-    }
-
-    impl<A, S> Default for MemoryGraphStore<A, S> {
-        fn default() -> Self {
-            Self {
-                state: Mutex::new(MemoryState {
-                    epoch: MakimaId::generate(),
-                    records: Vec::new(),
-                    persisted: 0,
-                    fail_next_publication: false,
-                }),
-            }
-        }
-    }
-
-    impl<A, S> MemoryGraphStore<A, S> {
-        fn lock(&self) -> Result<MutexGuard<'_, MemoryState<A, S>>, MemoryGraphStoreError> {
-            self.state
-                .lock()
-                .map_err(|_| MemoryGraphStoreError::Poisoned)
-        }
-
-        pub fn fail_next_publication(&self) -> Result<(), MemoryGraphStoreError> {
-            self.lock()?.fail_next_publication = true;
-            Ok(())
-        }
-
-        pub fn restart(&self) -> Result<(), MemoryGraphStoreError> {
-            let mut state = self.lock()?;
-            let persisted = state.persisted;
-            state.records.truncate(persisted);
-            state.epoch = MakimaId::generate();
-            state.fail_next_publication = false;
-            Ok(())
-        }
-    }
-
-    impl<A: Clone + PartialEq + Send + Sync, S: Clone + PartialEq + Send + Sync> GraphStore
-        for MemoryGraphStore<A, S>
-    {
-        type AgentRecord = A;
-        type StateRecord = S;
-        type Error = MemoryGraphStoreError;
-
-        fn put_agent(&self, record: A) -> Result<usize, Self::Error> {
-            let mut state = self.lock()?;
-            state.records.push(GraphMutation::Agent(record));
-            Ok(state.records.len())
-        }
-
-        fn append_state(&self, record: S) -> Result<usize, Self::Error> {
-            let mut state = self.lock()?;
-            state.records.push(GraphMutation::State(record));
-            Ok(state.records.len())
-        }
-
-        fn snapshot(&self) -> Result<GraphCheckpoint<A, S>, Self::Error> {
-            let state = self.lock()?;
-            Ok(GraphCheckpoint {
-                epoch: state.epoch,
-                records: state.records.clone().into(),
-            })
-        }
-
-        fn publish(&self, checkpoint: &GraphCheckpoint<A, S>) -> Result<(), Self::Error> {
-            let mut state = self.lock()?;
-            if checkpoint.epoch != state.epoch {
-                return Err(MemoryGraphStoreError::StaleCheckpoint);
-            }
-            if !state.records.starts_with(checkpoint.records()) {
-                return Err(MemoryGraphStoreError::InvalidCheckpoint);
-            }
-            if checkpoint.revision() <= state.persisted {
-                return Ok(());
-            }
-            if state.fail_next_publication {
-                state.fail_next_publication = false;
-                return Err(MemoryGraphStoreError::PublicationFailed);
-            }
-            state.persisted = checkpoint.revision();
-            Ok(())
-        }
-
-        fn load(&self) -> Result<GraphCheckpoint<A, S>, Self::Error> {
-            let state = self.lock()?;
-            Ok(GraphCheckpoint {
-                epoch: state.epoch,
-                records: state.records[..state.persisted].to_vec().into(),
-            })
-        }
+        assert_eq!(journal.snapshot().state.iter().len(), 1);
     }
 }

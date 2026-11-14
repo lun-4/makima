@@ -542,17 +542,15 @@ mod tests {
     use crate::orchestration::OrchestrationServices;
     use crate::runtime::block_on_or_fail;
     use crate::test_support::spawn_host_for_tests;
-    use makima_agent::actor::{ActorHistory, EffectiveAgentConfig};
+    use makima_agent::actor::EffectiveAgentConfig;
     use makima_agent::agent::RunSettings;
     use makima_agent::manager::ResidentAgent;
+    use makima_agent::test_util::StubBackend;
     use makima_agent::tools::ToolContext;
     use makima_agent::tools::test_support::stub_ctx;
-    use makima_agent::{
-        ActorBackend, AgentInput, AgentMode, BackendResult, ControlWork, ManagerError, TurnContext,
-        WorkKind,
-    };
+    use makima_agent::{ActorBackend, AgentMode, ManagerError};
     use makima_commands::CommandInvocation;
-    use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
+    use std::{path::PathBuf, time::Duration};
     use test_case::test_case;
 
     const PLUGIN: &str = "owner";
@@ -562,38 +560,6 @@ mod tests {
     const STALE_REJECTED: &str = "stale callback rejected";
     const FRESH_CLOSED: &str = "fresh callback closed replacement";
     const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
-
-    struct InactiveBackend;
-
-    impl ActorBackend for InactiveBackend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("callback test must not execute a turn") })
-        }
-
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("callback test must not execute a control") })
-        }
-
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("callback test must not compact") })
-        }
-    }
 
     struct CallbackTarget(TrustedTarget);
 
@@ -630,7 +596,7 @@ mod tests {
             let manager = AgentManagerHandle::new(Default::default()).unwrap();
             let agent = manager
                 .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-                    Ok::<Box<dyn ActorBackend>, String>(Box::new(InactiveBackend))
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend))
                 })
                 .unwrap();
             let old = agent.incarnation().unwrap();
@@ -690,7 +656,7 @@ mod tests {
             let replacement = manager
                 .ensure_resident_with(agent.id(), |_| async {
                     Ok(ResidentAgent {
-                        backend: Box::new(InactiveBackend),
+                        backend: Box::new(StubBackend),
                         config,
                         shared_messages: None,
                         start: None,

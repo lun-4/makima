@@ -584,31 +584,43 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn sync_failure_before_publication_leaves_no_blob() {
+    #[test_case(false; "before_publication")]
+    #[test_case(true; "directory_sync_after_publication")]
+    fn sync_failure_is_reported_and_retry_is_safe(directory_sync: bool) {
         use super::unix;
         use std::io;
 
-        const SYNC_ERROR: &str = "injected blob file sync failure";
+        const SYNC_ERROR: &str = "injected blob sync failure";
         let (_temporary, state, store, owner) = fixture();
         let reference = BlobRef {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
-        let error = unix::put(&state, owner, CONTENT, |_| {
-            Err(io::Error::other(SYNC_ERROR))
-        })
-        .unwrap_err();
-        assert!(matches!(error, BlobError::Io(source) if source.to_string() == SYNC_ERROR));
+        let result = unix::put(&state, owner, CONTENT, |file| {
+            if !directory_sync || file.metadata()?.is_dir() {
+                Err(io::Error::other(SYNC_ERROR))
+            } else {
+                file.sync_all()
+            }
+        });
+        assert!(matches!(result, Err(BlobError::Io(source)) if source.to_string() == SYNC_ERROR));
         let path = blob_path(&state, &reference);
-        assert!(!path.exists());
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 0);
+        assert_eq!(path.exists(), directory_sync);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            usize::from(directory_sync)
+        );
+        if directory_sync {
+            assert_eq!(store.read(&reference).unwrap(), CONTENT);
+        }
         assert_eq!(store.put(owner, CONTENT).unwrap(), reference);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn deletion_at_publication_gate_leaves_no_blob() {
+    #[test_case(false; "before_publication")]
+    #[test_case(true; "directory_sync_after_publication")]
+    fn owner_deletion_prevents_success(directory_sync: bool) {
         use super::unix;
 
         let (_temporary, state, _store, owner) = fixture();
@@ -616,12 +628,18 @@ mod tests {
             session: owner,
             hash: BlobHash::digest(CONTENT),
         };
+        let mut deleted = false;
         let result = unix::put(&state, owner, CONTENT, |file| {
             file.sync_all()?;
-            fs::remove_file(session_path(&state, owner))
+            if !deleted && (!directory_sync || file.metadata()?.is_dir()) {
+                fs::remove_file(session_path(&state, owner))?;
+                deleted = true;
+            }
+            Ok(())
         });
+        assert!(deleted);
         assert!(matches!(result, Err(BlobError::SessionUnavailable(id)) if id == owner));
-        assert!(!blob_path(&state, &reference).exists());
+        assert_eq!(blob_path(&state, &reference).exists(), directory_sync);
     }
 
     #[cfg(unix)]
@@ -651,55 +669,6 @@ mod tests {
         assert!(matches!(result, Err(BlobError::Unsafe(_))));
         assert!(!path.exists());
         assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_directory_sync_is_reported_and_retry_is_safe() {
-        use super::unix;
-        use std::io;
-
-        const SYNC_ERROR: &str = "injected blob directory sync failure";
-        let (_temporary, state, store, owner) = fixture();
-        let reference = BlobRef {
-            session: owner,
-            hash: BlobHash::digest(CONTENT),
-        };
-        let result = unix::put(&state, owner, CONTENT, |file| {
-            if file.metadata()?.is_dir() {
-                Err(io::Error::other(SYNC_ERROR))
-            } else {
-                file.sync_all()
-            }
-        });
-        assert!(matches!(result, Err(BlobError::Io(source)) if source.to_string() == SYNC_ERROR));
-        assert_eq!(store.read(&reference).unwrap(), CONTENT);
-        assert_eq!(store.put(owner, CONTENT).unwrap(), reference);
-        assert_eq!(
-            fs::read_dir(blob_path(&state, &reference).parent().unwrap())
-                .unwrap()
-                .count(),
-            1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn deletion_during_directory_sync_prevents_success() {
-        use super::unix;
-
-        let (_temporary, state, _store, owner) = fixture();
-        let mut deleted = false;
-        let result = unix::put(&state, owner, CONTENT, |file| {
-            file.sync_all()?;
-            if file.metadata()?.is_dir() && !deleted {
-                fs::remove_file(session_path(&state, owner))?;
-                deleted = true;
-            }
-            Ok(())
-        });
-        assert!(deleted);
-        assert!(matches!(result, Err(BlobError::SessionUnavailable(id)) if id == owner));
     }
 
     #[cfg(unix)]

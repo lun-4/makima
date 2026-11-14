@@ -16,6 +16,7 @@ use makima_storage::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
     },
     sessions::Session,
+    test_util::test_record,
 };
 use std::{
     collections::BTreeMap,
@@ -129,24 +130,13 @@ fn seed() -> (StoredSession, Arc<SessionJournal>, Arc<ChildDelivery>) {
     let records: Vec<_> = [(root, None), (child, Some(root))]
         .into_iter()
         .map(|(id, parent)| StoredAgentRecord {
-            id,
-            parent,
-            depth: u32::from(parent.is_some()),
             transcript_key: parent.map_or_else(String::new, |_| CHILD_KEY.into()),
             lifecycle: if parent.is_some() {
                 StoredAgentLifecycle::Closed
             } else {
                 StoredAgentLifecycle::Open
             },
-            ancestry_unknown: false,
-            label: None,
-            spawned_by_tool_use_id: None,
-            spec: None,
-            restorable: Ok(()),
-            usage: Default::default(),
-            created_seq: 0,
-            updated_seq: 0,
-            legacy: false,
+            ..test_record(id, parent)
         })
         .collect();
     let config = StoredAgentConfig {

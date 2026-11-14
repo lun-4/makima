@@ -320,13 +320,6 @@ pub struct PreparedRestoreConfig {
     pub warning: Option<String>,
 }
 
-impl PreparedRestoreConfig {
-    pub fn resolve(self, operation: &PreparedOperationTicket) -> Result<(), ConfigChangeError> {
-        operation.resolve_restore(self.saved, self.model, self.mode)?;
-        Ok(())
-    }
-}
-
 pub async fn prepare_restore(
     mut saved: StoredAgentConfig,
     policy: &ModelPolicy,

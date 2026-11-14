@@ -1550,7 +1550,7 @@ mod tests {
     use crate::runtime::bind_plugin_owner;
     use crate::test_support::run_command;
     use futures_lite::future::poll_once;
-    use makima_agent::actor::{ActorHistory, PreparedModel};
+    use makima_agent::actor::PreparedModel;
     use makima_agent::permissions::PermissionManager;
     use makima_agent::prompt::{PromptId, PromptSource, ResolvedSlots, Slot};
     use makima_agent::session_coordinator::{
@@ -1558,11 +1558,11 @@ mod tests {
         SessionCoordinatorParams, builtin_option_definitions,
     };
     use makima_agent::session_options::{ENABLED_VALUE, YOLO_OPTION_ID};
+    use makima_agent::test_util::StubBackend;
     use makima_agent::tools::test_support::stub_ctx_with_session;
     use makima_agent::tools::{ToolContext, ToolRegistry};
     use makima_agent::{
-        ActorBackend, AgentInput, AgentMode, BackendResult, ControlWork, EffectiveAgentConfig,
-        RunSettings, SessionMailbox, TurnContext, WorkKind,
+        ActorBackend, AgentMode, EffectiveAgentConfig, RunSettings, SessionMailbox,
     };
     use makima_storage::checkpoint::{
         CheckpointAck, CheckpointClaim, CheckpointError, CheckpointFuture, CheckpointRequest,
@@ -1572,7 +1572,6 @@ mod tests {
     use makima_storage::session_state::StateChange;
     use std::collections::BTreeMap;
     use std::future::Future;
-    use std::pin::Pin;
     use std::thread;
     use std::time::Instant;
     use test_case::test_case;
@@ -1584,38 +1583,6 @@ mod tests {
         local agent = assert(makima.agent.get(ctx, reference))
         return agent:set_option(ctx, "yolo", "enabled")
     "#;
-
-    struct IdleOptionBackend;
-
-    impl ActorBackend for IdleOptionBackend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!() })
-        }
-
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!() })
-        }
-
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!() })
-        }
-    }
 
     struct OptionTarget(TrustedTarget);
 
@@ -1710,7 +1677,7 @@ mod tests {
         let manager = AgentManagerHandle::new(Default::default()).unwrap();
         let target = manager
             .create_root_with_config(Some(config), Vec::new(), None, |_| {
-                Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleOptionBackend))
+                Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend))
             })
             .unwrap();
         template
@@ -2164,7 +2131,7 @@ mod tests {
                         Default::default(),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleOptionBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                     )
                     .unwrap();
                 TrustedTarget {
@@ -3771,7 +3738,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
-            .create_root(Vec::new(), None, Box::new(IdleOptionBackend))
+            .create_root(Vec::new(), None, Box::new(StubBackend))
             .unwrap();
         let source = |value: &str| {
             format!(

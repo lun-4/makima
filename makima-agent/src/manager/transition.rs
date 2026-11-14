@@ -83,16 +83,14 @@ mod tests {
         AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle,
         ManagerError,
     };
-    use crate::actor::{ActorHistory, ControlWork, TurnContext, WorkKind};
     use crate::{
-        ActorBackend, ActorError, ActorLifecycle, AgentInput, AgentMode, BackendResult,
-        EffectiveAgentConfig, RunSettings,
+        ActorBackend, ActorError, ActorLifecycle, AgentInput, AgentMode, EffectiveAgentConfig,
+        RunSettings, test_util::StubBackend,
     };
     use makima_providers::{Model, provider::unconfigured};
     use makima_storage::checkpoint::CheckpointPublication;
     use makima_storage::session_state::StoredAgentLifecycle;
     use std::future::Future;
-    use std::pin::Pin;
     use std::time::Duration;
     use test_case::test_case;
 
@@ -124,42 +122,12 @@ mod tests {
         ))
     }
 
-    struct Backend;
-
-    impl ActorBackend for Backend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { panic!("deferred source must not run") })
-        }
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { BackendResult::ControlDone })
-        }
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { BackendResult::CompactDone })
-        }
-    }
-
     #[test]
     fn transition_fences_admissions_and_resumes_unchanged_on_drop() {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let actor = root.actor().unwrap();
             let before = manager.journal().snapshot();
@@ -187,7 +155,7 @@ mod tests {
             ));
             assert!(
                 manager
-                    .create_root(Vec::new(), None, Box::new(Backend))
+                    .create_root(Vec::new(), None, Box::new(StubBackend))
                     .is_err()
             );
             let config = config();
@@ -198,7 +166,7 @@ mod tests {
                     AgentMetadata::default(),
                     Vec::new(),
                     None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(Backend))
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend))
                 ),
                 Err(ManagerError::RewindInProgress)
             ));
@@ -219,7 +187,7 @@ mod tests {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let reservation = manager.lock_graph().nodes[&root.id()].reservation;
             manager
@@ -243,7 +211,7 @@ mod tests {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let actor = root.actor().unwrap();
             let idle = actor.prepare_idle().unwrap();
@@ -272,7 +240,7 @@ mod tests {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let actor = root.actor().unwrap();
             let config = actor.reserve_config_publication().unwrap();
@@ -309,7 +277,7 @@ mod tests {
                     None,
                     Vec::new(),
                     None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(Backend)),
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                     wait,
                 )
                 .unwrap();
@@ -338,7 +306,7 @@ mod tests {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             {
                 let mut graph = manager.lock_graph();
@@ -368,7 +336,7 @@ mod tests {
         smol::block_on(async {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let actor = root.actor().unwrap();
             let incarnation = manager.incarnation(root.id()).unwrap();
@@ -442,7 +410,7 @@ mod tests {
                     Some(config()),
                     Vec::new(),
                     None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(Backend)),
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
                     wait,
                 )
                 .unwrap();

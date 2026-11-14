@@ -2295,10 +2295,6 @@ impl<M, U, T> Session<M, U, T> {
         self.parent.as_ref()
     }
 
-    pub fn features(&self) -> &BTreeSet<String> {
-        &self.features
-    }
-
     pub fn state_at(&self, seq: u64) -> Result<SessionStateView, SessionError> {
         SessionStateView::fold(&self.state, &self.agent_revisions, seq)
             .map_err(SessionError::InvalidState)
@@ -7189,7 +7185,7 @@ mod tests {
         assert!(
             TestSession::load_from(session.id, directory.path())
                 .unwrap()
-                .features()
+                .features
                 .is_empty()
         );
         let snapshot = serde_json::json!({
@@ -7206,7 +7202,7 @@ mod tests {
         });
         log.append(&session).unwrap();
         let appended = TestSession::load_from(session.id, directory.path()).unwrap();
-        assert!(appended.features().is_empty());
+        assert!(appended.features.is_empty());
         assert_eq!(appended.state().len(), session.state().len());
         assert!(matches!(
             appended.state().last().unwrap().change,
@@ -7221,7 +7217,7 @@ mod tests {
             session.save_to(directory.path()).unwrap();
         }
         let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
-        assert!(loaded.features().is_empty());
+        assert!(loaded.features.is_empty());
         assert_eq!(loaded.state().len(), appended.state().len());
         assert_eq!(TestSession::list_all_in(directory.path()).unwrap().len(), 1);
         let state = loaded
@@ -7235,7 +7231,7 @@ mod tests {
         assert!(
             TestSession::load_from(session.id, directory.path())
                 .unwrap()
-                .features()
+                .features
                 .is_empty()
         );
     }
@@ -7435,7 +7431,7 @@ mod tests {
         assert_eq!(loaded.agents(), expected.agents(), "agents");
         assert_eq!(loaded.branches(), expected.branches(), "branches");
         assert_eq!(loaded.parent(), expected.parent(), "parent");
-        assert_eq!(loaded.features(), expected.features(), "features");
+        assert_eq!(loaded.features, expected.features, "features");
         assert_eq!(
             crate::session_state::SessionStateView::fold(
                 &loaded_state,

@@ -3409,6 +3409,7 @@ mod tests {
     };
     use makima_storage::session_state::{StoredAgentLifecycle, StoredAgentRecord};
     use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
+    use makima_storage::test_util::test_record;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -3661,13 +3662,7 @@ mod tests {
             writer.bind_journal(id, Arc::clone(&journal));
             let old_fence = writer.session_save_fence(id);
             let (lease, old_coordinator) = guarded_writer(&writer, &dir, id);
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.write(&old).unwrap();
             let old_capture = capture_journal(&writer.pending, id).unwrap();
             let version = CheckpointVersion {
@@ -3892,13 +3887,7 @@ mod tests {
             let fence = writer.session_save_fence(id);
             let (lease, _) = guarded_writer(&writer, &dir, id);
             writer.bind_publication_guard(id, lease.publication_guard());
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.write(&session).unwrap();
             let version = CheckpointVersion {
                 epoch: 1,
@@ -4004,13 +3993,7 @@ mod tests {
                     .await
                     .is_none()
             );
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.flush(&writer.pending);
             result.await.unwrap();
             let state = lock(&writer.pending);
@@ -4042,13 +4025,7 @@ mod tests {
             writer.bind_journal(id, Arc::clone(&journal));
             let stale_fence = writer.session_save_fence(id);
             let (lease, _) = guarded_writer(&writer, &dir, id);
-            let (warn_tx, warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, warnings) = disk_writer(&dir);
             disk.write(&session).unwrap();
             let mut token = journal
                 .prepare_branch_restore(root, journal.snapshot())
@@ -4213,13 +4190,7 @@ mod tests {
             writer.bind_journal(id, Arc::clone(&journal));
             let old_fence = writer.session_save_fence(id);
             let (lease, _) = guarded_writer(&writer, &dir, id);
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.write(&old).unwrap();
             let directory = dir.ensure_subdir(SESSIONS_DIR).unwrap();
             let path = directory.join(format!("{id}.jsonl"));
@@ -4315,13 +4286,7 @@ mod tests {
         writer.seed(Arc::new(session.clone()));
         writer.bind_config_runtime(id, 1);
         let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.write(&session).unwrap();
         let path = dir.path().join(SESSIONS_DIR).join(format!("{id}.jsonl"));
         let before = std::fs::read(&path).unwrap();
@@ -4419,13 +4384,7 @@ mod tests {
         writer.seed(Arc::new(session.clone()));
         writer.bind_config_runtime(id, 1);
         let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&session).unwrap();
         session.push_message(Message::user(COORDINATOR_MSG.into()));
         let mut terminal_history = session.history_snapshot();
@@ -4596,13 +4555,7 @@ mod tests {
         let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
             .unwrap()
             .unwrap();
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&session).unwrap();
         let stage = |child: &str| {
             enqueue_staged_checkpoint(
@@ -4683,13 +4636,7 @@ mod tests {
         let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
             .unwrap()
             .unwrap();
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&session).unwrap();
         let destination = || HistoryDestination::Child(TOOL_ID.into());
         let edited = HistorySnapshot::new(vec![
@@ -4920,13 +4867,7 @@ mod tests {
         writer.seed(Arc::new(session.clone()));
         writer.bind_config_runtime(id, 1);
         let (lease, checkpoint) = guarded_writer(&writer, &dir, id);
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&session).unwrap();
         let root = publish_config(
             &checkpoint,
@@ -5011,13 +4952,7 @@ mod tests {
             CheckpointPublication::default(),
             claim,
         );
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         let sessions_path = dir.path().join(SESSIONS_DIR);
         let saved_path = dir.path().join(TITLE);
         if failures > 0 {
@@ -5069,13 +5004,7 @@ mod tests {
         writer.seed(Arc::new(session));
         writer.bind_config_runtime(id, 1);
         let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         if initial_config {
             let ack = publish_config(
                 &checkpoint,
@@ -5170,13 +5099,7 @@ mod tests {
             old.config_version = None;
         }
         let latest = enqueue(2);
-        let (warn_tx, warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir,
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, warn_rx) = disk_writer(&dir);
         disk.report_save(&writer.pending, &old, Err(FAILURE));
         assert!(warn_rx.try_recv().is_err());
         assert!(!disk.failing.contains(&id));
@@ -5279,13 +5202,7 @@ mod tests {
             assert!(save.waiters.is_empty());
             assert_eq!(message_texts(&save.session), [BASE_MSG]);
         }
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.flush(&writer.pending);
         if let Some(ack) = config_ack {
             assert!(smol::block_on(ack).is_ok());
@@ -5334,14 +5251,8 @@ mod tests {
         let old_ack = enqueue();
         writer.bind_config_runtime(id, 2);
         assert!(smol::block_on(enqueue()).is_err());
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        Writer {
-            dir,
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        }
-        .flush(&writer.pending);
+        let (mut disk, _warn_rx) = disk_writer(&dir);
+        disk.flush(&writer.pending);
         assert!(smol::block_on(old_ack).is_err());
         assert_eq!(lock(&writer.pending).config_versions[&id], (2, 0));
     }
@@ -5350,24 +5261,12 @@ mod tests {
         journal
             .commit(JournalCommit {
                 agents: vec![StoredAgentRecord {
-                    id: agent,
-                    parent: None,
-                    depth: 0,
-                    transcript_key: String::new(),
                     lifecycle: if closed {
                         StoredAgentLifecycle::Closed
                     } else {
                         StoredAgentLifecycle::Open
                     },
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
-                    created_seq: 0,
-                    updated_seq: 0,
-                    legacy: false,
+                    ..test_record(agent, None)
                 }],
                 changes: vec![JournalChange {
                     agent: Some(agent),
@@ -5446,13 +5345,7 @@ mod tests {
             writer.send(Arc::new(session));
             None
         };
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.flush(&writer.pending);
         if let Some(ack) = ack {
             smol::block_on(ack).unwrap();
@@ -5525,13 +5418,7 @@ mod tests {
             writer.send(Arc::clone(&session));
             None
         };
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         assert_eq!(journal.published_revision(), 0);
         disk.flush(&writer.pending);
         if let Some(ack) = ack {
@@ -5565,13 +5452,7 @@ mod tests {
         let captured = journal.snapshot();
         journal_commit(&journal, agent, true);
         std::fs::write(tmp.path().join(SESSIONS_DIR), BASE_MSG).unwrap();
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.flush(&writer.pending);
         assert_eq!(journal.published_revision(), 0);
         std::fs::remove_file(tmp.path().join(SESSIONS_DIR)).unwrap();
@@ -5915,13 +5796,7 @@ mod tests {
         let mut recovering =
             Box::pin(writer.recover_replacing(candidate, lease.publication_guard()));
         assert!(smol::block_on(futures_lite::future::poll_once(recovering.as_mut())).is_none());
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.flush(&writer.pending);
         let (_, publication) = smol::block_on(recovering).unwrap();
         assert_eq!(
@@ -6003,45 +5878,14 @@ mod tests {
 
     #[test]
     fn coordinator_options_publish_while_holding_prepared_journal_token() {
-        use makima_agent::actor::{ActorHistory, BackendResult, TurnContext, WorkKind};
         use makima_agent::mailbox::SessionMailbox;
         use makima_agent::permissions::PermissionManager;
         use makima_agent::session_coordinator::{
             SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
         };
-        use makima_agent::{
-            ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, ControlWork, ModeDef, ModeId,
-        };
+        use makima_agent::test_util::StubBackend;
+        use makima_agent::{AgentLimits, AgentManagerHandle, ModeDef, ModeId};
         use makima_config::{ModelPolicy, ProjectConfig};
-
-        struct Backend;
-        impl ActorBackend for Backend {
-            fn run_turn<'a>(
-                &'a mut self,
-                _: ActorHistory<'a>,
-                _: TurnContext,
-                _: AgentInput,
-                _: WorkKind,
-            ) -> BoxFuture<'a, BackendResult> {
-                Box::pin(async { unreachable!() })
-            }
-            fn run_control<'a>(
-                &'a mut self,
-                _: ActorHistory<'a>,
-                _: TurnContext,
-                _: &'a ControlWork,
-            ) -> BoxFuture<'a, BackendResult> {
-                Box::pin(async { unreachable!() })
-            }
-            fn run_compact<'a>(
-                &'a mut self,
-                _: ActorHistory<'a>,
-                _: TurnContext,
-                _: Option<&'a str>,
-            ) -> BoxFuture<'a, BackendResult> {
-                Box::pin(async { unreachable!() })
-            }
-        }
 
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
@@ -6051,7 +5895,7 @@ mod tests {
             writer.seed(Arc::new(session));
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let root = manager
-                .create_root(Vec::new(), None, Box::new(Backend))
+                .create_root(Vec::new(), None, Box::new(StubBackend))
                 .unwrap();
             let mut config = (*config_projection(FAILED_MODEL, CWD, 1, 1).config).clone();
             config.mode = AgentMode::Build;
@@ -6197,13 +6041,7 @@ mod tests {
                 .await
                 .unwrap();
             let expected = token.snapshot().clone();
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.flush(&writer.pending);
             assert_eq!(
                 message_texts(&AppSession::load(id, &dir).unwrap()),
@@ -6253,16 +6091,8 @@ mod tests {
             let (release, released) = flume::bounded(1);
             lock(&writer.pending).save_gate = Some((entered, released));
             let pending = Arc::clone(&writer.pending);
-            let (warn_tx, _warnings) = flume::unbounded();
-            let worker = std::thread::spawn(move || {
-                Writer {
-                    dir,
-                    warn_tx,
-                    logs: HashMap::new(),
-                    failing: HashSet::new(),
-                }
-                .flush(&pending)
-            });
+            let (mut disk, _warnings) = disk_writer(&dir);
+            let worker = std::thread::spawn(move || disk.flush(&pending));
             entering.recv_async().await.unwrap();
             let mut preparing = Box::pin(journal.prepare(JournalCommit {
                 changes: vec![JournalChange {
@@ -6335,13 +6165,7 @@ mod tests {
                     snapshot: Arc::new(checkpoint_snapshot),
                 },
             );
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.flush(&writer.pending);
             ack.await.unwrap();
             assert_eq!(
@@ -6352,7 +6176,7 @@ mod tests {
                 lock(&writer.pending).acknowledged[&id].state(),
                 expected.state.to_vec()
             );
-            assert!(journal.snapshot().state.len() < expected.state.len());
+            assert!(journal.snapshot().state.iter().len() < expected.state.iter().len());
             assert_eq!(journal.published_revision(), 0);
             token.commit().unwrap();
             assert_eq!(journal.published_revision(), expected.revision);
@@ -6434,13 +6258,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let (warn_tx, _warnings) = flume::unbounded();
-            let mut disk = Writer {
-                dir: dir.clone(),
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
+            let (mut disk, _warnings) = disk_writer(&dir);
             disk.flush(&writer.pending);
             response.recv_timeout(DRAIN_TIMEOUT).unwrap().unwrap();
             let reopened = AppSession::load(id, &dir).unwrap();
@@ -6506,13 +6324,7 @@ mod tests {
             }
             _ => {}
         }
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.flush(&writer.pending);
         let result = smol::block_on(recovery);
         assert!(save_fence_current(
@@ -6588,14 +6400,8 @@ mod tests {
         let (release, released) = flume::bounded(1);
         lock(&writer.pending).save_gate = Some((entered, released));
         let pending = Arc::clone(&writer.pending);
-        let (warn_tx, _warnings) = flume::unbounded();
+        let (mut disk, _warnings) = disk_writer(&dir);
         let worker = std::thread::spawn(move || {
-            let mut disk = Writer {
-                dir,
-                warn_tx,
-                logs: HashMap::new(),
-                failing: HashSet::new(),
-            };
             disk.flush(&pending);
         });
         writing.recv_timeout(DRAIN_TIMEOUT).unwrap();
@@ -6696,13 +6502,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.write(&session).unwrap();
         disk.flush(&writer.pending);
         response.recv().unwrap().unwrap();
@@ -6782,13 +6582,7 @@ mod tests {
         writer.bind_journal(id, Arc::clone(&journal));
         journal_commit(&journal, AgentId::generate(), false);
         let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         disk.write(&session).unwrap();
         let pending = Arc::clone(&writer.pending);
         let ack = checkpoint.checkpoint_guarded(
@@ -6826,6 +6620,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         (tmp, dir)
+    }
+
+    fn disk_writer(dir: &StateDir) -> (Writer, flume::Receiver<String>) {
+        let (warn_tx, warn_rx) = flume::unbounded();
+        (
+            Writer {
+                dir: dir.clone(),
+                warn_tx,
+                logs: HashMap::new(),
+                failing: HashSet::new(),
+            },
+            warn_rx,
+        )
     }
 
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
@@ -6981,13 +6788,7 @@ mod tests {
         };
         session.set_title(TITLE.into());
         writer.send(Arc::new(session.clone()));
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&in_flight.session).unwrap();
         commit_save(&writer.pending, id, &in_flight);
         acknowledge_waiters(&writer.pending, &in_flight.session, in_flight.waiters);
@@ -7068,13 +6869,7 @@ mod tests {
         } else {
             checkpoint.checkpoint(metadata)
         };
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&in_flight.session).unwrap();
         commit_save(&writer.pending, id, &in_flight);
         acknowledge_waiters(&writer.pending, &in_flight.session, in_flight.waiters);
@@ -7128,13 +6923,7 @@ mod tests {
             unreachable!()
         };
         let newer_ack = checkpoint(REWOUND_MSG);
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.write(&first.session).unwrap();
         commit_save(&writer.pending, id, &first);
         acknowledge_waiters(&writer.pending, &first.session, first.waiters);
@@ -7605,13 +7394,7 @@ mod tests {
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         let id = session.id;
         writer.seed(Arc::new(session));
-        let (warn_tx, _warnings) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warnings) = disk_writer(&dir);
         let checkpoint = |message: &str, revision| {
             let mut snapshot = config_checkpoint(1, revision);
             snapshot.config = None;
@@ -7735,13 +7518,7 @@ mod tests {
             session.set_title(TITLE.into());
         }
         writer.send(Arc::new(session));
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.flush(&writer.pending);
         assert_eq!(
             smol::block_on(checkpoint).unwrap_err(),
@@ -7921,13 +7698,7 @@ mod tests {
             session.set_title(TITLE.into());
             writer.send(Arc::new(session.clone()));
         }
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         for _ in 0..=CHECKPOINT_RETRY_BACKOFFS.len() {
             if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
                 save.retry_at = None;
@@ -8297,13 +8068,7 @@ mod tests {
             );
         }
         let (_tmp, dir) = state_dir();
-        let (warn_tx, _warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, _warn_rx) = disk_writer(&dir);
         disk.flush(&writer.pending);
         let ack = smol::block_on(pending_ack);
         if history_matches_base {
@@ -8416,13 +8181,7 @@ mod tests {
         let sessions_dir = dir.path().join(SESSIONS_DIR);
         std::fs::create_dir(&sessions_dir).unwrap();
         let (writer, _wake_rx) = manual_writer();
-        let (warn_tx, warn_rx) = flume::unbounded();
-        let mut disk = Writer {
-            dir: dir.clone(),
-            warn_tx,
-            logs: HashMap::new(),
-            failing: HashSet::new(),
-        };
+        let (mut disk, warn_rx) = disk_writer(&dir);
         let retry_state = |id| match lock(&writer.pending).entries.get(&id) {
             Some(Entry::Save(save)) => (save.retry_attempt, save.retry_at),
             _ => panic!("blocked session entry missing"),

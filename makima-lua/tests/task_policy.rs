@@ -62,7 +62,12 @@ const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
-const SEQUENTIAL_TASK_COUNT: usize = 129;
+const RETENTION_CHILD_REPLIES: [&str; 3] = [
+    "first task result",
+    "second task result",
+    "third task result",
+];
+const RETENTION_FOLLOWUP_REPLY: &str = "first task followup result";
 const ROLLBACK_RETAINED_LIMIT: usize = 2;
 const ROLLBACK_FAILED_ATTEMPTS: usize = 4;
 const STATE_SIZE_ERROR: &str = "state value exceeds maximum encoded size";
@@ -1535,28 +1540,34 @@ fn task_system_is_fixed_from_admitted_recorded_context(subagent_type: &str) {
 }
 
 #[test]
-fn task_129th_spawn_preserves_the_first_task() {
+fn completed_unrelated_tasks_preserve_first_task_result_and_followup() {
     let provider = Arc::new(common::CannedProvider::new(
-        (0..=SEQUENTIAL_TASK_COUNT)
-            .map(|_| common::canned_reply(PLAIN_TEXT))
+        RETENTION_CHILD_REPLIES
+            .into_iter()
+            .chain([RETENTION_FOLLOWUP_REPLY])
+            .map(common::canned_reply)
             .collect(),
     ));
     let (ctx, _events, _cancel) = common::ctx_with_provider(provider);
     let (reg, _host, ctx) = load_real_driver_host(&ctx);
-    let mut tasks = Vec::with_capacity(SEQUENTIAL_TASK_COUNT);
-    for index in 0..SEQUENTIAL_TASK_COUNT {
-        eprintln!("sequential task {index}/{SEQUENTIAL_TASK_COUNT}: spawn");
+    let mut tasks: Vec<Value> = Vec::with_capacity(RETENTION_CHILD_REPLIES.len());
+    for (index, expected) in RETENTION_CHILD_REPLIES.into_iter().enumerate() {
         let task = common::exec_tool(
             &reg,
             &ctx,
             TASK_SPAWN_TOOL,
-            task_input(&format!("sequential {index}"), None),
+            task_input(&format!("retained child {index}"), None),
         )
-        .unwrap_or_else(|error| panic!("spawn {index}/{SEQUENTIAL_TASK_COUNT}: {error}"));
-        eprintln!("sequential task {index}/{SEQUENTIAL_TASK_COUNT}: wait");
-        let result = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, task.clone())
-            .unwrap_or_else(|error| panic!("wait {index}/{SEQUENTIAL_TASK_COUNT}: {error}"));
-        assert_eq!(result["result"]["text"], PLAIN_TEXT, "task {index}");
+        .unwrap();
+        assert!(
+            tasks
+                .iter()
+                .all(|prior| prior["task_id"] != task["task_id"])
+        );
+        let result = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, task.clone()).unwrap();
+        assert_eq!(result["status"], "done");
+        assert_eq!(result["result"]["turn_id"], task["turn_id"]);
+        assert_eq!(result["result"]["text"], expected);
         tasks.push(task);
     }
     let manager = ctx.managed_turn.as_ref().unwrap().manager();
@@ -1569,7 +1580,9 @@ fn task_129th_spawn_preserves_the_first_task() {
     }
     let first = &tasks[0];
     let retained = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, first.clone()).unwrap();
+    assert_eq!(retained["status"], "done");
     assert_eq!(retained["result"]["turn_id"], first["turn_id"]);
+    assert_eq!(retained["result"]["text"], RETENTION_CHILD_REPLIES[0]);
     let sent = common::exec_tool(
         &reg,
         &ctx,
@@ -1577,6 +1590,7 @@ fn task_129th_spawn_preserves_the_first_task() {
         json!({ "task_id": first["task_id"], "message": TASK_PROMPT }),
     )
     .unwrap();
+    assert_eq!(sent["queued"], true);
     assert_ne!(sent["turn_id"], first["turn_id"]);
     let result = common::exec_tool(
         &reg,
@@ -1585,7 +1599,13 @@ fn task_129th_spawn_preserves_the_first_task() {
         json!({ "task_id": first["task_id"], "turn_id": sent["turn_id"] }),
     )
     .unwrap();
-    assert_eq!(result["result"]["text"], PLAIN_TEXT);
+    assert_eq!(result["status"], "done");
+    assert_eq!(result["result"]["turn_id"], sent["turn_id"]);
+    assert_eq!(result["result"]["text"], RETENTION_FOLLOWUP_REPLY);
+    let original = common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, first.clone()).unwrap();
+    assert_eq!(original["status"], "done");
+    assert_eq!(original["result"]["turn_id"], first["turn_id"]);
+    assert_eq!(original["result"]["text"], RETENTION_CHILD_REPLIES[0]);
 }
 
 #[test_case::test_case(false; "initial_admission")]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::manager::WorkReservation;
 use makima_providers::{Message, ObservationSource};
-use makima_storage::session_state::{StateChange, StoredDeliveryOp};
+use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StateChange, StoredDeliveryOp};
 use serde_json::{Value, json};
 
 use super::{
@@ -308,7 +308,7 @@ pub(crate) fn admit_delivery_bound(
     let delivery = preview;
     state.delivery_suspended = false;
     state.delivery_seen.push_back(id);
-    if state.delivery_seen.len() > super::MAX_RETAINED_TURN_RESULTS {
+    if state.delivery_seen.len() > MAX_STORED_TURN_RESULTS {
         state.delivery_seen.pop_front();
     }
     state.delivery_order.push_back(id);
@@ -829,6 +829,7 @@ mod tests {
         ActorBackend, ActorEvent, ActorHistory, BackendResult, ControlWork, TurnContext,
         TurnProvenance, TurnResult, WorkKind,
     };
+    use crate::test_util::StubBackend;
     use crate::{
         AgentActorHandle, AgentId, AgentInput, History, TurnCancellationReason, TurnId, TurnOutcome,
     };
@@ -838,36 +839,6 @@ mod tests {
     const CORRELATION: &str = "child correlation";
     const CONVERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const CONVERSION_TIMEOUT_MESSAGE: &str = "delivery conversion did not settle";
-
-    struct UnusedBackend;
-
-    impl ActorBackend for UnusedBackend {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("deferred runner must not execute") })
-        }
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("deferred runner must not execute") })
-        }
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-            Box::pin(async { unreachable!("deferred runner must not execute") })
-        }
-    }
 
     fn delivery(agent_id: AgentId) -> Arc<ChildDelivery> {
         Arc::new(ChildDelivery {
@@ -1041,7 +1012,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1070,7 +1041,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1091,15 +1062,17 @@ mod tests {
         });
     }
 
-    #[test]
-    fn withdrawn_delivery_settles_once_without_running() {
+    #[test_case(Discard::Clear; "clear")]
+    #[test_case(Discard::Close; "close")]
+    #[test_case(Discard::Withdraw; "withdraw")]
+    fn queued_delivery_discards_once(discard: Discard) {
         smol::block_on(async {
             let (_start, rx) = flume::bounded(1);
             let (actor, task) = AgentActorHandle::spawn_inner(
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1109,7 +1082,22 @@ mod tests {
             admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
             let child_turn = envelope.result.outcome.turn_id();
             assert!(!actor.withdraw_child_delivery(TurnId::generate()));
-            assert!(actor.withdraw_child_delivery(child_turn));
+            let reason = match discard {
+                Discard::Clear => {
+                    actor.clear();
+                    actor.clear();
+                    TurnCancellationReason::User
+                }
+                Discard::Close => {
+                    actor.close();
+                    actor.close();
+                    TurnCancellationReason::Closed
+                }
+                Discard::Withdraw => {
+                    assert!(actor.withdraw_child_delivery(child_turn));
+                    TurnCancellationReason::Withdrawn
+                }
+            };
             assert!(!actor.withdraw_child_delivery(child_turn));
             let statuses: Vec<_> = events
                 .try_iter()
@@ -1120,56 +1108,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 statuses,
-                vec![
-                    DeliveryStatus::Accepted,
-                    DeliveryStatus::Discarded(TurnCancellationReason::Withdrawn),
-                ]
-            );
-            assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
-            actor.close();
-            task.await;
-        });
-    }
-
-    #[test_case(false; "clear")]
-    #[test_case(true; "close")]
-    fn queued_delivery_discards_once(close: bool) {
-        smol::block_on(async {
-            let (_start, rx) = flume::bounded(1);
-            let (actor, task) = AgentActorHandle::spawn_inner(
-                AgentId::generate(),
-                Vec::new(),
-                None,
-                Box::new(UnusedBackend),
-                None,
-                None,
-                Some(rx),
-            );
-            let events = actor.subscribe_events();
-            let envelope = delivery(actor.agent_id());
-            admit_delivery(&actor.inner, Arc::clone(&envelope)).unwrap();
-            if close {
-                actor.close();
-            } else {
-                actor.clear();
-            }
-            let statuses: Vec<_> = events
-                .try_iter()
-                .filter_map(|event| match event {
-                    ActorEvent::Delivery(event) => Some(event.status),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                statuses,
-                vec![
-                    DeliveryStatus::Accepted,
-                    DeliveryStatus::Discarded(if close {
-                        TurnCancellationReason::Closed
-                    } else {
-                        TurnCancellationReason::User
-                    })
-                ]
+                vec![DeliveryStatus::Accepted, DeliveryStatus::Discarded(reason)]
             );
             assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
             actor.close();
@@ -1470,7 +1409,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1484,7 +1423,7 @@ mod tests {
                 managed.agent_id,
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 Some(managed),
                 None,
                 Some(rx),
@@ -1525,7 +1464,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1543,7 +1482,7 @@ mod tests {
                 managed.agent_id,
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 Some(managed),
                 Some(Arc::new(config)),
                 Some(rx),
@@ -1595,7 +1534,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(parent_rx),
@@ -1617,7 +1556,7 @@ mod tests {
                 admission.agent_id,
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 Some(admission),
                 None,
                 Some(child_rx),
@@ -1689,7 +1628,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1717,7 +1656,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1758,7 +1697,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -1829,7 +1768,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -2003,7 +1942,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -2040,7 +1979,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -2086,7 +2025,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),
@@ -2145,7 +2084,7 @@ mod tests {
             id,
             Vec::new(),
             None,
-            Box::new(UnusedBackend),
+            Box::new(StubBackend),
             Some(managed),
             None,
             Some(rx),
@@ -2188,7 +2127,7 @@ mod tests {
                 parent,
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(ready),
@@ -2444,7 +2383,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(UnusedBackend),
+                Box::new(StubBackend),
                 None,
                 None,
                 Some(rx),

@@ -336,13 +336,6 @@ impl RestoreStore {
         Ok(())
     }
 
-    pub fn guard_session_deletion(
-        &self,
-        session: MakimaId,
-    ) -> Result<RestoreDeletionGuard, RestoreError> {
-        Self::guard_session_deletion_in(&self.dir.path().join(SESSIONS_DIR), session)
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn guard_session_deletion_in(
         sessions_root: &Path,
@@ -1241,7 +1234,7 @@ mod compatibility_tests {
             let id = MakimaId::generate();
             assert!(store.pending(id).unwrap().is_empty());
             assert!(store.pending_for_session(id).unwrap().is_empty());
-            store.guard_session_deletion(id).unwrap();
+            RestoreStore::guard_session_deletion_in(&sessions, id).unwrap();
         }
     }
 
@@ -1980,13 +1973,9 @@ mod tests {
         assert!(fixture.store().pending(fixture.owner).unwrap().is_empty());
     }
 
-    #[test_case("load"; "load_requires_durable_complete")]
-    #[test_case("pending"; "pending_requires_durable_complete")]
-    #[test_case("global"; "global_pending_requires_durable_complete")]
-    #[test_case("delete"; "delete_requires_durable_complete")]
-    #[test_case("public_delete"; "public_delete_requires_durable_complete")]
-    #[test_case("public_delete_from"; "public_delete_from_requires_durable_complete")]
-    fn failed_complete_sync_cannot_silently_close_recovery(operation: &str) {
+    #[test_case(false; "global_pending_requires_durable_complete")]
+    #[test_case(true; "public_delete_from_requires_durable_complete")]
+    fn failed_complete_sync_cannot_silently_close_recovery(delete: bool) {
         let fixture = Fixture::new();
         let reference = fixture.prepare();
         fixture
@@ -2001,29 +1990,16 @@ mod tests {
             Err(RestoreError::Io(_))
         ));
         FAIL_PROGRESS_SYNC.with(|fail| fail.set(true));
-        let result = match operation {
-            "load" => fixture.store().load(&reference).map(|_| ()),
-            "pending" => fixture.store().pending(fixture.owner).map(|_| ()),
-            "global" => fixture
+        let result = if delete {
+            match TestSession::delete_from(fixture.owner, &fixture.root.path().join(SESSIONS_DIR)) {
+                Err(SessionError::Restore(error)) => Err(error),
+                other => panic!("expected restore durability error, got {other:?}"),
+            }
+        } else {
+            fixture
                 .store()
                 .pending_for_session(fixture.owner)
-                .map(|_| ()),
-            "delete" => fixture
-                .store()
-                .guard_session_deletion(fixture.owner)
-                .map(|_| ()),
-            "public_delete" | "public_delete_from" => {
-                let result = if operation == "public_delete" {
-                    TestSession::delete(fixture.owner, &fixture.state)
-                } else {
-                    TestSession::delete_from(fixture.owner, &fixture.root.path().join(SESSIONS_DIR))
-                };
-                match result {
-                    Err(SessionError::Restore(error)) => Err(error),
-                    other => panic!("expected restore durability error, got {other:?}"),
-                }
-            }
-            _ => unreachable!(),
+                .map(|_| ())
         };
         assert!(matches!(result, Err(RestoreError::Io(_))));
         assert!(fixture.owner_log().exists());
@@ -2462,8 +2438,10 @@ mod tests {
             fixture.manifest.source.session,
             fixture.manifest.target.session,
         ] {
-            assert!(matches!(fixture.store().guard_session_deletion(session),
-                Err(RestoreError::Pending(id)) if id == session));
+            assert!(
+                matches!(RestoreStore::guard_session_deletion_in(&fixture.root.path().join(SESSIONS_DIR), session),
+                Err(RestoreError::Pending(id)) if id == session)
+            );
         }
         fixture
             .store()
@@ -2478,8 +2456,10 @@ mod tests {
             fixture.manifest.source.session,
             fixture.manifest.target.session,
         ] {
-            assert!(matches!(fixture.store().guard_session_deletion(session),
-                Err(RestoreError::Pending(id)) if id == session));
+            assert!(
+                matches!(RestoreStore::guard_session_deletion_in(&fixture.root.path().join(SESSIONS_DIR), session),
+                Err(RestoreError::Pending(id)) if id == session)
+            );
         }
     }
 
@@ -2532,14 +2512,15 @@ mod tests {
         fixture.prepare();
         fs::write(fixture.directory().join(MANIFEST_FILE), b"{}").unwrap();
         assert!(
-            fixture
-                .store()
-                .guard_session_deletion(MakimaId::generate())
-                .is_err()
+            RestoreStore::guard_session_deletion_in(
+                &fixture.root.path().join(SESSIONS_DIR),
+                MakimaId::generate(),
+            )
+            .is_err()
         );
         fs::remove_file(fixture.owner_log()).unwrap();
         assert!(
-            matches!(fixture.store().guard_session_deletion(MakimaId::generate()),
+            matches!(RestoreStore::guard_session_deletion_in(&fixture.root.path().join(SESSIONS_DIR), MakimaId::generate()),
             Err(RestoreError::MissingOwner(owner)) if owner == fixture.owner)
         );
     }

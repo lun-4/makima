@@ -1089,19 +1089,16 @@ fn scoped_prepublication_migration_carries_unloaded_and_outside_values() {
         (Some(child), "unloaded/opaque".into(), 9),
     ] {
         snapshot.seq += 1;
-        snapshot.state.insert(
-            snapshot.seq,
-            StoredStateRecord {
-                seq: snapshot.seq,
-                agent,
-                generation: 7,
-                change: StateChange::Plugin {
-                    key,
-                    version,
-                    value: Some(json!({ "count": 4 })),
-                },
+        snapshot.state.push(StoredStateRecord {
+            seq: snapshot.seq,
+            agent,
+            generation: 7,
+            change: StateChange::Plugin {
+                key,
+                version,
+                value: Some(json!({ "count": 4 })),
             },
-        );
+        });
     }
     host.load_source(
         PLUGIN,
@@ -1126,8 +1123,8 @@ fn scoped_prepublication_migration_carries_unloaded_and_outside_values() {
             .is_empty()
     );
     assert_eq!(
-        root.manager().journal().snapshot().state.len() + 3,
-        snapshot.state.len()
+        root.manager().journal().snapshot().state.iter().len() + 3,
+        snapshot.state.iter().len()
     );
 }
 

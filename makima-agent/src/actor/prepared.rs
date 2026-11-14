@@ -7,7 +7,7 @@ use crate::manager::WorkReservation;
 use futures_lite::FutureExt;
 use makima_providers::Message;
 use makima_storage::checkpoint::CheckpointPublication;
-use makima_storage::session_state::{StateChange, StoredAgentConfig};
+use makima_storage::session_state::StateChange;
 use makima_storage::sessions::HistorySnapshot;
 use std::collections::BTreeMap;
 
@@ -512,28 +512,6 @@ impl PreparedOperationTicket {
             .filter(|pending| pending.turn.is_some())
             .ok_or(ActorError::PolicyCancelled)?;
         pending.turn_displayed = displayed;
-        Ok(())
-    }
-
-    /// Resolves the configuration change the prepared operation commits.
-    /// `None` keeps the actor's current configuration. Fails with
-    /// [`ActorError::PolicyPending`] when the change or turn input was
-    /// already resolved.
-    pub fn resolve_restore(
-        &self,
-        stored: StoredAgentConfig,
-        prepared: PreparedModel,
-        mode: (AgentMode, ModeDef),
-    ) -> Result<(), ActorError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let pending = self.unresolved(&mut state)?;
-        pending.restore = Some((prepared, mode));
-        pending.change = Some(Some(ConfigChange::Restore(stored)));
-        drive_operations(&self.inner, &mut state);
         Ok(())
     }
 

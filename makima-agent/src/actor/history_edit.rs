@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use makima_providers::provider::Provider;
 use makima_providers::{ContentBlock, ConversationEnd, Message, TokenUsage};
-use makima_storage::session_state::StoredAgentConfig;
+use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StoredAgentConfig};
 use makima_storage::sessions::{HistorySnapshot, next_epoch};
 
 use super::prepared::{CancelPublication, PreparedOperation};
@@ -159,7 +159,7 @@ impl PreparedActorRewind {
                 .results
                 .into_iter()
                 .rev()
-                .take(super::MAX_RETAINED_TURN_RESULTS)
+                .take(MAX_STORED_TURN_RESULTS)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -1147,8 +1147,8 @@ mod tests {
                                 assert_eq!(boundary.agent, final_access.target());
                                 assert_eq!(boundary.epoch, candidate.epoch);
                                 assert_eq!(callback_journal.snapshot().state, callback_before.state);
-                                assert!(candidate.state.iter().take(callback_before.state.len()).eq(callback_before.state.iter()));
-                                let changes: Vec<_> = candidate.state.iter().skip(callback_before.state.len()).collect();
+                                assert!(candidate.state.iter().take(callback_before.state.iter().len()).eq(callback_before.state.iter()));
+                                let changes: Vec<_> = candidate.state.iter().skip(callback_before.state.iter().len()).collect();
                                 assert_eq!(changes.len(), usize::from(with_edit) + 1);
                                 if with_edit {
                                     assert!(matches!(

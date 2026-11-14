@@ -61,7 +61,6 @@ pub use tickets::{TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket
 const TERMINAL_CHECKPOINT_PANICKED: &str = "terminal checkpoint callback panicked";
 const ADMISSION_PREPARATION_PANICKED: &str = "admission preparation panicked";
 
-pub const MAX_RETAINED_TURN_RESULTS: usize = 128;
 #[cfg(any(test, feature = "test-util"))]
 const QUIESCENCE_BARRIER_ROUNDS: usize = 128;
 
@@ -199,7 +198,7 @@ use crate::{
     AgentInput, AgentMode, CancelTrigger, History, HistorySnapshot, ModeDef, RunSettings,
     SharedMessages,
 };
-use makima_storage::session_state::StateChange;
+use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StateChange};
 
 /// One scheduler operation. Every admitted turn settles into one outcome;
 /// controls and compaction do not produce turn outcomes.
@@ -1265,7 +1264,7 @@ fn retire_turn(
         state.latest_history_turn = Some((turn_id, history.epoch, history.messages.len()));
     }
     state.retained_order.push_back(turn_id);
-    if state.retained_order.len() > MAX_RETAINED_TURN_RESULTS
+    if state.retained_order.len() > MAX_STORED_TURN_RESULTS
         && let Some(evicted) = state.retained_order.pop_front()
     {
         outcomes.remove(&evicted);
@@ -1580,19 +1579,9 @@ impl<'a> ActorHistory<'a> {
         self.history.checked_observation(message)
     }
 
-    pub async fn replace(&mut self, messages: Vec<Message>) {
-        let _permit = self.permit().await;
-        self.history.replace(messages);
-    }
-
     pub async fn replace_snapshot(&mut self, snapshot: HistorySnapshot) {
         let _permit = self.permit().await;
         self.history.replace_snapshot(snapshot);
-    }
-
-    pub async fn restore_snapshot(&mut self, snapshot: HistorySnapshot) {
-        let _permit = self.permit().await;
-        self.history.restore_snapshot(snapshot);
     }
 
     pub async fn replace_compacted(
@@ -1601,11 +1590,6 @@ impl<'a> ActorHistory<'a> {
     ) -> Result<Option<Arc<str>>, HistoryMutationError> {
         let _permit = self.permit().await;
         self.history.replace_compacted(messages)
-    }
-
-    pub async fn truncate(&mut self, len: usize) {
-        let _permit = self.permit().await;
-        self.history.truncate(len);
     }
 
     pub async fn sanitize_cancelled(&mut self, rollback_len: usize) {
@@ -1621,9 +1605,6 @@ impl<'a> ActorHistory<'a> {
     }
     pub fn continue_conversation(&mut self) -> Option<Arc<str>> {
         self.history.continue_conversation()
-    }
-    pub fn restart_conversation(&mut self) -> Option<Arc<str>> {
-        self.history.restart_conversation()
     }
 }
 
@@ -1895,7 +1876,7 @@ impl AgentActorHandle {
                 .results
                 .into_iter()
                 .rev()
-                .take(MAX_RETAINED_TURN_RESULTS)
+                .take(MAX_STORED_TURN_RESULTS)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -2682,7 +2663,7 @@ impl AgentActorHandle {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .len()
-                >= MAX_RETAINED_TURN_RESULTS
+                >= MAX_STORED_TURN_RESULTS
             {
                 return Err(ActorError::InstructionOverflow);
             }
@@ -2767,7 +2748,7 @@ impl AgentActorHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .len()
-            >= MAX_RETAINED_TURN_RESULTS
+            >= MAX_STORED_TURN_RESULTS
         {
             return Err(ActorError::InstructionOverflow);
         }

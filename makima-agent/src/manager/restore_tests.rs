@@ -8,6 +8,7 @@ use makima_storage::session_state::{
     StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
 };
 use makima_storage::sessions::Session;
+use makima_storage::test_util::test_record;
 use test_case::test_case;
 
 use super::{
@@ -24,6 +25,7 @@ use crate::{
     journal::{
         JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
     },
+    test_util::StubBackend,
 };
 
 type StoredSession = Session<Message, TokenUsage, crate::ToolOutput>;
@@ -522,8 +524,6 @@ fn detached_backend_cleanup_cannot_overwrite_replacement_history() {
     });
 }
 
-struct OfflineBackend;
-
 struct GatedCleanupBackend {
     entered: flume::Sender<()>,
     release: flume::Receiver<()>,
@@ -575,36 +575,6 @@ impl ActorBackend for GatedCleanupBackend {
     }
 }
 
-impl ActorBackend for OfflineBackend {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { panic!("restore must not run a turn") })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 fn config() -> EffectiveAgentConfig {
     EffectiveAgentConfig::new(
         RunSettings {
@@ -621,7 +591,7 @@ fn config() -> EffectiveAgentConfig {
 
 fn resident() -> ResidentAgent {
     ResidentAgent {
-        backend: Box::new(OfflineBackend),
+        backend: Box::new(StubBackend),
         config: config(),
         shared_messages: None,
         start: None,
@@ -640,28 +610,22 @@ fn records() -> [StoredAgentRecord; RETAINED_AGENTS] {
     .into_iter()
     .enumerate()
     .map(|(index, lifecycle)| StoredAgentRecord {
-        id: if index == 0 {
-            root
-        } else {
-            AgentId::generate()
-        },
-        parent: (index != 0).then_some(root),
-        depth: u32::from(index != 0),
         transcript_key: if index == 0 {
             String::new()
         } else {
             format!("child-{index}")
         },
         lifecycle,
-        ancestry_unknown: false,
         label: Some(format!("agent-{index}")),
         spawned_by_tool_use_id: (index != 0).then(|| format!("tool-{index}")),
-        spec: None,
-        restorable: Ok(()),
-        usage: Default::default(),
-        created_seq: 0,
-        updated_seq: 0,
-        legacy: false,
+        ..test_record(
+            if index == 0 {
+                root
+            } else {
+                AgentId::generate()
+            },
+            (index != 0).then_some(root),
+        )
     })
     .collect::<Vec<_>>()
     .try_into()
@@ -1545,7 +1509,7 @@ fn folded_legacy_identities_are_readable_but_exempt_from_retention_quota() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                |_| Ok::<_, String>(Box::new(OfflineBackend) as Box<dyn ActorBackend>),
+                |_| Ok::<_, String>(Box::new(StubBackend) as Box<dyn ActorBackend>),
             )
         };
         let child = spawn().unwrap();
@@ -1677,7 +1641,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(OfflineBackend)),
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
             )
             .unwrap();
         assert_ne!(replacement.id(), id);

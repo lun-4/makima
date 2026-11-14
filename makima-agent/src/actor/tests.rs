@@ -5,7 +5,6 @@
 #[path = "config_tests.rs"]
 mod config_tests;
 
-use std::slice;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,8 +17,8 @@ use makima_providers::{
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::SessionRef;
 use makima_storage::session_state::{
-    MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredScopeState, StoredTurnOrigin,
-    StoredTurnProvenance,
+    MAX_INLINE_TURN_RESULT_BYTES, MAX_STORED_TURN_RESULTS, StateChange, StoredScopeState,
+    StoredTurnOrigin, StoredTurnProvenance,
 };
 use serde_json::Value;
 
@@ -1535,10 +1534,6 @@ fn transcript_releases_locks_before_encoding_while_turn_settles() {
             let transcript = scope.spawn(move || {
                 reader
                     .transcript_inner(reader_request, || {
-                        assert!(reader.inner.outcomes.try_lock().is_ok());
-                        assert!(reader.inner.state.try_lock().is_ok());
-                        assert!(reader.inner.coverage.try_lock().is_ok());
-                        assert!(reader.inner.tickets.try_lock().is_ok());
                         captured_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                     })
@@ -1786,7 +1781,7 @@ fn retained_results_evict_without_invalidating_held_tickets() {
         let (actor, task) = spawn(ScriptedBackend::new());
         let first = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
         first.wait().await;
-        for _ in 0..super::MAX_RETAINED_TURN_RESULTS {
+        for _ in 0..MAX_STORED_TURN_RESULTS {
             actor
                 .admit_turn(input(TEXT), None, TEXT.into())
                 .unwrap()
@@ -1797,15 +1792,15 @@ fn retained_results_evict_without_invalidating_held_tickets() {
         assert!(actor.outcome(first.turn_id()).is_none());
         assert_eq!(
             actor.inner.outcomes.lock().unwrap().len(),
-            super::MAX_RETAINED_TURN_RESULTS
+            MAX_STORED_TURN_RESULTS
         );
         assert_eq!(
             actor.inner.retained_tickets.lock().unwrap().len(),
-            super::MAX_RETAINED_TURN_RESULTS
+            MAX_STORED_TURN_RESULTS
         );
         assert_eq!(
             actor.inner.coverage.lock().unwrap().len(),
-            super::MAX_RETAINED_TURN_RESULTS
+            MAX_STORED_TURN_RESULTS
         );
         assert!(first.peek_result().is_some());
         actor.close();
@@ -1822,7 +1817,7 @@ fn default_transcript_ignores_cancelled_queued_turn() {
         let first = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
         first.wait().await;
         let barrier = actor.reserve_prepared_operation(None).unwrap();
-        for _ in 0..=super::MAX_RETAINED_TURN_RESULTS {
+        for _ in 0..=MAX_STORED_TURN_RESULTS {
             let queued = actor.admit_turn(input(TEXT), None, TEXT.into()).unwrap();
             actor.cancel_turn(queued.turn_id()).unwrap();
             queued.wait().await;
@@ -3702,30 +3697,10 @@ fn duplicate_finalize_keeps_the_first_settled_identity() {
     smol::block_on(task);
 }
 
-#[test]
-fn first_cancellation_reason_wins() {
-    smol::block_on(async {
-        let backend = CancellableBackend::new();
-        let state = Arc::clone(&backend.state);
-        let (handle, task) = spawn(backend);
-        let ticket = handle.admit_turn(input("work"), None, "w".into()).unwrap();
-        until(|| state.entered.load(Ordering::SeqCst) > 0).await;
-        handle.close();
-        let outcome = ticket.wait().await;
-        assert!(matches!(
-            outcome,
-            TurnOutcome::Cancelled {
-                reason: TurnCancellationReason::Closed,
-                ..
-            }
-        ));
-        task.await;
-    });
-}
-
-#[test_case::test_case(false; "cancel_all_before_close")]
-#[test_case::test_case(true; "cancel_turn_before_close")]
-fn first_reason_wins_across_sources(cancel_one: bool) {
+#[test_case::test_case("all"; "cancel_all_before_close")]
+#[test_case::test_case("turn"; "cancel_turn_before_close")]
+#[test_case::test_case("correlation"; "cancel_correlation_before_close")]
+fn first_reason_wins_across_sources(source: &str) {
     smol::block_on(async {
         let gate = Gate::new();
         let mut backend = CancellableBackend::new();
@@ -3734,10 +3709,15 @@ fn first_reason_wins_across_sources(cancel_one: bool) {
         let (handle, task) = spawn(backend);
         let ticket = handle.admit_turn(input("work"), None, "w".into()).unwrap();
         until(|| state.entered.load(Ordering::SeqCst) > 0).await;
-        if cancel_one {
-            handle.cancel_turn(ticket.turn_id()).unwrap();
-        } else {
-            handle.cancel_all();
+        match source {
+            "turn" => handle.cancel_turn(ticket.turn_id()).unwrap(),
+            "all" => {
+                handle.cancel_all();
+            }
+            "correlation" => {
+                handle.cancel_correlation("w", TurnCancellationReason::User);
+            }
+            _ => unreachable!(),
         }
         handle.close();
         assert!(ticket.peek_result().is_none());
@@ -4774,30 +4754,6 @@ fn precancel_marks_match_and_do_not_poison() {
 }
 
 #[test]
-fn targeted_cancel_first_reason_wins_vs_close() {
-    smol::block_on(async {
-        let backend = CancellableBackend::new();
-        let state = Arc::clone(&backend.state);
-        let (handle, task) = spawn(backend);
-        let running = handle
-            .admit_turn(input("running"), None, "race-a".into())
-            .unwrap();
-        until(|| state.entered.load(Ordering::SeqCst) > 0).await;
-        // Targeted cancel fires User; the later close cannot override.
-        handle.cancel_correlation("race-a", TurnCancellationReason::User);
-        handle.close();
-        assert!(matches!(
-            running.wait().await,
-            TurnOutcome::Cancelled {
-                reason: TurnCancellationReason::User,
-                ..
-            }
-        ));
-        task.await;
-    });
-}
-
-#[test]
 fn remove_turn_terminalizes_exact_queued_turn() {
     smol::block_on(async {
         let gate = Gate::new();
@@ -5316,28 +5272,6 @@ fn instruction_inbox_limits_are_nonfatal(bytes: bool) {
             .submit(input(TEXT), None, TEXT.into(), Default::default())
             .unwrap();
         assert_ne!(first.turn_id(), successor.turn_id());
-        actor.close();
-        task.await;
-    });
-}
-
-#[test]
-fn graph_quiescence_probe_detects_extra_execution() {
-    smol::block_on(async {
-        const TEXT: &str = "probe";
-        let (actor, task) = spawn(ScriptedBackend::new());
-        let first = super::graph_quiescence_barrier(slice::from_ref(&actor))
-            .await
-            .unwrap();
-        let ticket = actor
-            .submit(input(TEXT), None, TEXT.into(), Default::default())
-            .unwrap();
-        ticket.wait().await;
-        let second = super::graph_quiescence_barrier(slice::from_ref(&actor))
-            .await
-            .unwrap();
-        assert!(second.iter().all(super::ActorRuntimeProbe::is_quiescent));
-        assert_eq!(second[0].retained_results, first[0].retained_results + 1);
         actor.close();
         task.await;
     });

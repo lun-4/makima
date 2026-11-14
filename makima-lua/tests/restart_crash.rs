@@ -284,36 +284,30 @@ fn root_replacement_report_stays_held_after_restart_until_one_explicit_user_turn
     let generation = restored.fold(restored.seq).unwrap().scopes[&Some(parent)].generation;
     let stored_result = result.to_stored(session_id, None).unwrap();
     restored.seq += 1;
-    restored.state.insert(
-        restored.seq,
-        StoredStateRecord {
-            seq: restored.seq,
-            agent: Some(source),
-            generation: 0,
-            change: StateChange::Turn {
-                turn,
-                result: stored_result.clone(),
-            },
+    restored.state.push(StoredStateRecord {
+        seq: restored.seq,
+        agent: Some(source),
+        generation: 0,
+        change: StateChange::Turn {
+            turn,
+            result: stored_result.clone(),
         },
-    );
+    });
     restored.seq += 1;
-    restored.state.insert(
-        restored.seq,
-        StoredStateRecord {
-            seq: restored.seq,
-            agent: Some(parent),
-            generation,
-            change: StateChange::Delivery {
-                id: (source, turn),
-                op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                    label: None,
-                    result: stored_result,
-                    held: false,
-                    preview_bytes: None,
-                })),
-            },
+    restored.state.push(StoredStateRecord {
+        seq: restored.seq,
+        agent: Some(parent),
+        generation,
+        change: StateChange::Delivery {
+            id: (source, turn),
+            op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                label: None,
+                result: stored_result,
+                held: false,
+                preview_bytes: None,
+            })),
         },
-    );
+    });
     let mut replacement = smol::block_on(common::bounded(
         journal.prepare_branch_restore(root, restored),
     ))
@@ -435,53 +429,6 @@ fn root_replacement_report_stays_held_after_restart_until_one_explicit_user_turn
         })
         .count();
     assert_eq!(consumed, 1);
-}
-
-#[test]
-fn history_epoch_normalization_preserves_order_and_aliases() {
-    const POLICY_GENERATION: u64 = 7;
-    const BEFORE: u64 = 10;
-    const AFTER: u64 = 20;
-    const RELOADED_BEFORE: u64 = 100;
-    const RELOADED_AFTER: u64 = 200;
-    let agent = AgentId::generate();
-    let records = |before, after| {
-        vec![
-            StoredStateRecord {
-                seq: 1,
-                agent: Some(agent),
-                generation: POLICY_GENERATION,
-                change: StateChange::Boundary {
-                    offset: 0,
-                    lens: [(agent, (before, 0))].into(),
-                },
-            },
-            StoredStateRecord {
-                seq: 2,
-                agent: Some(agent),
-                generation: POLICY_GENERATION,
-                change: StateChange::Compaction { epoch: after },
-            },
-        ]
-    };
-    let normalized = common::normalized_history_epoch_state(&records(BEFORE, AFTER));
-    assert_eq!(
-        normalized,
-        common::normalized_history_epoch_state(&records(RELOADED_BEFORE, RELOADED_AFTER))
-    );
-    assert_ne!(
-        normalized,
-        common::normalized_history_epoch_state(&records(AFTER, BEFORE))
-    );
-    assert_ne!(
-        normalized,
-        common::normalized_history_epoch_state(&records(BEFORE, BEFORE))
-    );
-    assert!(
-        normalized
-            .iter()
-            .all(|record| record.generation == POLICY_GENERATION)
-    );
 }
 
 #[test_case(false; "running_and_queued_child")]

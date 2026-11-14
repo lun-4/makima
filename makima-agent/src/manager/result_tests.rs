@@ -2,23 +2,24 @@ use super::{
     AgentLimits, AgentManagerHandle, AgentResidency, GraphLifecycle, ManagerError, ResidentAgent,
 };
 use crate::{
-    ActorBackend, AgentId, AgentInput, AgentMode, BackendResult, ControlWork, DoneReason, History,
-    RunSettings, TurnContext, TurnId, TurnOutcome, TurnProvenance, TurnResult, TurnTicket,
-    WorkKind,
-    actor::{ActorHistory, EffectiveAgentConfig},
+    AgentId, AgentMode, DoneReason, History, RunSettings, TurnId, TurnOutcome, TurnProvenance,
+    TurnResult, TurnTicket,
+    actor::EffectiveAgentConfig,
     journal::{JournalChange, JournalCommit, SessionJournal},
+    test_util::StubBackend,
     tools::offload::OffloadStore,
 };
 use makima_providers::{Message, Model, provider::unconfigured};
 use makima_storage::{
     id::{MakimaId, SessionRef},
     session_state::{
-        MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentLifecycle, StoredAgentRecord,
-        StoredOffloadRef, StoredPayload, StoredTurnResult,
+        MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredOffloadRef, StoredPayload,
+        StoredTurnResult,
     },
+    test_util::test_record,
 };
 use serde_json::json;
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 #[cfg(unix)]
 use std::{fs, os::unix::fs::symlink};
 use tempfile::TempDir;
@@ -27,41 +28,8 @@ use test_case::test_case;
 const MODEL: &str = "test/model";
 const HISTORY_TEXT: &str = "retained conversation";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const UNEXPECTED_TURN: &str = "result restoration must not run a turn";
 #[cfg(unix)]
 const REPLACEMENT: &str = "replacement";
-
-struct OfflineBackend;
-
-impl ActorBackend for OfflineBackend {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { panic!("{UNEXPECTED_TURN}") })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
 
 struct Fixture {
     root: TempDir,
@@ -102,22 +70,7 @@ impl Fixture {
         journal.bind_session(session).unwrap();
         journal
             .commit(JournalCommit {
-                agents: vec![StoredAgentRecord {
-                    id: agent_id,
-                    parent: None,
-                    depth: 0,
-                    transcript_key: String::new(),
-                    lifecycle: StoredAgentLifecycle::Open,
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
-                    created_seq: 0,
-                    updated_seq: 0,
-                    legacy: false,
-                }],
+                agents: vec![test_record(agent_id, None)],
                 changes: vec![JournalChange {
                     agent: Some(agent_id),
                     generation: 0,
@@ -191,7 +144,7 @@ impl Fixture {
         self.manager
             .ensure_resident_with(self.agent_id(), |_| async {
                 Ok(ResidentAgent {
-                    backend: Box::new(OfflineBackend),
+                    backend: Box::new(StubBackend),
                     config: EffectiveAgentConfig::new(
                         RunSettings {
                             provider: unconfigured(),
@@ -298,37 +251,27 @@ fn foreign_session_is_rejected_before_resolver_and_during_hydration(output: bool
 }
 
 #[cfg(unix)]
-#[test_case(false; "text_artifact")]
-#[test_case(true; "output_artifact")]
-fn artifact_symlink_is_rejected_by_dormant_lookup_and_hydration(output: bool) {
+#[test_case(Some(false); "text_artifact")]
+#[test_case(Some(true); "output_artifact")]
+#[test_case(None; "session_directory")]
+fn symlink_is_rejected_by_dormant_lookup_and_hydration(output: Option<bool>) {
     smol::block_on(async {
         let mut fixture = Fixture::new(|_| {});
         fixture.bind();
-        let reference = if output {
-            offloaded(&mut fixture.stored.output)
-        } else {
-            offloaded(&mut fixture.stored.text)
+        let artifact = match output {
+            Some(output) => {
+                let reference = if output {
+                    offloaded(&mut fixture.stored.output)
+                } else {
+                    offloaded(&mut fixture.stored.text)
+                };
+                fixture.store.dir().join(&reference.path)
+            }
+            None => fixture.store.dir(),
         };
-        let artifact = fixture.store.dir().join(&reference.path);
         let replacement = fixture.root.path().join(REPLACEMENT);
         fs::rename(&artifact, &replacement).unwrap();
         symlink(&replacement, &artifact).unwrap();
-        fixture.assert_unavailable(fixture.ticket());
-        fixture.assert_dormant();
-        fixture.assert_unavailable_after_hydration().await;
-    });
-}
-
-#[cfg(unix)]
-#[test]
-fn session_directory_symlink_is_rejected_by_dormant_lookup_and_hydration() {
-    smol::block_on(async {
-        let fixture = Fixture::new(|_| {});
-        fixture.bind();
-        let directory = fixture.store.dir();
-        let replacement = fixture.root.path().join(REPLACEMENT);
-        fs::rename(&directory, &replacement).unwrap();
-        symlink(&replacement, &directory).unwrap();
         fixture.assert_unavailable(fixture.ticket());
         fixture.assert_dormant();
         fixture.assert_unavailable_after_hydration().await;

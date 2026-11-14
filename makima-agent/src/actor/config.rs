@@ -483,7 +483,7 @@ mod context_tests {
                 .unwrap();
             assert!(committed.config.config.fast);
             let changed = journal.snapshot();
-            assert_eq!(changed.state.len(), before.state.len() + 1);
+            assert_eq!(changed.state.iter().len(), before.state.iter().len() + 1);
             let folded = changed.fold(changed.seq).unwrap();
             let saved = folded.scopes[&Some(target.id())].config.as_ref().unwrap();
             assert!(saved.fast);

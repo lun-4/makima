@@ -238,7 +238,7 @@ mod tests {
         }
         let capture = recording.capture(&path).unwrap();
         assert_blob(&recording, &capture.before, before);
-        assert!(recording.journal.snapshot().state.is_empty());
+        assert!(recording.journal.snapshot().state.iter().next().is_none());
         match after {
             Some(bytes) => fs::write(&path, bytes).unwrap(),
             None => fs::remove_file(&path).unwrap(),
@@ -275,7 +275,7 @@ mod tests {
         let capture = recording.capture(&path).unwrap();
         assert_eq!(capture.before, FileState::Absent);
         assert!(!path.parent().unwrap().exists());
-        assert!(recording.journal.snapshot().state.is_empty());
+        assert!(recording.journal.snapshot().state.iter().next().is_none());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, AFTER).unwrap();
         recording.finish(capture).unwrap();

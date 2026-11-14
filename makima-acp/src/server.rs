@@ -2700,19 +2700,15 @@ mod tests {
     };
     use makima_providers::{PreparedProvider, ProviderBackend, RegisteredProvider};
     use makima_storage::StateDir;
-    use makima_storage::blobs::{BlobStore, FileState};
     use makima_storage::checkpoint::{ClaimingWriter, accept_all};
     use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
-    use makima_storage::restore::{
-        PathRestore, RestoreChoice, RestoreEndpoint, RestoreProgress, RestoreStore,
-        RestoreTransition, TransitionRef,
-    };
-    use makima_storage::restore_digest::session_digest;
+    use makima_storage::restore::{RestoreProgress, RestoreStore};
     use makima_storage::session_state::{
         StateChange, StoredCancellationReason, StoredStateRecord, StoredTurnOrigin,
         StoredTurnStatus,
     };
     use makima_storage::sessions::{Effort, Session, StoredThinking};
+    use makima_storage::test_util::pending_restore;
     use smol::future::poll_once;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2729,43 +2725,6 @@ mod tests {
     const RESTORE_CHANGED: &str = "pending ACP restore content";
     const RESTORE_CONFLICT: &str = "independent ACP edit";
 
-    fn pending_acp_restore(
-        storage: &StateDir,
-        session: &StoredSession,
-        path: &Path,
-    ) -> TransitionRef {
-        let blobs = BlobStore::new(storage.clone());
-        let endpoint = RestoreEndpoint {
-            session: session.id,
-            branch: None,
-            seq: session.sequence_high_water().unwrap_or_default(),
-            digest: session_digest(session).unwrap(),
-        };
-        RestoreStore::new(storage.clone())
-            .prepare(
-                session.id,
-                RestoreTransition {
-                    id: MakimaId::generate(),
-                    choice: RestoreChoice::FilesOnly,
-                    source: endpoint.clone(),
-                    target: endpoint,
-                    inverse_of: None,
-                    paths: vec![PathRestore {
-                        path: path.to_path_buf(),
-                        before: FileState::Blob(
-                            blobs
-                                .put(session.id, SAVED_PLAN_CONTENT.as_bytes())
-                                .unwrap(),
-                        ),
-                        after: FileState::Blob(
-                            blobs.put(session.id, RESTORE_CHANGED.as_bytes()).unwrap(),
-                        ),
-                    }],
-                    skipped: Vec::new(),
-                },
-            )
-            .unwrap()
-    }
     const THINKING_MODEL_ID: &str = "acp-load-thinker";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const LIFECYCLE_STRESS_ITERATIONS: usize = 64;
@@ -8111,7 +8070,13 @@ mod tests {
                 let mut stored = StoredSession::load(session.id, &storage).unwrap();
                 stored.save(&storage).unwrap();
                 let stored = StoredSession::load(session.id, &storage).unwrap();
-                let reference = pending_acp_restore(&storage, &stored, &plan);
+                let reference = pending_restore(
+                    &storage,
+                    &stored,
+                    &plan,
+                    SAVED_PLAN_CONTENT.as_bytes(),
+                    RESTORE_CHANGED.as_bytes(),
+                );
                 std::fs::write(&plan, RESTORE_CHANGED).unwrap();
                 reference
             });
@@ -8226,7 +8191,13 @@ mod tests {
             saved.replace_messages(vec![Message::user(SAVED_PLAN_CONTENT.into())]);
             saved.save(&storage).unwrap();
             let path = directory.path().join(SAVED_PLAN_FILE);
-            let reference = pending_acp_restore(&storage, &saved, &path);
+            let reference = pending_restore(
+                &storage,
+                &saved,
+                &path,
+                SAVED_PLAN_CONTENT.as_bytes(),
+                RESTORE_CHANGED.as_bytes(),
+            );
             saved.push_restore_ref(reference.clone());
             saved.save(&storage).unwrap();
             std::fs::write(

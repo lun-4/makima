@@ -40,10 +40,6 @@ use crate::actor::{
     ActorHistory, ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES,
     MAX_PENDING_PREVIEW_BYTES, PreparedTurn, TurnProvenance, TurnResult, graph_quiescence_barrier,
 };
-use crate::journal::{
-    GraphCheckpoint, GraphMutation, GraphRestartError, GraphStore, MemoryGraphStore,
-    MemoryGraphStoreError,
-};
 use crate::{
     ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelToken,
     ConfigChange, ConfigPatch, ControlWork, EventSender, History, PreparedModel,
@@ -58,26 +54,6 @@ const SMALL_RETAINED_QUOTA: usize = 4;
 const TOOL_WRITE_BYTES: &[u8] = b"write completed after shutdown cut";
 #[cfg(unix)]
 const TOOL_WRITE_MODEL: &str = "shutdown-tool-recording";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestAgentRecord {
-    id: crate::AgentId,
-    parent: Option<crate::AgentId>,
-    label: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TestStateRecord {
-    agent: crate::AgentId,
-    turn: crate::TurnId,
-}
-
-type TestGraphStore = MemoryGraphStore<TestAgentRecord, TestStateRecord>;
-
-fn restart_manager(store: &TestGraphStore) -> AgentManagerHandle {
-    store.restart().unwrap();
-    AgentManagerHandle::restore_empty_graph(AgentLimits::default(), store).unwrap()
-}
 
 #[cfg(unix)]
 #[test_case(false; "shutdown_waits_for_postcapture")]
@@ -95,7 +71,11 @@ fn shutdown_drains_actual_write_before_incarnation_cleanup(timeout: bool) {
             .create_root(
                 Vec::new(),
                 None,
-                Box::new(ReportingCancellableBackend { current: entered }),
+                Box::new(CancellableBackend {
+                    entered: move |context: &TurnContext| {
+                        entered.send(context.managed_turn.clone().unwrap()).unwrap();
+                    },
+                }),
             )
             .unwrap();
         let actor = root.actor().unwrap();
@@ -202,173 +182,6 @@ fn weak_manager_observer_does_not_retain_manager_or_journal() {
     assert!(observer.upgrade().is_none());
     assert!(journal_weak.upgrade().is_none());
     assert!(receiver.is_disconnected());
-}
-
-#[test]
-fn restart_manager_round_trips_an_empty_graph() {
-    let store = TestGraphStore::default();
-    let manager = restart_manager(&store);
-    let generation = manager.generation();
-    assert!(manager.snapshot().is_empty());
-    drop(manager);
-
-    let manager = restart_manager(&store);
-    assert!(manager.snapshot().is_empty());
-    assert!(matches!(manager.root(), Err(ManagerError::MissingRoot)));
-    assert_ne!(manager.generation(), generation);
-    assert_eq!(manager.limits(), AgentLimits::default());
-
-    smol::block_on(async {
-        let (entered, current) = flume::unbounded();
-        let gate = Gate::new();
-        let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                TestBackend::reporting(entered, Some(gate.clone())),
-            )
-            .unwrap();
-        let ticket = root
-            .actor()
-            .unwrap()
-            .admit_turn(input(), None, String::new())
-            .unwrap();
-        let context = current.recv_async().await.unwrap();
-        assert_eq!(context.agent_id(), root.id());
-        gate.release(1);
-        let result = ticket.wait_result().await;
-        assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
-        assert!(
-            manager
-                .shutdown(COMPLETION_TIMEOUT)
-                .await
-                .timed_out
-                .is_empty()
-        );
-    });
-}
-
-#[test_case(false; "successful_publication")]
-#[test_case(true; "retry_failed_publication")]
-fn graph_store_restarts_at_the_published_immutable_prefix(fail_first: bool) {
-    let store = TestGraphStore::default();
-    let root = TestAgentRecord {
-        id: crate::AgentId::generate(),
-        parent: None,
-        label: "root".into(),
-    };
-    let admitted = TestStateRecord {
-        agent: root.id,
-        turn: crate::TurnId::generate(),
-    };
-    let first_revision = store.put_agent(root.clone()).unwrap();
-    let published_revision = store.append_state(admitted.clone()).unwrap();
-    assert!(published_revision > first_revision);
-    let checkpoint = store.snapshot().unwrap();
-    let child = TestAgentRecord {
-        id: crate::AgentId::generate(),
-        parent: Some(root.id),
-        label: "unpublished child".into(),
-    };
-    store.put_agent(child).unwrap();
-    assert_eq!(checkpoint.revision(), published_revision);
-    assert!(store.load().unwrap().records().is_empty());
-    if fail_first {
-        store.fail_next_publication().unwrap();
-        assert_eq!(
-            store.publish(&checkpoint),
-            Err(MemoryGraphStoreError::PublicationFailed)
-        );
-        assert!(store.load().unwrap().records().is_empty());
-    }
-    store.publish(&checkpoint).unwrap();
-    assert_eq!(store.load().unwrap().records(), checkpoint.records());
-    assert!(store.snapshot().unwrap().revision() > checkpoint.revision());
-
-    store.restart().unwrap();
-    assert_eq!(
-        store.load().unwrap().records(),
-        &[GraphMutation::Agent(root), GraphMutation::State(admitted)]
-    );
-    assert_eq!(store.snapshot().unwrap().revision(), published_revision);
-    assert_eq!(
-        store.publish(&checkpoint),
-        Err(MemoryGraphStoreError::StaleCheckpoint)
-    );
-    assert!(matches!(
-        AgentManagerHandle::restore_empty_graph(AgentLimits::default(), &store),
-        Err(GraphRestartError::NonemptyGraph)
-    ));
-}
-
-#[test]
-fn graph_store_publication_is_idempotent_and_cannot_regress() {
-    let store = TestGraphStore::default();
-    let agent = TestAgentRecord {
-        id: crate::AgentId::generate(),
-        parent: None,
-        label: "before".into(),
-    };
-    store.put_agent(agent.clone()).unwrap();
-    let older = store.snapshot().unwrap();
-    let mut updated = agent;
-    updated.label = "after".into();
-    store.put_agent(updated.clone()).unwrap();
-    let latest = store.snapshot().unwrap();
-    store.publish(&latest).unwrap();
-    store.publish(&older).unwrap();
-    store.publish(&latest).unwrap();
-    store.restart().unwrap();
-    assert_eq!(store.load().unwrap().records(), latest.records());
-    assert_eq!(
-        store.load().unwrap().records().last(),
-        Some(&GraphMutation::Agent(updated))
-    );
-}
-
-#[test]
-fn graph_store_rejects_a_forged_prefix_without_mutation() {
-    let store = TestGraphStore::default();
-    let checkpoint = store.snapshot().unwrap();
-    let forged = GraphCheckpoint::new(
-        checkpoint.epoch(),
-        vec![GraphMutation::State(TestStateRecord {
-            agent: crate::AgentId::generate(),
-            turn: crate::TurnId::generate(),
-        })],
-    );
-    assert_eq!(
-        store.publish(&forged),
-        Err(MemoryGraphStoreError::InvalidCheckpoint)
-    );
-    assert!(store.load().unwrap().records().is_empty());
-}
-
-#[test]
-fn restart_manager_discards_unpublished_graph_mutations() {
-    let store = TestGraphStore::default();
-    let manager = restart_manager(&store);
-    store
-        .put_agent(TestAgentRecord {
-            id: crate::AgentId::generate(),
-            parent: None,
-            label: "lost on crash".into(),
-        })
-        .unwrap();
-    let unpublished = store.snapshot().unwrap();
-    store.fail_next_publication().unwrap();
-    assert_eq!(
-        store.publish(&unpublished),
-        Err(MemoryGraphStoreError::PublicationFailed)
-    );
-    drop(manager);
-    let manager = restart_manager(&store);
-    assert!(manager.snapshot().is_empty());
-    assert!(store.snapshot().unwrap().records().is_empty());
-    assert_eq!(
-        store.publish(&unpublished),
-        Err(MemoryGraphStoreError::StaleCheckpoint)
-    );
 }
 
 #[test]
@@ -1041,8 +854,9 @@ fn graph_events_tag_every_actor_and_end_with_the_graph() {
     });
 }
 
-#[test]
-fn idle_guard_reports_closed_actor_as_non_live() {
+#[test_case(false; "direct_actor_close")]
+#[test_case(true; "manager_close")]
+fn idle_guard_reports_closed_actor_as_non_live(managed: bool) {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (start_tx, start_rx) = flume::bounded(1);
@@ -1058,7 +872,11 @@ fn idle_guard_reports_closed_actor_as_non_live() {
         let actor = root.actor().unwrap();
         let guard = manager.prepare_idle_subtree(root.id()).unwrap();
         let approved = actor.admit_turn(input(), None, "approved".into()).unwrap();
-        actor.close();
+        if managed {
+            manager.close_subtree(root.id()).unwrap();
+        } else {
+            actor.close();
+        }
         assert!(matches!(
             guard.allow_turn(&approved),
             Err(ActorError::Closed)
@@ -1395,13 +1213,9 @@ fn spawn_close_cycles_reclaim_tasks_and_retain_terminal_nodes() {
         root.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Dormant
     );
-    assert!(
-        manager
-            .lock_graph()
-            .nodes
-            .values()
-            .all(|node| node.task.is_none())
-    );
+    for node in manager.snapshot() {
+        assert!(manager.runner_finished(node.agent_id).unwrap());
+    }
 }
 
 #[test_case(false; "correlation")]
@@ -1514,7 +1328,29 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
         child_actor.snapshot().lifecycle,
         crate::ActorLifecycle::Closed
     );
+    assert_eq!(root.snapshot().unwrap().children, vec![child.id()]);
+    drop(independent_operation);
     root_gate.release(1);
+    smol::block_on(ticket.wait());
+    let later = root_actor
+        .admit_turn(input(), None, "later".into())
+        .unwrap();
+    let later_current = current_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let later_child = manager
+        .spawn_child(
+            &later_current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    assert_eq!(later_child.snapshot().unwrap().parent_id, Some(root.id()));
+    root_gate.release(1);
+    assert!(matches!(
+        smol::block_on(later.wait()),
+        TurnOutcome::Completed { .. }
+    ));
     assert!(
         smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
             .timed_out
@@ -1593,8 +1429,12 @@ fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
         .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
-            Ok::<Box<dyn ActorBackend>, String>(Box::new(ReportingCancellableBackend {
-                current: entered_tx,
+            Ok::<Box<dyn ActorBackend>, String>(Box::new(CancellableBackend {
+                entered: move |context: &TurnContext| {
+                    entered_tx
+                        .send(context.managed_turn.clone().unwrap())
+                        .unwrap();
+                },
             }))
         })
         .unwrap();
@@ -1635,8 +1475,12 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submis
     let (entered_tx, entered_rx) = flume::unbounded();
     let root = manager
         .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
-            Ok::<Box<dyn ActorBackend>, String>(Box::new(ReportingCancellableBackend {
-                current: entered_tx,
+            Ok::<Box<dyn ActorBackend>, String>(Box::new(CancellableBackend {
+                entered: move |context: &TurnContext| {
+                    entered_tx
+                        .send(context.managed_turn.clone().unwrap())
+                        .unwrap();
+                },
             }))
         })
         .unwrap();
@@ -2107,15 +1951,11 @@ impl TestBackend {
     }
 }
 
-struct CancellableBackend {
-    entered: flume::Sender<()>,
+struct CancellableBackend<F> {
+    entered: F,
 }
 
-struct ReportingCancellableBackend {
-    current: flume::Sender<crate::CurrentManagedTurn>,
-}
-
-impl ActorBackend for ReportingCancellableBackend {
+impl<F: FnMut(&TurnContext) + Send> ActorBackend for CancellableBackend<F> {
     fn run_turn<'a>(
         &'a mut self,
         _: ActorHistory<'a>,
@@ -2124,49 +1964,7 @@ impl ActorBackend for ReportingCancellableBackend {
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
-            self.current
-                .send(context.managed_turn.clone().unwrap())
-                .unwrap();
-            let reason = context.cancel_reason.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                context.agent_id,
-                context.turn_id.unwrap(),
-                TokenUsage::default(),
-                0,
-                reason,
-            ))
-        })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
-impl ActorBackend for CancellableBackend {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        context: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            self.entered.send(()).unwrap();
+            (self.entered)(&context);
             let reason = context.cancel_reason.cancelled().await;
             BackendResult::EnteredRun(TurnOutcome::cancelled(
                 context.agent_id,
@@ -3562,7 +3360,7 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
         start.send(()).unwrap();
     }
     let snapshot = manager.journal().snapshot();
-    assert_eq!(snapshot.agent_revisions.len(), 1);
+    assert_eq!(snapshot.agent_revisions.iter().len(), 1);
     let created = snapshot
         .agent_revisions
         .iter()
@@ -3570,7 +3368,7 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
         .unwrap()
         .1
         .created_seq;
-    assert_eq!(snapshot.state.len(), 1);
+    assert_eq!(snapshot.state.iter().len(), 1);
     assert!(
         matches!(&snapshot.state.iter().next().unwrap().change, StateChange::Config(saved) if saved.model == MODEL)
     );
@@ -3607,7 +3405,7 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
         .unwrap();
     let reopened = journal.snapshot();
     assert_eq!(reopened.state, snapshot.state);
-    assert_eq!(reopened.agent_revisions.len(), 2);
+    assert_eq!(reopened.agent_revisions.iter().len(), 2);
     assert_eq!(journal.agent(id).unwrap().created_seq, created);
     assert!(reopened.seq > snapshot.seq);
     reopened.apply_to(&mut session).unwrap();
@@ -4144,10 +3942,20 @@ fn failed_root_factory_leaves_no_durable_agent_or_history() {
     assert!(matches!(manager.create_root_with_id_and_config(
         id, None, Vec::new(), None, |_| Err::<Box<dyn ActorBackend>, _>(FAILURE),
     ), Err(ManagerError::Factory(message)) if message == FAILURE));
-    assert!(manager.journal().snapshot().agent_revisions.is_empty());
+    assert!(
+        manager
+            .journal()
+            .snapshot()
+            .agent_revisions
+            .iter()
+            .next()
+            .is_none()
+    );
     assert!(manager.journal().snapshot().histories.is_empty());
     manager
-        .create_root_with_id(id, Vec::new(), None, TestBackend::boxed())
+        .create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
+            Ok::<_, String>(TestBackend::boxed())
+        })
         .unwrap();
     smol::block_on(manager.shutdown(Duration::from_secs(1)));
 }
@@ -4173,11 +3981,13 @@ fn unresolved_root_config_fails_without_publishing_agent_or_history() {
     assert_eq!(factory_called.load(Ordering::SeqCst), 0);
     assert!(manager.snapshot().is_empty());
     let journal = manager.journal().snapshot();
-    assert!(journal.agent_revisions.is_empty());
+    assert!(journal.agent_revisions.iter().next().is_none());
     assert!(journal.histories.is_empty());
-    assert!(journal.state.is_empty());
+    assert!(journal.state.iter().next().is_none());
     manager
-        .create_root_with_id(id, Vec::new(), None, TestBackend::boxed())
+        .create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
+            Ok::<_, String>(TestBackend::boxed())
+        })
         .unwrap();
     smol::block_on(manager.shutdown(Duration::from_secs(1)));
 }
@@ -4871,7 +4681,9 @@ fn managed_child_cancelled_while_waiting_for_permit_never_enters_backend() {
                 Vec::new(),
                 None,
                 Box::new(CancellableBackend {
-                    entered: backend_entered_tx,
+                    entered: move |_: &TurnContext| {
+                        backend_entered_tx.send(()).unwrap();
+                    },
                 }),
             )
             .unwrap();
@@ -4928,7 +4740,11 @@ fn cancel_agent_is_reusable_and_isolates_siblings() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                Box::new(CancellableBackend { entered: first_tx }),
+                Box::new(CancellableBackend {
+                    entered: move |_: &TurnContext| {
+                        first_tx.send(()).unwrap();
+                    },
+                }),
             )
             .unwrap();
         let (second_tx, second_rx) = flume::bounded(1);
@@ -4938,7 +4754,11 @@ fn cancel_agent_is_reusable_and_isolates_siblings() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                Box::new(CancellableBackend { entered: second_tx }),
+                Box::new(CancellableBackend {
+                    entered: move |_: &TurnContext| {
+                        second_tx.send(()).unwrap();
+                    },
+                }),
             )
             .unwrap();
         let first_ticket = first
@@ -5093,80 +4913,6 @@ fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
     root_gate.release(1);
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
     assert!(report.timed_out.is_empty());
-}
-
-#[test]
-fn correlation_cancel_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
-    smol::block_on(async {
-        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-        let (current_tx, current_rx) = flume::unbounded();
-        let root_gate = Gate::new();
-        let root = manager
-            .create_root_with_config(
-                Some(config("anthropic/claude-sonnet-4-20250514", false)),
-                Vec::new(),
-                None,
-                |_| {
-                    Ok::<_, String>(TestBackend::reporting(
-                        current_tx,
-                        Some(Arc::clone(&root_gate)),
-                    ))
-                },
-            )
-            .unwrap();
-        let root_actor = root.actor().unwrap();
-        let first = root_actor
-            .admit_turn(input(), None, "first".into())
-            .unwrap();
-        let first_current = current_rx.recv_async().await.unwrap();
-        let (cut_tx, cut_rx) = flume::bounded(1);
-        let (release_tx, release_rx) = flume::bounded(1);
-        manager.set_descendant_cut_gate(cut_tx, release_rx);
-        let cutting = manager.clone();
-        let root_id = root.id();
-        let turn_id = first_current.turn_id();
-        let cut = std::thread::spawn(move || {
-            cutting.cancel_correlation(root_id, "first", crate::TurnCancellationReason::User)
-        });
-
-        cut_rx.recv().unwrap();
-        assert!(matches!(
-            manager.spawn_child(
-                &first_current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            ),
-            Err(ManagerError::InactiveTurn { agent_id, turn_id: rejected })
-                if agent_id == root.id() && rejected == turn_id
-        ));
-        release_tx.send(()).unwrap();
-        cut.join().unwrap().unwrap();
-        assert!(root.snapshot().unwrap().children.is_empty());
-
-        root_gate.release(1);
-        first.wait().await;
-        let later = root_actor
-            .admit_turn(input(), None, "later".into())
-            .unwrap();
-        let later_current = current_rx.recv_async().await.unwrap();
-        let child = manager
-            .spawn_child(
-                &later_current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            )
-            .unwrap();
-        assert_eq!(child.snapshot().unwrap().parent_id, Some(root.id()));
-        root_gate.release(1);
-        assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
-
-        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
-        assert!(report.timed_out.is_empty());
-    });
 }
 
 #[test]
@@ -6017,8 +5763,12 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
                 Vec::new(),
                 None,
                 |_| {
-                    Ok::<_, String>(Box::new(ReportingCancellableBackend {
-                        current: current_tx,
+                    Ok::<_, String>(Box::new(CancellableBackend {
+                        entered: move |context: &TurnContext| {
+                            current_tx
+                                .send(context.managed_turn.clone().unwrap())
+                                .unwrap();
+                        },
                     }) as Box<dyn ActorBackend>)
                 },
             )

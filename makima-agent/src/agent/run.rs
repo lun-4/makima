@@ -1333,7 +1333,7 @@ mod tests {
         ProviderEvent, RequestDelivery, RequestOptions, RetryKind, Role, StopReason,
         StreamResponse, TokenUsage,
     };
-    use makima_storage::session_state::{StoredAgentLifecycle, StoredAgentRecord};
+    use makima_storage::test_util::test_record;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -2659,22 +2659,7 @@ mod tests {
                 let journal = Arc::new(SessionJournal::default());
                 journal
                     .commit(JournalCommit {
-                        agents: vec![StoredAgentRecord {
-                            id: params.agent_id,
-                            parent: None,
-                            depth: 0,
-                            transcript_key: String::new(),
-                            lifecycle: StoredAgentLifecycle::Open,
-                            ancestry_unknown: false,
-                            label: None,
-                            spawned_by_tool_use_id: None,
-                            spec: None,
-                            restorable: Ok(()),
-                            usage: Default::default(),
-                            created_seq: 0,
-                            updated_seq: 0,
-                            legacy: false,
-                        }],
+                        agents: vec![test_record(params.agent_id, None)],
                         histories: [(params.agent_id, history.snapshot().clone())].into(),
                         ..Default::default()
                     })

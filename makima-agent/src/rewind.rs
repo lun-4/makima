@@ -1,19 +1,18 @@
 use crate::{
     AgentId, HistorySnapshot,
-    journal::{JournalError, SessionJournalSnapshot},
+    journal::{JournalError, JournalRecords, SessionJournalSnapshot},
 };
 use makima_providers::Message;
 use makima_storage::{
     id::MakimaId,
     session_state::{
-        SessionStateView, StateChange, StoredAgentRecord, StoredDeliveryOp, StoredStateRecord,
+        BOUNDARY_POOL_FORMAT, SessionStateView, StateChange, StoredAgentRecord, StoredDeliveryOp,
+        StoredStateRecord,
     },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-
-const BOUNDARY_POOL_FORMAT: &str = "boundary-pool-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewindBoundary {
@@ -280,7 +279,7 @@ fn prune_boundary_pins(candidate: &mut SessionJournalSnapshot) -> Result<(), Rew
     }
     for (seq, record) in changes {
         if let Some(record) = record {
-            candidate.state.insert(seq, record);
+            candidate.state.push(record);
         } else {
             candidate.state.remove(seq);
         }
@@ -449,8 +448,10 @@ fn pinned_snapshot(
         )));
     }
     let mut snapshot = current.clone();
-    snapshot.state = pin.state.into();
-    snapshot.agent_revisions = pin.agents.into();
+    snapshot.state =
+        JournalRecords::try_from_ordered(pin.state, "state").map_err(JournalError::from)?;
+    snapshot.agent_revisions =
+        JournalRecords::try_from_ordered(pin.agents, "agent").map_err(JournalError::from)?;
     snapshot.histories = pin
         .histories
         .into_iter()
@@ -543,24 +544,26 @@ pub(crate) fn prepare_boundary(
         candidate.state.retain(|record| {
             !session_scope && record.agent.is_none_or(|id| !affected.contains(&id))
         });
-        for record in source.state.iter().filter(|record| {
-            record.seq <= boundary.seq
-                && (session_scope || record.agent.is_some_and(|id| affected.contains(&id)))
-        }) {
-            candidate.state.insert(record.seq, record.clone());
-        }
+        candidate.state.extend(
+            source
+                .state
+                .iter()
+                .filter(|record| {
+                    record.seq <= boundary.seq
+                        && (session_scope || record.agent.is_some_and(|id| affected.contains(&id)))
+                })
+                .cloned(),
+        );
         candidate
             .agent_revisions
             .retain(|(_, record)| !session_scope && !affected.contains(&record.id));
-        for (seq, record) in source
-            .agent_revisions
-            .iter()
-            .filter(|(seq, record)| *seq <= boundary.seq && affected.contains(&record.id))
-        {
-            candidate
+        candidate.agent_revisions.extend(
+            source
                 .agent_revisions
-                .insert(*seq, (*seq, record.clone()));
-        }
+                .iter()
+                .filter(|(seq, record)| *seq <= boundary.seq && affected.contains(&record.id))
+                .cloned(),
+        );
     } else {
         candidate.state.retain(|record| {
             record.seq <= boundary.seq
@@ -653,7 +656,7 @@ pub(crate) fn rebase_history_epoch(
         {
             *previous = epoch;
         }
-        candidate.state.insert(record.seq, record);
+        candidate.state.push(record);
     }
 }
 
@@ -801,15 +804,12 @@ pub(crate) fn push(
         .seq
         .checked_add(1)
         .ok_or(JournalError::SequenceExhausted)?;
-    candidate.state.insert(
-        candidate.seq,
-        StoredStateRecord {
-            seq: candidate.seq,
-            agent,
-            generation,
-            change,
-        },
-    );
+    candidate.state.push(StoredStateRecord {
+        seq: candidate.seq,
+        agent,
+        generation,
+        change,
+    });
     Ok(())
 }
 
@@ -821,14 +821,14 @@ mod tests {
         actor::ActorHistory,
         agent::History,
         journal::{
-            JournalChange, JournalCommit, JournalError, SessionJournal, SessionJournalSnapshot,
+            JournalChange, JournalCommit, JournalError, JournalRecords, SessionJournal,
+            SessionJournalSnapshot,
         },
         state::{StateChangeReason, StateError, StateScope, StateSlotSpec},
     };
     use makima_providers::{ContentBlock, Message, Role};
-    use makima_storage::session_state::{
-        StateChange, StateFoldError, StoredAgentLifecycle, StoredAgentRecord,
-    };
+    use makima_storage::session_state::{StateChange, StateFoldError, StoredAgentLifecycle};
+    use makima_storage::test_util::test_record;
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1135,7 +1135,7 @@ mod tests {
     ) -> Result<BTreeSet<u64>, RewindError> {
         let mut state = snapshot.state.to_vec();
         let pinned = super::recover_boundary_pins(&mut state)?;
-        snapshot.state = state.into();
+        snapshot.state = JournalRecords::try_from_ordered(state, "state").unwrap();
         Ok(pinned)
     }
 
@@ -1166,7 +1166,7 @@ mod tests {
                 assert!(serde_json::from_value::<super::BoundaryPin>(snapshot.clone()).is_err());
             }
         }
-        candidate.state = state.into();
+        candidate.state = JournalRecords::try_from_ordered(state, "state").unwrap();
         assert!(matches!(
             super::pinned_snapshot(&candidate, seq),
             Err(RewindError::InvalidPin(_))
@@ -1217,7 +1217,7 @@ mod tests {
                 *snapshot = serde_json::to_value(pin).unwrap();
             }
         }
-        candidate.state = state.into();
+        candidate.state = JournalRecords::try_from_ordered(state, "state").unwrap();
         assert!(matches!(
             super::pinned_snapshot(&candidate, seq),
             Err(RewindError::InvalidPin(_))
@@ -1226,25 +1226,6 @@ mod tests {
             recover_snapshot_pins(&mut candidate),
             Err(RewindError::InvalidPin(_))
         ));
-    }
-
-    fn agent(id: AgentId, parent: Option<AgentId>) -> StoredAgentRecord {
-        StoredAgentRecord {
-            id,
-            parent,
-            depth: u32::from(parent.is_some()),
-            transcript_key: parent.map_or_else(String::new, |_| id.to_string()),
-            lifecycle: StoredAgentLifecycle::Open,
-            ancestry_unknown: false,
-            label: None,
-            spawned_by_tool_use_id: None,
-            spec: None,
-            restorable: Ok(()),
-            usage: Default::default(),
-            created_seq: 0,
-            updated_seq: 0,
-            legacy: false,
-        }
     }
 
     fn plugin(agent: Option<AgentId>, value: &str) -> JournalChange {
@@ -1273,9 +1254,9 @@ mod tests {
         journal
             .commit(JournalCommit {
                 agents: vec![
-                    agent(root, None),
-                    agent(child, Some(root)),
-                    agent(sibling, Some(root)),
+                    test_record(root, None),
+                    test_record(child, Some(root)),
+                    test_record(sibling, Some(root)),
                 ],
                 histories: [root, child, sibling]
                     .into_iter()
@@ -1333,9 +1314,15 @@ mod tests {
             let (journal, root, child, sibling, mut boundary) = fixture();
             if root_scope {
                 let mut state = journal.lock();
-                let mut record = state.snapshot.state.get(boundary.seq).unwrap().clone();
+                let mut record = state
+                    .snapshot
+                    .state
+                    .iter()
+                    .find(|record| record.seq == boundary.seq)
+                    .unwrap()
+                    .clone();
                 record.agent = Some(root);
-                state.snapshot.state.insert(record.seq, record);
+                state.snapshot.state.push(record);
                 boundary.agent = root;
             }
             let before = journal.snapshot();
@@ -1361,7 +1348,10 @@ mod tests {
             );
             if !root_scope {
                 for record in outside {
-                    assert!(candidate.state.get(record.seq) == Some(&record));
+                    assert!(
+                        candidate.state.iter().find(|saved| saved.seq == record.seq)
+                            == Some(&record)
+                    );
                 }
             }
             replacement.install().unwrap();
@@ -1953,9 +1943,7 @@ mod tests {
             let root_seq = journal.snapshot().seq;
             let mut history = History::restored_exact(snapshot.histories[&child].clone())
                 .with_journal(child, Arc::clone(&journal));
-            ActorHistory::new(&mut history)
-                .replace(vec![Message::observation(AFTER.into())])
-                .await;
+            history.replace(vec![Message::observation(AFTER.into())]);
             ActorHistory::new(&mut history)
                 .push(Message::user(CONTINUATION.into()))
                 .await

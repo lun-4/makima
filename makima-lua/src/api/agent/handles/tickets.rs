@@ -210,10 +210,8 @@ mod tests {
     };
     use makima_storage::{
         id::{MakimaId, SessionRef},
-        session_state::{
-            MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentLifecycle, StoredAgentRecord,
-            StoredPayload,
-        },
+        session_state::{MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredPayload},
+        test_util::test_record,
     };
     use mlua::Lua;
     use serde_json::json;
@@ -321,22 +319,7 @@ mod tests {
         journal.bind_session(session).unwrap();
         journal
             .commit(JournalCommit {
-                agents: vec![StoredAgentRecord {
-                    id: agent,
-                    parent: None,
-                    depth: 0,
-                    transcript_key: String::new(),
-                    lifecycle: StoredAgentLifecycle::Open,
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
-                    created_seq: 0,
-                    updated_seq: 0,
-                    legacy: false,
-                }],
+                agents: vec![test_record(agent, None)],
                 changes: vec![JournalChange {
                     agent: Some(agent),
                     generation: 0,

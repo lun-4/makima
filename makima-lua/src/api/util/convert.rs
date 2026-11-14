@@ -656,32 +656,24 @@ mod tests {
         let original: JsonValue = serde_json::from_str(ROUNDTRIP_CASES[idx]).unwrap();
         let lua = Lua::new();
         let lua_val = json_to_lua(&lua, &original).unwrap();
+        if original.is_null() {
+            assert_eq!(lua_val, Value::Nil);
+        }
         let back = lua_to_json(&lua, &lua_val).unwrap();
         assert_eq!(back, original);
-    }
-    const STATE_CASES: &[&str] = &[
-        "null",
-        "true",
-        "42",
-        "3.14",
-        r#""hello""#,
-        "[]",
-        "[null,1,null]",
-        "{}",
-        r#"{"a":null,"b":[true,"x"]}"#,
-    ];
 
-    #[test_case(0 ; "null")]
-    #[test_case(1 ; "bool")]
-    #[test_case(2 ; "integer")]
-    #[test_case(3 ; "float")]
-    #[test_case(4 ; "string")]
-    #[test_case(5 ; "empty_array")]
-    #[test_case(6 ; "array_with_nulls")]
-    #[test_case(7 ; "empty_object")]
-    #[test_case(8 ; "nested_object_with_nulls")]
-    fn state_value_roundtrip(idx: usize) {
-        let original: JsonValue = serde_json::from_str(STATE_CASES[idx]).unwrap();
+        let lua_value = state_value_to_lua(&lua, &original).unwrap();
+        if original.is_null() {
+            assert_eq!(lua_value, Value::NULL);
+        }
+        let back = state_value_from_lua(&lua, &lua_value).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test_case("[null,1,null]" ; "array_with_nulls")]
+    #[test_case(r#"{"a":null,"b":[true,"x"]}"# ; "nested_object_with_nulls")]
+    fn state_value_roundtrip_with_nulls(encoded: &str) {
+        let original: JsonValue = serde_json::from_str(encoded).unwrap();
         let lua = Lua::new();
         let lua_value = state_value_to_lua(&lua, &original).unwrap();
         let back = state_value_from_lua(&lua, &lua_value).unwrap();

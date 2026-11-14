@@ -1,9 +1,5 @@
 use imbl::OrdMap;
 use makima_storage::session_state::{StateFoldError, StoredAgentRecord, StoredStateRecord};
-use serde::{
-    Serialize, Serializer,
-    ser::{Error as _, SerializeSeq},
-};
 use std::{ops::Bound, sync::Arc};
 
 pub trait JournalRecord: Clone {
@@ -26,7 +22,6 @@ impl JournalRecord for (u64, StoredAgentRecord) {
 pub struct JournalRecords<T: Clone> {
     records: OrdMap<u64, Arc<T>>,
     identity: Arc<()>,
-    invalid_sequence: Option<StateFoldError>,
 }
 
 impl<T: Clone> Default for JournalRecords<T> {
@@ -34,7 +29,6 @@ impl<T: Clone> Default for JournalRecords<T> {
         Self {
             records: OrdMap::new(),
             identity: Arc::new(()),
-            invalid_sequence: None,
         }
     }
 }
@@ -63,16 +57,9 @@ impl<T: JournalRecord> JournalRecords<T> {
         Ok(result)
     }
 
-    pub fn insert(&mut self, seq: u64, record: T) {
-        self.identity = Arc::new(());
-        if seq != record.sequence() && self.invalid_sequence.is_none() {
-            self.invalid_sequence = Some(StateFoldError::DuplicateSequence { seq });
-        }
-        self.records.insert(seq, Arc::new(record));
-    }
-
     pub fn push(&mut self, record: T) {
-        self.insert(record.sequence(), record);
+        self.identity = Arc::new(());
+        self.records.insert(record.sequence(), Arc::new(record));
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
@@ -91,15 +78,6 @@ impl<T: JournalRecord> JournalRecords<T> {
 }
 
 impl<T: Clone> JournalRecords<T> {
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-    pub fn get(&self, seq: u64) -> Option<&T> {
-        self.records.get(&seq).map(Arc::as_ref)
-    }
     pub fn remove(&mut self, seq: u64) {
         self.identity = Arc::new(());
         self.records.remove(&seq);
@@ -115,40 +93,8 @@ impl<T: Clone> JournalRecords<T> {
     pub fn to_vec(&self) -> Vec<T> {
         self.iter().cloned().collect()
     }
-    pub fn validate(&self) -> Result<(), StateFoldError> {
-        self.invalid_sequence.clone().map_or(Ok(()), Err)
-    }
     pub(super) fn same_root(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.identity, &other.identity)
-    }
-}
-
-impl<T: JournalRecord> FromIterator<T> for JournalRecords<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(records: I) -> Self {
-        let mut result = Self::default();
-        let mut previous = None;
-        for record in records {
-            let seq = record.sequence();
-            if let Some(previous) = previous
-                && seq <= previous
-                && result.invalid_sequence.is_none()
-            {
-                result.invalid_sequence = Some(StateFoldError::UnorderedSequence {
-                    stream: "journal",
-                    previous,
-                    seq,
-                });
-            }
-            previous = Some(seq);
-            result.records.insert(seq, Arc::new(record));
-        }
-        result
-    }
-}
-
-impl<T: JournalRecord> From<Vec<T>> for JournalRecords<T> {
-    fn from(records: Vec<T>) -> Self {
-        records.into_iter().collect()
     }
 }
 
@@ -162,19 +108,7 @@ impl<T: JournalRecord> Extend<T> for JournalRecords<T> {
 
 impl<T: Clone + PartialEq> PartialEq for JournalRecords<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.same_root(other)
-            || (self.invalid_sequence == other.invalid_sequence && self.records == other.records)
-    }
-}
-
-impl<T: Clone + Serialize> Serialize for JournalRecords<T> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.validate().map_err(S::Error::custom)?;
-        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
-        for record in self.iter() {
-            sequence.serialize_element(record)?;
-        }
-        sequence.end()
+        self.same_root(other) || self.records == other.records
     }
 }
 
@@ -199,29 +133,25 @@ mod tests {
 
     #[test_case(vec![1, 1]; "duplicate")]
     #[test_case(vec![2, 1]; "out_of_order")]
-    fn raw_order_errors_survive_infallible_conversion(sequences: Vec<u64>) {
+    fn raw_order_errors_are_rejected(sequences: Vec<u64>) {
         let records: Vec<_> = sequences.into_iter().map(record).collect();
         assert!(matches!(
-            JournalRecords::try_from_ordered(records.clone(), "state"),
+            JournalRecords::try_from_ordered(records, "state"),
             Err(StateFoldError::UnorderedSequence { .. })
         ));
-        let converted: JournalRecords<_> = records.into();
-        assert!(matches!(
-            converted.validate(),
-            Err(StateFoldError::UnorderedSequence { .. })
-        ));
-        assert!(serde_json::to_value(&converted).is_err());
     }
 
     #[test]
-    fn cloned_records_share_payloads_and_serialize_as_ordered_arrays() {
+    fn keyed_updates_share_old_payloads_and_preserve_order() {
         let original = JournalRecords::try_from_ordered([record(1), record(3)], "state").unwrap();
         let mut updated = original.clone();
-        updated.insert(2, record(2));
-        assert_eq!(original.len(), 2);
+        updated.push(record(2));
+        updated.push(record(2));
+        assert_eq!(updated.iter().len(), 3);
+        assert_eq!(original.iter().len(), 2);
         assert!(std::ptr::eq(
-            original.get(1).unwrap(),
-            updated.get(1).unwrap()
+            original.iter().next().unwrap(),
+            updated.iter().next().unwrap()
         ));
         assert_eq!(
             updated
@@ -231,7 +161,7 @@ mod tests {
             [2, 3]
         );
         assert_eq!(
-            serde_json::to_value(&updated).unwrap(),
+            serde_json::to_value(updated.to_vec()).unwrap(),
             serde_json::to_value([record(1), record(2), record(3)]).unwrap()
         );
     }

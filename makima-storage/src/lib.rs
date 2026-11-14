@@ -15,11 +15,14 @@ pub mod model;
 mod offload_cleanup;
 pub mod paths;
 pub mod plans;
+mod resources;
 pub mod restore;
 pub mod restore_digest;
 pub mod session_lock;
 pub mod session_state;
 pub mod sessions;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
@@ -38,6 +41,7 @@ use tempfile::NamedTempFile;
 
 pub use offload_cleanup::remove_offload_dir_from;
 use paths::state_dir;
+pub use resources::RootResource;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;

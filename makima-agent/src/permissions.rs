@@ -646,15 +646,6 @@ impl PermissionManager {
         self.session().snapshot = snapshot;
     }
 
-    pub fn restore_stored(
-        &self,
-        rules: &[StoredRule],
-        yolo: Option<bool>,
-    ) -> Result<(), ToolKeyParseError> {
-        self.restore(PermissionSnapshot::from_stored(rules, yolo)?);
-        Ok(())
-    }
-
     fn update_session<T>(
         &self,
         update: impl FnOnce(&mut PermissionSnapshot) -> T,
@@ -727,10 +718,6 @@ impl PermissionManager {
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
         self.add_session_rules([rule]);
-    }
-
-    pub fn try_add_session_rule(&self, rule: PermissionRule) -> Result<(), JournalError> {
-        self.update_session(|snapshot| insert_session_rules(snapshot, [rule]))
     }
 
     pub fn try_toggle_yolo(&self) -> Result<bool, JournalError> {
@@ -2034,7 +2021,7 @@ mod tests {
         );
         let committed = journal.snapshot();
         assert_eq!(committed.revision, 1);
-        assert_eq!(committed.state.len(), 1);
+        assert_eq!(committed.state.iter().len(), 1);
         let record = committed.state.iter().next().unwrap();
         assert!(record.agent.is_none());
         match &record.change {
@@ -2109,7 +2096,7 @@ mod tests {
             }
         });
         let snapshot = journal.snapshot();
-        assert_eq!(snapshot.state.len(), WORKERS * 2);
+        assert_eq!(snapshot.state.iter().len(), WORKERS * 2);
         let mut previous_rule_count = 0;
         for record in snapshot.state.iter() {
             let StateChange::Rules { rules, .. } = &record.change else {
@@ -2239,7 +2226,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(manager.try_add_session_rule(allow_rule("cargo *")).is_err());
+            assert!(!manager.add_session_rules([allow_rule("cargo *")]));
             assert!(manager.try_set_yolo(true).is_err());
             assert!(manager.try_toggle_yolo().is_err());
             assert!(
@@ -2253,14 +2240,14 @@ mod tests {
             );
             assert!(manager.snapshot().rules.is_empty());
             assert_eq!(manager.persisted_yolo(), None);
-            assert_eq!(prepared.snapshot().state.len(), 1);
+            assert_eq!(prepared.snapshot().state.iter().len(), 1);
             prepared.install().unwrap();
-            manager.restore_stored(&stored, candidate.yolo).unwrap();
+            manager.restore(PermissionSnapshot::from_stored(&stored, candidate.yolo).unwrap());
             assert_eq!(manager.snapshot().stored_rules(), stored);
             assert_eq!(manager.persisted_yolo(), candidate.yolo);
             drop(prepared);
             manager.set_yolo(true);
-            assert_eq!(journal.snapshot().state.len(), 2);
+            assert_eq!(journal.snapshot().state.iter().len(), 2);
         });
     }
 
@@ -2316,12 +2303,12 @@ mod tests {
             );
             assert!(manager.snapshot().rules.is_empty());
             prepared.install().unwrap();
-            manager.restore_stored(&[], Some(false)).unwrap();
+            manager.restore(PermissionSnapshot::from_stored(&[], Some(false)).unwrap());
             drop(prepared);
             pending.await.unwrap();
             assert_eq!(manager.snapshot().rules.len(), 1);
             assert_eq!(manager.persisted_yolo(), Some(false));
-            assert_eq!(journal.snapshot().state.len(), 2);
+            assert_eq!(journal.snapshot().state.iter().len(), 2);
         });
     }
 
