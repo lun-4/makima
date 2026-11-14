@@ -40,7 +40,7 @@ local function rgb_to_hex(c, a)
 end
 
 -- Style cache: always fetch styles through here and reuse the returned table.
--- The renderer coalesces runs of identical tables, so identity matters.
+-- build_rows merges a run of identical tables, so identity matters.
 local function color(hex)
   local s = style_cache[hex]
   if not s then

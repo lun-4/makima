@@ -15,7 +15,7 @@ Write one for anything you keep explaining: how you cut a release, how you write
 
 A skill is a directory with a `SKILL.md` inside. Makima looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
 
-1. The builtin `makima-plugin-dev` (if enabled)
+1. The builtin skills (`makima-plugin-dev` when enabled, plus the hidden `init`)
 2. `~/.config/makima/skills/` (Windows: `%APPDATA%\makima\skills\`)
 3. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
 4. In your project, walking from the current directory up to the `.git` root, at each step: `.makima/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
@@ -69,9 +69,11 @@ The `skill` tool lists every skill it found that has not opted out, the agent ca
 
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
-## The builtin: makima-plugin-dev
+## Builtin skills
 
-Makima ships one skill, `makima-plugin-dev`. It teaches the agent how to write makima Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
+Makima ships two skills.
+
+`makima-plugin-dev` teaches the agent how to write makima Lua plugins. On load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
 -- ~/.config/makima/init.lua
@@ -81,3 +83,5 @@ makima.setup({
     },
 })
 ```
+
+`init` writes an `AGENTS.md` for the current project. It sends a research subagent to explore the codebase, then writes the file itself from the report. It is hidden from the model's list (`disable-model-invocation`), so it costs no prompt tokens. Summon it yourself by typing `@skill:init` and sending the message.

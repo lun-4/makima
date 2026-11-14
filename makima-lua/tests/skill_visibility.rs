@@ -32,6 +32,9 @@ const HIDDEN_DESCRIPTION: &str = "hidden skill description";
 const VISIBLE_BODY: &str = "visible body marker";
 const HIDDEN_BODY: &str = "hidden body marker";
 const SPELLING_BODY: &str = "spelling body marker";
+const BUILTIN_INIT: &str = "init";
+const INIT_DESCRIPTION: &str = "Initialize a project's AGENTS.md";
+const INIT_BODY: &str = "# Init: generate AGENTS.md";
 const UNKNOWN: &str = "nope";
 const NOT_FOUND: &str = "skill not found: nope";
 const SKILLS_TAG: &str = "<available_skills>";
@@ -168,4 +171,31 @@ fn unknown_skill_error_hides_disabled_skills() {
     assert!(!error.contains(HIDDEN), "got: {error}");
     assert!(!error.contains(SPELLING), "got: {error}");
     assert!(!error.contains(HIDDEN_DESCRIPTION), "got: {error}");
+}
+
+#[test]
+fn builtin_init_skill_is_hidden_but_summonable() {
+    let (handle, guard) = boot();
+    let registry = guard.host().registry();
+
+    let description = skill_description(&registry);
+    assert!(
+        !description.contains(INIT_DESCRIPTION),
+        "got: {description}"
+    );
+
+    let expected = format!("skill:{BUILTIN_INIT}");
+    let items = handle.collect_completion_items(&CompletionCtx::default());
+    assert!(
+        items.iter().any(|item| item.label == expected),
+        "init must stay in completion"
+    );
+
+    let expanded = handle
+        .expand_references("@skill:init")
+        .expect("init must expand");
+    assert_eq!(expanded, "<skill:init>");
+
+    let output = call_skill(&registry, BUILTIN_INIT).expect("init must load");
+    assert!(output.contains(INIT_BODY), "got: {output}");
 }

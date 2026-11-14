@@ -173,6 +173,23 @@ case("builtin_index_line_numbers_match_reference", function()
   assert(checked > 100, "expected the index to cover the reference, checked " .. checked)
 end)
 
+-- ── builtin init skill ──
+
+case("builtin_init_skill_loads", function()
+  local skill = require("init_skill")
+  eq(skill.name, "init")
+  assert(#skill.description > 0, "description should not be empty")
+  eq(skill.disable_model_invocation, true)
+  assert(skill.content:find("# Init: generate AGENTS.md", 1, true), "content should contain the init guide")
+end)
+
+case("builtin_init_skill_is_model_hidden", function()
+  local skill = require("init_skill")
+  local result = build_skill_list({ [skill.name] = skill })
+  assert(result:find("No skills available", 1, true), "hidden builtin should leave the list empty")
+  assert(not result:find("init", 1, true), "hidden builtin should not be listed")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end
