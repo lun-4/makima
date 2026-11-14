@@ -4,8 +4,9 @@
 -- and `headers(extra)`, which carry the credentials. Listings also use
 -- `get_json(ctx, url, extra)`; Google's listing reads `pool.current()`.
 --
--- Route fields: `def` (curated models and the default `base_url`) and
--- `stream(client, model, ctx, request, emit)` for descriptor {model}.
+-- Route fields: `def` (curated models and the default `base_url`),
+-- `stream(client, model, ctx, request, emit)` for descriptor {model}, and an
+-- optional `list_models(ctx, client)`.
 
 local anthropic = require("providers.anthropic_provider")
 local compat = require("providers.openai_compat")
