@@ -14,7 +14,7 @@ use makima_agent::{
 use makima_lua_macro::{lua_class, lua_fn};
 use makima_providers::CompleteModelSelection;
 use makima_storage::checkpoint::CheckpointPublication;
-use mlua::{IntoLuaMulti, Lua, MultiValue, Table, UserDataMethods, UserDataRef, Value as LuaValue};
+use mlua::{IntoLuaMulti, Lua, MultiValue, Table, UserDataRef, Value as LuaValue};
 
 use super::authority::{authorize, destination_template, lookup, observe, retire_closed};
 use super::projection::selection_table;
@@ -26,11 +26,11 @@ use super::subscriptions::{
 use super::tickets::retained_ticket;
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn, session_state};
 use crate::agent_errors::{
-    AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
-    RESTRICTED_MODE_CHANGE, SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
+    AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, RESTRICTED_MODE_CHANGE,
+    SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
-    LuaTaskOwner, SessionProviderPreparer, ensure_agent_resident, session_model_preparer,
+    SessionProviderPreparer, ensure_agent_resident, session_model_preparer,
     validate_required_output_mode,
 };
 use crate::api::env::host_state_dir;
@@ -39,7 +39,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
-use crate::orchestration::{self, plugin_authority};
+use crate::orchestration;
 use crate::runtime::{
     current_managed_turn, current_plugin, register_defer_close, validate_plugin_effect,
 };
@@ -552,21 +552,10 @@ fn agent_latest_turn(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     try_pair!(observe(lua, &ctx, this));
-    let ticket = if let Ok(actor) = this.manager.actor(this.id) {
-        actor.latest_ticket()
-    } else {
-        let snapshot = try_pair!(this.manager.journal().checkpoint_snapshot());
-        let view = try_pair!(snapshot.fold(snapshot.seq));
-        let turn = view
-            .scopes
-            .get(&Some(this.id))
-            .and_then(|scope| scope.results.back())
-            .map(|(turn, _)| *turn);
-        match turn {
-            Some(turn) => Some(try_pair!(retained_ticket(lua, this, turn))),
-            None => None,
-        }
-    };
+    let ticket = try_pair!(
+        this.manager
+            .latest_retained_turn_ticket(&this.manager.reference(this.id))
+    );
     Ok((
         ticket.map(|ticket| LuaAgentTurn {
             agent: this.clone(),
@@ -789,37 +778,6 @@ fn agent_state(
     }
 }
 
-// Bundled task plugin internals, not public API. `_makima_session_id` reads the
-// task/UI identity. `_makima_task_owner` returns a host-stamped guard whose
-// `_makima_can_control` checks plugin generation, host and parent branch, and whose
-// `_makima_retired` reports a closed child. The guard authorizes no effect.
-fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method(
-        "_makima_task_owner",
-        |lua, this, ctx: UserDataRef<LuaCtx>| {
-            authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
-            let (plugin, generation) =
-                current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
-            Ok(LuaTaskOwner {
-                owner_id: session_state(lua, this.id).and_then(|state| state.parent_agent_id),
-                owner: plugin_authority(lua, plugin.clone()),
-                plugin,
-                generation,
-                target: this
-                    .manager
-                    .lookup(this.id)
-                    .map_err(mlua::Error::external)?,
-            })
-        },
-    );
-    methods.add_method("_makima_session_id", |_, this, ()| {
-        Ok(this
-            .transcript_key
-            .clone()
-            .unwrap_or_else(|| this.identity()))
-    });
-}
-
 lua_class! {
     /// A nonowning agent handle. Garbage collection never closes its actor.
     /// Reads and effects require current invocation authority; identity is context-free.
@@ -830,5 +788,4 @@ lua_class! {
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_retire, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]
-    extra agent_internal_methods
 }

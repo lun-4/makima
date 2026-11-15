@@ -7,13 +7,19 @@ use std::{
 
 use common::{CannedProvider, RestartHost, TestSession};
 use makima_agent::{
-    AgentId, McpSession,
+    AgentActorHandle, AgentId, AgentRef, McpSession,
+    manager::{AgentIncarnation, ReactivationError},
     mcp::test_support::stub_session_with_result,
     permissions::{PermissionCheck, PermissionSnapshot},
     session_coordinator::SessionCoordinatorHandle,
+    tools::ToolContext,
 };
+use makima_commands::CommandInvocation;
 use makima_config::ToolKey;
-use makima_lua::test_support::{InMemoryFs, run_command};
+use makima_lua::{
+    orchestration::{OrchestrationServices, TrustedTarget},
+    test_support::{InMemoryFs, run_command},
+};
 use makima_providers::{
     AgentError, ContentBlock, Effort, Invocation, Message, Model, ModelInfo, PreparedProvider,
     ProviderBackend, ProviderEvent, ProviderRegistry, RegisteredProvider, RequestDelivery,
@@ -64,6 +70,7 @@ const TOOL_UNAVAILABLE: &str = "tool_unavailable: restart_echo";
 const MODEL_UNAVAILABLE: &str = "model_unavailable";
 const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const DISCOVERY_ERROR: &str = "model discovery failed";
+const ACTIVATION_INSTALL_ERROR: &str = "reactivation registration failed";
 const REPLACEMENT_HANDLER: &str = "replacement registry handler executed";
 const CUSTOM_MODE: &str = "restart_audit";
 const SAVED_DIRECTIVE: &str = "Saved audit directive, not the current registry definition.";
@@ -1312,8 +1319,51 @@ fn restart_folded_config_and_shared_rules_override_legacy_metadata(yolo: bool) {
     assert_eq!(observed, json!({ "allowed": true, "denied": true }));
 }
 
-#[test]
-fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_request() {
+struct FailedActivation {
+    root: TrustedTarget,
+    cancel: bool,
+}
+
+impl OrchestrationServices for FailedActivation {
+    fn resolve_target(
+        &self,
+        _: Option<&CommandInvocation>,
+    ) -> Result<Option<TrustedTarget>, String> {
+        Ok(Some(self.root.clone()))
+    }
+
+    fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
+        assert!(self.root.target.same_manager(target));
+        Ok(())
+    }
+
+    fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
+        self.validate_target(target)?;
+        Ok(self.root.template.clone())
+    }
+
+    fn register_child_activation(
+        &self,
+        _: TrustedTarget,
+        _: String,
+        actor: &AgentActorHandle,
+        _: &AgentIncarnation,
+    ) -> Result<(), String> {
+        if self.cancel {
+            actor.close();
+            Ok(())
+        } else {
+            Err(ACTIVATION_INSTALL_ERROR.into())
+        }
+    }
+}
+
+#[test_case(None; "successful_install")]
+#[test_case(Some(false); "failed_install_preserves_saved_config_then_retries")]
+#[test_case(Some(true); "cancelled_install_preserves_saved_config_then_retries")]
+fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_request(
+    cancel_install: Option<bool>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let provider = RestartProvider::new(vec![
         common::canned_reply(REPLY),
@@ -1344,6 +1394,25 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
     let host = host.restart_host(dir.path());
     assert!(!host.manager.is_live(child_id));
     assert_eq!(provider.request_count(), 1);
+    let host = if let Some(cancel) = cancel_install {
+        host.host
+            .event_handle()
+            .install_orchestration_services(Arc::new(FailedActivation {
+                root: host.root.clone(),
+                cancel,
+            }));
+        host.host.wait_for_worker_barrier_for_test();
+        let error = if cancel {
+            ReactivationError::Cancelled.to_string()
+        } else {
+            ACTIVATION_INSTALL_ERROR.into()
+        };
+        reject_without_mutation(&host, &provider, &path, &error, false);
+        assert!(!host.manager.is_live(child_id));
+        host.restart_host(dir.path())
+    } else {
+        host
+    };
     *provider.expected_config.lock().unwrap() = Some((
         StateDir::from_path(dir.path().into()),
         host.session.id.into(),

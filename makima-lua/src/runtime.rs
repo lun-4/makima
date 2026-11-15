@@ -3870,6 +3870,7 @@ impl LuaRuntime {
                     schema: t.schema,
                     audience: t.audience,
                     kind: t.kind.clone(),
+                    shell_execution: t.shell_execution,
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     generation,

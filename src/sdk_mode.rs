@@ -34,7 +34,6 @@ use makima_agent::headless::{
     self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
     RootSubmission, WorkCancel,
 };
-use makima_agent::journal::SessionJournal;
 use makima_agent::mcp;
 use makima_agent::permissions::{
     PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer,
@@ -71,7 +70,7 @@ use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::conversation::{ConversationRelation, ConversationState};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
-use makima_storage::session_state::ParentLink;
+use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
 use makima_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -739,10 +738,9 @@ impl SdkRuntime {
         let mut restored = if fresh {
             ResolvedSession {
                 id: None,
-                root_id: None,
                 parent: None,
-                journal: None,
                 seed: None,
+                fork_state: Vec::new(),
                 history: Default::default(),
                 model: None,
                 meta: Default::default(),
@@ -771,8 +769,6 @@ impl SdkRuntime {
         restored.history = recovered.session().history_snapshot();
         restored.meta = recovered.session().meta.clone();
         restored.model = Some(recovered.session().model.clone());
-        restored.root_id = Some(root_id);
-        restored.journal = Some(recovered.journal());
         let recovered_state = recovered.session().latest_state()?;
         let recovered_config = recovered_state
             .scopes
@@ -784,7 +780,6 @@ impl SdkRuntime {
         let cwd = recovered_config
             .map(|config| PathBuf::from(&config.cwd))
             .unwrap_or(cwd);
-        let restored_state = restored.model.is_some();
         let model_override = explicit_model.then(|| model.spec());
         let model = if let Some(config) = recovered_config {
             if !model_policy.allows(&config.model) {
@@ -801,7 +796,6 @@ impl SdkRuntime {
             .get(&None)
             .and_then(|scope| scope.yolo);
         let permission_mode = restored_permission_mode(
-            restored_state,
             persisted_yolo,
             startup_permission_mode,
             explicit_permission_mode,
@@ -858,8 +852,8 @@ impl SdkRuntime {
                 mcp_handle,
                 initial_wd: cwd.clone(),
                 session_id,
-                root_id: restored.root_id,
-                journal: restored.journal,
+                root_id: Some(root_id),
+                journal: Some(recovered.journal()),
                 initial_history: Vec::new(),
                 yolo,
                 system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
@@ -1616,12 +1610,11 @@ fn watch_command_projection(
 }
 
 fn restored_permission_mode(
-    restored: bool,
     persisted_yolo: Option<bool>,
     startup: PermissionMode,
     explicit: bool,
 ) -> PermissionMode {
-    if !restored || explicit {
+    if explicit {
         startup
     } else if let Some(yolo) = persisted_yolo {
         if yolo {
@@ -1715,10 +1708,9 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
 struct ResolvedSession {
     id: Option<SessionRef>,
-    root_id: Option<AgentId>,
     parent: Option<ParentLink>,
-    journal: Option<Arc<SessionJournal>>,
     seed: Option<StoredSession>,
+    fork_state: Vec<StateChange>,
     history: makima_agent::agent::HistorySnapshot,
     model: Option<String>,
     meta: SessionMeta,
@@ -1792,6 +1784,26 @@ async fn recover_sdk_session(
     };
     let root_id = seed.root_agent_id().unwrap_or_else(AgentId::generate);
     seed.bind_root_id(root_id)?;
+    if !restore_legacy {
+        for mut change in mem::take(&mut restored.fork_state) {
+            let agent = if let StateChange::Config(config) = &mut change {
+                config.cwd = cwd.to_owned();
+                Some(root_id)
+            } else {
+                None
+            };
+            seed.push_state(StoredStateRecord {
+                seq: seed.next_state_seq(),
+                agent,
+                generation: if agent.is_some() {
+                    seed.history_snapshot().epoch
+                } else {
+                    0
+                },
+                change,
+            });
+        }
+    }
     if restore_legacy
         && let Some(warning) =
             makima_agent::session_recovery::resolve_legacy_mode(&mut seed, modes, storage)?
@@ -1842,10 +1854,9 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
         .context("create sessions dir")?;
     // A bare continue flag (no ID) is rejected by the TUI guard before SDK
     // mode starts, so only a valued ID reaches this branch.
-    let mut root_id = None;
     let mut parent = None;
-    let mut journal = None;
     let mut seed = None;
+    let mut fork_state = Vec::new();
     let (resumed_id, mut history, mut restored_model, mut meta) =
         if let Some(id) = cli.continue_session.as_ref().and_then(|o| o.as_deref()) {
             let session_ref: SessionRef = id
@@ -1861,11 +1872,12 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
             }
             let resumed = (!cli.fork_session).then_some(session_ref);
             if !cli.fork_session {
-                root_id = session.root_agent_id();
-                journal = Some(Arc::new(SessionJournal::from_session(&session)?));
                 seed = Some(session.clone());
             }
-            parent = cli.fork_session.then(|| fork_parent(&session));
+            if cli.fork_session {
+                parent = Some(fork_parent(&session));
+                fork_state = fork_config_and_rules(&session)?;
+            }
             let model = session.model.clone();
             let meta = session.meta.clone();
             let history = session.history_snapshot();
@@ -1878,9 +1890,8 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
                     }
                     if cli.fork_session {
                         parent = Some(fork_parent(&session));
+                        fork_state = fork_config_and_rules(&session)?;
                     } else {
-                        root_id = session.root_agent_id();
-                        journal = Some(Arc::new(SessionJournal::from_session(&session)?));
                         seed = Some(session.clone());
                     }
                     let model = session.model.clone();
@@ -1931,9 +1942,7 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
                     if cli.fork_session {
                         return Err(eyre!(FORK_DESTINATION_EXISTS));
                     }
-                    root_id = session.root_agent_id();
                     parent = session.parent().cloned();
-                    journal = Some(Arc::new(SessionJournal::from_session(&session)?));
                     seed = Some(session.clone());
                     if !cli.fork_session {
                         history = session.history_snapshot();
@@ -1957,14 +1966,33 @@ fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedS
 
     Ok(ResolvedSession {
         id: cli_session_id.or(resumed_id),
-        root_id,
         parent,
-        journal,
         seed,
+        fork_state,
         history,
         model: restored_model,
         meta,
     })
+}
+
+fn fork_config_and_rules(session: &StoredSession) -> Result<Vec<StateChange>> {
+    let mut state = session.latest_state()?;
+    let mut changes = Vec::new();
+    if let Some(root) = session.root_agent_id()
+        && let Some(config) = state
+            .scopes
+            .remove(&Some(root))
+            .and_then(|scope| scope.config)
+    {
+        changes.push(StateChange::Config(config));
+    }
+    if let Some(scope) = state.scopes.remove(&None) {
+        changes.push(StateChange::Rules {
+            rules: scope.rules,
+            yolo: scope.yolo,
+        });
+    }
+    Ok(changes)
 }
 
 fn fork_parent(session: &StoredSession) -> ParentLink {
@@ -2705,22 +2733,27 @@ mod tests {
     use super::*;
     use makima_agent::actor::{ActorLifecycle, ActorStatus};
     use makima_agent::actor::{ConfigChange, ConfigPatch};
+    use makima_agent::journal::SessionJournal;
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
+    use makima_agent::session_options::{
+        SessionOptionCategory, SessionOptionDefinition, SessionOptionOwner, SessionOptionValue,
+    };
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::tools::ToolRegistry;
-    use makima_agent::{AgentError, AgentId, AgentRef, ModelSource, PreparedModel};
+    use makima_agent::{AgentError, AgentId, AgentRef, ModeDef, ModelSource, PreparedModel};
     use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use makima_lua::orchestration::OrchestrationServices;
+    use makima_providers::model::FastSupport;
     use makima_providers::provider::{BoxFuture, Provider};
     use makima_providers::{
-        ContentBlock, Invocation, ProviderEvent, RequestDelivery, RequestOptions, Role,
+        ContentBlock, Invocation, ModelInfo, ProviderEvent, RequestDelivery, RequestOptions, Role,
         StreamResponse,
     };
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use makima_storage::restore::{RestoreProgress, RestoreStore};
     use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
-    use makima_storage::sessions::Prefs;
+    use makima_storage::sessions::{Prefs, StoredEffect, StoredRule, StoredThinking};
     use makima_storage::test_util::pending_restore;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -3179,34 +3212,155 @@ mod tests {
         });
     }
 
-    #[test_case(false, RESTORED_MODEL; "inherits_source_model")]
-    #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_source")]
-    fn sdk_fork_recovers_source_model_before_runtime_startup(explicit_model: bool, expected: &str) {
+    #[test_case(false, None, false, true; "inherits_root_config_and_rules")]
+    #[test_case(false, None, false, false; "inherits_disabled_yolo")]
+    #[test_case(false, None, true, true; "latest_inherits_root_config_and_rules")]
+    #[test_case(true, None, false, true; "explicit_model_overrides_source")]
+    #[test_case(false, Some("default"), false, true; "explicit_default_overrides_source_mode_and_yolo")]
+    #[test_case(false, Some("plan"), false, true; "explicit_plan_overrides_source_mode_and_yolo")]
+    #[test_case(false, Some("bypassPermissions"), false, false; "explicit_bypass_overrides_disabled_yolo")]
+    fn sdk_fork_preserves_v3_root_config_and_rules(
+        explicit_model: bool,
+        permission_mode: Option<&str>,
+        latest: bool,
+        source_yolo: bool,
+    ) {
         use clap::Parser;
 
         let directory = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(directory.path().to_path_buf());
         let cwd = directory.path().to_string_lossy().into_owned();
+        const FORK_OPTION: &str = "fork.setting";
+        const FORK_PLUGIN: &str = "fork";
+        const FORK_VALUE: &str = "preserved";
+        const FORK_DEFAULT: &str = "default";
+        const FORK_MODE: &str = "review";
+        let destination = directory.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
         let mut source = StoredSession::new(RESTORED_MODEL, &cwd);
         source.push_message(Message::user(SDK_ROOT_PROMPT.into()));
+        let source_root = AgentId::generate();
+        source.bind_root_id(source_root).unwrap();
+        let mode = ModeDef::default_for(ModeId::Custom(FORK_MODE.into()));
+        let source_config = StoredAgentConfig {
+            cwd: cwd.clone(),
+            model: RESTORED_MODEL.into(),
+            thinking: Some(StoredThinking::Off),
+            fast: true,
+            workflow: true,
+            mode: mode.stored_snapshot(&AgentMode::Custom(mode.id.clone())),
+            options: BTreeMap::from([(FORK_OPTION.into(), FORK_VALUE.into())]),
+        };
+        let rules = vec![StoredRule {
+            tool: "bash".into(),
+            scope: Some("blocked *".into()),
+            effect: StoredEffect::Deny,
+        }];
+        for (agent, change) in [
+            (
+                Some(source_root),
+                StateChange::Config(source_config.clone()),
+            ),
+            (
+                None,
+                StateChange::Rules {
+                    rules: rules.clone(),
+                    yolo: Some(source_yolo),
+                },
+            ),
+            (
+                None,
+                StateChange::Plugin {
+                    key: RESET_STATE_KEY.into(),
+                    version: 1,
+                    value: Some(Value::String(RESET_STATE_VALUE.into())),
+                },
+            ),
+        ] {
+            source.push_state(StoredStateRecord {
+                seq: source.next_state_seq(),
+                agent,
+                generation: source.history_snapshot().epoch,
+                change,
+            });
+        }
+        let mut child = source.agents()[&source_root].clone();
+        child.id = AgentId::generate();
+        child.parent = Some(source_root);
+        child.depth = 1;
+        child.transcript_key = SDK_CHILD_PROMPT.into();
+        child.created_seq = source.next_state_seq();
+        child.updated_seq = child.created_seq;
+        source.push_agent_revision(child.created_seq, child);
+        source.set_subagent_messages(
+            SDK_CHILD_PROMPT.into(),
+            vec![Message::user(SDK_CHILD_PROMPT.into())],
+        );
         source.save(&storage).unwrap();
         let source_path = storage
             .path()
             .join(SESSIONS_DIR)
             .join(format!("{}.jsonl", source.id));
         let source_bytes = std::fs::read(&source_path).unwrap();
-        let mut params = reset_sdk_params(directory.path().to_path_buf());
-        params.cli = Cli::parse_from(["makima", "-c", &source.id.to_string(), "--fork-session"]);
-        params.model = sdk_model(STARTUP_MODEL);
+        let mut params = reset_sdk_params(if latest {
+            directory.path().to_path_buf()
+        } else {
+            destination.clone()
+        });
+        let mut args = if latest {
+            vec!["makima".to_owned(), "-l".to_owned()]
+        } else {
+            vec!["makima".to_owned(), "-c".to_owned(), source.id.to_string()]
+        };
+        args.push("--fork-session".into());
+        if let Some(mode) = permission_mode {
+            args.extend(["--permission-mode".into(), mode.into()]);
+        }
+        params.cli = Cli::parse_from(args);
+        params.model = Model::from_spec(STARTUP_MODEL).unwrap();
         params.explicit_model = explicit_model;
-        params.providers = Arc::new(makima_providers::test_util::offline_ids(&[
+        params.providers = Arc::new(makima_providers::test_util::offline_registry(vec![(
             "anthropic",
-            "openai",
-        ]));
-        let (out_tx, _out_rx) = flume::unbounded();
+            [STARTUP_MODEL, RESTORED_MODEL]
+                .map(|spec| ModelInfo {
+                    supports_thinking: Some(true),
+                    supports_fast: Some(FastSupport::Supported),
+                    ..ModelInfo::id_only(spec.split_once('/').unwrap().1.into())
+                })
+                .to_vec(),
+        )]));
+        smol::block_on(params.session_options.replace_plugin_options(
+            FORK_PLUGIN,
+            vec![SessionOptionDefinition {
+                id: FORK_OPTION.into(),
+                owner: SessionOptionOwner::Plugin {
+                    plugin: FORK_PLUGIN.into(),
+                    generation: 1,
+                },
+                name: FORK_OPTION.into(),
+                description: "".into(),
+                category: SessionOptionCategory::Mode,
+                values: [FORK_DEFAULT, FORK_VALUE].map(|value| SessionOptionValue {
+                    value: value.into(),
+                    name: value.into(),
+                }).into(),
+                free_value: None,
+                initial_value: FORK_DEFAULT.into(),
+                persistent: true,
+            }],
+        ))
+        .unwrap();
+        let expected = if explicit_model {
+            STARTUP_MODEL
+        } else {
+            RESTORED_MODEL
+        };
+        let expected_cwd = params.cwd.clone();
+        let (out_tx, out_rx) = flume::unbounded();
         let session = SdkSession::new(params, storage.clone(), out_tx).unwrap();
         let runtime = session.current();
         assert_ne!(runtime.handle.session_id.id(), source.id);
+        assert_ne!(runtime.root.target.id(), source_root);
         assert_eq!(
             runtime
                 .root
@@ -3230,6 +3384,50 @@ mod tests {
                 .unwrap()
                 .model,
             expected
+        );
+        let state = saved.latest_state().unwrap();
+        let config = state.scopes[&Some(runtime.root.target.id())]
+            .config
+            .as_ref()
+            .unwrap();
+        assert_eq!(config.cwd, expected_cwd.to_string_lossy());
+        assert_eq!(config.thinking, source_config.thinking);
+        assert!(config.fast);
+        assert!(config.workflow);
+        assert_eq!(config.options[FORK_OPTION], FORK_VALUE);
+        assert_eq!(
+            config.mode.id,
+            permission_mode.map_or(FORK_MODE, |mode| {
+                if mode == "plan" { "plan" } else { "build" }
+            })
+        );
+        let yolo = permission_mode.map_or(source_yolo, |mode| mode == "bypassPermissions");
+        if permission_mode.is_none() {
+            assert_eq!(config.mode, source_config.mode);
+        }
+        assert_eq!(state.scopes[&None].rules, rules);
+        assert_eq!(state.scopes[&None].yolo, Some(yolo));
+        assert_eq!(runtime.handle.permissions.is_yolo(), yolo);
+        assert_eq!(saved.agents().len(), 1);
+        assert!(!saved.agents().contains_key(&source_root));
+        assert!(saved.subagent_messages().is_empty());
+        assert!(
+            state
+                .scopes
+                .values()
+                .all(|scope| !scope.plugins.contains_key(RESET_STATE_KEY))
+        );
+        let init: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
+        assert_eq!(init["subtype"], "init");
+        assert_eq!(init["cwd"], expected_cwd.to_string_lossy().as_ref());
+        assert_eq!(init["model"], expected.split_once('/').unwrap().1);
+        assert_eq!(
+            init["permissionMode"],
+            permission_mode.unwrap_or(if source_yolo {
+                "bypassPermissions"
+            } else {
+                "default"
+            })
         );
         assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
         smol::block_on(runtime.close()).unwrap();
@@ -3559,10 +3757,9 @@ mod tests {
     fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
         let restored = ResolvedSession {
             id: None,
-            root_id: None,
             parent: None,
-            journal: None,
             seed: None,
+            fork_state: Vec::new(),
             history: Default::default(),
             model: Some(RESTORED_MODEL.into()),
             meta: SessionMeta::default(),
@@ -4515,7 +4712,10 @@ mod tests {
             shared: STORED_SENT,
         });
         assert_eq!(history.conversation().previous, link);
-        let expected_root = restored.root_id;
+        let expected_root = restored
+            .seed
+            .as_ref()
+            .and_then(StoredSession::root_agent_id);
         if !legacy && !fork {
             assert_eq!(expected_root, session.root_agent_id());
         }
@@ -4541,8 +4741,11 @@ mod tests {
             let mut params = idle_params();
             params.initial_wd = PathBuf::from(THIS_CWD);
             params.session_id = restored.id;
-            params.root_id = restored.root_id;
-            params.journal = restored.journal;
+            params.root_id = expected_root;
+            params.journal = restored
+                .seed
+                .as_ref()
+                .map(|seed| Arc::new(SessionJournal::from_session(seed).unwrap()));
             let handle = headless::spawn_interactive_with_binding(
                 params,
                 Box::new(move |model| {
@@ -4622,7 +4825,7 @@ mod tests {
             assert_eq!(saved.root_agent_id(), Some(root.id()));
             let resumed_cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
             let resumed = resolve_session(&resumed_cli, THIS_CWD, &storage).unwrap();
-            assert_eq!(resumed.root_id, Some(root.id()));
+            assert_eq!(resumed.seed.unwrap().root_agent_id(), Some(root.id()));
             assert_eq!(saved.parent(), restored.parent.as_ref());
             assert!(saved.history_snapshot().compacted);
             assert_eq!(saved.messages().len(), session.messages().len());
@@ -5660,23 +5863,22 @@ mod tests {
         smol::block_on(coordinator.close()).unwrap();
     }
 
-    #[test_case(true, Some(true), PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
-    #[test_case(true, Some(false), PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
-    #[test_case(false, None, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
-    #[test_case(true, Some(false), PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
-    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
-    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
-    #[test_case(true, Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
-    #[test_case(true, Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
+    #[test_case(Some(true), PermissionMode::Default, false, PermissionMode::BypassPermissions ; "bare_resume_restores_enabled")]
+    #[test_case(Some(false), PermissionMode::BypassPermissions, false, PermissionMode::Default ; "bare_resume_restores_disabled")]
+    #[test_case(None, PermissionMode::BypassPermissions, false, PermissionMode::BypassPermissions ; "new_session_uses_startup")]
+    #[test_case(Some(false), PermissionMode::Plan, false, PermissionMode::Plan ; "restored_disabled_preserves_plan")]
+    #[test_case(Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_resumed_yolo")]
+    #[test_case(Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_resumed_yolo")]
+    #[test_case(Some(true), PermissionMode::Plan, true, PermissionMode::Plan ; "explicit_plan_overrides_forked_yolo")]
+    #[test_case(Some(true), PermissionMode::Default, true, PermissionMode::Default ; "explicit_default_overrides_forked_yolo")]
     fn sdk_yolo_restore_precedence(
-        restored: bool,
         persisted: Option<bool>,
         startup: PermissionMode,
         explicit: bool,
         expected: PermissionMode,
     ) {
         assert_eq!(
-            restored_permission_mode(restored, persisted, startup, explicit),
+            restored_permission_mode(persisted, startup, explicit),
             expected
         );
     }

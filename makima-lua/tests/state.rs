@@ -93,6 +93,18 @@ makima.api.register_tool({
             local stale, conflict = slot:set(ctx, {}, { expect = revision })
             assert(stale == nil and string.find(conflict, "state_conflict", 1, true))
             return tostring(deleted)
+        elseif input.action == "nil" then
+            local committed, err = slot:set(ctx, nil, { expect = revision })
+            assert(committed, err)
+            local stored, current = slot:get(ctx)
+            assert(stored == makima.state.null and current == committed)
+            local updated, next_revision = slot:update(ctx, function(cur)
+                assert(cur == makima.state.null)
+                return nil
+            end)
+            assert(updated == makima.state.null and next_revision > current)
+            assert(slot:get(ctx) == makima.state.null)
+            return tostring(next_revision)
         elseif input.action == "capture" then
             held = ctx
             return "captured"
@@ -180,8 +192,10 @@ fn state_fixture_copies_cas_tombstones_and_failed_reload() {
         serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
         current
     );
+    let null_revision: u64 = call(json!({ "action": "nil" })).parse().unwrap();
+    assert!(null_revision > second);
     let deleted: u64 = call(json!({ "action": "delete" })).parse().unwrap();
-    assert!(deleted > second);
+    assert!(deleted > null_revision);
     let current: Value = serde_json::from_str(&call(json!({}))).unwrap();
     assert_eq!(current["revision"], deleted);
     assert!(current.get("value").is_none());

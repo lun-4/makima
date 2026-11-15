@@ -214,6 +214,7 @@ pub(crate) struct PendingTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) shell_execution: bool,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
@@ -243,6 +244,7 @@ pub(crate) struct LuaTool {
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
+    pub(crate) shell_execution: bool,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) generation: u64,
@@ -307,6 +309,10 @@ impl Tool for LuaTool {
 
     fn tool_kind(&self) -> Option<&str> {
         self.kind.as_deref()
+    }
+
+    fn shell_execution(&self) -> bool {
+        self.shell_execution
     }
 
     fn examples(&self) -> Option<Value> {
@@ -787,6 +793,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
+///   shell_execution (boolean)  Record each execution as a shell command that file restore cannot undo. Default: false.
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
 ///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -1728,6 +1735,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .get::<String>("kind")
         .ok()
         .map(|s| Arc::from(s.as_str()));
+    let shell_execution = spec_opt::<bool>(spec, "shell_execution", "a boolean")?.unwrap_or(false);
     let audience = parse_audience(audiences, ToolAudience::default())?;
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
@@ -1762,6 +1770,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             schema: param_schema,
             audience,
             kind,
+            shell_execution,
             handler_key,
             header_key,
             restore_key,
@@ -2873,6 +2882,7 @@ mod tests {
             schema,
             audience: ToolAudience::default(),
             kind: None,
+            shell_execution: false,
             tx,
             plugin: Arc::from("test"),
             generation: 1,

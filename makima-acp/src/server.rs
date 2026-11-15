@@ -251,7 +251,6 @@ struct SpawnSession {
 
 struct InstallSession<'a> {
     handle: InteractiveHandle,
-    seed: Option<StoredSession>,
     recovered_writer: Option<(Arc<SessionLogCheckpoint>, Arc<session_lock::LockHeartbeat>)>,
     root_target: Receiver<TrustedTarget>,
     mcp: Option<McpHandle>,
@@ -570,7 +569,6 @@ async fn new_session(
         params,
         InstallSession {
             handle,
-            seed: None,
             recovered_writer: Some((checkpoint, lock)),
             mcp,
             root_target,
@@ -649,16 +647,15 @@ async fn load_session(
         .recover(CheckpointPublication::default(), recovery_claim())
         .await
         .map_err(|error| session_registration_error(error.to_string()))?;
-    restored.history = recovered.session().history_snapshot();
-    restored.root_id = recovered.session().root_agent_id();
-    restored.journal = Some(recovered.journal());
+    let history_snapshot = recovered.session().history_snapshot();
+    let root_id = recovered.session().root_agent_id();
     let recovered_state = recovered
         .session()
         .latest_state()
         .map_err(|error| session_registration_error(error.to_string()))?;
     let recovered_config = recovered_state
         .scopes
-        .get(&restored.root_id)
+        .get(&root_id)
         .and_then(|scope| scope.config.as_ref());
     if let Some(config) = recovered_config {
         restored.cwd = Some(PathBuf::from(&config.cwd));
@@ -706,7 +703,7 @@ async fn load_session(
                 params.defaults,
                 &read_prefs(&params.storage),
                 &restored.meta,
-                restored.history.messages.is_empty(),
+                history_snapshot.messages.is_empty(),
                 &recorded_model,
             )
         },
@@ -719,16 +716,15 @@ async fn load_session(
     let persisted_options = recovered_config
         .map(|config| &config.options)
         .unwrap_or(&restored.meta.session_options);
-    let replay_history = Arc::clone(&restored.history.messages);
-    let history_snapshot = restored.history;
+    let replay_history = Arc::clone(&history_snapshot.messages);
     let (handle, root_target) = spawn_session_with_checkpoint(
         params,
         SpawnSession {
             model: recorded_model.clone(),
             cwd: session_cwd.clone(),
             session_id: Some(session_ref),
-            root_id: restored.root_id,
-            journal: restored.journal,
+            root_id,
+            journal: Some(recovered.journal()),
             history: Vec::new(),
             mcp_handle: mcp.clone(),
             elicitation: srv.elicitation,
@@ -752,7 +748,6 @@ async fn load_session(
         params,
         InstallSession {
             handle,
-            seed: None,
             recovered_writer: Some((checkpoint, lock)),
             mcp,
             current_model: spec,
@@ -1077,7 +1072,6 @@ async fn install_session_with_lock(
 ) -> Result<makima_agent::session_options::SessionOptionsSnapshot, String> {
     let InstallSession {
         handle,
-        seed,
         recovered_writer,
         root_target,
         mcp,
@@ -1107,11 +1101,8 @@ async fn install_session_with_lock(
             return Err(error);
         }
     };
-    let mut seed = seed.unwrap_or_else(|| {
-        let mut session = StoredSession::new(&current_model, &cwd.to_string_lossy());
-        session.id = handle.session_id.id();
-        session
-    });
+    let mut seed = StoredSession::new(&current_model, &cwd.to_string_lossy());
+    seed.id = handle.session_id.id();
     if let Err(error) = handle.initialized_root().await {
         rollback_install(handle, mcp, None).await;
         return Err(error);
@@ -1394,9 +1385,6 @@ type StoredSession =
 
 struct Restored {
     seed: StoredSession,
-    root_id: Option<AgentId>,
-    journal: Option<Arc<SessionJournal>>,
-    history: makima_agent::agent::HistorySnapshot,
     cwd: Option<PathBuf>,
     usage: TokenUsage,
     by_model: HashMap<String, StoredTokenUsage>,
@@ -1428,15 +1416,8 @@ fn load_history_from(
     let usage = session.token_usage;
     let by_model = session.usage_by_model().clone();
     let meta = session.meta.clone();
-    let history = session.history_snapshot();
     Ok(Restored {
-        seed: session.clone(),
-        root_id: session.root_agent_id(),
-        journal: Some(Arc::new(
-            SessionJournal::from_session(&session)
-                .map_err(|error| AcpError::internal_error().data(json_str(&error)))?,
-        )),
-        history,
+        seed: session,
         cwd,
         usage,
         by_model,
@@ -3902,9 +3883,9 @@ mod tests {
         session.meta.compacted = true;
         session.save(&storage).unwrap();
         let restored = load_history_from(&storage, session.id).unwrap();
-        assert!(restored.history.compacted);
+        assert!(restored.seed.history_snapshot().compacted);
         assert_eq!(
-            serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
+            serde_json::to_value(restored.seed.history_snapshot().messages.as_ref()).unwrap(),
             serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()
         );
     }
@@ -4137,7 +4118,6 @@ mod tests {
                 &params,
                 InstallSession {
                     handle,
-                    seed: None,
                     recovered_writer: None,
                     root_target,
                     mcp: None,
@@ -4258,7 +4238,6 @@ mod tests {
                 &params,
                 InstallSession {
                     handle: first,
-                    seed: None,
                     recovered_writer: None,
                     root_target,
                     mcp: None,
@@ -8327,7 +8306,7 @@ mod tests {
         let id: MakimaId = session.id;
         let history = load_history_from(&dir, id).unwrap();
         assert_eq!(
-            serde_json::to_value(history.history.messages.as_ref()).unwrap(),
+            serde_json::to_value(history.seed.history_snapshot().messages.as_ref()).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
     }
@@ -8372,7 +8351,10 @@ mod tests {
 
         let restored = load_history_from(&dir, session.id).unwrap();
         let state = restored.seed.latest_state().unwrap();
-        let config = state.scopes[&restored.root_id].config.as_ref().unwrap();
+        let config = state.scopes[&restored.seed.root_agent_id()]
+            .config
+            .as_ref()
+            .unwrap();
         assert_eq!(state.scopes[&None].yolo, Some(true));
         assert!(config.fast);
         assert!(config.workflow);

@@ -217,9 +217,6 @@ impl EventLoop<'_> {
             supplied,
             Arc::clone(&self.ctx.file_write_locks),
         )?;
-        if let Some(block) = session_lock::resume_block(&parent.cwd, &self.session_cwd, false) {
-            return Err(block.to_string());
-        }
         if !makima_agent::parent_rewind::boundaries(&parent, &link)
             .map_err(|error| error.to_string())?
             .iter()
@@ -987,8 +984,8 @@ impl EventLoop<'_> {
                         .apply_to(&mut session)
                         .map_err(|error| error.to_string())?;
                     project_presentations(&mut session, &snapshot, &affected)?;
-                    session.meta.queued_messages.clear();
                     if session_scope {
+                        session.meta.queued_messages.clear();
                         session.meta.input_draft = draft.clone();
                     }
                     let branch = StoredBranch {

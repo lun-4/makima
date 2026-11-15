@@ -719,19 +719,6 @@ pub(crate) fn plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthori
         .unwrap_or_else(|| Arc::new(PluginAuthority::new(false, 0)))
 }
 
-/// Whether the running code belongs to {plugin} at {generation} and the
-/// plugin's live authority is still {owner}.
-pub(crate) fn holds_plugin_grant(
-    lua: &Lua,
-    plugin: &Arc<str>,
-    generation: u64,
-    owner: &Arc<PluginAuthority>,
-) -> bool {
-    crate::runtime::current_plugin(lua).is_some_and(|(current, current_generation)| {
-        current == *plugin && current_generation == generation
-    }) && Arc::ptr_eq(owner, &plugin_authority(lua, plugin.clone()))
-}
-
 /// Grants a fresh authority when a plugin load commits; the previous one
 /// must already be revoked.
 pub(crate) fn install_plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {

@@ -42,8 +42,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_lock::{Semaphore, SemaphoreGuardArc};
+use async_lock::{RwLock, RwLockWriteGuardArc, Semaphore, SemaphoreGuardArc};
 use event_listener::Event;
+use futures_lite::FutureExt;
 use makima_providers::{Message, TokenUsage};
 use tracing::{info, warn};
 
@@ -58,7 +59,7 @@ use crate::journal::{
 use crate::tools::offload::OffloadStore;
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
-    HistorySnapshot, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
+    HistorySnapshot, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome, TurnTicket,
 };
 use makima_storage::session_state::{
     SessionStateView, StateChange, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
@@ -75,6 +76,7 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 struct ActivationAttempt {
     result: Mutex<Option<Result<(), ManagerError>>>,
     completed: Event,
+    finishing: AtomicBool,
 }
 
 impl ActivationAttempt {
@@ -82,6 +84,7 @@ impl ActivationAttempt {
         Self {
             result: Mutex::new(None),
             completed: Event::new(),
+            finishing: AtomicBool::new(false),
         }
     }
 
@@ -121,7 +124,7 @@ struct ActivationGuard {
 
 impl Drop for ActivationGuard {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed && !self.attempt.finishing.load(Ordering::Acquire) {
             self.manager.rollback_activation(&self.incarnation);
             self.attempt
                 .complete(Err(ReactivationError::Cancelled.into()));
@@ -131,6 +134,46 @@ impl Drop for ActivationGuard {
 
 type DeliveryWork = Mutex<HashMap<(AgentId, AgentId, TurnId), Vec<WorkReservation>>>;
 type RunnerTask = smol::Task<()>;
+
+struct RetainedTask {
+    _task: RunnerTask,
+    finished: Arc<AtomicBool>,
+}
+
+struct TaskCompletion {
+    manager: Weak<ManagerInner>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for TaskCompletion {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        if let Some(manager) = self.manager.upgrade() {
+            manager.reaped.notify(usize::MAX);
+        }
+    }
+}
+
+impl RetainedTask {
+    fn new(manager: &AgentManagerHandle, task: impl Future<Output = ()> + Send + 'static) -> Self {
+        let finished = Arc::new(AtomicBool::new(false));
+        let completion = TaskCompletion {
+            manager: Arc::downgrade(&manager.0),
+            finished: Arc::clone(&finished),
+        };
+        Self {
+            _task: smol::spawn(async move {
+                let _completion = completion;
+                task.await;
+            }),
+            finished,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
 
 pub struct GraphEvents {
     manager: Weak<ManagerInner>,
@@ -275,8 +318,9 @@ pub(crate) struct ManagerInner {
     pub(crate) work: Arc<WorkLedger>,
     restored_delivery_work: DeliveryWork,
     result_store: Mutex<Option<Arc<OffloadStore>>>,
-    cleanup_tasks: Mutex<Vec<RunnerTask>>,
-    tool_completions: Mutex<Vec<(AgentId, RunnerTask)>>,
+    activation_completion: Arc<RwLock<()>>,
+    cleanup_tasks: Mutex<Vec<RetainedTask>>,
+    tool_completions: Mutex<Vec<(AgentId, RetainedTask)>>,
     limiter: Arc<Semaphore>,
     watchers: Mutex<WatcherRegistry>,
     next_watcher: AtomicU64,
@@ -337,6 +381,7 @@ impl AgentManagerHandle {
             work: WorkLedger::new(limits),
             restored_delivery_work: Mutex::new(HashMap::new()),
             result_store: Mutex::new(None),
+            activation_completion: Arc::new(RwLock::new(())),
             cleanup_tasks: Mutex::new(Vec::new()),
             tool_completions: Mutex::new(Vec::new()),
             journal,
@@ -636,10 +681,7 @@ impl AgentManagerHandle {
         };
         let Some(incarnation) = incarnation else {
             attempt.wait().await?;
-            return self.lookup(agent_id).and_then(|agent| {
-                agent.validate_live()?;
-                Ok(agent)
-            });
+            return Ok(self.reference(agent_id));
         };
         let mut guard = ActivationGuard {
             manager: self.clone(),
@@ -654,10 +696,12 @@ impl AgentManagerHandle {
                 factory,
             )
             .await;
-        if result.is_err() {
-            self.rollback_activation(&incarnation);
+        if !attempt.finishing.load(Ordering::Acquire) {
+            if result.is_err() {
+                self.rollback_activation(&incarnation);
+            }
+            attempt.complete(result.as_ref().map(|_| ()).map_err(Clone::clone));
         }
-        attempt.complete(result.as_ref().map(|_| ()).map_err(Clone::clone));
         guard.committed = true;
         result
     }
@@ -834,12 +878,16 @@ impl AgentManagerHandle {
                 terminal: node.terminal.clone(),
             }
         };
+        let attempt = self.lock_graph().nodes[&incarnation.agent_id]
+            .activation
+            .clone();
         if let Some(initialize) = resident.initialize {
             let future = catch_unwind(AssertUnwindSafe(|| {
                 initialize(ResidentInitialization {
                     agent: agent.clone(),
                     actor: actor.clone(),
                     incarnation: incarnation.clone(),
+                    start: start.clone(),
                 })
             }))
             .map_err(|_| ReactivationError::Panicked)?;
@@ -853,41 +901,60 @@ impl AgentManagerHandle {
             })
             .await?;
         }
+        if let Some(attempt) = attempt.filter(|attempt| attempt.finishing.load(Ordering::Acquire)) {
+            attempt.wait().await?;
+        } else {
+            self.finish_activation(incarnation, &actor, false)?;
+        }
+        let _ = start.try_send(());
+        Ok(agent)
+    }
+
+    fn finish_activation(
+        &self,
+        incarnation: &AgentIncarnation,
+        actor: &AgentActorHandle,
+        prepared: bool,
+    ) -> Result<(), ManagerError> {
         {
             let mut graph = self.lock_graph();
-            if graph.shutting_down {
-                return Err(ManagerError::GraphShutdown);
-            }
-            if graph.rewind_affected.contains(&incarnation.agent_id) {
-                return Err(ManagerError::RewindInProgress);
+            if !prepared {
+                if graph.shutting_down {
+                    return Err(ManagerError::GraphShutdown);
+                }
+                if graph.rewind_affected.contains(&incarnation.agent_id) {
+                    return Err(ManagerError::RewindInProgress);
+                }
             }
             let node = graph
                 .nodes
                 .get_mut(&incarnation.agent_id)
                 .ok_or(ManagerError::UnknownAgent(incarnation.agent_id))?;
-            if node.reservation != incarnation.reservation
-                || node.detach_pending
-                || node.lifecycle != GraphLifecycle::Dormant
-                || node.residency != AgentResidency::Activating
+            if !prepared
+                && (node.reservation != incarnation.reservation
+                    || node.detach_pending
+                    || node.lifecycle != GraphLifecycle::Dormant
+                    || node.residency != AgentResidency::Activating)
             {
                 return Err(ManagerError::StaleIncarnation(incarnation.agent_id));
             }
             if actor.lifecycle() != ActorLifecycle::Open {
-                return Err(ReactivationError::Initialization(
-                    "initializer closed the actor".into(),
-                )
-                .into());
+                return Err(
+                    ReactivationError::Initialization(ActorError::Closed.to_string()).into(),
+                );
             }
-            actor
-                .reconcile_pending_deliveries(|source, turn| {
-                    self.take_delivery_work(incarnation.agent_id, source, turn)
-                })
-                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
-            self.0.work.set_open_for_incarnation(
-                incarnation.agent_id,
-                incarnation.reservation,
-                true,
-            )?;
+            if !prepared {
+                actor
+                    .reconcile_pending_deliveries(|source, turn| {
+                        self.take_delivery_work(incarnation.agent_id, source, turn)
+                    })
+                    .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+                self.0.work.set_open_for_incarnation(
+                    incarnation.agent_id,
+                    incarnation.reservation,
+                    true,
+                )?;
+            }
             node.lifecycle = GraphLifecycle::Live;
             node.residency = AgentResidency::Resident;
             node.reservation_pending = false;
@@ -902,8 +969,87 @@ impl AgentManagerHandle {
                 actor.attach_graph_observer(observer.clone());
             }
         }
-        let _ = start.try_send(());
-        Ok(agent)
+        self.0.reaped.notify(usize::MAX);
+        Ok(())
+    }
+
+    async fn finish_initialization(
+        &self,
+        initialization: ResidentInitialization,
+        work: impl Future<Output = Result<(), ReactivationError>> + Send + 'static,
+    ) -> Result<(), ReactivationError> {
+        let completion = self.0.activation_completion.read_arc().await;
+        let attempt = {
+            let graph = self.lock_graph();
+            if graph.shutting_down || graph.rewind_affected.contains(&initialization.agent.id()) {
+                return Err(ReactivationError::Cancelled);
+            }
+            let node = graph
+                .nodes
+                .get(&initialization.agent.id())
+                .filter(|node| {
+                    node.reservation == initialization.incarnation.reservation
+                        && !node.detach_pending
+                })
+                .ok_or(ReactivationError::Cancelled)?;
+            if node.lifecycle != GraphLifecycle::Dormant
+                || node.residency != AgentResidency::Activating
+            {
+                return Err(ReactivationError::Cancelled);
+            }
+            if initialization.actor.lifecycle() != ActorLifecycle::Open {
+                return Err(ReactivationError::Initialization(
+                    ActorError::Closed.to_string(),
+                ));
+            }
+            initialization
+                .actor
+                .reconcile_pending_deliveries(|source, turn| {
+                    self.take_delivery_work(initialization.agent.id(), source, turn)
+                })
+                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            self.0
+                .work
+                .set_open_for_incarnation(
+                    initialization.agent.id(),
+                    initialization.incarnation.reservation,
+                    true,
+                )
+                .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
+            let attempt = node
+                .activation
+                .clone()
+                .ok_or(ReactivationError::Cancelled)?;
+            attempt.finishing.store(true, Ordering::Release);
+            attempt
+        };
+        let manager = self.clone();
+        let waiting = attempt.clone();
+        self.retain_cleanup_task(smol::spawn(async move {
+            let _completion = completion;
+            let result = AssertUnwindSafe(work)
+                .catch_unwind()
+                .await
+                .map_err(|_| ManagerError::from(ReactivationError::Panicked))
+                .and_then(|result| result.map_err(ManagerError::from))
+                .and_then(|()| {
+                    manager.finish_activation(
+                        &initialization.incarnation,
+                        &initialization.actor,
+                        true,
+                    )
+                });
+            if result.is_err() {
+                manager.rollback_activation(&initialization.incarnation);
+            } else {
+                let _ = initialization.start.try_send(());
+            }
+            attempt.complete(result);
+        }));
+        waiting
+            .wait()
+            .await
+            .map_err(|error| ReactivationError::Initialization(error.to_string()))
     }
 
     fn restored_usage(snapshot: &SessionJournalSnapshot, record: &StoredAgentRecord) -> TokenUsage {
@@ -986,7 +1132,7 @@ impl AgentManagerHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         tasks.retain(|(_, task)| !task.is_finished());
-        tasks.push((agent, smol::spawn(completion)));
+        tasks.push((agent, RetainedTask::new(self, completion)));
         self.0.reaped.notify(usize::MAX);
         Ok(())
     }
@@ -1004,8 +1150,12 @@ impl AgentManagerHandle {
     }
 
     async fn drain_tool_completions(&self, agent: AgentId) {
-        while !self.tool_completions_finished(Some(agent)) {
-            smol::Timer::after(SHUTDOWN_POLL_INTERVAL).await;
+        loop {
+            let changed = self.0.reaped.listen();
+            if self.tool_completions_finished(Some(agent)) {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -1016,18 +1166,22 @@ impl AgentManagerHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        tasks.push(RetainedTask::new(self, task));
         self.0.reaped.notify(usize::MAX);
     }
 
     fn cleanup_finished(&self) -> bool {
+        self.cleanup_tasks_finished() && self.tool_completions_finished(None)
+    }
+
+    fn cleanup_tasks_finished(&self) -> bool {
         let mut tasks = self
             .0
             .cleanup_tasks
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         tasks.retain(|task| !task.is_finished());
-        tasks.is_empty() && self.tool_completions_finished(None)
+        tasks.is_empty()
     }
 
     fn rollback_activation(&self, incarnation: &AgentIncarnation) {
@@ -1259,6 +1413,35 @@ impl AgentManagerHandle {
     }
 
     pub fn detach_incarnation(&self, incarnation: &AgentIncarnation) -> Result<(), ManagerError> {
+        let Some(_completion) = self.0.activation_completion.try_write_arc() else {
+            let manager = self.clone();
+            let incarnation = incarnation.clone();
+            smol::spawn(async move {
+                loop {
+                    let changed = manager.0.reaped.listen();
+                    let completion = manager.0.activation_completion.write_arc().await;
+                    let result = manager.detach_incarnation_after_completion(&incarnation);
+                    drop(completion);
+                    match result {
+                        Err(ManagerError::RewindInProgress) => changed.await,
+                        Err(ManagerError::StaleIncarnation(_) | ManagerError::UnknownAgent(_)) | Ok(()) => break,
+                        Err(error) => {
+                            warn!(agent_id = %incarnation.agent_id, %error, "deferred activation detach failed");
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            return Ok(());
+        };
+        self.detach_incarnation_after_completion(incarnation)
+    }
+
+    fn detach_incarnation_after_completion(
+        &self,
+        incarnation: &AgentIncarnation,
+    ) -> Result<(), ManagerError> {
         if !self.tool_completions_finished(Some(incarnation.agent_id)) {
             return self.defer_incarnation_cleanup(incarnation, false);
         }
@@ -1319,6 +1502,7 @@ impl AgentManagerHandle {
         let incarnation = incarnation.clone();
         self.retain_cleanup_task(smol::spawn(async move {
             manager.drain_tool_completions(incarnation.agent_id).await;
+            let _completion = manager.0.activation_completion.write_arc().await;
             let _publication = manager.0.journal.publication_read().await;
             if rollback {
                 manager.rollback_activation_held(&incarnation);
@@ -1498,8 +1682,11 @@ impl AgentManagerHandle {
             {
                 return Err(DeliveryRejection::ParentClosed);
             }
-            (node.lifecycle == GraphLifecycle::Live
-                && node.residency == AgentResidency::Resident
+            ((node.lifecycle == GraphLifecycle::Live && node.residency == AgentResidency::Resident
+                || node
+                    .activation
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire)))
                 && !node.detach_pending)
                 .then(|| node.actor.clone())
                 .flatten()
@@ -1716,13 +1903,7 @@ impl AgentManagerHandle {
         crate::actor::transcript_snapshot(history, &request)
     }
 
-    #[cfg(test)]
     pub fn bind_result_store(&self, store: Arc<OffloadStore>) -> Result<(), ManagerError> {
-        if self.0.journal.session_id().is_none() {
-            return Err(ManagerError::InvalidGraph(
-                "result store requires a bound session".into(),
-            ));
-        }
         let mut current = self
             .0
             .result_store
@@ -1766,6 +1947,41 @@ impl AgentManagerHandle {
             )
         })?;
         store.read(name, reference.bytes)
+    }
+
+    /// Read the latest admitted ticket even while its actor is closing or closed.
+    /// Nonresident agents fall back to their latest stored terminal result.
+    pub fn latest_retained_turn_ticket(
+        &self,
+        agent: &AgentRef,
+    ) -> Result<Option<TurnTicket>, ManagerError> {
+        if !self.same_manager(&agent.manager) {
+            return Err(ManagerError::WrongManager);
+        }
+        let actor = {
+            let graph = self.lock_graph();
+            let node = graph
+                .nodes
+                .get(&agent.agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent.agent_id))?;
+            node.actor.clone()
+        };
+        if let Some(actor) = actor {
+            return Ok(actor.latest_ticket());
+        }
+        let snapshot = self
+            .0
+            .journal
+            .checkpoint_snapshot()
+            .map_err(ManagerError::InvalidGraph)?;
+        let view = snapshot
+            .fold(snapshot.seq)
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        view.scopes
+            .get(&Some(agent.agent_id))
+            .and_then(|scope| scope.results.back())
+            .map(|(turn, _)| self.retained_turn_ticket(agent, *turn))
+            .transpose()
     }
 
     pub fn retained_turn_ticket_with(
@@ -2615,6 +2831,7 @@ impl AgentManagerHandle {
             graph.root_id = None;
         }
         graph.revision += 1;
+        self.0.reaped.notify(usize::MAX);
         warn!(manager_generation = self.0.generation, %agent_id, revision = graph.revision, "agent reservation rolled back");
     }
 
@@ -2783,6 +3000,7 @@ impl AgentManagerHandle {
                 .filter(|node| node.lifecycle.consumes_capacity())
                 .count();
             drop(graph);
+            self.0.reaped.notify(usize::MAX);
             info!(manager_generation = self.0.generation, %agent_id, depth, revision, live_count, "agent node committed");
             return Ok(AgentRef {
                 manager: self.clone(),
@@ -2853,6 +3071,7 @@ impl AgentManagerHandle {
             .filter(|node| node.lifecycle.consumes_capacity())
             .count();
         drop(graph);
+        self.0.reaped.notify(usize::MAX);
         info!(manager_generation = self.0.generation, %agent_id, depth, revision, live_count, "agent node committed");
         Ok(AgentRef {
             manager: self.clone(),
@@ -3069,6 +3288,7 @@ impl AgentManagerHandle {
                     graph.root_id = None;
                 }
             }
+            self.0.reaped.notify(usize::MAX);
             return;
         }
         if let Some(node) = graph.nodes.get_mut(&agent_id)
@@ -3077,6 +3297,7 @@ impl AgentManagerHandle {
             node.reservation_pending = false;
         }
         Self::reclaim_finished_closings(&mut graph, &self.0.journal);
+        self.0.reaped.notify(usize::MAX);
     }
 
     /// Removed nodes have no runner resources remaining.
@@ -3313,6 +3534,15 @@ impl AgentManagerHandle {
             if graph.rewinding {
                 return Err(ManagerError::RewindInProgress);
             }
+            if Self::subtree_ids(&graph, agent_id).iter().any(|id| {
+                graph
+                    .nodes
+                    .get(id)
+                    .and_then(|node| node.activation.as_ref())
+                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+            }) {
+                return Err(ManagerError::BusySubtree(agent_id));
+            }
             let node = graph
                 .nodes
                 .get(&agent_id)
@@ -3388,6 +3618,15 @@ impl AgentManagerHandle {
             if graph.rewinding {
                 return Err(ManagerError::RewindInProgress);
             }
+            if Self::subtree_ids(&graph, agent_id).iter().any(|id| {
+                graph
+                    .nodes
+                    .get(id)
+                    .and_then(|node| node.activation.as_ref())
+                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+            }) {
+                return Err(ManagerError::BusySubtree(agent_id));
+            }
             let node = graph
                 .nodes
                 .get(&agent_id)
@@ -3426,6 +3665,15 @@ impl AgentManagerHandle {
     }
 
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
+        let completion = self.0.activation_completion.write_arc().await;
+        self.shutdown_after_completion(timeout, completion).await
+    }
+
+    async fn shutdown_after_completion(
+        &self,
+        timeout: Duration,
+        completion: RwLockWriteGuardArc<()>,
+    ) -> ShutdownReport {
         let deadline = std::time::Instant::now() + timeout;
         let publication = if let Some(publication) = self.0.journal.try_publication_read() {
             Some(publication)
@@ -3461,6 +3709,7 @@ impl AgentManagerHandle {
                     })
                     .collect::<Vec<_>>()
             };
+            drop(completion);
             for &id in &timed_out {
                 if let Ok(incarnation) = self.incarnation(id) {
                     let _ = self.defer_incarnation_cleanup(&incarnation, false);
@@ -3532,6 +3781,7 @@ impl AgentManagerHandle {
             (ids, actors, finished_tombstone_tasks)
         };
         drop(publication);
+        drop(completion);
         #[cfg(test)]
         self.wait_at_test_gate(&self.0.shutdown_cut_gate);
         for (actor, cut) in actors {
@@ -3812,6 +4062,15 @@ impl AgentManagerHandle {
         let mut ids = Self::subtree_ids(graph, agent_id);
         if !include_root {
             ids.remove(0);
+        }
+        if ids.iter().any(|id| {
+            graph
+                .nodes
+                .get(id)
+                .and_then(|node| node.activation.as_ref())
+                .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+        }) {
+            return Err(ManagerError::BusySubtree(agent_id));
         }
         let agents = ids
             .iter()

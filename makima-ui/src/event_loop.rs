@@ -1324,7 +1324,6 @@ fn swap_session_runtime(
 fn replace_session_runtime(
     current: &mut SessionRuntime,
     mut prepared: PreparedSessionRuntime,
-    _sessions_dir: &Path,
     model_slot: &ProviderSlot,
 ) -> Result<SessionRuntime, String> {
     let target_id = prepared.app.session_id();
@@ -1931,8 +1930,6 @@ impl SpawnCtx {
         #[cfg(test)]
         let seed_snapshot =
             seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
-        #[cfg(not(test))]
-        let _ = seed_snapshot;
         app.app.trust_question = self.trust_question.clone();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
@@ -4192,7 +4189,6 @@ impl<'t> EventLoop<'t> {
         let old = match replace_session_runtime(
             &mut self.sessions[idx],
             prepared,
-            &self.sessions_dir,
             &self.ctx.model_slot,
         ) {
             Ok(old) => old,
@@ -5210,10 +5206,9 @@ impl<'t> EventLoop<'t> {
                                         ),
                                         snapshot.history,
                                     )),
-                                    selected_config: Some((
+                                    selected_config: Some(
                                         makima_storage::sessions::HistoryDestination::Child(key),
-                                        snapshot.config,
-                                    )),
+                                    ),
                                     publication,
                                     claim: publication_claim(),
                                     guard,
@@ -8558,13 +8553,8 @@ end })
             .ctx()
             .prepare_replacement_runtime(session, None, &runtime)
             .unwrap();
-        let old = replace_session_runtime(
-            &mut runtime,
-            replacement,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, replacement, &harness.ctx().model_slot).unwrap();
         assert!(Arc::ptr_eq(
             &store,
             runtime.handles.offload.as_ref().unwrap()
@@ -9501,13 +9491,8 @@ end })
             .history_snapshot();
         let mut runtime = if replace {
             let mut current = harness.runtime(harness.session());
-            let old = replace_session_runtime(
-                &mut current,
-                prepared,
-                &harness.ctx().sessions_dir,
-                &harness.ctx().model_slot,
-            )
-            .unwrap();
+            let old =
+                replace_session_runtime(&mut current, prepared, &harness.ctx().model_slot).unwrap();
             release_runtime(old);
             current
         } else {
@@ -9654,13 +9639,8 @@ end })
             None => harness.ctx().prepare_runtime(session).unwrap(),
         };
         let runtime = if let Some(mut current) = current.take() {
-            let outgoing = replace_session_runtime(
-                &mut current,
-                prepared,
-                &harness.ctx().sessions_dir,
-                &harness.ctx().model_slot,
-            )
-            .unwrap();
+            let outgoing =
+                replace_session_runtime(&mut current, prepared, &harness.ctx().model_slot).unwrap();
             release_runtime(outgoing);
             current
         } else {
@@ -10047,15 +10027,7 @@ end })
             .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
         if let Some(current) = current.as_mut() {
             let identity = current.handles.identity();
-            assert!(
-                replace_session_runtime(
-                    current,
-                    prepared,
-                    &harness.ctx().sessions_dir,
-                    &harness.ctx().model_slot,
-                )
-                .is_err()
-            );
+            assert!(replace_session_runtime(current, prepared, &harness.ctx().model_slot).is_err());
             assert!(Arc::ptr_eq(&current.handles.identity(), &identity));
             assert!(matches!(
                 current.session_lock,
@@ -10129,12 +10101,7 @@ end })
             fs::write(lock_path, format!("{} replacement", std::process::id())).unwrap();
             release.send(()).unwrap();
         });
-        let result = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        );
+        let result = replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot);
         observer.join().unwrap();
         let error = result
             .err()
@@ -10221,14 +10188,9 @@ end })
             release.send(()).unwrap();
             published
         });
-        let error = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .err()
-        .expect("gated replacement must fail");
+        let error = replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot)
+            .err()
+            .expect("gated replacement must fail");
         let published = observer.join().unwrap();
         assert!(error.contains(FAILURE), "{error}");
         if rollback_fails {
@@ -10680,13 +10642,8 @@ end })
             .prepare_replacement_runtime(replacement, None, &runtime)
             .unwrap();
 
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
 
         assert_eq!(runtime.app.permissions.is_yolo(), current_yolo);
         assert_eq!(
@@ -10739,13 +10696,8 @@ end })
             .prepare_replacement_runtime(replacement, None, &runtime)
             .unwrap();
 
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
         runtime.app.input_box.history_up();
 
         assert_eq!(runtime.app.input_box.buffer.value(), PROMPT);
@@ -12399,13 +12351,8 @@ end })
         assert_eq!(provider.current_theme_name(), PREVIEW_THEME);
 
         let prepared = harness.prepare();
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
 
         assert_eq!(provider.current_theme_name(), ORIGINAL_THEME);
         release_runtime(old);
@@ -12420,13 +12367,8 @@ end })
         let cancel = runtime.lifetime_cancel.clone();
         let prepared = harness.prepare();
 
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
 
         assert!(runtime.app.exit_on_done);
         assert!(cancel.is_cancelled());
@@ -12690,13 +12632,8 @@ end })
             .ctx()
             .prepare_replacement_runtime(session, None, &runtime)
             .unwrap();
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
         assert_eq!(runtime.id(), id);
         assert_ne!(runtime.generation, generation);
         assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
@@ -12978,13 +12915,8 @@ end })
             .prepare_replacement_runtime(session, None, &runtime)
             .unwrap();
 
-        let old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
 
         assert!(old.session_lock.is_none());
         assert!(runtime.session_lock.is_some());
@@ -13004,13 +12936,8 @@ end })
         let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
         let prepared = harness.ctx().prepare_runtime(target).unwrap();
 
-        let mut old = replace_session_runtime(
-            &mut runtime,
-            prepared,
-            &harness.ctx().sessions_dir,
-            &harness.ctx().model_slot,
-        )
-        .unwrap();
+        let mut old =
+            replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot).unwrap();
 
         assert_eq!(runtime.id(), target_id);
         assert!(runtime.session_lock.is_some());

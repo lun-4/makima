@@ -33,7 +33,6 @@ pub(crate) use tickets::TURN_DOCS;
 pub(crate) struct LuaAgent {
     pub(super) manager: AgentManagerHandle,
     pub(super) id: AgentId,
-    transcript_key: Option<String>,
     held: Option<AgentRef>,
     ancestors: Vec<AgentId>,
 }
@@ -1302,7 +1301,6 @@ mod tests {
                     LuaAgent {
                         manager: manager.clone(),
                         id: target.id(),
-                        transcript_key: Some(managed_fixture.as_ref().unwrap().1.ui_id.clone()),
                         held: Some(target.clone()),
                         ancestors: vec![target.id()],
                     },

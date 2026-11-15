@@ -22,12 +22,12 @@ use crate::session_checkpoint::stored_agent_config;
 use crate::session_options::{FAST_PENDING_MODEL_OPTION_ID, YOLO_OPTION_ID};
 use crate::state::StateEdit;
 use crate::types::{ActorWorkIdentity, ActorWorkKind};
-use crate::{AgentInput, AgentMode, CancelToken, CancelTrigger, EventSender, ModeDef, TurnId};
+use crate::{AgentInput, CancelToken, CancelTrigger, EventSender, TurnId};
 
 use super::{
     ActorError, ActorInner, ActorLifecycle, ActorOperation, ActorState, AgentActorHandle,
-    ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedModel, TurnTicket, config,
-    drive_operations, lifecycle_error, materialize, preparation_input,
+    ConfigChange, ConfigCommit, EffectiveAgentConfig, TurnTicket, config, drive_operations,
+    lifecycle_error, materialize, preparation_input,
 };
 
 const PUBLICATION_CALLBACK_PANICKED: &str = "publication callback panicked";
@@ -53,7 +53,6 @@ pub struct PreparedTransactionSnapshot {
     pub journal: Option<SessionJournalSnapshot>,
     pub boundary: Option<RewindBoundary>,
     pub clear_pending_fast: bool,
-    pub options: Option<BTreeMap<String, String>>,
     journal_context: Option<(Arc<SessionJournal>, JournalIncarnation)>,
     context_updates: Vec<ContextUpdate>,
     context_event_sender: Option<EventSender>,
@@ -141,7 +140,7 @@ impl PreparedTransaction {
             if let Some((journal, incarnation)) = snapshot.journal_context.take() {
                 let mut config = stored_agent_config(&snapshot.config, BTreeMap::new())
                     .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
-                let options = snapshot.options.clone().or(self.options);
+                let options = self.options;
                 let clear_pending_fast = snapshot.clear_pending_fast;
                 let state_edits = self.state_edits;
                 let context_updates = snapshot.context_updates.clone();
@@ -277,9 +276,6 @@ pub(super) struct PreparedOperation {
     context_policy: Option<ContextPolicy>,
     change: Option<Option<ConfigChange>>,
     clear_pending_fast: bool,
-    restore: Option<(PreparedModel, (AgentMode, ModeDef))>,
-    force_generation: bool,
-    restore_options: Option<BTreeMap<String, String>>,
     ready: Option<(Arc<EffectiveAgentConfig>, Option<TurnAdmissionSnapshot>)>,
     pub(super) failure: Arc<Mutex<Option<ActorError>>>,
     cancel: CancelToken,
@@ -434,9 +430,6 @@ impl AgentActorHandle {
                 context_policy: None,
                 change: None,
                 clear_pending_fast: false,
-                restore: None,
-                force_generation: false,
-                restore_options: None,
                 ready: None,
                 failure: Arc::clone(&failure),
                 cancel,
@@ -788,7 +781,6 @@ impl PreparedOperation {
             journal: None,
             boundary: None,
             clear_pending_fast: self.clear_pending_fast,
-            options: self.restore_options.clone(),
             journal_context: inner.context_journal(),
             context_updates: self
                 .ready
@@ -811,7 +803,7 @@ impl PreparedOperation {
         let current = state
             .policy
             .as_ref()
-            .filter(|current| !self.force_generation && config::equivalent(current, candidate));
+            .filter(|current| config::equivalent(current, candidate));
         ConfigCommit {
             identity: Arc::clone(&inner.identity),
             generation: state
@@ -844,23 +836,21 @@ impl PreparedOperation {
         if let Some(journal) = &inner.journal {
             let config = stored_agent_config(&commit.config, BTreeMap::new())
                 .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
-            let options = self.restore_options.clone().or_else(|| {
-                self.clear_pending_fast.then(|| {
-                    let mut options = journal
-                        .snapshot()
-                        .state
-                        .iter()
-                        .rev()
-                        .find_map(|record| match &record.change {
-                            StateChange::Config(config) if record.agent == Some(inner.agent_id) => {
-                                Some(config.options.clone())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    options.remove(FAST_PENDING_MODEL_OPTION_ID);
-                    options
-                })
+            let options = self.clear_pending_fast.then(|| {
+                let mut options = journal
+                    .snapshot()
+                    .state
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.change {
+                        StateChange::Config(config) if record.agent == Some(inner.agent_id) => {
+                            Some(config.options.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                options.remove(FAST_PENDING_MODEL_OPTION_ID);
+                options
             });
             journal
                 .record_config_with_context_for(
@@ -1068,7 +1058,6 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
         .and_then(|current| {
             if let Some(change) = &change {
                 pending.clear_pending_fast = change.clears_pending_fast(current);
-                pending.force_generation = matches!(change, ConfigChange::Restore(_));
             }
             let pending_fast = inner.journal.as_ref().is_some_and(|journal| {
                 journal
@@ -1105,17 +1094,7 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
                     .is_some_and(|change| change.restores_pending_fast(current));
             let candidate = change.map_or_else(
                 || Ok(Arc::clone(current)),
-                |change| match (change, pending.restore.take()) {
-                    (ConfigChange::Restore(stored), Some((prepared, mode))) => {
-                        pending.restore_options = Some(stored.options.clone());
-                        ConfigChange::resolved_restore(&stored, prepared, mode, current)
-                            .map(Arc::new)
-                    }
-                    (ConfigChange::Restore(_), None) => Err(ActorError::InvalidConfig(
-                        "restore requires resources resolved against current discovery".into(),
-                    )),
-                    (change, _) => change.apply(current).map(Arc::new),
-                },
+                |change| change.apply(current).map(Arc::new),
             )?;
             if restore_fast {
                 ConfigChange::Patch(super::ConfigPatch {

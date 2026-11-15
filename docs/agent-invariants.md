@@ -59,6 +59,9 @@ These invariants cover the actor, manager and agent frontends as they are curren
 39. Actor/backend factories run outside the graph lock. Returned errors, panics, concurrent closure, and failed commit all roll reservations back exactly once.
 40. Never hold the graph lock across an await, actor call, backend call, factory invocation, task join, or any path that can re-enter tool dispatch.
 41. Durable agent records retain topology, spawn specification, lifecycle, usage, and identity across restart. Runtime residency and incarnation reservations are separate. Reactivation installs at most one resident actor and must reject a stale reservation or closed, retired, or unrestorable record.
+    - `ResidentInitialization::finish_with` acquires the activation-completion read guard before graph validation. Once the attempt is marked finishing, manager-owned work retains that guard through publication and activation commit or rollback, even if the initiating waiter is dropped. Fallible host registration precedes this work.
+    - Shutdown and detach acquire activation completion before journal publication. When these guards overlap the graph lock, the order is activation completion, journal publication, graph. No path may await activation completion or journal publication while holding the graph lock. The journal publication lock is distinct from its state mutex.
+    - Rewind acquires activation completion before reserving the affected graph, then releases both before reserving journal publication. Shutdown and rewind wait for finishing activation. Detach defers cleanup when the completion guard is unavailable and never blocks a destructor. Close refuses an affected finishing subtree with `BusySubtree` before mutating it.
 42. Root and descendant construction must not fall back to direct `AgentActorHandle::spawn`. Direct construction is allowed only in tests.
 
 ## Managed concurrency and descendant waits
@@ -75,7 +78,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 52. A wait without a current managed invocation uses an ordinary exact-ticket wait and yields no parent permit.
 53. Parent cancellation signals all registered watchers but does not bypass the global limit for backend cleanup.
 54. Abnormal managed-execution drop closes lease registration, signals watchers, releases physical capacity, and revokes authority without creating an ownership cycle.
-55. Manager shutdown owns and eventually joins or reaps actor runners and wait watchers. A timeout transfers ownership to the reaper rather than leaking tasks.
+55. Manager shutdown owns and eventually joins or reaps actor runners and wait watchers. Shutdown waits for finishing activation before starting its timeout budget. The timeout bounds publication-guard acquisition and runner drain after activation completes, not the full shutdown call. A stuck protected initialization can therefore delay shutdown indefinitely. Once that wait completes, a timeout transfers remaining cleanup to the reaper rather than leaking tasks. `ShutdownReport` describes node joins at return; it is not a guarantee that retained cleanup has finished. Reaping requires a running executor and cannot guarantee completion after process exit. Frontend forced-exit deadlines remain best-effort and may interrupt cleanup; only the published journal prefix is recoverable.
 
 ## History, events, and persistence
 

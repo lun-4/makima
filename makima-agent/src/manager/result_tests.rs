@@ -2,13 +2,14 @@ use super::{
     AgentLimits, AgentManagerHandle, AgentResidency, GraphLifecycle, ManagerError, ResidentAgent,
 };
 use crate::{
-    AgentId, AgentMode, DoneReason, History, RunSettings, TurnId, TurnOutcome, TurnProvenance,
-    TurnResult, TurnTicket,
+    AgentId, AgentInput, AgentMode, DoneReason, History, RunSettings, TurnCancellationReason,
+    TurnId, TurnOutcome, TurnProvenance, TurnResult, TurnTicket,
     actor::EffectiveAgentConfig,
     journal::{JournalChange, JournalCommit, SessionJournal},
     test_util::StubBackend,
     tools::offload::OffloadStore,
 };
+use futures_lite::future::or;
 use makima_providers::{Message, Model, provider::unconfigured};
 use makima_storage::{
     id::{MakimaId, SessionRef},
@@ -19,6 +20,7 @@ use makima_storage::{
     test_util::test_record,
 };
 use serde_json::json;
+use smol::Timer;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 #[cfg(unix)]
 use std::{fs, os::unix::fs::symlink};
@@ -28,6 +30,7 @@ use test_case::test_case;
 const MODEL: &str = "test/model";
 const HISTORY_TEXT: &str = "retained conversation";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const POP_GATE_TIMEOUT: &str = "turn did not reach the pop gate";
 #[cfg(unix)]
 const REPLACEMENT: &str = "replacement";
 
@@ -205,6 +208,12 @@ fn bound_store_resolves_dormant_results_and_hydrates_actor_owned_tickets() {
         fixture.bind();
         let dormant = fixture.ticket().unwrap();
         assert_eq!(dormant.peek_result(), Some(fixture.expected.clone()));
+        let latest = fixture
+            .manager
+            .latest_retained_turn_ticket(&fixture.manager.reference(fixture.agent_id()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.peek_result(), Some(fixture.expected.clone()));
         fixture.assert_dormant();
         fixture.activate().await;
         let actor = fixture.manager.actor(fixture.agent_id()).unwrap();
@@ -216,6 +225,68 @@ fn bound_store_resolves_dormant_results_and_hydrates_actor_owned_tickets() {
         assert!(actor.owns_ticket(&retained));
         assert_eq!(retained.peek_result(), Some(fixture.expected.clone()));
         fixture.shutdown().await;
+    });
+}
+
+#[test]
+fn latest_ticket_survives_close_before_terminal_result_is_published() {
+    smol::block_on(async {
+        let fixture = Fixture::new(|_| {});
+        fixture.bind();
+        fixture.activate().await;
+        let agent = fixture.manager.reference(fixture.agent_id());
+        let actor = fixture.manager.actor(fixture.agent_id()).unwrap();
+        let (popped, release) = actor.pause_after_next_pop();
+        let pending = actor
+            .admit_turn(
+                AgentInput {
+                    message: HISTORY_TEXT.into(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    prompt: None,
+                },
+                None,
+                HISTORY_TEXT.into(),
+            )
+            .unwrap();
+        or(async { popped.recv_async().await.unwrap() }, async {
+            Timer::after(SHUTDOWN_TIMEOUT).await;
+            panic!("{POP_GATE_TIMEOUT}");
+        })
+        .await;
+        fixture.manager.close_subtree(fixture.agent_id()).unwrap();
+        assert!(matches!(
+            fixture.manager.actor(fixture.agent_id()),
+            Err(ManagerError::NonLiveAgent(_))
+        ));
+        let snapshot = fixture.manager.journal().checkpoint_snapshot().unwrap();
+        let view = snapshot.fold(snapshot.seq).unwrap();
+        let results = &view.scopes[&Some(fixture.agent_id())].results;
+        assert_eq!(results.back().unwrap().0, fixture.turn_id());
+        assert!(results.iter().all(|(turn, _)| *turn != pending.turn_id()));
+        let latest = fixture
+            .manager
+            .latest_retained_turn_ticket(&agent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.turn_id(), pending.turn_id());
+        assert!(actor.owns_ticket(&latest));
+        assert!(latest.peek().is_none());
+        release.send(()).unwrap();
+        fixture.shutdown().await;
+        assert!(matches!(
+            latest.peek(),
+            Some(TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Closed,
+                ..
+            })
+        ));
+        let retained = fixture
+            .manager
+            .latest_retained_turn_ticket(&agent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.peek_result(), latest.peek_result());
     });
 }
 

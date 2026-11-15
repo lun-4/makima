@@ -619,11 +619,7 @@ impl SessionLogCheckpoint {
             &mut candidate,
             &request.snapshot,
             journal_snapshot.is_none(),
-        )
-        .map_err(|error| CheckpointError::Save {
-            session_id: request.session_id,
-            message: Arc::from(error.to_string()),
-        })?;
+        );
         let saved = match publication_guard {
             Some(guard) => guard
                 .publish(|| candidate.save(dir))
@@ -766,11 +762,7 @@ impl SessionLogCheckpoint {
             &mut candidate,
             &request.snapshot,
             journal_snapshot.is_none(),
-        )
-        .map_err(|error| CheckpointError::Save {
-            session_id: request.session_id,
-            message: Arc::from(error.to_string()),
-        })?;
+        );
         Self::publish_candidate(dir, &candidate, guard, publication, claim)?;
         *lock(session) = RetainedSession {
             session: candidate,
@@ -1018,18 +1010,15 @@ pub fn stored_agent_config(
     })
 }
 
-pub fn apply_session_checkpoint(
-    session: &mut StoredSession,
-    checkpoint: &SessionCheckpoint,
-) -> Result<(), SessionError> {
-    apply_session_checkpoint_with_history(session, checkpoint, true)
+pub fn apply_session_checkpoint(session: &mut StoredSession, checkpoint: &SessionCheckpoint) {
+    apply_session_checkpoint_with_history(session, checkpoint, true);
 }
 
 fn apply_session_checkpoint_with_history(
     session: &mut StoredSession,
     checkpoint: &SessionCheckpoint,
     apply_history: bool,
-) -> Result<(), SessionError> {
+) {
     if apply_history
         && checkpoint.kind != SessionCheckpointKind::Options
         && let Some(history) = &checkpoint.history
@@ -1037,7 +1026,6 @@ fn apply_session_checkpoint_with_history(
         session.adopt_history(history);
         session.update_title_if_default();
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1836,7 +1824,6 @@ mod tests {
         config.context = AgentContextSnapshot::new(PathBuf::from(cwd));
         config.mode_def = Some(ModeDef::default_for(ModeId::Build));
         CommittedConfigProjection {
-            runtime: Arc::new(()),
             generation: 1,
             runtime_epoch: 1,
             config: Arc::new(config),

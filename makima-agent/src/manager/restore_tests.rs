@@ -1,8 +1,18 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_lite::future::{or, poll_once, yield_now};
 use makima_providers::TokenUsage;
 use makima_providers::{Message, Model, provider::unconfigured};
+use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::session_state::{
     StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
     StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
@@ -13,7 +23,7 @@ use test_case::test_case;
 
 use super::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
-    ReactivationError, ResidentAgent,
+    ReactivationError, ResidentAgent, ResidentInitialization,
 };
 use crate::{
     ActorBackend, AgentId, AgentInput, AgentMode, BackendResult, ControlWork, History,
@@ -39,6 +49,7 @@ const DETACH_TIMEOUT: Duration = Duration::from_secs(1);
 const PUBLICATION_PLUGIN: &str = "detach-publication";
 const PUBLICATION_VERSION: u32 = 2;
 const PUBLICATION_VALUE: &str = "published candidate";
+const INITIALIZATION_CONTROL: &str = "initialization-publication";
 
 #[test]
 fn deferred_close_cannot_close_replacement_incarnation() {
@@ -1470,6 +1481,349 @@ fn detached_activation_cannot_publish_or_roll_back_replacement(initialize: bool)
             &manager.actor(id).unwrap().identity()
         ));
         manager.validate_incarnation(&current).unwrap();
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum InitializationCut {
+    DropWaiter,
+    Shutdown,
+    ShutdownWithoutDrainBudget,
+    Rewind,
+}
+
+struct InitializationBackend {
+    journal: Arc<SessionJournal>,
+    returned: Arc<AtomicBool>,
+    started: flume::Sender<(bool, bool)>,
+    stub: StubBackend,
+}
+
+impl ActorBackend for InitializationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        input: AgentInput,
+        kind: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        self.stub.run_turn(history, context, input, kind)
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        context: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let snapshot = self.journal.checkpoint_snapshot().unwrap();
+            let published = snapshot
+                .plugin(Some(context.agent_id), PUBLICATION_PLUGIN)
+                .is_some_and(|value| value.value == Some(serde_json::json!(PUBLICATION_VALUE)));
+            self.started
+                .send((published, self.returned.load(Ordering::Acquire)))
+                .unwrap();
+            BackendResult::ControlDone
+        })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        instructions: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        self.stub.run_compact(history, context, instructions)
+    }
+}
+
+#[test_case(InitializationCut::DropWaiter; "dropped_waiter")]
+#[test_case(InitializationCut::Shutdown; "shutdown")]
+#[test_case(InitializationCut::ShutdownWithoutDrainBudget; "shutdown_zero_budget_waits_for_finishing_activation")]
+#[test_case(InitializationCut::Rewind; "rewind")]
+fn finish_with_retains_claimed_publication_until_work_returns(cut: InitializationCut) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let publication = CheckpointPublication::default();
+        let work_publication = publication.clone();
+        let work_journal = Arc::clone(&journal);
+        let returned = Arc::new(AtomicBool::new(false));
+        let work_returned = Arc::clone(&returned);
+        let (claimed, claim) = flume::bounded(1);
+        let (acknowledge, ack) = flume::bounded(1);
+        let (persisted, persistence) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let (started, start) = flume::bounded(1);
+        let backend = InitializationBackend {
+            journal: Arc::clone(&journal),
+            returned,
+            started,
+            stub: StubBackend,
+        };
+        let mut first = Some(Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.backend = Box::new(backend);
+            resident.initialize = Some(Box::new(move |input: ResidentInitialization| {
+                Box::pin(async move {
+                    let actor = input.actor.clone();
+                    input
+                        .finish_with(async move {
+                            actor
+                                .push_control(
+                                    INITIALIZATION_CONTROL.into(),
+                                    INITIALIZATION_CONTROL.into(),
+                                    None,
+                                )
+                                .unwrap();
+                            let binding = work_journal.incarnation(id);
+                            let token = work_journal
+                                .prepare_with(|_| publication_commit(&binding))
+                                .await
+                                .unwrap();
+                            assert!(work_publication.try_publish());
+                            claimed.send(()).unwrap();
+                            ack.recv_async().await.unwrap();
+                            let candidate = token.snapshot().clone();
+                            token.commit().unwrap();
+                            work_journal.acknowledge(&candidate).unwrap();
+                            persisted.send(candidate).unwrap();
+                            wait.recv_async().await.unwrap();
+                            work_returned.store(true, Ordering::Release);
+                            Ok(())
+                        })
+                        .await
+                })
+            }));
+            Ok(resident)
+        })));
+        assert!(poll_once(first.as_mut().unwrap().as_mut()).await.is_none());
+        claim.recv_async().await.unwrap();
+        let incarnation = manager.incarnation(id).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("finish_with waiter must share the activation")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        assert!(!publication.cancel());
+        let shutdown_timeout = if cut == InitializationCut::ShutdownWithoutDrainBudget {
+            Duration::ZERO
+        } else {
+            SHUTDOWN_TIMEOUT
+        };
+        let mut shutdown = Box::pin(manager.shutdown(shutdown_timeout));
+        let mut rewind = Box::pin(manager.begin_rewind(id));
+        match cut {
+            InitializationCut::DropWaiter => drop(first.take()),
+            InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
+                assert!(poll_once(shutdown.as_mut()).await.is_none());
+            }
+            InitializationCut::Rewind => assert!(poll_once(rewind.as_mut()).await.is_none()),
+        }
+        assert_checkpoint(&journal, &before);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(!manager.is_live(id));
+        assert!(start.try_recv().is_err());
+        acknowledge.send(()).unwrap();
+        let candidate = persistence.recv_async().await.unwrap();
+        assert_checkpoint(&journal, &candidate);
+        assert_eq!(manager.incarnation(id).unwrap(), incarnation);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        assert!(start.try_recv().is_err());
+        match cut {
+            InitializationCut::DropWaiter => {}
+            InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
+                assert!(poll_once(shutdown.as_mut()).await.is_none());
+            }
+            InitializationCut::Rewind => assert!(poll_once(rewind.as_mut()).await.is_none()),
+        }
+        release.send(()).unwrap();
+        let agent = sibling.await.unwrap();
+        if let Some(first) = first {
+            assert_eq!(first.await.unwrap().id(), agent.id());
+        }
+        if matches!(cut, InitializationCut::DropWaiter) {
+            assert_eq!(start.recv_async().await.unwrap(), (true, true));
+        }
+        assert_eq!(manager.incarnation(id).unwrap(), incarnation);
+        assert_checkpoint(&journal, &candidate);
+        match cut {
+            InitializationCut::Shutdown => assert!(shutdown.await.timed_out.is_empty()),
+            InitializationCut::ShutdownWithoutDrainBudget => {
+                let report = shutdown.await;
+                assert!(report.joined.contains(&id) || report.timed_out.contains(&id));
+                assert!(matches!(
+                    manager
+                        .ensure_resident_with(id, |_| async { Ok(resident()) })
+                        .await,
+                    Err(ManagerError::GraphShutdown)
+                ));
+                manager.wait_until_reaped().await;
+                assert!(manager.cleanup_finished());
+            }
+            InitializationCut::Rewind => {
+                let guard = rewind.await.unwrap();
+                assert!(guard.actor_guards().contains_key(&id));
+                assert_checkpoint(&journal, &candidate);
+                drop(guard);
+                assert!(
+                    manager
+                        .shutdown(SHUTDOWN_TIMEOUT)
+                        .await
+                        .timed_out
+                        .is_empty()
+                );
+            }
+            InitializationCut::DropWaiter => {
+                agent.validate_live().unwrap();
+                assert!(
+                    manager
+                        .shutdown(SHUTDOWN_TIMEOUT)
+                        .await
+                        .timed_out
+                        .is_empty()
+                );
+            }
+        }
+    });
+}
+
+#[test_case(false, true; "cancel_before_claim")]
+#[test_case(false, false; "fail_before_claim")]
+#[test_case(true, false; "fail_after_claim")]
+fn finish_with_rejected_publication_preserves_checkpoint(claim: bool, cancel: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let publication = CheckpointPublication::default();
+        let work_publication = publication.clone();
+        let work_journal = Arc::clone(&journal);
+        let (prepared, preparation) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut first = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                Box::pin(input.finish_with(async move {
+                    let binding = work_journal.incarnation(id);
+                    let _token = work_journal
+                        .prepare_with(|_| publication_commit(&binding))
+                        .await
+                        .unwrap();
+                    if claim {
+                        assert!(work_publication.try_publish());
+                    }
+                    prepared.send(()).unwrap();
+                    wait.recv_async().await.unwrap();
+                    if cancel {
+                        assert!(!work_publication.try_publish());
+                        Err(ReactivationError::Cancelled)
+                    } else {
+                        Err(ReactivationError::Initialization(
+                            INITIALIZATION_ERROR.into(),
+                        ))
+                    }
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        preparation.recv_async().await.unwrap();
+        let old = manager.incarnation(id).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("failed finish_with waiter must share the activation")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        if cancel {
+            assert!(publication.cancel());
+        } else {
+            assert!(!publication.is_cancelled());
+        }
+        assert_checkpoint(&journal, &before);
+        drop(first);
+        release.send(()).unwrap();
+        let expected = if cancel {
+            ReactivationError::Cancelled
+        } else {
+            ReactivationError::Initialization(INITIALIZATION_ERROR.into())
+        };
+        assert_eq!(
+            sibling.await.unwrap_err(),
+            ManagerError::Reactivation(expected)
+        );
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert_ne!(manager.incarnation(id).unwrap(), old);
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn finish_with_closed_actor_rejects_activation_without_checkpoint_changes() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (entered, entry) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut first = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                let actor = input.actor.clone();
+                Box::pin(input.finish_with(async move {
+                    entered.send(actor.clone()).unwrap();
+                    wait.recv_async().await.unwrap();
+                    actor.close();
+                    Ok(())
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        let actor = entry.recv_async().await.unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("closed finish_with actor must not start a replacement factory")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        drop(first);
+        release.send(()).unwrap();
+        assert!(matches!(sibling.await, Err(ManagerError::Reactivation(_))));
+        assert!(!manager.is_live(id));
+        assert_dormant(&manager, id);
+        assert_ne!(actor.lifecycle(), crate::ActorLifecycle::Open);
         assert_checkpoint(&journal, &before);
         assert!(
             manager

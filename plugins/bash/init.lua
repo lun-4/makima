@@ -385,6 +385,7 @@ end
 makima.api.register_tool({
   name = "bash",
   kind = "execute",
+  shell_execution = true,
   description = description,
   permission = "run",
   schema = {

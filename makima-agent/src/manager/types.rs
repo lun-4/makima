@@ -92,6 +92,20 @@ pub struct ResidentInitialization {
     pub agent: AgentRef,
     pub actor: AgentActorHandle,
     pub incarnation: AgentIncarnation,
+    pub(super) start: flume::Sender<()>,
+}
+
+impl ResidentInitialization {
+    /// Owns durable initialization and activation completion even if its waiter is dropped.
+    /// Complete fallible host registration first. `work` must not invalidate the actor;
+    /// its publication must remain bound to the caller's cancellation authority.
+    /// Shutdown, rewind, and detach wait for completion; close returns `BusySubtree`.
+    pub async fn finish_with(
+        self,
+        work: impl Future<Output = Result<(), ReactivationError>> + Send + 'static,
+    ) -> Result<(), ReactivationError> {
+        self.agent.manager().finish_initialization(self, work).await
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -192,7 +192,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
     };
     let id = session.agent_id;
     let agent = try_pair!(lookup(session.agent.manager(), id, &lua));
-    retain_session(&lua, session, owner);
+    let _cleanup = retain_session(&lua, session, owner);
     Ok((Some(agent), None))
 }
 
@@ -200,7 +200,7 @@ pub(in crate::api::agent) fn retain_session(
     lua: &Lua,
     session: LuaSession,
     owner: Option<Arc<str>>,
-) {
+) -> impl FnOnce() + Send + 'static {
     let id = session.agent_id;
     let actor = Arc::clone(&session.actor);
     let events = actor.subscribe_events();
@@ -217,8 +217,12 @@ pub(in crate::api::agent) fn retain_session(
     let snapshot = actor.snapshot();
     if snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none() {
         owners.retire_incarnation(id, &identity);
-        return;
     }
+    let cleanup = {
+        let owners = owners.clone();
+        let identity = identity.clone();
+        move || owners.retire_incarnation(id, &identity)
+    };
     smol::spawn(async move {
         while let Ok(event) = events.recv_async().await {
             if matches!(event, ActorEvent::Close { .. }) {
@@ -228,4 +232,5 @@ pub(in crate::api::agent) fn retain_session(
         }
     })
     .detach();
+    cleanup
 }

@@ -6,7 +6,7 @@ use super::super::{EventLoop, InternalEvent, PreparedProvider, reserve_config_ch
 use crate::AppSession;
 use crate::chat::Chat;
 use crate::components::{Action, DisplayRole, Status};
-use makima_agent::actor::{ActorStatus, ConfigChange, HistoryBoundary, PreparedModel};
+use makima_agent::actor::{ActorStatus, ConfigChange, ConfigPatch, HistoryBoundary, PreparedModel};
 use makima_agent::command::CONTEXT_RELOAD_ROOT_ONLY;
 use makima_agent::context::root_context;
 use makima_agent::file_restore;
@@ -18,6 +18,7 @@ use makima_agent::state::{StateScope, StateSlotSpec};
 use makima_agent::tools::ToolRegistry;
 use makima_agent::{AgentInput, AgentMode, AgentRef, CancelToken, Post, PostLevel, TurnOutcome};
 use makima_commands::{CommandError, CommandOutcome, InputDispatch};
+use makima_config::{Effect, PermissionRule, ToolKey};
 use makima_lua::PluginHost;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
@@ -32,6 +33,7 @@ use makima_storage::restore::{
 };
 use makima_storage::session_lock;
 use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
+use makima_storage::sessions::StoredRule;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -694,9 +696,67 @@ fn context_reload_routes_root_and_rewinds_recorded_instructions_despite_changed_
 #[test_case(false; "root_rewind_and_redo")]
 #[test_case(true; "repeated_rewind_and_redo")]
 fn root_rewind_and_branch_redo_publish_actor_journal_and_disk(repeated: bool) {
+    const NEXT_MODEL: &str = "openai/gpt-5";
+    const ORIGINAL_SCOPE: &str = "original rewind rule *";
+    const LATER_SCOPE: &str = "later rewind rule *";
     with_event_loop(|event_loop| {
-        let (index, _host) = two_turn_fixture(event_loop);
+        let (index, _host) = setup(event_loop);
         let root = target(event_loop, index);
+        let permissions = event_loop.sessions[index]
+            .coordinator
+            .permissions()
+            .unwrap();
+        permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: Some(ORIGINAL_SCOPE.into()),
+            effect: Effect::Deny,
+        });
+        let historical_rules = permissions.snapshot().stored_rules();
+        assert_eq!(historical_rules.len(), 1);
+        turn(event_loop, index, FIRST);
+        turn(event_loop, index, SECOND);
+        let assert_config = |event_loop: &EventLoop<'_>, model: &str, rules: &[StoredRule]| {
+            assert_eq!(
+                root.effective_config().unwrap().unwrap().model.spec(),
+                model
+            );
+            assert_eq!(permissions.snapshot().stored_rules(), rules);
+            let journal = root.manager().journal().snapshot();
+            let view = journal.fold(journal.seq).unwrap();
+            let loaded =
+                AppSession::load(event_loop.sessions[index].id(), &event_loop.ctx.storage).unwrap();
+            for state in [view, loaded.latest_state().unwrap()] {
+                assert_eq!(
+                    state.scopes[&Some(root.id())]
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .model,
+                    model
+                );
+                assert_eq!(state.scopes[&None].rules, rules);
+            }
+            assert_persisted_state(&loaded, &journal);
+        };
+        checkpoint(event_loop, index);
+        assert_config(event_loop, MODEL, &historical_rules);
+        let reservation =
+            reserve_config_change(&root, &event_loop.sessions[index].coordinator, None).unwrap();
+        smol::block_on(reservation.commit_change(ConfigChange::Patch(ConfigPatch {
+            model: Some(PreparedModel {
+                model: Model::from_spec(NEXT_MODEL).unwrap(),
+                provider: Arc::clone(&root.effective_config().unwrap().unwrap().provider),
+            }),
+            ..Default::default()
+        })))
+        .unwrap();
+        permissions.add_session_rule(PermissionRule {
+            tool: ToolKey::native("bash"),
+            scope: Some(LATER_SCOPE.into()),
+            effect: Effect::Allow,
+        });
+        let later_rules = permissions.snapshot().stored_rules();
+        assert_eq!(later_rules.len(), historical_rules.len() + 1);
         smol::block_on(
             event_loop.sessions[index]
                 .coordinator
@@ -705,6 +765,7 @@ fn root_rewind_and_branch_redo_publish_actor_journal_and_disk(repeated: bool) {
         .unwrap();
         turn(event_loop, index, THIRD);
         let original = checkpoint(event_loop, index);
+        assert_config(event_loop, NEXT_MODEL, &later_rules);
         let (history, durable) = boundary(event_loop, index, SECOND);
         let expected = original.messages()[..history.offset].to_vec();
         event_loop.handle_action(
@@ -722,6 +783,7 @@ fn root_rewind_and_branch_redo_publish_actor_journal_and_disk(repeated: bool) {
             SECOND
         );
         assert!(!root.effective_config().unwrap().unwrap().workflow);
+        assert_config(event_loop, MODEL, &historical_rules);
         let branch = event_loop.sessions[index]
             .app
             .state
@@ -743,6 +805,7 @@ fn root_rewind_and_branch_redo_publish_actor_journal_and_disk(repeated: bool) {
             );
             finish_restore(event_loop, index);
             assert_history(event_loop, index, &expected);
+            assert_config(event_loop, MODEL, &historical_rules);
             assert_eq!(
                 event_loop.sessions[index].app.input_box.buffer.value(),
                 FIRST
@@ -758,6 +821,7 @@ fn root_rewind_and_branch_redo_publish_actor_journal_and_disk(repeated: bool) {
         finish_restore(event_loop, index);
         assert_history(event_loop, index, original.messages());
         assert!(root.effective_config().unwrap().unwrap().workflow);
+        assert_config(event_loop, NEXT_MODEL, &later_rules);
         smol::block_on(
             event_loop.sessions[index]
                 .coordinator
@@ -899,7 +963,12 @@ fn child_restore_preserves_outside_root_history_config_scroll_and_draft(outside_
             ));
             assert_eq!(manager.journal().snapshot().state, before.state);
         }
+        event_loop.sessions[index]
+            .app
+            .seed_recoverable_queue_for_test(vec![OUTSIDE_DRAFT.into()]);
         let original = checkpoint(event_loop, index);
+        assert_eq!(original.meta.queued_messages, [OUTSIDE_DRAFT]);
+        assert!(event_loop.sessions[index].app.holds_recovery_text());
         let root_history = root.actor().unwrap().committed_history();
         let root_config = root.effective_config().unwrap().unwrap();
         let (history, durable) = boundary_for(&child, THIRD);
@@ -947,6 +1016,8 @@ fn child_restore_preserves_outside_root_history_config_scroll_and_draft(outside_
             })
         );
         let loaded = AppSession::load(original.id, &event_loop.ctx.storage).unwrap();
+        assert_eq!(loaded.meta.queued_messages, original.meta.queued_messages);
+        assert!(!loaded.meta.queued_messages.is_empty());
         assert_eq!(
             serde_json::to_value(&loaded.subagent_messages()[&key]).unwrap(),
             serde_json::to_value(&expected).unwrap()
@@ -2184,11 +2255,12 @@ fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool, files_only:
         if baseline {
             super::super::tests::release_runtime(retired);
             pump_until(event_loop, |_| source_lease.upgrade().is_none());
-            session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                .unwrap()
-                .unwrap()
-                .release()
-                .unwrap();
+            let mut claimed = None;
+            pump_until(event_loop, |event_loop| {
+                claimed = session_lock::claim(&event_loop.ctx.sessions_dir, &id).unwrap();
+                claimed.is_some()
+            });
+            claimed.unwrap().release().unwrap();
         } else {
             let manager = retired.handles.manager_and_root().0;
             drop(retired);

@@ -1,7 +1,6 @@
 //! Errors the Lua agent API reports, shared with tests that assert them.
 
 pub const INVOCATION_EXPIRED: &str = "context invocation expired";
-pub const NO_PLUGIN_AUTHORITY: &str = "no active plugin authority";
 pub const NO_TASK_AUTHORITY: &str = "no active task authority";
 pub const MANAGED_AUTHORITY_INACTIVE: &str =
     "managed agent authority is not active in this invocation";

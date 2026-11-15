@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
+use std::time::Duration;
 
 use futures_lite::future::poll_once;
 use makima_config::ModelPolicy;
@@ -35,6 +37,9 @@ use super::{
     ReactivationError, ResidentAgent,
 };
 
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+const COMPLETION_WAKE_TIMEOUT: &str = "rewind did not wake after completion";
+const UNRELATED_COMPLETION_TIMEOUT: &str = "child rewind waited for unrelated completion";
 const TRANSCRIPT: &str = "rewind-child";
 const INPUT: &str = "rewind admission";
 const HISTORICAL_LABEL: &str = "historical";
@@ -160,6 +165,106 @@ fn graph() -> (AgentManagerHandle, AgentId, AgentId) {
         AgentManagerHandle::restore_graph(AgentLimits::default(), journal, view, histories)
             .unwrap();
     (manager, root, child)
+}
+
+struct RewindWake(flume::Sender<()>);
+
+impl Wake for RewindWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+#[test_case(false; "tool_completion")]
+#[test_case(true; "deferred_cleanup")]
+fn rewind_sleeps_until_completion_is_published(cleanup: bool) {
+    smol::block_on(async {
+        let (manager, root, child) = graph();
+        if !cleanup {
+            manager
+                .ensure_resident_with(child, |_| async { Ok(resident(RewindBackend::idle())) })
+                .await
+                .unwrap();
+        }
+        let (entered, started) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let completion = async move {
+            entered.send(()).unwrap();
+            wait.recv_async().await.unwrap();
+        };
+        if cleanup {
+            manager.retain_cleanup_task(smol::spawn(completion));
+        } else {
+            manager.retain_tool_completion(child, completion).unwrap();
+        }
+        started.recv_async().await.unwrap();
+        let (wake, wakes) = flume::bounded(1);
+        let waker = Waker::from(Arc::new(RewindWake(wake)));
+        let mut rewind = Box::pin(manager.begin_rewind(root));
+        assert!(
+            rewind
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(wakes.try_recv().is_err());
+        release.send(()).unwrap();
+        let guard = futures_lite::future::or(
+            async {
+                loop {
+                    wakes.recv_async().await.unwrap();
+                    if let Poll::Ready(result) =
+                        rewind.as_mut().poll(&mut Context::from_waker(&waker))
+                    {
+                        break result.unwrap();
+                    }
+                }
+            },
+            async {
+                smol::Timer::after(COMPLETION_TIMEOUT).await;
+                panic!("{COMPLETION_WAKE_TIMEOUT}");
+            },
+        )
+        .await;
+        assert!(manager.tool_completions_finished(Some(child)));
+        assert!(manager.cleanup_tasks_finished());
+        drop(guard);
+        if let Ok(actor) = manager.actor(child) {
+            actor.shutdown();
+        }
+    });
+}
+
+#[test]
+fn child_rewind_does_not_wait_for_unrelated_tool_completion() {
+    smol::block_on(async {
+        let (manager, root, child) = graph();
+        manager
+            .ensure_resident_with(root, |_| async { Ok(resident(RewindBackend::idle())) })
+            .await
+            .unwrap();
+        let (release, wait) = flume::bounded(1);
+        manager
+            .retain_tool_completion(root, async move {
+                wait.recv_async().await.unwrap();
+            })
+            .unwrap();
+        let guard = futures_lite::future::or(manager.begin_rewind(child), async {
+            smol::Timer::after(COMPLETION_TIMEOUT).await;
+            panic!("{UNRELATED_COMPLETION_TIMEOUT}");
+        })
+        .await
+        .unwrap();
+        assert!(!manager.tool_completions_finished(Some(root)));
+        drop(guard);
+        release.send(()).unwrap();
+        manager.drain_tool_completions(root).await;
+        manager.actor(root).unwrap().shutdown();
+    });
 }
 
 #[test]

@@ -14,10 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::actor::ActorHistory;
 use crate::call_scope::{CallGuard, CallScope, MovedBy};
-use crate::file_restore::{
-    SUPPORTED,
-    recording::{SHELL_KIND, ToolRecording},
-};
+use crate::file_restore::{SUPPORTED, recording::ToolRecording};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
@@ -900,7 +897,7 @@ async fn run_native_tool(
         Some((exec_ctx, guard, key, path)) => (exec_ctx, Some(guard), Some(key), Some(path)),
         None => (ctx.clone(), None, None, None),
     };
-    let is_shell = entry.tool.tool_kind() == Some(SHELL_KIND);
+    let is_shell = entry.tool.shell_execution();
     let (result_tx, result_rx) = flume::bounded(1);
     let completion = async move {
         let _guard = guard;
@@ -1513,7 +1510,7 @@ mod tests {
     use crate::agent::history::History;
     use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
-    use crate::file_restore::StoredSession;
+    use crate::file_restore::{StoredSession, recording::SHELL_KIND};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::manager::{GraphLifecycle, ReactivationError, ResidentAgent};
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
@@ -4144,7 +4141,7 @@ mod tests {
 
     struct ShellMarkerProbe {
         name: &'static str,
-        kind: Option<&'static str>,
+        shell_execution: bool,
         executed: Arc<AtomicUsize>,
     }
 
@@ -4159,7 +4156,10 @@ mod tests {
             json!({"type": "object"})
         }
         fn tool_kind(&self) -> Option<&str> {
-            self.kind
+            Some(SHELL_KIND)
+        }
+        fn shell_execution(&self) -> bool {
+            self.shell_execution
         }
         fn required_permission(&self) -> Option<Permission> {
             Some(Permission::Run)
@@ -4191,12 +4191,12 @@ mod tests {
         }
     }
 
-    #[test_case(Some(SHELL_KIND), false, false, 1; "renamed_execute_kind")]
-    #[test_case(None, true, false, 0; "execute_name_without_kind")]
-    #[test_case(Some(SHELL_KIND), false, true, 0; "permission_denial_records_nothing")]
-    #[test_case(Some(SHELL_KIND), true, false, 1; "execute_name_and_kind_once")]
-    fn central_dispatch_records_actual_shell_kind_once_per_nested_execution(
-        kind: Option<&'static str>,
+    #[test_case(true, false, false, 1; "renamed_shell")]
+    #[test_case(false, true, false, 0; "execute_kind_without_shell_marker")]
+    #[test_case(true, false, true, 0; "permission_denial_records_nothing")]
+    #[test_case(true, true, false, 1; "shell_name_and_kind_once")]
+    fn central_dispatch_records_shell_marker_once_per_nested_execution(
+        shell_execution: bool,
         named_execute: bool,
         denied: bool,
         markers_per_call: usize,
@@ -4238,7 +4238,7 @@ mod tests {
             )));
             ctx.registry = registered(Arc::new(ShellMarkerProbe {
                 name,
-                kind,
+                shell_execution,
                 executed: executed.clone(),
             }));
             pin(&mut ctx);

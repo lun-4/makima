@@ -150,7 +150,6 @@ pub enum ConfigChange {
         mode: AgentMode,
         mode_def: Option<ModeDef>,
     },
-    Restore(StoredAgentConfig),
     WorkingDirectory(PathBuf),
     ToggleFast,
     ToggleWorkflow,
@@ -242,11 +241,6 @@ impl ConfigChange {
     ) -> Result<EffectiveAgentConfig, ActorError> {
         let mut config = current.clone();
         let mut patch = match self {
-            Self::Restore(_) => {
-                return Err(ActorError::InvalidConfig(
-                    "restore requires resources resolved against current discovery".into(),
-                ));
-            }
             Self::WorkingDirectory(cwd) => {
                 if !cwd.is_absolute() {
                     return Err(ActorError::InvalidConfig(

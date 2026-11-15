@@ -167,9 +167,15 @@ makima.api.register_tool({
             elseif input.action == "legacy" then
                 local out, err = makima.agent.call_tool(ctx, "task_wait", { task_id = input.legacy })
                 assert(out == nil and err == "unknown task_id", tostring(err))
-            elseif input.action == "close" or input.action == "retained" then
-                if input.action == "close" then call(ctx, "task_despawn", { task_id = ids.task_id }) end
+            elseif input.action == "close" then
+                call(ctx, "task_despawn", { task_id = ids.task_id })
                 assert(call(ctx, "task_wait", ids).result.text == "durable task reply")
+            elseif input.action == "retained" then
+                local out, err = makima.agent.call_tool(ctx, "task_wait", { task_id = ids.task_id, turn_id = ids.turn_id })
+                assert(out == nil and err == "unknown task_id", tostring(err))
+                local agent = assert(makima.agent.get(ctx, ids.task_id))
+                local ticket = assert(agent:turn(ctx, ids.turn_id))
+                assert(assert(ticket:wait(ctx)).text == "durable task reply")
             else
                 local result = call(ctx, "task_wait", ids)
                 assert(result.result.text == "durable task reply")
@@ -494,7 +500,7 @@ fn task_tools_restore_policy_and_exact_turns(kind: &str) {
     assert_eq!(
         policy.as_ref().unwrap()[ids["task_id"].as_str().unwrap()],
         json!({
-            "description": kind, "writes": kind == "general", "owner": ids["owner"],
+            "description": kind, "writes": kind == "general",
         })
     );
     let host = host.restart_host(dir.path());

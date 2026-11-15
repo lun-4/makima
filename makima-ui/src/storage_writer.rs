@@ -28,7 +28,6 @@ use makima_storage::sessions::{
 use makima_storage::{StateDir, StorageError};
 use tracing::warn;
 
-use makima_agent::actor::EffectiveAgentConfig;
 use makima_agent::journal::{SessionJournal, SessionJournalSnapshot};
 use makima_agent::session_checkpoint::{apply_session_checkpoint, validate_checkpoint_history};
 use makima_agent::session_coordinator::{
@@ -132,7 +131,7 @@ pub struct StagedSessionCheckpoint {
     pub session_id: MakimaId,
     pub checkpoint: Option<Arc<SessionCheckpoint>>,
     pub journal: Option<SessionJournalSnapshot>,
-    pub selected_config: Option<(HistoryDestination, Arc<EffectiveAgentConfig>)>,
+    pub selected_config: Option<HistoryDestination>,
     pub history: Option<(HistoryDestination, HistorySnapshot<Message>)>,
     pub publication: CheckpointPublication,
     pub claim: CheckpointClaim,
@@ -1594,7 +1593,7 @@ fn enqueue_staged_checkpoint_inner(
             validate_checkpoint_history(checkpoint, request.history.is_some())
                 .map_err(str::to_owned)?;
         }
-        if let Some((destination, _)) = &request.selected_config
+        if let Some(destination) = &request.selected_config
             && (!matches!(destination, HistoryDestination::Child(_))
                 || request
                     .history
@@ -2151,7 +2150,7 @@ fn promote_staged_checkpoint(
     if let Some((destination, history)) = &request.history {
         adopt_checkpoint_history(Arc::make_mut(session), destination, history, live_ids);
     }
-    if let Some((HistoryDestination::Child(key), _)) = &request.selected_config
+    if let Some(HistoryDestination::Child(key)) = &request.selected_config
         && !session
             .subagents()
             .iter()
@@ -2226,7 +2225,7 @@ fn merge_checkpoint(
     live_ids: Option<&[String]>,
 ) -> Result<AppSession, SessionError> {
     let mut session = base.clone();
-    apply_session_checkpoint(&mut session, checkpoint)?;
+    apply_session_checkpoint(&mut session, checkpoint);
     session.latest_state()?;
     if checkpoint.kind != SessionCheckpointKind::Options && checkpoint.history.is_some() {
         prune_main_history(&mut session, live_ids);
@@ -3124,7 +3123,7 @@ impl Writer {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| CHECKPOINT_REPLACED.to_owned())?;
-            if let Some((HistoryDestination::Child(key), _)) = &request.selected_config
+            if let Some(HistoryDestination::Child(key)) = &request.selected_config
                 && !candidate
                     .subagents()
                     .iter()
@@ -3163,7 +3162,7 @@ impl Writer {
         {
             return Err(CHECKPOINT_REPLACED.into());
         }
-        if let Some((HistoryDestination::Child(key), _)) = &request.selected_config
+        if let Some(HistoryDestination::Child(key)) = &request.selected_config
             && !candidate
                 .subagents()
                 .iter()
@@ -3385,7 +3384,7 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::event_loop::rewind::tests::assert_persisted_state;
-    use makima_agent::actor::AgentContextSnapshot;
+    use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::session_checkpoint::stored_agent_config;
     use makima_agent::session_coordinator::CommittedConfigProjection;
@@ -3494,7 +3493,6 @@ mod tests {
         );
         config.context = AgentContextSnapshot::new(PathBuf::from(cwd));
         CommittedConfigProjection {
-            runtime: Arc::new(()),
             runtime_epoch,
             generation,
             config: Arc::new(config),
@@ -4565,10 +4563,7 @@ mod tests {
                     session_id: id,
                     checkpoint: None,
                     journal: None,
-                    selected_config: Some((
-                        HistoryDestination::Child(child.into()),
-                        config_checkpoint(1, 1).config.unwrap().config,
-                    )),
+                    selected_config: Some(HistoryDestination::Child(child.into())),
                     history: None,
                     publication: CheckpointPublication::default(),
                     claim: publication_claim(),
@@ -4643,11 +4638,6 @@ mod tests {
             Message::user(BASE_MSG.into()),
             Message::user(COORDINATOR_MSG.into()),
         ]);
-        let history_model = if history_first {
-            NEXT_MODEL
-        } else {
-            FAILED_MODEL
-        };
         let config_claim: CheckpointClaim = if reject {
             Arc::new(|_| Err(Arc::from(CHECKPOINT_CANCELLED)))
         } else {
@@ -4655,14 +4645,10 @@ mod tests {
         };
         let mut replies = Vec::new();
         for history in [history_first, !history_first] {
-            let (staged_history, model, claim) = if history {
-                (
-                    Some((destination(), edited.clone())),
-                    history_model,
-                    publication_claim(),
-                )
+            let (staged_history, claim) = if history {
+                (Some((destination(), edited.clone())), publication_claim())
             } else {
-                (None, FAILED_MODEL, Arc::clone(&config_claim))
+                (None, Arc::clone(&config_claim))
             };
             let reply = enqueue_staged_checkpoint(
                 &writer.pending,
@@ -4671,10 +4657,7 @@ mod tests {
                     session_id: id,
                     checkpoint: None,
                     journal: None,
-                    selected_config: Some((
-                        destination(),
-                        config_projection(model, CWD, 1, 1).config,
-                    )),
+                    selected_config: Some(destination()),
                     history: staged_history,
                     publication: CheckpointPublication::default(),
                     claim,
@@ -4887,10 +4870,7 @@ mod tests {
                 session_id: id,
                 checkpoint: None,
                 journal: None,
-                selected_config: Some((
-                    HistoryDestination::Child(TOOL_ID.into()),
-                    config_projection(NEXT_MODEL, CWD, 1, 1).config,
-                )),
+                selected_config: Some(HistoryDestination::Child(TOOL_ID.into())),
                 history: None,
                 publication: CheckpointPublication::default(),
                 claim: publication_claim(),
@@ -6247,10 +6227,7 @@ mod tests {
                     session_id: id,
                     checkpoint: None,
                     journal: Some(expected.clone()),
-                    selected_config: Some((
-                        HistoryDestination::Child(TOOL_ID.into()),
-                        config_projection(NEXT_MODEL, CWD, 1, 1).config,
-                    )),
+                    selected_config: Some(HistoryDestination::Child(TOOL_ID.into())),
                     history: Some((HistoryDestination::Child(TOOL_ID.into()), history)),
                     publication: CheckpointPublication::default(),
                     claim: publication_claim(),

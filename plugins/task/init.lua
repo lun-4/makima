@@ -8,7 +8,7 @@ local GENERAL_SEND_IN_PLAN_ERR =
 local GENERAL_BLOCKED_IN_PLAN_ERR =
   "general subagents are blocked in plan mode; use research or plan_reviewer (read-only)"
 local UNKNOWN_TASK_ERR = "unknown task_id"
-local TASK_ACCESS_ERR = "task is owned by another agent branch"
+local LEGACY_TASK_ACCESS_ERR = "task is owned by another agent branch"
 local RETIRE_CONTEXT_ERR = "task-retire requires an agent context"
 local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local QUOTE_BAR = "│ "
@@ -224,10 +224,6 @@ local function enqueue(agent, message, ctx)
 end
 
 local function spawn(spec, input, ctx)
-  local owner, owner_err = ctx:agent()
-  if not owner then
-    return nil, owner_err
-  end
   local agent, spawn_err = makima.agent.spawn(ctx, spawn_options(spec, input))
   if not agent then
     return nil, spawn_err
@@ -243,7 +239,6 @@ local function spawn(spec, input, ctx)
       tasks[task_id] = {
         description = input.description,
         writes = spec.subagent_type == "general",
-        owner = owner:id(),
       }
       return tasks
     end)
@@ -326,6 +321,15 @@ makima.api.register_command({
     end
     local ok
     ok, err = agent:retire(ctx)
+    if not ok then
+      error(err)
+    end
+    ok, err = policy:update(ctx, function(tasks)
+      if tasks then
+        tasks[id] = nil
+      end
+      return tasks or {}
+    end)
     if not ok then
       error(err)
     end
@@ -455,7 +459,7 @@ local function wait_view(input, output, is_error, ctx, state)
     local errors = {
       [TURN_UNAVAILABLE_ERR] = "Cannot retrieve this turn: its result is no longer retained.",
       [UNKNOWN_TASK_ERR] = "Cannot retrieve this task: it is no longer available.",
-      [TASK_ACCESS_ERR] = "Cannot retrieve this task: it belongs to another agent branch.",
+      [LEGACY_TASK_ACCESS_ERR] = "Cannot retrieve this task: it belongs to another agent branch.",
     }
     status, style = errors[output] and (errors[output] .. " (" .. output .. ")") or ("Wait failed: " .. output), "error"
   elseif envelope.status == "running" then

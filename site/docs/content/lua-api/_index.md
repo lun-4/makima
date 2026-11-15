@@ -431,6 +431,7 @@ string or a table with richer output fields.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
+  - `shell_execution` (`boolean`) Record each execution as a shell command that file restore cannot undo. Default: false.
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
   - `restore` (`function`) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -1493,7 +1494,7 @@ empty table.
 
 ## makima.state {#makima-state}
 
-Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Agent-scoped values follow the durable agent ID across session restart. Unloaded plugin values remain stored without running plugin code; old slot handles return state_slot_expired after unload or replacement. StateSlot methods are get(ctx), set(ctx, value, opts?), delete(ctx, opts?), update(ctx, callback), and on_change(callback). get returns value, revision on success, including nil, revision for an absent value; update returns the updated value and revision. Failures return nil, error. set and delete return revision or nil, error. opts.expect requires the observed revision. State writes require a live invocation context; retaining a slot or context does not extend its authority.
+Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Agent-scoped values follow the durable agent ID across session restart. Unloaded plugin values remain stored without running plugin code; old slot handles return state_slot_expired after unload or replacement. StateSlot methods are get(ctx), set(ctx, value, opts?), delete(ctx, opts?), update(ctx, callback), and on_change(callback). get returns value, revision on success, including nil, revision for an absent value; update returns the updated value and revision. Passing nil to set or returning nil from an update callback stores JSON null, which reads back as makima.state.null. Use delete to remove a value. Failures return nil, error. set and delete return revision or nil, error. opts.expect requires the observed revision. State writes require a live invocation context; retaining a slot or context does not extend its authority. Notifications for a dormant child keep state access pinned to that child, but currently use the root callback template for model and workflow context when no child template is available.
 
 ---
 

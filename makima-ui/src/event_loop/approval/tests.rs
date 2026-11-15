@@ -1566,6 +1566,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
             let (manager, root) = runtime.handles.manager_and_root();
             let actor = manager.actor(root).unwrap();
             runtime.app.status == Status::Idle
+                && runtime.app.run_id == actor.presentation_id()
                 && !runtime.app.plan_approval_pending
                 && actor.snapshot().status == ActorStatus::Idle
                 && matches!(
@@ -1861,12 +1862,26 @@ fn parent_navigation_rejects_without_replacing_implementation(changed_cwd: bool)
     });
 }
 
-#[test_case(false; "normal_publication")]
-#[test_case(true; "implementation_lease_lost_after_publication")]
-fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(lose_source_lease: bool) {
+#[test_case(false, false; "normal_publication")]
+#[test_case(true, false; "implementation_lease_lost_after_publication")]
+#[test_case(false, true; "parent_navigation_after_cd")]
+fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(
+    lose_source_lease: bool,
+    after_cd: bool,
+) {
     const LATEST_DRAFT: &str = "implementation draft typed immediately before parent navigation";
     with_event_loop(|event_loop| {
         let (index, path, requests, _host) = setup(event_loop);
+        if after_cd {
+            let cwd = PathBuf::from(&event_loop.session_cwd).join(MOVED_CWD);
+            fs::create_dir_all(&cwd).unwrap();
+            event_loop.handle_action(index, Action::ChangeDirectory(cwd.clone()));
+            pump_until(event_loop, |event_loop| {
+                event_loop.sessions[index].coordinator.read().cwd().as_ref() == Some(&cwd)
+                    && Path::new(&event_loop.sessions[index].app.state.session.cwd) == cwd
+            });
+            assert_ne!(Path::new(&event_loop.session_cwd), cwd);
+        }
         approve(event_loop, index, true);
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].app.root_mode() == Mode::Build

@@ -68,6 +68,8 @@ const RETENTION_CHILD_REPLIES: [&str; 3] = [
     "third task result",
 ];
 const RETENTION_FOLLOWUP_REPLY: &str = "first task followup result";
+const RETIRE_CYCLES: usize = 3;
+const RETIRE_DESCRIPTION_BYTES: usize = MAX_PLUGIN_VALUE_BYTES / 2;
 const ROLLBACK_RETAINED_LIMIT: usize = 2;
 const ROLLBACK_FAILED_ATTEMPTS: usize = 4;
 const STATE_SIZE_ERROR: &str = "state value exceeds maximum encoded size";
@@ -1606,6 +1608,66 @@ fn completed_unrelated_tasks_preserve_first_task_result_and_followup() {
     assert_eq!(original["status"], "done");
     assert_eq!(original["result"]["turn_id"], first["turn_id"]);
     assert_eq!(original["result"]["text"], RETENTION_CHILD_REPLIES[0]);
+}
+
+#[test]
+fn retired_task_policy_releases_space_for_later_spawns() {
+    let provider = Arc::new(common::CannedProvider::new(
+        (0..RETIRE_CYCLES)
+            .map(|_| common::canned_reply(PLAIN_TEXT))
+            .collect(),
+    ));
+    let (ctx, _events, _cancel) = common::ctx_with_provider(provider);
+    let (reg, host, ctx) = load_real_driver_host_with_limits(
+        &ctx,
+        AgentLimits {
+            max_retained_agents: ROLLBACK_RETAINED_LIMIT,
+            ..AgentLimits::default()
+        },
+        "",
+    );
+    let current = ctx.managed_turn.as_ref().unwrap();
+    let manager = current.manager();
+    let root = manager.reference(current.agent_id());
+    for _ in 0..RETIRE_CYCLES {
+        let task = common::exec_tool(
+            &reg,
+            &ctx,
+            TASK_SPAWN_TOOL,
+            task_input(&"x".repeat(RETIRE_DESCRIPTION_BYTES), None),
+        )
+        .unwrap();
+        common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, task.clone()).unwrap();
+        common::exec_tool(&reg, &ctx, TASK_DESPAWN_TOOL, task.clone()).unwrap();
+        let id = task["task_id"].as_str().unwrap();
+        let done = makima_lua::test_support::run_command(
+            &host.command_registry(),
+            &format!("/task-retire {id}"),
+            0,
+            Some(makima_lua::orchestration::TrustedTarget {
+                target: root.clone(),
+                template: ctx.clone(),
+            }),
+        );
+        smol::block_on(common::bounded(done.recv_async()))
+            .unwrap()
+            .unwrap();
+        let snapshot = manager.journal().snapshot();
+        let folded = snapshot.fold(snapshot.seq).unwrap();
+        let stored = folded.scopes[&None].plugins["task_policy_real/policy"]
+            .value
+            .as_ref()
+            .unwrap();
+        assert!(stored.as_object().unwrap().is_empty());
+        assert_eq!(
+            manager
+                .journal()
+                .agent(id.parse().unwrap())
+                .unwrap()
+                .lifecycle,
+            StoredAgentLifecycle::Retired
+        );
+    }
 }
 
 #[test_case::test_case(false; "initial_admission")]

@@ -139,7 +139,6 @@ pub enum SessionCoordinatorError {
 
 #[derive(Clone)]
 pub struct CommittedConfigProjection {
-    pub runtime: Arc<()>,
     pub generation: u64,
     pub runtime_epoch: u64,
     pub config: Arc<EffectiveAgentConfig>,
@@ -398,7 +397,6 @@ impl SessionTransactionReservation {
                             history,
                             options,
                             config: Some(CommittedConfigProjection {
-                                runtime: snapshot.commit.identity,
                                 generation: snapshot.commit.generation,
                                 runtime_epoch,
                                 config: snapshot.commit.config,

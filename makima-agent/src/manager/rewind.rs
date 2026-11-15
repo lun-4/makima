@@ -27,6 +27,7 @@ pub struct ManagerRewindGuard {
 
 impl AgentManagerHandle {
     pub async fn begin_rewind(&self, scope: AgentId) -> Result<ManagerRewindGuard, ManagerError> {
+        let completion = self.0.activation_completion.write_arc().await;
         let (affected, actors, discarded) = {
             let mut graph = self.lock_graph();
             if graph.shutting_down {
@@ -91,6 +92,7 @@ impl AgentManagerHandle {
             graph.revision += 1;
             (affected, actors, discarded)
         };
+        drop(completion);
         let mut guard = ManagerRewindGuard {
             manager: self.clone(),
             affected,
@@ -112,7 +114,8 @@ impl AgentManagerHandle {
             }
         }
         guard.actors = loop {
-            let cleanup_finished = self.cleanup_finished();
+            let changed = self.0.reaped.listen();
+            let cleanup_finished = self.cleanup_tasks_finished();
             let actors = {
                 let graph = self.lock_graph();
                 if graph.shutting_down {
@@ -143,7 +146,7 @@ impl AgentManagerHandle {
             if let Some(actors) = actors {
                 break actors;
             }
-            smol::future::yield_now().await;
+            changed.await;
         };
         for (id, actor) in &guard.actors {
             let idle = loop {
@@ -159,8 +162,17 @@ impl AgentManagerHandle {
             };
             guard.guards.insert(*id, idle);
         }
-        while !self.cleanup_finished() {
-            smol::future::yield_now().await;
+        loop {
+            let changed = self.0.reaped.listen();
+            if self.cleanup_tasks_finished()
+                && guard
+                    .affected
+                    .iter()
+                    .all(|agent| self.tool_completions_finished(Some(*agent)))
+            {
+                break;
+            }
+            changed.await;
         }
         self.lock_graph().rewind_quiescent = true;
         Ok(guard)

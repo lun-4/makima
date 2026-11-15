@@ -166,11 +166,6 @@ pub(crate) fn lookup(
             .parent_id;
     }
     Ok(LuaAgent {
-        transcript_key: manager
-            .journal()
-            .agent(id)
-            .map(|record| record.transcript_key)
-            .or(node.metadata.transcript_key),
         manager,
         id,
         held: Some(held),
@@ -621,7 +616,6 @@ mod tests {
                 r#"
             local child = assert(agent_api.get(ctx, child_id))
             assert(child:id() == child_id)
-            assert(child:_makima_session_id() == {TRANSCRIPT_KEY:?})
             assert(not child:is_live())
             local status = assert(child:status(ctx))
             assert(not status.live and status.status == expected_status)

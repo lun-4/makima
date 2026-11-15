@@ -706,6 +706,11 @@ fn spawn_agent_internal(
         None => AgentManagerHandle::new_with_journal(agent_limits(&config), journal)
             .map_err(|error| error.to_string())?,
     };
+    if let Some(store) = &offload {
+        manager
+            .bind_result_store(Arc::clone(store))
+            .map_err(|error| error.to_string())?;
+    }
     let (runner_start, start_rx) = flume::bounded(1);
     let mut orchestration_template = None;
     let initial_config = initial_config.with_context(

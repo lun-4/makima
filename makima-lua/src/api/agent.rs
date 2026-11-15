@@ -2314,96 +2314,118 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                             .map_err(|error| {
                                 ReactivationError::Initialization(error.to_string())
                             })?;
-                        if warning.is_some() {
-                            let actor = initialization.actor.clone();
-                            let target = initialization.agent.clone();
-                            let incarnation = initialization.incarnation.clone();
-                            let ticket = ConfigChangeTicket::reserve_for_actor(
-                                actor,
-                                CheckpointPublication::default(),
-                                |publication| {
-                                    target.manager().validate_activation(&incarnation)?;
-                                    services.reserve_config_mutation(&target, publication)
-                                },
-                            )
-                            .map_err(|error| {
-                                ReactivationError::Initialization(error.to_string())
-                            })?;
-                            ticket
-                                .commit(async |publication, config| {
-                                    let claim =
-                                        activation_ctx.publication_claim(&lua, &publication)?;
-                                    target.manager().validate_activation(&incarnation)?;
-                                    let owner_registration = authority
-                                        .as_ref()
-                                        .map(|owner| owner.register_publication(&publication));
-                                    let guarded: CheckpointClaim = Arc::new(move |publication| {
-                                        let _registration = &owner_registration;
-                                        claim(publication)
-                                    });
-                                    Ok((
-                                        guarded,
-                                        ConfigChange::Mode {
-                                            mode: config.mode.clone(),
-                                            mode_def: config.mode_def.clone(),
-                                        },
-                                    ))
-                                })
-                                .await
-                                .map_err(|error| {
-                                    ReactivationError::Initialization(error.to_string())
-                                })?;
-                        }
+                        let session = LuaSession {
+                            agent_id: initialization.agent.id(),
+                            actor: Arc::new(initialization.actor.clone()),
+                            state: state.clone(),
+                            agent: initialization.agent.clone(),
+                            incarnation: initialization.incarnation.clone(),
+                            services: Some(services.clone()),
+                        };
                         let install = || {
                             let current = crate::orchestration::services(&lua)
                                 .ok_or("agent host is unavailable")?;
                             if !Arc::ptr_eq(&services, &current) {
                                 return Err("agent host changed during activation".into());
                             }
-                            services.validate_target(&initialization.agent)?;
-                            initialization
+                            services.validate_target(&session.agent)?;
+                            session
                                 .agent
                                 .manager()
-                                .validate_incarnation(&initialization.incarnation)
+                                .validate_incarnation(&session.incarnation)
                                 .map_err(|error| error.to_string())?;
                             services.register_child_activation(
                                 crate::orchestration::TrustedTarget {
-                                    target: initialization.agent.clone(),
+                                    target: session.agent.clone(),
                                     template,
                                 },
                                 state.ui_id.clone(),
-                                &initialization.actor,
-                                &initialization.incarnation,
+                                &session.actor,
+                                &session.incarnation,
                             )?;
-                            *cancel_actor.lock().unwrap() = Some(initialization.actor.clone());
-                            let session = LuaSession {
-                                agent_id: initialization.agent.id(),
-                                actor: Arc::new(initialization.actor),
-                                state: state.clone(),
-                                agent: initialization.agent,
-                                incarnation: initialization.incarnation,
-                                services: Some(services.clone()),
-                            };
-                            handles::retain_session(&lua, session, owner);
-                            smol::spawn(relay_session_events_scoped(
-                                sub_rx,
-                                state.parent_event_tx.clone(),
-                                state.subagent_info.clone(),
-                                None,
-                                state.silent,
-                                Some(Arc::downgrade(&state)),
-                            ))
-                            .detach();
-                            if let Some(message) = warning {
-                                let _ = state
-                                    .parent_event_tx
-                                    .send(AgentEvent::ControlError { message });
-                            }
                             Ok(())
                         };
                         guard
                             .claim(authority.as_deref(), install)
-                            .map_err(ReactivationError::Initialization)
+                            .map_err(ReactivationError::Initialization)?;
+                        let publication = CheckpointPublication::default();
+                        let claim = activation_ctx
+                            .publication_claim(&lua, &publication)
+                            .map_err(ReactivationError::Initialization)?;
+                        let owner_registration = authority
+                            .as_ref()
+                            .map(|owner| owner.register_publication(&publication));
+                        let actor = session.actor.as_ref().clone();
+                        let target = session.agent.clone();
+                        let incarnation = session.incarnation.clone();
+                        *cancel_actor.lock().unwrap() = Some(actor.clone());
+                        let cleanup = guard
+                            .claim(authority.as_deref(), || {
+                                Ok(handles::retain_session(&lua, session, owner))
+                            })
+                            .map_err(ReactivationError::Initialization)?;
+                        let mut cleanup = RetainedSessionCleanup(Some(cleanup));
+                        smol::spawn(relay_session_events_scoped(
+                            sub_rx,
+                            state.parent_event_tx.clone(),
+                            state.subagent_info.clone(),
+                            None,
+                            state.silent,
+                            Some(Arc::downgrade(&state)),
+                        ))
+                        .detach();
+                        initialization
+                            .finish_with(async move {
+                                let result = async {
+                                    if warning.is_some() {
+                                        let ticket = ConfigChangeTicket::reserve_for_actor(
+                                            actor,
+                                            publication,
+                                            move |publication| {
+                                                target
+                                                    .manager()
+                                                    .validate_activation(&incarnation)?;
+                                                services
+                                                    .reserve_config_mutation(&target, publication)
+                                            },
+                                        )
+                                        .map_err(|error| {
+                                            ReactivationError::Initialization(error.to_string())
+                                        })?;
+                                        ticket
+                                            .commit(async move |_, config| {
+                                                let guarded: CheckpointClaim =
+                                                    Arc::new(move |publication| {
+                                                        let _registration = &owner_registration;
+                                                        claim(publication)
+                                                    });
+                                                Ok((
+                                                    guarded,
+                                                    ConfigChange::Mode {
+                                                        mode: config.mode.clone(),
+                                                        mode_def: config.mode_def.clone(),
+                                                    },
+                                                ))
+                                            })
+                                            .await
+                                            .map_err(|error| {
+                                                ReactivationError::Initialization(error.to_string())
+                                            })?;
+                                    }
+                                    if let Some(message) = warning {
+                                        let _ = state
+                                            .parent_event_tx
+                                            .send(AgentEvent::ControlError { message });
+                                    }
+                                    Ok(())
+                                }
+                                .await;
+                                if result.is_ok() {
+                                    cleanup.0.take();
+                                }
+                                result
+                            })
+                            .await
                     })
                 })),
             })
@@ -2420,6 +2442,16 @@ pub(crate) fn detach_all_agents(lua: &Lua) {
 
 pub(crate) fn close_plugin_agents(lua: &Lua, plugin: &str) {
     handles::close_plugin_agents(lua, plugin);
+}
+
+struct RetainedSessionCleanup<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for RetainedSessionCleanup<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
+    }
 }
 
 struct LuaSession {
@@ -2461,51 +2493,6 @@ impl Drop for LuaSession {
             output_tokens = snapshot.cumulative_usage.output,
             "subagent session dropped",
         );
-    }
-}
-
-struct LuaTaskOwner {
-    owner_id: Option<AgentId>,
-    plugin: Arc<str>,
-    generation: u64,
-    owner: Arc<crate::orchestration::PluginAuthority>,
-    target: AgentRef,
-}
-
-impl mlua::UserData for LuaTaskOwner {
-    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        // A managed task whose child has closed, for instance because its owner
-        // was closed, can be dropped without anyone's authority.
-        methods.add_method("_makima_retired", |_, this, ()| {
-            Ok(this.target.validate_live().is_err())
-        });
-        methods.add_method("_makima_can_control", |lua, this, ()| {
-            if InvocationGuard::capture(lua).is_err()
-                || !crate::orchestration::holds_plugin_grant(
-                    lua,
-                    &this.plugin,
-                    this.generation,
-                    &this.owner,
-                )
-            {
-                return Ok(false);
-            }
-            let Some(current) = crate::runtime::current_managed_turn(lua) else {
-                return Ok(false);
-            };
-            if !current.manager().same_manager(&this.target.manager())
-                || current.validate_active().is_err()
-                || (current.agent_id() != this.target.id()
-                    && current.validate_descendant(this.target.id()).is_err())
-            {
-                return Ok(false);
-            }
-            Ok(match this.owner_id {
-                None => true,
-                Some(owner_id) if owner_id == current.agent_id() => true,
-                Some(owner_id) => current.validate_descendant(owner_id).is_ok(),
-            })
-        });
     }
 }
 

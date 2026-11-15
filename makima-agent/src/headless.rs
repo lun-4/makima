@@ -1295,6 +1295,11 @@ fn spawn_interactive(
                 let PreparedModel { model, provider } = prepare(params.model.clone())
                     .await
                     .map_err(|error| error.user_message())?;
+                if persist_turn_results && let Some(store) = &offload {
+                    manager
+                        .bind_result_store(Arc::clone(store))
+                        .map_err(|error| error.to_string())?;
+                }
                 model_source.install(Arc::clone(&provider), model.clone());
                 let mut mode_fallback = false;
                 let config = if let Some(stored) = restored_config {
@@ -1603,9 +1608,10 @@ pub(crate) mod tests {
     use crate::session_checkpoint::SessionLogCheckpoint;
     use crate::session_coordinator::tests::bind_initializing_actor;
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
+    use crate::test_util::StubBackend;
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
-    use makima_providers::provider::Provider;
+    use makima_providers::provider::{Provider, unconfigured};
     use makima_providers::{
         ContentBlock, ConversationEnd, Invocation, RequestDelivery, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -1615,8 +1621,12 @@ pub(crate) mod tests {
         CheckpointAck, CheckpointError, CheckpointFuture, CheckpointPublication, CheckpointRequest,
         CheckpointWriter, ClaimingWriter, accept_all,
     };
-    use makima_storage::session_state::{MAX_INLINE_TURN_RESULT_BYTES, StoredPayload};
+    use makima_storage::session_state::{
+        MAX_INLINE_TURN_RESULT_BYTES, StoredDelivery, StoredDeliveryOp, StoredPayload,
+    };
     use makima_storage::sessions::{SESSIONS_DIR, Session, offload_dir};
+    use makima_storage::test_util::test_record;
+    use std::collections::BTreeMap;
     use std::io;
     use std::sync::Barrier;
     use std::thread;
@@ -2581,6 +2591,204 @@ pub(crate) mod tests {
                 recovered.session().messages()
             );
             handle.task.cancel().await;
+        });
+    }
+
+    #[test]
+    fn oversized_results_survive_headless_restart_wake_and_rewind() {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(directory.path().to_path_buf());
+            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let session_id = session.id;
+            let provider: Arc<dyn Provider> = Arc::new(OversizedPrintProvider);
+            let coordinator = coordinator(session_id, checkpoint());
+            let binding = coordinator_binding(coordinator.clone(), Arc::clone(&provider));
+            let journal = Arc::new(SessionJournal::default());
+            journal.bind_session(session_id).unwrap();
+            let mut params = interactive_params(session_id, Vec::new());
+            params.journal = Some(journal);
+            params.state_dir = Some(directory.path().to_path_buf());
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
+                None,
+                Some(binding),
+            );
+            let ticket = bounded(handle.input_tx.admit(first_input())).await.unwrap();
+            let expected = bounded(ticket.wait_result()).await;
+            assert!(matches!(expected.outcome, TurnOutcome::Completed { .. }));
+            assert!(expected.text.len() > MAX_INLINE_TURN_RESULT_BYTES);
+            let root_id = handle.manager.root_id().unwrap();
+            session.bind_root_id(root_id).unwrap();
+            let config = handle.manager.effective_config(root_id).unwrap().unwrap();
+            let journal = handle.manager.journal();
+            let snapshot = journal.checkpoint_snapshot().unwrap();
+            let view = snapshot.fold(snapshot.seq).unwrap();
+            let stored = &view.scopes[&Some(root_id)].results[0].1;
+            assert!(matches!(stored.text, StoredPayload::Offloaded(_)));
+            let child_id = AgentId::generate();
+            let child_turn = TurnId::generate();
+            let child_result = TurnResult {
+                outcome: TurnOutcome::completed(
+                    child_id,
+                    child_turn,
+                    TokenUsage::default(),
+                    1,
+                    DoneReason::EndTurn,
+                ),
+                ..expected.clone()
+            };
+            let store = session_offload(Some(directory.path()), &handle.session_id).unwrap();
+            let child_stored = child_result.to_stored(session_id, Some(&store)).unwrap();
+            journal
+                .commit(JournalCommit {
+                    agents: vec![test_record(child_id, Some(root_id))],
+                    changes: vec![
+                        JournalChange {
+                            agent: Some(child_id),
+                            generation: 0,
+                            change: StateChange::Config(
+                                stored_agent_config(&config, Default::default()).unwrap(),
+                            ),
+                        },
+                        JournalChange {
+                            agent: Some(child_id),
+                            generation: 0,
+                            change: StateChange::Turn {
+                                turn: child_turn,
+                                result: child_stored.clone(),
+                            },
+                        },
+                        JournalChange {
+                            agent: Some(root_id),
+                            generation: 0,
+                            change: StateChange::Delivery {
+                                id: (child_id, child_turn),
+                                op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                                    label: None,
+                                    result: child_stored,
+                                    preview_bytes: None,
+                                    held: true,
+                                })),
+                            },
+                        },
+                    ],
+                    histories: BTreeMap::from([(
+                        child_id,
+                        History::new(Vec::new()).snapshot().clone(),
+                    )]),
+                    ..Default::default()
+                })
+                .unwrap();
+            journal
+                .checkpoint_snapshot()
+                .unwrap()
+                .apply_to(&mut session)
+                .unwrap();
+            session.save(&storage).unwrap();
+            handle.task.cancel().await;
+            assert!(
+                bounded(handle.manager.shutdown(GATE_TIMEOUT))
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+            bounded(coordinator.close()).await.unwrap();
+            drop(handle.manager);
+            drop(journal);
+
+            let loaded =
+                Session::<Message, TokenUsage, ToolOutput>::load(session_id, &storage).unwrap();
+            let mut params = interactive_params(session_id, Vec::new());
+            params.providers = Arc::new(makima_providers::test_util::offline_ids(&["anthropic"]));
+            params.root_id = Some(root_id);
+            params.journal = Some(Arc::new(SessionJournal::from_session(&loaded).unwrap()));
+            params.state_dir = Some(directory.path().to_path_buf());
+            let (provider, requests) = recording();
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
+                Some(loaded.history_snapshot()),
+                None,
+            );
+            let root = bounded(handle.initialized_root()).await.unwrap();
+            let actor = root.actor().unwrap();
+            assert_eq!(
+                actor.turn_ticket(ticket.turn_id()).unwrap().peek_result(),
+                Some(expected.clone())
+            );
+
+            let manager = &handle.manager;
+            assert_eq!(
+                manager
+                    .retained_turn_ticket(&manager.reference(child_id), child_turn)
+                    .unwrap()
+                    .peek_result(),
+                Some(child_result.clone()),
+            );
+            let child = bounded(manager.ensure_resident_with(child_id, |_| async {
+                Ok(ResidentAgent {
+                    backend: Box::new(StubBackend),
+                    config: (*config).clone(),
+                    shared_messages: None,
+                    start: None,
+                    initialize: None,
+                })
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                child
+                    .actor()
+                    .unwrap()
+                    .turn_ticket(child_turn)
+                    .unwrap()
+                    .peek_result(),
+                Some(child_result.clone())
+            );
+            let snapshot = manager.journal().checkpoint_snapshot().unwrap();
+            let mut rewind = bounded(manager.begin_rewind(root_id)).await.unwrap();
+            let preparer: ModelPreparer = Arc::new(|spec| {
+                Box::pin(async move {
+                    Ok(PreparedModel {
+                        model: Model::from_spec(&spec).unwrap(),
+                        provider: unconfigured(),
+                    })
+                })
+            });
+            let prepared = bounded(rewind.prepare_actors(
+                &snapshot,
+                &ModelPolicy::default(),
+                &preparer,
+                &ModeRegistry::builtin(),
+            ))
+            .await
+            .unwrap();
+            let installed: Vec<_> = prepared
+                .into_iter()
+                .map(|actor| actor.install_held())
+                .collect();
+            rewind.reconcile(&snapshot).unwrap();
+            assert_eq!(
+                actor.turn_ticket(ticket.turn_id()).unwrap().peek_result(),
+                Some(expected)
+            );
+            assert!(actor.withdraw_child_delivery(child_turn));
+            assert!(requests.is_empty());
+            drop(installed);
+            drop(rewind);
+            handle.task.cancel().await;
+            assert!(
+                bounded(manager.shutdown(GATE_TIMEOUT))
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
         });
     }
 

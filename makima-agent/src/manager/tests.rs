@@ -119,12 +119,12 @@ fn shutdown_drains_actual_write_before_incarnation_cleanup(timeout: bool) {
             let report = shutdown.as_mut().await;
             assert!(report.timed_out.contains(&root.id()));
         } else {
+            manager.detach_incarnation(&incarnation).unwrap();
             assert!(
                 futures_lite::future::poll_once(shutdown.as_mut())
                     .await
                     .is_none()
             );
-            manager.detach_incarnation(&incarnation).unwrap();
         }
         assert_eq!(
             journal.incarnation(root.id()).reservation,
