@@ -190,6 +190,23 @@ case("builtin_init_skill_is_model_hidden", function()
   assert(not result:find("init", 1, true), "hidden builtin should not be listed")
 end)
 
+-- ── builtin skill-creator skill ──
+
+case("builtin_skill_creator_loads", function()
+  local skill = require("skill_creator")
+  eq(skill.name, "skill-creator")
+  assert(#skill.description > 0, "description should not be empty")
+  eq(skill.disable_model_invocation, nil)
+  assert(skill.content:find("# Creating makima skills", 1, true), "content should contain the guide")
+end)
+
+case("builtin_skill_creator_is_model_visible", function()
+  local skill = require("skill_creator")
+  local result = build_skill_list({ [skill.name] = skill })
+  assert(result:find("skill-creator", 1, true), "visible builtin should be listed")
+  assert(result:find("Create, update, or review makima skills", 1, true), "description should be listed")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end

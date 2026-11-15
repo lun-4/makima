@@ -35,6 +35,9 @@ const SPELLING_BODY: &str = "spelling body marker";
 const BUILTIN_INIT: &str = "init";
 const INIT_DESCRIPTION: &str = "Initialize a project's AGENTS.md";
 const INIT_BODY: &str = "# Init: generate AGENTS.md";
+const BUILTIN_CREATOR: &str = "skill-creator";
+const CREATOR_DESCRIPTION: &str = "Create, update, or review makima skills";
+const CREATOR_BODY: &str = "# Creating makima skills";
 const UNKNOWN: &str = "nope";
 const NOT_FOUND: &str = "skill not found: nope";
 const SKILLS_TAG: &str = "<available_skills>";
@@ -198,4 +201,32 @@ fn builtin_init_skill_is_hidden_but_summonable() {
 
     let output = call_skill(&registry, BUILTIN_INIT).expect("init must load");
     assert!(output.contains(INIT_BODY), "got: {output}");
+}
+
+#[test]
+fn builtin_skill_creator_is_listed_and_loadable() {
+    let (handle, guard) = boot();
+    let registry = guard.host().registry();
+
+    let description = skill_description(&registry);
+    assert!(description.contains(BUILTIN_CREATOR), "got: {description}");
+    assert!(
+        description.contains(CREATOR_DESCRIPTION),
+        "got: {description}"
+    );
+
+    let expected = format!("skill:{BUILTIN_CREATOR}");
+    let items = handle.collect_completion_items(&CompletionCtx::default());
+    assert!(
+        items.iter().any(|item| item.label == expected),
+        "skill-creator must be in completion"
+    );
+
+    let expanded = handle
+        .expand_references("@skill:skill-creator")
+        .expect("skill-creator must expand");
+    assert_eq!(expanded, "<skill:skill-creator>");
+
+    let output = call_skill(&registry, BUILTIN_CREATOR).expect("skill-creator must load");
+    assert!(output.contains(CREATOR_BODY), "got: {output}");
 }

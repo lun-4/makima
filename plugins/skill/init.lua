@@ -70,6 +70,7 @@ end
 
 local opts = makima.api.register_options({
   plugin_dev = { default = true, desc = "Offer the builtin makima-plugin-dev skill for writing makima plugins." },
+  skill_creator = { default = true, desc = "Offer the builtin skill-creator skill for writing and testing skills." },
 })
 
 local ok, builtin, reference = pcall(function()
@@ -84,6 +85,12 @@ local init_ok, init_skill = pcall(require, "init_skill")
 if not init_ok then
   makima.log.warn("builtin init skill unavailable: " .. tostring(init_skill))
   init_skill = nil
+end
+
+local creator_ok, skill_creator = pcall(require, "skill_creator")
+if not creator_ok then
+  makima.log.warn("builtin skill_creator skill unavailable: " .. tostring(skill_creator))
+  skill_creator = nil
 end
 
 local function resolve_builtin_content()
@@ -125,6 +132,9 @@ local function discover_skills(cwd)
   end
   if init_skill then
     add_builtin_skill(skills, init_skill)
+  end
+  if skill_creator and opts.skill_creator then
+    add_builtin_skill(skills, skill_creator)
   end
 
   local config = makima.env.config_dir()
