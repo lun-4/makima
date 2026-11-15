@@ -48,7 +48,8 @@ pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_MAX_CONCURRENT_AGENT_TURNS: usize = 8;
 pub const DEFAULT_MAX_AGENT_DEPTH: usize = 4;
 pub const DEFAULT_MAX_CHILDREN_PER_AGENT: usize = 16;
-pub const DEFAULT_MAX_LIVE_AGENTS: usize = 64;
+pub const DEFAULT_MAX_ACTIVE_AGENTS: usize = 64;
+pub const DEFAULT_MAX_RETAINED_AGENTS: usize = 1024;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 /// What one turn asks to generate. A number of makima's own choosing rather than
 /// "whatever the window can spare", because the latter ties the output cap to a
@@ -728,7 +729,9 @@ pub struct AgentFileConfig {
     pub max_concurrent_agent_turns: Option<usize>,
     pub max_agent_depth: Option<usize>,
     pub max_children_per_agent: Option<usize>,
-    pub max_live_agents: Option<usize>,
+    #[serde(alias = "max_live_agents")]
+    pub max_active_agents: Option<usize>,
+    pub max_retained_agents: Option<usize>,
     pub compaction_buffer: Option<CompactionBuffer>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
@@ -749,7 +752,8 @@ impl AgentFileConfig {
             max_concurrent_agent_turns,
             max_agent_depth,
             max_children_per_agent,
-            max_live_agents,
+            max_active_agents,
+            max_retained_agents,
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
@@ -1563,11 +1567,14 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_AGENT_DEPTH, min = MIN_AGENT_LIMIT, desc = "Max nesting depth for child agents")]
     pub max_agent_depth: usize,
 
-    #[config(default = DEFAULT_MAX_CHILDREN_PER_AGENT, min = MIN_AGENT_LIMIT, desc = "Max child agents created by one agent")]
+    #[config(default = DEFAULT_MAX_CHILDREN_PER_AGENT, min = MIN_AGENT_LIMIT, desc = "Max direct children with outstanding work")]
     pub max_children_per_agent: usize,
 
-    #[config(default = DEFAULT_MAX_LIVE_AGENTS, min = MIN_AGENT_LIMIT, desc = "Max live agents in one outer session")]
-    pub max_live_agents: usize,
+    #[config(default = DEFAULT_MAX_ACTIVE_AGENTS, min = MIN_AGENT_LIMIT, desc = "Max agents with outstanding work in one outer session")]
+    pub max_active_agents: usize,
+
+    #[config(default = DEFAULT_MAX_RETAINED_AGENTS, min = MIN_AGENT_LIMIT, desc = "Max non-retired agent identities in one outer session; imported legacy agents are exempt")]
+    pub max_retained_agents: usize,
 
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
@@ -1627,7 +1634,10 @@ impl AgentConfig {
             max_children_per_agent: file
                 .max_children_per_agent
                 .unwrap_or(DEFAULT_MAX_CHILDREN_PER_AGENT),
-            max_live_agents: file.max_live_agents.unwrap_or(DEFAULT_MAX_LIVE_AGENTS),
+            max_active_agents: file.max_active_agents.unwrap_or(DEFAULT_MAX_ACTIVE_AGENTS),
+            max_retained_agents: file
+                .max_retained_agents
+                .unwrap_or(DEFAULT_MAX_RETAINED_AGENTS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
@@ -2426,7 +2436,11 @@ mod tests {
             config.agent.max_children_per_agent,
             DEFAULT_MAX_CHILDREN_PER_AGENT
         );
-        assert_eq!(config.agent.max_live_agents, DEFAULT_MAX_LIVE_AGENTS);
+        assert_eq!(config.agent.max_active_agents, DEFAULT_MAX_ACTIVE_AGENTS);
+        assert_eq!(
+            config.agent.max_retained_agents,
+            DEFAULT_MAX_RETAINED_AGENTS
+        );
         assert_eq!(
             config.provider.connect_timeout,
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
@@ -2468,22 +2482,64 @@ mod tests {
         assert_eq!(config.agent.max_line_bytes, DEFAULT_MAX_LINE_BYTES);
     }
 
-    #[test]
-    fn agent_limits_construct_from_file() {
-        let raw: RawConfig = toml::from_str(
+    #[test_case("max_active_agents"; "canonical")]
+    #[test_case("max_live_agents"; "legacy_alias")]
+    fn agent_limits_construct_from_file(active_key: &str) {
+        let raw: RawConfig = toml::from_str(&format!(
             "[agent]\n\
              max_concurrent_agent_turns = 2\n\
              max_agent_depth = 3\n\
              max_children_per_agent = 5\n\
-             max_live_agents = 7\n",
-        )
+             {active_key} = 7\n\
+             max_retained_agents = 11\n",
+        ))
         .unwrap();
         let config = raw.into_config().unwrap();
 
         assert_eq!(config.agent.max_concurrent_agent_turns, 2);
         assert_eq!(config.agent.max_agent_depth, 3);
         assert_eq!(config.agent.max_children_per_agent, 5);
-        assert_eq!(config.agent.max_live_agents, 7);
+        assert_eq!(config.agent.max_active_agents, 7);
+        assert_eq!(config.agent.max_retained_agents, 11);
+    }
+
+    #[test]
+    fn canonical_and_legacy_active_limits_reject_duplicate_assignment() {
+        let error =
+            toml::from_str::<RawConfig>("[agent]\nmax_active_agents = 3\nmax_live_agents = 4\n")
+                .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("duplicate field `max_active_agents`")
+        );
+    }
+
+    #[test]
+    fn agent_limit_overlay_merges_canonical_and_legacy_keys() {
+        let mut base: RawConfig =
+            toml::from_str("[agent]\nmax_active_agents = 3\nmax_retained_agents = 5\n").unwrap();
+        let overlay: RawConfig =
+            toml::from_str("[agent]\nmax_live_agents = 7\nmax_retained_agents = 9\n").unwrap();
+        base.merge(overlay);
+        let config = base.into_config().unwrap();
+        assert_eq!(config.agent.max_active_agents, 7);
+        assert_eq!(config.agent.max_retained_agents, 9);
+    }
+
+    #[test_case("max_active_agents"; "active")]
+    #[test_case("max_live_agents"; "legacy_active")]
+    #[test_case("max_retained_agents"; "retained")]
+    fn zero_agent_identity_and_work_limits_from_file_are_rejected(key: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{key} = 0\n")).unwrap();
+        let field = if key == "max_live_agents" {
+            "max_active_agents"
+        } else {
+            key
+        };
+        assert!(
+            matches!(raw.into_config().unwrap().validate(), Err(ConfigError::BelowMinimum { field: actual, .. }) if actual == field)
+        );
     }
 
     #[test]
@@ -2715,7 +2771,8 @@ mod tests {
     #[test_case("max_concurrent_agent_turns", 0 ; "zero_concurrent_agent_turns")]
     #[test_case("max_agent_depth", 0 ; "zero_agent_depth")]
     #[test_case("max_children_per_agent", 0 ; "zero_children_per_agent")]
-    #[test_case("max_live_agents", 0 ; "zero_live_agents")]
+    #[test_case("max_active_agents", 0 ; "zero_active_agents")]
+    #[test_case("max_retained_agents", 0 ; "zero_retained_agents")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
@@ -2725,7 +2782,8 @@ mod tests {
             "max_concurrent_agent_turns" => config.max_concurrent_agent_turns = value,
             "max_agent_depth" => config.max_agent_depth = value,
             "max_children_per_agent" => config.max_children_per_agent = value,
-            "max_live_agents" => config.max_live_agents = value,
+            "max_active_agents" => config.max_active_agents = value,
+            "max_retained_agents" => config.max_retained_agents = value,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();

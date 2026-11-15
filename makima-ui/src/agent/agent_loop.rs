@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use makima_agent::actor::{
-    ActorBackend, BackendResult, ControlWork, EffectiveAgentConfig, TurnContext, WorkKind,
+    ActorBackend, ActorHistory, BackendResult, ControlWork, EffectiveAgentConfig, TurnContext,
+    WorkKind,
 };
 use makima_agent::mcp::config::McpServerStatus;
 use makima_agent::mcp::{McpHandle, McpSession};
@@ -145,6 +146,7 @@ impl TuiActorBackend {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(makima_agent::prompt::ResolvedSlots::default()),
+                root_context: None,
                 modes: self.lua_handle.mode_registry(),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(ToolRegistry::global_arc()),
@@ -157,7 +159,7 @@ impl TuiActorBackend {
                 managed_turn: None,
             },
             AgentRunParams {
-                history: &mut history,
+                history: ActorHistory::new(&mut history),
                 system: String::new(),
                 event_tx: EventSender::new(self.agent_tx.clone()),
                 tools,
@@ -191,19 +193,16 @@ impl TuiActorBackend {
         system
     }
 
-    /// One-shot startup: env vars, instruction loading, `btw_system`, tool
-    /// building, and MCP readiness raced against the init cancel token.
+    /// One-shot startup: environment, tools, and MCP readiness.
     /// Races cancellation so a canceled startup stops before any run enters.
     async fn initialize(&mut self) -> bool {
         if self.initialized {
             return true;
         }
         self.vars = template::env_vars_for(&self.cwd.load());
-        self.reload_instructions().await;
         if self.init_cancel.is_cancelled() {
             return false;
         }
-        self.publish_btw_system(&makima_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model, false);
@@ -329,7 +328,7 @@ impl TuiActorBackend {
     /// before `Agent::run` (the actor then synthesizes one `Failed` delivery).
     async fn execute_agent(
         &mut self,
-        history: &mut History,
+        mut history: ActorHistory<'_>,
         context: &TurnContext,
         mut input: AgentInput,
         turn_id: TurnId,
@@ -378,6 +377,11 @@ impl TuiActorBackend {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots,
+                root_context: context
+                    .admission
+                    .as_ref()
+                    .and_then(|admission| admission.prompt_inputs.as_ref())
+                    .and_then(|inputs| inputs.root_context()),
                 modes: Arc::clone(&self.lua_handle.mode_registry()),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(makima_agent::tools::ToolRegistry::global_arc()),
@@ -390,7 +394,7 @@ impl TuiActorBackend {
                 managed_turn: context.managed_turn.clone(),
             },
             AgentRunParams {
-                history,
+                history: history.reborrow(),
                 system,
                 event_tx: EventSender::with_identity(self.agent_tx.clone(), Some(work)),
                 tools,
@@ -404,7 +408,7 @@ impl TuiActorBackend {
         let outcome = agent.run(turn_id, input).await;
         drop(agent);
         if matches!(outcome, TurnOutcome::Completed { .. })
-            && let Err(error) = self.persist_history(history).await
+            && let Err(error) = self.persist_history(&history).await
         {
             warn!(%error, "committing session history after turn failed");
         }
@@ -425,12 +429,6 @@ impl TuiActorBackend {
         )
     }
 
-    async fn reload_instructions(&mut self) {
-        let cwd = self.vars.apply("{cwd}").into_owned();
-        self.instructions =
-            smol::unblock(move || makima_agent::agent::load_instructions(&cwd)).await;
-    }
-
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints
     /// would only confuse the model. Everything else matches the live prompt.
     fn publish_btw_system(&mut self, prompt_slots: &makima_agent::prompt::ResolvedSlots) {
@@ -447,6 +445,10 @@ impl TuiActorBackend {
 impl ActorBackend for TuiActorBackend {
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         self.offload.clone()
+    }
+
+    fn context_event_sender(&self) -> Option<EventSender> {
+        Some(EventSender::new(self.agent_tx.clone()))
     }
 
     fn prepared_readiness(&self) -> Option<makima_agent::actor::PreparedReadiness> {
@@ -470,7 +472,7 @@ impl ActorBackend for TuiActorBackend {
 
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        history: ActorHistory<'a>,
         context: TurnContext,
         input: AgentInput,
         work: WorkKind,
@@ -551,7 +553,7 @@ impl ActorBackend for TuiActorBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _history: &'a mut History,
+        _history: ActorHistory<'a>,
         _context: TurnContext,
         control: &'a ControlWork,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -565,7 +567,7 @@ impl ActorBackend for TuiActorBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         instructions: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>> {
@@ -601,7 +603,7 @@ impl ActorBackend for TuiActorBackend {
                 &provider,
                 &base_provider,
                 &model,
-                history,
+                history.reborrow(),
                 &event_tx,
                 &context.cancel,
                 &self.config,
@@ -610,12 +612,12 @@ impl ActorBackend for TuiActorBackend {
             )
             .await;
             if result.is_ok() {
-                result = self.persist_history(history).await;
+                result = self.persist_history(&history).await;
             }
             match result {
                 Ok(()) => BackendResult::CompactDone,
                 Err(e) => {
-                    history.replace_snapshot(previous);
+                    history.replace_snapshot(previous).await;
                     warn!(error = %e, "idle compaction failed");
                     let _ = event_tx.send(AgentEvent::ControlError {
                         message: e.user_message(),
@@ -685,15 +687,24 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::poll_once;
-    use makima_agent::actor::{ActorEvent, DeliveryStatus};
-    use makima_agent::agent::{PROMPT_INPUTS_CLOSED, PROMPT_SLOTS_CLOSED};
+    use makima_agent::actor::ActorHistory;
+    use makima_agent::actor::{
+        ActorEvent, AdmissionPreparation, AgentContextSnapshot, DeliveryStatus, PreparedReadiness,
+    };
+    use makima_agent::agent::{PROMPT_INPUTS_CLOSED, PROMPT_SLOTS_CLOSED, TurnSetup};
+    use makima_agent::context::{CONTEXT_CHANGED_NOTICE, root_context};
+    use makima_agent::journal::SessionJournal;
+    use makima_agent::manager::ResidentAgent;
     use makima_agent::{
         AgentManagerHandle, AgentMode, AgentRef, EffectiveAgentConfig, McpPromptRef,
-        ReasonedCancelToken, RunSettings, TurnAdmissionOptions,
+        ReasonedCancelToken, RunSettings, ToolOutput, TurnAdmissionOptions,
     };
     use makima_config::PermissionsConfig;
+    use makima_lua::PluginHost;
     use makima_lua::test_support::run_command;
-    use makima_providers::{ContentBlock, Invocation, RequestDelivery};
+    use makima_providers::provider::BoxFuture;
+    use makima_providers::{ContentBlock, Invocation, RequestDelivery, TokenUsage};
+    use makima_storage::sessions::Session;
     use test_case::test_case;
 
     use super::*;
@@ -1292,7 +1303,7 @@ mod tests {
                     makima_agent::ImageMediaType::Png,
                     Arc::from(format!("{PNG}{}", "AAAA".repeat(IMAGE_BYTES / 4))),
                 );
-                let (mut backend, _, events) = failing_backend();
+                let (mut backend, _, events, _host) = live_backend();
                 let (requests_tx, requests) = flume::unbounded();
                 let (release, released) = flume::bounded(1);
                 let manager = makima_agent::AgentManagerHandle::new(Default::default()).unwrap();
@@ -1313,7 +1324,8 @@ mod tests {
                     makima_agent::ModeRegistry::builtin().get(&makima_agent::ModeId::Build),
                 );
                 let target = if child {
-                    let (parent_backend, _, _) = failing_backend();
+                    let (mut parent_backend, _, _) = failing_backend();
+                    parent_backend.lua_handle = backend.lua_handle.clone();
                     let parent = manager
                         .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
                             Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend))
@@ -1328,7 +1340,7 @@ mod tests {
                             None,
                             |agent_id| {
                                 backend.agent_id = agent_id;
-                                Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                                Ok::<Box<dyn ActorBackend>, String>(Box::new(ChildBackend(backend)))
                             },
                         )
                         .unwrap()
@@ -1474,7 +1486,8 @@ mod tests {
         )
         .with_mode_def(makima_agent::ModeRegistry::builtin().get(&makima_agent::ModeId::Build));
         if child {
-            let (parent_backend, _, _) = failing_backend();
+            let (mut parent_backend, _, _) = failing_backend();
+            parent_backend.lua_handle = backend.lua_handle.clone();
             let parent = manager
                 .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend))
@@ -1489,7 +1502,7 @@ mod tests {
                     None,
                     |id| {
                         backend.agent_id = id;
-                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(ChildBackend(backend)))
                     },
                 )
                 .unwrap()
@@ -1513,7 +1526,7 @@ mod tests {
         const FAILURE: &str = "gated provider failure";
         smol::block_on(futures_lite::future::or(
             async {
-                let (mut backend, mut input, events) = failing_backend();
+                let (mut backend, mut input, events, _host) = live_backend();
                 if budget {
                     backend.config.max_turns = Some(1);
                 }
@@ -1626,7 +1639,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-                let (backend, mut input, _events) = failing_backend();
+                let (backend, mut input, _events, _host) = live_backend();
                 input.prompt = None;
                 let (release, released) = flume::bounded(1);
                 let (requests_tx, requests) = flume::unbounded();
@@ -1644,8 +1657,8 @@ mod tests {
                     .submit(input, None, String::new(), Default::default())
                     .unwrap();
                 requests.recv_async().await.unwrap();
-                let (mut reporter_backend, mut reporter_input, _reporter_events) =
-                    failing_backend();
+                let (mut reporter_backend, mut reporter_input, _reporter_events, _reporter_host) =
+                    live_backend();
                 reporter_input.prompt = None;
                 let (report_release, report_released) = flume::bounded(1);
                 let (report_requests_tx, report_requests) = flume::unbounded();
@@ -1665,7 +1678,9 @@ mod tests {
                         None,
                         |id| {
                             reporter_backend.agent_id = id;
-                            Ok::<Box<dyn ActorBackend>, String>(Box::new(reporter_backend))
+                            Ok::<Box<dyn ActorBackend>, String>(Box::new(ChildBackend(
+                                reporter_backend,
+                            )))
                         },
                     )
                     .unwrap();
@@ -1901,7 +1916,9 @@ mod tests {
             };
             let work = WorkKind::Turn;
             let mut history = History::new(Vec::new());
-            let result = backend.run_turn(&mut history, context, input, work).await;
+            let result = backend
+                .run_turn(ActorHistory::new(&mut history), context, input, work)
+                .await;
             let BackendResult::EnteredRun(outcome) = result else {
                 panic!("setup must return its terminal outcome");
             };
@@ -2175,7 +2192,7 @@ mod tests {
             const RUN_ID: u64 = 7;
             const CHILD_INPUT: &str = "child work";
             futures_lite::future::or(async {
-                let (mut backend, mut input, events) = failing_backend();
+                let (mut backend, mut input, events, _host) = live_backend();
                 input.prompt = None;
                 let (release, released) = flume::unbounded();
                 let (requests, request_rx) = flume::unbounded();
@@ -2210,7 +2227,7 @@ mod tests {
                         if streamed { break; }
                     }
                 }
-                let (mut child_backend, mut child_input, _child_events) = failing_backend();
+                let (mut child_backend, mut child_input, _child_events, _child_host) = live_backend();
                 child_input.prompt = None;
                 child_input.message = CHILD_INPUT.into();
                 let (child_release, child_released) = flume::unbounded();
@@ -2220,13 +2237,14 @@ mod tests {
                 let child = manager.spawn_child_trusted_with_config(
                     &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
                         child_backend.agent_id = agent_id;
-                        Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend))
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(ChildBackend(child_backend)))
                     },
                 ).unwrap();
                 let child_actor = child.actor().unwrap();
                 child_actor.configure_parent_delivery(true).unwrap();
                 let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
-                assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
+                let outcome = child_ticket.wait().await;
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }), "{outcome:?}");
                 if active { release.send(()).unwrap(); }
                 let request = serde_json::to_string(&request_rx.recv_async().await.unwrap()).unwrap();
                 assert!(request.contains(EXPLICIT_RESPONSE), "missing child observation: {request}");
@@ -2282,7 +2300,7 @@ mod tests {
     fn shared_consumption_wrapper_and_request_order(child: bool) {
         smol::block_on(async {
             futures_lite::future::or(async {
-                let (backend, mut input, _events) = failing_backend();
+                let (backend, mut input, _events, _host) = live_backend();
                 input.prompt = None;
                 let (release, released) = flume::unbounded();
                 let (requests, request_rx) = flume::unbounded();
@@ -2303,7 +2321,7 @@ mod tests {
                 let steering = actor.submit(AgentInput::new(STEERING.into(), Vec::new()), None, String::new(), Default::default()).unwrap();
                 assert_eq!(steering.turn_id(), parent.turn_id());
 
-                let (mut child_backend, mut child_input, _child_events) = failing_backend();
+                let (mut child_backend, mut child_input, _child_events, _child_host) = live_backend();
                 child_input.prompt = None;
                 let (child_release, child_released) = flume::unbounded();
                 child_release.send(()).unwrap();
@@ -2312,13 +2330,14 @@ mod tests {
                 let child = manager.spawn_child_trusted_with_config(
                     &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
                         child_backend.agent_id = agent_id;
-                        Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend))
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(ChildBackend(child_backend)))
                     },
                 ).unwrap();
                 let child_actor = child.actor().unwrap();
                 child_actor.configure_parent_delivery(true).unwrap();
                 let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
-                assert!(matches!(child_ticket.wait().await, TurnOutcome::Completed { .. }));
+                let outcome = child_ticket.wait().await;
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }), "{outcome:?}");
                 let mut seen = Vec::new();
                 loop {
                     let event = actor_events.recv_async().await.unwrap();
@@ -2667,6 +2686,7 @@ mod tests {
             makima_agent::prompt::Slot::Identity,
             makima_agent::prompt::SlotEntry {
                 plugin: "admission".into(),
+                registration: 0,
                 content: "admitted identity".into(),
             },
         );
@@ -2701,6 +2721,202 @@ mod tests {
         assert!(system.contains("admitted identity"));
         assert!(!system.contains("/tmp/changed"));
         assert_eq!(backend.vars.apply("{cwd}"), "/tmp/admitted");
+    }
+
+    #[test_case(false, false; "changed_agents")]
+    #[test_case(true, false; "removed_agents")]
+    #[test_case(false, true; "changed_agents_resumed")]
+    #[test_case(true, true; "removed_agents_resumed")]
+    fn managed_tui_turns_keep_recorded_instructions_and_notice_once(remove: bool, resume: bool) {
+        const INSTRUCTION_FILE: &str = "AGENTS.md";
+        const RECORDED: &str = "recorded TUI project instructions";
+        const CHANGED: &str = "changed TUI project instructions";
+
+        smol::block_on(futures_lite::future::or(
+            async {
+                let directory = tempfile::tempdir().unwrap();
+                let instruction_path = directory.path().join(INSTRUCTION_FILE);
+                smol::fs::write(&instruction_path, RECORDED).await.unwrap();
+                let canonical_path = instruction_path.canonicalize().unwrap();
+                let (mut backend, _, mut events) = failing_backend();
+                backend.initialized = false;
+                backend.init_cancel = CancelToken::none();
+                backend.cwd.store(Arc::new(directory.path().to_path_buf()));
+                let mut btw_system = Arc::clone(&backend.btw_system);
+                let (requests_tx, requests) = flume::bounded(1);
+                let (release, released) = flume::bounded(1);
+                let mut config = stub_policy()
+                    .with_context(AgentContextSnapshot::new(directory.path().to_path_buf()));
+                config.settings.provider = Arc::new(ContextProvider {
+                    inner: ExplicitProvider { release: released },
+                    systems: requests_tx,
+                });
+                let mut manager = AgentManagerHandle::new(Default::default()).unwrap();
+                let mut root = manager
+                    .create_root_with_config(Some(config.clone()), Vec::new(), None, |agent_id| {
+                        backend.agent_id = agent_id;
+                        Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
+                    })
+                    .unwrap();
+                let mut actor = root.actor().unwrap();
+                let mut settlements = actor.subscribe_events();
+                assert!(root_context(&root.state_access()).unwrap().is_none());
+                for turn in 0..3 {
+                    if turn == 2 && resume {
+                        let root_id = root.id();
+                        let generation = manager.generation();
+                        let history = actor.committed_history();
+                        let mut session = Session::<Message, TokenUsage, ToolOutput>::new(
+                            &config.model.spec(),
+                            &directory.path().to_string_lossy(),
+                        );
+                        session.bind_root_id(root_id).unwrap();
+                        manager
+                            .journal()
+                            .checkpoint_snapshot()
+                            .unwrap()
+                            .apply_to(&mut session)
+                            .unwrap();
+                        session.save_to(directory.path()).unwrap();
+                        actor.close();
+                        assert!(
+                            manager
+                                .shutdown(SHUTDOWN_TIMEOUT)
+                                .await
+                                .timed_out
+                                .is_empty()
+                        );
+                        let session = Session::load_from(session.id, directory.path()).unwrap();
+                        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+                        let snapshot = journal.checkpoint_snapshot().unwrap();
+                        manager = AgentManagerHandle::restore_graph(
+                            Default::default(),
+                            journal,
+                            session.latest_state().unwrap(),
+                            snapshot.histories,
+                        )
+                        .unwrap();
+                        assert_ne!(manager.generation(), generation);
+                        let (mut backend, _, resumed_events) = failing_backend();
+                        backend.agent_id = root_id;
+                        backend.initialized = false;
+                        backend.init_cancel = CancelToken::none();
+                        backend.cwd.store(Arc::new(directory.path().to_path_buf()));
+                        btw_system = Arc::clone(&backend.btw_system);
+                        events = resumed_events;
+                        root = manager
+                            .ensure_resident_with(root_id, |_| async {
+                                Ok(ResidentAgent {
+                                    backend: Box::new(backend),
+                                    config: config.clone(),
+                                    shared_messages: None,
+                                    start: None,
+                                    initialize: None,
+                                })
+                            })
+                            .await
+                            .unwrap();
+                        actor = root.actor().unwrap();
+                        settlements = actor.subscribe_events();
+                        assert_eq!(actor.committed_history(), history);
+                        let recorded = root_context(&root.state_access()).unwrap().unwrap();
+                        assert!(recorded.instructions.text.contains(RECORDED));
+                        assert!(!recorded.instructions.text.contains(CHANGED));
+                        assert!(requests.is_empty());
+                    }
+                    if turn == 1 {
+                        if remove {
+                            smol::fs::remove_file(&instruction_path).await.unwrap();
+                        } else {
+                            smol::fs::write(&instruction_path, CHANGED).await.unwrap();
+                        }
+                    }
+                    let ticket = actor
+                        .admit_turn(
+                            AgentInput::new(format!("context turn {turn}"), Vec::new()),
+                            None,
+                            String::new(),
+                        )
+                        .unwrap();
+                    let system = requests.recv_async().await.unwrap();
+                    assert_eq!(system.matches(RECORDED).count(), 1);
+                    assert!(!system.contains(CHANGED));
+                    assert!(btw_system.load().contains(RECORDED));
+                    assert!(!btw_system.load().contains(CHANGED));
+                    let recorded = root_context(&root.state_access()).unwrap().unwrap();
+                    let source = recorded
+                        .instructions
+                        .sources
+                        .iter()
+                        .find(|source| source.path == canonical_path)
+                        .unwrap();
+                    assert_eq!(source.content, RECORDED);
+                    release.send_async(()).await.unwrap();
+                    assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+                    await_settlement(&settlements, actor.presentation_id()).await;
+                    manager
+                        .journal()
+                        .wait_terminal_conversion(root.id(), ticket.turn_id())
+                        .await
+                        .unwrap();
+                    assert!(requests.is_empty());
+                    let notices: Vec<_> = events
+                        .drain()
+                        .filter_map(|envelope| match envelope.event {
+                            AgentEvent::Post(post) => Some(post.text),
+                            AgentEvent::ControlError { message } => panic!("{message}"),
+                            _ => None,
+                        })
+                        .collect();
+                    let expected = if turn == 1 {
+                        vec![CONTEXT_CHANGED_NOTICE.to_owned()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(notices, expected);
+                }
+                actor.close();
+                assert!(
+                    manager
+                        .shutdown(SHUTDOWN_TIMEOUT)
+                        .await
+                        .timed_out
+                        .is_empty()
+                );
+            },
+            async {
+                smol::Timer::after(TEST_TIMEOUT).await;
+                panic!("managed TUI context regression timed out");
+            },
+        ));
+    }
+
+    struct ContextProvider {
+        inner: ExplicitProvider,
+        systems: flume::Sender<String>,
+    }
+
+    impl makima_providers::provider::Provider for ContextProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a serde_json::Value,
+            events: &'a flume::Sender<makima_providers::ProviderEvent>,
+            options: makima_providers::RequestOptions,
+            session: Option<&'a SessionRef>,
+            invocation: &'a Invocation,
+            delivery: RequestDelivery,
+        ) -> makima_providers::provider::BoxFuture<
+            'a,
+            Result<makima_providers::StreamResponse, AgentError>,
+        > {
+            self.systems.send(system.to_owned()).unwrap();
+            self.inner.stream_message(
+                model, messages, system, tools, events, options, session, invocation, delivery,
+            )
+        }
     }
 
     #[test_case::test_case(false; "outer_channel_closed")]
@@ -2776,6 +2992,68 @@ mod tests {
         )
     }
 
+    struct ChildBackend(TuiActorBackend);
+
+    impl ActorBackend for ChildBackend {
+        fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+            Some(
+                TurnSetup {
+                    registry: Arc::clone(ToolRegistry::global_arc()),
+                    local_tools: Default::default(),
+                    mcp: self.0.mcp.clone(),
+                    slots: self.0.lua_handle.prompt_slot_source(),
+                    modes: self.0.lua_handle.mode_registry(),
+                    instructions: false,
+                }
+                .preparation(),
+            )
+        }
+
+        fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+            self.0.prepared_readiness()
+        }
+
+        fn run_turn<'a>(
+            &'a mut self,
+            history: ActorHistory<'a>,
+            context: TurnContext,
+            input: AgentInput,
+            work: WorkKind,
+        ) -> BoxFuture<'a, BackendResult> {
+            self.0.run_turn(history, context, input, work)
+        }
+
+        fn run_control<'a>(
+            &'a mut self,
+            history: ActorHistory<'a>,
+            context: TurnContext,
+            control: &'a ControlWork,
+        ) -> BoxFuture<'a, BackendResult> {
+            self.0.run_control(history, context, control)
+        }
+
+        fn run_compact<'a>(
+            &'a mut self,
+            history: ActorHistory<'a>,
+            context: TurnContext,
+            instructions: Option<&'a str>,
+        ) -> BoxFuture<'a, BackendResult> {
+            self.0.run_compact(history, context, instructions)
+        }
+    }
+
+    fn live_backend() -> (
+        TuiActorBackend,
+        AgentInput,
+        flume::Receiver<Envelope>,
+        PluginHost,
+    ) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let (mut backend, input, events) = failing_backend();
+        backend.lua_handle = host.event_handle();
+        (backend, input, events, host)
+    }
+
     fn failing_backend() -> (TuiActorBackend, AgentInput, flume::Receiver<Envelope>) {
         let (model_slot, _change_rx) =
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
@@ -2847,7 +3125,7 @@ mod tests {
         };
         let mut history = History::new(Vec::new());
         let outcome = smol::block_on(backend.execute_agent(
-            &mut history,
+            ActorHistory::new(&mut history),
             &context,
             input,
             TurnId::generate(),
@@ -2937,7 +3215,12 @@ mod tests {
             successor_input.prompt = input.prompt.clone();
             let mut history = History::new(Vec::new());
             let outcome = {
-                let mut run = pin!(backend.run_turn(&mut history, context, input, WorkKind::Turn));
+                let mut run = pin!(backend.run_turn(
+                    ActorHistory::new(&mut history),
+                    context,
+                    input,
+                    WorkKind::Turn
+                ));
                 assert!(poll_once(run.as_mut()).await.is_none());
                 // The model announcement is stamped from admission, so it is
                 // the one event a turn emits before it settles.
@@ -2975,7 +3258,12 @@ mod tests {
                 managed_turn: None,
             };
             let result = backend
-                .run_turn(&mut history, successor, successor_input, WorkKind::Turn)
+                .run_turn(
+                    ActorHistory::new(&mut history),
+                    successor,
+                    successor_input,
+                    WorkKind::Turn,
+                )
                 .await;
             assert!(matches!(
                 result,

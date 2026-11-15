@@ -884,6 +884,116 @@ fn dispatched_handlers_serialize_on_the_lock() {
     });
 }
 
+#[test_case::test_case(false; "cancelled_caller")]
+#[test_case::test_case(true; "dropped_caller")]
+fn parked_mutable_path_callback_does_not_block_runtime(abandon: bool) {
+    const TOOL: &str = "parked_mutable";
+    const PROBE: &str = "parked_mutable_probe";
+    const CANCELLED: &str = "cancelled";
+    let fs = ProbeFs::new();
+    fs.fs.seed(std::path::Path::new(FILE), b"target".to_vec());
+    let (registry, host) = boot_with_backend(&[], fs.clone(), HashMap::new());
+    host.load_source(
+        TOOL,
+        &format!(
+            r#"
+local resumed, handlers = 0, 0
+makima.api.register_tool({{
+    name = "{TOOL}", description = "parked mutable callback", schema = {{ type = "object", properties = {{}} }},
+    mutable_path = function()
+        assert(makima.fs.read({FILE:?}))
+        resumed += 1
+        return {FILE:?}
+    end,
+    handler = function() handlers += 1; return "executed" end,
+}})
+makima.api.register_tool({{
+    name = "{PROBE}", description = "callback status", schema = {{ type = "object", properties = {{}} }},
+    handler = function() return makima.json.encode({{ resumed, handlers }}) end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    let mut ctx = shared_ctx(&registry);
+    let (trigger, cancel) = makima_agent::cancel::CancelToken::new();
+    ctx.cancel = cancel;
+    fs.arm_read_gate();
+    smol::block_on(async {
+        let running = smol::spawn({
+            let ctx = ctx.clone();
+            async move {
+                tool_dispatch::run(TOOL.into(), TOOL, &json!({}), &ctx, CallOrigin::Nested).await
+            }
+        });
+        fs.wait_read().await;
+        let probe =
+            tool_dispatch::run(PROBE.into(), PROBE, &json!({}), &ctx, CallOrigin::Nested).await;
+        assert!(!probe.is_error, "{}", probe.output.as_text());
+        assert_eq!(probe.output.as_text(), "[0,0]");
+        if abandon {
+            let _ = running.cancel().await;
+        } else {
+            trigger.cancel();
+            let result = running.await;
+            assert!(result.is_error);
+            assert!(result.output.as_text().contains(CANCELLED));
+        }
+        host.drain_tasks_for_test();
+        fs.release_read_gate();
+        let fresh = shared_ctx(&registry);
+        let probe =
+            tool_dispatch::run(PROBE.into(), PROBE, &json!({}), &fresh, CallOrigin::Nested).await;
+        assert!(!probe.is_error, "{}", probe.output.as_text());
+        assert_eq!(probe.output.as_text(), "[0,0]");
+    });
+}
+
+#[test_case::test_case(false; "unload")]
+#[test_case::test_case(true; "reload")]
+fn plugin_replacement_cancels_parked_mutable_path_before_side_effects(reload: bool) {
+    const TOOL: &str = "replaced_mutable";
+    const REPLACED: &str = "callback escaped replacement";
+    let fs = ProbeFs::new();
+    fs.fs.seed(std::path::Path::new(FILE), b"original".to_vec());
+    let (registry, host) = boot_with_backend(&[], fs.clone(), HashMap::new());
+    let source = format!(
+        r#"
+makima.api.register_tool({{
+    name = "{TOOL}", description = "replaced callback", schema = {{ type = "object", properties = {{}} }},
+    mutable_path = function()
+        assert(makima.fs.read({FILE:?}))
+        assert(makima.fs.write({FILE:?}, {REPLACED:?}))
+        return {FILE:?}
+    end,
+    handler = function() error("handler must not execute") end,
+}})
+"#
+    );
+    host.load_source(TOOL, &source).unwrap();
+    let ctx = shared_ctx(&registry);
+    fs.arm_read_gate();
+    smol::block_on(async {
+        let running = smol::spawn(async move {
+            tool_dispatch::run(TOOL.into(), TOOL, &json!({}), &ctx, CallOrigin::Nested).await
+        });
+        fs.wait_read().await;
+        if reload {
+            host.load_source(TOOL, &source).unwrap();
+        } else {
+            host.unload(TOOL).unwrap();
+        }
+        host.drain_tasks_for_test();
+        let result = running.await;
+        assert!(result.is_error, "{}", result.output.as_text());
+        assert!(!fs.events().iter().any(|event| event == "write"));
+        fs.release_read_gate();
+        host.drain_tasks_for_test();
+        assert_eq!(file_content(&fs.fs, FILE), "original");
+        assert!(!fs.events().iter().any(|event| event == "write"));
+    });
+}
+
 /// memory write and delete share the lock namespace through the computed
 /// `mutable_path` callback. With the delete's existence check parked, a
 /// concurrent same-note write must stay blocked; release the delete and its
@@ -1003,13 +1113,13 @@ fn memory_computed_mutable_path_locks_the_real_note() {
     };
     let mut first_ctx = shared_ctx(&registry);
     first_ctx.cwd = PathBuf::from("/projects/first");
-    let first_target = parse_write()
-        .mutable_path(&first_ctx)
+    let first_target = smol::block_on(parse_write().mutable_path(&first_ctx))
+        .expect("memory path callback succeeds")
         .expect("memory write declares a mutable path");
     let mut second_ctx = first_ctx.clone();
     second_ctx.cwd = PathBuf::from("/projects/second");
-    let second_target = parse_write()
-        .mutable_path(&second_ctx)
+    let second_target = smol::block_on(parse_write().mutable_path(&second_ctx))
+        .expect("memory path callback succeeds")
         .expect("memory write declares a mutable path");
     assert!(
         first_target.is_absolute(),
@@ -1031,7 +1141,9 @@ fn memory_computed_mutable_path_locks_the_real_note() {
         .parse(&json!({"command": "read", "path": "notes.md"}))
         .expect("parse");
     assert!(
-        read.mutable_path(&first_ctx).is_none(),
+        smol::block_on(read.mutable_path(&first_ctx))
+            .unwrap()
+            .is_none(),
         "memory read must not participate in write serialization"
     );
 }

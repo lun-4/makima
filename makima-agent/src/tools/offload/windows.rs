@@ -180,6 +180,10 @@ fn open_relative(
     Ok(file)
 }
 
+pub(super) fn open_read(dir: &File, name: &str) -> io::Result<File> {
+    open_relative(dir, OsStr::new(name), Some(false), false, false, false)
+}
+
 fn nt_error(status: i32) -> io::Error {
     io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
 }

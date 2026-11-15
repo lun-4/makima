@@ -3,6 +3,30 @@ use thiserror::Error;
 use crate::{AgentId, TurnId};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ReactivationError {
+    #[error("not_restorable: {reason}")]
+    NotRestorable { reason: String },
+    #[error("provider_unavailable: {provider}")]
+    ProviderUnavailable { provider: String },
+    #[error("model_unavailable: {model}")]
+    ModelUnavailable { model: String },
+    #[error("tool_unavailable: {tool}")]
+    ToolUnavailable { tool: String },
+    #[error("mcp_unavailable: {server}")]
+    McpUnavailable { server: String },
+    #[error("mode ceiling rejected reactivation: {0}")]
+    ModeCeiling(String),
+    #[error("agent initialization failed: {0}")]
+    Initialization(String),
+    #[error("tool_completion_pending: previous tool writes are still settling; retry reactivation")]
+    ToolCompletionPending,
+    #[error("agent activation was cancelled")]
+    Cancelled,
+    #[error("agent factory panicked")]
+    Panicked,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ManagerError {
     #[error("agent limits must be at least one")]
     InvalidLimits,
@@ -16,12 +40,28 @@ pub enum ManagerError {
     NonLiveAgent(AgentId),
     #[error("agent graph is shutting down")]
     GraphShutdown,
+    #[error("agent graph rewind is in progress")]
+    RewindInProgress,
     #[error("agent depth {depth} exceeds the configured maximum {max}")]
     DepthExceeded { depth: usize, max: usize },
-    #[error("agent {parent_id} already has the configured maximum of {max} live children")]
+    #[error(
+        "child_limit: agent {parent_id} has the configured maximum of {max} children with outstanding work"
+    )]
     ChildLimit { parent_id: AgentId, max: usize },
-    #[error("agent graph already has the configured maximum of {max} live agents")]
-    LiveAgentLimit { max: usize },
+    #[error("active_agent_limit: agent graph has the configured maximum of {max} active agents")]
+    ActiveAgentLimit { max: usize },
+    #[error("retention_limit: agent graph has the configured maximum of {max} retained identities")]
+    RetentionLimit { max: usize },
+    #[error("retired: agent {0} is retired")]
+    Retired(AgentId),
+    #[error("agent {0} has a newer incarnation")]
+    StaleIncarnation(AgentId),
+    #[error("agent {0} is not a leaf")]
+    NotLeaf(AgentId),
+    #[error("invalid restored agent graph: {0}")]
+    InvalidGraph(String),
+    #[error(transparent)]
+    Reactivation(#[from] ReactivationError),
     #[error("managed turn authority belongs to another manager")]
     WrongManager,
     #[error("managed turn {turn_id} for agent {agent_id} is no longer active")]

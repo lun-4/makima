@@ -40,7 +40,7 @@ use makima_commands::{
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use makima_lua::EventHandle;
 use makima_lua::orchestration::{
-    self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, TrustedTarget,
+    self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, PinnedCommandTarget, TrustedTarget,
 };
 use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
@@ -201,13 +201,18 @@ fn dispatch_print(
     registry: &CommandRegistry,
     target: &TargetHandle,
     literal: AgentInput,
+    admission: &PinnedCommandTarget,
 ) -> Result<PrintWork> {
     let content = CommandContent {
         text: Arc::from(literal.message.as_str()),
         attachments: command_attachments::from_images(&literal.images),
     };
     Ok(
-        match smol::block_on(registry.dispatch_input(target, content)) {
+        match smol::block_on(registry.dispatch_input_with_admission(
+            target,
+            content,
+            Arc::new(admission.clone()),
+        )) {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                 PrintWork::Turn(command_attachments::agent_input(turn)?)
             }
@@ -335,7 +340,7 @@ fn start_print_session(
     let model_policy = Arc::clone(&params.model_policy);
     let providers = Arc::clone(&params.providers);
     let (binding, root_target) = orchestration::root_binding();
-    let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
+    let handle = headless::spawn_nonpersistent_with_binding(params, prepare, Some(binding));
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
     let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: handle.session_id.id(),
@@ -528,6 +533,8 @@ pub fn run(
                 mcp_handle,
                 initial_wd: cwd,
                 session_id: None,
+                root_id: None,
+                journal: None,
                 initial_history: Vec::new(),
                 yolo: false,
                 system_prompt_override,
@@ -554,14 +561,20 @@ pub fn run(
             let handle = &session.handle;
             let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
             observer.install(session.root.target.clone());
-            let work = dispatch_print(&command_registry, &session.commands, literal)?;
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            let work = dispatch_print(&command_registry, &session.commands, literal, &admission)?;
             let session_id = &handle.session_id;
             let start = Instant::now();
             let (mut result, verbose_out) = match work {
                 PrintWork::Turn(_) | PrintWork::Completed => {
                     let wait = match work {
                         PrintWork::Turn(input) => {
-                            smol::block_on(handle.input_tx.admit(input))
+                            handle
+                                .input_tx
+                                .admitter()
+                                .for_actor(admission.actor().map_err(|error| eyre!(error))?)
+                                .submit(input)
                                 .map_err(|error| eyre!(error))?;
                             true
                         }
@@ -576,11 +589,10 @@ pub fn run(
                         }
                     };
                     let tool_names = &handle.tool_names;
-                    let config = session
-                        .root
-                        .target
-                        .effective_config()
+                    let config = admission
+                        .actor()
                         .map_err(|error| eyre!(error))?
+                        .effective_config()
                         .ok_or_else(|| eyre!(UNCOMMITTED_ROOT_ERR))?;
                     let cwd = &*config.context.cwd().to_string_lossy();
                     (|| -> Result<_> {
@@ -738,7 +750,8 @@ pub fn run(
                 }
                 PrintWork::IsolatedTurn(turn) => {
                     let images = command_attachments::into_images(&turn.content.attachments)?;
-                    let answer = smol::block_on(handle.control_tx.ask_isolated(
+                    let answer = smol::block_on(handle.control_tx.ask_isolated_to(
+                        admission.actor().map_err(|error| eyre!(error))?,
                         turn.content.text.to_string(),
                         images,
                         CancelToken::none(),
@@ -747,9 +760,11 @@ pub fn run(
                 }
                 PrintWork::Reply(text) => (operation_result(Ok(text), session_id), None),
                 PrintWork::Compaction(instructions) => {
-                    let compacted = smol::block_on(
-                        handle.control_tx.compact(instructions, CancelToken::none()),
-                    );
+                    let compacted = smol::block_on(handle.control_tx.compact_to(
+                        admission.actor().map_err(|error| eyre!(error))?,
+                        instructions,
+                        CancelToken::none(),
+                    ));
                     (
                         operation_result(compacted.map(|()| String::new()), session_id),
                         None,
@@ -806,7 +821,9 @@ mod tests {
     use super::*;
     use flume::{Receiver, Sender};
     use makima_agent::{
-        AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
+        ActorLifecycle, ActorStatus, AgentError, AgentId, AgentManagerHandle, GraphLifecycle,
+        SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
+        manager::AgentResidency,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
@@ -1083,6 +1100,8 @@ mod tests {
             mcp_handle: None,
             initial_wd: cwd.to_path_buf(),
             session_id: None,
+            root_id: None,
+            journal: None,
             initial_history: Vec::new(),
             yolo: false,
             system_prompt_override: None,
@@ -1123,6 +1142,34 @@ mod tests {
         .unwrap();
         smol::block_on(session.handle.input_tx.admit(input(message))).unwrap();
         session
+    }
+
+    fn assert_print_graph_settled(manager: &AgentManagerHandle) {
+        let graph = manager.snapshot();
+        assert!(!graph.is_empty());
+        assert!(!manager.journal().is_persistent());
+        for node in graph {
+            assert!(matches!(
+                node.graph_lifecycle,
+                GraphLifecycle::Closed | GraphLifecycle::Dormant
+            ));
+            assert_eq!(node.residency, AgentResidency::Dormant);
+            assert!(manager.runner_finished(node.agent_id).unwrap());
+            let retained = manager.lookup(node.agent_id).unwrap();
+            assert!(!retained.is_live());
+            assert!(retained.validate_live().is_err());
+            assert!(retained.actor().is_err());
+            assert!(retained.effective_config().is_err());
+            if let Some(actor) = node.actor {
+                assert!(matches!(
+                    actor.lifecycle,
+                    ActorLifecycle::Closed | ActorLifecycle::Shutdown
+                ));
+                assert_eq!(actor.status, ActorStatus::Idle);
+                assert_eq!(actor.active_turn, None);
+                assert_eq!(actor.queued, 0);
+            }
+        }
     }
 
     fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -1360,8 +1407,10 @@ mod tests {
             .unwrap();
         let (polled, polling) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
+        let mut params = print_params(&std::env::temp_dir(), None);
+        params.permissions_config.yolo = true;
         let session = spawn_started(
-            print_params(&std::env::temp_dir(), None),
+            params,
             name,
             Arc::new(GatedToolProvider {
                 name,
@@ -1371,6 +1420,8 @@ mod tests {
         );
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
         let manager = session.handle.manager.clone();
+        let root = session.root.target.clone();
+        let actor = root.actor().unwrap();
         let session_id = session.handle.session_id.id();
         let result = catch_unwind(AssertUnwindSafe(|| {
             with_print_session(session, |_| {
@@ -1389,7 +1440,16 @@ mod tests {
         } else {
             assert_eq!(result.unwrap().unwrap_err().to_string(), OUTPUT_ERROR);
         }
-        assert!(manager.snapshot().is_empty());
+        assert_print_graph_settled(&manager);
+        assert_eq!(manager.snapshot().len(), 1);
+        assert_eq!(manager.snapshot()[0].agent_id, root.id());
+        assert!(matches!(
+            actor.snapshot().latest,
+            Some(TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Shutdown,
+                ..
+            })
+        ));
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         let _ = release.send(());
         assert!(execution.try_recv().is_err());
@@ -1761,7 +1821,9 @@ mod tests {
                     "initialized command did not finish"
                 );
             }
-            let work = dispatch_print(&registry, target, literal)?;
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            let work = dispatch_print(&registry, target, literal, &admission)?;
             if let PrintWork::Reply(reply) = &work {
                 assert_eq!(
                     root.effective_config().unwrap().unwrap().context.cwd(),
@@ -1784,15 +1846,30 @@ mod tests {
                     let child_actor = if nested {
                         entering.recv_timeout(GATE_TIMEOUT).unwrap();
                         let graph = manager.snapshot();
-                        assert_eq!(graph.len(), 3);
+                        assert_eq!(graph.len(), 4);
+                        let closed_child = graph
+                            .iter()
+                            .find(|node| node.graph_lifecycle == GraphLifecycle::Closed)
+                            .unwrap();
+                        assert_eq!(closed_child.parent_id, Some(root.id()));
+                        let retained = manager.lookup(closed_child.agent_id).unwrap();
+                        assert!(retained.validate_live().is_err());
+                        assert!(retained.actor().is_err());
+                        assert!(manager.runner_finished(closed_child.agent_id).unwrap());
+                        assert_eq!(
+                            graph
+                                .iter()
+                                .filter(|node| node.graph_lifecycle == GraphLifecycle::Live)
+                                .count(),
+                            3
+                        );
+                        let grandchild = graph.iter().find(|node| node.depth == 2).unwrap();
                         let child = graph
                             .iter()
-                            .find(|node| node.parent_id == Some(root.id()))
+                            .find(|node| Some(node.agent_id) == grandchild.parent_id)
                             .unwrap();
-                        let grandchild = graph
-                            .iter()
-                            .find(|node| node.parent_id == Some(child.agent_id))
-                            .unwrap();
+                        assert_eq!(child.parent_id, Some(root.id()));
+                        assert_ne!(child.agent_id, closed_child.agent_id);
                         assert_eq!((child.depth, grandchild.depth), (1, 2));
                         assert_eq!(grandchild.root_id, root.id());
                         let actor = manager.lookup(child.agent_id).unwrap().actor().unwrap();
@@ -1848,7 +1925,17 @@ mod tests {
         } else {
             result.unwrap();
         }
-        assert!(manager.snapshot().is_empty());
+        assert_print_graph_settled(&manager);
+        assert_eq!(
+            manager.snapshot().len(),
+            if nested {
+                4
+            } else if outcome == "turn" {
+                2
+            } else {
+                1
+            }
+        );
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         assert!(!dir.exists());
         assert_eq!(files_under(state_dir.path()), Vec::<PathBuf>::new());
@@ -1892,7 +1979,9 @@ mod tests {
         )
         .unwrap();
         with_print_session(session, |session| {
-            dispatch_print(registry, &session.commands, literal)
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            dispatch_print(registry, &session.commands, literal, &admission)
         })
     }
 

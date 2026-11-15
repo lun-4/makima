@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use makima_providers::{ContentBlock, Message};
 
 use super::{ActorError, AgentActorHandle};
-use crate::TurnId;
+use crate::{HistorySnapshot, TurnId};
 
 const MAX_MESSAGES: usize = 1000;
 const MIN_BYTES: usize = 2;
@@ -32,7 +32,39 @@ pub struct TranscriptSnapshot {
     pub truncated: bool,
 }
 
+impl TranscriptRequest {
+    fn validate(&self) -> Result<(), ActorError> {
+        if !(1..=MAX_MESSAGES).contains(&self.last_messages)
+            || !(MIN_BYTES..=MAX_BYTES).contains(&self.max_bytes)
+        {
+            return Err(ActorError::InvalidTranscriptCaps);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn transcript_snapshot(
+    history: &HistorySnapshot,
+    request: &TranscriptRequest,
+) -> Result<TranscriptSnapshot, ActorError> {
+    request.validate()?;
+    if let Some(turn_id) = request.through_turn {
+        return Err(ActorError::UnavailableTurnHistory(turn_id));
+    }
+    bounded_snapshot(
+        &history.messages,
+        None,
+        history.epoch,
+        history.compacted,
+        request,
+    )
+}
+
 impl AgentActorHandle {
+    pub(crate) fn committed_history_snapshot(&self) -> crate::HistorySnapshot {
+        (*self.inner.history.load_full()).clone()
+    }
+
     pub fn committed_message_count(&self) -> usize {
         self.inner.history.load().messages.len()
     }
@@ -55,11 +87,7 @@ impl AgentActorHandle {
         request: TranscriptRequest,
         #[cfg(test)] after_snapshot: impl FnOnce(),
     ) -> Result<TranscriptSnapshot, ActorError> {
-        if !(1..=MAX_MESSAGES).contains(&request.last_messages)
-            || !(MIN_BYTES..=MAX_BYTES).contains(&request.max_bytes)
-        {
-            return Err(ActorError::InvalidTranscriptCaps);
-        }
+        request.validate()?;
         let (history, through_turn, end) = {
             // Settlement takes outcomes before state, then coverage. Keep that order
             // so a boundary and its history are captured in the same observation.
@@ -217,8 +245,11 @@ mod tests {
     use makima_providers::{ContentBlock, Message, Role};
     use test_case::test_case;
 
-    use super::{MAX_BYTES, TranscriptRequest, bounded_snapshot};
-    use crate::TurnId;
+    use super::{
+        MAX_BYTES, MAX_MESSAGES, MIN_BYTES, TranscriptRequest, bounded_snapshot,
+        transcript_snapshot,
+    };
+    use crate::{ActorError, HistorySnapshot, TurnId};
 
     const FIRST_CALL: &str = "first-call";
     const SECOND_CALL: &str = "second-call";
@@ -247,6 +278,83 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test_case(1, 3, 1; "omits_partial_tool_group")]
+    #[test_case(4, 0, 0; "keeps_complete_tool_group")]
+    fn dormant_snapshot_preserves_history_metadata(
+        last_messages: usize,
+        omitted: usize,
+        omitted_groups: usize,
+    ) {
+        let history = HistorySnapshot {
+            epoch: EPOCH,
+            compacted: true,
+            conversation: None,
+            messages: vec![
+                calls(&[FIRST_CALL, SECOND_CALL]),
+                result(SECOND_CALL),
+                result(FIRST_CALL),
+                Message::user(TEXT.into()),
+            ]
+            .into(),
+        };
+        let snapshot = transcript_snapshot(
+            &history,
+            &TranscriptRequest {
+                through_turn: None,
+                last_messages,
+                max_bytes: MAX_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.messages,
+            serde_json::to_value(&history.messages[omitted..]).unwrap()
+        );
+        assert_eq!(snapshot.total_messages, history.messages.len());
+        assert_eq!(snapshot.omitted_messages, omitted);
+        assert_eq!(snapshot.omitted_tool_groups, omitted_groups);
+        assert_eq!(snapshot.epoch, EPOCH);
+        assert!(snapshot.compacted);
+        assert_eq!(snapshot.through_turn, None);
+        assert_eq!(snapshot.truncated, omitted != 0);
+        assert_eq!(
+            snapshot.bytes,
+            serde_json::to_vec(&snapshot.messages).unwrap().len()
+        );
+    }
+
+    #[test_case(0, MAX_BYTES; "zero_messages")]
+    #[test_case(MAX_MESSAGES + 1, MAX_BYTES; "too_many_messages")]
+    #[test_case(1, MIN_BYTES - 1; "too_few_bytes")]
+    #[test_case(1, MAX_BYTES + 1; "too_many_bytes")]
+    fn dormant_snapshot_validates_caps(last_messages: usize, max_bytes: usize) {
+        let error = transcript_snapshot(
+            &HistorySnapshot::new(Vec::new()),
+            &TranscriptRequest {
+                through_turn: None,
+                last_messages,
+                max_bytes,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ActorError::InvalidTranscriptCaps));
+    }
+
+    #[test]
+    fn dormant_snapshot_does_not_invent_turn_coverage() {
+        let turn_id = TurnId::generate();
+        let error = transcript_snapshot(
+            &HistorySnapshot::new(vec![Message::user(TEXT.into())]),
+            &TranscriptRequest {
+                through_turn: Some(turn_id),
+                last_messages: 1,
+                max_bytes: MAX_BYTES,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ActorError::UnavailableTurnHistory(id) if id == turn_id));
     }
 
     #[test_case(1, MAX_BYTES, 1, 3, 1; "count_intersects_parallel_group")]

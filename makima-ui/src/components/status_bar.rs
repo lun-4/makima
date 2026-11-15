@@ -1074,7 +1074,8 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let cwd = env::current_dir().unwrap();
+        let (_dir, path) = tmp_with_head(Some("ref: refs/heads/main\n"));
+        let cwd = PathBuf::from(path);
         let label = cwd_branch_label(&cwd);
         let (tx, rx) = flume::bounded(1);
         let mut bar = StatusBar::new(FLASH_TTL, cwd);

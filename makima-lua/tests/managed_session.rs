@@ -3,17 +3,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use makima_agent::actor::DeliveryStatus;
+use makima_agent::actor::{ActorHistory, DeliveryStatus};
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::manager::AgentResidency;
 use makima_agent::template::Vars;
 use makima_agent::tools::{
     DescriptionContext, RequestTools, ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
 };
 use makima_agent::{
-    ActorBackend, ActorEvent, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle,
-    AgentMetadata, AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope,
-    GraphLifecycle, History, RunSettings, ToolOutput, TurnContext, TurnId, TurnOutcome, TurnResult,
-    TurnTicket, WorkKind,
+    ActorBackend, ActorEvent, ActorLifecycle, AgentEvent, AgentId, AgentInput, AgentLimits,
+    AgentManagerHandle, AgentMetadata, AgentMode, AgentRef, BackendResult, ControlWork, DoneReason,
+    Envelope, GraphLifecycle, ManagerError, RunSettings, ToolOutput, TurnCancellationReason,
+    TurnContext, TurnId, TurnOutcome, TurnResult, TurnTicket, WorkKind,
 };
 use makima_lua::PluginHost;
 use makima_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
@@ -24,6 +25,7 @@ use makima_providers::{
     RequestDelivery, RequestOptions, Role, StreamResponse,
 };
 use makima_storage::id::SessionRef;
+use makima_storage::session_state::StoredAgentLifecycle;
 use serde_json::{Value, json};
 
 mod common;
@@ -193,8 +195,8 @@ makima.api.register_tool({
         local sent = test_task_handlers.task_send({
           task_id = retained_task_id,
           message = "stale turn",
-        })
-        local despawned = test_task_handlers.task_despawn({ task_id = retained_task_id })
+        }, ctx)
+        local despawned = test_task_handlers.task_despawn({ task_id = retained_task_id }, ctx)
         finish_async_wait(sent.llm_output, sent.is_error, despawned.llm_output, despawned.is_error)
       end)
     end)
@@ -212,10 +214,10 @@ makima.api.register_tool({
       finish_async_wait = done
       release_async_worker()
     end)
-    if send_err ~= "task is owned by another agent branch" or send_is_error ~= true then
+    if send_err ~= "$EXPIRED_CONTEXT_ERROR" or send_is_error ~= true then
       return { llm_output = "unexpected stale task_send result: " .. tostring(send_err), is_error = true }
     end
-    if despawn_err ~= "task is owned by another agent branch" or despawn_is_error ~= true then
+    if despawn_err ~= "$EXPIRED_CONTEXT_ERROR" or despawn_is_error ~= true then
       return { llm_output = "unexpected stale task_despawn result: " .. tostring(despawn_err), is_error = true }
     end
     return "ok"
@@ -478,7 +480,7 @@ struct LuaToolBackend {
 impl ActorBackend for LuaToolBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -494,6 +496,7 @@ impl ActorBackend for LuaToolBackend {
             );
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
+            self.context.execution_agent_id = Some(context.agent_id);
             self.context.managed_turn = context.managed_turn;
             collect_request_tools(&mut self.context, &self.registry, ToolAudience::MAIN);
             let invocation = self
@@ -520,7 +523,7 @@ impl ActorBackend for LuaToolBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -529,7 +532,7 @@ impl ActorBackend for LuaToolBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -549,7 +552,7 @@ struct NestedTaskBackend {
 impl ActorBackend for NestedTaskBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -565,6 +568,7 @@ impl ActorBackend for NestedTaskBackend {
             );
             assert!(!context.cancel.is_cancelled());
             self.context.cancel = context.cancel;
+            self.context.execution_agent_id = Some(context.agent_id);
             self.context.managed_turn = context.managed_turn;
             collect_request_tools(&mut self.context, &self.registry, ToolAudience::GENERAL_SUB);
             let invocation = self
@@ -601,7 +605,7 @@ impl ActorBackend for NestedTaskBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -610,7 +614,7 @@ impl ActorBackend for NestedTaskBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -626,7 +630,7 @@ struct SpawnManagedChildBackend {
 impl ActorBackend for SpawnManagedChildBackend {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -659,7 +663,7 @@ impl ActorBackend for SpawnManagedChildBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -668,7 +672,7 @@ impl ActorBackend for SpawnManagedChildBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -983,13 +987,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
         }
         manager.lookup(child_id).unwrap().close_subtree().unwrap();
         let nested_id = closed_child(&events, child_id).await;
-        wait_for_runner_finished(&manager, nested_id).await;
-        assert!(
-            manager
-                .snapshot()
-                .iter()
-                .all(|node| node.agent_id != nested_id)
-        );
+        assert_closed_child(&manager, nested_id, child_id).await;
         assert!(first_rx.is_empty());
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
@@ -1059,6 +1057,35 @@ async fn closed_child(events: &flume::Receiver<Envelope>, parent_id: AgentId) ->
     .await
 }
 
+async fn assert_closed_child(manager: &AgentManagerHandle, agent_id: AgentId, parent_id: AgentId) {
+    wait_for_runner_finished(manager, agent_id).await;
+    let child = manager.node(agent_id).unwrap();
+    assert_eq!(child.parent_id, Some(parent_id));
+    assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+    assert_eq!(child.residency, AgentResidency::Dormant);
+    assert!(
+        manager
+            .node(parent_id)
+            .unwrap()
+            .children
+            .contains(&agent_id)
+    );
+    assert_eq!(
+        manager.journal().agent(agent_id).unwrap().lifecycle,
+        StoredAgentLifecycle::Closed
+    );
+    assert!(matches!(
+        manager.actor(agent_id),
+        Err(ManagerError::NonLiveAgent(id)) if id == agent_id
+    ));
+    if let Some(actor) = child.actor {
+        assert_eq!(actor.lifecycle, ActorLifecycle::Closed);
+        assert!(actor.active_turn.is_none());
+        assert_eq!(actor.queued, 0);
+        assert!(actor.latest.is_some());
+    }
+}
+
 async fn wait_for_runner_finished(manager: &AgentManagerHandle, agent_id: AgentId) {
     let finished = futures_lite::future::race(
         async {
@@ -1119,13 +1146,7 @@ fn managed_nested_task_completes_before_parent_turn_ends_at_capacity_one() {
         );
         assert_eq!(parent.snapshot().unwrap().depth, 1);
         let nested_id = closed_child(&events, parent.id()).await;
-        wait_for_runner_finished(&manager, nested_id).await;
-        assert!(
-            manager
-                .snapshot()
-                .iter()
-                .all(|node| node.agent_id != nested_id)
-        );
+        assert_closed_child(&manager, nested_id, parent.id()).await;
 
         release_tx.send(()).unwrap();
         assert!(matches!(
@@ -1804,7 +1825,7 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let (release_tx, release_rx) = flume::bounded(1);
-        let (parent, _parent_ticket) = spawn_managed_parent(
+        let (parent, parent_ticket) = spawn_managed_parent(
             &manager,
             parent_policy(&context),
             Box::new(NestedTaskBackend {
@@ -1862,19 +1883,20 @@ fn closing_managed_subtree_closes_retained_nested_session_adapter() {
             .execute(&context)
             .await;
         assert!(retry.output.is_ok(), "retained descendant accepted input");
-        wait_for_runner_finished(&manager, descendant_id).await;
+        assert_closed_child(&manager, descendant_id, parent.id()).await;
         assert_eq!(
             descendant.snapshot().unwrap().graph_lifecycle,
             GraphLifecycle::Closed
         );
-        assert!(
-            manager
-                .snapshot()
-                .iter()
-                .all(|node| node.agent_id != descendant_id)
-        );
 
         release_tx.send(()).unwrap();
+        assert!(matches!(
+            parent_ticket.wait().await,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Closed,
+                ..
+            }
+        ));
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });
@@ -1922,13 +1944,7 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
         assert_eq!(completed, Ok(SILENT_REPLY.into()));
         assert!(parent_ticket.peek().is_none());
         let child_id = closed_child(&events, parent.id()).await;
-        wait_for_runner_finished(&manager, child_id).await;
-        assert!(
-            manager
-                .snapshot()
-                .iter()
-                .all(|node| node.agent_id != child_id)
-        );
+        assert_closed_child(&manager, child_id, parent.id()).await;
 
         release_tx.send(()).unwrap();
         assert!(matches!(
@@ -2172,11 +2188,11 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             .expect("managed child history envelope");
         let child = envelope.subagent.unwrap();
         assert_eq!(child.parent_agent_id, Some(root.id()));
-        wait_for_runner_finished(&manager, child.agent_id).await;
+        assert_closed_child(&manager, child.agent_id, root.id()).await;
         let root_node = root.snapshot().unwrap();
         assert_eq!(root_node.graph_lifecycle, GraphLifecycle::Live);
-        assert!(root_node.children.is_empty());
-        assert_eq!(manager.snapshot().len(), 1);
+        assert_eq!(root_node.children, [child.agent_id]);
+        assert_eq!(manager.snapshot().len(), 2);
 
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
@@ -2213,27 +2229,10 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
 
         assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-        let reclaimed = futures_lite::future::race(
-            async {
-                loop {
-                    let children = root.snapshot().unwrap().children;
-                    if children.is_empty() {
-                        break true;
-                    }
-                    for child_id in children {
-                        wait_for_runner_finished(&manager, child_id).await;
-                    }
-                    smol::future::yield_now().await;
-                }
-            },
-            async {
-                smol::Timer::after(SETTLE_TIMEOUT).await;
-                false
-            },
-        )
-        .await;
-        assert!(reclaimed, "silent child was not reclaimed");
-        assert_eq!(manager.snapshot().len(), 1);
+        let children = root.snapshot().unwrap().children;
+        assert_eq!(children.len(), 1);
+        assert_closed_child(&manager, children[0], root.id()).await;
+        assert_eq!(manager.snapshot().len(), 2);
         assert!(
             events.is_empty(),
             "silent child emitted parent envelopes: {:?}",
@@ -2353,9 +2352,9 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
             .await
             .expect("timed-out managed provider request remained alive");
         let child_id = closed_child(&events, root.id()).await;
-        wait_for_runner_finished(&manager, child_id).await;
-        assert!(root.snapshot().unwrap().children.is_empty());
-        assert_eq!(manager.snapshot().len(), 1);
+        assert_closed_child(&manager, child_id, root.id()).await;
+        assert_eq!(root.snapshot().unwrap().children, [child_id]);
+        assert_eq!(manager.snapshot().len(), 2);
 
         let report = manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

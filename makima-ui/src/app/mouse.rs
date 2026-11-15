@@ -4,6 +4,7 @@ use crate::click::{ClickTarget, ScrollOwner, Surface};
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use makima_agent::AgentId;
 use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
@@ -314,33 +315,12 @@ impl App {
                         if !self.result_action_contains(row, col, area, id) {
                             return (Dirty::NO, vec![]);
                         }
-                        let historical = self.chats[self.active_chat]
-                            .message_at_row(row, area)
-                            .is_some_and(|message| message.result_historical);
-                        let target = if historical {
-                            self.historical_chat_index(id)
-                        } else {
-                            self.live_chat_index.get(&id).copied()
-                        };
-                        if let Some(index) = target {
-                            self.active_chat = index;
-                        } else {
-                            self.flash(format!("Child transcript unavailable for {id}"));
-                        }
+                        self.open_agent_chat(id);
                         return (Dirty::YES, vec![]);
                     }
                     if let Some(id) = self.chats[self.active_chat].post_agent_at(row, area) {
-                        let mut matches = self
-                            .chats
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(id));
-                        let target = matches.next().map(|(index, _)| index);
-                        if let Some(index) = target.filter(|_| matches.next().is_none()) {
-                            self.active_chat = index;
-                        } else {
-                            self.flash(FLASH_NO_AGENT_CHAT.into());
-                        }
+                        self.open_agent_chat(id);
+                        return (Dirty::YES, vec![]);
                     } else {
                         self.chats[self.active_chat].handle_click(row, area);
                     }
@@ -348,6 +328,14 @@ impl App {
             }
         }
         (Dirty::NO, vec![])
+    }
+
+    fn open_agent_chat(&mut self, id: AgentId) {
+        if let Some(&index) = self.agent_chat_index.get(&id) {
+            self.active_chat = index;
+        } else {
+            self.flash(FLASH_NO_AGENT_CHAT.into());
+        }
     }
 
     fn result_action_contains(
@@ -407,6 +395,7 @@ impl App {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         match surface {
             Surface::Picker(picker) => self.handle_picker_key(picker, key),
+            Surface::Restore => self.handle_key(key),
             Surface::Help => {
                 self.help_modal.handle_key(key);
                 vec![]

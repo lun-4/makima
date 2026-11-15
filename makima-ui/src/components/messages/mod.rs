@@ -36,8 +36,8 @@ use std::time::Instant;
 use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
 use makima_agent::{
-    AgentId, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentId, AgentRef, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND,
+    SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use makima_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 
@@ -102,6 +102,7 @@ pub struct MessagesPanel {
     role_names: RoleNames,
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
+    restore_target: Option<AgentRef>,
     show_thinking: bool,
     thinking_collapsed: bool,
     clock_format: ClockFormat,
@@ -181,6 +182,7 @@ impl MessagesPanel {
             role_names,
             lua_event_handle,
             restore_event_tx: None,
+            restore_target: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
             clock_format: ui_config.clock_format,
@@ -199,6 +201,10 @@ impl MessagesPanel {
 
     pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
+    }
+
+    pub(crate) fn set_restore_target(&mut self, target: Option<AgentRef>) {
+        self.restore_target = target;
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -728,8 +734,8 @@ impl MessagesPanel {
         (line + 1 == segment.lines().len()).then_some(agent)
     }
 
-    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
-        self.message_at_row(row, area)?.post_agent.as_deref()
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<AgentId> {
+        self.message_at_row(row, area)?.post_agent
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
@@ -1357,7 +1363,12 @@ impl MessagesPanel {
             .messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-        crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
+        crate::chat::restore_item_for(
+            msg,
+            self.tool_output_lines,
+            self.theme_generation,
+            self.restore_target.clone(),
+        )
     }
 
     /// Re-restores every snapshot still painted with old-theme colors.
@@ -1381,7 +1392,9 @@ impl MessagesPanel {
             ) {
                 continue;
             }
-            if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+            if let Some(mut item) =
+                crate::chat::restore_item_for(msg, tol, current_gen, self.restore_target.clone())
+            {
                 item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
                 eh.request_restore(item, tx.clone());
                 requested.push(role.id.clone());

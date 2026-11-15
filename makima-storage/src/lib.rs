@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod blobs;
 pub mod checkpoint;
 pub mod conversation;
 pub mod id;
@@ -14,8 +15,14 @@ pub mod model;
 mod offload_cleanup;
 pub mod paths;
 pub mod plans;
+mod resources;
+pub mod restore;
+pub mod restore_digest;
 pub mod session_lock;
+pub mod session_state;
 pub mod sessions;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
@@ -34,6 +41,7 @@ use tempfile::NamedTempFile;
 
 pub use offload_cleanup::remove_offload_dir_from;
 use paths::state_dir;
+pub use resources::RootResource;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
@@ -43,11 +51,14 @@ pub struct StateDir(PathBuf);
 
 impl StateDir {
     pub fn resolve() -> Result<Self, StorageError> {
-        let dir = state_dir()?;
-        Ok(Self(dir))
+        Ok(Self::from_path(state_dir()?))
     }
 
+    /// Anchored stores walk below this root without following symlinks, so the
+    /// symlinks that already exist on the way to it are resolved once here.
     pub fn from_path(path: PathBuf) -> Self {
+        #[cfg(unix)]
+        let path = paths::canonical_key(&path);
         Self(path)
     }
 

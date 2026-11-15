@@ -14,7 +14,7 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use makima_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use makima_agent::{
-    AgentEvent, AgentId, BufferSnapshot, Post, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use makima_config::{ToolKey, ToolOutputLines, UiConfig};
 use makima_lua::WinView;
@@ -115,6 +115,10 @@ impl Chat {
 
     pub(crate) fn set_restore_channel(&mut self, event_tx: Option<makima_agent::EventSender>) {
         self.messages_panel.set_restore_channel(event_tx);
+    }
+
+    pub(crate) fn set_restore_target(&mut self, target: Option<AgentRef>) {
+        self.messages_panel.set_restore_target(target);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
@@ -395,7 +399,7 @@ impl Chat {
         self.messages_panel.result_navigation_at(row, area)
     }
 
-    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<AgentId> {
         self.messages_panel.post_agent_at(row, area)
     }
 
@@ -590,15 +594,15 @@ pub fn history_to_display(
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
-    history_to_display_with_lookup(messages, tool_outputs, tool_output_lines, posts, &|_| false)
+    history_to_display_with_target(messages, tool_outputs, tool_output_lines, posts, None)
 }
 
-pub(crate) fn history_to_display_with_lookup(
+pub(crate) fn history_to_display_with_target(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
-    available: &impl Fn(AgentId) -> bool,
+    state_target: Option<AgentRef>,
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
@@ -606,7 +610,7 @@ pub(crate) fn history_to_display_with_lookup(
     for (boundary, msg) in messages.iter().enumerate() {
         push_posts_at(&mut display, posts, boundary, messages.len());
         if msg.is_observation() {
-            if let Some(notice) = child_result_notice(msg, available) {
+            if let Some(notice) = child_result_notice(msg) {
                 display.push(notice);
             }
             continue;
@@ -700,6 +704,7 @@ pub(crate) fn history_to_display_with_lookup(
                                     theme_gen: None,
                                     clicks: Vec::new(),
                                     state,
+                                    state_target: state_target.clone(),
                                 });
                             }
                             display.push(DisplayMessage {
@@ -717,7 +722,6 @@ pub(crate) fn history_to_display_with_lookup(
                                 annotation,
                                 plan_path: None,
                                 result_agent: None,
-                                result_historical: false,
                                 result_expanded: false,
                                 result_preview: None,
                                 post_agent: None,
@@ -740,10 +744,7 @@ pub(crate) fn history_to_display_with_lookup(
     (display, restore_items)
 }
 
-fn child_result_notice(
-    message: &Message,
-    available: &impl Fn(AgentId) -> bool,
-) -> Option<DisplayMessage> {
+fn child_result_notice(message: &Message) -> Option<DisplayMessage> {
     let ObservationSource::ChildResult { agent_id, turn_id } =
         message.observation_source.as_ref()?;
     let payload = message
@@ -760,10 +761,12 @@ fn child_result_notice(
     let source = envelope["label"].as_str().unwrap_or(agent_id);
     let text = envelope["text"].as_str()?;
     let output = envelope["output"].as_array().map_or(&[][..], Vec::as_slice);
-    let agent_id = agent_id.parse().ok().filter(|id| available(*id));
-    let mut notice = format_child_result_notice(source, text, output, agent_id);
-    notice.result_historical = true;
-    Some(notice)
+    Some(format_child_result_notice(
+        source,
+        text,
+        output,
+        agent_id.parse().ok(),
+    ))
 }
 
 pub(crate) fn format_child_result_notice(
@@ -827,7 +830,7 @@ fn push_posts_at(
 
 fn post_message(post: &Post) -> DisplayMessage {
     DisplayMessage {
-        post_agent: post.agent.clone(),
+        post_agent: post.agent.as_deref().and_then(|id| id.parse().ok()),
         ..DisplayMessage::new(DisplayRole::Post(post.level), post.text.clone())
     }
 }
@@ -838,6 +841,7 @@ pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: makima_config::ToolOutputLines,
     theme_gen: u64,
+    state_target: Option<AgentRef>,
 ) -> Option<makima_lua::RestoreItem> {
     let DisplayRole::Tool(role) = &msg.role else {
         return None;
@@ -859,6 +863,7 @@ pub(crate) fn restore_item_for(
         theme_gen: Some(theme_gen),
         clicks: Vec::new(),
         state,
+        state_target,
     })
 }
 
@@ -1246,6 +1251,7 @@ mod tests {
     #[test_case(5, 2 ; "past_a_shortened_history")]
     fn restored_post_lands_at_its_message_boundary(after_message: usize, expected_index: usize) {
         const POST_TEXT: &str = "reviewer started";
+        let agent_id = AgentId::generate();
         let msgs = vec![
             Message::user(USER_TEXT.into()),
             Message {
@@ -1262,7 +1268,7 @@ mod tests {
             post: Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Warn,
-                agent: Some(TASK_ID.into()),
+                agent: Some(agent_id.to_string()),
             },
         };
         let display = history_to_display(
@@ -1278,7 +1284,7 @@ mod tests {
             DisplayRole::Post(PostLevel::Warn)
         );
         assert_eq!(display[expected_index].text, POST_TEXT);
-        assert_eq!(display[expected_index].post_agent.as_deref(), Some(TASK_ID));
+        assert_eq!(display[expected_index].post_agent, Some(agent_id));
     }
 
     #[test]
@@ -1321,14 +1327,12 @@ mod tests {
         assert_eq!(display[0].text, USER_TEXT);
         assert_eq!(display[1].text, REPLY_TEXT);
         assert_eq!(display[2].role, DisplayRole::Done);
-        assert_eq!(display[2].result_agent, None);
-        assert!(display[2].result_historical);
+        assert_eq!(display[2].result_agent, Some(agent_id));
         assert!(!display[2].result_expanded);
         let full = &display[2].text;
         let preview = display[2].result_preview.as_ref().unwrap();
         let suffix = format!(
-            "{COMPLETION_TRUNCATED}\n[Full result lookup: {reference}]\n[click to expand or collapse]\n[Child transcript unavailable; {} for Tasks]",
-            key::TASKS.label
+            "{COMPLETION_TRUNCATED}\n[Full result lookup: {reference}]\n[click to expand or collapse]\n[View child transcript]"
         );
         assert_eq!(
             *full,
@@ -1650,9 +1654,43 @@ mod tests {
     const RESTORE_THEME_GEN: u64 = 7;
 
     #[test]
+    fn history_and_rebake_restore_items_keep_explicit_agent_target() {
+        let manager = makima_agent::AgentManagerHandle::new(Default::default()).unwrap();
+        let agent = AgentId::generate();
+        let target = manager.reference(agent);
+        let messages = tool_use_pair(
+            "bash",
+            serde_json::json!({"command": "echo"}),
+            RESTORE_OUTPUT,
+            false,
+        );
+        let (_, items) = history_to_display_with_target(
+            &messages,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            &[],
+            Some(target.clone()),
+        );
+        let captured = items[0].state_target.as_ref().unwrap();
+        assert_eq!(captured.id(), agent);
+        assert!(captured.same_manager(&target));
+        let message = tool_msg_with_input("bash");
+        let rebaked = restore_item_for(
+            &message,
+            ToolOutputLines::default(),
+            RESTORE_THEME_GEN,
+            Some(target.clone()),
+        )
+        .unwrap();
+        let captured = rebaked.state_target.unwrap();
+        assert_eq!(captured.id(), agent);
+        assert!(captured.same_manager(&target));
+    }
+
+    #[test]
     fn restore_item_for_round_trips_fields() {
         let msg = tool_msg_with_input("bash");
-        let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN)
+        let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN, None)
             .expect("tool message with input and output must produce a RestoreItem");
         assert_eq!(&*item.tool, "bash");
         assert_eq!(item.tool_use_id, "t1");
@@ -1666,7 +1704,9 @@ mod tests {
     fn restore_item_for_skips_structured_outputs_rust_renders() {
         let mut msg = tool_msg_with_input("edit");
         msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
-        assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
+        assert!(
+            restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN, None).is_none()
+        );
     }
 
     #[test]
@@ -1691,15 +1731,15 @@ mod tests {
         let tol = ToolOutputLines::default();
 
         let plain = DisplayMessage::new(DisplayRole::Assistant, "hi".into());
-        assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN, None).is_none());
 
         let mut no_input = tool_msg_with_input("bash");
         no_input.tool_raw_input = None;
-        assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN, None).is_none());
 
         let mut no_output = tool_msg_with_input("bash");
         no_output.tool_output = None;
-        assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN, None).is_none());
     }
 
     #[test]

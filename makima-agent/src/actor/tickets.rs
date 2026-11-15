@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use event_listener::Event;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{TurnId, TurnOutcome};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnResult {
     pub outcome: TurnOutcome,
     pub text: String,
@@ -22,7 +23,8 @@ pub struct TurnResult {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnOrigin {
     #[default]
     Internal,
@@ -30,7 +32,7 @@ pub enum TurnOrigin {
     Plugin,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnProvenance {
     pub origin: TurnOrigin,
     pub plugin: Option<String>,
@@ -117,6 +119,26 @@ struct Shared {
 }
 
 impl TurnTicket {
+    pub fn from_result(result: TurnResult) -> Self {
+        Self::from_result_for_actor(result, Arc::new(()))
+    }
+
+    pub(crate) fn from_result_for_actor(result: TurnResult, actor_identity: Arc<()>) -> Self {
+        Self {
+            turn_id: result.outcome.turn_id(),
+            actor_identity,
+            provenance: result.provenance.clone(),
+            shared: Arc::new(Shared {
+                outcome: Mutex::new(Some(result.outcome.clone())),
+                event: Event::new(),
+            }),
+            output: TurnOutput(Arc::new(Mutex::new(OutputState {
+                result: Some(result),
+                ..Default::default()
+            }))),
+        }
+    }
+
     pub(crate) fn new(turn_id: TurnId, actor_identity: Arc<()>) -> Self {
         Self {
             turn_id,
@@ -190,6 +212,17 @@ impl TurnTicket {
         }
     }
 
+    pub(crate) fn replace_sealed_outcome(&self, outcome: &TurnOutcome) {
+        let mut state = self
+            .output
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(result) = &mut state.result {
+            result.outcome = outcome.clone();
+        }
+    }
+
     pub(crate) fn resolve(&self, outcome: TurnOutcome) {
         let mut outcome_slot = self
             .shared
@@ -224,5 +257,74 @@ impl TurnTicket {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures_lite::future::poll_once;
+    use makima_providers::TokenUsage;
+    use serde_json::json;
+
+    use super::{TurnOrigin, TurnProvenance, TurnResult, TurnTicket};
+    use crate::{AgentId, TurnCancellationReason, TurnId, TurnOutcome};
+
+    const TEXT: &str = "frozen response";
+    const LATE_TEXT: &str = "late response";
+    const PLUGIN: &str = "task";
+
+    #[test]
+    fn restored_ticket_is_resolved_without_actor_execution() {
+        let result = TurnResult {
+            outcome: TurnOutcome::cancelled(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                2,
+                TurnCancellationReason::Interrupted,
+            ),
+            text: TEXT.into(),
+            output: vec![json!({ "answer": [1, true, null] })],
+            provenance: TurnProvenance {
+                origin: TurnOrigin::Plugin,
+                plugin: Some(PLUGIN.into()),
+                plugin_generation: Some(3),
+                source_agent: Some(AgentId::generate()),
+                source_turn: Some(TurnId::generate()),
+            },
+            duration_ms: 42,
+        };
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TurnResult>(&encoded).unwrap(),
+            result
+        );
+        let ticket = TurnTicket::from_result(result.clone());
+        assert_eq!(ticket.turn_id(), result.outcome.turn_id());
+        assert_eq!(ticket.provenance(), &result.provenance);
+        assert!(!ticket.belongs_to(&Arc::new(())));
+        assert_eq!(
+            smol::block_on(poll_once(ticket.wait())),
+            Some(result.outcome.clone())
+        );
+        assert_eq!(
+            smol::block_on(poll_once(ticket.wait_result())),
+            Some(result.clone())
+        );
+        ticket.output().append_text(LATE_TEXT);
+        ticket.output().append_output(json!(LATE_TEXT));
+        ticket.output().begin_text_attempt();
+        ticket.mark_started();
+        ticket.resolve(TurnOutcome::cancelled(
+            result.outcome.agent_id(),
+            result.outcome.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        ));
+        assert_eq!(ticket.peek_result(), Some(result.clone()));
+        assert_eq!(ticket.peek(), Some(result.outcome));
     }
 }

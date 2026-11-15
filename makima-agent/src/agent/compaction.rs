@@ -14,6 +14,7 @@ use super::history::{History, remove_orphaned_tool_results};
 use super::streaming::{
     Conversation, StreamError, end_conversation_detached, fresh_id, stream_with_retry,
 };
+use crate::actor::ActorHistory;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 
@@ -63,7 +64,7 @@ pub(super) async fn compact_history(
     provider: &Arc<dyn Provider>,
     agent_provider: &Arc<dyn Provider>,
     model: &Model,
-    history: &mut History,
+    history: ActorHistory<'_>,
     event_tx: &EventSender,
     cancel: &CancelToken,
     config: &AgentConfig,
@@ -81,7 +82,7 @@ pub(super) async fn compact_history(
 
     let result = summarize(
         provider,
-        history,
+        &history,
         model,
         compaction_history,
         &event_tx,
@@ -97,6 +98,7 @@ pub(super) async fn compact_history(
         compact_start,
         model,
     )
+    .await
 }
 
 /// Each attempt is its own conversation, because truncating the oldest round
@@ -167,23 +169,14 @@ async fn summarize(
     Err(last_error.unwrap())
 }
 
-fn finish_compact(
+async fn finish_compact(
     response: StreamResponse,
-    history: &mut History,
+    mut history: ActorHistory<'_>,
     agent_provider: &Arc<dyn Provider>,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
 ) -> Result<TokenUsage, AgentError> {
-    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-        message: response.message.clone(),
-        usage: response.usage,
-        model: model.id.clone(),
-        cost: model.billed_cost(&response.usage, false),
-        context_size: Some(response.usage.output),
-        context_window: model.context_window,
-    })));
-
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
     if response.message.first_text_content().is_none() {
@@ -192,11 +185,25 @@ fn finish_compact(
 
     let new_history = vec![
         Message::user("What did we do so far?".into()),
-        response.message,
+        response.message.clone(),
     ];
-    if let Some(previous) = history.replace_compacted(new_history) {
+    let previous = history
+        .replace_compacted(new_history)
+        .await
+        .map_err(|error| AgentError::Config {
+            message: error.to_string(),
+        })?;
+    if let Some(previous) = previous {
         end_conversation_detached(agent_provider, previous, ConversationEnd::Compacted);
     }
+    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: response.message,
+        usage: response.usage,
+        model: model.id.clone(),
+        cost: model.billed_cost(&response.usage, false),
+        context_size: Some(response.usage.output),
+        context_window: model.context_window,
+    })));
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
@@ -211,7 +218,7 @@ pub async fn compact(
     provider: &Arc<dyn Provider>,
     agent_provider: &Arc<dyn Provider>,
     model: &Model,
-    history: &mut History,
+    mut history: ActorHistory<'_>,
     event_tx: &EventSender,
     cancel: &CancelToken,
     config: &AgentConfig,
@@ -222,7 +229,7 @@ pub async fn compact(
         provider,
         agent_provider,
         model,
-        history,
+        history.reborrow(),
         event_tx,
         cancel,
         config,
@@ -231,7 +238,12 @@ pub async fn compact(
     )
     .await?;
     if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
-        history.push(Message::synthetic(post.to_string()));
+        history
+            .push(Message::synthetic(post.to_string()))
+            .await
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
     }
 
     event_tx.send(AgentEvent::ControlComplete { usage })?;
@@ -360,7 +372,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::AgentConfig;
+    use crate::actor::HistoryMutationError;
+    use crate::journal::{JournalError, SessionJournal};
+    use crate::{AgentConfig, AgentId};
     use makima_config::CompactionBuffer;
 
     type Ended = (Arc<str>, ConversationEnd);
@@ -423,6 +437,71 @@ mod tests {
     }
 
     const SUMMARY_FAILED: &str = "summary failed";
+    const KEPT_HISTORY: &str = "history before compaction";
+
+    #[test_case(false, false; "unsent_success")]
+    #[test_case(false, true; "sent_success")]
+    #[test_case(true, false; "unsent_rejected")]
+    #[test_case(true, true; "sent_rejected")]
+    fn compaction_completion_and_invalidation_require_published_history(reject: bool, sent: bool) {
+        smol::block_on(async {
+            let journal = Arc::new(SessionJournal::default());
+            let agent = AgentId::generate();
+            let mut history = History::new(vec![Message::user(KEPT_HISTORY.into())])
+                .with_journal(agent, Arc::clone(&journal));
+            if sent {
+                history.mark_sent();
+            }
+            let before = history.snapshot().clone();
+            let conversation = Arc::clone(history.conversation_id());
+            if reject {
+                let incarnation = journal.incarnation(agent);
+                journal.set_incarnation(agent, incarnation.reservation.wrapping_add(1));
+            }
+            let provider = MockProvider::new(Vec::new());
+            let (tx, rx) = flume::unbounded();
+            let result = finish_compact(
+                text_response(StopReason::EndTurn),
+                ActorHistory::new(&mut history),
+                &dyn_provider(&provider),
+                &EventSender::new(tx),
+                std::time::Instant::now(),
+                &default_model(),
+            )
+            .await;
+            let ended = provider.ended.1.clone();
+            drop(provider);
+            if reject {
+                let expected =
+                    HistoryMutationError::Publication(JournalError::StaleIncarnation(agent));
+                assert!(
+                    matches!(result, Err(AgentError::Config { message }) if message == expected.to_string())
+                );
+                assert_eq!(history.snapshot().epoch, before.epoch);
+                assert_eq!(history.snapshot().messages, before.messages);
+                assert_eq!(history.conversation_id(), &conversation);
+                assert!(rx.try_recv().is_err());
+                assert_eq!(ended.recv_async().await.ok(), None);
+            } else {
+                assert!(result.is_ok());
+                assert!(history.snapshot().compacted);
+                assert_ne!(history.snapshot().epoch, before.epoch);
+                assert_ne!(history.conversation_id(), &conversation);
+                assert!(matches!(
+                    rx.try_recv().unwrap().event,
+                    AgentEvent::TurnComplete(_)
+                ));
+                assert!(rx.try_recv().is_err());
+                if sent {
+                    assert_eq!(
+                        ended.recv_async().await.unwrap(),
+                        (conversation, ConversationEnd::Compacted)
+                    );
+                }
+                assert_eq!(ended.recv_async().await.ok(), None);
+            }
+        });
+    }
 
     fn default_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
@@ -468,7 +547,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &sender,
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -503,7 +582,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -543,7 +622,7 @@ mod tests {
                 &provider,
                 &provider,
                 &model,
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -574,7 +653,7 @@ mod tests {
                 &dyn_provider(&summarizer),
                 &dyn_provider(&agent),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -622,7 +701,7 @@ mod tests {
                 &dyn_provider(&summarizer),
                 &dyn_provider(&summarizer),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -654,13 +733,13 @@ mod tests {
             })]);
             const KEPT: &str = "first";
             let mut history = History::new(vec![Message::user(KEPT.into())]);
-            let (raw_tx, _rx) = flume::unbounded();
+            let (raw_tx, rx) = flume::unbounded();
 
             let err = compact(
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -671,6 +750,10 @@ mod tests {
             .expect_err("empty summary must fail");
 
             assert!(matches!(err, AgentError::EmptySummary));
+            assert!(rx.try_iter().all(|event| !matches!(
+                event.event,
+                AgentEvent::TurnComplete(_) | AgentEvent::ControlComplete { .. }
+            )));
             assert_eq!(history.len(), 1);
             assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
         });
@@ -698,7 +781,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &config,
@@ -779,7 +862,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -1019,7 +1102,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),
@@ -1064,7 +1147,7 @@ mod tests {
                 &dyn_provider(&provider),
                 &dyn_provider(&provider),
                 &default_model(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &EventSender::new(raw_tx),
                 &CancelToken::none(),
                 &AgentConfig::default(),

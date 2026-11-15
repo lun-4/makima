@@ -7,12 +7,14 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+imbl = { workspace = true }
 event-listener = { workspace = true }
 makima-domain = { workspace = true }
 getrandom = { workspace = true }
 isahc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

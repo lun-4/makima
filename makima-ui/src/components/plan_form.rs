@@ -115,6 +115,14 @@ impl PlanForm {
         }
     }
 
+    pub(crate) fn restore_ready(&mut self, ready: bool) {
+        if ready && self.visibility == Visibility::Hidden {
+            self.on_plan_ready();
+        } else if !ready && self.visibility == Visibility::Shown {
+            self.on_plan_drafting();
+        }
+    }
+
     pub fn on_plan_drafting(&mut self) {
         self.visibility = Visibility::Hidden;
     }
@@ -166,11 +174,6 @@ impl PlanForm {
         self.selected = self
             .selected
             .min(Self::menu_len(!self.implementation_selection.is_empty()) - 1);
-    }
-
-    pub fn use_current_model(&mut self) {
-        self.implementation_selection = ModelSelection::default();
-        self.selected = MODEL_ROW;
     }
 
     pub fn clear_model_if_current(&mut self, current_model: &str) {
@@ -567,7 +570,7 @@ mod tests {
             PlanFormAction::UseCurrentModel
         );
         assert!(!form.select_row(USE_CURRENT_ROW + 1));
-        form.use_current_model();
+        form.set_implementation_selection(ModelSelection::default());
         assert!(!form.select_row(USE_CURRENT_ROW));
     }
 
@@ -753,7 +756,8 @@ mod tests {
             spec,
             &[("thinking", "off"), ("fast", "false")],
         ));
-        form.use_current_model();
+        form.selected = USE_CURRENT_ROW;
+        form.set_implementation_selection(ModelSelection::default());
         assert!(form.implementation_selection().is_empty());
         assert!(form.parallel());
         assert_eq!(form.selected, MODEL_ROW);

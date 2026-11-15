@@ -1,4 +1,4 @@
-use makima_lua::orchestration::{self, CommandRunner, TrustedTarget};
+use makima_lua::orchestration::{self, CommandRunner, PinnedCommandTarget, TrustedTarget};
 use std::{
     any::Any,
     collections::HashMap,
@@ -18,20 +18,20 @@ pub(crate) enum CommandEvent {
     Host {
         target: makima_commands::InvocationTargetId,
         request: HostRequest,
-        admission: Option<Box<TrustedTarget>>,
+        admission: Option<Box<PinnedCommandTarget>>,
         reply: flume::Sender<Result<HostResponse, CommandError>>,
     },
     Outcome {
         target: makima_commands::InvocationTargetId,
         outcome: CommandOutcome,
-        admission: Option<Box<TrustedTarget>>,
+        admission: Option<Box<PinnedCommandTarget>>,
     },
 }
 
 struct UiCommandHost {
     target: std::sync::OnceLock<makima_commands::InvocationTargetId>,
     tx: flume::Sender<CommandEvent>,
-    admissions: Arc<Mutex<HashMap<makima_commands::InvocationTargetId, TrustedTarget>>>,
+    admissions: Arc<Mutex<HashMap<makima_commands::InvocationTargetId, PinnedCommandTarget>>>,
 }
 
 pub(crate) struct PreparedCommandTarget {
@@ -66,6 +66,7 @@ impl CommandHost for UiCommandHost {
             .unwrap_or_else(|error| error.into_inner())
             .get(target)
             .cloned()
+            .filter(|target| target.validate().is_ok())
             .map(|target| Arc::new(target) as Arc<dyn Any + Send + Sync>)
     }
     fn request(&self, request: HostRequest) -> CommandFuture<Result<HostResponse, CommandError>> {
@@ -77,7 +78,8 @@ impl CommandHost for UiCommandHost {
         request: HostRequest,
         admission: Option<Arc<dyn Any + Send + Sync>>,
     ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let admission = admission.and_then(|value| value.downcast_ref::<TrustedTarget>().cloned());
+        let admission =
+            admission.and_then(|value| value.downcast_ref::<PinnedCommandTarget>().cloned());
         let Some(target) = self.target.get().copied() else {
             return Box::pin(async { Err(CommandError::StaleTarget) });
         };
@@ -101,7 +103,7 @@ impl CommandHost for UiCommandHost {
 
 pub(crate) struct CommandRuntime {
     pub registry: CommandRegistry,
-    admissions: Arc<Mutex<HashMap<makima_commands::InvocationTargetId, TrustedTarget>>>,
+    admissions: Arc<Mutex<HashMap<makima_commands::InvocationTargetId, PinnedCommandTarget>>>,
     event_tx: flume::Sender<CommandEvent>,
     #[cfg(test)]
     event_rx: flume::Receiver<CommandEvent>,
@@ -167,20 +169,28 @@ impl CommandRuntime {
         *self
             .admissions
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = targets;
+            .unwrap_or_else(|error| error.into_inner()) = targets
+            .into_iter()
+            .filter_map(|(id, target)| {
+                PinnedCommandTarget::pin(target)
+                    .ok()
+                    .map(|target| (id, target))
+            })
+            .collect();
     }
 
-    fn target_admission(&self, target: &TargetHandle) -> Option<TrustedTarget> {
+    pub(crate) fn target_admission(&self, target: &TargetHandle) -> Option<PinnedCommandTarget> {
         self.admissions
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&target.id())
             .cloned()
+            .filter(|admission| admission.validate().is_ok())
     }
 
     pub(crate) fn target_agent(&self, target: &TargetHandle) -> Option<makima_agent::AgentRef> {
         self.target_admission(target)
-            .map(|admission| admission.target)
+            .map(|admission| admission.target.clone())
     }
 
     pub(crate) fn prepare_target(&self) -> PreparedCommandTarget {
@@ -252,14 +262,21 @@ impl CommandRuntime {
 
     pub(crate) fn dispatch_input(&self, target: &TargetHandle, content: CommandContent) {
         let admission = self.target_admission(target);
-        let future = self.registry.dispatch_input(target, content);
+        let future = match &admission {
+            Some(admission) => self.registry.dispatch_input_with_admission(
+                target,
+                content,
+                Arc::new(admission.clone()),
+            ),
+            None => self.registry.dispatch_input(target, content),
+        };
         self.send_dispatched(target.id(), admission, future);
     }
 
     fn send_dispatched(
         &self,
         target: makima_commands::InvocationTargetId,
-        admission: Option<TrustedTarget>,
+        admission: Option<PinnedCommandTarget>,
         future: CommandFuture<makima_commands::InputDispatch>,
     ) {
         let tx = self.event_tx.clone();
@@ -281,7 +298,7 @@ impl CommandRuntime {
     fn send_outcome(
         &self,
         target: makima_commands::InvocationTargetId,
-        admission: Option<TrustedTarget>,
+        admission: Option<PinnedCommandTarget>,
         future: CommandFuture<CommandOutcome>,
     ) {
         let tx = self.event_tx.clone();
@@ -325,13 +342,15 @@ impl CommandRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, CommandContent, CommandEvent, CommandOutcome, CommandRegistry, CommandRuntime,
-        HashMap, ModelArgSource, ThemeArgSource, TrustedTarget, command,
+        Arc, CommandContent, CommandEvent, CommandHost, CommandOutcome, CommandRegistry,
+        CommandRuntime, HashMap, ModelArgSource, PinnedCommandTarget, ThemeArgSource,
+        TrustedTarget, command,
     };
     use arc_swap::ArcSwapOption;
+    use makima_agent::actor::ActorHistory;
     use makima_agent::{
-        ActorBackend, AgentInput, AgentManagerHandle, BackendResult, ControlWork, History,
-        TurnContext, WorkKind,
+        ActorBackend, AgentInput, AgentManagerHandle, BackendResult, ControlWork, TurnContext,
+        WorkKind,
     };
     use makima_lua::orchestration;
     use std::{future::Future, pin::Pin, time::Duration};
@@ -345,7 +364,7 @@ mod tests {
     impl ActorBackend for IdleBackend {
         fn run_turn<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: AgentInput,
             _: WorkKind,
@@ -355,7 +374,7 @@ mod tests {
 
         fn run_control<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: &'a ControlWork,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -364,7 +383,7 @@ mod tests {
 
         fn run_compact<'a>(
             &'a mut self,
-            _: &'a mut History,
+            _: ActorHistory<'a>,
             _: TurnContext,
             _: Option<&'a str>,
         ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -402,13 +421,14 @@ mod tests {
             .unwrap()
             .create_root(Vec::new(), None, Box::new(IdleBackend))
             .unwrap();
+        let admission = PinnedCommandTarget::pin(TrustedTarget {
+            target: root.clone(),
+            template: makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
+        })
+        .unwrap();
         if close {
             root.close_subtree().unwrap();
         }
-        let admission = TrustedTarget {
-            target: root.clone(),
-            template: makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
-        };
         let result = smol::block_on(runtime.command_runner(&handle)(
             COMMAND.into(),
             0,
@@ -431,6 +451,30 @@ mod tests {
         assert_eq!(turn.content.text.as_ref(), CONTENT);
         assert_eq!(admission.target.id(), root.id());
         root.close_subtree().unwrap();
+    }
+
+    #[test]
+    fn cached_closed_target_has_no_admission_authority() {
+        let runtime = pinned_runtime();
+        let prepared = runtime.prepare_target();
+        let host = Arc::clone(&prepared.host);
+        let handle = prepared.activate();
+        let root = AgentManagerHandle::new(Default::default())
+            .unwrap()
+            .create_root(Vec::new(), None, Box::new(IdleBackend))
+            .unwrap();
+        runtime.sync_admissions(HashMap::from([(
+            handle.id(),
+            TrustedTarget {
+                target: root.clone(),
+                template: makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
+            },
+        )]));
+        assert!(runtime.target_agent(&handle).is_some());
+        assert!(host.admission_context().is_some());
+        root.close_subtree().unwrap();
+        assert!(runtime.target_agent(&handle).is_none());
+        assert!(host.admission_context().is_none());
     }
 
     #[test_case(false, false; "input_focus_switch")]

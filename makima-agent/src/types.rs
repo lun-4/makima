@@ -1,7 +1,8 @@
 use std::any::Any;
-use std::fmt::{self, Write};
+#[cfg(test)]
+use std::fmt;
+use std::fmt::Write;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -12,7 +13,7 @@ use makima_providers::{
     AgentError, ContentBlock, ImageSource, Message, RetryKind, Role, StopReason, TokenUsage,
     add_cost,
 };
-use makima_storage::id::{MakimaId, MakimaIdParseError};
+pub use makima_storage::id::{AgentId, TurnId};
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
@@ -487,78 +488,6 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
         role: Role::User,
         content,
         ..Default::default()
-    }
-}
-
-macro_rules! lifecycle_id {
-    ($name:ident, $doc:literal) => {
-        #[doc = $doc]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(MakimaId);
-
-        impl $name {
-            pub fn generate() -> Self {
-                Self(MakimaId::generate())
-            }
-
-            pub fn as_makima_id(self) -> MakimaId {
-                self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = MakimaIdParseError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                value.parse().map(Self)
-            }
-        }
-    };
-}
-
-lifecycle_id!(AgentId, "Stable identity of one runtime agent instance.");
-/// Stable identity of one accepted agent turn.
-///
-/// Agent and turn identities are nominal and cannot be interchanged:
-///
-/// ```compile_fail
-/// use makima_agent::{AgentId, TurnId};
-///
-/// fn accepts_turn(_: TurnId) {}
-/// accepts_turn(AgentId::generate());
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TurnId(MakimaId);
-
-impl TurnId {
-    pub fn generate() -> Self {
-        Self(MakimaId::generate())
-    }
-
-    pub fn as_makima_id(self) -> MakimaId {
-        self.0
-    }
-}
-
-impl fmt::Display for TurnId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for TurnId {
-    type Err = MakimaIdParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse().map(Self)
     }
 }
 
@@ -1574,6 +1503,8 @@ impl SessionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use makima_storage::id::MakimaIdParseError;
+    use std::str::FromStr;
     use test_case::test_case;
 
     #[test_case(false; "send")]

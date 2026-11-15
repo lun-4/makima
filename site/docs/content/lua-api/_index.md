@@ -90,6 +90,7 @@ The rules:
 | [`makima.api`](#makima-api) | Plugin registration. |
 | [`makima.perf`](#makima-perf) | Performance instrumentation for splashes and the UI. |
 | [`makima.store`](#makima-store) | Shared key-value store for plugin contributions. |
+| [`makima.state`](#makima-state) | Journaled plugin slots, scoped to an agent or session. |
 | [`makima.agent`](#makima-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`makima.agent.Agent`](#makima-agent-Agent) | A nonowning agent handle. |
 | [`makima.agent.AgentRef`](#makima-agent-AgentRef) | Visibility-only identity. |
@@ -430,6 +431,7 @@ string or a table with richer output fields.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
+  - `shell_execution` (`boolean`) Record each execution as a shell command that file restore cannot undo. Default: false.
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
   - `header` (`function`) Optional. Called before execution, returns a string or BufHandle for the one-line header.
   - `restore` (`function`) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -1490,6 +1492,45 @@ empty table.
 **Returns:** table Map of entry key to registered value.
 
 
+## makima.state {#makima-state}
+
+Journaled plugin slots, scoped to an agent or session. Values are copied strict JSON data. Agent-scoped values follow the durable agent ID across session restart. Unloaded plugin values remain stored without running plugin code; old slot handles return state_slot_expired after unload or replacement. StateSlot methods are get(ctx), set(ctx, value, opts?), delete(ctx, opts?), update(ctx, callback), and on_change(callback). get returns value, revision on success, including nil, revision for an absent value; update returns the updated value and revision. Passing nil to set or returning nil from an update callback stores JSON null, which reads back as makima.state.null. Use delete to remove a value. Failures return nil, error. set and delete return revision or nil, error. opts.expect requires the observed revision. State writes require a live invocation context; retaining a slot or context does not extend its authority. Notifications for a dormant child keep state access pinned to that child, but currently use the root callback template for model and workflow context when no child template is available.
+
+---
+
+### `makima.state.register()` {#makima-state-register}
+
+```lua
+makima.state.register({name}, {spec})
+```
+
+Register a plugin-qualified slot during load. spec supplies scope (agent or session), positive version, and optional synchronous migrate(value, old_version). Migration calls it once per version from the stored version through version - 1; each result must be valid strict JSON and becomes the next call's input. Migration cannot yield. Only the final value is journaled after all steps succeed. Registration is transactional with plugin load. Names are local to the plugin and contain no slash; plan/state is reserved for the host.
+
+**Returns:** (`StateSlot`) Registered slot.
+
+**Example:**
+
+```lua
+local progress = makima.state.register('progress', {
+  scope = 'agent', version = 3,
+  migrate = function(value, old_version)
+    if old_version == 1 then return { count = value } end
+    if old_version == 2 then value.finished = false; return value end
+  end,
+})
+```
+
+---
+
+### `makima.state.null()` {#makima-state-null}
+
+```lua
+makima.state.null()
+```
+
+JSON null sentinel, used as makima.state.null without a call. Unlike nil it remains present in arrays and objects.
+
+
 ## makima.agent {#makima-agent}
 
 Subagent primitives for plugins that need to talk to an LLM.
@@ -1566,7 +1607,7 @@ prompt for a subagent session.
   Optional fields:
 
   - `instructions` (`string|boolean?`) extra text appended to the prompt.
-    `true` loads instructions from the project `.makima/instructions` file.
+    `true` uses the invoking turn's recorded instructions.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
@@ -1768,7 +1809,7 @@ Read the root agent of this context's graph.
 makima.agent.list({ctx})
 ```
 
-List accessible live agents in this context's graph.
+List accessible resident and dormant agents in this context's graph.
 
 **Parameters:**
 
@@ -1784,12 +1825,14 @@ List accessible live agents in this context's graph.
 makima.agent.get({ctx}, {reference})
 ```
 
-Resolve an AgentRef with current control authority. String IDs are not accepted.
+Resolve an agent reference or durable agent ID with current control authority.
+Resolution does not reactivate a dormant agent. Saved IDs can be resolved in
+the restored session graph.
 
 **Parameters:**
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
-- `{reference}` ([`AgentRef`](#makima-agent-AgentRef)) Visibility-only reference.
+- `{reference}` (`AgentRef|string`) Visibility-only reference or stable agent ID.
 
 **Returns:** ([`Agent?`](#makima-agent-Agent), `string?`) Nonowning handle or error.
 
@@ -1814,7 +1857,7 @@ Requires an active managed turn or a trusted manager-backed parent.
 - `{opts}` (`table`) Optional creation fields:
   - `model` (`string|table`) a spec or `{spec, thinking, fast}` selection, validated
     like `Agent:set_model`; omitted fields inherit, thinking is capped at the
-    parent's level, and `Agent:model` results can be passed as is.
+    parent's level, and `Agent:config(ctx).model` results can be passed as is.
   - `system` (`string`) custom text appended after the admitted mode's prompt contribution; defaults to empty and does not inherit the parent's full system prompt.
   - `tools` (`array`) request definitions; omitted inherits permitted parent tools.
   - `local_tools` (`table`) name-keyed Lua tool specs with description, input_schema,
@@ -1856,9 +1899,38 @@ A held managed handle retains authorized closed-status reads, not mutation right
 Agent:id()
 ```
 
-Read the stable agent ID.
+Read the durable agent ID, retained across session restart.
 
-**Returns:** (`string?`, `string?`) Agent ID.
+**Returns:** (`string?`, `string?`) Agent ID, distinct from the session ID and turn IDs.
+
+---
+
+### `Agent:is_live()` {#Agent-is_live}
+
+```lua
+Agent:is_live()
+```
+
+Check whether this agent currently has an open resident actor.
+
+**Returns:** (`boolean?`, `string?`) Liveness without restoring the agent.
+
+---
+
+### `Agent:turn()` {#Agent-turn}
+
+```lua
+Agent:turn({ctx}, {turn_id})
+```
+
+Resolve an exact retained turn without starting or restoring the agent.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{turn_id}` (`string`) Stable turn ID.
+
+**Returns:** ([`AgentTurn?`](#makima-agent-AgentTurn), `string?`) Exact-turn ticket or a retention error.
 
 ---
 
@@ -1891,7 +1963,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
-**Returns:** (`table?`, `string?`) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+**Returns:** (`table?`, `string?`) Fields: id (string), live (boolean, whether an open resident actor exists), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Dormant agents report live=false without reactivation. Authorized held managed handles retain a closed snapshot after graph removal.
 
 ---
 
@@ -1901,7 +1973,7 @@ Read lifecycle, active turn, queue size, and cumulative usage.
 Agent:config({ctx})
 ```
 
-Read the committed configuration.
+Read the committed configuration without reactivating a dormant agent.
 
 **Parameters:**
 
@@ -1948,6 +2020,26 @@ Snapshots are bounded history views, not an archive immune to compaction.
 
 ---
 
+### `Agent:state()` {#Agent-state}
+
+```lua
+Agent:state({ctx}, {key})
+```
+
+Read a registered agent-scoped slot without reactivating this agent.
+Uses the same topology authorization as makima.agent.get. Values are copied.
+Older values return a migrated copy without journaling; slot:get journals owner migrations.
+Unknown keys return state_slot_unavailable; session-scoped slots are rejected.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+- `{key}` (`string`) Plugin-qualified slot key, <plugin>/<name>.
+
+**Returns:** (`any?`, `integer|string`) Value and stored revision, including nil for an absent value, or nil and error.
+
+---
+
 ### `Agent:ref()` {#Agent-ref}
 
 ```lua
@@ -1973,6 +2065,11 @@ joins compatible admitted work, reaching its next safe model request
 without interrupting a provider request or tool, or starts a turn when
 there is none; `"queue"` queues a distinct turn behind admitted work.
 Wait for the result with `AgentTurn:wait`.
+A dormant agent is reactivated from its saved configuration and capabilities
+before admission. Reactivation can fail with `not_restorable`,
+`provider_unavailable`, `model_unavailable`, `tool_unavailable`,
+`mcp_unavailable`, or `tool_completion_pending` while earlier writes settle.
+A failed reactivation admits no turn.
 
 **Parameters:**
 
@@ -2086,6 +2183,22 @@ Permanently close this agent and its descendants.
 - `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
 
 **Returns:** (`boolean?`, `string?`) Success or error.
+
+---
+
+### `Agent:retire()` {#Agent-retire}
+
+```lua
+Agent:retire({ctx})
+```
+
+Retire a quiescent leaf, preserving its retained results and transcript.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Invocation context.
+
+**Returns:** (`boolean?`, `string?`) Success or a retirement error.
 
 ---
 

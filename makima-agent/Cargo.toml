@@ -7,6 +7,7 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+imbl = { workspace = true }
 makima-domain = { workspace = true }
 makima-providers = { workspace = true }
 makima-config = { workspace = true }
@@ -57,4 +58,8 @@ makima-storage = { workspace = true, features = ["test-util"] }
 makima-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "boundary_pin_profile"
+harness = false
 

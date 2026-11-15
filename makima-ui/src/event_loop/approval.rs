@@ -6,18 +6,23 @@ use makima_agent::actor::{
     PreparedOperationTicket, PreparedTransaction, PreparedTurn, TurnTicket,
 };
 use makima_agent::config_change::prepare_selection;
+use makima_agent::rewind::RewindBoundary;
+use makima_agent::session_checkpoint::stored_agent_config;
+use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
 use makima_agent::{
     AgentId, AgentInput, AgentMode, AgentRef, CancelToken, EffectiveAgentConfig, EventSender,
 };
-use makima_providers::{Message, ModelSelection};
+use makima_providers::{Message, ModelSelection, PreparedProvider};
 use makima_storage::checkpoint::CheckpointPublication;
+use makima_storage::session_state::ParentLink;
 use makima_storage::sessions::{HistorySnapshot, StoredRule};
 
 use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
     bounded_session_op,
 };
-use crate::app::session_state::rules_to_stored;
+use crate::AppSession;
+use crate::components::{SessionReplacementKind, SessionReplacementRequest};
 use crate::plan_approval::{
     APPROVAL_CANCELLED, APPROVAL_CHANGED, APPROVAL_LOCK_LOST, ApprovedPlan, idle_error_message,
     read_plan,
@@ -64,6 +69,7 @@ pub(super) struct PreparedPlanApproval {
     operation: PreparedOperationTicket,
     idle: ActorIdleGuard,
     transaction: PreparedTransaction,
+    linked_config: Option<EffectiveAgentConfig>,
 }
 
 pub(super) struct CommittedPlanApproval {
@@ -72,7 +78,8 @@ pub(super) struct CommittedPlanApproval {
     plan: ApprovedPlan,
     config: ConfigCommit,
     history: Option<HistoryChange>,
-    presentation: ApprovalPresentation,
+    presentation: Option<ApprovalPresentation>,
+    linked: Option<(EffectiveAgentConfig, RewindBoundary, usize)>,
 }
 
 struct ApprovalPresentation {
@@ -112,6 +119,7 @@ struct PlanApprovalRequest {
     selection: ModelSelection,
     parallel: bool,
     clear_context: bool,
+    linked: bool,
     run_id: u64,
     yolo: Option<bool>,
     rules: Vec<StoredRule>,
@@ -157,6 +165,7 @@ impl SessionRuntime {
             .idle
             .source_snapshot()
             .map_err(|_| APPROVAL_CHANGED.to_owned())?;
+        let permissions = self.app.permissions.snapshot();
         if self.session_lock.is_none()
             || source.agent_id != prepared.target.id()
             || !Arc::ptr_eq(&source.config.identity, &prepared.source.config.identity)
@@ -167,9 +176,8 @@ impl SessionRuntime {
                 &prepared.request.selection,
                 prepared.request.parallel,
             )
-            || prepared.request.yolo != self.app.permissions.persisted_yolo()
-            || prepared.request.rules
-                != rules_to_stored(&self.app.permissions.session_rules_snapshot())
+            || prepared.request.yolo != permissions.yolo
+            || prepared.request.rules != permissions.stored_rules()
         {
             return Err(APPROVAL_CHANGED.into());
         }
@@ -243,7 +251,9 @@ impl EventLoop<'_> {
         {
             return self.sessions[idx].abort_plan_approval(error);
         }
-        if let Err(error) = prepared.operation.set_turn_displayed(true) {
+        if !prepared.request.linked
+            && let Err(error) = prepared.operation.set_turn_displayed(true)
+        {
             return self.sessions[idx].abort_plan_approval(error.to_string());
         }
         let runtime = &mut self.sessions[idx];
@@ -266,27 +276,43 @@ impl EventLoop<'_> {
                 idle,
                 operation,
                 transaction,
+                linked_config,
             } = prepared;
-            let replacement = request.clear_context.then(|| HistorySnapshot::<Message> {
-                epoch: source.history.epoch.wrapping_add(1),
-                compacted: false,
-                conversation: None,
-                messages: Arc::new(Vec::new()),
-            });
+            let replacement =
+                (request.clear_context && !request.linked).then(|| HistorySnapshot::<Message> {
+                    epoch: source.history.epoch.wrapping_add(1),
+                    compacted: false,
+                    conversation: None,
+                    messages: Arc::new(Vec::new()),
+                });
             let observer = async move {
                 let (idle, committed, history) = idle
                     .commit_prepared_transaction_held(operation, replacement, transaction)
                     .await
                     .map_err(|error| error.to_string())?;
-                let ticket = committed
-                    .ticket
-                    .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+                let (presentation, linked) = if let Some(config) = linked_config {
+                    let boundary = committed
+                        .boundary
+                        .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+                    let message_count = source.history.messages.len();
+                    drop(idle);
+                    (None, Some((config, boundary, message_count)))
+                } else {
+                    let ticket = committed
+                        .ticket
+                        .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
+                    (
+                        Some(ApprovalPresentation {
+                            idle: Some(idle),
+                            ticket,
+                            target: target.clone(),
+                        }),
+                        None,
+                    )
+                };
                 Ok(ApprovalStep::Committed(Box::new(CommittedPlanApproval {
-                    presentation: ApprovalPresentation {
-                        idle: Some(idle),
-                        ticket,
-                        target: target.clone(),
-                    },
+                    presentation,
+                    linked,
                     target,
                     request,
                     plan,
@@ -332,7 +358,62 @@ impl EventLoop<'_> {
             config,
             history,
             presentation,
+            linked,
         } = committed;
+        if let Some((config, boundary, message_count)) = linked {
+            runtime.app.clear_plan_approval_pending(target.id());
+            runtime.pending_approval.take();
+            let mut session = AppSession::new(
+                &config.model.spec(),
+                &config.context.cwd().to_string_lossy(),
+            );
+            session.set_parent(Some(ParentLink {
+                session: runtime.id(),
+                message_count,
+                seq: boundary.seq,
+            }));
+            session.meta.yolo = request.yolo;
+            session.meta.session_rules = request.rules;
+            session.meta.session_options = runtime.coordinator.read().options().config_values();
+            if request.selection.spec.is_some() || request.selection.fast.is_some() {
+                session
+                    .meta
+                    .session_options
+                    .remove(FAST_PENDING_MODEL_OPTION_ID);
+            }
+            session.meta.input_draft = Some(plan.message.clone());
+            let root = AgentId::generate();
+            let prepared = (|| -> Result<_, String> {
+                session
+                    .bind_root_id(root)
+                    .map_err(|error| error.to_string())?;
+                session
+                    .resolve_legacy_config(
+                        stored_agent_config(&config, session.meta.session_options.clone())
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                runtime.app.checkpoint_now();
+                Ok(session)
+            })();
+            match prepared {
+                Ok(session) => self.handle_action(
+                    idx,
+                    crate::components::Action::ReplaceSession(Box::new(
+                        SessionReplacementRequest {
+                            session,
+                            kind: SessionReplacementKind::Linked,
+                            provider: Some(PreparedProvider {
+                                model: config.model.clone(),
+                                provider: Arc::clone(&config.provider),
+                            }),
+                        },
+                    )),
+                ),
+                Err(error) => self.sessions[idx].app.flash(error),
+            }
+            return;
+        }
         if let Some(history) = history {
             let draft = runtime.app.input_box.buffer.value().to_owned();
             runtime.app.apply_history_change(history);
@@ -363,7 +444,9 @@ impl EventLoop<'_> {
         }
         runtime.app.finish_child_plan_approval(target.id());
         runtime.pending_approval.take();
-        if let Err(error) = presentation.release() {
+        if let Some(presentation) = presentation
+            && let Err(error) = presentation.release()
+        {
             runtime.app.flash(error);
         }
     }
@@ -447,17 +530,22 @@ impl EventLoop<'_> {
             let (_, root) = runtime.handles.manager_and_root();
             let sender =
                 (target.id() == root).then(|| EventSender::new(runtime.handles.agent_tx.clone()));
+            let linked = clear_context && target.id() == root;
             let operation = idle
-                .reserve_prepared_operation(Some(implementation_turn(String::new(), sender)))
+                .reserve_prepared_operation(
+                    (!linked).then(|| implementation_turn(String::new(), sender)),
+                )
                 .map_err(|error| error.to_string())?;
+            let permissions = runtime.app.permissions.snapshot();
             let request = PlanApprovalRequest {
                 path,
                 selection,
                 parallel,
                 clear_context,
+                linked,
                 run_id: operation.presentation_id(),
-                yolo: runtime.app.permissions.persisted_yolo(),
-                rules: rules_to_stored(&runtime.app.permissions.session_rules_snapshot()),
+                yolo: permissions.yolo,
+                rules: permissions.stored_rules(),
             };
             let publication = CheckpointPublication::default();
             operation
@@ -482,9 +570,6 @@ impl EventLoop<'_> {
                 Ok(prepared) => prepared,
                 Err(error) => return self.sessions[idx].abort_plan_approval(error),
             };
-        if request.selection.spec.is_some() || request.selection.fast.is_some() {
-            self.sessions[idx].drop_pending_fast(&target);
-        }
         let absolute = if request.path.is_absolute() {
             request.path.clone()
         } else {
@@ -494,30 +579,76 @@ impl EventLoop<'_> {
         self.spawn_approval_step(idx, target.id(), publication, async move {
             let parallel = request.parallel;
             let plan = smol::unblock(move || read_plan(absolute, parallel)).await?;
-            operation
-                .replace_turn_input(AgentInput::new(plan.message.clone(), Vec::new()))
-                .map_err(|error| error.to_string())?;
+            if !request.linked {
+                operation
+                    .replace_turn_input(AgentInput::new(plan.message.clone(), Vec::new()))
+                    .map_err(|error| error.to_string())?;
+            }
             let patch = prepare_selection(&request.selection, &template.model_policy, &prepare)
                 .await
                 .map_err(|error| error.to_string())?;
-            let change = ConfigChange::PatchAndMode {
-                patch,
-                mode: AgentMode::Build,
-                mode_def: mode,
+            let (change, linked_config) = if request.linked {
+                let mut stored = stored_agent_config(&source.config.config, Default::default())
+                    .map_err(|error| error.to_string())?;
+                let prepared = patch.model.unwrap_or_else(|| PreparedProvider {
+                    model: source.config.config.model.clone(),
+                    provider: Arc::clone(&source.config.config.provider),
+                });
+                if patch.fast == Some(true) && !prepared.model.supports_fast() {
+                    return Err(SessionOptionError::FastUnsupported.to_string());
+                }
+                if patch.thinking.is_some_and(|thinking| thinking.is_enabled())
+                    && prepared.model.supports_thinking() != Some(true)
+                {
+                    return Err(SessionOptionError::ThinkingUnsupported.to_string());
+                }
+                stored.model = prepared.model.spec();
+                if let Some(thinking) = patch.thinking {
+                    stored.thinking = Some(thinking.into());
+                }
+                if let Some(fast) = patch.fast {
+                    stored.fast = fast;
+                }
+                let config =
+                    EffectiveAgentConfig::from_stored(&stored, prepared, (AgentMode::Build, mode))
+                        .map_err(|error| error.to_string())?;
+                (None, Some(config))
+            } else {
+                (
+                    Some(ConfigChange::PatchAndMode {
+                        patch,
+                        mode: AgentMode::Build,
+                        mode_def: mode,
+                    }),
+                    None,
+                )
             };
             operation
-                .resolve(Some(change))
+                .resolve(change)
                 .map_err(|error| error.to_string())?;
             operation
                 .wait_ready()
                 .await
                 .map_err(|error| error.to_string())?;
+            let state_edit = makima_agent::plan_state::approval_edit(
+                &target,
+                &request.path,
+                plan.content.clone(),
+                request.selection.clone(),
+            )
+            .map_err(|error| error.to_string())?;
             let transaction = transaction(
                 operation
                     .ready_config()
                     .map_err(|error| error.to_string())?,
-                request.clear_context,
-            )?;
+                request.clear_context && !request.linked,
+            )?
+            .with_state_edit(state_edit);
+            let transaction = if request.linked {
+                transaction.with_boundary()
+            } else {
+                transaction
+            };
             Ok(ApprovalStep::Prepared(Box::new(PreparedPlanApproval {
                 target,
                 request,
@@ -526,6 +657,7 @@ impl EventLoop<'_> {
                 idle,
                 operation,
                 transaction,
+                linked_config,
             })))
         });
     }

@@ -166,7 +166,9 @@ impl ActorTurnInbox {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let pending_completions = await_completions && !state.deliveries.is_empty();
+        let pending_completions = await_completions
+            && !state.deliveries.is_empty()
+            && !super::delivery::held(&inner, &state);
         let Some(inbox) = state.instructions.get_mut(&self.turn_id) else {
             return true;
         };

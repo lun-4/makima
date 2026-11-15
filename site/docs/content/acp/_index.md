@@ -35,7 +35,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 
 ## What works
 
-- Sessions persist. Loading a session replays the full conversation in the editor. A session that is open in another terminal cannot be loaded.
+- Sessions persist. Loading a session sends its saved conversation to the editor without replaying model requests or tools. A session that is open in another terminal cannot be loaded.
 - Session options include Model, YOLO, Fast, Workflow, and available plugin options such as Bash auto mode. New and loaded sessions return the complete ordered option list. Option updates also contain the complete list.
 - Model switching uses the editor's model selector. All configured providers appear. Providers such as OpenRouter add discovered models in the background. A model change and any required Fast disablement appear as one update.
 - Modes switch between build mode and plan mode. Build mode has full tool access. Plan mode limits writes to the plan file.
@@ -48,8 +48,13 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
 - `/btw` runs one isolated model request with copied history and no tools. Its question and response do not change the primary model history.
 - `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
+- `/reload-context` on the main agent adopts current instruction sources and available system-prompt contributions. Normal resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
+
+Loaded sessions retain durable agent IDs, child histories, committed configuration, and retained turn results. Children remain dormant until reactivated for work. Recovery marks unfinished admitted turns as `interrupted` rather than rerunning them. Recorded child-report delivery state survives restart. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) for reactivation limits.
+
+Rewind pickers and restore dialogs require the TUI and are not advertised as ACP commands. An unfinished file restore must reconcile before new work can start, including through ACP. See [Rewind and branches](/docs/agent-work/#rewind-and-branches) for restore choices, file conflicts, and platform limits.
 
 ACP cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory and reports it in the transcript, but the editor can continue to display its original directory field.
 

@@ -36,6 +36,38 @@ use monty_types::{BASELINE_MEMORY, LIVE_MEMORY};
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
 
+#[cfg(feature = "memory-profile")]
+static PROCESS_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "memory-profile")]
+static PROCESS_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "memory-profile")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationSnapshot {
+    pub live_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[cfg(feature = "memory-profile")]
+pub fn allocation_snapshot() -> AllocationSnapshot {
+    let live_bytes = PROCESS_LIVE_BYTES.load(Relaxed);
+    AllocationSnapshot {
+        live_bytes,
+        peak_bytes: PROCESS_PEAK_BYTES.load(Relaxed).max(live_bytes),
+    }
+}
+
+#[cfg(feature = "memory-profile")]
+fn process_charge(size: usize) {
+    let live = PROCESS_LIVE_BYTES.fetch_add(size, Relaxed) + size;
+    PROCESS_PEAK_BYTES.fetch_max(live, Relaxed);
+}
+
+#[cfg(feature = "memory-profile")]
+fn process_refund(size: usize) {
+    PROCESS_LIVE_BYTES.fetch_sub(size, Relaxed);
+}
+
 thread_local! {
     static IN_SANDBOX: Cell<bool> = const { Cell::new(false) };
 }
@@ -66,16 +98,28 @@ fn refund(size: usize) {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         charge(layout.size());
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        #[cfg(feature = "memory-profile")]
+        if !ptr.is_null() {
+            process_charge(layout.size());
+        }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         charge(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        #[cfg(feature = "memory-profile")]
+        if !ptr.is_null() {
+            process_charge(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         refund(layout.size());
+        #[cfg(feature = "memory-profile")]
+        process_refund(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -85,7 +129,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
         } else {
             refund(layout.size() - new_size);
         }
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        #[cfg(feature = "memory-profile")]
+        if !ptr.is_null() {
+            if new_size >= layout.size() {
+                process_charge(new_size - layout.size());
+            } else {
+                process_refund(layout.size() - new_size);
+            }
+        }
+        ptr
     }
 }
 
@@ -110,5 +163,34 @@ impl Drop for SandboxScope {
     fn drop(&mut self) {
         IN_SANDBOX.set(false);
         ACTIVE_SCOPES.fetch_sub(1, Relaxed);
+    }
+}
+
+#[cfg(all(test, feature = "memory-profile"))]
+mod tests {
+    use super::{ALLOC, GlobalAlloc, Layout, allocation_snapshot};
+    use std::hint::black_box;
+
+    const INITIAL_BYTES: usize = 1024 * 1024;
+    const GROWN_BYTES: usize = 2 * INITIAL_BYTES;
+
+    #[test]
+    fn process_counters_track_successful_allocations_and_cross_thread_free() {
+        let worker = std::thread::spawn(|| {
+            let layout = Layout::from_size_align(INITIAL_BYTES, 1).unwrap();
+            let ptr = unsafe { ALLOC.alloc_zeroed(layout) };
+            assert!(!ptr.is_null());
+            unsafe { ptr.write_bytes(1, INITIAL_BYTES) };
+            let ptr = unsafe { ALLOC.realloc(ptr, layout, GROWN_BYTES) };
+            assert!(!ptr.is_null());
+            black_box(ptr as usize)
+        });
+        let ptr = worker.join().unwrap() as *mut u8;
+        let snapshot = allocation_snapshot();
+        assert!(snapshot.live_bytes >= GROWN_BYTES);
+        assert!(snapshot.peak_bytes >= snapshot.live_bytes);
+        unsafe {
+            ALLOC.dealloc(ptr, Layout::from_size_align(GROWN_BYTES, 1).unwrap());
+        }
     }
 }
