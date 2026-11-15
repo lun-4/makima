@@ -6359,7 +6359,8 @@ mod tests {
         let other = MakimaId::generate();
         let other_path = branch_path(dir.path(), other, saved.id);
         fs::create_dir_all(other_path.parent().unwrap()).unwrap();
-        fs::write(&other_path, POST_TEXT).unwrap();
+        fs::copy(branch_path(dir.path(), session.id, saved.id), &other_path).unwrap();
+        let other_log = fs::read(&other_path).unwrap();
         TestSession::delete_from(session.id, dir.path()).unwrap();
         assert!(
             !branch_path(dir.path(), session.id, saved.id)
@@ -6368,7 +6369,7 @@ mod tests {
                 .exists()
         );
         assert!(!jsonl_path(dir.path(), session.id).exists());
-        assert_eq!(fs::read_to_string(other_path).unwrap(), POST_TEXT);
+        assert_eq!(fs::read(other_path).unwrap(), other_log);
     }
 
     #[test]

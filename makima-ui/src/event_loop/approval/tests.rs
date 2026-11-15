@@ -1875,6 +1875,7 @@ fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(
         if after_cd {
             let cwd = PathBuf::from(&event_loop.session_cwd).join(MOVED_CWD);
             fs::create_dir_all(&cwd).unwrap();
+            let cwd = cwd.canonicalize().unwrap();
             event_loop.handle_action(index, Action::ChangeDirectory(cwd.clone()));
             pump_until(event_loop, |event_loop| {
                 event_loop.sessions[index].coordinator.read().cwd().as_ref() == Some(&cwd)

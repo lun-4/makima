@@ -1139,14 +1139,15 @@ mod tests {
     fn locked_projection_serializes_capture_and_retains_tool_guards(rollback: bool) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("plan.md");
+            let base = directory.path().canonicalize().unwrap();
+            let path = base.join("plan.md");
             fs::write(&path, MUTATED_CONTENT).unwrap();
             let (snapshot, agent) = rollback_snapshot(&path);
             let affected = BTreeSet::from([agent]);
             let locks = crate::tools::FileWriteLocks::new();
             let cancel = crate::CancelToken::none();
             let key =
-                crate::tools::FileWriteLocks::lock_key(&path.to_string_lossy(), directory.path())
+                crate::tools::FileWriteLocks::lock_key(&path.to_string_lossy(), base.as_path())
                     .unwrap();
             let writer = locks
                 .acquire(key.clone(), &[], &cancel, crate::tools::Deadline::None)
@@ -1198,7 +1199,8 @@ mod tests {
     fn cancelled_locked_capture_does_not_capture_or_mutate() {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("plan.md");
+            let base = directory.path().canonicalize().unwrap();
+            let path = base.join("plan.md");
             fs::write(&path, MUTATED_CONTENT).unwrap();
             let (snapshot, agent) = rollback_snapshot(&path);
             let affected = BTreeSet::from([agent]);
@@ -1221,7 +1223,8 @@ mod tests {
     #[test_case(true; "absent_file_and_parent")]
     fn aborted_projection_restores_actual_prior_file(missing: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested/plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("nested/plan.md");
         if !missing {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, MUTATED_CONTENT).unwrap();
@@ -1256,12 +1259,14 @@ mod tests {
     fn aborted_projection_rejects_unsafe_substitution(ancestor: bool) {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
         let external = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("nested");
+        let external_base = external.path().canonicalize().unwrap();
+        let parent = base.join("nested");
         fs::create_dir(&parent).unwrap();
         let path = parent.join("plan.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
-        let sentinel = external.path().join("plan.md");
+        let sentinel = external_base.join("plan.md");
         fs::write(&sentinel, APPROVED_CONTENT).unwrap();
         let (snapshot, agent) = rollback_snapshot(&path);
         let mut token =
@@ -1274,8 +1279,8 @@ mod tests {
             )
             .unwrap();
         if ancestor {
-            fs::rename(&parent, directory.path().join("displaced")).unwrap();
-            symlink(external.path(), &parent).unwrap();
+            fs::rename(&parent, base.join("displaced")).unwrap();
+            symlink(external_base.as_path(), &parent).unwrap();
         } else {
             fs::remove_file(&path).unwrap();
             symlink(&sentinel, &path).unwrap();
@@ -1288,7 +1293,8 @@ mod tests {
     #[test]
     fn aborted_projection_does_not_overwrite_new_external_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("plan.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
         let (snapshot, agent) = rollback_snapshot(&path);
         let mut token =
@@ -1311,8 +1317,9 @@ mod tests {
     fn unsafe_capture_cannot_become_untracked_projection(symlink: bool) {
         use std::os::unix::fs::symlink as create_symlink;
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("plan.md");
-        let external = directory.path().join("external.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("plan.md");
+        let external = base.join("external.md");
         fs::write(&external, MUTATED_CONTENT).unwrap();
         if symlink {
             create_symlink(&external, &path).unwrap();
@@ -1347,7 +1354,8 @@ mod tests {
     #[test_case(true; "after_projection")]
     fn absent_parent_substitution_does_not_delete_unrelated_file(projected: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("nested");
+        let base = directory.path().canonicalize().unwrap();
+        let parent = base.join("nested");
         let path = parent.join("plan.md");
         let (snapshot, agent) = rollback_snapshot(&path);
         let mut token =
@@ -1360,7 +1368,7 @@ mod tests {
                     &crate::ModeRegistry::builtin(),
                 )
                 .unwrap();
-            fs::rename(&parent, directory.path().join("displaced")).unwrap();
+            fs::rename(&parent, base.join("displaced")).unwrap();
         }
         fs::create_dir(&parent).unwrap();
         fs::write(&path, APPROVED_CONTENT).unwrap();
@@ -1384,7 +1392,8 @@ mod tests {
     #[test]
     fn rollback_capture_preserves_nonregular_candidate_build_fallback() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("plan.md");
         fs::create_dir(&path).unwrap();
         let (snapshot, agent) = rollback_snapshot(&path);
         let mut token =
@@ -1413,7 +1422,8 @@ mod tests {
     ) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("nested/plan.md");
+            let base = directory.path().canonicalize().unwrap();
+            let path = base.join("nested/plan.md");
             if !missing {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(&path, MUTATED_CONTENT).unwrap();
@@ -1428,7 +1438,7 @@ mod tests {
             .await
             .unwrap();
             let key =
-                crate::tools::FileWriteLocks::lock_key(&path.to_string_lossy(), directory.path())
+                crate::tools::FileWriteLocks::lock_key(&path.to_string_lossy(), base.as_path())
                     .unwrap();
             let mut competing = Box::pin(locks.acquire_all(BTreeSet::from([key]), &cancel));
             assert!(
@@ -1470,7 +1480,8 @@ mod tests {
     #[test_case(Some(MUTATED_CONTENT); "changed_approved_plan_is_restored")]
     fn windows_resume_preserves_approved_plan_authority(existing: Option<&str>) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested/plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("nested/plan.md");
         if let Some(content) = existing {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, content).unwrap();
@@ -1510,8 +1521,9 @@ mod tests {
     #[test_case(true; "configured_plan_path_disagrees")]
     fn windows_invalid_plan_projection_preserves_existing_files(path_mismatch: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("plan.md");
-        let other = directory.path().join("other.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("plan.md");
+        let other = base.join("other.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
         let (snapshot, agent) = rollback_snapshot(&path);
         let mut view = snapshot.fold(snapshot.seq).unwrap();
@@ -1562,11 +1574,12 @@ mod tests {
     fn windows_plan_projection_rejects_reparse_paths(parent: bool) {
         use std::os::windows::fs::{symlink_dir, symlink_file};
         let directory = tempfile::tempdir().unwrap();
-        let outside = directory.path().join("outside");
+        let base = directory.path().canonicalize().unwrap();
+        let outside = base.join("outside");
         fs::create_dir(&outside).unwrap();
         let sentinel = outside.join("plan.md");
         fs::write(&sentinel, MUTATED_CONTENT).unwrap();
-        let destination = directory.path().join("plans");
+        let destination = base.join("plans");
         let path = destination.join("plan.md");
         if parent {
             symlink_dir(&outside, &destination).unwrap();
@@ -1590,7 +1603,8 @@ mod tests {
     #[test_case(true; "recreates_missing_file")]
     fn restores_exact_approved_bytes(missing: bool) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested/plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("nested/plan.md");
         if !missing {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, MUTATED_CONTENT).unwrap();
@@ -1611,7 +1625,8 @@ mod tests {
     #[test]
     fn invalid_hash_does_not_replace_disk_content() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("plan.md");
+        let base = directory.path().canonicalize().unwrap();
+        let path = base.join("plan.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
         let entry = PlanEntry {
             path: path.clone(),
@@ -1648,8 +1663,9 @@ mod tests {
     #[test_case(true; "failed_build_projection")]
     fn restore_failure_returns_visible_build_without_replacing_slot(build: bool) {
         let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
         let root = AgentId::generate();
-        let path = directory.path().join("plan.md");
+        let path = base.join("plan.md");
         fs::write(&path, MUTATED_CONTENT).unwrap();
         let entry = PlanEntry {
             path: path.clone(),
@@ -1683,7 +1699,7 @@ mod tests {
         let mode = if build {
             crate::AgentMode::Build
         } else {
-            crate::AgentMode::Plan(directory.path().join("other.md"))
+            crate::AgentMode::Plan(base.join("other.md"))
         };
         let snapshot = registry.current(&mode).stored_snapshot(&mode);
         let before = view.clone();
@@ -1708,7 +1724,8 @@ mod tests {
         rewind: bool,
     ) {
         let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path().join("agent-cwd");
+        let base = directory.path().canonicalize().unwrap();
+        let cwd = base.join("agent-cwd");
         fs::create_dir_all(&cwd).unwrap();
         let root = AgentId::generate();
         let agent = if child { AgentId::generate() } else { root };
@@ -1764,9 +1781,9 @@ mod tests {
                 ),
             },
         });
-        session.save_to(directory.path()).unwrap();
+        session.save_to(base.as_path()).unwrap();
         let resumed =
-            Session::<Message, TokenUsage, ToolOutput>::load_from(session.id, directory.path())
+            Session::<Message, TokenUsage, ToolOutput>::load_from(session.id, base.as_path())
                 .unwrap();
         let view = resumed.latest_state().unwrap();
         let restored = if rewind {
@@ -1807,11 +1824,12 @@ mod tests {
     fn symlink_substitution_returns_build_without_overwriting_unrelated_file(ancestor: bool) {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
-        let unrelated = directory.path().join("unrelated");
+        let base = directory.path().canonicalize().unwrap();
+        let unrelated = base.join("unrelated");
         fs::create_dir(&unrelated).unwrap();
         let sentinel = unrelated.join("plan.md");
         fs::write(&sentinel, MUTATED_CONTENT).unwrap();
-        let destination = directory.path().join("plans");
+        let destination = base.join("plans");
         let path = destination.join("plan.md");
         if ancestor {
             symlink(&unrelated, &destination).unwrap();

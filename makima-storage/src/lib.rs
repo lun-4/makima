@@ -51,11 +51,14 @@ pub struct StateDir(PathBuf);
 
 impl StateDir {
     pub fn resolve() -> Result<Self, StorageError> {
-        let dir = state_dir()?;
-        Ok(Self(dir))
+        Ok(Self::from_path(state_dir()?))
     }
 
+    /// Anchored stores walk below this root without following symlinks, so the
+    /// symlinks that already exist on the way to it are resolved once here.
     pub fn from_path(path: PathBuf) -> Self {
+        #[cfg(unix)]
+        let path = paths::canonical_key(&path);
         Self(path)
     }
 

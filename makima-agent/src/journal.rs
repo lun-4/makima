@@ -3360,7 +3360,7 @@ mod tests {
         let parent = AgentId::generate();
         session.bind_root_id(parent).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let store = OffloadStore::on_disk(directory.path().join("offload"));
+        let store = OffloadStore::on_disk(directory.path().canonicalize().unwrap().join("offload"));
         let text = if offload_text {
             FIRST.repeat(MAX_INLINE_TURN_RESULT_BYTES)
         } else {

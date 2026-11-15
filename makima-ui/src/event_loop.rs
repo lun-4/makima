@@ -6565,7 +6565,15 @@ end })
             assert!(matches!(kind, SessionOpKind::ModeChanged));
             let config = actor.effective_config().unwrap();
             let plan = config.mode.plan_path().unwrap();
-            assert!(plan.starts_with(temp_dir.path().join(makima_storage::plans::PLANS_DIR)));
+            assert!(
+                plan.starts_with(
+                    temp_dir
+                        .path()
+                        .canonicalize()
+                        .unwrap()
+                        .join(makima_storage::plans::PLANS_DIR)
+                )
+            );
             assert_eq!(
                 config.mode_def,
                 EventHandle::disconnected_for_test()
@@ -8073,7 +8081,7 @@ end })
         assert_eq!(durable.messages()[0].user_text(), Some(PERSISTED));
         let manager_generation = runtime.handles.manager_and_root().0.generation();
         let runtime_generation = runtime.generation;
-        let source_root = harness._temp_dir.path().to_path_buf();
+        let source_root = harness._temp_dir.path().canonicalize().unwrap();
         let store = runtime.handles.offload.as_ref().unwrap();
         let artifact = store.put(ARTIFACT).unwrap();
         let artifact_path = store.path_of(&artifact);
@@ -9212,7 +9220,7 @@ end })
             .config
             .clone()
             .unwrap();
-        let path = harness._temp_dir.path().join(PLAN);
+        let path = harness._temp_dir.path().canonicalize().unwrap().join(PLAN);
         if blocked {
             fs::create_dir(&path).unwrap();
         }

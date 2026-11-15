@@ -1023,6 +1023,7 @@ fn restart_rebuilds_one_structured_output_handler_and_keeps_previous_capture() {
 fn post_spawn_options_and_root_cwd_survive_restart_without_retargeting_child() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
+    let resolved_cwd = cwd.path().canonicalize().unwrap();
     let provider = RestartProvider::new(vec![
         common::canned_tool_use("restart_echo", json!({})),
         common::canned_reply(REPLY),
@@ -1070,7 +1071,7 @@ fn post_spawn_options_and_root_cwd_survive_restart_without_retargeting_child() {
         .config
         .as_ref()
         .unwrap();
-    assert_eq!(root.cwd, cwd.path().to_str().unwrap());
+    assert_eq!(root.cwd, resolved_cwd.to_str().unwrap());
     assert_eq!(root.options[OPTION], SAVED_OPTION_VALUE);
     assert_eq!(root.options[TRANSIENT_OPTION], SAVED_OPTION_VALUE);
     assert_eq!(provider.request_count(), 2);
@@ -1084,7 +1085,7 @@ fn post_spawn_options_and_root_cwd_survive_restart_without_retargeting_child() {
             .unwrap()
             .context
             .cwd(),
-        cwd.path()
+        resolved_cwd.as_path()
     );
     command(&host, json!({ "action": "check_config", "path": path }));
     assert!(!host.manager.is_live(child_id));

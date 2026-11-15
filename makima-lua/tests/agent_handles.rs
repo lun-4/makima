@@ -1846,7 +1846,12 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 .effective_config()
                 .unwrap();
             if command == "/pr5_capture" {
-                let plans = fixture._state_dir.path().join(PLANS_DIR);
+                let plans = fixture
+                    ._state_dir
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(PLANS_DIR);
                 assert!(config.mode.plan_path().unwrap().starts_with(plans));
             } else {
                 assert_eq!(config.mode, AgentMode::Build);
@@ -2080,7 +2085,7 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
         assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::Low));
         assert!(config.fast);
         assert!(
-            matches!(&config.mode, AgentMode::Plan(path) if path.starts_with(fixture._state_dir.path())),
+            matches!(&config.mode, AgentMode::Plan(path) if path.starts_with(fixture._state_dir.path().canonicalize().unwrap())),
             "{:?}",
             config.mode
         );

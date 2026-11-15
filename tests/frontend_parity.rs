@@ -258,6 +258,8 @@ impl Scenario {
                 assert!(prompt.contains("allowed for read-only investigation"));
                 assert!(prompt.contains("normal permission flow"));
                 let plans = home
+                    .canonicalize()
+                    .unwrap()
                     .join(".local/state")
                     .join(APP_DIR)
                     .join(makima_storage::plans::PLANS_DIR);
@@ -723,9 +725,10 @@ fn sdk_resume_restores_the_saved_mode(
 ) {
     let home = TempDir::new().unwrap();
     write_config(home.path(), DEAD_PROXY, BLANK);
-    let work = home.path().join("work");
+    let root = home.path().canonicalize().unwrap();
+    let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let state = home.path().join(".local/state").join(APP_DIR);
+    let state = root.join(".local/state").join(APP_DIR);
     let plan = state.join(PLAN_FILE);
     std::fs::write(&plan, "").unwrap();
     let mut session: Session<Message, TokenUsage, ToolOutput> =

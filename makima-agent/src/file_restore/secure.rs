@@ -1,6 +1,8 @@
 use std::{io, path::Path};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use makima_storage::paths::canonical_parent;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::{
     fs::{self as anchored, AtFlags, FileType, Mode, OFlags, Stat},
     io::Errno,
@@ -47,8 +49,8 @@ pub(crate) struct AnchoredPath {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AnchoredPath {
     pub(crate) fn capture(path: &Path) -> io::Result<Self> {
-        let mut parts = path.components();
-        if parts.next() != Some(Component::RootDir)
+        if path.components().next() != Some(Component::RootDir)
+            || path.components().any(|part| part == Component::ParentDir)
             || path
                 .as_os_str()
                 .as_bytes()
@@ -58,6 +60,9 @@ impl AnchoredPath {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, INVALID_PATH));
         }
+        let resolved = canonical_parent(path);
+        let mut parts = resolved.components();
+        parts.next();
         let name = parts
             .next_back()
             .filter(|part| matches!(part, Component::Normal(_)))
@@ -610,7 +615,6 @@ mod tests {
             fs::write(parent.join("file"), BEFORE).unwrap();
         } else {
             symlink(&moved, &parent).unwrap();
-            assert!(AnchoredPath::capture(&parent.join("file")).is_err());
         }
         assert!(captured.read().is_err());
         assert!(captured.replace(Some(BEFORE), Some(AFTER)).is_err());

@@ -88,7 +88,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let path = new_plan_path(&dir).unwrap();
-        assert!(path.starts_with(tmp.path().join("plans")));
+        assert!(path.starts_with(dir.path().join("plans")));
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
     }
 }

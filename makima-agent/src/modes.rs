@@ -702,14 +702,9 @@ mod tests {
 
     #[test]
     fn resolve_allocates_plan_in_state_dir() {
-        let state = tempfile::tempdir().unwrap();
-        let (mode, _) = resolve(
-            &reg(),
-            "plan",
-            &AgentMode::Build,
-            &StateDir::from_path(state.path().into()),
-        )
-        .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temporary.path().into());
+        let (mode, _) = resolve(&reg(), "plan", &AgentMode::Build, &state).unwrap();
         let path = mode.plan_path().unwrap();
         assert!(path.starts_with(state.path().join(makima_storage::plans::PLANS_DIR)));
     }

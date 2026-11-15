@@ -650,7 +650,7 @@ mod tests {
     fn payloads_obey_independent_inline_limits(text_bytes: usize, output_bytes: usize) {
         const JSON_STRING_ARRAY_OVERHEAD: usize = 4;
         let dir = TempDir::new().unwrap();
-        let store = OffloadStore::on_disk(dir.path().to_path_buf());
+        let store = OffloadStore::on_disk(dir.path().canonicalize().unwrap());
         let session = MakimaId::generate();
         let mut expected = result(outcome());
         expected.text = "é".repeat(text_bytes / 2);
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn result_larger_than_preview_cap_restores_losslessly() {
         let dir = TempDir::new().unwrap();
-        let store = OffloadStore::on_disk(dir.path().to_path_buf());
+        let store = OffloadStore::on_disk(dir.path().canonicalize().unwrap());
         let mut expected = result(outcome());
         expected.text = "x".repeat(MAX_OFFLOAD_FILE_BYTES + 1);
         let stored = expected
@@ -705,7 +705,7 @@ mod tests {
             Err(TurnResultStorageError::MissingOffloadStore)
         ));
         let dir = TempDir::new().unwrap();
-        let store = OffloadStore::on_disk(dir.path().to_path_buf());
+        let store = OffloadStore::on_disk(dir.path().canonicalize().unwrap());
         store.request_close();
         assert!(matches!(
             expected.to_stored(session, Some(&store)),

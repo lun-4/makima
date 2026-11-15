@@ -282,21 +282,15 @@ mod tests {
         assert_file_change(&recording, &path, None, Some(AFTER));
     }
 
-    #[test_case(false; "destination_symlink")]
-    #[test_case(true; "parent_symlink")]
-    fn rejects_unsafe_precapture_symlink(parent_symlink: bool) {
+    #[test]
+    fn rejects_precapture_destination_symlink() {
         let (temporary, recording) = fixture();
         let root = temporary.path().canonicalize().unwrap();
         let outside = root.join("outside");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("file"), BEFORE).unwrap();
-        let path = if parent_symlink {
-            symlink(&outside, root.join("link")).unwrap();
-            root.join("link/file")
-        } else {
-            symlink(outside.join("file"), root.join("link")).unwrap();
-            root.join("link")
-        };
+        symlink(outside.join("file"), root.join("link")).unwrap();
+        let path = root.join("link");
         let before = recording.journal.snapshot();
         assert!(recording.capture(&path).is_err());
         let after = recording.journal.snapshot();
@@ -304,6 +298,18 @@ mod tests {
         assert_eq!(after.seq, before.seq);
         assert_eq!(after.revision, before.revision);
         assert_eq!(fs::read(outside.join("file")).unwrap(), BEFORE);
+    }
+
+    #[test]
+    fn precapture_parent_symlink_records_the_resolved_file() {
+        let (temporary, recording) = fixture();
+        let root = temporary.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), BEFORE).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        let capture = recording.capture(&root.join("link/file")).unwrap();
+        assert_blob(&recording, &capture.before, Some(BEFORE));
     }
 
     #[test_case(false; "replacement_directory")]

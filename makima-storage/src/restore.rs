@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::paths::canonical_parent;
 use crate::{
     StateDir,
     blobs::{BlobHash, BlobRef, BlobStore, FileState},
@@ -341,6 +343,7 @@ impl RestoreStore {
         sessions_root: &Path,
         session: MakimaId,
     ) -> Result<RestoreDeletionGuard, RestoreError> {
+        let sessions_root = &canonical_parent(sessions_root);
         let guard = Self::namespace_lock(sessions_root)?;
         let sessions = Directory::open(sessions_root)?;
         let references = checkpoint_references(&sessions, session)?;
