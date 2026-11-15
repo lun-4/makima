@@ -192,7 +192,7 @@ async fn spawn(lua: Lua, ctx: UserDataRef<LuaCtx>, opts: Table) -> mlua::Result<
     };
     let id = session.agent_id;
     let agent = try_pair!(lookup(session.agent.manager(), id, &lua));
-    let _cleanup = retain_session(&lua, session, owner);
+    let _ = retain_session(&lua, session, owner);
     Ok((Some(agent), None))
 }
 
