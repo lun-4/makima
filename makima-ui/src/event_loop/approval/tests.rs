@@ -2679,12 +2679,22 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         let (index, _, requests, _host) = setup(event_loop);
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
-            let app = &event_loop.sessions[index].app;
-            app.root_mode() == Mode::Build && app.status == Status::Idle && !requests.is_empty()
+            let runtime = &event_loop.sessions[index];
+            let (manager, root) = runtime.handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            runtime.app.root_mode() == Mode::Build
+                && runtime.app.status == Status::Idle
+                && runtime.app.run_id == actor.presentation_id()
+                && actor.snapshot().status == ActorStatus::Idle
+                && matches!(
+                    actor.snapshot().latest,
+                    Some(makima_agent::TurnOutcome::Completed { .. })
+                )
+                && !requests.is_empty()
         });
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
-        checkpoint(event_loop, index);
+        checkpoint_settled(event_loop, index);
         let log = session_log(event_loop, id);
         let moved = log.with_extension(SESSION_LOG_BACKUP_EXTENSION);
         fs::rename(&log, &moved).unwrap();
