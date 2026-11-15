@@ -14,8 +14,9 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024
 // Inside Makima's provider idle timeout while Claude Code is slow or retrying.
 const HEARTBEAT_MS = 15_000
 const PROBE_TTL_MS = 60_000
-// Each usage fetch starts Claude Code, and the view that asks may ask again soon.
-const USAGE_TTL_MS = 30_000
+// Each usage fetch starts Claude Code. Longer than the usage view's 30 second
+// poll, so every other poll is served from the cache.
+const USAGE_TTL_MS = 40_000
 const END_PATH = /^\/v1\/conversations\/([^/]+)\/end$/
 
 // {contextWindows} asks each model's window too, which takes seconds.
@@ -49,14 +50,14 @@ function frame(response: ServerResponse, event: string, data: unknown): void {
 
 // Caches an answer for {ttlMs}, since each one starts Claude Code and
 // `auth_status`, `discover` and the usage view ask often. A failure is not kept.
-function cached<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
+export function cached<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
   let entry: { at: number; result: Promise<T> } | undefined
   return () => {
     if (!entry || Date.now() - entry.at > ttlMs) {
       const result = load()
       entry = { at: Date.now(), result }
       result.catch(() => {
-        entry = undefined
+        if (entry?.result === result) entry = undefined
       })
     }
     return entry.result

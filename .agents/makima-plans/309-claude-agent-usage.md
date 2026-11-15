@@ -43,7 +43,7 @@ Verified manually against Claude Code 2.1.322 and SDK 0.3.318: the call works wi
    - `PROTOCOL_VERSION` stays 1: the route is additive, and an old bridge answers 404, which the Lua side treats as unsupported.
 
 3. **Bridge: route** (`claude-agent-bridge/src/server.ts`, `src/main.ts`)
-   - Extend `handler` with a third dependency, `fetchUsage: () => Promise<Usage | undefined>`, wrapped in the existing `cachedProbe` pattern with its own TTL const (`USAGE_TTL_MS = 30_000`). Generalize `cachedProbe` to `cached<T>(ttl, load)` rather than duplicating it.
+   - Extend `handler` with a third dependency, `fetchUsage: () => Promise<Usage | undefined>`, wrapped in the existing `cachedProbe` pattern with its own TTL const (`USAGE_TTL_MS = 40_000`, just over the usage view's 30 s poll, so every other poll hits the cache). Generalize `cachedProbe` to `cached<T>(ttl, load)` rather than duplicating it.
    - `GET /v1/usage` answers `200 { usage }`. `usage` is omitted when the SDK lacks the method. Failures go through the existing catch and `toErrorTable`.
    - Wire it in `main.ts` with `usage(base(environment), PROBE_TIMEOUT_MS)`. Update test call sites of `handler(...)` for the new argument.
    - Mention the route in `claude-agent-bridge/README.md` if it lists routes.
@@ -57,11 +57,11 @@ Verified manually against Claude Code 2.1.322 and SDK 0.3.318: the call works wi
      - `seven_day_opus` → `{ kind = { Weekly = { model = "Opus" } } }`, `seven_day_sonnet` → `{ Weekly = { model = "Sonnet" } }`
      - each `model_scoped[i]` → `{ kind = { Weekly = { model = name } } }`
      - `extra_usage` when `enabled` → `{ kind = { Credits = {} }, detail = "<used> / <limit> <currency>" }`, or `"<used> <currency> used"` without a limit, formatted with two decimals. Check the exact unit-variant encoding against `openai.lua`'s `{ Weekly = {} }` and the serde `UsageWindow` derive while implementing.
-     - `percentage` = `math.clamp(math.floor(utilization + 0.5), 0, 100)` when numeric. `reset_at` is passed through (already ms).
+     - `percentage` = `math.max(0, math.floor(utilization + 0.5))` when numeric, with no upper clamp: claude.ai reports over 100 once a window is exceeded, and that is worth showing. `reset_at` is passed through (already ms).
      - `plan` = `body.usage.plan`.
      - A window that maps to neither percentage nor reset is skipped.
    - In `prepare`, add `instance.fetch_usage(ctx)`: GET `USAGE_PATH` with the existing `get_json`/`send` helpers. A bridge that cannot be reached returns `unreachable(socket, err)`, as `stream` does. A 404 returns `nil` (old bridge). Any other non-200 returns `refused(response)`. Otherwise return `M.parse_usage(body)`.
-   - Use named consts for the labels, the 5-hour window and the max percent. No inline magic values.
+   - Use named consts for the labels and the 5-hour window. No inline magic values.
 
 5. **Docs**
    - Extend the provider `docs.notes` in `claude_agent.lua` with one sentence: plan usage shows for Claude subscription logins, and API-key logins have none. Run `just gen-docs`.
@@ -72,7 +72,7 @@ Verified manually against Claude Code 2.1.322 and SDK 0.3.318: the call works wi
 - **AC.2** A session without plan limits (`rate_limits_available: false`) yields `available: false`, and the Lua side returns `nil` (unsupported).
 - **AC.3** An SDK without the experimental method yields a 200 without `usage`. An old bridge (404) also maps to `nil`, not an error.
 - **AC.4** Repeated `/v1/usage` calls within the TTL start Claude Code once. A failed fetch is not cached.
-- **AC.5** `M.parse_usage` maps every window kind to the documented `UsageWindow`, rounds and clamps percentages, skips empty windows, and formats credits.
+- **AC.5** `M.parse_usage` maps every window kind to the documented `UsageWindow`, rounds percentages and floors them at 0 (over 100 is kept), skips empty windows, and formats credits.
 - **AC.6** `instance.fetch_usage` reaches the bridge over the socket. An unreachable bridge is a config error (no retry), matching `stream`.
 - **AC.7** `probe()` behavior and the existing routes are unchanged.
 
@@ -84,7 +84,7 @@ Verified manually against Claude Code 2.1.322 and SDK 0.3.318: the call works wi
 | AC.2 | bridge: `trimUsage marks sessions without plan limits unavailable`. Lua: `parse_usage_without_plan_limits_is_unsupported` |
 | AC.3 | `server.test.ts`: `usage without the SDK method answers without usage`. Lua: `fetch_usage_on_an_old_bridge_is_unsupported` (scripted 404) |
 | AC.4 | `server.test.ts`: `usage is cached for its ttl`, `a failed usage fetch is not cached` (counting fake `fetchUsage`) |
-| AC.5 | `plugins/providers/tests/claude_agent.lua`: `parse_usage_maps_windows` (test_case table over five_hour, seven_day, opus, sonnet, model_scoped), `parse_usage_rounds_and_clamps_percentages`, `parse_usage_skips_empty_windows`, `parse_usage_formats_credits` |
+| AC.5 | `plugins/providers/tests/claude_agent.lua`: `parse_usage_maps_windows` (test_case table over five_hour, seven_day, opus, sonnet, model_scoped), `parse_usage_skips_disabled_credits_and_empty_model_windows` (also keeps a percentage over 100), `parse_usage_skips_empty_windows`, `parse_usage_formats_credits` |
 | AC.6 | Lua: `fetch_usage_reads_the_bridge`, `fetch_usage_with_bridge_down_is_a_config_error` |
 | AC.7 | Existing `server.test.ts` (`status reports the login`, step tests) and existing `claude_agent.lua` cases pass unchanged |
 

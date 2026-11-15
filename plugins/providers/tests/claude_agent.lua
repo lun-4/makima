@@ -258,6 +258,20 @@ t.case("parse_usage_lists_plan_windows_then_model_windows_then_credits", functio
   })
 end)
 
+t.case("parse_usage_skips_disabled_credits_and_empty_model_windows", function()
+  local usage = claude_agent.parse_usage({
+    usage = {
+      available = true,
+      rate_limits = {
+        five_hour = { utilization = 110, resets_at = RESET },
+        model_scoped = { { display_name = "Fable", resets_at = WEEK_RESET } },
+        extra_usage = { is_enabled = false, used_credits = 25384, decimal_places = 2, currency = "BRL" },
+      },
+    },
+  })
+  t.same(usage, { limits = { { kind = { Hours = 5 }, percentage = 110, reset_at = RESET_MS } } })
+end)
+
 t.case("parse_usage_without_plan_limits_is_unsupported", function()
   t.eq(claude_agent.parse_usage({ usage = { plan = "pro", available = false } }), nil)
   t.eq(claude_agent.parse_usage({}), nil)

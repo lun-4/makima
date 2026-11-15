@@ -3,10 +3,10 @@ import { request as httpRequest } from "node:http"
 import { mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { after, before, test } from "node:test"
+import { after, before, mock, test } from "node:test"
 import type { Server } from "node:http"
 import type { PlanUsage } from "../src/protocol.ts"
-import { handler, listen } from "../src/server.ts"
+import { cached, handler, listen } from "../src/server.ts"
 import { harness, LOGGED_IN, request, text, textTurn, user } from "./fake.ts"
 
 const PLAN: PlanUsage = { plan: "pro", available: true, rate_limits: { five_hour: { utilization: 24, resets_at: "2026-11-15T20:19:59Z" } } }
@@ -108,4 +108,23 @@ test("usage is cached once fetched, and a failed fetch is not", async () => {
   assert.deepEqual(JSON.parse((await call("GET", "/v1/usage")).text), { usage: PLAN })
   assert.deepEqual(JSON.parse((await call("GET", "/v1/usage")).text), { usage: PLAN })
   assert.equal(usageCalls, 2)
+})
+
+test("a late failure keeps the newer cached answer", async () => {
+  mock.timers.enable({ apis: ["Date"] })
+  try {
+    const first = Promise.withResolvers<string>()
+    const loads = [first.promise, Promise.resolve("fresh")]
+    let calls = 0
+    const load = cached(1_000, () => loads[calls++]!)
+    void load().catch(() => {})
+    mock.timers.tick(1_001)
+    assert.equal(await load(), "fresh")
+    first.reject(new Error(USAGE_FAILED))
+    await first.promise.catch(() => {})
+    assert.equal(await load(), "fresh")
+    assert.equal(calls, 2)
+  } finally {
+    mock.timers.reset()
+  }
 })
