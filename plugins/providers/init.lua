@@ -2,11 +2,9 @@ local aperture = require("providers.aperture")
 local catalog = require("providers.catalog")
 local compat = require("providers.openai_compat")
 local custom = require("providers.custom")
-local executable = require("providers.executable")
 local http = require("providers.http")
 local local_server = require("providers.local_server")
 local opencode = require("providers.opencode")
-local routes = require("providers.routes")
 
 local registered = {}
 
@@ -64,15 +62,11 @@ cache:load()
 register(opencode.provider(cache, opencode.ZEN))
 register(opencode.provider(cache, opencode.GO))
 
--- The providers a script can name as its base.
-local bases = table.clone(routes.ROUTES)
-bases.aperture = aperture.delegated()
-bases.opencode = opencode.delegated(cache)
-register(custom.creator(executable.notes(bases) .. "\n\n" .. catalog.NOTES))
+register(custom.creator(catalog.NOTES))
 
--- Sections with a protocol, then scripts, each win over a models.dev
--- provider of the same id but never over a built-in one. A built-in
--- provider's section may name a protocol of its own.
+-- Sections with a protocol each win over a models.dev provider of the same
+-- id but never over a built-in one. A built-in provider's section may name
+-- a protocol of its own.
 local sections = makima.api.startup_provider_config()
 local ids = {}
 for id, section in pairs(sections) do
@@ -86,20 +80,6 @@ for _, id in ipairs(ids) do
     register_user(id, "providers.toml", function()
       return custom.provider(id, sections[id])
     end)
-  end
-end
-
-local config_dir, state_dir = makima.env.config_dir(), makima.env.state_dir()
-if config_dir then
-  local cache_path = state_dir and makima.fs.joinpath(state_dir, executable.CACHE_FILE)
-  for _, script in ipairs(executable.scan(makima.fs.joinpath(config_dir, executable.DIR), cache_path, bases)) do
-    if registered[script.slug] then
-      makima.log.warn(string.format("%s: provider id %s is already taken, skipping", script.path, script.slug))
-    else
-      register_user(script.slug, script.path, function()
-        return executable.provider(script, bases[script.info.base])
-      end)
-    end
   end
 end
 

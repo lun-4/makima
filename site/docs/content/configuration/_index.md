@@ -311,7 +311,7 @@ makima.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `allow_model` | boolean | `true` | - | Expose a `model` input that overrides the subagent model. Only disable if you do not trust callers to pick an exact model themselves. |
 
 ### `plugins.webfetch`
 
@@ -346,7 +346,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\makima\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `providers/` (executable providers), and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

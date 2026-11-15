@@ -464,35 +464,9 @@ Model fields: `id` (required), `tier` (`weak`, `medium`, `strong` or `compaction
 
 A section never takes over a built-in provider's id. A section that fails to register is logged and left out, and a file that does not parse stops Makima at startup with exit code 2.
 
-#### Executable providers
-
-An executable file in the config `providers/` directory (`~/.config/makima/providers/` on Linux and macOS, `%APPDATA%\makima\providers\` on Windows) is a provider named after the file. Makima runs it with one subcommand and reads JSON from its output:
-
-| Subcommand | Timeout | What it returns |
-|------------|---------|-----------------|
-| `info` | 5s | `display_name`, `base`, `has_auth` and an optional `system_prefix` |
-| `models` | 5s | An optional list of models |
-| `resolve` | 30s | Auth for each new agent: `headers` and an optional `base_url` |
-| `refresh` | 30s | The same, after the server rejects the credentials |
-| `reload` | 30s | The same, after a login elsewhere |
-| `login` | none | Only with `has_auth`. Runs on your terminal, so use `makima auth login <name>`; `/login` in the TUI cannot |
-| `logout` | 30s | Only with `has_auth`. Runs on `makima auth logout <name>` |
-
-`resolve` runs each time an agent starts, so read tokens from disk instead of caching them, and a login in another process is picked up. `info` and `models` change only with the script, so their output is cached by the file's size and modification time.
-
-`base` names the provider whose protocol the script speaks and whose curated models it inherits: one of `anthropic`, `aperture`, `copilot`, `deepseek`, `google`, `llama-cpp`, `mistral`, `ollama`, `openai`, `opencode`, `openrouter`, `regolo`, `requesty`, `synthetic`, `tensorx`, `zai`. A `models` list replaces them:
-
-```json
-[{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
-```
-
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (default 128K), `max_output_tokens` (default 16K), `pricing` (`{input, output, cache_write, cache_read}` per 1M tokens), and `supports_tool_examples`, `supports_thinking`, `requires_thinking` and `supports_vision`, which default to the base's. A `llama-cpp` based model can also declare `thinking_fields`: the JSON merged into the request body for `off`, `adaptive` and each effort level it accepts.
-
-Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.
-
 #### Providers from models.dev
 
-Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider, a `providers.toml` section or a script with the same id wins. The login picker lists them under "Providers from Models.dev". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
+Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider or a `providers.toml` section with the same id wins. The login picker lists them under "Providers from Models.dev". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
 
 The catalog is cached in the cache directory (`models-dev/`) and fetched again once it is a day old, or by `makima models --refresh`. Startup reads only the cache and never waits on the network, so a provider new to the catalog appears from the next start.
 

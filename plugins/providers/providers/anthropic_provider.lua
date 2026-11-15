@@ -269,9 +269,8 @@ function M.fetch_usage(ctx, api)
 end
 
 -- Streams {request} to the Messages API at {api} (`base` origin and
--- `headers(extra)`) for descriptor {model}. {system_prefix} goes before the
--- system prompt as its own block.
-function M.stream(api, model, ctx, request, emit, system_prefix)
+-- `headers(extra)`) for descriptor {model}.
+function M.stream(api, model, ctx, request, emit)
   -- A stale fast flag must never bill an ineligible model at the fast rate.
   request.fast = request.fast and model.supports_fast == true
   local response, err = http.send(ctx, {
@@ -282,7 +281,7 @@ function M.stream(api, model, ctx, request, emit, system_prefix)
       ["anthropic-beta"] = codec.beta_header(request),
       ["anthropic-version"] = M.API_VERSION,
     }),
-    body = assert(makima.json.encode(codec.build_request(request, system_prefix))),
+    body = assert(makima.json.encode(codec.build_request(request))),
   })
   if not response then
     return nil, err
