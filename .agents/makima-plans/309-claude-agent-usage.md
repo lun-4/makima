@@ -101,3 +101,7 @@ After implementation, review the diff against AC.1 to AC.7, with special attenti
 - **Not chosen: passive `rate_limit_event` capture** (`convert.ts:189`). It is free, but covers only the window that fired and has no plan or credits. It could become a fallback later.
 - **Decision: extra usage shows only when enabled.** A disabled pool (for example `out_of_credits`) is omitted to keep the view focused on limits that apply.
 - **Decision: map to Makima's `UsageWindow` in Lua, not in the bridge.** The bridge protocol stays free of Makima's serde enum encoding, and the mapping is spec-tested next to the other providers.
+
+## Implementation Notes (deviation from the plan)
+
+`anthropic_provider.lua` already parses claude.ai's OAuth usage body (`five_hour`, `seven_day*`, `extra_usage` in minor units with `decimal_places`), which is the same shape the SDK returns. So the bridge forwards the whitelisted fields as they are (`planUsage` in `convert.ts`: RFC 3339 resets and minor-unit credits are kept), and `claude_agent.parse_usage` reuses `anthropic.parse_usage`. It adds `model_scoped` rows through the new shared `anthropic.window_limit` and lists them before the credits row. Credits are formatted like the anthropic provider (`253.84 BRL spent`), shown only when extra usage is enabled.

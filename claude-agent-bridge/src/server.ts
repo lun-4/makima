@@ -6,7 +6,7 @@ import { dirname } from "node:path"
 import type { Conversations } from "./conversations.ts"
 import { isLoggedIn } from "./conversations.ts"
 import { END_REASONS, invalid, parseStep, PROTOCOL_VERSION, toErrorTable } from "./protocol.ts"
-import type { EndReason, ErrorTable } from "./protocol.ts"
+import type { EndReason, ErrorTable, PlanUsage } from "./protocol.ts"
 import { BridgeError } from "./protocol.ts"
 import type { Probe } from "./session.ts"
 
@@ -14,10 +14,14 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024
 // Inside Makima's provider idle timeout while Claude Code is slow or retrying.
 const HEARTBEAT_MS = 15_000
 const PROBE_TTL_MS = 60_000
+// Each usage fetch starts Claude Code, and the view that asks may ask again soon.
+const USAGE_TTL_MS = 30_000
 const END_PATH = /^\/v1\/conversations\/([^/]+)\/end$/
 
 // {contextWindows} asks each model's window too, which takes seconds.
 export type ProbeClaude = (contextWindows: boolean) => Promise<Probe>
+// Undefined when Claude Code cannot report usage.
+export type FetchUsage = () => Promise<PlanUsage | undefined>
 
 async function readBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
@@ -43,25 +47,26 @@ function frame(response: ServerResponse, event: string, data: unknown): void {
   response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
 }
 
-// Caches a probe briefly, since `auth_status` and `discover` ask often and
-// each probe starts Claude Code.
-function cachedProbe(probe: () => Promise<Probe>): () => Promise<Probe> {
-  let cached: { at: number; result: Promise<Probe> } | undefined
+// Caches an answer for {ttlMs}, since each one starts Claude Code and
+// `auth_status`, `discover` and the usage view ask often. A failure is not kept.
+function cached<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
+  let entry: { at: number; result: Promise<T> } | undefined
   return () => {
-    if (!cached || Date.now() - cached.at > PROBE_TTL_MS) {
-      const result = probe()
-      cached = { at: Date.now(), result }
+    if (!entry || Date.now() - entry.at > ttlMs) {
+      const result = load()
+      entry = { at: Date.now(), result }
       result.catch(() => {
-        cached = undefined
+        entry = undefined
       })
     }
-    return cached.result
+    return entry.result
   }
 }
 
-export function handler(conversations: Conversations, probeClaude: ProbeClaude) {
-  const probe = cachedProbe(() => probeClaude(false))
-  const probeModels = cachedProbe(() => probeClaude(true))
+export function handler(conversations: Conversations, probeClaude: ProbeClaude, fetchUsage: FetchUsage) {
+  const probe = cached(PROBE_TTL_MS, () => probeClaude(false))
+  const probeModels = cached(PROBE_TTL_MS, () => probeClaude(true))
+  const planUsage = cached(USAGE_TTL_MS, fetchUsage)
 
   async function status(response: ServerResponse): Promise<void> {
     try {
@@ -91,6 +96,10 @@ export function handler(conversations: Conversations, probeClaude: ProbeClaude) 
         supported_effort_levels: model.supportedEffortLevels,
       })),
     })
+  }
+
+  async function usage(response: ServerResponse): Promise<void> {
+    json(response, 200, { usage: await planUsage() })
   }
 
   async function step(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -138,6 +147,7 @@ export function handler(conversations: Conversations, probeClaude: ProbeClaude) 
       const ending = END_PATH.exec(url.pathname)
       if (request.method === "GET" && url.pathname === "/v1/status") return await status(response)
       if (request.method === "GET" && url.pathname === "/v1/models") return await models(response)
+      if (request.method === "GET" && url.pathname === "/v1/usage") return await usage(response)
       if (request.method === "POST" && url.pathname === "/v1/steps") return await step(request, response)
       if (request.method === "POST" && ending) return await end(decodeURIComponent(ending[1]!), request, response)
       json(response, 404, { message: `no route ${request.method} ${url.pathname}`, retry: "none" } satisfies ErrorTable)

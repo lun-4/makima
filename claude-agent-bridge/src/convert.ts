@@ -1,7 +1,19 @@
-import type { SDKAssistantMessageError, SDKMessage } from "@anthropic-ai/claude-agent-sdk"
+import type { SDKAssistantMessageError, SDKControlGetUsageResponse, SDKMessage } from "@anthropic-ai/claude-agent-sdk"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { BridgeError, invalid } from "./protocol.ts"
-import type { Block, ErrorTable, Event, Message, StepResult, StopReason, Tool, Usage } from "./protocol.ts"
+import type {
+  Block,
+  ErrorTable,
+  Event,
+  Message,
+  PlanUsage,
+  RateLimits,
+  StepResult,
+  StopReason,
+  Tool,
+  Usage,
+  UsageWindow,
+} from "./protocol.ts"
 import { originalName } from "./tools.ts"
 
 export type ClaudeBlock = { type: "text"; text: string } | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
@@ -300,4 +312,38 @@ export class StepTranslator {
     const rateLimited = code === "rate_limit" ? 429 : undefined
     return { status: status ?? rateLimited, message, retry: "none" }
   }
+}
+
+const PLAN_WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] as const
+
+type RawWindow = { utilization: number | null; resets_at: string | null } | null | undefined
+// Claude Code sends `decimal_places`, which the SDK types leave out.
+type RawExtraUsage = NonNullable<NonNullable<SDKControlGetUsageResponse["rate_limits"]>["extra_usage"]> & {
+  decimal_places?: number | null
+}
+
+function planWindow(raw: RawWindow): UsageWindow | undefined {
+  return raw ? { utilization: raw.utilization ?? undefined, resets_at: raw.resets_at ?? undefined } : undefined
+}
+
+// Keeps the known fields of Claude Code's usage answer, which also carries
+// unnamed windows and a scan of local transcripts Makima does not show.
+export function planUsage(raw: SDKControlGetUsageResponse): PlanUsage {
+  const plan = raw.subscription_type ?? undefined
+  const limits = raw.rate_limits
+  if (!raw.rate_limits_available || !limits) return { plan, available: false }
+  const rateLimits: RateLimits = {}
+  for (const name of PLAN_WINDOWS) rateLimits[name] = planWindow(limits[name])
+  rateLimits.model_scoped = limits.model_scoped?.map((row) => ({ display_name: row.display_name, ...planWindow(row) }))
+  const extra = limits.extra_usage as RawExtraUsage | null | undefined
+  if (extra) {
+    rateLimits.extra_usage = {
+      is_enabled: extra.is_enabled,
+      utilization: extra.utilization ?? undefined,
+      used_credits: extra.used_credits ?? undefined,
+      decimal_places: extra.decimal_places ?? undefined,
+      currency: extra.currency ?? undefined,
+    }
+  }
+  return { plan, available: true, rate_limits: rateLimits }
 }

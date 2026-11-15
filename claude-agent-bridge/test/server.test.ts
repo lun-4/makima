@@ -5,20 +5,31 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { after, before, test } from "node:test"
 import type { Server } from "node:http"
+import type { PlanUsage } from "../src/protocol.ts"
 import { handler, listen } from "../src/server.ts"
 import { harness, LOGGED_IN, request, text, textTurn, user } from "./fake.ts"
+
+const PLAN: PlanUsage = { plan: "pro", available: true, rate_limits: { five_hour: { utilization: 24, resets_at: "2026-11-15T20:19:59Z" } } }
+const USAGE_FAILED = "claude did not answer"
 
 let dir: string
 let server: Server
 let socket: string
+let usageCalls = 0
+let nextUsage: () => Promise<PlanUsage | undefined> = async () => PLAN
 const h = harness([[textTurn("hello")]])
+
+function fetchUsage(): Promise<PlanUsage | undefined> {
+  usageCalls++
+  return nextUsage()
+}
 
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), "bridge-"))
   socket = join(dir, "state", "bridge.sock")
   server = await listen(
     socket,
-    handler(h.conversations, async () => LOGGED_IN),
+    handler(h.conversations, async () => LOGGED_IN, fetchUsage),
   )
 })
 
@@ -48,7 +59,7 @@ test("a second bridge on the same socket refuses to start", async () => {
   await assert.rejects(
     listen(
       socket,
-      handler(h.conversations, async () => LOGGED_IN),
+      handler(h.conversations, async () => LOGGED_IN, fetchUsage),
     ),
     /already listening/,
   )
@@ -84,4 +95,17 @@ test("status reports the login", async () => {
 test("ending a conversation takes a known reason only", async () => {
   assert.equal((await call("POST", "/v1/conversations/c/end", { reason: "closed" })).status, 200)
   assert.equal((await call("POST", "/v1/conversations/c/end", { reason: "bored" })).status, 400)
+})
+
+test("usage is cached once fetched, and a failed fetch is not", async () => {
+  nextUsage = async () => {
+    throw new Error(USAGE_FAILED)
+  }
+  const failed = await call("GET", "/v1/usage")
+  assert.equal(failed.status, 500)
+  assert.equal(JSON.parse(failed.text).message, USAGE_FAILED)
+  nextUsage = async () => PLAN
+  assert.deepEqual(JSON.parse((await call("GET", "/v1/usage")).text), { usage: PLAN })
+  assert.deepEqual(JSON.parse((await call("GET", "/v1/usage")).text), { usage: PLAN })
+  assert.equal(usageCalls, 2)
 })

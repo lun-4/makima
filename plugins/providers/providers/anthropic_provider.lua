@@ -214,6 +214,14 @@ local function credits(body)
   return { kind = "Credits", percentage = percentage, detail = detail or nil }
 end
 
+-- A usage window `{ utilization, resets_at }` as a limit of {kind}, or nil
+-- when it has no utilization.
+function M.window_limit(kind, usage)
+  usage = object(usage)
+  local percentage = usage and percent(usage.utilization)
+  return percentage and { kind = kind, percentage = percentage, reset_at = clock.parse_rfc3339(usage.resets_at) } or nil
+end
+
 -- The OAuth usage response: its `limits` rows, or the older per-window
 -- fields without them, then the extra-usage credits.
 function M.parse_usage(body)
@@ -235,11 +243,7 @@ function M.parse_usage(body)
       { { Weekly = { model = "Sonnet" } }, body.seven_day_sonnet },
       { { Weekly = { model = "Opus" } }, body.seven_day_opus },
     }) do
-      local usage = object(lane[2])
-      if usage and percent(usage.utilization) then
-        limits[#limits + 1] =
-          { kind = lane[1], percentage = percent(usage.utilization), reset_at = clock.parse_rfc3339(usage.resets_at) }
-      end
+      limits[#limits + 1] = M.window_limit(lane[1], lane[2])
     end
   end
   limits[#limits + 1] = credits(body)

@@ -8,7 +8,7 @@ import { Conversations } from "./conversations.ts"
 import { base } from "./options.ts"
 import { fileRecords } from "./records.ts"
 import { handler, listen } from "./server.ts"
-import { probe, startSession } from "./session.ts"
+import { probe, startSession, usage } from "./session.ts"
 
 const PROBE_TIMEOUT_MS = 30_000
 const USAGE = `Usage: makima-claude-agent-bridge [--socket PATH] [--state DIR] [--claude PATH]
@@ -55,7 +55,11 @@ async function main(): Promise<void> {
   const conversations = new Conversations(environment, startSession, fileRecords(join(state, "conversations")))
   const server = await listen(
     socket,
-    handler(conversations, (contextWindows) => probe(base(environment), PROBE_TIMEOUT_MS, contextWindows)),
+    handler(
+      conversations,
+      (contextWindows) => probe(base(environment), PROBE_TIMEOUT_MS, contextWindows),
+      () => usage(base(environment), PROBE_TIMEOUT_MS),
+    ),
   )
   console.error(`claude-agent bridge listening on ${socket} (claude: ${environment.executable})`)
 
