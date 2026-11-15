@@ -13,8 +13,9 @@ is about writing one that actually triggers and actually helps.
   the skill tool runs, so the description carries the whole triggering burden.
 - `disable-model-invocation: true` hides the skill from the model's list but
   keeps it reachable with `@skill:<name>`.
-- Paths in the body are relative to the skill's directory, so
-  `references/schema.md` resolves next to `SKILL.md`.
+- Paths into the skill's own files are relative to its directory, so
+  `references/schema.md` resolves next to `SKILL.md`. Project paths such as
+  `docs/meetings/` are not; state the working directory for them.
 
 Discovery order matters when names collide: builtins, then the global
 `~/.config/makima/skills/`, the Claude/OpenCode/Agents dirs, then the project
@@ -94,10 +95,27 @@ Rules:
   expensive.
 - Keep `SKILL.md` under about 500 lines. Move long schemas, API docs, and
   variant details into `references/`, and say exactly when to read each file.
-- Use `scripts/` only for deterministic or repeated operations. Scripts should
-  print short, LLM-friendly output.
+- Use `scripts/` only for deterministic or repeated operations.
 - Use `assets/` for files that go into the result, not instructions.
 - No README, changelog, install guide, or other scaffolding.
+
+Say where commands run. A skill can be loaded from anywhere, but project files
+live somewhere specific. Pick one base, usually the repo root, and use it in
+every command block. Do not mix a skill-relative script path with a
+project-relative data path in the same block unless the sentence above the
+block states both bases.
+
+Script contract:
+
+- Resolve project inputs from the stated base, or accept them as arguments.
+  Never depend on the process cwd without saying so.
+- Fail loudly when an expected input directory or file is missing. An empty
+  result is not a missing input.
+- Create the output directories the skill promises, without deleting existing
+  files.
+- Exit non-zero on validation failure and print one short `file:line: problem`
+  line per issue. Keep normal output compact.
+- Reject conflicting flags instead of silently preferring one.
 
 Useful shape:
 
@@ -109,17 +127,37 @@ Useful shape:
 If <observable condition>, read [references/x.md](references/x.md).
 ```
 
-### 6. Validate
+### 6. Validate by running it
+
+Run the skill's own commands, not just your eyes. Use a throwaway directory
+with realistic fixture inputs.
 
 - [ ] Directory name and `name` agree; the name is lowercase, digits, and
       hyphens, at most 64 characters.
 - [ ] `description` is present, specific, and under 1024 characters.
 - [ ] The body is non-empty and has no unfinished TODOs or placeholders.
 - [ ] Every relative file mentioned in the body exists.
+- [ ] Every command block names its working directory, and the paths in it
+      are valid from that directory.
+- [ ] Every fenced command was run verbatim from the working directory the
+      body states and succeeded.
+- [ ] The body's own output template passes the body's own validator.
+- [ ] Every code example in the body parses or runs (YAML, JSON, shell,
+      snippets).
+- [ ] Empty sections, heading variants, and every behavior promised in the
+      description or body each have a fixture that exercises them.
+- [ ] At least one negative case per documented check fails with the expected
+      message and exit code.
+- [ ] Fixtures cover an empty result, a missing input, and an item that hits
+      each extraction rule.
+- [ ] A missing input directory fails loudly instead of returning an empty
+      result.
 - [ ] The skill is one coherent unit and does not restate what the model or
       `AGENTS.md` already knows.
 - [ ] Hidden skills are documented for the user as `@skill:<name>`.
 - [ ] `SKILL.md` is under about 500 lines; over 5k tokens is a smell.
+- [ ] After the mechanical checks pass, read one generated artifact against
+      the body and list every promise no validator checks.
 
 Do not duplicate another skill or `AGENTS.md`. Link to the canonical home
 instead.

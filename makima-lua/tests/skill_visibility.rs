@@ -12,7 +12,10 @@ use makima_agent::tools::{
 };
 use makima_agent::{AgentMode, ToolOutput};
 use makima_config::AgentConfig;
-use makima_lua::test_support::{InMemoryFs, PluginHostGuard, spawn_host_with_fs_for_tests};
+use makima_lua::test_support::{
+    InMemoryFs, PluginHostGuard, spawn_host_with_fs_and_opts_for_tests,
+    spawn_host_with_fs_for_tests,
+};
 use makima_lua::{CompletionCtx, EventHandle};
 use makima_providers::Model;
 
@@ -229,4 +232,25 @@ fn builtin_skill_creator_is_listed_and_loadable() {
 
     let output = call_skill(&registry, BUILTIN_CREATOR).expect("skill-creator must load");
     assert!(output.contains(CREATOR_BODY), "got: {output}");
+}
+
+#[test]
+fn skill_creator_option_removes_it_from_the_list() {
+    let fs = Arc::new(InMemoryFs::new());
+    let mut opts = std::collections::HashMap::new();
+    opts.insert(
+        "skill".to_string(),
+        serde_json::json!({ "skill_creator": false })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let (_handle, guard) = spawn_host_with_fs_and_opts_for_tests(&[SKILL_PLUGIN], fs, None, opts);
+
+    let description = skill_description(&guard.host().registry());
+    assert!(!description.contains(BUILTIN_CREATOR), "got: {description}");
+    assert!(
+        description.contains("makima-plugin-dev"),
+        "plugin_dev should stay: {description}"
+    );
 }

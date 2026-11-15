@@ -86,4 +86,4 @@ makima.setup({
 
 `init` writes an `AGENTS.md` for the current project. It sends a research subagent to explore the codebase, then writes the file itself from the report. It is hidden from the model's list (`disable-model-invocation`), so it costs no prompt tokens. Summon it yourself by typing `@skill:init` and sending the message.
 
-`skill-creator` writes, reviews, and tests skills. It interviews you, picks the project or personal location, drafts the frontmatter and body, validates the result, and suggests trigger tests. Turn it off if you never write skills with `skill = { skill_creator = false }`.
+`skill-creator` writes, reviews, and tests skills. It is on by default. It interviews you, picks the project or personal location, drafts the frontmatter and body, validates the result by running the skill's own commands, and suggests trigger tests. Turn it off if you never write skills with `skill = { skill_creator = false }`.
