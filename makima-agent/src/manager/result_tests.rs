@@ -34,6 +34,13 @@ const POP_GATE_TIMEOUT: &str = "turn did not reach the pop gate";
 #[cfg(unix)]
 const REPLACEMENT: &str = "replacement";
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "root and stored are read only by unix symlink tests"
+    )
+)]
 struct Fixture {
     root: TempDir,
     store: Arc<OffloadStore>,

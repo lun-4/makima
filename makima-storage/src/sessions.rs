@@ -761,6 +761,10 @@ fn sync_branch_directory(path: &Path) -> Result<(), StorageError> {
 }
 
 fn sync_branch_file(path: &Path) -> Result<(), StorageError> {
+    // FlushFileBuffers rejects read-only handles on Windows.
+    #[cfg(windows)]
+    OpenOptions::new().write(true).open(path)?.sync_all()?;
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()?;
     if let Some(parent) = path.parent() {
         sync_branch_directory(parent)?;

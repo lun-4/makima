@@ -958,7 +958,7 @@ impl StorageWriter {
             .await?
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn hold_restore_sync(
         &self,
         error: &str,
@@ -971,7 +971,7 @@ impl StorageWriter {
         (observed, release)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn hold_current_sync(
         &self,
         error: &str,
@@ -982,7 +982,7 @@ impl StorageWriter {
         gates
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn release_restore_sync(&self) {
         lock(&self.pending).restore_sync_gate = None;
         let _ = self.wake.send(());

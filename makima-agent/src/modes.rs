@@ -638,11 +638,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_restore_rejects_fifo_without_waiting_for_reader() {
-        use rustix::fs::{CWD, Mode, mkfifoat};
+        use crate::test_util::make_fifo;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("plan.pipe");
-        mkfifoat(CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+        make_fifo(&path).unwrap();
         let snapshot = ModeDef::default_for(ModeId::Plan).stored_snapshot(&AgentMode::Plan(path));
         let restored = prepare_restore(&snapshot, &reg()).unwrap();
         assert_eq!(restored.mode, AgentMode::Build);

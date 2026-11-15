@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_imports, dead_code)
+)]
+
 mod coherence;
 mod outside_snapshot;
 

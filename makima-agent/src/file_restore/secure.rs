@@ -361,7 +361,7 @@ impl AnchoredPath {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::{AnchoredPath, CONTENT_CHANGED, DIRECTORY_CHANGED, INVALID_PATH};
-    use rustix::fs::{CWD, Mode, mkfifoat};
+    use crate::test_util::make_fifo;
     use std::{fs, io, os::unix::fs::symlink, path::Path};
     use test_case::test_case;
 
@@ -673,7 +673,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().canonicalize().unwrap().join("fifo");
         let captured = AnchoredPath::capture(&path).unwrap();
-        mkfifoat(CWD, &path, Mode::RWXU).unwrap();
+        make_fifo(&path).unwrap();
         let error = AnchoredPath::capture(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(captured.read().is_err());
