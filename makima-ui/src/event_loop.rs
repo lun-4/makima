@@ -1362,6 +1362,12 @@ fn replace_session_runtime(
 
 impl SessionRuntime {
     fn share_session_lease(&mut self) -> Result<Arc<RenewingDeletionLease>, String> {
+        if let Some(SessionLockState::InFlight(completion_rx)) = &self.session_lock
+            && let Some(completion) =
+                collect_heartbeat(completion_rx.clone(), Some(AGENT_SHUTDOWN_TIMEOUT))
+        {
+            apply_heartbeat_completion(self, completion);
+        }
         match self.session_lock.take() {
             Some(SessionLockState::Held(lease)) => {
                 let lease = Arc::new(RenewingDeletionLease::new(lease));
@@ -8159,6 +8165,30 @@ end })
         AppSession::delete(id, &storage).unwrap();
         assert!(!artifact.exists());
         assert!(!expected.exists());
+    }
+
+    #[test]
+    fn sharing_the_lease_collects_an_in_flight_heartbeat() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let mut runtime = harness.runtime(session);
+        let Some(SessionLockState::Held(lease)) = runtime.session_lock.take() else {
+            panic!("expected held session lock");
+        };
+        let (completion_tx, completion_rx) = flume::bounded(1);
+        completion_tx
+            .send(HeartbeatCompletion {
+                result: Ok(session_lock::LockBeat::Held),
+                lease: Some(lease),
+            })
+            .unwrap();
+        runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
+        assert!(runtime.share_session_lease().is_ok());
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::Shared(_))
+        ));
+        release_runtime(runtime);
     }
 
     struct GatedDiskBackend {

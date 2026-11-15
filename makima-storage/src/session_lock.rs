@@ -267,7 +267,7 @@ impl ClaimedSessionLock {
     }
 
     fn release_inner(&mut self) -> io::Result<()> {
-        let Some(mut file) = open_existing_locked(&self.path)? else {
+        let Some(mut file) = open_existing_locked_blocking(&self.path)? else {
             self.released = true;
             return Ok(());
         };
@@ -823,6 +823,26 @@ mod tests {
 
         assert_eq!(published_rx.recv().unwrap().unwrap(), Some("published"));
         lease.release().unwrap();
+    }
+
+    #[test]
+    fn release_waits_for_in_flight_publication() {
+        let dir = tempdir().unwrap();
+        let id = MakimaId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let publication = File::options().read(true).write(true).open(&path).unwrap();
+        publication.lock_exclusive().unwrap();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || released_tx.send(lease.release()).unwrap());
+        assert!(
+            released_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        publication.unlock().unwrap();
+        released_rx.recv().unwrap().unwrap();
+        assert!(claim(dir.path(), &id).unwrap().is_some());
     }
 
     #[test]
