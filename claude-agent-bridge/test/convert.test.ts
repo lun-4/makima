@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk"
-import { catchUp, continuation, StepTranslator } from "../src/convert.ts"
+import type { SDKControlGetUsageResponse, SDKMessage } from "@anthropic-ai/claude-agent-sdk"
+import { catchUp, continuation, planUsage, StepTranslator } from "../src/convert.ts"
 import { unseen } from "../src/conversations.ts"
 import { BridgeError } from "../src/protocol.ts"
 import type { Block } from "../src/protocol.ts"
@@ -198,4 +198,37 @@ test("clearing answers every waiting handler as cancelled", async () => {
   const waiting = pending.call(`${PREFIX}read`)
   pending.clear()
   assert.deepEqual(await waiting, { isError: true, content: [{ type: "text", text: CANCELLED_TEXT }] })
+})
+
+function usageAnswer(extra: object): SDKControlGetUsageResponse {
+  return { subscription_type: "pro", rate_limits_available: true, rate_limits: null, ...extra } as unknown as SDKControlGetUsageResponse
+}
+
+test("plan usage keeps the known windows and drops the rest", () => {
+  const usage = planUsage(
+    usageAnswer({
+      rate_limits: {
+        five_hour: { utilization: 24, resets_at: "2026-11-15T20:19:59Z", limit_dollars: null },
+        seven_day: { utilization: 31, resets_at: null },
+        seven_day_opus: null,
+        tangelo: { utilization: 99, resets_at: null },
+        model_scoped: [{ display_name: "Fable", utilization: 5, resets_at: "2026-11-20T03:00:00Z" }],
+        extra_usage: { is_enabled: true, utilization: 12, used_credits: 25384, decimal_places: 2, currency: "BRL", daily: null },
+      },
+    }),
+  )
+  assert.deepEqual(JSON.parse(JSON.stringify(usage)), {
+    plan: "pro",
+    available: true,
+    rate_limits: {
+      five_hour: { utilization: 24, resets_at: "2026-11-15T20:19:59Z" },
+      seven_day: { utilization: 31 },
+      model_scoped: [{ display_name: "Fable", utilization: 5, resets_at: "2026-11-20T03:00:00Z" }],
+      extra_usage: { is_enabled: true, utilization: 12, used_credits: 25384, decimal_places: 2, currency: "BRL" },
+    },
+  })
+})
+
+test("plan usage is unavailable where plan limits do not apply", () => {
+  assert.deepEqual(planUsage(usageAnswer({ subscription_type: null, rate_limits_available: false })), { plan: undefined, available: false })
 })

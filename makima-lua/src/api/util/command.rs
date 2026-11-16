@@ -488,6 +488,8 @@ pub struct ProviderUsageLimit {
     pub reset_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_shortname_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
