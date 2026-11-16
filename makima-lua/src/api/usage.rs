@@ -9,6 +9,7 @@ use crate::api::util::command::{ProviderUsageSnapshot, UiAction, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::dispatch::call_isolated;
 use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::runtime::TaskScope;
 
 const CALLBACK_SEAM: &str = "makima.usage.on_change";
 
@@ -56,6 +57,9 @@ pub(crate) fn publish(lua: &Lua, snapshot: ProviderUsageSnapshot) {
             return;
         }
     };
+    // Publications arrive between tasks, where the last task's finished
+    // handle is still ambient and would make every callback look expired.
+    let _delivery = TaskScope::delivery(lua);
     for (plugin, callback) in callbacks {
         call_isolated::<()>(lua, &callback, value.clone(), CALLBACK_SEAM, &plugin);
     }
@@ -155,8 +159,11 @@ lua_table! {
 mod tests {
     use serde_json::json;
 
+    use makima_agent::cancel::CancelToken;
+
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, ProviderUsageLimit, ProviderUsageWindow};
+    use crate::runtime::{TaskCell, TaskScope};
 
     fn snapshot() -> ProviderUsageSnapshot {
         ProviderUsageSnapshot {
@@ -235,6 +242,21 @@ mod tests {
         let value: Table = lua.load("return usage.get()").eval().unwrap();
         assert_eq!(value.get::<String>("provider_id").unwrap(), "anthropic");
         assert_eq!(value.get::<String>("status").unwrap(), "ready");
+    }
+
+    #[test]
+    fn publish_reaches_callbacks_under_a_finished_task() {
+        let lua = lua_with_usage(None, "test");
+        lua.load("seen = false; usage.on_change(function() seen = true end)")
+            .exec()
+            .unwrap();
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        let _finished = TaskScope::new(&lua, TaskCell::new(cancel, None, None));
+
+        publish(&lua, snapshot());
+
+        assert!(lua.globals().get::<bool>("seen").unwrap());
     }
 
     #[test]
