@@ -252,7 +252,7 @@ t.case("parse_usage_lists_plan_windows_then_model_windows_then_credits", functio
     limits = {
       { kind = { Hours = 5 }, percentage = 24, reset_at = RESET_MS },
       { kind = { Weekly = {} }, percentage = 31, reset_at = WEEK_RESET_MS },
-      { kind = { Weekly = { model = "Fable" } }, percentage = 5, reset_at = WEEK_RESET_MS },
+      { kind = { Weekly = { model = "Fable" } }, percentage = 5, reset_at = WEEK_RESET_MS, ui_shortname_hint = "f" },
       { kind = "Credits", percentage = 12, detail = "253.84 BRL spent" },
     },
   })

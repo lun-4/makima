@@ -169,6 +169,7 @@ mod tests {
                 percentage: Some(42),
                 reset_at_ms: None,
                 detail: None,
+                ui_shortname_hint: None,
             }],
             plan: Some("pro".into()),
             error: None,

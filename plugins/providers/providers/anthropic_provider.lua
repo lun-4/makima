@@ -214,12 +214,24 @@ local function credits(body)
   return { kind = "Credits", percentage = percentage, detail = detail or nil }
 end
 
+-- A weekly window scoped to a model reads as the model's initial in compact
+-- views (`ws` for Sonnet, `wf` for Fable).
+local function limit_row(kind, percentage, resets_at)
+  local model = object(kind.Weekly) and kind.Weekly.model
+  return {
+    kind = kind,
+    percentage = percentage,
+    reset_at = clock.parse_rfc3339(resets_at),
+    ui_shortname_hint = type(model) == "string" and model:match("^%a") and model:sub(1, 1):lower() or nil,
+  }
+end
+
 -- A usage window `{ utilization, resets_at }` as a limit of {kind}, or nil
 -- when it has no utilization.
 function M.window_limit(kind, usage)
   usage = object(usage)
   local percentage = usage and percent(usage.utilization)
-  return percentage and { kind = kind, percentage = percentage, reset_at = clock.parse_rfc3339(usage.resets_at) } or nil
+  return percentage and limit_row(kind, percentage, usage.resets_at) or nil
 end
 
 -- The OAuth usage response: its `limits` rows, or the older per-window
@@ -229,11 +241,7 @@ function M.parse_usage(body)
   local limits = {}
   for _, limit in ipairs(object(body.limits) or {}) do
     if object(limit) and type(limit.kind) == "string" and percent(limit.percent) then
-      limits[#limits + 1] = {
-        kind = window(limit),
-        percentage = percent(limit.percent),
-        reset_at = clock.parse_rfc3339(limit.resets_at),
-      }
+      limits[#limits + 1] = limit_row(window(limit), percent(limit.percent), limit.resets_at)
     end
   end
   if #limits == 0 then
