@@ -2009,7 +2009,7 @@ impl App {
             return Some(self.handle_picker_key(PickerId::File, key));
         }
 
-        if self.queue.focus().is_some() {
+        if !key::BACKGROUND.matches(key) && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),

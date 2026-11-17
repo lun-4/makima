@@ -4404,6 +4404,76 @@ fn managed_observation_preserves_child_on_timeout_or_drop(drop_wait: bool) {
     });
 }
 
+#[test_case(false; "child_completes")]
+#[test_case(true; "moved_call_stops")]
+fn moved_call_retires_only_its_suspension(stop: bool) {
+    smol::block_on(async {
+        let (manager, _, current, root_gate) = active_root(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        });
+        let child_gate = Gate::new();
+        let (tx, rx) = flume::bounded(1);
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(tx, Some(child_gate.clone())),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let ticket = actor.admit_turn(input(), None, "child".into()).unwrap();
+        let observe = || {
+            current
+                .lease()
+                .observe_descendant(&current, child.id(), &actor, ticket.clone(), None)
+                .unwrap()
+        };
+        let other = observe();
+        let call = crate::CallScope::new(
+            "call".into(),
+            "task_wait".into(),
+            String::new(),
+            None,
+            None,
+            &CancelToken::none(),
+            None,
+        );
+        let mut wait = Box::pin(observe().wait_for_call(&call));
+        rx.recv_async().await.unwrap(); // The child holds the only permit.
+        assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
+        let trigger = call.move_home(crate::MovedBy::User).unwrap();
+        assert!(futures_lite::future::poll_once(&mut wait).await.is_none());
+        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 1);
+        current.lease.inner.cancel_waiters();
+        assert_eq!(
+            other.inner.wait_result().await,
+            Err(super::PromptWaitError::Cancelled)
+        );
+        if stop {
+            trigger.cancel();
+            assert_eq!(
+                futures_lite::future::poll_once(&mut wait).await,
+                Some(Err(super::PromptWaitError::Cancelled))
+            );
+            assert!(ticket.peek().is_none());
+            child_gate.release(1);
+        } else {
+            child_gate.release(1);
+            assert_eq!(wait.await, Ok(ticket.wait().await));
+        }
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
 #[test]
 fn parent_waiting_for_child_yields_permit() {
     smol::block_on(async {

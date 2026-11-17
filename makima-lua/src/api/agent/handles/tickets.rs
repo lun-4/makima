@@ -56,7 +56,10 @@ fn ticket_result(
 /// A wait in the parent's own turn hands the result to its model, which makes
 /// the queued delivery redundant. Plain result reads leave the delivery alone.
 fn withdraw_delivery(active: Option<&CurrentManagedTurn>, turn_id: TurnId) {
-    if let Some(parent) = active.and_then(|active| active.manager().actor(active.agent_id()).ok()) {
+    if let Some(active) = active
+        && !active.tool_call().is_some_and(|call| call.is_moved())
+        && let Ok(parent) = active.manager().actor(active.agent_id())
+    {
         parent.withdraw_child_delivery(turn_id);
     }
 }
@@ -102,7 +105,11 @@ async fn ticket_wait(
             ticket,
             timeout.map(Duration::from_secs)
         ));
-        try_pair!(wait.wait().await.map_err(|error| match error {
+        let outcome = match active.tool_call() {
+            Some(call) => wait.wait_for_call(call).await,
+            None => wait.wait().await,
+        };
+        try_pair!(outcome.map_err(|error| match error {
             PromptWaitError::Timeout => TURN_WAIT_TIMEOUT,
             PromptWaitError::Cancelled => CANCELLED_MSG,
         }));
