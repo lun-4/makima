@@ -20,7 +20,7 @@ M.EMPTY_MODELS_ERROR = "Codex models response listed no visible models; the endp
 M.TIMEOUT_ERROR = "device authorization timed out"
 -- The backend hides models newer than this Codex CLI version, so bump it
 -- when a fresh model is missing from the list.
-M.CODEX_CLIENT_VERSION = "0.153.4"
+M.CODEX_CLIENT_VERSION = "0.169.0"
 -- Offline fallback; the backend's `/models` is the source of truth. Codex
 -- models match by their `-codex` substring, so they are not listed.
 M.PLAN_MODELS = {
