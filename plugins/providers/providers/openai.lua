@@ -99,8 +99,7 @@ end
 
 local GPT_5_6_MAX_OUTPUT = 128000
 local GPT_5_6_WINDOW = 372000
-local GPT_6_WINDOW = 272000
-local GPT_6_2_WINDOW = 1050000
+local GPT_6_WINDOW = 1050000
 local CODEX_MAX_OUTPUT = 128000
 local CODEX_API_WINDOW = 400000
 
@@ -122,7 +121,7 @@ M.def = {
   env = "OPENAI_API_KEY",
   base_url = "https://api.openai.com/v1",
   login_url = "https://platform.openai.com/api-keys",
-  model = "gpt-5.5",
+  model = "gpt-6.2-sol",
   notes = NOTES,
   max_tokens_field = MAX_TOKENS_FIELD,
   include_stream_usage = true,
@@ -134,16 +133,16 @@ M.def = {
     supports_tool_examples = true,
   },
   models = {
+    row("gpt-6.2-sol", "strong", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
+    row("gpt-6.2-astra", "strong", pricing(8.00, 40.00, 10.00, 0.40), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
+    row("gpt-6-luna", "weak", pricing(0.10, 0.50, 0.125, 0.01), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.6-luna", "weak", pricing(1.00, 6.00, 1.25, 0.10), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
+    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.6-terra", "medium", pricing(2.50, 15.00, 3.125, 0.25), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
     row("gpt-5.6-sol", "strong", pricing(5.00, 30.00, 6.25, 0.50), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
-    row("gpt-6.2-astra", "strong", pricing(8.00, 40.00, 10.00, 0.40), GPT_5_6_MAX_OUTPUT, GPT_6_2_WINDOW),
-    row("gpt-6.2-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_2_WINDOW),
-    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, PLAN_WINDOW_500K),
-    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, PLAN_WINDOW_500K),
+    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-astra", "strong", pricing(10.00, 50.00, 12.50, 1.00), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-sol", "medium", pricing(2.00, 10.00, 2.50, 0.20), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
-    row("gpt-6-luna", "weak", pricing(0.10, 0.50, 0.125, 0.01), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.4-nano", "weak", pricing(0.20, 1.25, 0, 0.02), 128000, 400000),
     row("gpt-5.4-mini", "weak", pricing(0.75, 4.50, 0, 0.075), 128000, 400000),
     row("gpt-4.1-nano", "weak", pricing(0.10, 0.40, 0, 0.025), 32768, 1047576),

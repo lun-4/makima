@@ -134,12 +134,12 @@ t.case("curated_models_keep_tier_pricing_and_window", function()
     { "gpt-5.6-terra", "medium", 2.5, 0.25, 3.125, 15.0, 372000 },
     { "gpt-5.6-sol", "strong", 5.0, 0.5, 6.25, 30.0, 372000 },
     { "gpt-6.2-astra", "strong", 8.0, 0.4, 10.0, 40.0, 1050000 },
-    { "gpt-6.2-sol", "medium", 2.0, 0.1, 2.5, 10.0, 1050000 },
-    { "gpt-6.1-sol", "medium", 2.0, 0.1, 2.5, 10.0, 500000 },
-    { "gpt-6.1-terra", "medium", 1.0, 0.05, 1.25, 5.0, 500000 },
-    { "gpt-6-astra", "strong", 10.0, 1.0, 12.5, 50.0, 272000 },
-    { "gpt-6-sol", "medium", 2.0, 0.2, 2.5, 10.0, 272000 },
-    { "gpt-6-luna", "weak", 0.1, 0.01, 0.125, 0.5, 272000 },
+    { "gpt-6.2-sol", "strong", 2.0, 0.1, 2.5, 10.0, 1050000 },
+    { "gpt-6-luna", "weak", 0.1, 0.01, 0.125, 0.5, 1050000 },
+    { "gpt-6.1-sol", "medium", 2.0, 0.1, 2.5, 10.0, 1050000 },
+    { "gpt-6.1-terra", "medium", 1.0, 0.05, 1.25, 5.0, 1050000 },
+    { "gpt-6-astra", "strong", 10.0, 1.0, 12.5, 50.0, 1050000 },
+    { "gpt-6-sol", "medium", 2.0, 0.2, 2.5, 10.0, 1050000 },
   }) do
     local model = assert(by_id[case[1]], case[1])
     t.eq(model.tier, case[2], case[1])
@@ -150,7 +150,8 @@ t.case("curated_models_keep_tier_pricing_and_window", function()
   for _, model in ipairs(spec.models) do
     defaults[model.tier] = defaults[model.tier] or model.id
   end
-  t.same(defaults, { weak = "gpt-5.6-luna", medium = "gpt-5.6-terra", strong = "gpt-5.6-sol" })
+  t.same(defaults, { weak = "gpt-6-luna", medium = "gpt-6.1-terra", strong = "gpt-6.2-sol" })
+  t.eq(openai.def.model, "gpt-6.2-sol")
 end)
 
 t.case("plan_window_matches_plan_models", function()
