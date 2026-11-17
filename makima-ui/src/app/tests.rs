@@ -14148,14 +14148,38 @@ fn plan_ready_fires_once_per_draft() {
     assert!(app.state.plan.is_ready());
 }
 
-#[test]
-fn ctrl_b_asks_the_session_to_move_the_running_call() {
-    let mut app = test_app();
+#[test_case(Some(1) ; "focused_queue")]
+#[test_case(None ; "unfocused_queue")]
+fn ctrl_b_backgrounds_the_running_call_without_changing_the_queue(focus: Option<usize>) {
+    let mut app = app_with_queued_message();
+    app.update(agent_msg(tool_start("call", "bash")));
+    app.queue_and_notify(queued_msg("second"));
+    if let Some(index) = focus {
+        app.queue.set_focus_at(index);
+    }
+
     let actions = app.update(Msg::Key(kb::BACKGROUND.to_key_event()));
+
     assert!(matches!(
         actions.as_slice(),
-        [Action::MoveToBackground { .. }]
+        [Action::MoveToBackground { agent }] if *agent == app.selected_agent_id()
     ));
+    assert_eq!(app.queue.text_messages(), ["queued", "second"]);
+    assert_eq!(app.queue.focus(), focus);
+}
+
+#[test]
+fn focused_queue_ctrl_b_respects_override_and_picker_precedence() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+    let key = kb::BACKGROUND.to_key_event();
+    let _probe = install_override(&mut app, key.code, key.modifiers);
+
+    let actions = app.update(Msg::Key(key));
+    assert!(matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]));
+
+    app.open_tasks();
+    assert!(app.update(Msg::Key(key)).is_empty());
 }
 
 #[test]

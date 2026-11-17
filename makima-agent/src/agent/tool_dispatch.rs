@@ -1193,12 +1193,15 @@ pub(super) async fn process_tool_calls(
         if let Some(mailbox) = &mailbox {
             mailbox.register_call(Arc::clone(&scope));
         }
-        let tool_ctx = ToolContext {
+        let mut tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             call: Some(Arc::clone(&scope)),
             cancel: scope.cancel().clone(),
             ..ctx.clone()
         };
+        if let Some(turn) = &mut tool_ctx.managed_turn {
+            turn.tool_call = Some(Arc::clone(&scope));
+        }
         let guard = CallGuard::new(Arc::clone(&scope));
         let event_tx_clone = ctx.event_tx.clone();
         let result_tx_clone = result_tx.clone();
