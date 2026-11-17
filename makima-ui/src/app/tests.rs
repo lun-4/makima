@@ -11045,6 +11045,13 @@ fn completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
     (tmp, app, backend)
 }
 
+fn streaming_completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
+    let (tmp, mut app, backend) = completion_app();
+    app.status = Status::Streaming;
+    assert!(app.focused_streaming());
+    (tmp, app, backend)
+}
+
 fn write_completion_fixture(cwd: &Path, rel: &str, content: &str) {
     let path = cwd.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -11091,6 +11098,24 @@ fn typing_at_opens_popup() {
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(app.file_completion.is_active());
     assert_eq!(app.input_box.buffer.value(), "@");
+}
+
+#[test]
+fn at_completion_works_while_streaming() {
+    let (_tmp, mut app, backend) = streaming_completion_app();
+    seed_skill(&backend, "review");
+    for c in "@skill:rev".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+    assert!(app.file_completion.is_active());
+    assert!(
+        rendered_rows(&mut app, 80, 24)
+            .iter()
+            .any(|row| row.contains("skill:review"))
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "@skill:review");
 }
 
 #[test]
