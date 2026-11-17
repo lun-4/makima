@@ -24,6 +24,8 @@ M.CODEX_CLIENT_VERSION = "0.153.4"
 -- Offline fallback; the backend's `/models` is the source of truth. Codex
 -- models match by their `-codex` substring, so they are not listed.
 M.PLAN_MODELS = {
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
   "gpt-6.1-sol",
   "gpt-6.1-terra",
   "gpt-6-astra",
@@ -56,9 +58,9 @@ local IMAGE = "image"
 local CODEX_MARKER = "-codex"
 local CODEX_WINDOW = 272000
 local GPT_5_6_PLAN_WINDOW = 372000
--- GPT-6.1's default context on Codex went up to 500k (max 1M).
-local GPT_6_1_PLAN_WINDOW = 500000
-local GPT_6_1_PREFIXES = { "gpt-6.1-sol", "gpt-6.1-terra" }
+-- GPT-6.1 and GPT-6.2 Sol default to 500k in Codex (max 1M).
+local PLAN_WINDOW_500K = 500000
+local PLAN_WINDOW_500K_PREFIXES = { "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-sol" }
 local GPT_5_6_PREFIX = "gpt-5.6-"
 local DEFAULT_INTERVAL = 5
 local POLL_MARGIN = 3
@@ -98,6 +100,7 @@ end
 local GPT_5_6_MAX_OUTPUT = 128000
 local GPT_5_6_WINDOW = 372000
 local GPT_6_WINDOW = 272000
+local GPT_6_2_WINDOW = 1050000
 local CODEX_MAX_OUTPUT = 128000
 local CODEX_API_WINDOW = 400000
 
@@ -134,8 +137,10 @@ M.def = {
     row("gpt-5.6-luna", "weak", pricing(1.00, 6.00, 1.25, 0.10), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
     row("gpt-5.6-terra", "medium", pricing(2.50, 15.00, 3.125, 0.25), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
     row("gpt-5.6-sol", "strong", pricing(5.00, 30.00, 6.25, 0.50), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
-    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_1_PLAN_WINDOW),
-    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, GPT_6_1_PLAN_WINDOW),
+    row("gpt-6.2-astra", "strong", pricing(8.00, 40.00, 10.00, 0.40), GPT_5_6_MAX_OUTPUT, GPT_6_2_WINDOW),
+    row("gpt-6.2-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_2_WINDOW),
+    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, PLAN_WINDOW_500K),
+    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, PLAN_WINDOW_500K),
     row("gpt-6-astra", "strong", pricing(10.00, 50.00, 12.50, 1.00), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-sol", "medium", pricing(2.00, 10.00, 2.50, 0.20), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-luna", "weak", pricing(0.10, 0.50, 0.125, 0.01), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
@@ -177,15 +182,21 @@ end
 -- without an edit; named plan models match exactly so `gpt-5.6-terra-preview`
 -- does not.
 function M.plan_window(id)
-  local gpt_6_1 = starts_with(id, GPT_6_1_PREFIXES[1]) or starts_with(id, GPT_6_1_PREFIXES[2])
+  local wide
+  for _, prefix in ipairs(PLAN_WINDOW_500K_PREFIXES) do
+    if starts_with(id, prefix) then
+      wide = PLAN_WINDOW_500K
+      break
+    end
+  end
   if id:find(CODEX_MARKER, 1, true) then
-    return gpt_6_1 and GPT_6_1_PLAN_WINDOW or CODEX_WINDOW
+    return wide or CODEX_WINDOW
   end
   if not table.find(M.PLAN_MODELS, id) then
     return nil
   end
-  if gpt_6_1 then
-    return GPT_6_1_PLAN_WINDOW
+  if wide then
+    return wide
   elseif starts_with(id, GPT_5_6_PREFIX) then
     return GPT_5_6_PLAN_WINDOW
   end

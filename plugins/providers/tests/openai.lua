@@ -133,6 +133,8 @@ t.case("curated_models_keep_tier_pricing_and_window", function()
     { "gpt-5.6-luna", "weak", 1.0, 0.1, 1.25, 6.0, 372000 },
     { "gpt-5.6-terra", "medium", 2.5, 0.25, 3.125, 15.0, 372000 },
     { "gpt-5.6-sol", "strong", 5.0, 0.5, 6.25, 30.0, 372000 },
+    { "gpt-6.2-astra", "strong", 8.0, 0.4, 10.0, 40.0, 1050000 },
+    { "gpt-6.2-sol", "medium", 2.0, 0.1, 2.5, 10.0, 1050000 },
     { "gpt-6.1-sol", "medium", 2.0, 0.1, 2.5, 10.0, 500000 },
     { "gpt-6.1-terra", "medium", 1.0, 0.05, 1.25, 5.0, 500000 },
     { "gpt-6-astra", "strong", 10.0, 1.0, 12.5, 50.0, 272000 },
@@ -155,6 +157,9 @@ t.case("plan_window_matches_plan_models", function()
   for id, expected in pairs({
     ["gpt-5.6-luna"] = 372000,
     ["gpt-5.6-sol"] = 372000,
+    ["gpt-6.2-astra"] = 272000,
+    ["gpt-6.2-sol"] = 500000,
+    ["gpt-6.2-sol-codex"] = 500000,
     ["gpt-6.1-sol"] = 500000,
     ["gpt-6.1-terra"] = 500000,
     ["gpt-6.1-terra-codex"] = 500000,
@@ -167,7 +172,7 @@ t.case("plan_window_matches_plan_models", function()
   }) do
     t.eq(openai.plan_window(id), expected, id)
   end
-  for _, id in ipairs({ "gpt-6.1-terra-preview", "gpt-5.6-terra-preview", "gpt-5.4-nano" }) do
+  for _, id in ipairs({ "gpt-6.2-sol-preview", "gpt-6.1-terra-preview", "gpt-5.6-terra-preview", "gpt-5.4-nano" }) do
     t.eq(openai.plan_window(id), nil, id)
   end
 end)
@@ -328,6 +333,11 @@ t.case("api_key_plan_models_use_responses_at_the_platform_api", function()
     { base_url = PROXY }
   )
   t.eq(ctx.requests[1].url, PROXY .. "/responses")
+end)
+
+t.case("api_key_gpt_6_2_uses_responses_for_tool_calling", function()
+  local ctx = stream({ [KEY_ENV] = "sk-1" }, { id = "gpt-6.2-sol" }, nil, { responses_sse("ok") })
+  t.eq(ctx.requests[1].url, API .. "/responses")
 end)
 
 t.case("chatgpt_login_uses_the_fixed_backend_and_account_header", function()

@@ -105,6 +105,7 @@ You need `AWS_REGION` and one of these for auth:
 | weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
+| medium | gpt-6.2-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
 | medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
 | medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
@@ -113,6 +114,7 @@ You need `AWS_REGION` and one of these for auth:
 | medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
 | strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| strong | gpt-6.2-astra | $8.00 / $40.00 | 1050K ctx / 128K out |
 | strong | gpt-6-astra | $10.00 / $50.00 | 272K ctx / 128K out |
 | strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
