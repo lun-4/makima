@@ -79,7 +79,7 @@ All of this exists on the #44 branch.
 - **`retry`** on the error table (`rate_limit`, `transient`, `connect`, `timeout`, `none`). An error without it is not retried. See [retry classes](.agents/makima-plans/44-providers-lua.md#retry-classes).
 - **Conversation end.** The optional instance method `end_conversation(ctx, conversation_id, reason)`, with `cancelled`, `closed`, `compacted` or `rewound`. The host calls it detached after every stream for that id is dropped, including when a turn is cancelled while Makima waits on a tool after a tool-use response.
 - **Transport.** `ctx.send` is `makima.net.send` with the `[provider]` timeouts as defaults. It takes `unix_socket`, has no byte cap on streamed bodies, no private-address guard and follows no redirects. The shared `sse` module in `plugins/providers/providers/` parses the step stream.
-- **Process.** `makima.fn.jobstart` can start the bridge, as executable providers start their scripts.
+- **Process.** `makima.fn.jobstart` can start the bridge, as the managed bridge will do on first use once the protocol is stable.
 
 ## Conversation identity and lineage
 

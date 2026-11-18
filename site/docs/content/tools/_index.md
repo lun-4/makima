@@ -178,6 +178,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
+| `model` | string | no | Exact model spec, e.g. "ollama/glm-5.2". You tell makima the model; makima will not guess. Overrides model_tier. |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | object | no | JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
@@ -240,7 +241,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill` {#skill}
 
-Load a skill that provides instructions and workflows for specific tasks.
+Load a skill that provides instructions and workflows for specific tasks. When the user message names a skill, load it with this tool, even if it is not in the list below.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

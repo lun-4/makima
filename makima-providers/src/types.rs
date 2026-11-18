@@ -650,6 +650,11 @@ pub struct UsageLimit {
     /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// A short suffix for compact views, appended to the window's short
+    /// label (`w` + `f` reads `wf`). Tells apart limits of the same kind;
+    /// keeping hints from clashing is the provider's job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_shortname_hint: Option<String>,
 }
 
 #[cfg(test)]

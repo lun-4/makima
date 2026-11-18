@@ -634,7 +634,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         cwd,
         model,
         explicit_model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -649,9 +649,6 @@ pub fn run(params: SdkParams) -> Result<()> {
         lua_handle,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
     let explicit_permission_mode = cli.permission_mode.is_some();
     let permission_mode = PermissionMode::resolve(
         cli.permission_mode.as_deref(),

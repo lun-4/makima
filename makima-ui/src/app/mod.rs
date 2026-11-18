@@ -2009,7 +2009,7 @@ impl App {
             return Some(self.handle_picker_key(PickerId::File, key));
         }
 
-        if self.queue.focus().is_some() {
+        if !key::BACKGROUND.matches(key) && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -2317,9 +2317,6 @@ impl App {
             return vec![];
         }
 
-        if self.focused_streaming() {
-            self.file_completion.close();
-        }
         if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
             let action = self.input_box.handle_key(key);
             return self.handle_input_action(action);
@@ -2525,7 +2522,7 @@ impl App {
     fn sync_file_completion(&mut self) {
         let cwd = self.focused_cwd().to_string_lossy().into_owned();
         self.command_palette.set_cwd(Arc::from(cwd.as_str()));
-        if self.focused_streaming() || self.typed_path_completion_context().is_some() {
+        if self.typed_path_completion_context().is_some() {
             self.file_completion.close();
             return;
         }
@@ -2769,6 +2766,11 @@ impl App {
         }
         // A moved call reports after the turn that took its receipt is gone,
         // so these skip the run filter like posts do.
+        if matches!(&envelope.event, AgentEvent::ToolMoved { .. })
+            && let Some(root) = &self.root_agent
+        {
+            makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+        }
         match &envelope.event {
             AgentEvent::ToolMoved { id, tool, summary } => {
                 let chat_idx = envelope
@@ -2869,6 +2871,9 @@ impl App {
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                if let Some(root) = &self.root_agent {
+                    makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+                }
                 self.finish_child_plan_approval(subagent.agent_id);
                 if self.plan_picker_edits(Some(subagent.agent_id))
                     || self
@@ -2900,6 +2905,9 @@ impl App {
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
             (&envelope.subagent, &envelope.event)
         {
+            if let Some(root) = &self.root_agent {
+                makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+            }
             let agent_id = subagent.agent_id;
             let turn_id = match outcome {
                 makima_agent::TurnOutcome::Completed { turn_id, .. }

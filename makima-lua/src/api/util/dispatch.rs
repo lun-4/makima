@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
@@ -31,38 +31,42 @@ pub(crate) struct DepthStore {
 pub(crate) struct DepthExceeded;
 
 /// Reentrancy bound as RAII: `Drop` is the only decrement, so an error
-/// path can never leave the depth stuck high.
+/// path can never leave the depth stuck high. It counts in an `Arc<Mutex>`
+/// rather than the VM's app data, because a guard can be dropped inside a
+/// Luau GC sweep, where any `Lua` call aborts.
 pub(crate) struct DepthGuard {
-    lua: Lua,
+    store: Arc<Mutex<DepthStore>>,
     key: (&'static str, String, u64),
 }
 
 impl DepthGuard {
     pub(crate) fn enter(lua: &Lua, kind: &'static str, name: &str) -> Result<Self, DepthExceeded> {
-        if lua.app_data_ref::<DepthStore>().is_none() {
-            lua.set_app_data(DepthStore::default());
-        }
+        let store = depth_store(lua);
         let key = (kind, name.to_owned(), current_task(lua));
-        let mut store = lua
-            .app_data_mut::<DepthStore>()
-            .expect("DepthStore just ensured");
-        let depth = store.depths.entry(key.clone()).or_insert(0);
+        let mut depths = store.lock().unwrap_or_else(|error| error.into_inner());
+        let depth = depths.depths.entry(key.clone()).or_insert(0);
         if *depth >= MAX_HOOK_DEPTH {
             return Err(DepthExceeded);
         }
         *depth += 1;
-        Ok(Self {
-            lua: lua.clone(),
-            key,
-        })
+        drop(depths);
+        Ok(Self { store, key })
     }
+}
+
+fn depth_store(lua: &Lua) -> Arc<Mutex<DepthStore>> {
+    if let Some(store) = lua.app_data_ref::<Arc<Mutex<DepthStore>>>() {
+        return Arc::clone(&store);
+    }
+    let store = Arc::new(Mutex::new(DepthStore::default()));
+    lua.set_app_data(Arc::clone(&store));
+    store
 }
 
 impl Drop for DepthGuard {
     fn drop(&mut self) {
-        if let Some(mut store) = self.lua.app_data_mut::<DepthStore>()
-            && let Some(depth) = store.depths.get_mut(&self.key)
-        {
+        let mut store = self.store.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(depth) = store.depths.get_mut(&self.key) {
             *depth -= 1;
             if *depth == 0 {
                 store.depths.remove(&self.key);
@@ -144,7 +148,8 @@ mod tests {
         assert!(DepthGuard::enter(&lua, "test", "other").is_ok());
         drop(guards);
         assert!(DepthGuard::enter(&lua, "test", SEAM).is_ok());
-        let store = lua.app_data_ref::<DepthStore>().unwrap();
+        let store = depth_store(&lua);
+        let store = store.lock().unwrap_or_else(|error| error.into_inner());
         assert!(store.depths.is_empty(), "zero entries removed");
     }
 

@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use makima_agent::{
     ActorEvent, ActorWorkIdentity, AgentEvent, AgentId, AgentManagerHandle, AgentRef,
-    CompactionStatus, DoneReason, Envelope, TurnOutcome,
+    CompactionStatus, DoneReason, Envelope, TurnId, TurnOutcome,
 };
 use serde_json::{Value, json};
 
@@ -27,21 +27,20 @@ pub const CONFIG_CHANGED_EVENT: &str = "ConfigChanged";
 pub const COMPACTION_DONE_EVENT: &str = "CompactionDone";
 pub const SESSION_CWD_CHANGED_EVENT: &str = "SessionCwdChanged";
 
-/// How long a started call stays remembered. A call moved to the background
-/// reports `BackgroundDone` instead of `ToolDone`, so its entry is never read
-/// back; this is what keeps those from piling up over a long session.
-const TOOL_CALL_RETENTION: Duration = Duration::from_secs(60 * 60);
-
 /// Fires the autocmd for one envelope a frontend read from {root}'s graph.
 pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {
-    let Some((event, data)) = envelope_autocmd(&envelope.event, handle.tool_calls()) else {
-        return;
-    };
     let agent = match &envelope.subagent {
         Some(subagent) => root.manager().reference(subagent.agent_id),
         None => root.clone(),
     };
-    handle.fire_agent_autocmd(event, agent, data);
+    if let Some((event, data)) = envelope_autocmd(
+        &envelope.event,
+        agent.id(),
+        envelope.identity.and_then(|identity| identity.turn_id()),
+        handle.tool_calls(),
+    ) {
+        handle.fire_agent_autocmd(event, agent, data);
+    }
 }
 
 /// What `ToolDone` cannot carry itself: the input a call ran with and when the
@@ -49,32 +48,48 @@ pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {
 /// holds them until the matching `ToolDone` reads them back. A call that never
 /// reports done has neither.
 #[derive(Clone, Default)]
-pub struct ToolCalls(Arc<Mutex<HashMap<String, StartedCall>>>);
+pub struct ToolCalls(Arc<Mutex<HashMap<(AgentId, String), StartedCall>>>);
 
 struct StartedCall {
     input: Option<Value>,
     started: Instant,
+    turn_id: Option<TurnId>,
 }
 
 impl ToolCalls {
-    fn start(&self, id: &str, input: Option<Value>) {
-        let mut calls = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
-        calls.retain(|_, call| now.duration_since(call.started) < TOOL_CALL_RETENTION);
-        calls.insert(
-            id.to_owned(),
-            StartedCall {
-                input,
-                started: now,
-            },
-        );
-    }
-
-    fn finish(&self, id: &str) -> Option<StartedCall> {
+    fn start(&self, agent: AgentId, id: &str, turn_id: Option<TurnId>, input: Option<Value>) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(id)
+            .insert(
+                (agent, id.to_owned()),
+                StartedCall {
+                    input,
+                    started: Instant::now(),
+                    turn_id,
+                },
+            );
+    }
+
+    fn finish(&self, agent: AgentId, id: &str) -> Option<StartedCall> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(agent, id.to_owned()))
+    }
+
+    fn finish_turn(&self, agent: AgentId, turn_id: TurnId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(call_agent, _), call| *call_agent != agent || call.turn_id != Some(turn_id));
+    }
+
+    fn close_agent(&self, agent: AgentId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(call_agent, _), _| *call_agent != agent);
     }
 }
 
@@ -134,10 +149,15 @@ impl IdleFilter {
     }
 }
 
-fn envelope_autocmd(event: &AgentEvent, tool_calls: &ToolCalls) -> Option<(&'static str, Value)> {
+fn envelope_autocmd(
+    event: &AgentEvent,
+    agent: AgentId,
+    turn_id: Option<TurnId>,
+    tool_calls: &ToolCalls,
+) -> Option<(&'static str, Value)> {
     match event {
         AgentEvent::ToolStart(e) => {
-            tool_calls.start(&e.id, e.raw_input.clone());
+            tool_calls.start(agent, &e.id, turn_id, e.raw_input.clone());
             Some(("ToolStart", json!({ "tool_id": e.id, "tool": e.tool })))
         }
         AgentEvent::ToolDone(e) => {
@@ -147,13 +167,25 @@ fn envelope_autocmd(event: &AgentEvent, tool_calls: &ToolCalls) -> Option<(&'sta
                 "is_error": e.is_error,
                 "bytes": e.output.as_text().len(),
             });
-            if let Some(call) = tool_calls.finish(&e.id) {
+            if let Some(call) = tool_calls.finish(agent, &e.id) {
                 if let Some(input) = call.input {
                     data["input"] = input;
                 }
                 data["duration_ms"] = json!(call.started.elapsed().as_millis() as u64);
             }
             Some(("ToolDone", data))
+        }
+        AgentEvent::ToolMoved { id, .. } => {
+            tool_calls.finish(agent, id);
+            None
+        }
+        AgentEvent::TurnOutcome(outcome) => {
+            tool_calls.finish_turn(agent, outcome.turn_id());
+            None
+        }
+        AgentEvent::SubagentClosed => {
+            tool_calls.close_agent(agent);
+            None
         }
         AgentEvent::AutoCompacting {
             context_size,
@@ -300,8 +332,9 @@ mod tests {
     #[test]
     fn tool_done_carries_the_call_it_started() {
         let calls = ToolCalls::default();
-        envelope_autocmd(&tool_start(), &calls).unwrap();
-        let (event, data) = envelope_autocmd(&tool_done(TOOL_OUTPUT), &calls).unwrap();
+        let agent = AgentId::generate();
+        envelope_autocmd(&tool_start(), agent, None, &calls).unwrap();
+        let (event, data) = envelope_autocmd(&tool_done(TOOL_OUTPUT), agent, None, &calls).unwrap();
         assert_eq!(event, "ToolDone");
         assert_eq!(data["input"]["command"], TOOL_COMMAND);
         assert_eq!(data["bytes"], TOOL_OUTPUT.len());
@@ -311,9 +344,97 @@ mod tests {
 
     #[test]
     fn tool_done_without_a_start_carries_no_call() {
-        let (_, data) = envelope_autocmd(&tool_done(TOOL_OUTPUT), &ToolCalls::default()).unwrap();
+        let (_, data) = envelope_autocmd(
+            &tool_done(TOOL_OUTPUT),
+            AgentId::generate(),
+            None,
+            &ToolCalls::default(),
+        )
+        .unwrap();
         assert!(data.get("input").is_none() && data.get("duration_ms").is_none());
         assert_eq!(data["bytes"], TOOL_OUTPUT.len());
+    }
+
+    #[test]
+    fn calls_with_the_same_id_are_scoped_to_the_agent() {
+        let calls = ToolCalls::default();
+        let first = AgentId::generate();
+        let second = AgentId::generate();
+        let mut other = tool_start();
+        if let AgentEvent::ToolStart(start) = &mut other {
+            start.raw_input = Some(json!({ "command": SUMMARY }));
+        }
+        envelope_autocmd(&tool_start(), first, None, &calls);
+        envelope_autocmd(&other, second, None, &calls);
+        let (_, first_done) =
+            envelope_autocmd(&tool_done(TOOL_OUTPUT), first, None, &calls).unwrap();
+        let (_, second_done) =
+            envelope_autocmd(&tool_done(TOOL_OUTPUT), second, None, &calls).unwrap();
+        assert_eq!(first_done["input"]["command"], TOOL_COMMAND);
+        assert_eq!(second_done["input"]["command"], SUMMARY);
+        assert!(first_done["duration_ms"].is_u64());
+        assert!(second_done["duration_ms"].is_u64());
+    }
+
+    #[test]
+    fn starting_another_call_does_not_expire_a_long_running_call() {
+        let calls = ToolCalls::default();
+        let agent = AgentId::generate();
+        envelope_autocmd(&tool_start(), agent, None, &calls);
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&(agent, TOOL_ID.into()))
+            .unwrap()
+            .started -= std::time::Duration::from_secs(7200);
+        calls.start(agent, SUMMARY, None, None);
+        let (_, done) = envelope_autocmd(&tool_done(TOOL_OUTPUT), agent, None, &calls).unwrap();
+        assert_eq!(done["input"]["command"], TOOL_COMMAND);
+        assert!(done["duration_ms"].as_u64().unwrap() >= 7_200_000);
+    }
+
+    #[test]
+    fn moved_calls_and_finished_turns_are_cleaned_up() {
+        let calls = ToolCalls::default();
+        let agent = AgentId::generate();
+        let other = AgentId::generate();
+        let turn = TurnId::generate();
+        let next_turn = TurnId::generate();
+        calls.start(agent, TOOL_ID, Some(turn), None);
+        calls.start(agent, SUMMARY, Some(next_turn), None);
+        calls.start(other, TOOL_ID, Some(turn), None);
+        envelope_autocmd(
+            &AgentEvent::ToolMoved {
+                id: TOOL_ID.into(),
+                tool: "bash".into(),
+                summary: String::new(),
+            },
+            agent,
+            Some(turn),
+            &calls,
+        );
+        assert!(calls.finish(agent, TOOL_ID).is_none());
+        calls.start(agent, TOOL_ID, Some(turn), None);
+        let ActorEvent::End(mut result) = completed_turn(DoneReason::EndTurn) else {
+            unreachable!();
+        };
+        if let TurnOutcome::Completed {
+            agent_id, turn_id, ..
+        } = &mut result.outcome
+        {
+            *agent_id = agent;
+            *turn_id = turn;
+        }
+        envelope_autocmd(
+            &AgentEvent::TurnOutcome(result.outcome),
+            agent,
+            Some(turn),
+            &calls,
+        );
+        assert!(calls.finish(agent, TOOL_ID).is_none());
+        assert!(calls.finish(agent, SUMMARY).is_some());
+        assert!(calls.finish(other, TOOL_ID).is_some());
     }
 
     #[test]
@@ -324,7 +445,8 @@ mod tests {
             context_window: 200_000,
             summary: SUMMARY.into(),
         };
-        let (name, data) = envelope_autocmd(&event, &ToolCalls::default()).unwrap();
+        let (name, data) =
+            envelope_autocmd(&event, AgentId::generate(), None, &ToolCalls::default()).unwrap();
         assert_eq!(name, COMPACTION_DONE_EVENT);
         assert_eq!(data["summary"], SUMMARY);
         assert_eq!(data["context_size_after"], 30_000);

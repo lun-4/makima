@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use crate::actor::{ActorCloseCut, ActorIdleGuard, ManagedTurnAdmission};
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
-    SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
+    ReasonedCancelTrigger, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -881,7 +881,6 @@ impl AgentManagerHandle {
             watcher_id,
             result: Mutex::new(None),
             completed: Event::new(),
-            cancel: Mutex::new(Some(cancel)),
         });
         let watcher_wait = Arc::clone(&wait);
         let suspension = PermitSuspensionGuard {
@@ -933,6 +932,7 @@ impl AgentManagerHandle {
         Ok(ManagedPromptWait {
             inner: wait,
             ticket: result_ticket,
+            _cancel: cancel,
         })
     }
 
@@ -1850,7 +1850,7 @@ struct LeaseState {
     suspensions_sealed: bool,
     closing: bool,
     wake: Option<std::task::Waker>,
-    watcher_cancels: HashMap<u64, Option<crate::cancel::ReasonedCancelTrigger>>,
+    watcher_cancels: HashMap<u64, Option<ReasonedCancelTrigger>>,
 }
 
 pub(crate) struct LeaseInner {
@@ -1862,11 +1862,7 @@ pub(crate) struct LeaseInner {
 }
 
 impl LeaseInner {
-    fn suspend(
-        &self,
-        watcher_id: u64,
-        cancel: crate::cancel::ReasonedCancelTrigger,
-    ) -> Result<(), ManagerError> {
+    fn suspend(&self, watcher_id: u64, cancel: ReasonedCancelTrigger) -> Result<(), ManagerError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.closing || state.suspensions_sealed {
             return Err(ManagerError::InactiveTurn {
@@ -1886,17 +1882,16 @@ impl LeaseInner {
         Ok(())
     }
 
-    fn retire(&self, watcher_id: u64) {
+    fn retire(&self, watcher_id: u64) -> Option<ReasonedCancelTrigger> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.watcher_cancels.remove(&watcher_id).is_none() {
-            return;
-        }
+        let cancel = state.watcher_cancels.remove(&watcher_id)?;
         state.suspensions -= 1;
         if state.suspensions == 0
             && let Some(wake) = state.wake.take()
         {
             wake.wake();
         }
+        cancel
     }
 
     fn cancel_waiters(&self) {
@@ -1952,7 +1947,6 @@ pub(crate) struct PromptWaitInner {
     watcher_id: u64,
     result: Mutex<Option<Result<crate::TurnOutcome, PromptWaitError>>>,
     completed: Event,
-    cancel: Mutex<Option<crate::cancel::ReasonedCancelTrigger>>,
 }
 
 impl PromptWaitInner {
@@ -1965,13 +1959,6 @@ impl PromptWaitInner {
             *slot = Some(result);
             self.completed.notify(usize::MAX);
         }
-    }
-
-    fn cancel(&self) {
-        self.cancel
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
     }
 
     async fn wait_result(&self) -> Result<crate::TurnOutcome, PromptWaitError> {
@@ -2277,6 +2264,7 @@ pub(crate) async fn enter_managed_turn(
     });
     let current = CurrentManagedTurn {
         token,
+        tool_call: None,
         lease: TurnPermitLease {
             inner: Arc::clone(&lease),
         },

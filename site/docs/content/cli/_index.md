@@ -32,9 +32,12 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--session-id`, `--fork-session` | no | no | yes |
+| `--max-turns` | no | yes | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+
+ACP applies the global flags too, so `makima --allowed-tools read,grep --yolo acp` covers every ACP session. `--max-turns` does not apply there: an ACP server outlives one run. See [ACP](/docs/acp/).
 
 ### Shared flags (detail)
 
@@ -61,7 +64,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Session id for SDK mode |
 | `--fork-session` | Load a session's history under a new id (SDK) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt entirely |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
@@ -69,7 +72,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names in `--allowed-tools` error out with the list of valid names; `--disallowed-tools` skips them. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
 
 ### Permission modes (SDK)
 
@@ -96,7 +99,7 @@ makima auth status
 
 `login` and the TUI's `/login` run the same flow. You name a provider or pick one from the list, answer the settings it asks for (a plan, a base URL), and choose a login method. Each provider brings its own methods, such as pasting an API key, a device code in the browser for a ChatGPT login, or importing an existing Copilot token. A login alias like `openai-codex` skips the method question. Settings are written to `providers.toml` only after the login works, so a cancelled login leaves nothing behind. Credentials go to `auth/<provider>.json` in the state directory, readable only by you (paths in [Configuration](/docs/configuration/#directory-layout)). The provider's strong default becomes your model.
 
-Pick **Custom provider...** to add an endpoint of your own. An [executable provider](/docs/providers/#executable-providers) with its own login runs that login on your terminal, so it works from `makima auth login` but not from the TUI.
+Pick **Custom provider...** to add an endpoint of your own.
 
 `logout` deletes the saved credentials and the provider's `providers.toml` section.
 
@@ -111,7 +114,7 @@ makima models
 makima models --refresh    # refetch the models.dev catalog
 ```
 
-One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+One spec per line, warnings on stderr. Built-in and custom providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
 
 ### `makima sessions`
 

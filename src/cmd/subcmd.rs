@@ -325,6 +325,7 @@ fn load_effective_config(
         .into_config()
         .context("invalid config")?;
     makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    config.validate()?;
     Ok(config)
 }
 
@@ -362,6 +363,7 @@ pub fn index(
         .context("invalid config")?;
     makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.permissions = load_permissions(&trust.project_config)?;
+    config.validate()?;
 
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
@@ -461,6 +463,7 @@ pub fn prompt(
         .into_config()
         .context("invalid config")?;
     makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
+    config.validate()?;
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 

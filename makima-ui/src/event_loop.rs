@@ -875,6 +875,7 @@ impl PreparedSessionRuntime {
                 return Err(error);
             }
         };
+        handles.publish_history();
         Ok(SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
@@ -950,6 +951,7 @@ impl PreparedSessionRuntime {
                 return Err((error, session_lock));
             }
         };
+        handles.publish_history();
         Ok(SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             config_commits,
@@ -4831,6 +4833,7 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
         percentage: limit.percentage,
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
+        ui_shortname_hint: limit.ui_shortname_hint,
     }
 }
 
@@ -7591,6 +7594,27 @@ end })
     }
 
     #[test]
+    fn preparing_replacement_preserves_active_live_history() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let runtime = harness.runtime(session.clone());
+        let session_id = runtime.id();
+        let active_history = Arc::clone(&runtime.handles.history.load().messages);
+
+        let prepared = harness.ctx().prepare_runtime(session).unwrap();
+        assert!(Arc::ptr_eq(
+            &makima_agent::live_history(session_id).unwrap(),
+            &active_history
+        ));
+        drop(prepared);
+        assert!(Arc::ptr_eq(
+            &makima_agent::live_history(session_id).unwrap(),
+            &active_history
+        ));
+        release_runtime(runtime);
+    }
+
+    #[test]
     fn activation_publishes_target_mailbox_and_runtime_identities() {
         let harness = RuntimeHarness::new();
         let target_count = harness.target_count();
@@ -9785,6 +9809,10 @@ end })
         .unwrap();
         assert_eq!(runtime.id(), id);
         assert_ne!(runtime.generation, generation);
+        assert!(Arc::ptr_eq(
+            &makima_agent::live_history(id).unwrap(),
+            &runtime.handles.history.load().messages
+        ));
         assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
         release_runtime(old);
         release_runtime(runtime);
