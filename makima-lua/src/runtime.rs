@@ -21,7 +21,8 @@ use makima_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use makima_agent::tools::hook::{Authority, Verdict};
 use makima_agent::tools::offload::OutputLimits;
 use makima_agent::tools::{
-    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
+    Deadline, HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry,
+    ToolSource,
 };
 use makima_agent::{
     BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
@@ -230,7 +231,6 @@ pub enum Request {
         generation: u64,
         input: Value,
         ctx: Box<LuaCtx>,
-        deadline: Option<Instant>,
         reply: flume::Sender<ToolCallReply>,
         live: Option<LiveCtx>,
         /// Runs on the caller's slot instead of taking one of its own.
@@ -590,6 +590,7 @@ pub(crate) struct TaskCell {
     kill_at: Cell<Option<Instant>>,
     kill_grace: Duration,
     pub(crate) deadline: Cell<Option<Instant>>,
+    tool_deadline: Deadline,
     pub(crate) deadline_secs: Cell<Option<u64>>,
     /// The model call this task serves, when it is a tool handler.
     pub(crate) call: Option<Arc<makima_agent::CallScope>>,
@@ -682,15 +683,21 @@ impl TaskCell {
             return true;
         }
         let now = Instant::now();
-        self.deadline
-            .get()
+        self.effective_deadline()
             .is_none_or(|deadline| now <= deadline || self.expire_to_background())
+    }
+
+    fn effective_deadline(&self) -> Option<Instant> {
+        match (self.deadline.get(), self.tool_deadline.instant()) {
+            (Some(local), Some(tool)) => Some(local.min(tool)),
+            (local, tool) => local.or(tool),
+        }
     }
 
     /// Hands the call to the mailbox instead of timing it out. The mailbox
     /// owns the trigger from here, so `task_stop` can still end it.
     fn expire_to_background(&self) -> bool {
-        if !self.expire_background || self.deadline.get().is_none() {
+        if !self.expire_background || self.effective_deadline().is_none() {
             return false;
         }
         let Some(call) = &self.call else {
@@ -730,6 +737,7 @@ impl TaskCell {
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
+            tool_deadline: Deadline::default(),
             deadline_secs: Cell::new(None),
             call: None,
             expire_background: false,
@@ -764,7 +772,7 @@ impl TaskCell {
             Some(KillReason::Cancelled)
         } else if self.call.as_ref().is_some_and(|call| call.is_moved()) {
             None
-        } else if self.deadline.get().is_some_and(|d| now > d) {
+        } else if self.effective_deadline().is_some_and(|d| now > d) {
             (!self.expire_to_background()).then_some(KillReason::Deadline)
         } else {
             None
@@ -1826,12 +1834,17 @@ impl InflightGate {
     async fn acquire_before_abandoned(
         self: &Rc<Self>,
         cancel: &CancelToken,
-        deadline: Option<Instant>,
+        deadline: &Deadline,
     ) -> Result<GateGuard, &'static str> {
         let lapsed = async {
-            match deadline {
-                Some(at) => _ = smol::Timer::at(at).await,
-                None => std::future::pending::<()>().await,
+            loop {
+                match deadline.instant() {
+                    Some(at) => _ = smol::Timer::at(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+                if deadline.check().is_err() {
+                    break;
+                }
             }
             HANDLER_TIMEOUT_MSG
         };
@@ -2131,12 +2144,19 @@ async fn until_abandoned<T>(
             // two wakes us instead of leaving us armed on the stale deadline.
             let changed = lock_cell(handle).deadline_changed.listen();
             // Bound before the match: the guard would outlive the await.
-            let deadline = lock_cell(handle).deadline.get();
+            let deadline = lock_cell(handle).effective_deadline();
             match deadline {
                 Some(dl) if dl <= Instant::now() => {
                     let mut cell = lock_cell(handle);
                     if cell.call.as_ref().is_some_and(|call| call.is_moved()) {
                         cell.deadline.set(None);
+                        cell.tool_deadline = Deadline::default();
+                        continue;
+                    }
+                    if cell
+                        .effective_deadline()
+                        .is_none_or(|deadline| deadline > Instant::now())
+                    {
                         continue;
                     }
                     if cell.expire_to_background() {
@@ -4719,7 +4739,6 @@ async fn run_tool_call(
     generation: u64,
     input: Value,
     mut ctx: Box<LuaCtx>,
-    deadline: Option<Instant>,
     live: Option<LiveCtx>,
     live_tasks: LiveTasks,
     warm_tools: WarmTools,
@@ -4761,7 +4780,8 @@ async fn run_tool_call(
     let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
     let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
-    let mut cell = TaskCell::new(cancel.clone(), deadline, live);
+    let mut cell = TaskCell::new(cancel.clone(), None, live);
+    cell.tool_deadline = agent.deadline.clone();
     cell.call = ctx.agent().and_then(|agent| agent.call.clone());
     cell.delegated_tool = Some(ctx.delegated_tool());
     cell.live_sink = live_sink;
@@ -4839,7 +4859,7 @@ async fn run_tool_call(
     // `tool.rs` timeout is the absolute backstop; the dispatch loop
     // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
     let mut reply = call_future.await;
-    reply.deadline = lock_cell(&handle).deadline.get();
+    reply.deadline = lock_cell(&handle).effective_deadline();
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.
@@ -5207,7 +5227,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             generation,
                             input,
                             ctx,
-                            deadline,
                             reply,
                             live,
                             nested,
@@ -5219,11 +5238,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             let shutdown_ref = Arc::clone(&rt.shutdown);
                             let g = Rc::clone(&gate);
                             let cancel = ctx.cancel.clone();
+                            let deadline = ctx.agent().map(|agent| agent.deadline.clone()).unwrap_or_default();
                             ex.spawn(async move {
                                 let slot = if nested {
                                     None
                                 } else {
-                                    match g.acquire_before_abandoned(&cancel, deadline).await {
+                                    match g.acquire_before_abandoned(&cancel, &deadline).await {
                                         Ok(guard) => Some(guard),
                                         Err(msg) => {
                                             let _ = reply.send(ToolCallReply::err(msg));
@@ -5240,7 +5260,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                         generation,
                                         input,
                                         ctx,
-                                        deadline,
                                         live,
                                         live_tasks,
                                         warm_tools,
@@ -6837,6 +6856,30 @@ mod tests {
             )
             .await
             .expect("a finished handler outranks a doom in the same slice");
+        });
+    }
+
+    #[test]
+    fn paused_tool_deadline_keeps_watchdog_and_parked_handler_alive() {
+        const BUDGET: Duration = Duration::from_millis(100);
+        let deadline = Deadline::after(BUDGET);
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.tool_deadline = deadline.clone();
+        let handle = cell.into_handle();
+        let (release, wait) = flume::bounded::<()>(1);
+        smol::block_on(async {
+            let paused = deadline.paused_while(async {
+                smol::Timer::after(BUDGET * 2).await;
+                assert!(lock_cell(&handle).doomed(Instant::now()).is_none());
+                release.send(()).unwrap();
+            });
+            let handler = until_abandoned(async { wait.recv_async().await.unwrap() }, &handle);
+            let (_, result) = futures_lite::future::zip(paused, handler).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                until_abandoned(std::future::pending::<()>(), &handle).await,
+                Err(HANDLER_TIMEOUT_MSG)
+            );
         });
     }
 
