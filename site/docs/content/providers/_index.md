@@ -99,21 +99,23 @@ You need `AWS_REGION` and one of these for auth:
 
 | Tier | Model | Pricing (in/out per 1M tokens) | Limits |
 |------|-------|-------------------------------|--------|
-| weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
-| weak | gpt-6-luna | $0.10 / $0.50 | 272K ctx / 128K out |
+| weak | **gpt-6-luna** (default) | $0.10 / $0.50 | 1050K ctx / 128K out |
+| weak | gpt-5.6-luna | $1.00 / $6.00 | 372K ctx / 128K out |
 | weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
-| medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
-| medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
-| medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
+| medium | **gpt-6.1-terra** (default) | $1.00 / $5.00 | 1050K ctx / 128K out |
+| medium | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
+| medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-| strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
-| strong | gpt-6-astra | $10.00 / $50.00 | 272K ctx / 128K out |
+| strong | **gpt-6.2-sol** (default) | $2.00 / $10.00 | 1050K ctx / 128K out |
+| strong | gpt-6.2-astra | $8.00 / $40.00 | 1050K ctx / 128K out |
+| strong | gpt-5.6-sol | $5.00 / $30.00 | 372K ctx / 128K out |
+| strong | gpt-6-astra | $10.00 / $50.00 | 1050K ctx / 128K out |
 | strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
@@ -387,7 +389,7 @@ Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, el
 | medium | **sonnet** (default) |  | 200K ctx |
 | strong | **opus** (default) |  | 200K ctx |
 
-Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider.
+Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider. With a Claude subscription login, the usage view shows your plan's 5-hour and weekly limits; an API key login has none.
 
 ### Opencode Zen
 
@@ -464,35 +466,9 @@ Model fields: `id` (required), `tier` (`weak`, `medium`, `strong` or `compaction
 
 A section never takes over a built-in provider's id. A section that fails to register is logged and left out, and a file that does not parse stops Makima at startup with exit code 2.
 
-#### Executable providers
-
-An executable file in the config `providers/` directory (`~/.config/makima/providers/` on Linux and macOS, `%APPDATA%\makima\providers\` on Windows) is a provider named after the file. Makima runs it with one subcommand and reads JSON from its output:
-
-| Subcommand | Timeout | What it returns |
-|------------|---------|-----------------|
-| `info` | 5s | `display_name`, `base`, `has_auth` and an optional `system_prefix` |
-| `models` | 5s | An optional list of models |
-| `resolve` | 30s | Auth for each new agent: `headers` and an optional `base_url` |
-| `refresh` | 30s | The same, after the server rejects the credentials |
-| `reload` | 30s | The same, after a login elsewhere |
-| `login` | none | Only with `has_auth`. Runs on your terminal, so use `makima auth login <name>`; `/login` in the TUI cannot |
-| `logout` | 30s | Only with `has_auth`. Runs on `makima auth logout <name>` |
-
-`resolve` runs each time an agent starts, so read tokens from disk instead of caching them, and a login in another process is picked up. `info` and `models` change only with the script, so their output is cached by the file's size and modification time.
-
-`base` names the provider whose protocol the script speaks and whose curated models it inherits: one of `anthropic`, `aperture`, `copilot`, `deepseek`, `google`, `llama-cpp`, `mistral`, `ollama`, `openai`, `opencode`, `openrouter`, `regolo`, `requesty`, `synthetic`, `tensorx`, `zai`. A `models` list replaces them:
-
-```json
-[{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
-```
-
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (default 128K), `max_output_tokens` (default 16K), `pricing` (`{input, output, cache_write, cache_read}` per 1M tokens), and `supports_tool_examples`, `supports_thinking`, `requires_thinking` and `supports_vision`, which default to the base's. A `llama-cpp` based model can also declare `thinking_fields`: the JSON merged into the request body for `off`, `adaptive` and each effort level it accepts.
-
-Script models are `<file name>/<model id>`. The name starts with a letter or digit, continues with letters, digits, `_` and `-`, and cannot take an id that is already registered.
-
 #### Providers from models.dev
 
-Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider, a `providers.toml` section or a script with the same id wins. The login picker lists them under "Providers from Models.dev". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
+Every provider in the [models.dev](https://models.dev) catalog that speaks Chat Completions or Anthropic Messages at a published base URL becomes a provider of its own, under its models.dev id. A built-in provider or a `providers.toml` section with the same id wins. The login picker lists them under "Providers from Models.dev". Each takes its key from the environment variables models.dev names for it, or from `makima auth login <id>`, and shows its models once it has one.
 
 The catalog is cached in the cache directory (`models-dev/`) and fetched again once it is a day old, or by `makima models --refresh`. Startup reads only the cache and never waits on the network, so a provider new to the catalog appears from the next start.
 
@@ -502,7 +478,7 @@ Models are referenced as `provider/model_id`:
 
 ```
 anthropic/claude-sonnet-5
-openai/gpt-5.6-terra
+openai/gpt-6.1-terra
 copilot/gpt-5.6-terra
 ```
 

@@ -66,6 +66,15 @@ case("compact_status_skips_non_ready_and_percentless_lanes", function()
   eq(spans[3][2], "#ee616c")
 end)
 
+case("compact_status_appends_the_provider_shortname_hint", function()
+  local spans = h.status_content(ready({
+    { window = { kind = "weekly" }, percentage = 5 },
+    { window = { kind = "weekly", model = "Fable" }, percentage = 0, ui_shortname_hint = "f" },
+    { window = { kind = "hours", value = 5 }, percentage = 12, ui_shortname_hint = "o" },
+  }))
+  eq(text(spans), "w5% wf0% 5ho12%")
+end)
+
 case("status_gradient_has_exact_low_mid_high_colors", function()
   local spans = h.status_content(ready({
     { window = { kind = "hours", value = 1 }, percentage = 0 },

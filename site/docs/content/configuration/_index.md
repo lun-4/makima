@@ -35,7 +35,7 @@ makima.setup({
     },
     provider = {
         default_model = "anthropic/claude-sonnet-5",
-        allowed_models = { "anthropic/*", "openai/gpt-5.6-terra" },
+        allowed_models = { "anthropic/*", "openai/gpt-6.1-terra" },
         excluded_models = { "*/*-preview" },
     },
 
@@ -279,7 +279,7 @@ makima.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Model-facing `max_output_bytes` cap. |
 | `max_output_lines` | integer | - | - | Model-facing `max_output_lines` cap. |
-| `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
+| `search_result_limit` | integer | `100` | 10 | Max match groups per search in compact mode. A call's `limit` param overrides it. |
 
 ### `plugins.index`
 
@@ -310,7 +310,7 @@ makima.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `allow_model` | boolean | `true` | - | Expose a `model` input that overrides the subagent model. Only disable if you do not trust callers to pick an exact model themselves. |
 
 ### `plugins.webfetch`
 
@@ -345,7 +345,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\makima\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `providers/` (executable providers), and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

@@ -73,6 +73,37 @@ export interface StepResult {
   stop_reason: StopReason
 }
 
+// A claude.ai plan window, as Claude Code reports it: utilization in percent
+// and an RFC 3339 reset time.
+export interface UsageWindow {
+  utilization?: number
+  resets_at?: string
+}
+
+// The fields of Claude Code's plan usage Makima reads. They keep the shape of
+// claude.ai's usage endpoint, which Makima's anthropic provider already parses.
+export interface RateLimits {
+  five_hour?: UsageWindow
+  seven_day?: UsageWindow
+  seven_day_opus?: UsageWindow
+  seven_day_sonnet?: UsageWindow
+  model_scoped?: (UsageWindow & { display_name: string })[]
+  extra_usage?: {
+    is_enabled: boolean
+    utilization?: number
+    used_credits?: number
+    decimal_places?: number
+    currency?: string
+  }
+}
+
+export interface PlanUsage {
+  plan?: string
+  // False where plan limits do not apply: API keys, Bedrock, Vertex.
+  available: boolean
+  rate_limits?: RateLimits
+}
+
 export type Retry = "rate_limit" | "transient" | "connect" | "timeout" | "none"
 
 export type EndReason = "cancelled" | "closed" | "compacted" | "rewound"

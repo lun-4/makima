@@ -444,7 +444,9 @@ impl FsBackend for InMemoryFs {
                 let lines: Vec<&str> = content.split('\n').collect();
                 let mut groups: Vec<GrepMatchGroup> = Vec::new();
                 for (idx, line) in lines.iter().enumerate() {
-                    if line.len() > params.max_line_bytes || !re.is_match(line) {
+                    if (params.max_line_bytes != 0 && line.len() > params.max_line_bytes)
+                        || !re.is_match(line)
+                    {
                         continue;
                     }
                     let mut group_lines: Vec<GrepLine> = Vec::new();
@@ -454,7 +456,7 @@ impl FsBackend for InMemoryFs {
                         .take(idx)
                         .skip(idx.saturating_sub(params.context_before))
                     {
-                        if text.len() <= params.max_line_bytes {
+                        if params.max_line_bytes == 0 || text.len() <= params.max_line_bytes {
                             group_lines.push(GrepLine::context(i + 1, text));
                         }
                     }
@@ -465,7 +467,7 @@ impl FsBackend for InMemoryFs {
                         .skip(idx + 1)
                         .take(params.context_after)
                     {
-                        if text.len() <= params.max_line_bytes {
+                        if params.max_line_bytes == 0 || text.len() <= params.max_line_bytes {
                             group_lines.push(GrepLine::context(i + 1, text));
                         }
                     }
@@ -815,6 +817,29 @@ mod tests {
         params.path = Some("/t".to_string());
         let err = smol::block_on(fs.grep(params)).unwrap_err().to_string();
         assert!(err.starts_with("invalid regex pattern"), "{err}");
+    }
+
+    #[test]
+    fn grep_zero_line_limit_keeps_matches_and_context() {
+        let fs = InMemoryFs::new();
+        fs.seed(
+            Path::new("/t/data.txt"),
+            b"before\nneedle\nafter\n".to_vec(),
+        );
+        let mut params = GrepParams::new("needle".into());
+        params.path = Some(ROOT.into());
+        params.max_line_bytes = 0;
+        params.context_before = 1;
+        params.context_after = 1;
+        let (_, entries) = smol::block_on(fs.grep(params)).unwrap();
+        let lines = &entries[0].groups[0].lines;
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "needle", "after"]
+        );
     }
 
     #[test]

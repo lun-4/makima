@@ -3,8 +3,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use makima_agent::actor::DeliveryStatus;
+use makima_agent::actor::{DeliveryStatus, TurnAdmissionOptions, TurnOrigin, TurnProvenance};
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionCoordinatorParams};
 use makima_agent::template::Vars;
 use makima_agent::tools::{
     DescriptionContext, RequestTools, ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
@@ -12,18 +13,19 @@ use makima_agent::tools::{
 use makima_agent::{
     ActorBackend, ActorEvent, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle,
     AgentMetadata, AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, Envelope,
-    GraphLifecycle, History, RunSettings, ToolOutput, TurnContext, TurnId, TurnOutcome, TurnResult,
-    TurnTicket, WorkKind,
+    GraphLifecycle, History, RunSettings, SessionMailbox, ToolOutput, TurnContext, TurnId,
+    TurnOutcome, TurnResult, TurnTicket, WorkKind,
 };
-use makima_lua::PluginHost;
 use makima_lua::agent_errors::{INVOCATION_EXPIRED, TURN_WAIT_TIMEOUT};
 use makima_lua::test_support::InMemoryFs;
+use makima_lua::{PluginHost, UiAction};
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     AgentError, ContentBlock, Invocation, Message, Model, ObservationSource, ProviderEvent,
     RequestDelivery, RequestOptions, Role, StreamResponse,
 };
-use makima_storage::id::SessionRef;
+use makima_storage::checkpoint::accept_all;
+use makima_storage::id::{MakimaId, SessionRef};
 use serde_json::{Value, json};
 
 mod common;
@@ -52,6 +54,9 @@ const AUTO_DELIVERY_PROBE_TOOL: &str = "auto_delivery_probe";
 const TASK_SPAWN_TOOL: &str = "task_spawn";
 const TASK_SEND_TOOL: &str = "task_send";
 const TASK_WAIT_TOOL: &str = "task_wait";
+const NESTED_WAIT_TOOL: &str = "nested_wait";
+const QUEUED_PROMPT: &str = "What is two plus two?";
+const USER_MOVED_RECEIPT: &str = "The user moved this call to the background.";
 const AUTO_DELIVERY_INTERIM_REPLY: &str = "parent interim reply";
 const COORDINATION_UPDATES: [&str; 3] = ["update: scope", "update: owner", "update: deadline"];
 const LATE_UPDATE: &str = "update: after the fact";
@@ -410,6 +415,47 @@ makima.api.register_tool({
 })
 "#;
 
+const BACKGROUND_WAIT_PRELUDE: &str = r#"
+-- Only the moved wait should report the child result in this fixture.
+local spawn = makima.agent.spawn
+makima.agent.spawn = function(ctx, opts)
+  opts.auto_deliver = false
+  return spawn(ctx, opts)
+end
+
+local register = makima.api.register_tool
+makima.api.register_tool = function(spec)
+  if spec.name == "$TASK_WAIT_TOOL" then
+    local wait = spec.handler
+    spec.handler = function(input, ctx)
+      -- The worker can run this callback only after the real handler yields.
+      makima.async.run(function() makima.ui.flash(input.turn_id) end)
+      return wait(input, ctx)
+    end
+  end
+  return register(spec)
+end
+
+local tools = makima.agent.tools
+makima.agent.tools = function(ctx, opts)
+  local defs = tools(ctx, opts)
+  if defs then
+    table.insert(defs, { name = "$NESTED_WAIT_TOOL", description = "nested wait", input_schema = { type = "object" } })
+  end
+  return defs
+end
+register({
+  name = "$NESTED_WAIT_TOOL",
+  description = "wait through call_tool",
+  schema = { type = "object", properties = { task_id = { type = "string" }, turn_id = { type = "string" } } },
+  audiences = { "general_sub" },
+  handler = function(input, ctx)
+    local text, err = makima.agent.call_tool(ctx, "$TASK_WAIT_TOOL", input)
+    return { llm_output = text or err, is_error = err ~= nil }
+  end,
+})
+"#;
+
 const AUTO_DELIVERY_DRIVER: &str = r#"
 makima.api.register_tool({
   name = "$DRIVER_TOOL",
@@ -729,16 +775,19 @@ fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
     (registry, host)
 }
 
-fn load_auto_delivery_host() -> (Arc<ToolRegistry>, PluginHost) {
+fn load_auto_delivery_host(extra_prelude: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let registry = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-    let source = format!("{AUTO_DELIVERY_PRELUDE}\n{TASK_PLUGIN_SRC}\n{AUTO_DELIVERY_DRIVER}")
-        .replace("$TASK_SPAWN_TOOL", TASK_SPAWN_TOOL)
-        .replace("$TASK_SEND_TOOL", TASK_SEND_TOOL)
-        .replace("$TASK_WAIT_TOOL", TASK_WAIT_TOOL)
-        .replace("$PROBE_TOOL", AUTO_DELIVERY_PROBE_TOOL)
-        .replace("$DRIVER_TOOL", AUTO_DELIVERY_TOOL_NAME)
-        .replace("$PARENT_PROMPT", AUTO_DELIVERY_PARENT_PROMPT);
+    let source = format!(
+        "{AUTO_DELIVERY_PRELUDE}\n{extra_prelude}\n{TASK_PLUGIN_SRC}\n{AUTO_DELIVERY_DRIVER}"
+    )
+    .replace("$NESTED_WAIT_TOOL", NESTED_WAIT_TOOL)
+    .replace("$TASK_SPAWN_TOOL", TASK_SPAWN_TOOL)
+    .replace("$TASK_SEND_TOOL", TASK_SEND_TOOL)
+    .replace("$TASK_WAIT_TOOL", TASK_WAIT_TOOL)
+    .replace("$PROBE_TOOL", AUTO_DELIVERY_PROBE_TOOL)
+    .replace("$DRIVER_TOOL", AUTO_DELIVERY_TOOL_NAME)
+    .replace("$PARENT_PROMPT", AUTO_DELIVERY_PARENT_PROMPT);
     host.load_source("managed-auto-delivery", &source).unwrap();
     (registry, host)
 }
@@ -1226,7 +1275,7 @@ fn only_child(manager: &AgentManagerHandle, parent_id: AgentId) -> AgentId {
 #[test]
 fn nested_lua_parent_receives_completions_mid_turn() {
     smol::block_on(async {
-        let (registry, _host) = load_auto_delivery_host();
+        let (registry, _host) = load_auto_delivery_host("");
         let (parent_requests_tx, parent_requests) = flume::unbounded();
         let (parent_paused_tx, parent_paused) = flume::unbounded();
         let (parent_release, parent_release_rx) = flume::bounded(1);
@@ -1365,7 +1414,7 @@ fn nested_lua_parent_receives_completions_mid_turn() {
 enum ParentStep {
     Spawn,
     Send(&'static str),
-    Wait,
+    Wait(&'static str),
     Reply(&'static str),
 }
 
@@ -1482,10 +1531,10 @@ impl Provider for ScriptedTaskProvider {
                     TASK_SEND_TOOL,
                     json!({ "task_id": spawned()["task_id"], "message": message }),
                 )),
-                Some(ParentStep::Wait) => {
+                Some(ParentStep::Wait(tool)) => {
                     let spawned = spawned();
                     Ok(common::canned_tool_use(
-                        TASK_WAIT_TOOL,
+                        tool,
                         json!({ "task_id": spawned["task_id"], "turn_id": spawned["turn_id"] }),
                     ))
                 }
@@ -1570,7 +1619,7 @@ async fn next_end(
 
 /// A driver turn whose Lua tool spawns the model-driven parent and waits on it.
 struct AutoDeliveryRun {
-    _host: PluginHost,
+    host: PluginHost,
     manager: AgentManagerHandle,
     driver: AgentRef,
     driver_ticket: TurnTicket,
@@ -1580,8 +1629,18 @@ struct AutoDeliveryRun {
 
 impl AutoDeliveryRun {
     async fn start<P: Provider + 'static>(provider: Arc<P>, limits: AgentLimits) -> Self {
-        let (registry, host) = load_auto_delivery_host();
+        Self::start_with_session(provider, limits, None, "").await
+    }
+
+    async fn start_with_session<P: Provider + 'static>(
+        provider: Arc<P>,
+        limits: AgentLimits,
+        session: Option<SessionRef>,
+        extra_prelude: &str,
+    ) -> Self {
+        let (registry, host) = load_auto_delivery_host(extra_prelude);
         let (mut context, _events, _cancel) = common::ctx_with_provider(provider);
+        context.session_id = session;
         context.registry = Arc::clone(&registry);
         context.turn_bindings = Arc::new(TurnToolBindings::capture(
             &registry,
@@ -1605,7 +1664,7 @@ impl AutoDeliveryRun {
         )
         .await;
         Self {
-            _host: host,
+            host,
             manager,
             driver,
             driver_ticket,
@@ -1625,6 +1684,125 @@ impl AutoDeliveryRun {
         let report = self.manager.shutdown(SETTLE_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     }
+}
+
+struct MailboxSession(SessionCoordinatorHandle);
+
+impl MailboxSession {
+    fn new() -> Self {
+        let id = MakimaId::generate();
+        Self(
+            SessionCoordinatorHandle::register(SessionCoordinatorParams {
+                session_id: id,
+                catalog: Default::default(),
+                definitions: Vec::new(),
+                persisted_options: Default::default(),
+                model_policy: Arc::default(),
+                checkpoint: accept_all(),
+                mailbox: SessionMailbox::new(id),
+            })
+            .unwrap(),
+        )
+    }
+}
+
+impl Drop for MailboxSession {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
+#[test_case::test_case(TASK_WAIT_TOOL ; "direct")]
+#[test_case::test_case(NESTED_WAIT_TOOL ; "via_call_tool")]
+fn backgrounding_task_wait_resumes_parent_with_queued_prompt(wait_tool: &'static str) {
+    smol::block_on(common::bounded(async {
+        let session = MailboxSession::new();
+        let mailbox = session.0.mailbox().unwrap();
+        let (provider, handles) = scripted_provider(
+            vec![
+                ParentStep::Spawn,
+                ParentStep::Wait(wait_tool),
+                ParentStep::Reply(AUTO_DELIVERY_PARENT_REPLY),
+            ],
+            Some(2),
+        );
+        let run = AutoDeliveryRun::start_with_session(
+            Arc::new(provider),
+            AgentLimits::default(),
+            Some(session.0.session_id().into()),
+            BACKGROUND_WAIT_PRELUDE,
+        )
+        .await;
+
+        handles.child_started.recv_async().await.unwrap();
+        let parent_id = only_child(&run.manager, run.driver.id());
+        let parent = run.manager.actor(parent_id).unwrap();
+        let next_request = || handles.parent_requests.recv_async();
+        next_request().await.unwrap(); // spawn
+        let before_wait = next_request().await.unwrap();
+        let child_turn = tool_results(&before_wait)[0]["turn_id"].clone();
+        let actions = run.host.ui_action_rx();
+        loop {
+            if let UiAction::Flash(turn) = actions.recv_async().await.unwrap()
+                && child_turn == turn
+            {
+                break;
+            }
+        }
+
+        let active = parent.latest_ticket().unwrap();
+        let queued = parent
+            .submit(
+                AgentInput {
+                    message: QUEUED_PROMPT.into(),
+                    ..input()
+                },
+                None,
+                String::new(),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(queued.turn_id(), active.turn_id());
+        let moved = mailbox.move_latest_for(Some(parent_id)).unwrap();
+
+        let resumed = next_request().await.unwrap();
+        let added = &resumed[before_wait.len()..];
+        assert!(
+            added
+                .iter()
+                .any(|m| m.role == Role::User && has_text(m, QUEUED_PROMPT))
+        );
+        assert!(added.iter().flat_map(|m| &m.content).any(|block| matches!(block,
+            ContentBlock::ToolResult { tool_use_id, content, is_error: false } if tool_use_id == &moved && content.contains(USER_MOVED_RECEIPT)
+        )));
+
+        // Keep the parent's turn open until the detached wait reports its result.
+        handles.child_release.send(()).unwrap();
+        let background = loop {
+            if let Some(message) = mailbox.claim_wake().pop() {
+                break message;
+            }
+            smol::future::yield_now().await;
+        };
+        assert!(background.is_observation());
+        let (header, output) = background.user_text().unwrap().split_once('\n').unwrap();
+        assert!(
+            header.starts_with(&format!("[background] {wait_tool} finished (call {moved},")),
+            "{header}"
+        );
+        let waited: Value = serde_json::from_str(output).unwrap();
+        assert_eq!(waited["status"], "done");
+        assert_eq!(waited["result"]["turn_id"], child_turn);
+        assert_eq!(waited["result"]["text"], AUTO_DELIVERY_CHILD_REPLY);
+        handles.parent_release.send(()).unwrap();
+        run.finish(AUTO_DELIVERY_PARENT_REPLY).await;
+    }));
 }
 
 #[test]
@@ -1696,7 +1874,7 @@ fn incident_coordination_updates_do_not_trigger_post_answer_turns(late_update: b
         let wait_step = UPDATE_COUNT + 1;
         let mut script = vec![ParentStep::Spawn];
         script.extend(COORDINATION_UPDATES.map(ParentStep::Send));
-        script.push(ParentStep::Wait);
+        script.push(ParentStep::Wait(TASK_WAIT_TOOL));
         if late_update {
             script.extend([
                 ParentStep::Send(LATE_UPDATE),

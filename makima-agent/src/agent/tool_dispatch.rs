@@ -20,7 +20,7 @@ use crate::tools::offload::{OutputLimitOptions, OutputLimits, PreviewShape};
 use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
 use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
-    TurnToolRoute, truncate_scope,
+    ToolOutputMode, TurnToolRoute, truncate_scope,
 };
 use crate::{AgentError, AgentEvent, SessionMailbox, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use makima_config::{FILE_WRITE_TOOLS, ToolKey};
@@ -193,21 +193,33 @@ pub async fn run(
         && let Some(text) = done.output.filterable_text_mut()
     {
         opts.recover_filtered_trailer(text);
-        let deadline = match (deadline, opts.deadline) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, right) => left.or(right),
-        };
-        let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
-        match finalize_output(apply, deadline, ctx).await {
-            Ok(limited) => *text = limited,
-            Err(reason) => {
-                *text = reason.to_owned();
-                done.is_error = true;
+        if ctx.output_mode == ToolOutputMode::Full {
+            if let Some(trailer) = opts.trailer.as_deref()
+                && !trailer.is_empty()
+            {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(trailer);
+            }
+        } else {
+            let deadline = match (deadline, opts.deadline) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            };
+            let apply = opts.apply(std::mem::take(text), ctx.offload.clone());
+            match finalize_output(apply, deadline, ctx).await {
+                Ok(limited) => *text = limited,
+                Err(reason) => {
+                    *text = reason.to_owned();
+                    done.is_error = true;
+                }
             }
         }
     }
     if mcp_succeeded
         && !done.is_error
+        && ctx.output_mode == ToolOutputMode::Compact
         && let Some(store) = ctx.offload.clone()
     {
         let text = done.output.as_text();
@@ -1194,12 +1206,15 @@ pub(super) async fn process_tool_calls(
         if let Some(mailbox) = &mailbox {
             mailbox.register_call(Arc::clone(&scope));
         }
-        let tool_ctx = ToolContext {
+        let mut tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             call: Some(Arc::clone(&scope)),
             cancel: scope.cancel().clone(),
             ..ctx.clone()
         };
+        if let Some(turn) = &mut tool_ctx.managed_turn {
+            turn.tool_call = Some(Arc::clone(&scope));
+        }
         let guard = CallGuard::new(Arc::clone(&scope));
         let event_tx_clone = ctx.event_tx.clone();
         let result_tx_clone = result_tx.clone();
@@ -1477,6 +1492,86 @@ mod tests {
             .collect();
         let input = serde_json::json!({"path": "/a"});
         assert_eq!(recent_calls(&entries).is_doom_loop(name, &input), expected);
+    }
+
+    const DEFERRED_TOOL: &str = "deferred_output_probe";
+    const DEFERRED_SECRET: &str = "sensitive content";
+    const DEFERRED_REDACTED: &str = "[redacted]";
+    const DEFERRED_TRAILER: &str = "sensitive content trailer";
+
+    fn redact_deferred_output(stage: HookStage, value: &Value) -> Verdict {
+        match stage {
+            HookStage::Input => Verdict::Unchanged,
+            HookStage::Output => Verdict::Replaced(json!({
+                OUTPUT_TEXT: value[OUTPUT_TEXT].as_str().unwrap().replace(DEFERRED_SECRET, DEFERRED_REDACTED),
+                OUTPUT_TRAILER: value[OUTPUT_TRAILER].as_str().unwrap().replace(DEFERRED_SECRET, DEFERRED_REDACTED),
+            })),
+        }
+    }
+
+    #[test_case(ToolOutputMode::Full ; "full")]
+    #[test_case(ToolOutputMode::Compact ; "compact")]
+    fn deferred_output_hook_respects_output_mode(mode: ToolOutputMode) {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let text = format!(
+                "{}\n{DEFERRED_SECRET}",
+                (0..100)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let body = text.clone();
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.output_mode = mode;
+            ctx.config.max_output_lines = 10;
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
+            ctx.local_tools = Arc::new(HashMap::from([(
+                DEFERRED_TOOL.to_owned(),
+                local_tool(ToolAudience::all(), move |_, ctx| {
+                    let body = body.clone();
+                    Box::pin(async move {
+                        assert!(ctx.defer_output_limits(OutputLimitOptions {
+                            deadline: None,
+                            trailer: Some(DEFERRED_TRAILER.to_owned()),
+                            shape: PreviewShape::Head,
+                            lines_clipped: false,
+                            limits: OutputLimits::from_config(&ctx.config),
+                        }));
+                        Ok(body)
+                    })
+                }),
+            )]));
+            let hook = RecordingHook::answering(redact_deferred_output);
+            ctx.registry.set_hook(hook.clone());
+            let done = dispatch(&ctx, DEFERRED_TOOL, &json!({})).await;
+            assert!(!done.is_error);
+            let output = done.output.as_text();
+            assert!(!output.contains(DEFERRED_SECRET));
+            let seen = hook.seen();
+            let observed = seen.iter().find(|s| s.stage == HookStage::Output).unwrap();
+            assert_eq!(
+                observed.value[OUTPUT_TEXT],
+                format!("{text}\n{DEFERRED_TRAILER}")
+            );
+            assert_eq!(observed.value[OUTPUT_TRAILER], DEFERRED_TRAILER);
+            let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+            if mode == ToolOutputMode::Full {
+                assert!(output.contains(&text.replace(DEFERRED_SECRET, DEFERRED_REDACTED)));
+                assert!(
+                    output.contains(&DEFERRED_TRAILER.replace(DEFERRED_SECRET, DEFERRED_REDACTED))
+                );
+                assert!(files.is_empty());
+            } else {
+                assert_eq!(files.len(), 1);
+                let saved = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+                assert!(!saved.contains(DEFERRED_SECRET));
+                assert!(saved.contains(DEFERRED_REDACTED));
+                assert!(output.contains(OFFLOAD_FOOTER_PREFIX));
+            }
+        });
     }
 
     fn local_ctx(
@@ -2751,6 +2846,29 @@ mod tests {
             assert_eq!(saved.len(), 1);
             let saved = std::fs::read_to_string(saved[0].as_ref().unwrap().path()).unwrap();
             assert_eq!(saved, text);
+        });
+    }
+
+    #[test]
+    fn mcp_full_output_is_filtered_without_offloading() {
+        smol::block_on(async {
+            let dir = tempfile::TempDir::new().unwrap();
+            let text = format!("{}\n{MCP_SECRET}", many_lines());
+            let mut ctx = answering_ctx(&text);
+            ctx.output_mode = ToolOutputMode::Full;
+            ctx.offload = Some(Arc::new(OffloadStore::on_disk(
+                dir.path().canonicalize().unwrap(),
+            )));
+            ctx.registry
+                .set_hook(RecordingHook::answering(redact_mcp_output));
+
+            let done = dispatch_nested(&ctx, PROBE_WIRE, &json!({})).await;
+            assert!(!done.is_error);
+            assert_eq!(
+                done.output.as_text(),
+                text.replace(MCP_SECRET, MCP_REDACTED)
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         });
     }
 

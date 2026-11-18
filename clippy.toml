@@ -2,4 +2,5 @@ disallowed-methods = [
   { path = "uuid::Uuid::new_v4", reason = "use makima_storage::id::MakimaId::generate (base58-encoded UUIDv7)", allow-invalid = true },
   { path = "uuid::Uuid::new_v7", reason = "use makima_storage::id::MakimaId::generate (base58-encoded UUIDv7)", allow-invalid = true },
   { path = "uuid::Uuid::now_v7", reason = "use makima_storage::id::MakimaId::generate (base58-encoded UUIDv7)", allow-invalid = true },
+  { path = "mlua::Thread::into_async", reason = "an abandoned coroutine future is dropped inside the GC; use Function::call_async (see AGENTS.md, Lua drop invariant)", allow-invalid = true },
 ]

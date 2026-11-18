@@ -3558,7 +3558,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
+- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `unlimited` (boolean): remove the default match group limit when `limit` is absent. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
 **Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
 
@@ -5148,7 +5148,7 @@ output until it exits, for a login that is an interactive program. Only
 **Example:**
 
 ```lua
-local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
+local ok, err = ui:run({ "gh", "auth", "login" })
 ```
 
 

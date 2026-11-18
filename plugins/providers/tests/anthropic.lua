@@ -2,6 +2,7 @@ local anthropic = require("providers.anthropic")
 local t = require("makima.test_helpers")
 
 local EPHEMERAL = { type = "ephemeral" }
+local EMPTY_TEXT = "(empty)"
 local UNPARSED_ERROR = "upstream exploded"
 local FALLBACK_MAX_TOKENS = 32000
 local FALLBACK_HIGH_BUDGET = 19660
@@ -82,8 +83,27 @@ t.case("messages_cache_the_tail_and_drop_blank_text", function()
         },
       },
     },
-    { role = "assistant", content = { { type = "text", text = "(empty)", cache_control = EPHEMERAL } } },
+    { role = "assistant", content = { { type = "text", text = EMPTY_TEXT, cache_control = EPHEMERAL } } },
   })
+end)
+
+local function replayed(content)
+  local messages = anthropic.convert_messages({
+    { role = "assistant", content = content },
+    { role = "user", content = { { type = "text", text = "next" } } },
+    { role = "assistant", content = { { type = "text", text = "done" } } },
+  })
+  return messages[1].content
+end
+
+t.case("replays_only_signed_thinking", function()
+  local unsigned = { type = "thinking", thinking = "summary" }
+  t.same(replayed({ unsigned, { type = "text", text = "reply" } }), { { type = "text", text = "reply" } })
+  t.same(replayed({ unsigned }), { { type = "text", text = EMPTY_TEXT } })
+  t.same(
+    replayed({ { type = "thinking", thinking = "hmm", signature = "sig" }, { type = "text", text = "reply" } }),
+    { { type = "thinking", thinking = "hmm", signature = "sig" }, { type = "text", text = "reply" } }
+  )
 end)
 
 t.case("build_request", function()
@@ -171,6 +191,37 @@ t.case("stream_decodes_blocks", function()
     usage = { input_tokens = 10, output_tokens = 7, cache_creation_input_tokens = 2, cache_read_input_tokens = 3 },
     stop_reason = "tool_use",
   })
+end)
+
+t.case("message_delta_usage_updates_all_counters", function()
+  local delta_usage = {
+    input_tokens = 42,
+    output_tokens = 10,
+    cache_creation_input_tokens = 5,
+    cache_read_input_tokens = 8,
+  }
+  local result = assert(anthropic.stream(
+    sse({
+      { type = "message_start", message = { usage = { input_tokens = 0, output_tokens = 0 } } },
+      { type = "message_delta", delta = { stop_reason = "end_turn" }, usage = delta_usage },
+      { type = "message_stop" },
+    }),
+    t.recorder()
+  ))
+  t.same(result.usage, delta_usage)
+
+  result = assert(anthropic.stream(
+    sse({
+      {
+        type = "message_start",
+        message = { usage = { input_tokens = 42, cache_creation_input_tokens = 5, cache_read_input_tokens = 8 } },
+      },
+      { type = "message_delta", delta = { stop_reason = "end_turn" }, usage = { output_tokens = 10 } },
+      { type = "message_stop" },
+    }),
+    t.recorder()
+  ))
+  t.same(result.usage, delta_usage)
 end)
 
 t.case("error_events", function()
