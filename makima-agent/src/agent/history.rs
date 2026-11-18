@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use makima_providers::{
     ContentBlock, ConversationLink, ConversationRelation, EMPTY_RESPONSE_MARKER, Message, Role,
 };
 use makima_storage::conversation::ConversationState;
+use makima_storage::id::MakimaId;
 use makima_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -14,6 +16,44 @@ pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = makima_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+
+type WeakMessages = Weak<ArcSwap<HistorySnapshot>>;
+
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakimaId, Vec<WeakMessages>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Publishes a session's transcript where `makima.session.messages` reads it.
+/// The most recently published live mirror wins.
+pub fn publish_live_history(session: MakimaId, mirror: &SharedMessages) {
+    let mut live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    live.retain(|_, mirrors| {
+        mirrors.retain(|mirror| mirror.strong_count() > 0);
+        !mirrors.is_empty()
+    });
+    let mirrors = live.entry(session).or_default();
+    let weak = Arc::downgrade(mirror);
+    mirrors.retain(|previous| !previous.ptr_eq(&weak));
+    mirrors.push(weak);
+}
+
+/// The messages of the most recently published mirror still held by an owner,
+/// oldest first, or `None` when no published mirror remains alive.
+pub fn live_history(session: MakimaId) -> Option<Arc<Vec<Message>>> {
+    let mut live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mirrors = live.get_mut(&session)?;
+    while let Some(mirror) = mirrors.last() {
+        if let Some(mirror) = mirror.upgrade() {
+            return Some(Arc::clone(&mirror.load().messages));
+        }
+        mirrors.pop();
+    }
+    live.remove(&session);
+    None
+}
 
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never
@@ -341,6 +381,47 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+
+    #[test]
+    fn live_history_falls_back_to_previous_live_mirror() {
+        let session = MakimaId::generate();
+        let other = MakimaId::generate();
+        let first = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            Message::user(FIRST.into()),
+        ])));
+        let second = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            Message::user(SECOND.into()),
+        ])));
+        assert!(live_history(session).is_none());
+        publish_live_history(session, &first);
+        publish_live_history(other, &second);
+        publish_live_history(session, &second);
+        assert_eq!(live_history(session).unwrap()[0].user_text(), Some(SECOND));
+        drop(second);
+        assert_eq!(live_history(session).unwrap()[0].user_text(), Some(FIRST));
+        assert!(live_history(other).is_none());
+        drop(first);
+        assert!(live_history(session).is_none());
+    }
+
+    #[test]
+    fn republishing_a_mirror_updates_its_precedence() {
+        let session = MakimaId::generate();
+        let first = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            Message::user(FIRST.into()),
+        ])));
+        let second = Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            Message::user(SECOND.into()),
+        ])));
+        publish_live_history(session, &first);
+        publish_live_history(session, &second);
+        publish_live_history(session, &first);
+        assert_eq!(live_history(session).unwrap()[0].user_text(), Some(FIRST));
+        drop(first);
+        assert_eq!(live_history(session).unwrap()[0].user_text(), Some(SECOND));
+        drop(second);
+        assert!(live_history(session).is_none());
+    }
 
     #[test]
     fn compaction_metadata_survives_append_and_snapshot_restoration() {

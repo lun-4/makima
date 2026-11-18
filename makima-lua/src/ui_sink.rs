@@ -6,6 +6,7 @@
 use crate::UiAction;
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
+pub const NO_FOCUSED_SESSION_ERR: &str = "no focused session";
 
 pub trait UiSink {
     /// Shows a notification in the frontend's own idiom.

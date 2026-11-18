@@ -11,6 +11,7 @@ pub use admission::{PROMPT_INPUTS_CLOSED, PROMPT_SLOTS_CLOSED, PromptSlotSource,
 pub use compaction::compact;
 pub use history::{
     History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    live_history, publish_live_history,
 };
 pub use instructions::{
     Instructions, LoadedInstructions, build_mode_system_prompt, build_system_prompt,

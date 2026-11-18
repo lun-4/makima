@@ -934,18 +934,22 @@ Their `ev.agent` is the agent's handle (nil once it has left the graph),
 `ctx` is a trusted context pinned to it, and `ev.data` carries `agent_id`,
 `session_id` and `parent_id` (nil for a root, so `if ev.data.parent_id then
 return end` keeps a listener on roots). `"TurnStart"` adds `turn_id`,
-`origin` and `selection`; `"TurnEnd"` carries the same fields as
+`text` (the message that started the turn), `origin` and `selection`;
+`"TurnEnd"` carries the same fields as
 `AgentTurn:result` plus `reason`, `cost`, `list_cost`, `context_size`,
 `context_window` and `num_turns`; `"AgentIdle"` fires once work (a turn,
 a compaction) settled, not after a config change alone, and adds `settled`;
 `"ConfigChanged"` adds `generation`, `selection` and `mode`;
-`"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`.
+`"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`;
+`"ToolDone"` adds `is_error` and `bytes`, the size of the text the model
+reads, and, for a call that ran, `input` (the input the tool received) and
+`duration_ms`. A call that never ran, like a cancelled one, has neither.
 `"AutoCompacting"` adds `context_size` and `context_window`.
 `"CompactionDone"` adds `status` (`"completed"`, `"failed"` or
 `"cancelled"`), and after a compaction inside a turn also
-`context_size_before`, `context_size_after` and `context_window`; a
-compaction inside a turn that fails ends the turn, so it reports as a
-failed `"TurnEnd"`.
+`context_size_before`, `context_size_after`, `context_window` and
+`summary`, the text that replaced the history; a compaction inside a turn
+that fails ends the turn, so it reports as a failed `"TurnEnd"`.
 
 Host events with no agent, where `ctx` is nil: `"SessionReset"`,
 `"SessionFocusChanged"`, `"SessionCwdChanged"`, `"ProviderChanged"`,
@@ -4649,6 +4653,53 @@ model and leave it empty. Model, mode and options are on the agent:
 ```lua
 local s = makima.session.read({ session = ctx:session_id() })
 makima.ui.notify("spent " .. tostring(s.usage.total.cost))
+```
+
+---
+
+### `makima.session.messages()` {#makima-session-messages}
+
+```lua
+makima.session.messages({opts?})
+```
+
+Reads a live session's transcript, oldest first: everything the model has
+been sent so far, tool calls and results included. Read only.
+
+Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
+`"assistant"`. `kind` is `"turn"` for something the user or the model said
+and `"observation"` for a report sent to the model as a user message, like
+`makima.session.notify`. `hidden` marks a message only the model sees, such
+as a nudge or a compaction note. `content` lists blocks:
+
+```text
+{ type = "text", text }
+{ type = "thinking", text }
+{ type = "tool_use", id, name, input }
+{ type = "tool_result", tool_use_id, content, is_error }
+{ type = "image", media_type }
+```
+
+Works in the TUI and in the drivers that keep a live session, `makima -p`
+and SDK included. A headless driver has no focused session, so pass
+`session` there; hook and event payloads carry the `session_id` to pass.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) id of a live session, defaults to the focused one.
+  - `last` (`integer?`) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
+
+**Example:**
+
+```lua
+local msgs = makima.session.messages({ last = 1 })
+local last = msgs and msgs[1]
+if last and last.role == "assistant" then
+  makima.ui.notify(last.content[1].text)
+end
 ```
 
 ---

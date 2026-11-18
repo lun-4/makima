@@ -456,11 +456,25 @@ pub enum SessionRequest {
     List,
     ListAll,
     Live,
-    Read { id: MakimaId },
-    New { prompt: Option<String>, focus: bool },
-    Focus { id: String },
-    Delete { id: String },
-    SetTitle { id: String, title: String },
+    /// The focused session's id, or an error when no UI has one focused.
+    Current,
+    Read {
+        id: MakimaId,
+    },
+    New {
+        prompt: Option<String>,
+        focus: bool,
+    },
+    Focus {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    SetTitle {
+        id: String,
+        title: String,
+    },
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
