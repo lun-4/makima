@@ -2,8 +2,8 @@
 //! prompt, does not count as running, so [`Deadline::paused_while`] moves the
 //! deadline later by however long the wait took.
 //!
-//! All clones share one instant: the output hook chain holds a copy of the
-//! context made before the prompt and still has to see the new time.
+//! Clones and derived deadlines share their constituent budgets, so pauses in
+//! nested calls also suspend the budgets inherited from their callers.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,11 +12,53 @@ use std::time::{Duration, Instant};
 pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 
 #[derive(Clone, Debug, Default)]
-pub struct Deadline(Option<Arc<Mutex<Instant>>>);
+pub struct Deadline(Vec<Arc<Mutex<DeadlineState>>>);
+
+#[derive(Debug)]
+struct DeadlineState {
+    at: Instant,
+    pause_started: Option<Instant>,
+    pauses: usize,
+}
+
+impl DeadlineState {
+    fn instant(&self, now: Instant) -> Instant {
+        self.at
+            + self.pause_started.map_or(Duration::ZERO, |started| {
+                now.saturating_duration_since(started)
+            })
+    }
+
+    fn pause(&mut self, now: Instant) {
+        if self.pauses == 0 {
+            self.pause_started = Some(now);
+        }
+        self.pauses += 1;
+    }
+
+    fn resume(&mut self, now: Instant) {
+        self.pauses -= 1;
+        if self.pauses == 0
+            && let Some(started) = self.pause_started.take()
+        {
+            self.at += now.saturating_duration_since(started);
+        }
+    }
+}
 
 impl From<Option<Instant>> for Deadline {
     fn from(at: Option<Instant>) -> Self {
-        Self(at.map(|at| Arc::new(Mutex::new(at))))
+        Self(
+            at.into_iter()
+                .map(|at| {
+                    Arc::new(Mutex::new(DeadlineState {
+                        at,
+                        pause_started: None,
+                        pauses: 0,
+                    }))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -29,23 +71,24 @@ impl Deadline {
         Self::from(Some(instant))
     }
 
-    fn lock(&self) -> Option<MutexGuard<'_, Instant>> {
-        self.0
-            .as_deref()
-            .map(|at| at.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    /// The absolute instant the call must finish by, if it has one.
+    /// The current effective deadline, including elapsed time in an active pause.
     pub fn instant(&self) -> Option<Instant> {
-        self.lock().as_deref().copied()
+        self.0
+            .iter()
+            .map(|state| lock(state).instant(Instant::now()))
+            .min()
     }
 
+    /// Combines shared budgets without snapshotting their current instants.
+    /// Pausing the result pauses each constituent budget, including ancestors.
     pub fn min(&self, other: &Self) -> Self {
-        match (self.instant(), other.instant()) {
-            (Some(left), Some(right)) => Self::at(left.min(right)),
-            (Some(at), None) | (None, Some(at)) => Self::at(at),
-            (None, None) => Self::default(),
+        let mut states = self.0.clone();
+        for state in &other.0 {
+            if !states.iter().any(|existing| Arc::ptr_eq(existing, state)) {
+                states.push(Arc::clone(state));
+            }
         }
+        Self(states)
     }
 
     /// Only wrap waits on the user: real work should still spend the budget.
@@ -57,9 +100,23 @@ impl Deadline {
     /// Holds the deadline still until the guard drops, then pushes it back by
     /// however long the hold lasted.
     pub(crate) fn pause(&self) -> Pause<'_> {
-        Pause {
-            deadline: self,
-            started: Instant::now(),
+        for state in &self.0 {
+            lock(state).pause(Instant::now());
+        }
+        Pause { deadline: self }
+    }
+
+    #[cfg(test)]
+    fn pause_at(&self, now: Instant) {
+        for state in &self.0 {
+            lock(state).pause(now);
+        }
+    }
+
+    #[cfg(test)]
+    fn resume_at(&self, now: Instant) {
+        for state in &self.0 {
+            lock(state).resume(now);
         }
     }
 
@@ -84,17 +141,19 @@ impl Deadline {
     }
 }
 
-/// A pause in progress. Dropping it moves the deadline back by the time the
-/// pause lasted, and every clone sees the move.
+fn lock(state: &Mutex<DeadlineState>) -> MutexGuard<'_, DeadlineState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A pause in progress. The deadline advances while any pause is active.
 pub(crate) struct Pause<'a> {
     deadline: &'a Deadline,
-    started: Instant,
 }
 
 impl Drop for Pause<'_> {
     fn drop(&mut self) {
-        if let Some(mut at) = self.deadline.lock() {
-            *at += self.started.elapsed();
+        for state in &self.deadline.0 {
+            lock(state).resume(Instant::now());
         }
     }
 }
@@ -126,6 +185,152 @@ mod tests {
         let expired = Deadline::after(Duration::ZERO);
         assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
         assert_eq!(expired.check().unwrap_err(), DEADLINE_EXCEEDED);
+    }
+
+    #[test_case(false ; "nested")]
+    #[test_case(true ; "overlapping")]
+    fn concurrent_pauses_count_only_the_union(overlapping: bool) {
+        let start = Instant::now();
+        let mut state = DeadlineState {
+            at: start + BUDGET,
+            pause_started: None,
+            pauses: 0,
+        };
+        let second = start + Duration::from_secs(1);
+        let first_end = start + Duration::from_secs(2);
+        let end = start + Duration::from_secs(3);
+
+        state.pause(start);
+        state.pause(second);
+        assert_eq!(
+            state.instant(first_end),
+            start + BUDGET + Duration::from_secs(2)
+        );
+        state.resume(first_end);
+        assert_eq!(state.instant(end), start + BUDGET + Duration::from_secs(3));
+        state.resume(end);
+        assert_eq!(state.instant(end), start + BUDGET + Duration::from_secs(3));
+
+        let deadline = Deadline::after(BUDGET);
+        let clone = deadline.clone();
+        let first = deadline.pause();
+        let second = clone.pause();
+        if overlapping {
+            drop(first);
+            assert_eq!(lock(&deadline.0[0]).pauses, 1);
+            drop(second);
+        } else {
+            drop(second);
+            assert_eq!(lock(&deadline.0[0]).pauses, 1);
+            drop(first);
+        }
+        assert_eq!(lock(&deadline.0[0]).pauses, 0);
+    }
+
+    #[test]
+    fn active_pause_freezes_remaining_time_and_expired_stays_expired() {
+        let now = Instant::now();
+        let deadline = Deadline::at(now + BUDGET);
+        {
+            let mut state = lock(&deadline.0[0]);
+            state.pause(now - BUDGET);
+        }
+        assert!(deadline.remaining().unwrap() > BUDGET + BUDGET / 2);
+        lock(&deadline.0[0]).resume(Instant::now());
+
+        let expired = Deadline::at(now - BUDGET);
+        let guard = expired.pause();
+        assert_eq!(expired.check().unwrap_err(), DEADLINE_EXCEEDED);
+        drop(guard);
+        assert_eq!(expired.check().unwrap_err(), DEADLINE_EXCEEDED);
+    }
+
+    #[test]
+    fn separate_pauses_do_not_count_the_gap() {
+        let start = Instant::now();
+        let mut state = DeadlineState {
+            at: start + BUDGET,
+            pause_started: None,
+            pauses: 0,
+        };
+        state.pause(start);
+        state.resume(start + Duration::from_secs(1));
+        state.pause(start + Duration::from_secs(3));
+        state.resume(start + Duration::from_secs(4));
+        assert_eq!(
+            state.instant(start + Duration::from_secs(4)),
+            start + BUDGET + Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn derived_pause_propagates_to_all_ancestors_and_respects_each_budget() {
+        let start = Instant::now();
+        let parent = Deadline::at(start + BUDGET);
+        let local = Deadline::at(start + BUDGET / 2);
+        let child = parent.min(&local);
+        let grandchild_limit = Deadline::at(start + BUDGET * 2);
+        let grandchild = child.min(&grandchild_limit);
+        let sibling = parent.min(&Deadline::at(start + BUDGET * 3));
+        let end = start + Duration::from_secs(5);
+
+        grandchild.pause_at(start);
+        grandchild.resume_at(end);
+
+        assert_eq!(
+            parent.instant(),
+            Some(start + BUDGET + Duration::from_secs(5))
+        );
+        assert_eq!(
+            local.instant(),
+            Some(start + BUDGET / 2 + Duration::from_secs(5))
+        );
+        assert_eq!(child.instant(), local.instant());
+        assert_eq!(grandchild.instant(), local.instant());
+        assert_eq!(sibling.instant(), parent.instant());
+    }
+
+    #[test]
+    fn overlapping_parent_and_child_pauses_are_not_double_counted() {
+        let start = Instant::now();
+        let parent = Deadline::at(start + BUDGET);
+        let limit = Deadline::at(start + BUDGET * 2);
+        let child = parent.min(&limit).min(&parent);
+        let second = start + Duration::from_secs(1);
+        let third = start + Duration::from_secs(2);
+        let end = start + Duration::from_secs(3);
+
+        parent.pause_at(start);
+        child.pause_at(second);
+        parent.resume_at(third);
+        child.resume_at(end);
+
+        assert_eq!(
+            parent.instant(),
+            Some(start + BUDGET + Duration::from_secs(3))
+        );
+        assert_eq!(
+            limit.instant(),
+            Some(start + BUDGET * 2 + Duration::from_secs(2))
+        );
+        assert_eq!(child.instant(), parent.instant());
+    }
+
+    #[test]
+    fn min_with_unbounded_deadline_keeps_parent_shared() {
+        let start = Instant::now();
+        let parent = Deadline::at(start + BUDGET);
+        let child = Deadline::default().min(&parent).min(&Deadline::default());
+        child.pause_at(start);
+        child.resume_at(start + Duration::from_secs(1));
+        assert_eq!(
+            parent.instant(),
+            Some(start + BUDGET + Duration::from_secs(1))
+        );
+        assert_eq!(
+            Deadline::default().min(&Deadline::default()).instant(),
+            None
+        );
     }
 
     #[test]
