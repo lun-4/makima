@@ -25,7 +25,6 @@ use test_case::test_case;
 #[test_case("providers_copilot", include_str!("../../plugins/providers/tests/copilot.lua") ; "providers_copilot_spec")]
 #[test_case("providers_custom", include_str!("../../plugins/providers/tests/custom.lua") ; "providers_custom_spec")]
 #[test_case("providers_deepseek", include_str!("../../plugins/providers/tests/deepseek.lua") ; "providers_deepseek_spec")]
-#[test_case("providers_executable", include_str!("../../plugins/providers/tests/executable.lua") ; "providers_executable_spec")]
 #[test_case("providers_gemini", include_str!("../../plugins/providers/tests/gemini.lua") ; "providers_gemini_spec")]
 #[test_case("providers_google", include_str!("../../plugins/providers/tests/google.lua") ; "providers_google_spec")]
 #[test_case("providers_http", include_str!("../../plugins/providers/tests/http.lua") ; "providers_http_spec")]

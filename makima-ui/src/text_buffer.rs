@@ -140,7 +140,7 @@ impl TextBuffer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lines.iter().all(String::is_empty)
+        self.lines.len() == 1 && self.lines[0].is_empty()
     }
 
     fn position(&self) -> (usize, usize) {
@@ -704,6 +704,21 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test_case("", true; "empty")]
+    #[test_case("\n", false; "newline")]
+    #[test_case("\n\n", false; "multiple_newlines")]
+    #[test_case("a", false; "text")]
+    fn emptiness_matches_buffer_value(value: &str, expected: bool) {
+        let mut buf = TextBuffer::new(value.into());
+        assert_eq!(buf.is_empty(), expected);
+        buf.clear();
+        assert!(buf.is_empty());
+        buf.add_line();
+        assert!(!buf.is_empty());
+        buf.remove_char();
+        assert!(buf.is_empty());
     }
 
     #[test]

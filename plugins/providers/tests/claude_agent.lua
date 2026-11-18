@@ -4,6 +4,20 @@ local t = require("makima.test_helpers")
 local SOCKET = "/run/user/1000/bridge.sock"
 local CONFIG = { socket = SOCKET }
 local CONNECT_FAILED = "could not connect to claude-agent: connection refused"
+local RESET = "2026-02-06T22:00:00+00:00"
+local RESET_MS = 1770415200000
+local WEEK_RESET = "2026-02-09T00:00:00+00:00"
+local WEEK_RESET_MS = 1770595200000
+local PLAN_USAGE = {
+  plan = "pro",
+  available = true,
+  rate_limits = {
+    five_hour = { utilization = 24.4, resets_at = RESET },
+    seven_day = { utilization = 31, resets_at = WEEK_RESET },
+    model_scoped = { { display_name = "Fable", utilization = 5, resets_at = WEEK_RESET }, { utilization = 9 } },
+    extra_usage = { is_enabled = true, utilization = 12, used_credits = 25384, decimal_places = 2, currency = "BRL" },
+  },
+}
 local REQUEST = {
   model = { id = "sonnet" },
   messages = { { role = "user", content = { { type = "text", text = "hi" } } } },
@@ -225,6 +239,69 @@ t.case("ending_a_conversation_posts_the_reason", function()
   instance.end_conversation(ctx, "c/1", "cancelled")
   t.has(ctx.requests[1].url, "/v1/conversations/c%2F1/end")
   t.same(makima.json.decode(ctx.requests[1].body), { reason = "cancelled" })
+end)
+
+local function fetch_usage(ctx)
+  local instance = assert(spec.prepare(ctx, { id = "sonnet" }, CONFIG))
+  return instance.fetch_usage(ctx)
+end
+
+t.case("parse_usage_lists_plan_windows_then_model_windows_then_credits", function()
+  t.same(claude_agent.parse_usage({ usage = PLAN_USAGE }), {
+    plan = "pro",
+    limits = {
+      { kind = { Hours = 5 }, percentage = 24, reset_at = RESET_MS },
+      { kind = { Weekly = {} }, percentage = 31, reset_at = WEEK_RESET_MS },
+      { kind = { Weekly = { model = "Fable" } }, percentage = 5, reset_at = WEEK_RESET_MS, ui_shortname_hint = "f" },
+      { kind = "Credits", percentage = 12, detail = "253.84 BRL spent" },
+    },
+  })
+end)
+
+t.case("parse_usage_skips_disabled_credits_and_empty_model_windows", function()
+  local usage = claude_agent.parse_usage({
+    usage = {
+      available = true,
+      rate_limits = {
+        five_hour = { utilization = 110, resets_at = RESET },
+        model_scoped = { { display_name = "Fable", resets_at = WEEK_RESET } },
+        extra_usage = { is_enabled = false, used_credits = 25384, decimal_places = 2, currency = "BRL" },
+      },
+    },
+  })
+  t.same(usage, { limits = { { kind = { Hours = 5 }, percentage = 110, reset_at = RESET_MS } } })
+end)
+
+t.case("parse_usage_without_plan_limits_is_unsupported", function()
+  t.eq(claude_agent.parse_usage({ usage = { plan = "pro", available = false } }), nil)
+  t.eq(claude_agent.parse_usage({}), nil)
+end)
+
+t.case("fetch_usage_reads_the_bridge", function()
+  local ctx = t.provider_ctx({ json({ usage = PLAN_USAGE }) })
+  local usage = assert(fetch_usage(ctx))
+  t.eq(ctx.requests[1].method, "GET")
+  t.eq(ctx.requests[1].unix_socket, SOCKET)
+  t.has(ctx.requests[1].url, "/v1/usage")
+  t.eq(usage.plan, "pro")
+end)
+
+t.case("fetch_usage_on_an_old_bridge_is_unsupported", function()
+  local usage, err = fetch_usage(t.provider_ctx({ json({ message = "no route GET /v1/usage" }, 404) }))
+  t.eq(usage, nil)
+  t.eq(err, nil)
+end)
+
+t.case("fetch_usage_returns_the_bridge_error", function()
+  local failure = { message = "claude did not answer", retry = "none" }
+  local _, err = fetch_usage(t.provider_ctx({ json(failure, 500) }))
+  t.same(err, failure)
+end)
+
+t.case("fetch_usage_with_the_bridge_down_is_a_config_error", function()
+  local _, err = fetch_usage(failing_ctx(CONNECT_FAILED))
+  t.eq(err.kind, "config")
+  t.has(err.message, SOCKET)
 end)
 
 t.report()

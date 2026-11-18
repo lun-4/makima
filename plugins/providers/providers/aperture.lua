@@ -289,27 +289,4 @@ function M.provider()
   return spec
 end
 
--- A route for a gateway at the client's base, with its headers and the
--- overrides in `client.config`.
-function M.delegated()
-  local function api_for(client)
-    return function(prefix)
-      return { base = client.base:gsub("/+$", "") .. prefix, headers = client.headers }
-    end
-  end
-  return {
-    def = { models = {} },
-    stream = function(client, model, ctx, request, emit)
-      local instance, err = M.instance(model, client.config, api_for(client))
-      if not instance then
-        return nil, err
-      end
-      return instance.stream(ctx, request, emit)
-    end,
-    list_models = function(ctx, client)
-      return M.discover(ctx, api_for(client)(""), client.config)
-    end,
-  }
-end
-
 return M

@@ -1,3 +1,5 @@
+local TRUTHY = { ["true"] = true, ["yes"] = true, ["on"] = true, ["1"] = true }
+
 local M = {}
 
 function M.parse_frontmatter(content)
@@ -18,10 +20,19 @@ function M.parse_frontmatter(content)
   return fm, body
 end
 
+function M.parse_bool(value)
+  if value == true or value == 1 then
+    return true
+  end
+  return type(value) == "string" and TRUTHY[value:lower()] == true
+end
+
 function M.build_skill_list(skills)
   local sorted = {}
   for _, s in pairs(skills) do
-    sorted[#sorted + 1] = s
+    if s.disable_model_invocation ~= true then
+      sorted[#sorted + 1] = s
+    end
   end
   table.sort(sorted, function(a, b)
     return a.name < b.name

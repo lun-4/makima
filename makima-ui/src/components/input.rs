@@ -472,16 +472,8 @@ impl InputBox {
             }
         }
 
-        let (mut total_vl, rows) = {
-            let layout = self.layout(area.width);
-            (
-                saturating_u16(layout.total_rows() as usize),
-                layout
-                    .rows_from(&self.buffer, u32::from(self.scroll_y))
-                    .take(usize::from(content_height))
-                    .collect::<Vec<Row>>(),
-            )
-        };
+        let text_rows = self.layout(area.width).total_rows();
+        let mut total_vl = saturating_u16(text_rows as usize);
         if !self.pending_images.is_empty() {
             total_vl = total_vl.saturating_add(1);
         }
@@ -489,6 +481,11 @@ impl InputBox {
         self.last_content_height = content_height.max(1);
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
+        let rows = self
+            .layout(area.width)
+            .rows_from(&self.buffer, u32::from(self.scroll_y))
+            .take(usize::from(content_height))
+            .collect::<Vec<Row>>();
 
         let mut styled_lines: Vec<Line> = if self.buffer.is_empty()
             && self.pending_images.is_empty()
@@ -543,7 +540,10 @@ impl InputBox {
             styled_lines
         };
 
-        if !self.pending_images.is_empty() {
+        if !self.pending_images.is_empty()
+            && text_rows >= u32::from(self.scroll_y)
+            && text_rows < u32::from(self.scroll_y) + u32::from(content_height)
+        {
             let n = self.pending_images.len();
             let label = match n {
                 1 => "1 image".to_string(),
@@ -565,7 +565,6 @@ impl InputBox {
         }
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
-            .scroll((self.scroll_y, 0))
             .block(block);
         frame.render_widget(paragraph, area);
 
@@ -754,8 +753,8 @@ fn paint_selection(
     for span in spans {
         let chars: Vec<char> = span.content.chars().collect();
         let end = pos + chars.len();
-        let from = range.start.max(pos) - pos;
-        let to = range.end.min(end) - pos;
+        let from = range.start.max(pos).min(end) - pos;
+        let to = range.end.min(end).max(pos) - pos;
         if from >= to {
             out.push(span);
         } else {
@@ -1177,6 +1176,23 @@ abcdef"
         assert_eq!((input.buffer.y(), input.buffer.x()), (0, 8));
     }
 
+    #[test_case(1..3; "before_later_spans")]
+    #[test_case(3..5; "after_earlier_spans")]
+    #[test_case(1..5; "across_spans")]
+    fn selection_across_styled_spans(range: Range<usize>) {
+        let spans = vec![Span::raw("a界"), Span::raw("bc"), Span::raw("de")];
+        let selected = Style::new().bg(Color::Blue);
+        let painted = paint_selection(spans, range.clone(), selected);
+        let chars: Vec<_> = painted
+            .iter()
+            .flat_map(|span| span.content.chars().map(move |c| (c, span.style.bg)))
+            .collect();
+        assert_eq!(chars.iter().map(|(c, _)| c).collect::<String>(), "a界bcde");
+        for (index, (_, bg)) in chars.iter().enumerate() {
+            assert_eq!(*bg, range.contains(&index).then_some(Color::Blue));
+        }
+    }
+
     #[test]
     fn a_selection_paints_the_selected_chars_and_copies_them() {
         let mut input = InputBox::new(InputHistory::default(), 20);
@@ -1531,6 +1547,49 @@ abcdef"
         input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         let _ = render_input(&mut input, 40, 6);
         assert!(input.scroll_y() > 0);
+    }
+
+    #[test_case(false; "text")]
+    #[test_case(true; "image")]
+    fn scrolled_view_renders_visible_rows_and_clamps_before_render(with_image: bool) {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("zero\none\ntwo\nthree\nfour\nfive".into());
+        input.buffer.move_to_end();
+        if with_image {
+            input.attach_image(test_image());
+        }
+        let terminal = render_input(&mut input, 30, 5);
+        for (row, text) in ["three", "four", "five"].iter().enumerate() {
+            assert!(rendered_row(&terminal, row as u16 + 1).contains(text));
+        }
+        if with_image {
+            input.scroll_to_line(u16::MAX);
+            let terminal = render_input(&mut input, 30, 5);
+            for (row, text) in ["four", "five", "1 image"].iter().enumerate() {
+                assert!(rendered_row(&terminal, row as u16 + 1).contains(text));
+            }
+        }
+        input.scroll_to_line(1);
+        let terminal = render_input(&mut input, 30, 5);
+        for (row, text) in ["one", "two", "three"].iter().enumerate() {
+            assert!(rendered_row(&terminal, row as u16 + 1).contains(text));
+        }
+        input.set_input("short\ntail".into());
+        let terminal = render_input(&mut input, 30, 5);
+        assert_eq!(input.scroll_y(), 0);
+        assert!(rendered_row(&terminal, 1).contains("short"));
+        assert!(rendered_row(&terminal, 2).contains("tail"));
+    }
+
+    #[test]
+    fn newline_only_buffer_renders_without_placeholder() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.set_input("\n\n".into());
+        input.buffer.move_to_end();
+        let terminal = render_input(&mut input, 30, 6);
+        assert!(!rendered_row(&terminal, 1).contains("Ask makima"));
+        let cursor = terminal.backend().buffer().cell((2, 3)).unwrap();
+        assert!(cursor.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

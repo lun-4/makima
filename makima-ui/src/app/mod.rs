@@ -2032,7 +2032,7 @@ impl App {
             return Some(self.handle_picker_key(PickerId::File, key));
         }
 
-        if self.queue.focus().is_some() {
+        if !key::BACKGROUND.matches(key) && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -2343,9 +2343,6 @@ impl App {
             return vec![];
         }
 
-        if self.focused_streaming() {
-            self.file_completion.close();
-        }
         if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
             let action = self.input_box.handle_key(key);
             return self.handle_input_action(action);
@@ -2551,7 +2548,7 @@ impl App {
     fn sync_file_completion(&mut self) {
         let cwd = self.focused_cwd().to_string_lossy().into_owned();
         self.command_palette.set_cwd(Arc::from(cwd.as_str()));
-        if self.focused_streaming() || self.typed_path_completion_context().is_some() {
+        if self.typed_path_completion_context().is_some() {
             self.file_completion.close();
             return;
         }
