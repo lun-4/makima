@@ -5,6 +5,7 @@
 -- the agent loop, tools and permissions: the bridge offers Makima's tools to
 -- Claude and ends a step when Claude calls one.
 
+local anthropic = require("providers.anthropic_provider")
 local http = require("providers.http")
 local sse = require("providers.sse")
 
@@ -22,6 +23,9 @@ local BASE_URL = "http://claude-agent"
 local STATUS_PATH = "/v1/status"
 local MODELS_PATH = "/v1/models"
 local STEPS_PATH = "/v1/steps"
+local USAGE_PATH = "/v1/usage"
+local NOT_FOUND = 404
+local CREDITS = "Credits"
 local END_PATH = "/v1/conversations/%s/end"
 local CONTENT_TYPE = { ["Content-Type"] = "application/json" }
 local LONG_CONTEXT_SUFFIX = "[1m]"
@@ -146,6 +150,27 @@ function M.describe(row)
   }
 end
 
+-- The login's plan usage from the bridge, or nil where plan limits do not
+-- apply. Claude Code reports the windows of claude.ai's usage endpoint, which
+-- the anthropic provider already reads, plus per-model weekly windows, listed
+-- here before the extra-usage credits.
+function M.parse_usage(body)
+  local usage = type(body) == "table" and body.usage
+  if type(usage) ~= "table" or usage.available ~= true or type(usage.rate_limits) ~= "table" then
+    return nil
+  end
+  local rate_limits = usage.rate_limits
+  local limits = anthropic.parse_usage(rate_limits).limits
+  local credits = #limits > 0 and limits[#limits].kind == CREDITS and table.remove(limits) or nil
+  for _, row in ipairs(type(rate_limits.model_scoped) == "table" and rate_limits.model_scoped or {}) do
+    if type(row) == "table" and type(row.display_name) == "string" then
+      limits[#limits + 1] = anthropic.window_limit({ Weekly = { model = row.display_name } }, row)
+    end
+  end
+  limits[#limits + 1] = credits
+  return { plan = type(usage.plan) == "string" and usage.plan or nil, limits = limits }
+end
+
 -- Reads the step's event stream: events go to {emit}, and the one terminal
 -- frame is the result or the bridge's error table. The step may have
 -- advanced Claude's session by the time the stream breaks, so a broken
@@ -195,7 +220,7 @@ function M.provider(cache)
     },
     docs = {
       endpoint = "unix:<state dir>/claude-agent/bridge.sock",
-      notes = "Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider.",
+      notes = "Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider. With a Claude subscription login, the usage view shows your plan's 5-hour and weekly limits; an API key login has none.",
     },
   }
 
@@ -244,6 +269,12 @@ function M.provider(cache)
         makima.log.warn("claude-agent: model cache not written: " .. write_err)
       end
     end
+    local account = type(body.account) == "table" and body.account or {}
+    if account.api_provider == "firstParty" and (account.subscription == "pro" or account.subscription == "max") then
+      for _, model in ipairs(models) do
+        model.subsidised_by = "Claude " .. account.subscription:gsub("^%l", string.upper)
+      end
+    end
     return models
   end
 
@@ -270,6 +301,26 @@ function M.provider(cache)
         return nil, refused(response)
       end
       return M.read_step(response, emit)
+    end
+
+    -- A bridge older than the usage route answers 404: no usage, not an error.
+    function instance.fetch_usage(ctx)
+      local response, err = send(ctx, socket, "GET", USAGE_PATH)
+      if not response then
+        return nil, unreachable(socket, err)
+      end
+      if response.status == NOT_FOUND then
+        response:close()
+        return nil
+      end
+      if response.status ~= 200 then
+        return nil, refused(response)
+      end
+      local body, read_err = http.read_json(response)
+      if not body then
+        return nil, read_err
+      end
+      return M.parse_usage(body)
     end
 
     function instance.end_conversation(ctx, conversation_id, reason)

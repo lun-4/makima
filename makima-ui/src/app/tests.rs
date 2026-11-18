@@ -1035,6 +1035,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         model: model.into(),
         cost,
         list_cost: None,
+        subsidy_source: None,
         context_size: None,
         context_window: 0,
     }))
@@ -11046,6 +11047,13 @@ fn completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
     (tmp, app, backend)
 }
 
+fn streaming_completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
+    let (tmp, mut app, backend) = completion_app();
+    app.status = Status::Streaming;
+    assert!(app.focused_streaming());
+    (tmp, app, backend)
+}
+
 fn write_completion_fixture(cwd: &Path, rel: &str, content: &str) {
     let path = cwd.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -11092,6 +11100,24 @@ fn typing_at_opens_popup() {
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(app.file_completion.is_active());
     assert_eq!(app.input_box.buffer.value(), "@");
+}
+
+#[test]
+fn at_completion_works_while_streaming() {
+    let (_tmp, mut app, backend) = streaming_completion_app();
+    seed_skill(&backend, "review");
+    for c in "@skill:rev".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+    assert!(app.file_completion.is_active());
+    assert!(
+        rendered_rows(&mut app, 80, 24)
+            .iter()
+            .any(|row| row.contains("skill:review"))
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "@skill:review");
 }
 
 #[test]
@@ -12723,9 +12749,90 @@ fn final_history_after_subagent_closed_only_persists_messages() {
 }
 
 #[test]
+fn chat_costs_survive_session_roundtrip() {
+    let mut app = app_with_subagent();
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    app.update(sub_turn_complete());
+    app.sync_subagents();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    app.state.session = Arc::new(AppSession::load(id, &dir).unwrap());
+    app.reset_ui_chrome();
+    app.restore_display();
+
+    assert_eq!(app.chats[0].cost, MAIN_COST);
+    assert_eq!(app.chats[1].cost, SUB_COST);
+    assert_eq!(app.state.cost, Some(MAIN_COST.unwrap() + SUB_COST.unwrap()));
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    assert_eq!(app.chats[0].cost, Some(MAIN_COST.unwrap() * 2.0));
+    assert_eq!(app.chats[1].cost, SUB_COST);
+}
+
+#[test]
+fn subsidy_sources_survive_model_switch_and_resume() {
+    const FIRST: &str = "first plan";
+    const SECOND: &str = "second plan";
+    const FIRST_COST: f64 = 0.25;
+    const SECOND_COST: f64 = 0.5;
+    const LEGACY_COST: f64 = 0.125;
+    let mut app = app_with_subagent();
+    for (source, list) in [
+        (Some(FIRST), FIRST_COST),
+        (Some(SECOND), SECOND_COST),
+        (None, LEGACY_COST),
+    ] {
+        let mut event = turn_complete(MAIN_TOKENS, "same-model-id", Some(0.0));
+        if let AgentEvent::TurnComplete(turn) = &mut event {
+            turn.list_cost = Some(list);
+            turn.subsidy_source = source.map(Arc::from);
+        }
+        app.update(agent_msg(event));
+    }
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    app.state.session = Arc::new(AppSession::load(id, &dir).unwrap());
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_eq!(app.chats[0].list_cost, Some(LEGACY_COST));
+    assert_eq!(
+        app.chats[0].list_cost_by_source.get(FIRST),
+        Some(&FIRST_COST)
+    );
+    assert_eq!(
+        app.chats[0].list_cost_by_source.get(SECOND),
+        Some(&SECOND_COST)
+    );
+}
+
+#[test]
+fn legacy_session_does_not_attribute_aggregate_cost_to_main_chat() {
+    let mut app = test_app();
+    app.state.cost = MAIN_COST;
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_eq!(app.state.cost, MAIN_COST);
+    assert_eq!(app.chats[0].cost, None);
+}
+
+#[test]
 fn turn_complete_after_subagent_closed_only_accounts_usage() {
     const MODEL: &str = "delayed-model";
     const COST: f64 = 0.125;
+    const LIST: f64 = 0.75;
+    const SOURCE: &str = "subscription";
 
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
@@ -12745,14 +12852,20 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
         subagent: Some(info.clone()),
         identity: Some(work_identity(1)),
     })));
+    app.live_chat_index.remove(&agent_id);
+    let mut late = turn_complete(usage, MODEL, Some(COST));
+    if let AgentEvent::TurnComplete(turn) = &mut late {
+        turn.list_cost = Some(LIST);
+        turn.subsidy_source = Some(SOURCE.into());
+    }
     app.update(Msg::Agent(Box::new(Envelope {
-        event: turn_complete(usage, MODEL, Some(COST)),
+        event: late,
         subagent: Some(info),
         identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.state.token_usage, usage);
-    assert_eq!(app.chats[chat_idx].cost, Some(COST));
+    assert_eq!(app.chats[chat_idx].cost, None);
     assert_eq!(app.chats.len(), chat_count);
     assert!(app.chats[chat_idx].is_finished());
     assert!(app.active_subagent_closed());
@@ -12764,7 +12877,22 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
     app.state.session_mut().save(&dir).unwrap();
     let persisted = AppSession::load(session_id, &dir).unwrap();
     assert_eq!(persisted.usage_by_model().len(), 1);
-    assert_eq!(persisted.usage_by_model()[MODEL], usage.billed(Some(COST)));
+    assert_eq!(
+        persisted.usage_by_model()[MODEL],
+        usage.billed_with_list_cost(Some(COST), Some(LIST))
+    );
+    assert_eq!(
+        persisted.chat_usage(Some(TASK_ID)),
+        Some(&usage.billed(Some(COST)))
+    );
+    assert_eq!(persisted.chat_usage(None), None);
+    assert_eq!(
+        persisted
+            .chat_list_cost_by_source(Some(TASK_ID))
+            .unwrap()
+            .get(SOURCE),
+        Some(&LIST)
+    );
 }
 
 #[test]
@@ -14149,14 +14277,38 @@ fn plan_ready_fires_once_per_draft() {
     assert!(app.state.plan.is_ready());
 }
 
-#[test]
-fn ctrl_b_asks_the_session_to_move_the_running_call() {
-    let mut app = test_app();
+#[test_case(Some(1) ; "focused_queue")]
+#[test_case(None ; "unfocused_queue")]
+fn ctrl_b_backgrounds_the_running_call_without_changing_the_queue(focus: Option<usize>) {
+    let mut app = app_with_queued_message();
+    app.update(agent_msg(tool_start("call", "bash")));
+    app.queue_and_notify(queued_msg("second"));
+    if let Some(index) = focus {
+        app.queue.set_focus_at(index);
+    }
+
     let actions = app.update(Msg::Key(kb::BACKGROUND.to_key_event()));
+
     assert!(matches!(
         actions.as_slice(),
-        [Action::MoveToBackground { .. }]
+        [Action::MoveToBackground { agent }] if *agent == app.selected_agent_id()
     ));
+    assert_eq!(app.queue.text_messages(), ["queued", "second"]);
+    assert_eq!(app.queue.focus(), focus);
+}
+
+#[test]
+fn focused_queue_ctrl_b_respects_override_and_picker_precedence() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+    let key = kb::BACKGROUND.to_key_event();
+    let _probe = install_override(&mut app, key.code, key.modifiers);
+
+    let actions = app.update(Msg::Key(key));
+    assert!(matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]));
+
+    app.open_tasks();
+    assert!(app.update(Msg::Key(key)).is_empty());
 }
 
 #[test]

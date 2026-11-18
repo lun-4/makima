@@ -61,7 +61,9 @@ Rust workspace, key crates in root dir:
 - makima-acp: ACP ndjson stdio server
 - claude-agent-bridge: TypeScript bridge that serves the `claude-agent` provider through the Claude Agent SDK over a Unix socket (`just bridge-check`)
 
-Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch, splash (the home-screen renderer; it owns the version UI via `makima.version()`), providers (every built-in provider, the models.dev catalog providers, and custom and executable providers from `providers.toml` and `providers/`).
+Invariant: no `Drop` reachable from Lua touches the VM. Luau can free a coroutine, userdata, or closure capture inside a GC sweep, where any `Lua` call aborts the process: a silent SIGSEGV on macOS. Such types hold no `Lua`; they park work in a Lua-free queue (`JobStore`'s released receivers, `DepthGuard`'s `Arc<Mutex>`) and the next safe point applies it. Run Lua callbacks through `Function::call_async`, never `Thread::into_async` (clippy enforces it): an abandoned coroutine future would otherwise be dropped by the collector.
+
+Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task, code_execution (python sandbox), batch, splash (the home-screen renderer; it owns the version UI via `makima.version()`), providers (every built-in provider, the models.dev catalog providers, and custom providers from `providers.toml`).
 
 ## Providers
 

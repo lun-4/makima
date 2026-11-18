@@ -1,7 +1,7 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -64,6 +64,7 @@ pub struct Chat {
     /// This chat's list-price reference, `None` until a turn a subscription
     /// prepaid lands here.
     pub list_cost: Option<f64>,
+    pub list_cost_by_source: BTreeMap<String, f64>,
     pub context_size: u32,
     pub(crate) retry_info: Option<RetryInfo>,
     pub model_id: Option<String>,
@@ -91,6 +92,7 @@ impl Chat {
             name,
             cost: None,
             list_cost: None,
+            list_cost_by_source: BTreeMap::new(),
             context_size: 0,
             retry_info: None,
             model_id: None,
@@ -1074,6 +1076,7 @@ mod tests {
                 model: String::new(),
                 cost: None,
                 list_cost: None,
+                subsidy_source: None,
                 context_size: None,
                 context_window: 0,
             })),

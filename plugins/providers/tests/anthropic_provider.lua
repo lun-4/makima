@@ -286,7 +286,7 @@ t.case("parse_usage_reads_limits_then_credits", function()
     limits = {
       { kind = { Hours = 5 }, percentage = 14, reset_at = RESET_MS },
       { kind = { Weekly = {} }, percentage = 2, reset_at = WEEK_RESET_MS },
-      { kind = { Weekly = { model = "Fable" } }, percentage = 3, reset_at = WEEK_RESET_MS },
+      { kind = { Weekly = { model = "Fable" } }, percentage = 3, reset_at = WEEK_RESET_MS, ui_shortname_hint = "f" },
       { kind = "Credits", percentage = 2, detail = "$2.33 spent" },
     },
   })
@@ -304,8 +304,8 @@ t.case("parse_usage_falls_back_to_windows", function()
     limits = {
       { kind = { Hours = 5 }, percentage = 35, reset_at = RESET_MS },
       { kind = { Weekly = {} }, percentage = 14 },
-      { kind = { Weekly = { model = "Sonnet" } }, percentage = 39 },
-      { kind = { Weekly = { model = "Opus" } }, percentage = 3 },
+      { kind = { Weekly = { model = "Sonnet" } }, percentage = 39, ui_shortname_hint = "s" },
+      { kind = { Weekly = { model = "Opus" } }, percentage = 3, ui_shortname_hint = "o" },
       { kind = "Credits", percentage = 2, detail = "2.33 EUR spent" },
     },
   })

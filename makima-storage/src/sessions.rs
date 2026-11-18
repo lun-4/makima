@@ -253,6 +253,10 @@ pub struct Session<M, U, T> {
     subagents: Vec<StoredSubagent>,
     posts: Vec<StoredPost>,
     usage_by_model: HashMap<String, StoredTokenUsage>,
+    main_chat_usage: Option<StoredTokenUsage>,
+    child_chat_usage: HashMap<String, StoredTokenUsage>,
+    main_chat_list_cost_by_source: BTreeMap<String, f64>,
+    child_chat_list_cost_by_source: HashMap<String, BTreeMap<String, f64>>,
     pub meta: SessionMeta,
     pub created_at: u64,
     pub updated_at: u64,
@@ -442,6 +446,14 @@ enum LogRecord<M, U, T> {
         subagent_conversations: HashMap<String, Arc<str>>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        main_chat_usage: Box<Option<StoredTokenUsage>>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        child_chat_usage: HashMap<String, StoredTokenUsage>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        main_chat_list_cost_by_source: BTreeMap<String, f64>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        child_chat_list_cost_by_source: HashMap<String, BTreeMap<String, f64>>,
         #[serde(flatten)]
         meta: Box<SessionMeta>,
     },
@@ -871,6 +883,10 @@ where
             subagents: session.subagents.clone(),
             subagent_conversations: session.subagent_conversations.clone(),
             usage_by_model: session.usage_by_model.clone(),
+            main_chat_usage: Box::new(session.main_chat_usage),
+            child_chat_usage: session.child_chat_usage.clone(),
+            main_chat_list_cost_by_source: session.main_chat_list_cost_by_source.clone(),
+            child_chat_list_cost_by_source: session.child_chat_list_cost_by_source.clone(),
             meta: Box::new(session.meta.clone()),
         },
     )?;
@@ -958,6 +974,10 @@ where
     let mut subagent_conversations = HashMap::new();
     let mut posts = Vec::new();
     let mut usage_by_model = HashMap::new();
+    let mut main_chat_usage = None;
+    let mut child_chat_usage = HashMap::new();
+    let mut main_chat_list_cost_by_source = BTreeMap::new();
+    let mut child_chat_list_cost_by_source = HashMap::new();
     let mut meta = SessionMeta::default();
     for line in data.split(|&b| b == b'\n') {
         line_count += 1;
@@ -1021,6 +1041,10 @@ where
                 subagents: m_subagents,
                 subagent_conversations: m_subagent_conversations,
                 usage_by_model: m_usage_by_model,
+                main_chat_usage: m_main_chat_usage,
+                child_chat_usage: m_child_chat_usage,
+                main_chat_list_cost_by_source: m_main_sources,
+                child_chat_list_cost_by_source: m_child_sources,
                 meta: m_meta,
             } => {
                 title = m_title;
@@ -1029,6 +1053,10 @@ where
                 subagents = m_subagents;
                 subagent_conversations = m_subagent_conversations;
                 usage_by_model = m_usage_by_model;
+                main_chat_usage = *m_main_chat_usage;
+                child_chat_usage = m_child_chat_usage;
+                main_chat_list_cost_by_source = m_main_sources;
+                child_chat_list_cost_by_source = m_child_sources;
                 meta = *m_meta;
             }
         }
@@ -1056,6 +1084,10 @@ where
         subagents,
         posts,
         usage_by_model,
+        main_chat_usage,
+        child_chat_usage,
+        main_chat_list_cost_by_source,
+        child_chat_list_cost_by_source,
         meta,
         created_at,
         updated_at,
@@ -1351,6 +1383,10 @@ where
             subagents: Vec::new(),
             posts: Vec::new(),
             usage_by_model: HashMap::new(),
+            main_chat_usage: None,
+            child_chat_usage: HashMap::new(),
+            main_chat_list_cost_by_source: BTreeMap::new(),
+            child_chat_list_cost_by_source: HashMap::new(),
             meta: SessionMeta {
                 mode: Some(StoredMode::Build),
                 ..Default::default()
@@ -1658,6 +1694,41 @@ where
         }
         self.model = model;
         self.rewrite();
+    }
+
+    pub fn chat_usage(&self, child: Option<&str>) -> Option<&StoredTokenUsage> {
+        match child {
+            Some(id) => self.child_chat_usage.get(id),
+            None => self.main_chat_usage.as_ref(),
+        }
+    }
+
+    pub fn add_chat_usage(&mut self, child: Option<&str>, usage: StoredTokenUsage) {
+        let total = match child {
+            Some(id) => self.child_chat_usage.entry(id.to_owned()).or_default(),
+            None => self.main_chat_usage.get_or_insert_default(),
+        };
+        *total += usage;
+        self.touch();
+    }
+
+    pub fn chat_list_cost_by_source(&self, child: Option<&str>) -> Option<&BTreeMap<String, f64>> {
+        match child {
+            Some(id) => self.child_chat_list_cost_by_source.get(id),
+            None => Some(&self.main_chat_list_cost_by_source),
+        }
+    }
+
+    pub fn add_chat_list_cost_source(&mut self, child: Option<&str>, source: &str, cost: f64) {
+        let sources = match child {
+            Some(id) => self
+                .child_chat_list_cost_by_source
+                .entry(id.to_owned())
+                .or_default(),
+            None => &mut self.main_chat_list_cost_by_source,
+        };
+        *sources.entry(source.to_owned()).or_default() += cost;
+        self.touch();
     }
 
     pub fn add_model_usage(&mut self, model: &str, usage: StoredTokenUsage) {
@@ -2137,6 +2208,59 @@ mod tests {
     }
 
     #[test]
+    fn chat_usage_roundtrip_keeps_chats_separate() {
+        let tmp = TempDir::new().unwrap();
+        let mut session: TestSession = Session::new("model", "/project");
+        let main = super::StoredTokenUsage {
+            input: 10,
+            cost: Some(SONNET_COST),
+            list_cost: Some(HAIKU_COST),
+            ..Default::default()
+        };
+        let child = super::StoredTokenUsage {
+            output: 20,
+            cost: Some(HAIKU_COST),
+            ..Default::default()
+        };
+        session.add_chat_usage(None, main);
+        session.add_chat_usage(Some("child"), child);
+        session.add_chat_list_cost_source(None, "first", SONNET_COST);
+        session.add_chat_list_cost_source(None, "second", HAIKU_COST);
+        session.add_chat_list_cost_source(Some("child"), "first", HAIKU_COST);
+        session.save_to(tmp.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.chat_usage(None), Some(&main));
+        assert_eq!(loaded.chat_usage(Some("child")), Some(&child));
+        assert_eq!(loaded.chat_usage(Some("other")), None);
+        assert_eq!(
+            loaded.chat_list_cost_by_source(None).unwrap().get("first"),
+            Some(&SONNET_COST)
+        );
+        assert_eq!(
+            loaded.chat_list_cost_by_source(None).unwrap().get("second"),
+            Some(&HAIKU_COST)
+        );
+        assert_eq!(
+            loaded
+                .chat_list_cost_by_source(Some("child"))
+                .unwrap()
+                .get("first"),
+            Some(&HAIKU_COST)
+        );
+        assert_eq!(loaded.chat_list_cost_by_source(Some("other")), None);
+        loaded.add_chat_list_cost_source(Some("child"), "first", HAIKU_COST);
+        loaded.save_to(tmp.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(
+            loaded.chat_list_cost_by_source(Some("child")).unwrap()["first"],
+            2.0 * HAIKU_COST
+        );
+        loaded.add_chat_usage(Some("child"), child);
+        assert_eq!(loaded.chat_usage(Some("child")).unwrap().output, 40);
+        assert_eq!(loaded.chat_usage(None), Some(&main));
+    }
+
+    #[test]
     fn roundtrip_usage_by_model() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2222,6 +2346,8 @@ mod tests {
         fs::write(tmp.path().join(format!("{FIXTURE_ID}.jsonl")), json).unwrap();
 
         let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        assert_eq!(loaded.chat_usage(None), None);
+        assert_eq!(loaded.chat_usage(Some("child")), None);
         let entry = loaded.usage_by_model()["m"];
         assert_eq!(entry.cost, None, "no key means unpriced, not free");
         assert_eq!((entry.input, entry.output), (7, 3));

@@ -99,7 +99,7 @@ makima auth status
 
 `login` and the TUI's `/login` run the same flow. You name a provider or pick one from the list, answer the settings it asks for (a plan, a base URL), and choose a login method. Each provider brings its own methods, such as pasting an API key, a device code in the browser for a ChatGPT login, or importing an existing Copilot token. A login alias like `openai-codex` skips the method question. Settings are written to `providers.toml` only after the login works, so a cancelled login leaves nothing behind. Credentials go to `auth/<provider>.json` in the state directory, readable only by you (paths in [Configuration](/docs/configuration/#directory-layout)). The provider's strong default becomes your model.
 
-Pick **Custom provider...** to add an endpoint of your own. An [executable provider](/docs/providers/#executable-providers) with its own login runs that login on your terminal, so it works from `makima auth login` but not from the TUI.
+Pick **Custom provider...** to add an endpoint of your own.
 
 `logout` deletes the saved credentials and the provider's `providers.toml` section.
 
@@ -114,7 +114,7 @@ makima models
 makima models --refresh    # refetch the models.dev catalog
 ```
 
-One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+One spec per line, warnings on stderr. Built-in and custom providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
 
 ### `makima sessions`
 

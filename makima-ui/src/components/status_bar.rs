@@ -1,5 +1,7 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,12 +47,9 @@ pub struct UsageStats {
     pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
-    /// What this chat's turns would have cost at list rates, shown beside
-    /// `cost` only while a subscription covers the bill.
+    /// List-rate cost of subsidised turns with no recorded source.
     pub list_cost: Option<f64>,
-    /// Name of the subscription covering the bill, `None` when the model is
-    /// metered and there is no reference figure to show.
-    pub subsidy_source: Option<Arc<str>>,
+    pub list_cost_by_source: BTreeMap<String, f64>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -319,17 +318,19 @@ impl StatusBar {
                     format_tokens(ctx.stats.context_window),
                     pct,
                 );
-                let rest_text = match (
-                    ctx.stats.cost,
-                    ctx.stats.list_cost,
-                    &ctx.stats.subsidy_source,
-                ) {
-                    (Some(cost), Some(list), Some(source)) if list > 0.0 => {
-                        format!("{context_text} ${cost:.3} (~${list:.3} {source}) ")
+                let mut rest_text = context_text;
+                if let Some(cost) = ctx.stats.cost {
+                    rest_text.push_str(&format!(" ${cost:.3}"));
+                }
+                for (source, list) in &ctx.stats.list_cost_by_source {
+                    if *list > 0.0 {
+                        rest_text.push_str(&format!(" (~${list:.3} {source})"));
                     }
-                    (Some(cost), _, _) => format!("{context_text} ${cost:.3} "),
-                    (None, _, _) => format!("{context_text} "),
-                };
+                }
+                if let Some(list) = ctx.stats.list_cost.filter(|list| *list > 0.0) {
+                    rest_text.push_str(&format!(" (~${list:.3} list)"));
+                }
+                rest_text.push(' ');
                 rest_spans.push(Span::styled(
                     rest_text,
                     Style::new().fg(theme::current().foreground),
@@ -646,7 +647,6 @@ mod tests {
     const CHAT_COST_TEXT: &str = "$0.250";
     const SESSION_COST: f64 = 1.5;
     const LIST_COST: f64 = 0.75;
-    const SUBSIDY_SOURCE: &str = "Max";
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
     const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -679,7 +679,7 @@ mod tests {
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
                 list_cost: None,
-                subsidy_source: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -826,7 +826,7 @@ mod tests {
             context_size: CONTEXT_SIZE,
             cost: Some(CHAT_COST),
             list_cost: None,
-            subsidy_source: None,
+            list_cost_by_source: BTreeMap::new(),
             context_window: crate::components::TEST_CONTEXT_WINDOW,
             show_global,
         })
@@ -841,23 +841,65 @@ mod tests {
             context_size: CONTEXT_SIZE,
             cost: Some(0.0),
             list_cost: Some(LIST_COST),
-            subsidy_source: Some(SUBSIDY_SOURCE.into()),
+            list_cost_by_source: BTreeMap::new(),
             context_window: crate::components::TEST_CONTEXT_WINDOW,
             show_global: false,
         });
         assert!(
-            text.contains(&format!("(~${LIST_COST:.3} {SUBSIDY_SOURCE})")),
+            text.contains(&format!("(~${LIST_COST:.3} list)")),
             "no list price in:\n{text}"
         );
     }
 
-    /// A metered bill has no reference figure to add, so it must stay one
-    /// plain number even if a stale list total is lying around.
     #[test]
     fn a_metered_chat_shows_only_its_bill() {
         let text = render(None, false);
         assert!(text.contains(CHAT_COST_TEXT), "{text}");
         assert!(!text.contains("(~$"), "{text}");
+    }
+
+    #[test]
+    fn mixed_metered_and_subsidised_turns_show_historical_list_cost() {
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: Some(LIST_COST),
+            list_cost_by_source: BTreeMap::new(),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(text.contains(CHAT_COST_TEXT), "{text}");
+        assert!(text.contains(&format!("(~${LIST_COST:.3} list)")), "{text}");
+    }
+
+    #[test]
+    fn multiple_sources_and_legacy_total_are_displayed_separately() {
+        const FIRST_SOURCE: &str = "First";
+        const SECOND_SOURCE: &str = "Second";
+        const FIRST_COST: f64 = 0.25;
+        const SECOND_COST: f64 = 0.5;
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: Some(LIST_COST),
+            list_cost_by_source: BTreeMap::from([
+                (FIRST_SOURCE.into(), FIRST_COST),
+                (SECOND_SOURCE.into(), SECOND_COST),
+            ]),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(
+            text.contains(&format!("(~${FIRST_COST:.3} {FIRST_SOURCE})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("(~${SECOND_COST:.3} {SECOND_SOURCE})")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("(~${LIST_COST:.3} list)")), "{text}");
     }
 
     fn render_stats(stats: UsageStats) -> String {
@@ -912,7 +954,7 @@ mod tests {
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
                 list_cost: None,
-                subsidy_source: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -965,7 +1007,7 @@ mod tests {
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
                 list_cost: None,
-                subsidy_source: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -1223,7 +1265,7 @@ mod tests {
                 context_size: 0,
                 cost: None,
                 list_cost: None,
-                subsidy_source: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: 0,
                 show_global: false,
             },

@@ -152,7 +152,8 @@ function M.status_content(state)
         spans[#spans + 1] = { " ", "status_dim" }
       end
       local _, short = M.kind(limit.window or limit.kind)
-      spans[#spans + 1] = { short .. math.floor(percentage) .. "%", percentage_style(percentage) }
+      local hint = type(limit.ui_shortname_hint) == "string" and limit.ui_shortname_hint or ""
+      spans[#spans + 1] = { short .. hint .. math.floor(percentage) .. "%", percentage_style(percentage) }
     end
   end
   return spans

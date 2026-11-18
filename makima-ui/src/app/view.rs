@@ -1,5 +1,4 @@
 use makima_providers::ThinkingConfigExt;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::click::{ClickTarget, HitTarget, PickerId, ScrollOwner, Surface};
@@ -360,7 +359,7 @@ impl App {
                 self.hits
                     .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Input));
             }
-            if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
+            if !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
                 let hits = self.file_completion.hits();
                 self.absorb_hits(hits);
@@ -566,10 +565,7 @@ impl App {
                 context_size: chat.context_size,
                 cost: chat.cost,
                 list_cost: chat.list_cost,
-                subsidy_source: config
-                    .as_ref()
-                    .and_then(|config| config.model.subsidy_source())
-                    .map(Arc::from),
+                list_cost_by_source: chat.list_cost_by_source.clone(),
                 context_window: if let Some(config) = &config {
                     config.model.context_window
                 } else if self.focused_streaming() {

@@ -130,7 +130,7 @@ async fn open_browser(_lua: Lua, this: UserDataRef<LoginUi>, url: String) -> Lua
 /// @param argv table The program and its arguments.
 /// @return (boolean?, string?) true once the program exited successfully, or nil plus an error.
 /// @example
-/// local ok, err = ui:run({ "/home/me/.config/makima/providers/corp", "login" })
+/// local ok, err = ui:run({ "gh", "auth", "login" })
 #[lua_fn]
 async fn run(_lua: Lua, this: UserDataRef<LoginUi>, argv: Vec<String>) -> LuaResult<Pair<bool>> {
     Ok(notify(this, InteractionRequest::Terminal(argv)).await)

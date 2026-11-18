@@ -264,12 +264,18 @@ impl App {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
-        let cost = self.state.cost;
-        let list_cost = self.state.list_cost;
+        let usage = self.state.session.chat_usage(None).copied();
+        let sources = self
+            .state
+            .session
+            .chat_list_cost_by_source(None)
+            .cloned()
+            .unwrap_or_default();
         let context_size = self.state.context_size;
         let main = self.main_chat();
-        main.cost = cost;
-        main.list_cost = list_cost;
+        main.cost = usage.and_then(|usage| usage.cost);
+        main.list_cost = usage.and_then(|usage| usage.list_cost);
+        main.list_cost_by_source = sources;
         main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.clone() {
             self.refresh_at_ref_labels(&draft);
@@ -291,6 +297,17 @@ impl App {
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.subagent_id = Some(sa.tool_use_id.clone());
+            if let Some(usage) = self.state.session.chat_usage(Some(&sa.tool_use_id)) {
+                chat.cost = usage.cost;
+                let sources = self
+                    .state
+                    .session
+                    .chat_list_cost_by_source(Some(&sa.tool_use_id))
+                    .cloned()
+                    .unwrap_or_default();
+                chat.list_cost = usage.list_cost;
+                chat.list_cost_by_source = sources;
+            }
             chat.model_id = sa.model;
             chat.opts = sa.thinking.map(|thinking| RequestOptions {
                 thinking: thinking.into(),

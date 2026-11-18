@@ -20,10 +20,12 @@ M.EMPTY_MODELS_ERROR = "Codex models response listed no visible models; the endp
 M.TIMEOUT_ERROR = "device authorization timed out"
 -- The backend hides models newer than this Codex CLI version, so bump it
 -- when a fresh model is missing from the list.
-M.CODEX_CLIENT_VERSION = "0.153.4"
+M.CODEX_CLIENT_VERSION = "0.169.0"
 -- Offline fallback; the backend's `/models` is the source of truth. Codex
 -- models match by their `-codex` substring, so they are not listed.
 M.PLAN_MODELS = {
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
   "gpt-6.1-sol",
   "gpt-6.1-terra",
   "gpt-6-astra",
@@ -56,9 +58,9 @@ local IMAGE = "image"
 local CODEX_MARKER = "-codex"
 local CODEX_WINDOW = 272000
 local GPT_5_6_PLAN_WINDOW = 372000
--- GPT-6.1's default context on Codex went up to 500k (max 1M).
-local GPT_6_1_PLAN_WINDOW = 500000
-local GPT_6_1_PREFIXES = { "gpt-6.1-sol", "gpt-6.1-terra" }
+-- GPT-6.1 and GPT-6.2 Sol default to 500k in Codex (max 1M).
+local PLAN_WINDOW_500K = 500000
+local PLAN_WINDOW_500K_PREFIXES = { "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-sol" }
 local GPT_5_6_PREFIX = "gpt-5.6-"
 local DEFAULT_INTERVAL = 5
 local POLL_MARGIN = 3
@@ -97,7 +99,7 @@ end
 
 local GPT_5_6_MAX_OUTPUT = 128000
 local GPT_5_6_WINDOW = 372000
-local GPT_6_WINDOW = 272000
+local GPT_6_WINDOW = 1050000
 local CODEX_MAX_OUTPUT = 128000
 local CODEX_API_WINDOW = 400000
 
@@ -119,7 +121,7 @@ M.def = {
   env = "OPENAI_API_KEY",
   base_url = "https://api.openai.com/v1",
   login_url = "https://platform.openai.com/api-keys",
-  model = "gpt-5.5",
+  model = "gpt-6.2-sol",
   notes = NOTES,
   max_tokens_field = MAX_TOKENS_FIELD,
   include_stream_usage = true,
@@ -131,14 +133,16 @@ M.def = {
     supports_tool_examples = true,
   },
   models = {
+    row("gpt-6.2-sol", "strong", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
+    row("gpt-6.2-astra", "strong", pricing(8.00, 40.00, 10.00, 0.40), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
+    row("gpt-6-luna", "weak", pricing(0.10, 0.50, 0.125, 0.01), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.6-luna", "weak", pricing(1.00, 6.00, 1.25, 0.10), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
+    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.6-terra", "medium", pricing(2.50, 15.00, 3.125, 0.25), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
     row("gpt-5.6-sol", "strong", pricing(5.00, 30.00, 6.25, 0.50), GPT_5_6_MAX_OUTPUT, GPT_5_6_WINDOW),
-    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_1_PLAN_WINDOW),
-    row("gpt-6.1-terra", "medium", pricing(1.00, 5.00, 1.25, 0.05), GPT_5_6_MAX_OUTPUT, GPT_6_1_PLAN_WINDOW),
+    row("gpt-6.1-sol", "medium", pricing(2.00, 10.00, 2.50, 0.10), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-astra", "strong", pricing(10.00, 50.00, 12.50, 1.00), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-6-sol", "medium", pricing(2.00, 10.00, 2.50, 0.20), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
-    row("gpt-6-luna", "weak", pricing(0.10, 0.50, 0.125, 0.01), GPT_5_6_MAX_OUTPUT, GPT_6_WINDOW),
     row("gpt-5.4-nano", "weak", pricing(0.20, 1.25, 0, 0.02), 128000, 400000),
     row("gpt-5.4-mini", "weak", pricing(0.75, 4.50, 0, 0.075), 128000, 400000),
     row("gpt-4.1-nano", "weak", pricing(0.10, 0.40, 0, 0.025), 32768, 1047576),
@@ -177,15 +181,21 @@ end
 -- without an edit; named plan models match exactly so `gpt-5.6-terra-preview`
 -- does not.
 function M.plan_window(id)
-  local gpt_6_1 = starts_with(id, GPT_6_1_PREFIXES[1]) or starts_with(id, GPT_6_1_PREFIXES[2])
+  local wide
+  for _, prefix in ipairs(PLAN_WINDOW_500K_PREFIXES) do
+    if starts_with(id, prefix) then
+      wide = PLAN_WINDOW_500K
+      break
+    end
+  end
   if id:find(CODEX_MARKER, 1, true) then
-    return gpt_6_1 and GPT_6_1_PLAN_WINDOW or CODEX_WINDOW
+    return wide or CODEX_WINDOW
   end
   if not table.find(M.PLAN_MODELS, id) then
     return nil
   end
-  if gpt_6_1 then
-    return GPT_6_1_PLAN_WINDOW
+  if wide then
+    return wide
   elseif starts_with(id, GPT_5_6_PREFIX) then
     return GPT_5_6_PLAN_WINDOW
   end
@@ -558,21 +568,6 @@ local function stream(state, config, model, ctx, request, emit)
   end)
 end
 
--- Streams {request} through {client} (`base` and `headers(extra)`), whose
--- credentials come from elsewhere: plan models speak Responses and the rest
--- Chat Completions, both with the standard effort levels.
-function M.route_stream(client, ctx, request, emit)
-  local max = thinking.max_budget(request.model)
-  local dialect = thinking.dialects.standard
-  if M.plan_window(request.model.id) then
-    local body = responses.build_request(request, responses.reasoning(request.thinking, dialect, max))
-    return responses.post_stream(ctx, client.base .. RESPONSES_PATH, client.headers(), body, emit)
-  end
-  local body = chat.build_request(request, { max_tokens_field = MAX_TOKENS_FIELD, include_stream_usage = true })
-  body.reasoning_effort = thinking.effort(request.thinking, dialect, max)
-  return http.post_stream(ctx, client.base .. CHAT_PATH, client.headers(), body, chat.stream, emit)
-end
-
 local function new_state(ctx, config)
   local configured, err = http.headers(M.def.id, {}, config.headers)
   if not configured then
@@ -614,7 +609,11 @@ function M.provider()
       end)
       discovered = true
       -- A failed listing falls back to the curated plan models.
-      return compat.merge(M.def, rows or {})
+      local models = compat.merge(M.def, rows or {})
+      for _, model in ipairs(models) do
+        model.subsidised_by = "ChatGPT"
+      end
+      return models
     end
     local body, err = authorized(ctx, config, state, function()
       return get_json(ctx, state.base .. compat.MODELS_PATH, headers(state))
@@ -631,6 +630,7 @@ function M.provider()
       return nil, err
     end
     local model = compat.describe(M.def, info)
+    model.subsidised_by = state.tokens and "ChatGPT" or nil
     -- API-key users get no opinion on fast; the host's pricing gate decides.
     if state.tokens then
       local listed = type(model.provider_data) == "table" and model.provider_data.fast ~= nil

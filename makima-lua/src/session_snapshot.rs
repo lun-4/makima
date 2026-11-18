@@ -201,6 +201,7 @@ mod tests {
             model: String::new(),
             cost: None,
             list_cost: None,
+            subsidy_source: None,
             context_size: Some(context_size),
             context_window: WINDOW,
         })))
