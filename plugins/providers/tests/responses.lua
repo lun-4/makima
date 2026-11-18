@@ -1,6 +1,12 @@
 local responses = require("providers.responses")
 local t = require("makima.test_helpers")
 
+local SUMMARY_MESSAGE = "Unsupported value for 'reasoning.summary'."
+local RETRY_URL = "https://summary-retry.test/v1/responses"
+local MESSAGE_URL = "https://summary-message.test/v1/responses"
+local OTHER_URL = "https://summary-other.test/v1/responses"
+local LATE_URL = "https://summary-late.test/v1/responses"
+
 local function sse(events)
   local frames = {}
   for _, event in ipairs(events) do
@@ -12,6 +18,74 @@ end
 local function completed(status, usage)
   return { type = "response.completed", response = { status = status, usage = usage } }
 end
+
+local function summary_body()
+  return { model = "m", reasoning = { effort = "high", summary = "auto" } }
+end
+
+local function refusal(detail)
+  return assert(makima.json.encode({ error = detail }))
+end
+
+local function reasoning_sent(request)
+  return makima.json.decode(request.body).reasoning
+end
+
+t.case("summary_refusal_retries_once_and_is_remembered", function()
+  local ctx = t.provider_ctx({
+    t.response({ refusal({ code = "unsupported_value", message = SUMMARY_MESSAGE, param = "reasoning.summary" }) }, {
+      status = 400,
+    }),
+    sse({ completed("completed", {}) }),
+    sse({ completed("completed", {}) }),
+  })
+  local body = summary_body()
+  local result = assert(responses.post_stream(ctx, RETRY_URL, {}, body, t.recorder()))
+  t.eq(#ctx.requests, 2)
+  t.same(reasoning_sent(ctx.requests[1]), { effort = "high", summary = "auto" })
+  t.same(reasoning_sent(ctx.requests[2]), { effort = "high" })
+  t.same(body, summary_body())
+  t.eq(result.stop_reason, "end_turn")
+
+  assert(responses.post_stream(ctx, RETRY_URL, {}, summary_body(), t.recorder()))
+  t.eq(#ctx.requests, 3)
+  t.same(reasoning_sent(ctx.requests[3]), { effort = "high" })
+end)
+
+t.case("refusal_naming_only_the_message_is_retried", function()
+  local ctx = t.provider_ctx({
+    t.response({ refusal({ message = SUMMARY_MESSAGE }) }, { status = 400 }),
+    sse({ completed("completed", {}) }),
+  })
+  assert(responses.post_stream(ctx, MESSAGE_URL, {}, summary_body(), t.recorder()))
+  t.eq(#ctx.requests, 2)
+  t.same(reasoning_sent(ctx.requests[2]), { effort = "high" })
+end)
+
+t.case("other_refusals_are_not_retried", function()
+  local detail =
+    refusal({ code = "unsupported_value", message = "Unsupported value: 'max'.", param = "reasoning.effort" })
+  local ctx = t.provider_ctx({ t.response({ detail }, { status = 400 }) })
+  local result, err = responses.post_stream(ctx, OTHER_URL, {}, summary_body(), t.recorder())
+  t.eq(result, nil)
+  t.eq(#ctx.requests, 1)
+  t.eq(err.status, 400)
+  t.eq(err.message, detail)
+end)
+
+t.case("summary_refusal_after_output_is_not_retried", function()
+  local ctx = t.provider_ctx({
+    sse({
+      { type = "response.output_text.delta", delta = "hi" },
+      { type = "response.failed", response = { error = { code = "unsupported_value", message = SUMMARY_MESSAGE } } },
+    }),
+    sse({ completed("completed", {}) }),
+  })
+  local result, err = responses.post_stream(ctx, LATE_URL, {}, summary_body(), t.recorder())
+  t.eq(result, nil)
+  t.eq(#ctx.requests, 1)
+  t.eq(err.message, SUMMARY_MESSAGE)
+end)
 
 t.case("build_request", function()
   local body = responses.build_request({

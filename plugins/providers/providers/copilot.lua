@@ -473,39 +473,12 @@ local function stream(state, model, ctx, request, emit)
   elseif data.route == "responses" then
     local reasoning = responses.reasoning(request.thinking, M.dialect(data), thinking.max_budget(request.model))
     local body = responses.build_request(request, reasoning)
-    return http.post_stream(
-      ctx,
-      auth.endpoint .. RESPONSES_PATH,
-      headers(state, auth, true),
-      body,
-      responses.stream,
-      emit
-    )
+    return responses.post_stream(ctx, auth.endpoint .. RESPONSES_PATH, headers(state, auth, true), body, emit)
   end
   local body = chat.build_request(request, {})
   body.n = 1
   body.temperature = TEMPERATURE
   return http.post_stream(ctx, auth.endpoint .. CHAT_PATH, headers(state, auth, true), body, chat.stream, emit)
-end
-
--- State for {client} (`base` and `headers()`), whose headers carry
--- credentials that come from elsewhere and whose base is the endpoint. The
--- model listing stays with the client.
-local function delegated(client)
-  client.copilot = client.copilot or {}
-  local state = client.copilot
-  state.configured = client.headers()
-  state.auth = { token = "", endpoint = client.base }
-  return state
-end
-
-function M.route_stream(client, model, ctx, request, emit)
-  return stream(delegated(client), model, ctx, request, emit)
-end
-
-function M.route_list(ctx, client)
-  local state = delegated(client)
-  return list(ctx, state, state.auth)
 end
 
 local function new_state(config)

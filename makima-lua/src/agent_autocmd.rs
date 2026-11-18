@@ -23,6 +23,7 @@ pub const AGENT_IDLE_EVENT: &str = "AgentIdle";
 pub const AGENT_CLOSED_EVENT: &str = "AgentClosed";
 pub const CONFIG_CHANGED_EVENT: &str = "ConfigChanged";
 pub const COMPACTION_DONE_EVENT: &str = "CompactionDone";
+pub const SESSION_CWD_CHANGED_EVENT: &str = "SessionCwdChanged";
 
 /// Fires the autocmd for one envelope a frontend read from {root}'s graph.
 pub fn dispatch(handle: &EventHandle, root: &AgentRef, envelope: &Envelope) {

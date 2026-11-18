@@ -2,17 +2,51 @@
 
 local chat_completions = require("providers.chat_completions")
 local codec = require("providers.codec")
+local http = require("providers.http")
 local sse = require("providers.sse")
 local thinking = require("providers.thinking")
 
 local M = {}
 
 local SUMMARY = "auto"
+-- The request field a server names when it refuses reasoning summaries.
+local SUMMARY_PARAM = "reasoning.summary"
 local UNKNOWN_ERROR_STATUS = 500
 local FAILED_MESSAGE = "response generation failed"
 
 local function data_url(source)
   return "data:" .. source.media_type .. ";base64," .. source.data
+end
+
+-- Endpoints that refused `reasoning.summary`, so later turns omit it.
+local summary_rejected = {}
+
+local function has_summary(body)
+  return type(body.reasoning) == "table" and body.reasoning.summary ~= nil
+end
+
+-- {body} without the summary request, leaving the caller's table alone.
+local function without_summary(body)
+  local copy = table.clone(body)
+  copy.reasoning = table.clone(body.reasoning)
+  copy.reasoning.summary = nil
+  return copy
+end
+
+-- Whether {err} is the API refusing `reasoning.summary`. Every Responses
+-- implementation spells the rejection with a different code, so the field is
+-- the only stable part of the answer.
+local function refused_summary(err)
+  if type(err) ~= "table" or type(err.message) ~= "string" then
+    return false
+  end
+  local body = makima.json.decode(err.message)
+  local detail = type(body) == "table" and body.error
+  if type(detail) ~= "table" then
+    return false
+  end
+  return detail.param == SUMMARY_PARAM
+    or (type(detail.message) == "string" and detail.message:find(SUMMARY_PARAM, 1, true) ~= nil)
 end
 
 function M.convert_input(messages)
@@ -101,6 +135,27 @@ function M.build_request(request, reasoning)
     body.tools = tools
   end
   return body
+end
+
+-- Posts {body} to {url} and streams the reply with `M.stream`, retrying once
+-- without `reasoning.summary` when the API refuses it, and remembering the
+-- refusal for {url}. A failure after the stream started is returned as is,
+-- since a retry would repeat what was already emitted.
+function M.post_stream(ctx, url, headers, body, emit)
+  if summary_rejected[url] and has_summary(body) then
+    body = without_summary(body)
+  end
+  local emitted = false
+  local function forward(event)
+    emitted = true
+    return emit(event)
+  end
+  local result, err = http.post_stream(ctx, url, headers, body, M.stream, forward)
+  if result or emitted or not has_summary(body) or not refused_summary(err) then
+    return result, err
+  end
+  summary_rejected[url] = true
+  return http.post_stream(ctx, url, headers, without_summary(body), M.stream, emit)
 end
 
 -- Function call arguments as a JSON text: a string as is, an object encoded.

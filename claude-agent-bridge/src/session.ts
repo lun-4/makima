@@ -1,6 +1,10 @@
 import { query } from "@anthropic-ai/claude-agent-sdk"
 import type { AccountInfo, ModelInfo, Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
+import { planUsage } from "./convert.ts"
 import type { ClaudeBlock } from "./convert.ts"
+import type { PlanUsage } from "./protocol.ts"
+
+const USAGE_METHOD = "usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET"
 
 export type ResultMessage = Extract<SDKMessage, { type: "result" }>
 export type Effort = NonNullable<Options["effort"]>
@@ -219,9 +223,12 @@ async function contextWindows(sdk: ReturnType<typeof query>, models: readonly Mo
   return windows
 }
 
-// Starts Claude Code without a prompt to read its version, login and models,
-// and with {withContextWindows} their context windows. No model call is made.
-export async function probe(options: Options, timeoutMs: number, withContextWindows: boolean): Promise<Probe> {
+type Query = ReturnType<typeof query>
+type Init = Awaited<ReturnType<Query["initializationResult"]>>
+
+// Starts Claude Code without a prompt and runs {use} on it, all within
+// {timeoutMs}. No model call is made.
+async function idleClaude<T>(options: Options, timeoutMs: number, use: (sdk: Query, init: Init) => Promise<T>): Promise<T> {
   const stop = Promise.withResolvers<void>()
   async function* idle(): AsyncGenerator<SDKUserMessage> {
     await stop.promise
@@ -231,11 +238,30 @@ export async function probe(options: Options, timeoutMs: number, withContextWind
     const timeout = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error(`claude did not answer within ${timeoutMs / 1000} seconds`)), timeoutMs).unref(),
     )
-    const init = await Promise.race([sdk.initializationResult(), timeout])
-    const windows = withContextWindows ? await Promise.race([contextWindows(sdk, init.models), timeout]) : undefined
-    return { version: init.claude_code_version, account: init.account, models: init.models, contextWindows: windows }
+    return await Promise.race([sdk.initializationResult().then((init) => use(sdk, init)), timeout])
   } finally {
     stop.resolve()
     sdk.close()
   }
+}
+
+// Claude Code's version, login and models, and with {withContextWindows}
+// their context windows.
+export function probe(options: Options, timeoutMs: number, withContextWindows: boolean): Promise<Probe> {
+  return idleClaude(options, timeoutMs, async (sdk, init) => ({
+    version: init.claude_code_version,
+    account: init.account,
+    models: init.models,
+    contextWindows: withContextWindows ? await contextWindows(sdk, init.models) : undefined,
+  }))
+}
+
+// The login's plan usage, or undefined when this SDK has no usage call. The
+// call is experimental, so the bridge checks for it rather than relying on it.
+export function usage(options: Options, timeoutMs: number): Promise<PlanUsage | undefined> {
+  return idleClaude(options, timeoutMs, async (sdk) => {
+    const fetch = (sdk as Partial<Query>)[USAGE_METHOD]
+    if (typeof fetch !== "function") return undefined
+    return planUsage(await fetch.call(sdk, { skipBehaviors: true }))
+  })
 }

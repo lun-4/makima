@@ -84,6 +84,7 @@ use makima_commands::{
 };
 use makima_config::project::{self, GatedFile, TrustQuestion};
 use makima_config::{ModelPolicy, ToolKey, UiConfig};
+use makima_lua::agent_autocmd::SESSION_CWD_CHANGED_EVENT;
 use makima_lua::orchestration::TrustedTarget;
 use makima_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
@@ -2008,7 +2009,7 @@ impl App {
             return Some(self.handle_picker_key(PickerId::File, key));
         }
 
-        if self.queue.focus().is_some() {
+        if !key::BACKGROUND.matches(key) && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -2316,9 +2317,6 @@ impl App {
             return vec![];
         }
 
-        if self.focused_streaming() {
-            self.file_completion.close();
-        }
         if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
             let action = self.input_box.handle_key(key);
             return self.handle_input_action(action);
@@ -2524,7 +2522,7 @@ impl App {
     fn sync_file_completion(&mut self) {
         let cwd = self.focused_cwd().to_string_lossy().into_owned();
         self.command_palette.set_cwd(Arc::from(cwd.as_str()));
-        if self.focused_streaming() || self.typed_path_completion_context().is_some() {
+        if self.typed_path_completion_context().is_some() {
             self.file_completion.close();
             return;
         }
@@ -3676,6 +3674,10 @@ impl App {
             .session_mut()
             .set_cwd(path.to_string_lossy().into_owned());
         self.status_bar.set_cwd(path.clone());
+        self.fire_session_autocmd(
+            SESSION_CWD_CHANGED_EVENT,
+            serde_json::json!({ "cwd": path.to_string_lossy() }),
+        );
         let input = self.input_box.buffer.value();
         self.sync_command_arguments(&input, self.input_box.buffer.cursor_byte_offset());
         if self.file_completion.is_active() {

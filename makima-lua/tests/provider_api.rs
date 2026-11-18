@@ -65,6 +65,7 @@ const KEY_COUNT: usize = 3;
 const CONFIGURED_URL: &str = "http://configured.invalid";
 const FIVE_HOURS: u64 = 5;
 const USED_PERCENT: u32 = 70;
+const SHORTNAME_HINT: &str = "f";
 const MARKER_ERR: &str = r#"request_delivery_marker must be "auto" or "manual""#;
 const EMIT_THEN_FAIL: &str = r#"emit({ type = "text_delta", text = "hi" })
             return nil, "boom""#;
@@ -774,7 +775,7 @@ fn usage_limits_decode_from_lua_shapes() {
             stream = function() end,
             fetch_usage = function()
                 return {{ limits = {{
-                    {{ kind = {{ Hours = {FIVE_HOURS} }}, percentage = {USED_PERCENT} }},
+                    {{ kind = {{ Hours = {FIVE_HOURS} }}, percentage = {USED_PERCENT}, ui_shortname_hint = "{SHORTNAME_HINT}" }},
                     {{ kind = {{ Weekly = {{}} }} }},
                     {{ kind = "Credits", detail = "$1" }},
                 }} }}
@@ -800,6 +801,7 @@ fn usage_limits_decode_from_lua_shapes() {
             percentage: Some(USED_PERCENT),
             reset_at: None,
             detail: None,
+            ui_shortname_hint: Some(SHORTNAME_HINT.into()),
         }
     );
 }

@@ -5,24 +5,19 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use makima_agent::{command, tools::ToolRegistry};
+use makima_config::load_env_files;
 use makima_config::project::{self, TrustMode};
-use makima_config::{load_env_files, load_permissions};
 use makima_lua::PluginHost;
 use makima_lua::ui_sink::{HeadlessUi, HostUi};
 use makima_storage::StateDir;
 
+use crate::cli::Cli;
 use crate::setup;
 
-#[allow(clippy::too_many_arguments)]
 pub fn run(
+    cli: &Cli,
     cwd: PathBuf,
     model_arg: Option<String>,
-    yolo: bool,
-    automode: bool,
-    no_plugins: bool,
-    no_jit: bool,
-    system_prompt_override: Option<String>,
-    append_system_prompt: Option<String>,
     trust_mode: TrustMode,
 ) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
@@ -41,32 +36,16 @@ pub fn run(
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry.clone(),
-        !no_jit,
+        !cli.no_jit,
         HostUi::Sink(Box::new(HeadlessUi)),
     )
     .context("initialize lua plugin host")?;
 
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
-    let raw_config = plugin_host
-        .load_init_files_or_skip(no_plugins, &trust.project_config, &mut warnings)
-        .context("load init.lua files")?;
+    let config = super::load_config(&plugin_host, cli, &trust.project_config, &mut warnings)?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config()
-        .context("invalid config")?;
-    makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(&trust.project_config)?;
-
-    if yolo || config.always_yolo {
-        config.permissions.yolo = true;
-    }
-    let automode_on = automode || config.always_automode;
-    super::seed_automode(&mut config, automode_on);
-    config.validate()?;
 
     plugin_host
         .load_builtins(&config.plugins)
@@ -98,8 +77,8 @@ pub fn run(
         prompt_slots: lua_event_handle.prompt_slot_source(),
         yolo,
         defaults: config.session_defaults,
-        system_prompt_override,
-        append_system_prompt,
+        system_prompt_override: cli.system_prompt.clone(),
+        append_system_prompt: cli.append_system_prompt.clone(),
         model_policy: Arc::new(config.provider.model_policy.clone()),
         providers,
         plugin_rules: plugin_host.plugin_rules(),

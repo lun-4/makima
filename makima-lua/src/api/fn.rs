@@ -44,12 +44,18 @@ struct JobMeta {
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
+    released: ReleasedReceivers,
 }
 
-struct CheckedOutReceiver {
-    lua: Lua,
+/// Receivers whose `jobwait` future died. A `Drop` can run inside a Luau GC
+/// sweep, where any call into the VM aborts, so the receiver parks here and
+/// the next safe point gives it back to the store.
+type ReleasedReceivers = Arc<std::sync::Mutex<Vec<(u32, flume::Receiver<JobEvent>)>>>;
+
+pub(crate) struct CheckedOutReceiver {
     job_id: u32,
     receiver: Option<flume::Receiver<JobEvent>>,
+    released: ReleasedReceivers,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +112,7 @@ impl JobStore {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
+            released: Arc::default(),
         }
     }
 
@@ -234,10 +241,29 @@ impl JobStore {
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-    ) -> Option<flume::Receiver<JobEvent>> {
+    ) -> Option<CheckedOutReceiver> {
+        self.reclaim_released();
         let job = self.jobs.get_mut(&job_id)?;
-        job.can_access(task_id, plugin)
-            .then(|| job.event_rx.take())?
+        if !job.can_access(task_id, plugin) {
+            return None;
+        }
+        Some(CheckedOutReceiver {
+            job_id,
+            receiver: Some(job.event_rx.take()?),
+            released: Arc::clone(&self.released),
+        })
+    }
+
+    pub(crate) fn reclaim_released(&mut self) {
+        let released = std::mem::take(
+            &mut *self
+                .released
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for (job_id, receiver) in released {
+            self.restore_receiver(job_id, receiver);
+        }
     }
 
     pub fn restore_receiver(&mut self, job_id: u32, receiver: flume::Receiver<JobEvent>) {
@@ -347,14 +373,6 @@ impl Drop for JobStore {
 }
 
 impl CheckedOutReceiver {
-    fn new(lua: &Lua, job_id: u32, receiver: flume::Receiver<JobEvent>) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            receiver: Some(receiver),
-        }
-    }
-
     fn get(&self) -> &flume::Receiver<JobEvent> {
         self.receiver.as_ref().expect("receiver is checked out")
     }
@@ -363,9 +381,10 @@ impl CheckedOutReceiver {
 impl Drop for CheckedOutReceiver {
     fn drop(&mut self) {
         if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
+            self.released
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((self.job_id, receiver));
         }
     }
 }
@@ -558,7 +577,6 @@ async fn jobwait(
     let task_id = active_task_id(&lua);
     let receiver = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
         .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
-    let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let deadline = smol::Timer::after(timeout);
@@ -797,6 +815,16 @@ mod tests {
     }
 
     #[test]
+    fn dropped_receiver_returns_at_the_next_safe_point() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+        let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_none());
+        drop(receiver);
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
+    }
+
+    #[test]
     fn finishing_a_job_removes_it() {
         let lua = Lua::new();
         let mut store = make_store();
@@ -807,7 +835,7 @@ mod tests {
         assert!(!store.is_empty(&owner));
         let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receiver.get().recv_timeout(Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -833,11 +861,13 @@ mod tests {
             store.take_receiver(id, Some(2), TEST_PLUGIN).is_none(),
             "another task must not access the job"
         );
-        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
+        let lease = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         assert!(
             store.take_receiver(id, Some(1), TEST_PLUGIN).is_none(),
-            "second take should fail (receiver already moved)"
+            "second take should fail while the lease is held"
         );
+        drop(lease);
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
     }
 
     #[test]
@@ -921,7 +951,7 @@ mod tests {
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.get().recv_timeout(Duration::from_millis(200)) {
                 Ok(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
