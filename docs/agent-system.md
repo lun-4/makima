@@ -78,7 +78,7 @@ An actor commit publishes its identity, generation, and full configuration to fr
 | Turn admissions, outcomes and deliveries | Journal records. Recovery interrupts admitted unfinished turns without executing them again. Terminal delivery records prevent duplicate observations after restart and compaction. |
 | Model, thinking, effective fast setting, workflow, cwd and resolved mode | Per-agent `Config` records. Provider instances, model capabilities, runtime generations and caches are rebuilt. The spawn ceiling remains separate from mutable mode configuration. |
 | Deferred fast intent | A model-pinned internal Config option. Discovery consumes the intent with the committed setting change. |
-| Plugin options | All current values belong to Config history. Resume applies values whose current definitions declare persistence. Full-state rewind restores all recorded values. |
+| Plugin options | All current values belong to Config history. Resume applies values whose current definitions declare persistence. |
 | Permission grants and explicit YOLO intent | Session-scoped `Rules` records. Invocation-only YOLO, config/project/plugin rules and cwd-derived boundary checks are rebuilt. Allow-once answers and pending prompts are discarded. |
 | Plan path, written status, approved content and staged implementation selection | The session-scoped `plan/state` slot records per-agent entries. Legacy metadata migrates into this slot. Approval that clears context creates an implementation session with a durable parent link. |
 | Draft, inactive root text queue, context display, title and billed usage | Session metadata or the existing usage records. Draft and queued attachments are not retained. Pending compaction requests are discarded. |
@@ -91,7 +91,7 @@ Runtime configuration epochs and provider metadata are not independent durable s
 
 ### Durable publication
 
-Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (rewind, plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:
+Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:
 
 ```text
 writer guard      SessionPublicationGuard: session lock held, owner still ours
@@ -110,11 +110,11 @@ After the claim, nothing can cancel the publication. The commit runs on an actor
 
 ## Session journal and recovery
 
-`SessionJournal` gives agent revisions and state changes one monotonic session sequence. Config, rules, recorded context, plugin slots, turn admissions and results, delivery disposition, file changes, and restoration boundaries share that order. Agent scope and session scope are explicit. Actor histories remain the mutable transcript authority; journal snapshots include the matching histories for checkpoint publication.
+`SessionJournal` gives agent revisions and state changes one monotonic session sequence. Config, rules, recorded context, plugin slots, turn admissions and results, delivery disposition, and turn boundaries share that order. Agent scope and session scope are explicit. Actor histories remain the mutable transcript authority; journal snapshots include the matching histories for checkpoint publication.
 
-Session JSONL format v3 stores agent revisions, state records, branch descriptors, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. Grouped boundary snapshots are part of baseline v3. Every pool requires the string marker `boundary-pool-v1` and an explicit ordered `boundaries` list. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable restore endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
+Session JSONL format v3 stores agent revisions, state records, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
 
-Recovery sanitizes transcripts, repairs unavailable tool results, restores retained boundary snapshots, and records `Interrupted` cancellation for admitted turns without terminal results. It never reissues interrupted model requests, tools, shell commands, or queued input. Inactive root text returns to the draft. Recovery publishes its checkpoint before exposing the runtime or admitting work. Root and child Config records, saved mode snapshots, Rules, registered state slots, and recorded instructions supply restored state; runtime providers, tools, permissions, and authority are rebuilt. Instruction-file changes produce a reload notice but do not replace recorded content. `/reload-context` journals the new root content; children retain the system prompt resolved at spawn.
+Recovery sanitizes transcripts, repairs unavailable tool results, and records `Interrupted` cancellation for admitted turns without terminal results. It never reissues interrupted model requests, tools, shell commands, or queued input. Inactive root text returns to the draft. Recovery publishes its checkpoint before exposing the runtime or admitting work. Root and child Config records, saved mode snapshots, Rules, registered state slots, and recorded instructions supply restored state; runtime providers, tools, permissions, and authority are rebuilt. Instruction-file changes produce a reload notice but do not replace recorded content. `/reload-context` journals the new root content; children retain the system prompt resolved at spawn.
 
 Child result and delivery disposition records use `(AgentId, TurnId)`. Queued, consumed, withdrawn, and dropped deliveries survive restart and compaction. Recovery reconstructs pending delivery work from the journal. A consumed or withdrawn delivery cannot become eligible again because its presentation event was lost. This deduplication is separate from the best-effort event transport and applies only to state retained by a successful checkpoint.
 
@@ -122,19 +122,13 @@ Child result and delivery disposition records use `(AgentId, TurnId)`. Queued, c
 
 Decision: retain v2 import ambiguity markers and presentation fallbacks where duplicate transcript keys or conflicting historical metadata prevent unique identity resolution. Generated durable IDs identify imported records but do not resolve those conflicts. Ambiguous links remain unavailable across saves and merges. Remove historical lookup paths only where unique durable-ID resolution supersedes them.
 
-### History epochs and restoration points
+### History epochs
 
-A restoration boundary names an agent, journal sequence, journal identity, and per-agent history epoch and length. Child rewind writes pinned boundary snapshots to preserve root boundaries that the child history replacement would otherwise make unreachable. Compaction does not create pins. A root rewind across a later compaction is refused unless an earlier child rewind already pinned that boundary. Conversation rewind replaces the selected agent and its recorded descendants, their configurations and state, and the applicable session-scoped state. Branch checkpoints preserve the displaced state for later restoration. Missing or pruned branch files are reported as expired.
+History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, and compactions. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
 
-Grouped snapshots store a shared canonical state and agent-revision prefix, raw histories, and an ordered list of covered boundary sequences. Each boundary lens records an epoch and exact prefix length for every identity retained at that boundary, including closed and retired agents. A later cleanup append cannot extend that cutoff. Old boundaries without an unambiguous durable cutoff are not added to a group. Pools contain no nested boundary snapshots or external pool/history dependencies. Copied state can still contain offload references.
+### Rewind
 
-Recovery validates grouped snapshots without eagerly sanitizing every covered prefix. Restoring a selected boundary first truncates raw histories to its recorded cutoffs, then sanitizes those exact prefixes and remaps their offsets and epochs. Sanitizing a full shared history before truncation would incorrectly retain a later tool result or omit the unavailable-result repair required by an earlier boundary.
-
-History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, compactions, and grouped snapshots. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
-
-### Rewind publication
-
-Rewind changes the conversation and recorded state only; it never restores files. Cross-session rewind follows recorded parent links through planning and implementation sessions; it does not include unrelated branches. The writer first confirms baseline checkpoint durability, then publishes the target checkpoint. A visible target checkpoint requires forward completion even if directory sync fails or the waiter is cancelled. Target durability precedes runtime activation and new admission.
+Rewind is being reworked and is unavailable. The old implementation restored whole-session state (boundary pins, branch files, child rewind, parent-session restore) and was removed. Clear-context plan approval still creates an implementation session with a durable parent link.
 
 ## The actor
 
@@ -383,13 +377,13 @@ Live execution resources, accepted input payloads, pending permission prompts, s
 | Backend and work types | `makima-agent/src/actor/types.rs` |
 | Manager graph and permit machinery | `makima-agent/src/manager/mod.rs` |
 | Manager public projections | `makima-agent/src/manager/types.rs` |
-| Work capacity and graph transitions | `makima-agent/src/manager/work.rs`, `makima-agent/src/manager/transition.rs`, `makima-agent/src/manager/rewind.rs` |
+| Work capacity and graph transitions | `makima-agent/src/manager/work.rs` |
 | Session journal and durable state fold | `makima-agent/src/journal.rs`, `makima-storage/src/session_state.rs` |
 | Checkpoint-qualified restart recovery | `makima-agent/src/session_recovery.rs`, `makima-agent/src/session_checkpoint.rs` |
 | Plugin state and recorded instructions | `makima-agent/src/state.rs`, `makima-lua/src/api/state.rs`, `makima-agent/src/context.rs` |
-| Restoration boundaries and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/parent_rewind.rs`, `makima-agent/src/plan_state.rs` |
-| Session format and branches | `makima-storage/src/sessions.rs` |
-| TUI restore publication and activation | `makima-ui/src/event_loop/rewind.rs`, `makima-ui/src/storage_writer.rs` |
+| Turn boundaries and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
+| Session format | `makima-storage/src/sessions.rs` |
+| TUI checkpoint publication | `makima-ui/src/storage_writer.rs` |
 | Manager errors | `makima-agent/src/manager/manager_error.rs` |
 | TUI root construction/backend | `makima-ui/src/agent/mod.rs`, `makima-ui/src/agent/agent_loop.rs` |
 | TUI cancellation routing | `makima-ui/src/agent/command_router.rs` |

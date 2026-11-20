@@ -1,19 +1,15 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
 };
 
 use makima_agent::{
-    AgentId, AgentRef,
-    journal::{JournalChange, SessionJournal, SessionJournalSnapshot},
+    AgentRef,
+    journal::SessionJournal,
     state::{
         StateAccess, StateChangeEvent, StateChangeReason, StateRevision, StateScope, StateSlot,
         StateSlotSpec,
     },
-};
-use makima_storage::{
-    checkpoint::CheckpointPublication,
-    session_state::{SessionStateView, StateChange, StoredStateRecord},
 };
 use mlua::{Function, Lua, MultiValue, Table, UserData, UserDataMethods, UserDataRef, Value};
 use serde_json::Value as JsonValue;
@@ -24,7 +20,6 @@ use crate::{
         ctx::LuaCtx,
         pair::{Pair, err_pair, pair},
     },
-    loader::PreparedStateRestore,
     runtime::{deny_delegated_registration, require_plugin_load},
 };
 
@@ -144,87 +139,6 @@ pub(crate) fn create_state_table(
         })?,
     )?;
     Ok(table)
-}
-
-pub(crate) fn prepare_restore(
-    lua: &Lua,
-    snapshot: &SessionJournalSnapshot,
-    affected: &BTreeSet<AgentId>,
-    session_scope: bool,
-    publication: CheckpointPublication,
-) -> Result<PreparedStateRestore, String> {
-    let view = snapshot
-        .fold(snapshot.seq)
-        .map_err(|error| error.to_string())?;
-    let definitions = lua
-        .app_data_ref::<StateStore>()
-        .map(|store| store.0.clone())
-        .unwrap_or_default();
-    let owners = definitions
-        .values()
-        .filter(|definition| match definition.scope {
-            Scope::Agent => !affected.is_empty(),
-            Scope::Session => session_scope,
-        })
-        .map(|definition| crate::orchestration::plugin_authority(lua, definition.plugin.clone()))
-        .collect();
-    let mut changes = Vec::new();
-    for (agent, scope) in view.scopes {
-        if agent.map_or(!session_scope, |agent| !affected.contains(&agent)) {
-            continue;
-        }
-        for (key, stored) in scope.plugins {
-            let Some(definition) = definitions.get(&key) else {
-                continue;
-            };
-            if agent.is_some() != (definition.scope == Scope::Agent) {
-                return Err(format!(
-                    "state_invalid_registration: scope changed for {key}"
-                ));
-            }
-            if stored.version > definition.version {
-                return Err(format!(
-                    "state_newer_version: stored {}, registered {}",
-                    stored.version, definition.version
-                ));
-            }
-            if stored.version == definition.version {
-                continue;
-            }
-            let Some(value) = stored.value else {
-                continue;
-            };
-            let value = migrate_value(lua, definition, stored.version, &value)?;
-            validate_slot(lua, &LuaStateSlot(definition.clone()))?;
-            let record = StoredStateRecord {
-                seq: snapshot
-                    .seq
-                    .checked_add(1)
-                    .ok_or("state sequence exhausted")?,
-                agent,
-                generation: scope.generation,
-                change: StateChange::Plugin {
-                    key,
-                    version: definition.version,
-                    value: Some(value),
-                },
-            };
-            let encoded = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-            let decoded: StoredStateRecord =
-                serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
-            if decoded != record {
-                return Err("state value storage round trip is lossy".into());
-            }
-            SessionStateView::fold(&[decoded], &[], record.seq)
-                .map_err(|error| error.to_string())?;
-            changes.push(JournalChange {
-                agent: record.agent,
-                generation: record.generation,
-                change: record.change,
-            });
-        }
-    }
-    Ok(PreparedStateRestore::new(changes, owners, publication))
 }
 
 fn host_slot(
@@ -542,7 +456,6 @@ pub(crate) fn dispatch(lua: &Lua, target: AgentRef, event: StateChangeEvent) -> 
         match event.reason {
             StateChangeReason::Commit => "commit",
             StateChangeReason::Resume => "resume",
-            StateChangeReason::Rewind => "rewind",
         },
     )?;
     let callbacks = definition

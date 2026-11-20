@@ -9,7 +9,6 @@ use makima_domain::ModelSelection;
 use makima_providers::ModelError;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::session_state::StoredAgentConfig;
 use thiserror::Error;
 
 use crate::AgentMode;
@@ -311,30 +310,6 @@ impl<'a> ConfigChangeTicket<'a> {
         self.commit(async |_, _| Ok((publication_claim(), change)))
             .await
     }
-}
-
-pub struct PreparedRestoreConfig {
-    pub saved: StoredAgentConfig,
-    pub model: PreparedModel,
-    pub mode: (AgentMode, ModeDef),
-    pub warning: Option<String>,
-}
-
-pub async fn prepare_restore(
-    mut saved: StoredAgentConfig,
-    policy: &ModelPolicy,
-    prepare: &ModelPreparer,
-    modes: &ModeRegistry,
-) -> Result<PreparedRestoreConfig, ConfigChangeError> {
-    let model = prepare_model(&saved.model, policy, prepare).await?;
-    let restored = modes::prepare_restore(&saved.mode, modes)?;
-    saved.mode = restored.definition.stored_snapshot(&restored.mode);
-    Ok(PreparedRestoreConfig {
-        saved,
-        model,
-        mode: (restored.mode, restored.definition),
-        warning: restored.warning,
-    })
 }
 
 /// Resolves {spec} under {policy} and prepares its provider.

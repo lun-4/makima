@@ -376,15 +376,6 @@ impl App {
             .is_ok()
     }
 
-    #[cfg(test)]
-    pub(crate) fn seed_recoverable_queue_for_test(&mut self, messages: Vec<String>) {
-        self.recoverable_queue = messages;
-    }
-
-    pub(crate) fn clear_recoverable_queue(&mut self) {
-        self.recoverable_queue.clear();
-    }
-
     pub(crate) fn start_mailbox_run(
         &mut self,
         preamble: Vec<makima_providers::Message>,

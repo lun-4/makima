@@ -22,10 +22,6 @@ use crate::actor::{
     MAX_PENDING_PREVIEW_BYTES, StoredTurnProgress, TurnResult, TurnResultStorageError,
 };
 use crate::context::{CONTEXT_MANIFEST, ContextUpdate, manifest_hash};
-use crate::rewind::{
-    RewindBoundary, RewindError, finalize_candidate, prepare_boundary, rebase_history_epoch,
-    subtree,
-};
 use crate::state::{
     StateChangeEvent, StateChangeReason, StateEdit, StateError, StateRevision, StateRuntime,
     StateScope, read_slot, validate_access, validate_record,
@@ -37,7 +33,6 @@ mod records;
 pub use records::{JournalRecord, JournalRecords};
 
 const CONVERSION_RETRY_DELAY: Duration = Duration::from_secs(1);
-const REPLACEMENT_RESERVED: &str = "rewind publication is reserved";
 
 fn context_address(source: &str) -> String {
     format!("\0context:{source}")
@@ -189,15 +184,8 @@ impl SessionJournalSnapshot {
         });
     }
 
-    pub fn fold(&self, through: u64) -> Result<SessionStateView, StateFoldError> {
-        if through >= self.seq {
-            return Ok(self.reduced()?.materialize());
-        }
-        SessionStateView::fold(
-            &self.state.to_vec(),
-            &self.agent_revisions.to_vec(),
-            through,
-        )
+    pub fn fold(&self) -> Result<SessionStateView, StateFoldError> {
+        Ok(self.reduced()?.materialize())
     }
 
     pub(crate) fn plugin(&self, agent: Option<AgentId>, key: &str) -> Option<StoredPluginValue> {
@@ -258,7 +246,7 @@ impl SessionJournalSnapshot {
 
     pub fn apply_to(&self, session: &mut StoredSession) -> Result<(), JournalError> {
         if self.authoritative {
-            self.fold(self.seq)?;
+            self.fold()?;
             session.replace_state(self.state.to_vec());
             session.replace_agent_revisions(self.agent_revisions.to_vec());
             session.replace_journal_histories(
@@ -294,7 +282,7 @@ impl SessionJournalSnapshot {
         }
         let state: Vec<_> = state.into_values().collect();
         let agents: Vec<_> = agents.into_iter().collect();
-        let view = SessionStateView::fold(&state, &agents, u64::MAX)?;
+        let view = SessionStateView::fold(&state, &agents)?;
         session.replace_state(state);
         session.replace_agent_revisions(agents);
         for (agent, history) in &self.histories {
@@ -365,7 +353,6 @@ pub(crate) struct JournalState {
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
     aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
-    replacement: Option<MakimaId>,
 }
 
 /// An owned publication lane, acquired before reading runtime state that the
@@ -560,300 +547,6 @@ impl Drop for JournalPrepared {
     }
 }
 
-pub struct PreparedRewindNotification {
-    journal: Arc<SessionJournal>,
-    notices: Vec<StateChangeEvent>,
-}
-
-impl PreparedRewindNotification {
-    pub fn notify(self) {
-        self.journal
-            .lock()
-            .plugin_state
-            .enqueue_notices(self.notices);
-        self.journal.drain_state_notices();
-    }
-}
-
-pub struct JournalReplacement {
-    journal: Arc<SessionJournal>,
-    candidate: SessionJournalSnapshot,
-    affected: BTreeSet<AgentId>,
-    session_scope: bool,
-    reservation: MakimaId,
-    previous_revision: u64,
-    notices: Vec<StateChangeEvent>,
-    installed: bool,
-    _boundary: Option<RwLockWriteGuardArc<()>>,
-    _publication: Option<RwLockWriteGuardArc<()>>,
-}
-
-impl JournalReplacement {
-    pub fn snapshot(&self) -> &SessionJournalSnapshot {
-        &self.candidate
-    }
-
-    pub fn affected_agents(&self) -> &BTreeSet<AgentId> {
-        &self.affected
-    }
-
-    pub fn session_scope(&self) -> bool {
-        self.session_scope
-    }
-
-    pub fn apply_configs(&mut self, changes: Vec<JournalChange>) -> Result<(), RewindError> {
-        if self.installed {
-            return Err(RewindError::LostReservation);
-        }
-        let mut candidate = self.candidate.clone();
-        for change in changes {
-            if !change
-                .agent
-                .is_some_and(|agent| self.affected.contains(&agent))
-                || !matches!(change.change, StateChange::Config(_))
-            {
-                return Err(StateError::ReadOnly.into());
-            }
-            crate::rewind::push(
-                &mut candidate,
-                change.agent,
-                change.generation,
-                change.change,
-            )?;
-        }
-        candidate.fold(candidate.seq).map_err(JournalError::from)?;
-        self.candidate = candidate;
-        Ok(())
-    }
-
-    pub fn apply_migrations(&mut self, changes: Vec<JournalChange>) -> Result<(), RewindError> {
-        if self.installed {
-            return Err(RewindError::LostReservation);
-        }
-        let mut candidate = self.candidate.clone();
-        SessionJournal::migrate_replacement(
-            &mut candidate,
-            &self.affected,
-            self.session_scope,
-            changes,
-        )?;
-        let mut notices: BTreeMap<_, _> = self
-            .notices
-            .iter()
-            .map(|notice| ((notice.agent, notice.key.clone()), notice.clone()))
-            .collect();
-        for record in candidate.state.iter() {
-            if (self.session_scope
-                || record
-                    .agent
-                    .is_some_and(|agent| self.affected.contains(&agent)))
-                && let StateChange::Plugin { key, version, .. } = &record.change
-            {
-                notices.insert(
-                    (record.agent, key.clone()),
-                    StateChangeEvent {
-                        agent: record.agent,
-                        key: key.clone(),
-                        revision: read_slot(&candidate, record.agent, key, *version).revision,
-                        reason: StateChangeReason::Rewind,
-                    },
-                );
-            }
-        }
-        self.candidate = candidate;
-        self.notices = notices.into_values().collect();
-        Ok(())
-    }
-
-    pub fn with_prepared_actors(
-        mut self,
-        actors: &[crate::actor::PreparedActorRewind],
-    ) -> Result<Self, RewindError> {
-        if self.installed {
-            return Err(RewindError::LostReservation);
-        }
-        for actor in actors {
-            let agent = actor.agent_id();
-            if !self.affected.contains(&agent) {
-                return Err(StateError::ReadOnly.into());
-            }
-            let previous_epoch = self
-                .candidate
-                .histories
-                .get(&agent)
-                .map(|history| history.epoch);
-            self.candidate
-                .histories
-                .insert(agent, actor.history().clone());
-            if let Some(previous_epoch) = previous_epoch {
-                rebase_history_epoch(&mut self.candidate, agent, previous_epoch);
-            }
-            let config = actor.config();
-            let options = self
-                .candidate
-                .state
-                .iter()
-                .rev()
-                .find_map(|record| match &record.change {
-                    StateChange::Config(config) if record.agent == Some(agent) => {
-                        Some(config.options.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let stored = crate::session_checkpoint::stored_agent_config(&config.config, options)
-                .map_err(|error| JournalError::Preparation(error.to_string()))?;
-            crate::rewind::push(
-                &mut self.candidate,
-                Some(agent),
-                config.generation,
-                StateChange::Config(stored),
-            )?;
-        }
-        let lens = self
-            .candidate
-            .histories
-            .iter()
-            .map(|(agent, history)| (*agent, (history.epoch, history.messages.len())))
-            .collect();
-        let boundary = self
-            .candidate
-            .state
-            .iter()
-            .rev()
-            .find(|record| matches!(record.change, StateChange::Boundary { .. }))
-            .cloned();
-        if let Some(mut record) = boundary
-            && let StateChange::Boundary { lens: saved, .. } = &mut record.change
-        {
-            *saved = lens;
-            self.candidate.state.push(record);
-        }
-        Ok(self)
-    }
-
-    pub fn prepare_handoff(
-        mut self,
-        installed: Arc<SessionJournal>,
-    ) -> Result<PreparedRewindNotification, RewindError> {
-        if self.installed || Arc::ptr_eq(&self.journal, &installed) {
-            return Err(RewindError::LostReservation);
-        }
-        {
-            let state = self.journal.lock();
-            if state.replacement != Some(self.reservation)
-                || state.snapshot.revision != self.previous_revision
-                || !state.staged.is_empty()
-            {
-                return Err(RewindError::LostReservation);
-            }
-        }
-        {
-            let state = installed.lock();
-            let candidate = &self.candidate;
-            let actual = &state.snapshot;
-            if actual.epoch != candidate.epoch
-                || actual.seq != candidate.seq
-                || actual.revision != candidate.revision
-                || actual.state != candidate.state
-                || actual.agent_revisions != candidate.agent_revisions
-                || actual.managed_histories != candidate.managed_histories
-                || actual.histories.len() != candidate.histories.len()
-                || actual.histories.iter().any(|(agent, history)| {
-                    candidate.histories.get(agent).is_none_or(|saved| {
-                        history.epoch != saved.epoch
-                            || history.compacted != saved.compacted
-                            || history.conversation != saved.conversation
-                            || history.messages != saved.messages
-                    })
-                })
-                || !state.staged.is_empty()
-            {
-                return Err(RewindError::LostReservation);
-            }
-        }
-        Ok(PreparedRewindNotification {
-            journal: installed,
-            notices: take(&mut self.notices),
-        })
-    }
-
-    pub fn install(&mut self) -> Result<(), RewindError> {
-        if self.installed {
-            return Ok(());
-        }
-        self.candidate
-            .cache_reducer(self.candidate.reduced().map_err(JournalError::from)?);
-        let mut state = self.journal.lock();
-        if state.replacement != Some(self.reservation)
-            || state.snapshot.revision != self.previous_revision
-            || !state.staged.is_empty()
-        {
-            return Err(RewindError::LostReservation);
-        }
-        state
-            .results
-            .retain(|(agent, _), _| !self.affected.contains(agent));
-        state
-            .conversion_errors
-            .retain(|(agent, _), _| !self.affected.contains(agent));
-        state.delivery_envelopes.retain(|(parent, source, _), _| {
-            !self.session_scope
-                && !self.affected.contains(parent)
-                && !self.affected.contains(source)
-        });
-        state.delivery_bytes.retain(|(parent, source, _), _| {
-            !self.session_scope
-                && !self.affected.contains(parent)
-                && !self.affected.contains(source)
-        });
-        state
-            .plugin_state
-            .active_turns
-            .retain(|(agent, _), _| !self.affected.contains(agent));
-        for agent in &self.affected {
-            state
-                .plugin_state
-                .agent_epochs
-                .insert(*agent, MakimaId::generate());
-        }
-        if self.session_scope {
-            state.plugin_state.session_epoch = MakimaId::generate();
-        }
-        state.snapshot = self.candidate.clone();
-        state.ready = self.candidate.clone();
-        state.published_revision = self.candidate.revision;
-        state.replacement = None;
-        self.installed = true;
-        drop(state);
-        self._boundary.take();
-        self._publication.take();
-        self.journal.conversion_changed.notify(usize::MAX);
-        Ok(())
-    }
-
-    pub fn notify(&mut self) {
-        if !self.installed {
-            return;
-        }
-        self.journal
-            .lock()
-            .plugin_state
-            .enqueue_notices(take(&mut self.notices));
-        self.journal.drain_state_notices();
-    }
-}
-
-impl Drop for JournalReplacement {
-    fn drop(&mut self) {
-        let mut state = self.journal.lock();
-        if state.replacement == Some(self.reservation) {
-            state.replacement = None;
-        }
-        self.journal.conversion_changed.notify(usize::MAX);
-    }
-}
-
 pub struct SessionJournal {
     boundaries: Arc<RwLock<()>>,
     publication: Arc<RwLock<()>>,
@@ -883,7 +576,6 @@ impl Default for SessionJournal {
                 conversion_errors: BTreeMap::new(),
                 aborted_preparations: BTreeSet::new(),
                 incarnations: BTreeMap::new(),
-                replacement: None,
             }),
             conversion_changed: Event::new(),
         }
@@ -942,7 +634,7 @@ impl SessionJournal {
         session: &StoredSession,
         snapshot: SessionJournalSnapshot,
     ) -> Result<Self, JournalError> {
-        let view = snapshot.fold(snapshot.seq)?;
+        let view = snapshot.fold()?;
         if !session.state().iter().eq(snapshot.state.iter())
             || !session
                 .agent_revisions()
@@ -1595,196 +1287,6 @@ impl SessionJournal {
         self.boundaries.read_arc().await
     }
 
-    pub fn preview_rewind(
-        &self,
-        boundary: RewindBoundary,
-    ) -> Result<SessionJournalSnapshot, RewindError> {
-        let current = self.snapshot();
-        let (candidate, _, _) = prepare_boundary(&current, boundary)?;
-        Ok(candidate)
-    }
-
-    pub async fn prepare_rewind(
-        self: &Arc<Self>,
-        boundary: RewindBoundary,
-    ) -> Result<JournalReplacement, RewindError> {
-        self.prepare_replacement(move |current| prepare_boundary(current, boundary))
-            .await
-    }
-
-    fn migrate_replacement(
-        candidate: &mut SessionJournalSnapshot,
-        affected: &BTreeSet<AgentId>,
-        session_scope: bool,
-        changes: Vec<JournalChange>,
-    ) -> Result<(), RewindError> {
-        for change in changes {
-            if change.agent.is_none() && !session_scope
-                || change.agent.is_some_and(|agent| !affected.contains(&agent))
-                || !matches!(change.change, StateChange::Plugin { .. })
-            {
-                return Err(StateError::ReadOnly.into());
-            }
-            validate_record(&change, candidate.seq)?;
-            crate::rewind::push(candidate, change.agent, change.generation, change.change)?;
-        }
-        Ok(())
-    }
-
-    pub async fn prepare_branch_restore(
-        self: &Arc<Self>,
-        agent: AgentId,
-        restored: SessionJournalSnapshot,
-    ) -> Result<JournalReplacement, RewindError> {
-        self.prepare_replacement(move |current| {
-            let view = current.fold(current.seq).map_err(JournalError::from)?;
-            let session_scope = view
-                .agents
-                .get(&agent)
-                .ok_or(RewindError::StaleBoundary)?
-                .parent
-                .is_none();
-            let saved = restored.fold(restored.seq).map_err(JournalError::from)?;
-            if !saved.agents.contains_key(&agent) {
-                return Err(RewindError::StaleBoundary);
-            }
-            let mut affected = subtree(&view, agent);
-            affected.extend(subtree(&saved, agent));
-            let mut candidate = if session_scope {
-                restored.clone()
-            } else {
-                let mut candidate = current.clone();
-                candidate.seq = current.seq.max(restored.seq);
-                candidate
-                    .state
-                    .retain(|record| record.agent.is_none_or(|id| !affected.contains(&id)));
-                candidate
-                    .agent_revisions
-                    .retain(|(_, record)| !affected.contains(&record.id));
-                candidate.state.extend(
-                    restored
-                        .state
-                        .iter()
-                        .filter(|record| record.agent.is_some_and(|id| affected.contains(&id)))
-                        .cloned(),
-                );
-                candidate.agent_revisions.extend(
-                    restored
-                        .agent_revisions
-                        .iter()
-                        .filter(|(_, record)| affected.contains(&record.id))
-                        .cloned(),
-                );
-                crate::rewind::carry_boundary_pins(&restored, &mut candidate)?;
-                candidate.histories = candidate
-                    .histories
-                    .iter()
-                    .filter(|(id, _)| !affected.contains(id))
-                    .map(|(id, history)| (*id, history.clone()))
-                    .collect();
-                candidate.histories.extend(
-                    restored
-                        .histories
-                        .iter()
-                        .filter(|(id, _)| affected.contains(id))
-                        .map(|(id, history)| (*id, history.clone())),
-                );
-                candidate.managed_histories = candidate
-                    .managed_histories
-                    .iter()
-                    .filter(|id| !affected.contains(id))
-                    .copied()
-                    .collect();
-                candidate.managed_histories.extend(
-                    restored
-                        .managed_histories
-                        .iter()
-                        .filter(|id| affected.contains(id))
-                        .copied(),
-                );
-                candidate
-            };
-            if !session_scope {
-                crate::rewind::pin_outside_boundaries(current, &mut candidate, &affected)?;
-            }
-            let mut previous_epochs = Vec::new();
-            for id in &affected {
-                if let Some(history) = candidate.histories.get(id) {
-                    previous_epochs.push((*id, history.epoch));
-                    let mut restored = HistorySnapshot::new(history.messages.as_ref().clone());
-                    restored.compacted = history.compacted;
-                    candidate.histories.insert(*id, restored);
-                }
-            }
-            for (agent, epoch) in previous_epochs {
-                rebase_history_epoch(&mut candidate, agent, epoch);
-            }
-            finalize_candidate(current, &mut candidate, &affected, session_scope, agent)?;
-            Ok((candidate, affected, session_scope))
-        })
-        .await
-    }
-
-    async fn prepare_replacement(
-        self: &Arc<Self>,
-        build: impl FnOnce(
-            &SessionJournalSnapshot,
-        )
-            -> Result<(SessionJournalSnapshot, BTreeSet<AgentId>, bool), RewindError>,
-    ) -> Result<JournalReplacement, RewindError> {
-        let publication = self.publication.write_arc().await;
-        let boundary = self.boundaries.write_arc().await;
-        let mut build = Some(build);
-        loop {
-            let listener = self.conversion_changed.listen();
-            {
-                let mut state = self.lock();
-                if let Some(error) = state.conversion_errors.values().next() {
-                    return Err(JournalError::Preparation(error.clone()).into());
-                }
-                if state.staged.is_empty() {
-                    if state.replacement.is_some() {
-                        return Err(RewindError::LostReservation);
-                    }
-                    let (candidate, affected, session_scope) =
-                        build.take().ok_or(RewindError::LostReservation)?(&state.snapshot)?;
-                    let mut addresses = BTreeSet::new();
-                    for record in state.snapshot.state.iter().chain(candidate.state.iter()) {
-                        if (session_scope || record.agent.is_some_and(|id| affected.contains(&id)))
-                            && let StateChange::Plugin { key, version, .. } = &record.change
-                        {
-                            addresses.insert((record.agent, key.clone(), *version));
-                        }
-                    }
-                    let notices = addresses
-                        .into_iter()
-                        .map(|(agent, key, version)| StateChangeEvent {
-                            revision: read_slot(&candidate, agent, &key, version).revision,
-                            agent,
-                            key,
-                            reason: StateChangeReason::Rewind,
-                        })
-                        .collect();
-                    let reservation = MakimaId::generate();
-                    state.replacement = Some(reservation);
-                    return Ok(JournalReplacement {
-                        journal: Arc::clone(self),
-                        previous_revision: state.snapshot.revision,
-                        candidate,
-                        affected,
-                        session_scope,
-                        reservation,
-                        notices,
-                        installed: false,
-                        _boundary: Some(boundary),
-                        _publication: Some(publication),
-                    });
-                }
-            }
-            listener.await;
-        }
-    }
-
     pub async fn prepare(
         self: &Arc<Self>,
         commit: JournalCommit,
@@ -1821,9 +1323,6 @@ impl SessionJournal {
                     return Err(JournalError::Preparation(error.clone()));
                 }
                 if state.staged.is_empty() {
-                    if state.replacement.is_some() {
-                        return Err(JournalError::Preparation(REPLACEMENT_RESERVED.into()));
-                    }
                     let builder = build.take().ok_or(JournalError::InvalidPending)?;
                     let mut commit = builder(&state.snapshot);
                     if commit.changes.is_empty()
@@ -2022,9 +1521,6 @@ impl SessionJournal {
         apply: impl FnOnce(),
     ) -> Result<(u64, Vec<StateChangeEvent>), JournalError> {
         let mut state = self.lock();
-        if state.replacement.is_some() {
-            return Err(JournalError::Preparation(REPLACEMENT_RESERVED.into()));
-        }
         let mut commit = build(&state.snapshot);
         Self::validate_incarnations(&state, &commit.incarnations)?;
         self.resolve_state_edits(&mut state, &mut commit)?;
@@ -2310,9 +1806,6 @@ impl SessionJournal {
         commit: JournalCommit,
         pending_change_count: usize,
     ) -> Result<JournalPending, JournalError> {
-        if state.replacement.is_some() {
-            return Err(JournalError::Preparation(REPLACEMENT_RESERVED.into()));
-        }
         Self::validate_incarnations(state, &commit.incarnations)?;
         if !commit.state_edits.is_empty()
             || !commit.context_updates.is_empty()
@@ -2550,11 +2043,6 @@ impl SessionJournal {
         self.lock().published_revision
     }
 
-    #[cfg(test)]
-    pub(crate) fn try_lock_for_rewind_test(&self) -> bool {
-        self.state.try_lock().is_ok()
-    }
-
     pub(crate) fn lock(&self) -> MutexGuard<'_, JournalState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -2642,11 +2130,10 @@ mod tests {
         let full = makima_storage::session_state::SessionStateView::fold(
             &snapshot.state.to_vec(),
             &snapshot.agent_revisions.to_vec(),
-            snapshot.seq,
         )
         .unwrap();
         assert_eq!(snapshot.reduced().unwrap().materialize(), full);
-        assert_eq!(snapshot.fold(snapshot.seq).unwrap(), full);
+        assert_eq!(snapshot.fold().unwrap(), full);
     }
 
     #[test_case(vec![1, 1]; "duplicate_durable_target")]
@@ -2682,8 +2169,8 @@ mod tests {
     }
 
     #[test_case(false; "empty_snapshot")]
-    #[test_case(true; "snapshot_with_pool")]
-    fn incremental_commit_rejects_bad_tail_atomically_and_shares_old_records(with_pool: bool) {
+    #[test_case(true; "snapshot_with_boundary")]
+    fn incremental_commit_rejects_bad_tail_atomically_and_shares_old_records(with_boundary: bool) {
         let journal = SessionJournal::default();
         let agent = AgentId::generate();
         journal
@@ -2692,21 +2179,13 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        if with_pool {
+        if with_boundary {
             journal
                 .commit(JournalCommit {
                     boundary: Some((agent, 0)),
                     ..Default::default()
                 })
                 .unwrap();
-            let boundary = journal.snapshot().seq;
-            let snapshot = journal.snapshot();
-            journal.commit(JournalCommit { changes: vec![JournalChange {
-                agent: None, generation: 0, change: StateChange::BoundarySnapshot {
-                    boundary,
-                    snapshot: json!({"format":"boundary-pool-v1","boundaries":[boundary],"state":snapshot.state.to_vec(),"agents":[],"histories":{agent.to_string():{"epoch":snapshot.histories[&agent].epoch,"compacted":false,"messages":[]}}}),
-                },
-            }], ..Default::default() }).unwrap();
         }
         let before = journal.snapshot();
         let plugin = || JournalChange {
@@ -2743,10 +2222,7 @@ mod tests {
             (before.revision, before.seq)
         );
         assert!(rejected.state.same_root(&before.state));
-        assert_eq!(
-            rejected.fold(rejected.seq).unwrap(),
-            before.fold(before.seq).unwrap()
-        );
+        assert_eq!(rejected.fold().unwrap(), before.fold().unwrap());
         journal
             .commit(JournalCommit {
                 changes: vec![plugin()],
@@ -2864,7 +2340,7 @@ mod tests {
                 snapshot.state.iter().rev().nth(1).unwrap().change,
                 StateChange::Plugin { .. }
             ));
-            let view = snapshot.fold(boundary.seq).unwrap();
+            let view = snapshot.fold().unwrap();
             assert_eq!(view.scopes[&None].plugins[SLOT].value, Some(json!(SECOND)));
             assert_eq!(journal.snapshot().state, before.state);
             assert!(Arc::ptr_eq(

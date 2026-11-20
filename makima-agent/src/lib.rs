@@ -17,11 +17,10 @@ pub mod modes;
 pub use actor::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
     AgentActorHandle, AgentContextSnapshot, BackendResult, CompactionStatus, CompletionPolicy,
-    ConfigChange, ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryBoundary,
-    HistoryChange, InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel,
-    QueueProjection, SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission,
-    TurnAdmissionOptions, TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult,
-    TurnTicket, WorkKind,
+    ConfigChange, ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryChange,
+    InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel, QueueProjection,
+    SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission, TurnAdmissionOptions,
+    TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket, WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
@@ -52,7 +51,6 @@ pub mod context;
 #[cfg(test)]
 mod context_journal_tests;
 pub mod diff;
-pub mod parent_rewind;
 pub mod permissions;
 pub mod plan_state;
 pub mod prompt;

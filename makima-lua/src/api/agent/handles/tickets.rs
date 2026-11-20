@@ -333,7 +333,7 @@ mod tests {
             })
             .unwrap();
         let before = journal.checkpoint_snapshot().unwrap();
-        let view = before.fold(before.seq).unwrap();
+        let view = before.fold().unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             Arc::clone(&journal),

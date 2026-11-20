@@ -176,21 +176,6 @@ pub async fn rediscovered_model(providers: &ProviderRegistry, model: &Model) -> 
 }
 
 impl ConfigChange {
-    pub(super) fn resolved_restore(
-        stored: &StoredAgentConfig,
-        prepared: PreparedModel,
-        mode: (AgentMode, ModeDef),
-        current: &EffectiveAgentConfig,
-    ) -> Result<EffectiveAgentConfig, ActorError> {
-        let mut config = EffectiveAgentConfig::from_stored(stored, prepared, mode)?;
-        config.context = current.context.change_directory(PathBuf::from(&stored.cwd));
-        config.mode_authority = current.mode_authority.clone();
-        if let Some(ceiling) = &config.mode_authority {
-            ceiling.validate(&config.mode, config.mode_def.as_ref())?;
-        }
-        Ok(config)
-    }
-
     pub(super) fn restores_pending_fast(&self, current: &EffectiveAgentConfig) -> bool {
         matches!(self, Self::Refresh { expected, replacement }
             if Arc::ptr_eq(&expected.provider, &current.provider)
@@ -478,7 +463,7 @@ mod context_tests {
             assert!(committed.config.config.fast);
             let changed = journal.snapshot();
             assert_eq!(changed.state.iter().len(), before.state.iter().len() + 1);
-            let folded = changed.fold(changed.seq).unwrap();
+            let folded = changed.fold().unwrap();
             let saved = folded.scopes[&Some(target.id())].config.as_ref().unwrap();
             assert!(saved.fast);
             assert_eq!(saved.options, options);
@@ -633,46 +618,6 @@ mod context_tests {
         assert!(restored.workflow);
         assert_eq!(restored.mode, mode);
         assert_eq!(restored.mode_def, Some(definition));
-    }
-
-    #[test_case(false; "rejects_changed_permissions")]
-    #[test_case(true; "restores_inside_existing_ceiling")]
-    fn restore_preserves_current_mode_authority(allowed: bool) {
-        use crate::actor::{ModeCeiling, PreparedModel};
-        use crate::session_checkpoint::stored_agent_config;
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
-
-        const RESTRICTED_TOOL: &str = "read";
-        let mut definition = ModeDef::default_for(ModeId::Build);
-        definition.tools = Some(vec![RESTRICTED_TOOL.into()]);
-        let current =
-            EffectiveAgentConfig::new(crate::actor::tests::policy(false), AgentMode::Build)
-                .with_context(AgentContextSnapshot::new(PathBuf::from("/current")))
-                .with_mode_def(Some(definition.clone()))
-                .with_mode_authority(ModeCeiling::from_mode(&AgentMode::Build, Some(&definition)));
-        let mut saved = stored_agent_config(&current, BTreeMap::new()).unwrap();
-        if !allowed {
-            saved.mode.tools = None;
-        }
-        let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
-        let result = ConfigChange::resolved_restore(
-            &saved,
-            PreparedModel {
-                provider: Arc::clone(&current.provider),
-                model: current.model.clone(),
-            },
-            mode,
-            &current,
-        );
-        assert_eq!(result.is_ok(), allowed);
-        if let Ok(config) = result {
-            assert!(config.mode_authority().is_some());
-            assert_eq!(
-                config.context.generation(),
-                current.context.generation() + 1
-            );
-        }
     }
 
     #[test]

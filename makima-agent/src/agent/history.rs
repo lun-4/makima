@@ -728,7 +728,7 @@ mod tests {
             Message::user(GO.into())
         });
         let snapshot = journal.snapshot();
-        let view = snapshot.fold(snapshot.seq).unwrap();
+        let view = snapshot.fold().unwrap();
         let StoredDeliveryOp::Queued(delivery) =
             &view.scopes[&Some(parent)].deliveries[&(child, turn)]
         else {

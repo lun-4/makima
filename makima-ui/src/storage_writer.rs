@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -20,10 +19,9 @@ use makima_storage::checkpoint::{
 };
 use makima_storage::id::MakimaId;
 use makima_storage::session_lock::SessionPublicationGuard;
-use makima_storage::session_state::StoredBranch;
 use makima_storage::sessions::{
-    HistoryDestination, HistoryIdentity, HistorySnapshot, PublicationOutcome, SESSIONS_DIR,
-    SessionError, SessionLog, StoredSubagent,
+    HistoryDestination, HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError, SessionLog,
+    StoredSubagent,
 };
 use makima_storage::{StateDir, StorageError};
 use tracing::warn;
@@ -37,16 +35,10 @@ use makima_agent::session_recovery::{RecoveredSession, RecoveryCandidate};
 use makima_agent::tools::offload::OffloadStore;
 
 use crate::AppSession;
-use makima_agent::CancelToken;
 use makima_providers::Message;
 
 pub(crate) const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
-const RESTORE_UNSYNCED: &str =
-    "Session restore is live, but directory sync failed; retrying durability confirmation";
-const RESTORE_SYNC_RECOVERED: &str = "Session restore durability confirmed";
-const RESTORE_SYNC_ABANDONED: &str =
-    "Session restore durability is unconfirmed; session lock was lost";
 const JOURNAL_UNSAVED: &str = "changes applied but not saved";
 const JOURNAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CHECKPOINT_REPLACED: &str = "checkpoint payload superseded by authoritative session state";
@@ -58,8 +50,6 @@ const STAGED_HISTORY_INCOMPLETE: &str = "staged history requires a destination a
 const SELECTED_CONFIG_DESTINATION: &str =
     "selected config requires its child checkpoint destination";
 const SELECTED_CONFIG_MISSING: &str = "selected child config requires existing stored metadata";
-const RESTORE_PROJECTION_MISMATCH: &str =
-    "restore session does not match its exact journal or branch";
 #[cfg(not(test))]
 const CHECKPOINT_RETRY_BACKOFFS: &[Duration] = &[
     Duration::from_millis(100),
@@ -80,8 +70,6 @@ const BACKGROUND_RETRY_BACKOFFS: &[Duration] =
     &[Duration::from_millis(20), Duration::from_millis(50)];
 
 type Pending = Arc<Mutex<PendingState>>;
-#[cfg(test)]
-type RestoreSyncGate = (flume::Sender<MakimaId>, flume::Receiver<Result<(), String>>);
 
 #[derive(Default)]
 struct PendingState {
@@ -108,19 +96,9 @@ struct PendingState {
     incarnations: HashMap<MakimaId, Arc<()>>,
     authoritative_sessions: HashSet<MakimaId>,
     save_incarnations: HashMap<MakimaId, Arc<()>>,
-    restore_checkpoints: Vec<RestoreCheckpointSave>,
-    publication_syncs: HashMap<MakimaId, PublicationSync>,
-    publication_sync_failures: HashMap<MakimaId, String>,
     publication_guards: HashMap<MakimaId, SessionPublicationGuard>,
     write_barrier: Arc<Mutex<()>>,
-    current_checkpoints: Vec<CurrentCheckpointSave>,
     generation_floors: HashMap<MakimaId, u64>,
-    #[cfg(test)]
-    restore_sync_error: Option<StorageError>,
-    #[cfg(test)]
-    current_sync_error: Option<StorageError>,
-    #[cfg(test)]
-    restore_sync_gate: Option<RestoreSyncGate>,
     #[cfg(test)]
     child_stage_gate: Option<(flume::Sender<()>, flume::Receiver<()>)>,
     #[cfg(test)]
@@ -138,52 +116,10 @@ pub struct StagedSessionCheckpoint {
     pub guard: SessionPublicationGuard,
 }
 
-pub struct CurrentSessionCheckpoint {
-    pub session: Arc<AppSession>,
-    pub journal: SessionJournalSnapshot,
-    pub publication: CheckpointPublication,
-    pub claim: CheckpointClaim,
-    pub guard: SessionPublicationGuard,
-    pub fence: SessionSaveFence,
-}
-
-struct CurrentCheckpointSave {
-    request: CurrentSessionCheckpoint,
-    journal: JournalCheckpoint,
-    incarnation: Arc<()>,
-    generation: Option<u64>,
-    reply: flume::Sender<Result<(), String>>,
-}
-
-pub struct RestoredSessionCheckpoint {
-    pub session_id: MakimaId,
-    pub session: Arc<AppSession>,
-    pub journal: SessionJournalSnapshot,
-    pub branch: StoredBranch,
-    pub publication: CheckpointPublication,
-    pub claim: CheckpointClaim,
-    pub guard: SessionPublicationGuard,
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionSaveFence {
     session_id: MakimaId,
     incarnation: Arc<()>,
-}
-
-struct PublicationSync {
-    guard: SessionPublicationGuard,
-    retry_at: Instant,
-    retry_attempt: usize,
-    waiters: Vec<flume::Sender<Result<(), String>>>,
-}
-
-struct RestoreCheckpointSave {
-    request: RestoredSessionCheckpoint,
-    journal: JournalCheckpoint,
-    incarnation: Arc<()>,
-    generation: Option<u64>,
-    reply: flume::Sender<Result<SessionSaveFence, String>>,
 }
 
 #[derive(Clone)]
@@ -391,13 +327,6 @@ pub(crate) struct CoordinatorCheckpointWriter {
 }
 
 impl CoordinatorCheckpointWriter {
-    pub(crate) fn refresh_fence(&self, fence: &SessionSaveFence) {
-        self.save_incarnations
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(fence.session_id, Arc::clone(&fence.incarnation));
-    }
-
     pub(crate) fn bind(&self, guard: Option<SessionPublicationGuard>) {
         *self
             .publication
@@ -732,6 +661,7 @@ impl StorageWriter {
         }
     }
 
+    #[cfg(test)]
     pub fn seed(&self, session: Arc<AppSession>) {
         let id = session.id;
         let mut state = lock(&self.pending);
@@ -872,120 +802,6 @@ impl StorageWriter {
         let barrier = Arc::clone(&lock(&self.pending).write_barrier);
         let _barrier = barrier.lock().unwrap_or_else(PoisonError::into_inner);
         lock(&self.pending).publication_guards.insert(id, guard);
-    }
-
-    #[cfg(test)]
-    pub async fn checkpoint_fenced_guarded(
-        &self,
-        request: CheckpointRequest<AppSession>,
-        fence: &SessionSaveFence,
-        guard: SessionPublicationGuard,
-    ) -> Result<(), String> {
-        if request.session_id != request.snapshot.id {
-            return Err(RESTORE_PROJECTION_MISMATCH.into());
-        }
-        let journal =
-            capture_journal(&self.pending, request.session_id).ok_or(SNAPSHOT_UNAVAILABLE)?;
-        let mut session = request.snapshot;
-        project_journal(
-            &lock(&self.pending),
-            request.session_id,
-            Some(&journal),
-            &mut session,
-        )?;
-        self.checkpoint_current_guarded(CurrentSessionCheckpoint {
-            session,
-            journal: journal.snapshot.as_ref().clone(),
-            publication: CheckpointPublication::default(),
-            claim: publication_claim(),
-            guard,
-            fence: fence.clone(),
-        })
-        .await
-    }
-
-    pub async fn checkpoint_current_guarded(
-        &self,
-        request: CurrentSessionCheckpoint,
-    ) -> Result<(), String> {
-        self.bind_publication_guard(request.session.id, request.guard.clone());
-        enqueue_current_checkpoint(&self.pending, &self.wake, request)?
-            .recv_async()
-            .await
-            .map_err(|error| error.to_string())?
-    }
-
-    pub async fn checkpoint_restore(
-        &self,
-        request: RestoredSessionCheckpoint,
-    ) -> Result<SessionSaveFence, String> {
-        enqueue_restore_checkpoint(&self.pending, &self.wake, request)?
-            .recv_async()
-            .await
-            .map_err(|error| error.to_string())?
-    }
-
-    pub async fn await_publication_sync(
-        &self,
-        fence: &SessionSaveFence,
-        cancel: &CancelToken,
-    ) -> Result<(), String> {
-        cancel
-            .race(async {
-                #[cfg(test)]
-                {
-                    let gate = {
-                        let state = lock(&self.pending);
-                        state
-                            .publication_syncs
-                            .contains_key(&fence.session_id)
-                            .then(|| state.restore_sync_gate.clone())
-                            .flatten()
-                    };
-                    if let Some((entered, release)) = gate {
-                        let _ = entered.send(fence.session_id);
-                        release
-                            .recv_async()
-                            .await
-                            .map_err(|error| error.to_string())??;
-                    }
-                }
-                publication_sync_waiter(&self.pending, fence)?
-                    .recv_async()
-                    .await
-                    .map_err(|error| error.to_string())?
-            })
-            .await?
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_restore_sync(
-        &self,
-        error: &str,
-    ) -> (flume::Receiver<MakimaId>, flume::Sender<Result<(), String>>) {
-        let (entered, observed) = flume::bounded(1);
-        let (release, gate) = flume::bounded(1);
-        let mut state = lock(&self.pending);
-        state.restore_sync_error = Some(StorageError::from(io::Error::other(error.to_owned())));
-        state.restore_sync_gate = Some((entered, gate));
-        (observed, release)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_current_sync(
-        &self,
-        error: &str,
-    ) -> (flume::Receiver<MakimaId>, flume::Sender<Result<(), String>>) {
-        let gates = self.hold_restore_sync(error);
-        let mut state = lock(&self.pending);
-        state.current_sync_error = state.restore_sync_error.take();
-        gates
-    }
-
-    #[cfg(test)]
-    pub(crate) fn release_restore_sync(&self) {
-        lock(&self.pending).restore_sync_gate = None;
-        let _ = self.wake.send(());
     }
 
     pub async fn recover_checkpoint(
@@ -1305,156 +1121,6 @@ fn save_fence_current(
         }
         None => !state.authoritative_sessions.contains(&id),
     }
-}
-
-fn enqueue_current_checkpoint(
-    pending: &Pending,
-    wake: &flume::Sender<()>,
-    request: CurrentSessionCheckpoint,
-) -> Result<flume::Receiver<Result<(), String>>, String> {
-    let id = request.session.id;
-    if request.session.state() != request.journal.state.to_vec()
-        || request.session.agent_revisions() != request.journal.agent_revisions.to_vec()
-    {
-        return Err(RESTORE_PROJECTION_MISMATCH.into());
-    }
-    let journal = capture_journal(pending, id).ok_or(SNAPSHOT_UNAVAILABLE)?;
-    let (reply, response) = flume::bounded(1);
-    {
-        let mut state = lock(pending);
-        if state.closed
-            || state.recovery_transactions.contains_key(&id)
-            || !save_fence_current(&state, id, Some(&request.fence))
-            || !journal_current(&state, id, Some(&journal))
-            || journal.snapshot.epoch != request.journal.epoch
-            || journal.snapshot.revision != request.journal.revision
-        {
-            return Err(CHECKPOINT_REPLACED.into());
-        }
-        if matches!(state.entries.get(&id), Some(Entry::Delete(_, _, _))) {
-            return Err(CHECKPOINT_REPLACED.into());
-        }
-        if let Some(Entry::Save(save)) = state.entries.remove(&id) {
-            fail_waiters(id, save.waiters, CHECKPOINT_REPLACED);
-        }
-        state.coordinator_pending.remove(&id);
-        if let Some(publications) = state.publications.remove(&id) {
-            for publication in publications {
-                publication.cancel();
-            }
-        }
-        let incarnation = Arc::clone(state.incarnations.entry(id).or_default());
-        let generation = state.latest_generations.get(&id).copied();
-        state
-            .publications
-            .entry(id)
-            .or_default()
-            .push(request.publication.clone());
-        state.current_checkpoints.push(CurrentCheckpointSave {
-            request,
-            journal,
-            incarnation,
-            generation,
-            reply,
-        });
-    }
-    wake.send(()).map_err(|error| error.to_string())?;
-    Ok(response)
-}
-
-fn publication_sync_waiter(
-    pending: &Pending,
-    fence: &SessionSaveFence,
-) -> Result<flume::Receiver<Result<(), String>>, String> {
-    let (reply, response) = flume::bounded(1);
-    let mut state = lock(pending);
-    if !save_fence_current(&state, fence.session_id, Some(fence)) {
-        return Err(CHECKPOINT_REPLACED.into());
-    }
-    if let Some(error) = state.publication_sync_failures.get(&fence.session_id) {
-        return Err(error.clone());
-    }
-    if let Some(sync) = state.publication_syncs.get_mut(&fence.session_id) {
-        sync.waiters.push(reply);
-    } else {
-        let _ = reply.send(Ok(()));
-    }
-    Ok(response)
-}
-
-fn enqueue_restore_checkpoint(
-    pending: &Pending,
-    wake: &flume::Sender<()>,
-    request: RestoredSessionCheckpoint,
-) -> Result<flume::Receiver<Result<SessionSaveFence, String>>, String> {
-    let id = request.session_id;
-    if request.session.id != id
-        || request.session.state() != request.journal.state.to_vec()
-        || request.session.agent_revisions() != request.journal.agent_revisions.to_vec()
-        || !request.journal.authoritative
-        || !request.session.branches().contains(&request.branch)
-    {
-        return Err(RESTORE_PROJECTION_MISMATCH.into());
-    }
-    let mut projection = request.session.as_ref().clone();
-    request
-        .journal
-        .apply_to(&mut projection)
-        .map_err(|error| error.to_string())?;
-    if request.journal.histories.iter().any(|(id, history)| {
-        let Some(agent) = request.session.agents().get(id) else {
-            return true;
-        };
-        let epoch = if agent.transcript_key.is_empty() {
-            Some(request.session.history_snapshot().epoch)
-        } else {
-            request
-                .session
-                .subagent_history_snapshot(&agent.transcript_key)
-                .map(|history| history.epoch)
-        };
-        epoch != Some(history.epoch)
-    }) || serde_json::to_value(projection.history_snapshot().messages.as_ref())
-        .map_err(|error| error.to_string())?
-        != serde_json::to_value(request.session.messages()).map_err(|error| error.to_string())?
-        || serde_json::to_value(projection.subagent_messages())
-            .map_err(|error| error.to_string())?
-            != serde_json::to_value(request.session.subagent_messages())
-                .map_err(|error| error.to_string())?
-    {
-        return Err(RESTORE_PROJECTION_MISMATCH.into());
-    }
-    let journal = capture_journal(pending, id).ok_or(SNAPSHOT_UNAVAILABLE)?;
-    let (reply, response) = flume::bounded(1);
-    {
-        let mut state = lock(pending);
-        if state.closed {
-            return Err(CheckpointError::Closed(id).to_string());
-        }
-        if state.recovery_transactions.contains_key(&id)
-            || !journal_current(&state, id, Some(&journal))
-            || journal.snapshot.epoch == request.journal.epoch
-            || journal.snapshot.revision >= request.journal.revision
-        {
-            return Err(CHECKPOINT_REPLACED.into());
-        }
-        let incarnation = Arc::clone(state.incarnations.entry(id).or_default());
-        let generation = state.latest_generations.get(&id).copied();
-        state
-            .publications
-            .entry(id)
-            .or_default()
-            .push(request.publication.clone());
-        state.restore_checkpoints.push(RestoreCheckpointSave {
-            request,
-            journal,
-            incarnation,
-            generation,
-            reply,
-        });
-    }
-    wake.send(()).map_err(|error| error.to_string())?;
-    Ok(response)
 }
 
 fn install_recovered(
@@ -2338,7 +2004,6 @@ impl Writer {
     }
 
     fn flush(&mut self, pending: &Pending) -> Option<Instant> {
-        self.retry_publication_syncs(pending, Instant::now(), SessionLog::sync_publication);
         let rollbacks = mem::take(&mut lock(pending).recovery_rollbacks);
         for rollback in rollbacks {
             let reply = rollback.reply.clone();
@@ -2346,28 +2011,6 @@ impl Writer {
             let result = self.rollback_recovery(rollback.publication);
             self.report(id, result.as_ref().map(|_| ()).map_err(ToString::to_string));
             let _ = reply.send(result);
-        }
-        let current = mem::take(&mut lock(pending).current_checkpoints);
-        for save in current {
-            let id = save.request.session.id;
-            let result = self.write_current_checkpoint(pending, &save);
-            self.report(id, result.as_ref().map(|_| ()).map_err(String::as_str));
-            if let Some(publications) = lock(pending).publications.get_mut(&id) {
-                publications
-                    .retain(|publication| !publication.same_request(&save.request.publication));
-            }
-            let _ = save.reply.send(result);
-        }
-        let restores = mem::take(&mut lock(pending).restore_checkpoints);
-        for save in restores {
-            let id = save.request.session_id;
-            let result = self.write_restore_checkpoint(pending, &save);
-            self.report(id, result.as_ref().map(|_| ()).map_err(String::as_str));
-            if let Some(publications) = lock(pending).publications.get_mut(&id) {
-                publications
-                    .retain(|publication| !publication.same_request(&save.request.publication));
-            }
-            let _ = save.reply.send(result);
         }
         let recoveries = mem::take(&mut lock(pending).recoveries);
         for save in recoveries {
@@ -2641,69 +2284,8 @@ impl Writer {
                 Entry::Save(save) => save.retry_at,
                 Entry::Delete(_, _, _) => None,
             })
-            .chain(state.publication_syncs.values().map(|sync| sync.retry_at))
             .chain((!state.journals.is_empty()).then(|| Instant::now() + JOURNAL_POLL_INTERVAL))
             .min()
-    }
-
-    fn retry_publication_syncs(
-        &mut self,
-        pending: &Pending,
-        now: Instant,
-        mut sync_directory: impl FnMut(&Path) -> Result<(), StorageError>,
-    ) {
-        #[cfg(test)]
-        if lock(pending).restore_sync_gate.is_some() {
-            return;
-        }
-        let directory = self.dir.path().join(SESSIONS_DIR);
-        let retries = {
-            let state = lock(pending);
-            state
-                .publication_syncs
-                .iter()
-                .filter(|(_, sync)| sync.retry_at <= now)
-                .map(|(id, sync)| (*id, sync.guard.clone()))
-                .collect::<Vec<_>>()
-        };
-        for (id, guard) in retries {
-            let result = guard
-                .publish(|| sync_directory(&directory))
-                .map_err(StorageError::from)
-                .and_then(|result| result.transpose());
-            let mut state = lock(pending);
-            match result {
-                Ok(Some(())) => {
-                    if let Some(sync) = state.publication_syncs.remove(&id) {
-                        for waiter in sync.waiters {
-                            let _ = waiter.send(Ok(()));
-                        }
-                    }
-                    let _ = self.warn_tx.send(RESTORE_SYNC_RECOVERED.into());
-                }
-                Ok(None) => {
-                    state
-                        .publication_sync_failures
-                        .insert(id, RESTORE_SYNC_ABANDONED.into());
-                    if let Some(sync) = state.publication_syncs.remove(&id) {
-                        for waiter in sync.waiters {
-                            let _ = waiter.send(Err(RESTORE_SYNC_ABANDONED.into()));
-                        }
-                    }
-                    warn!(session_id = %id, "restore directory sync abandoned after lock loss");
-                    let _ = self.warn_tx.send(RESTORE_SYNC_ABANDONED.into());
-                }
-                Err(error) => {
-                    warn!(%error, session_id = %id, "restore directory sync retry failed");
-                    if let Some(retry) = state.publication_syncs.get_mut(&id) {
-                        let backoff = BACKGROUND_RETRY_BACKOFFS
-                            [retry.retry_attempt.min(BACKGROUND_RETRY_BACKOFFS.len() - 1)];
-                        retry.retry_attempt = retry.retry_attempt.saturating_add(1);
-                        retry.retry_at = now + backoff;
-                    }
-                }
-            }
-        }
     }
 
     fn write_recovery(
@@ -2851,223 +2433,6 @@ impl Writer {
             .insert(id, Arc::clone(&publication.previous));
         state.recovery_transactions.remove(&id);
         Ok(())
-    }
-
-    fn write_current_checkpoint(
-        &mut self,
-        pending: &Pending,
-        save: &CurrentCheckpointSave,
-    ) -> Result<(), String> {
-        let request = &save.request;
-        let id = request.session.id;
-        let directory = self
-            .dir
-            .ensure_subdir(SESSIONS_DIR)
-            .map_err(|error| error.to_string())?;
-        let staged = SessionLog::stage_checkpoint(&directory, request.session.as_ref())
-            .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        {
-            let gate = lock(pending).child_stage_gate.clone();
-            if let Some((entered, release)) = gate {
-                let _ = entered.send(());
-                let _ = release.recv();
-            }
-        }
-        let _publication = save
-            .journal
-            .publication
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut state = lock(pending);
-        let mut claim_error = None;
-        let outcome = staged
-            .publish_outcome(&request.guard, || {
-                if state.closed
-                    || state.recovery_transactions.contains_key(&id)
-                    || !save_fence_current(&state, id, Some(&request.fence))
-                    || !journal_current(&state, id, Some(&save.journal))
-                    || !state
-                        .incarnations
-                        .get(&id)
-                        .is_some_and(|current| Arc::ptr_eq(current, &save.incarnation))
-                    || state.latest_generations.get(&id).copied() != save.generation
-                    || matches!(state.entries.get(&id), Some(Entry::Delete(_, _, _)))
-                {
-                    return false;
-                }
-                match (request.claim)(&request.publication) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        claim_error = Some(error);
-                        false
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        let outcome = match (outcome, state.current_sync_error.take()) {
-            (PublicationOutcome::Published, Some(error)) => {
-                PublicationOutcome::PublishedUnsynced(error)
-            }
-            (outcome, _) => outcome,
-        };
-        if matches!(outcome, PublicationOutcome::NotPublished) {
-            return Err(
-                claim_error.map_or_else(|| CHECKPOINT_REPLACED.into(), |error| error.to_string())
-            );
-        }
-        self.logs.remove(&id);
-        state.acknowledged.insert(id, Arc::clone(&request.session));
-        state.latest.insert(id, Arc::clone(&request.session));
-        let generation = next_generation(&mut state);
-        state.latest_generations.insert(id, generation);
-        state.generation_floors.insert(id, generation);
-        remember_journal(
-            &mut state,
-            id,
-            Some(&JournalCheckpoint {
-                snapshot: Arc::new(request.journal.clone()),
-                ..save.journal.clone()
-            }),
-        );
-        state.publication_syncs.remove(&id);
-        state.publication_sync_failures.remove(&id);
-        if let PublicationOutcome::PublishedUnsynced(error) = outcome {
-            warn!(%error, session_id = %id, "current session published without confirmed directory durability");
-            let _ = self.warn_tx.send(format!("{RESTORE_UNSYNCED}: {error}"));
-            state.publication_syncs.insert(
-                id,
-                PublicationSync {
-                    guard: request.guard.clone(),
-                    retry_at: Instant::now() + BACKGROUND_RETRY_BACKOFFS[0],
-                    retry_attempt: 1,
-                    waiters: Vec::new(),
-                },
-            );
-        }
-        drop(state);
-        if let Err(error) = save.journal.journal.acknowledge(&request.journal) {
-            warn!(%error, session_id = %id, "current journal acknowledgement rejected after publication");
-        }
-        Ok(())
-    }
-
-    fn write_restore_checkpoint(
-        &mut self,
-        pending: &Pending,
-        save: &RestoreCheckpointSave,
-    ) -> Result<SessionSaveFence, String> {
-        let request = &save.request;
-        let id = request.session_id;
-        if request.publication.is_cancelled() {
-            return Err(CHECKPOINT_CANCELLED.into());
-        }
-        let directory = self
-            .dir
-            .ensure_subdir(SESSIONS_DIR)
-            .map_err(|error| error.to_string())?;
-        let staged = SessionLog::stage_checkpoint_with_branch(
-            &directory,
-            request.session.as_ref(),
-            request.branch.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        {
-            let gate = lock(pending).child_stage_gate.clone();
-            if let Some((entered, release)) = gate {
-                let _ = entered.send(());
-                let _ = release.recv();
-            }
-        }
-        let _publication = save
-            .journal
-            .publication
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut state = lock(pending);
-        let mut claim_error = None;
-        let outcome = staged
-            .publish_outcome(&request.guard, || {
-                if state.closed
-                    || state.recovery_transactions.contains_key(&id)
-                    || !journal_current(&state, id, Some(&save.journal))
-                    || !state
-                        .incarnations
-                        .get(&id)
-                        .is_some_and(|current| Arc::ptr_eq(current, &save.incarnation))
-                    || state.latest_generations.get(&id).copied() != save.generation
-                    || matches!(state.entries.get(&id), Some(Entry::Delete(_, _, _)))
-                {
-                    return false;
-                }
-                match (request.claim)(&request.publication) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        claim_error = Some(error);
-                        false
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        let outcome = match (outcome, state.restore_sync_error.take()) {
-            (PublicationOutcome::Published, Some(error)) => {
-                PublicationOutcome::PublishedUnsynced(error)
-            }
-            (outcome, _) => outcome,
-        };
-        if matches!(outcome, PublicationOutcome::NotPublished) {
-            return Err(
-                claim_error.map_or_else(|| CHECKPOINT_REPLACED.into(), |error| error.to_string())
-            );
-        }
-        self.logs.remove(&id);
-        cancel_publications(&mut state, id);
-        if let Some(Entry::Save(queued)) = state.entries.remove(&id) {
-            fail_waiters(id, queued.waiters, CHECKPOINT_REPLACED);
-        }
-        state.coordinator_pending.remove(&id);
-        state.coordinator_history_bases.remove(&id);
-        state.config_versions.remove(&id);
-        state.history_versions.remove(&id);
-        state.live_children.remove(&id);
-        state.prepared_histories.remove(&id);
-        state.acknowledged.insert(id, Arc::clone(&request.session));
-        state.latest.insert(id, Arc::clone(&request.session));
-        let generation = next_generation(&mut state);
-        state.latest_generations.insert(id, generation);
-        state.journals.insert(
-            id,
-            JournalCheckpoint {
-                publication: Arc::default(),
-                journal: Arc::clone(&save.journal.journal),
-                snapshot: Arc::new(request.journal.clone()),
-            },
-        );
-        state.authoritative_sessions.insert(id);
-        let incarnation = Arc::new(());
-        state.save_incarnations.insert(id, Arc::clone(&incarnation));
-        state.publication_syncs.remove(&id);
-        state.publication_sync_failures.remove(&id);
-        if let PublicationOutcome::PublishedUnsynced(error) = outcome {
-            warn!(%error, session_id = %id, "restored session published without confirmed directory durability");
-            let _ = self.warn_tx.send(format!("{RESTORE_UNSYNCED}: {error}"));
-            state.publication_syncs.insert(
-                id,
-                PublicationSync {
-                    guard: request.guard.clone(),
-                    retry_at: Instant::now() + BACKGROUND_RETRY_BACKOFFS[0],
-                    retry_attempt: 1,
-                    waiters: Vec::new(),
-                },
-            );
-        }
-        Ok(SessionSaveFence {
-            session_id: id,
-            incarnation,
-        })
     }
 
     fn write_staged_checkpoint(
@@ -3350,7 +2715,6 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_loop::rewind::tests::assert_persisted_state;
     use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::session_checkpoint::stored_agent_config;
@@ -3515,325 +2879,8 @@ mod tests {
         )
     }
 
-    #[test_case(false; "root_epoch")]
-    #[test_case(true; "child_epoch")]
-    fn restore_checkpoint_rejects_history_epoch_mismatch(child: bool) {
-        let (_tmp, dir) = state_dir();
-        let (writer, wake) = manual_writer();
-        let mut session = AppSession::new(MODEL, CWD);
-        let root = AgentId::generate();
-        let child_id = AgentId::generate();
-        session.bind_root_id(root).unwrap();
-        session.push_message(Message::user(BASE_MSG.into()));
-        let mut record = session.agents()[&root].clone();
-        record.id = child_id;
-        record.parent = Some(root);
-        record.depth = 1;
-        record.transcript_key = LIVE_CHILD.into();
-        let seq = session.next_state_seq();
-        record.created_seq = seq;
-        record.updated_seq = seq;
-        session.push_agent_revision(seq, record);
-        session.adopt_subagent_history(
-            LIVE_CHILD.into(),
-            &HistorySnapshot::new(vec![Message::user(RESUMED_MSG.into())]),
-        );
-        let mut journal = SessionJournal::from_session(&session).unwrap().snapshot();
-        journal.authoritative = true;
-        let branch = StoredBranch {
-            id: MakimaId::generate(),
-            created_at: session.updated_at,
-            at_seq: journal.seq,
-            agent: root,
-            offset: session.messages().len(),
-        };
-        session.push_branch(branch.clone());
-        session.save(&dir).unwrap();
-        let path = dir
-            .path()
-            .join(SESSIONS_DIR)
-            .join(format!("{}.jsonl", session.id));
-        let before = std::fs::read(&path).unwrap();
-        if child {
-            let history =
-                HistorySnapshot::new(session.subagent_messages()[LIVE_CHILD].as_ref().clone());
-            session.adopt_subagent_history(LIVE_CHILD.into(), &history);
-        } else {
-            let history = HistorySnapshot::new(session.messages().to_vec());
-            session.adopt_history(&history);
-        }
-        let (lease, _coordinator) = guarded_writer(&writer, &dir, session.id);
-        let result = enqueue_restore_checkpoint(
-            &writer.pending,
-            &writer.wake,
-            RestoredSessionCheckpoint {
-                session_id: session.id,
-                session: Arc::new(session),
-                journal,
-                branch,
-                publication: CheckpointPublication::default(),
-                claim: publication_claim(),
-                guard: lease.publication_guard(),
-            },
-        );
-        assert_eq!(result.unwrap_err(), RESTORE_PROJECTION_MISMATCH);
-        assert!(lock(&writer.pending).restore_checkpoints.is_empty());
-        assert!(wake.is_empty());
-        assert_eq!(std::fs::read(path).unwrap(), before);
-    }
-
-    #[test_case(false, false, false; "exact_replacement")]
-    #[test_case(true, false, false; "unchanged_replacement")]
-    #[test_case(false, true, false; "detached_exact_before_install")]
-    #[test_case(true, true, false; "detached_unchanged_before_install")]
-    #[test_case(false, true, true; "detached_exact_after_install")]
-    #[test_case(true, true, true; "detached_unchanged_after_install")]
-    fn restore_checkpoint_replaces_exactly_and_fences_old_producers(
-        unchanged: bool,
-        detached: bool,
-        installed: bool,
-    ) {
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let (writer, _wake_rx) = manual_writer();
-            let mut target = AppSession::new(MODEL, CWD);
-            let root = AgentId::generate();
-            target.bind_root_id(root).unwrap();
-            target.push_message(Message::user(BASE_MSG.into()));
-            let mut old = target.clone();
-            if !unchanged {
-                old.push_message(Message::user(COORDINATOR_MSG.into()));
-                old.push_state(StoredStateRecord {
-                    seq: old.sequence_high_water().unwrap() + 1,
-                    agent: None,
-                    generation: 1,
-                    change: StateChange::Rules {
-                        rules: Vec::new(),
-                        yolo: Some(true),
-                    },
-                });
-                old.set_subagent_messages(
-                    ORPHAN_CHILD.into(),
-                    vec![Message::user(RESUMED_MSG.into())],
-                );
-                old.push_post(stored_post(None, 1));
-                old.insert_tool_output(TOOL_ID.into(), ToolOutput::Plain(TOOL_TEXT.into()));
-                old.set_title(TITLE.into());
-            }
-            let id = old.id;
-            let journal = Arc::new(SessionJournal::from_session(&old).unwrap());
-            writer.seed(Arc::new(old.clone()));
-            writer.bind_journal(id, Arc::clone(&journal));
-            let old_fence = writer.session_save_fence(id);
-            let (lease, old_coordinator) = guarded_writer(&writer, &dir, id);
-            let (mut disk, _warnings) = disk_writer(&dir);
-            disk.write(&old).unwrap();
-            let old_capture = capture_journal(&writer.pending, id).unwrap();
-            let version = CheckpointVersion {
-                epoch: 1,
-                revision: 1,
-            };
-            let queued = writer.checkpoint_fenced(
-                CheckpointRequest {
-                    session_id: id,
-                    version,
-                    snapshot: Arc::new(old.clone()),
-                },
-                &old_fence,
-            );
-            let staged_publication = CheckpointPublication::default();
-            let staged = enqueue_staged_checkpoint(
-                &writer.pending,
-                &writer.wake,
-                StagedSessionCheckpoint {
-                    session_id: id,
-                    checkpoint: None,
-                    journal: None,
-                    selected_config: None,
-                    history: None,
-                    publication: staged_publication.clone(),
-                    claim: publication_claim(),
-                    guard: lease.publication_guard(),
-                },
-            )
-            .unwrap();
-            {
-                let mut state = lock(&writer.pending);
-                let generation = state.latest_generations[&id];
-                state.coordinator_pending.insert(
-                    id,
-                    CoordinatorPending {
-                        generation,
-                        session: Arc::new(old.clone()),
-                        history_base: Some(old.history_identity()),
-                    },
-                );
-                state.config_versions.insert(id, (1, 1));
-                state
-                    .prepared_histories
-                    .insert(id, vec![(HistoryDestination::Main, old.history_snapshot())]);
-            }
-            let detached_saves = detached.then(|| {
-                let mut state = lock(&writer.pending);
-                (
-                    state.entries.remove(&id).unwrap(),
-                    state.staged_checkpoints.remove(0),
-                )
-            });
-            let restored = SessionJournal::from_session(&target).unwrap().snapshot();
-            let mut token = journal
-                .prepare_branch_restore(root, restored)
-                .await
-                .unwrap();
-            let snapshot = token.snapshot().clone();
-            snapshot.apply_to(&mut target).unwrap();
-            let branch = StoredBranch {
-                id: MakimaId::generate(),
-                created_at: old.updated_at,
-                at_seq: old.sequence_high_water().unwrap(),
-                agent: root,
-                offset: old.messages().len(),
-            };
-            target.push_branch(branch.clone());
-            let expected = Arc::new(target);
-            let response = enqueue_restore_checkpoint(
-                &writer.pending,
-                &writer.wake,
-                RestoredSessionCheckpoint {
-                    session_id: id,
-                    session: Arc::clone(&expected),
-                    journal: snapshot.clone(),
-                    branch: branch.clone(),
-                    publication: CheckpointPublication::default(),
-                    claim: publication_claim(),
-                    guard: lease.publication_guard(),
-                },
-            )
-            .unwrap();
-            disk.flush(&writer.pending);
-            let fence = response.recv().unwrap().unwrap();
-            if installed {
-                token.install().unwrap();
-            }
-            if let Some((ordinary, staged)) = detached_saves {
-                let path = dir.path().join(SESSIONS_DIR).join(format!("{id}.jsonl"));
-                let published = std::fs::read(&path).unwrap();
-                {
-                    let mut state = lock(&writer.pending);
-                    state.entries.insert(id, ordinary);
-                    state.staged_checkpoints.push(staged);
-                }
-                disk.flush(&writer.pending);
-                assert_eq!(std::fs::read(path).unwrap(), published);
-                assert!(!lock(&writer.pending).entries.contains_key(&id));
-                assert!(lock(&writer.pending).staged_checkpoints.is_empty());
-            }
-            token.install().unwrap();
-            assert!(
-                matches!(queued.await, Err(CheckpointError::Save { message, .. }) if message.as_ref() == CHECKPOINT_REPLACED)
-            );
-            assert!(staged.recv().unwrap().is_err());
-            assert!(staged_publication.is_cancelled());
-            {
-                let state = lock(&writer.pending);
-                assert!(Arc::ptr_eq(&state.latest[&id], &expected));
-                assert!(Arc::ptr_eq(&state.acknowledged[&id], &expected));
-                assert!(!state.coordinator_pending.contains_key(&id));
-                assert!(!state.coordinator_history_bases.contains_key(&id));
-                assert!(!state.config_versions.contains_key(&id));
-                assert!(!state.prepared_histories.contains_key(&id));
-                assert!(!journal_current(&state, id, Some(&old_capture)));
-            }
-            let loaded = AppSession::load(id, &dir).unwrap();
-            assert_persisted_state(&loaded, &snapshot);
-            assert_eq!(loaded.agent_revisions(), expected.agent_revisions());
-            assert_eq!(message_texts(&loaded), message_texts(&expected));
-            assert_eq!(loaded.posts(), expected.posts());
-            assert_eq!(loaded.subagents(), expected.subagents());
-            assert_eq!(
-                loaded.subagent_messages().len(),
-                expected.subagent_messages().len()
-            );
-            assert_eq!(loaded.tool_outputs().len(), expected.tool_outputs().len());
-            assert_eq!(loaded.title, expected.title);
-            let saved_branch = loaded
-                .load_branch_from(branch.id, &dir.ensure_subdir(SESSIONS_DIR).unwrap())
-                .unwrap();
-            assert_persisted_state(
-                &saved_branch,
-                &SessionJournal::from_session(&old).unwrap().snapshot(),
-            );
-            assert_eq!(message_texts(&saved_branch), message_texts(&old));
-            let mut stale = old;
-            stale.set_title(RESUMED_MSG.into());
-            writer.send(Arc::new(stale.clone()));
-            writer.send_fenced(Arc::new(stale.clone()), &old_fence);
-            assert!(
-                writer
-                    .checkpoint_fenced(
-                        CheckpointRequest {
-                            session_id: id,
-                            version,
-                            snapshot: Arc::new(stale)
-                        },
-                        &old_fence
-                    )
-                    .await
-                    .is_err()
-            );
-            assert!(Arc::ptr_eq(&writer.latest_snapshot(id).unwrap(), &expected));
-            let mut checkpoint = config_checkpoint(1, 1);
-            checkpoint.kind = SessionCheckpointKind::Options;
-            assert!(
-                old_coordinator
-                    .checkpoint(CheckpointRequest {
-                        session_id: id,
-                        version,
-                        snapshot: Arc::new(checkpoint.clone())
-                    })
-                    .await
-                    .is_err()
-            );
-            checkpoint.config = None;
-            checkpoint.journal = Some(snapshot);
-            assert!(
-                old_coordinator
-                    .checkpoint_guarded(
-                        CheckpointRequest {
-                            session_id: id,
-                            version,
-                            snapshot: Arc::new(checkpoint.clone()),
-                        },
-                        CheckpointPublication::default(),
-                        publication_claim(),
-                    )
-                    .await
-                    .is_err()
-            );
-            let coordinator = writer.coordinator_checkpoint();
-            coordinator.bind(Some(lease.publication_guard()));
-            let saved = coordinator.checkpoint_guarded(
-                CheckpointRequest {
-                    session_id: id,
-                    version,
-                    snapshot: Arc::new(checkpoint),
-                },
-                CheckpointPublication::default(),
-                publication_claim(),
-            );
-            disk.flush(&writer.pending);
-            assert_eq!(saved.await.unwrap().version, version);
-            let mut fresh = expected.as_ref().clone();
-            fresh.set_title(RESUMED_MSG.into());
-            writer.send_fenced(Arc::new(fresh), &fence);
-            disk.flush(&writer.pending);
-            assert_eq!(AppSession::load(id, &dir).unwrap().title, RESUMED_MSG);
-        });
-    }
-
-    #[test_case(false; "ordinary_write_at_takeover")]
-    #[test_case(true; "guarded_current_at_takeover")]
-    fn lease_takeover_rejects_current_and_already_queued_writes(current: bool) {
+    #[test]
+    fn lease_takeover_rejects_already_queued_writes() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
             let (writer, _wake_rx) = manual_writer();
@@ -3864,33 +2911,10 @@ mod tests {
                 },
                 &fence,
             );
-            let mut guarded = current.then(|| {
-                Box::pin(writer.checkpoint_fenced_guarded(
-                    CheckpointRequest {
-                        session_id: id,
-                        version,
-                        snapshot: Arc::new(session.clone()),
-                    },
-                    &fence,
-                    lease.publication_guard(),
-                ))
-            });
-            if let Some(guarded) = &mut guarded {
-                assert!(
-                    futures_lite::future::poll_once(guarded.as_mut())
-                        .await
-                        .is_none()
-                );
-            }
             let (entered, staged) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
             {
-                let mut state = lock(&writer.pending);
-                if current {
-                    state.child_stage_gate = Some((entered, released));
-                } else {
-                    state.save_gate = Some((entered, released));
-                }
+                lock(&writer.pending).save_gate = Some((entered, released));
             }
             let pending = Arc::clone(&writer.pending);
             let worker = std::thread::spawn(move || disk.flush(&pending));
@@ -3911,327 +2935,10 @@ mod tests {
             let published = std::fs::read(&path).unwrap();
             release.send(()).unwrap();
             worker.join().unwrap();
-            if let Some(guarded) = guarded {
-                assert_eq!(guarded.await, Err(CHECKPOINT_REPLACED.into()));
-            }
-            if !current {
-                lock(&writer.pending).entries.remove(&id);
-            }
+            lock(&writer.pending).entries.remove(&id);
             assert!(queued.await.is_err());
             assert_eq!(std::fs::read(path).unwrap(), published);
             assert!(save_fence_current(&lock(&writer.pending), id, Some(&fence)));
-        });
-    }
-
-    #[test]
-    fn guarded_current_publication_keeps_incarnations_and_has_no_branch() {
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let (writer, _wake_rx) = manual_writer();
-            let mut session = AppSession::new(MODEL, CWD);
-            session.bind_root_id(AgentId::generate()).unwrap();
-            session.push_message(Message::user(BASE_MSG.into()));
-            let id = session.id;
-            writer.seed(Arc::new(session.clone()));
-            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
-            writer.bind_journal(id, Arc::clone(&journal));
-            let fence = writer.session_save_fence(id);
-            let captured = capture_journal(&writer.pending, id).unwrap();
-            let (lease, _) = guarded_writer(&writer, &dir, id);
-            let incarnation = Arc::clone(&lock(&writer.pending).incarnations[&id]);
-            let mut result = Box::pin(writer.checkpoint_fenced_guarded(
-                CheckpointRequest {
-                    session_id: id,
-                    version: CheckpointVersion {
-                        epoch: 1,
-                        revision: 1,
-                    },
-                    snapshot: Arc::new(session.clone()),
-                },
-                &fence,
-                lease.publication_guard(),
-            ));
-            assert!(
-                futures_lite::future::poll_once(result.as_mut())
-                    .await
-                    .is_none()
-            );
-            let (mut disk, _warnings) = disk_writer(&dir);
-            disk.flush(&writer.pending);
-            result.await.unwrap();
-            let state = lock(&writer.pending);
-            assert!(save_fence_current(&state, id, Some(&fence)));
-            assert!(Arc::ptr_eq(&state.incarnations[&id], &incarnation));
-            assert!(journal_current(&state, id, Some(&captured)));
-            drop(state);
-            let loaded = AppSession::load(id, &dir).unwrap();
-            assert_eq!(message_texts(&loaded), [BASE_MSG]);
-            assert!(loaded.branches().is_empty());
-            assert_eq!(journal.published_revision(), journal.snapshot().revision);
-        });
-    }
-
-    #[test_case(false; "directory_sync_recovers")]
-    #[test_case(true; "directory_sync_loses_guard")]
-    fn unsynced_restore_installs_and_retries_only_directory_sync(lose_guard: bool) {
-        const SYNC_ERROR: &str = "injected directory sync failure";
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let (writer, _wake_rx) = manual_writer();
-            let mut session = AppSession::new(MODEL, CWD);
-            let root = AgentId::generate();
-            session.bind_root_id(root).unwrap();
-            session.push_message(Message::user(BASE_MSG.into()));
-            let id = session.id;
-            writer.seed(Arc::new(session.clone()));
-            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
-            writer.bind_journal(id, Arc::clone(&journal));
-            let stale_fence = writer.session_save_fence(id);
-            let (lease, _) = guarded_writer(&writer, &dir, id);
-            let (mut disk, warnings) = disk_writer(&dir);
-            disk.write(&session).unwrap();
-            let mut token = journal
-                .prepare_branch_restore(root, journal.snapshot())
-                .await
-                .unwrap();
-            token.snapshot().apply_to(&mut session).unwrap();
-            let branch = StoredBranch {
-                id: MakimaId::generate(),
-                created_at: session.updated_at,
-                at_seq: session.sequence_high_water().unwrap(),
-                agent: root,
-                offset: session.messages().len(),
-            };
-            session.push_branch(branch.clone());
-            let expected = Arc::new(session);
-            let claims = Arc::new(Mutex::new(0));
-            let claimed = Arc::clone(&claims);
-            let response = enqueue_restore_checkpoint(
-                &writer.pending,
-                &writer.wake,
-                RestoredSessionCheckpoint {
-                    session_id: id,
-                    session: Arc::clone(&expected),
-                    journal: token.snapshot().clone(),
-                    branch: branch.clone(),
-                    publication: CheckpointPublication::default(),
-                    claim: Arc::new(move |publication| {
-                        *claimed.lock().unwrap() += 1;
-                        publication_claim()(publication)
-                    }),
-                    guard: lease.publication_guard(),
-                },
-            )
-            .unwrap();
-            lock(&writer.pending).restore_sync_error =
-                Some(StorageError::from(io::Error::other(SYNC_ERROR)));
-            let deadline = disk.flush(&writer.pending).unwrap();
-            let fence = response.recv().unwrap().unwrap();
-            assert_eq!(
-                warnings.recv().unwrap(),
-                format!("{RESTORE_UNSYNCED}: {SYNC_ERROR}")
-            );
-            {
-                let state = lock(&writer.pending);
-                assert!(Arc::ptr_eq(&state.latest[&id], &expected));
-                assert!(Arc::ptr_eq(&state.acknowledged[&id], &expected));
-                assert!(!save_fence_current(&state, id, Some(&stale_fence)));
-                assert!(save_fence_current(&state, id, Some(&fence)));
-                assert_eq!(state.publication_syncs.len(), 1);
-                assert!(state.restore_checkpoints.is_empty());
-                assert!(state.entries.is_empty());
-                assert!(state.staged_checkpoints.is_empty());
-                assert!(deadline <= state.publication_syncs[&id].retry_at);
-            }
-            let synced = publication_sync_waiter(&writer.pending, &fence).unwrap();
-            assert!(synced.is_empty());
-            let cancel = CancelToken::none();
-            let mut wait = Box::pin(writer.await_publication_sync(&fence, &cancel));
-            assert!(
-                futures_lite::future::poll_once(wait.as_mut())
-                    .await
-                    .is_none()
-            );
-            let (trigger, cancelled) = CancelToken::new();
-            let mut cancelled_wait = Box::pin(writer.await_publication_sync(&fence, &cancelled));
-            assert!(
-                futures_lite::future::poll_once(cancelled_wait.as_mut())
-                    .await
-                    .is_none()
-            );
-            token.install().unwrap();
-            let directory = dir.path().join(SESSIONS_DIR);
-            let path = directory.join(format!("{id}.jsonl"));
-            let published = std::fs::read(&path).unwrap();
-            let branch_count = std::fs::read_dir(directory.join("branches").join(id.to_string()))
-                .unwrap()
-                .count();
-            let retry_at = lock(&writer.pending).publication_syncs[&id].retry_at;
-            let mut attempts = 0;
-            disk.retry_publication_syncs(
-                &writer.pending,
-                retry_at - BACKGROUND_RETRY_BACKOFFS[0],
-                |_| {
-                    attempts += 1;
-                    Ok(())
-                },
-            );
-            assert_eq!(attempts, 0);
-            if lose_guard {
-                lease.release().unwrap();
-                disk.retry_publication_syncs(&writer.pending, retry_at, |_| {
-                    attempts += 1;
-                    Ok(())
-                });
-                assert_eq!(attempts, 0);
-                assert_eq!(warnings.recv().unwrap(), RESTORE_SYNC_ABANDONED);
-                assert_eq!(wait.await, Err(RESTORE_SYNC_ABANDONED.into()));
-                assert_eq!(synced.recv().unwrap(), Err(RESTORE_SYNC_ABANDONED.into()));
-                assert_eq!(
-                    publication_sync_waiter(&writer.pending, &fence).unwrap_err(),
-                    RESTORE_SYNC_ABANDONED
-                );
-            } else {
-                disk.retry_publication_syncs(&writer.pending, retry_at, |path| {
-                    assert_eq!(path, directory.as_path());
-                    attempts += 1;
-                    Err(StorageError::from(io::Error::other(SYNC_ERROR)))
-                });
-                assert_eq!(attempts, 1);
-                assert!(warnings.is_empty());
-                assert!(synced.is_empty());
-                assert!(
-                    futures_lite::future::poll_once(wait.as_mut())
-                        .await
-                        .is_none()
-                );
-                trigger.cancel();
-                assert!(cancelled_wait.await.is_err());
-                assert!(lock(&writer.pending).publication_syncs.contains_key(&id));
-                let retry_at = lock(&writer.pending).publication_syncs[&id].retry_at;
-                disk.retry_publication_syncs(&writer.pending, retry_at, |path| {
-                    attempts += 1;
-                    SessionLog::sync_publication(path)
-                });
-                assert_eq!(attempts, 2);
-                assert_eq!(warnings.recv().unwrap(), RESTORE_SYNC_RECOVERED);
-                assert_eq!(wait.await, Ok(()));
-                assert_eq!(synced.recv().unwrap(), Ok(()));
-            }
-            assert!(lock(&writer.pending).publication_syncs.is_empty());
-            assert_eq!(*claims.lock().unwrap(), 1);
-            assert_eq!(std::fs::read(path).unwrap(), published);
-            assert_eq!(
-                std::fs::read_dir(directory.join("branches").join(id.to_string()))
-                    .unwrap()
-                    .count(),
-                branch_count
-            );
-            let loaded = AppSession::load(id, &dir).unwrap();
-            assert_eq!(loaded.branches(), expected.branches());
-            assert!(loaded.load_branch_from(branch.id, &directory).is_ok());
-            assert!(Arc::ptr_eq(&writer.latest_snapshot(id).unwrap(), &expected));
-        });
-    }
-
-    #[test_case(0; "cancelled")]
-    #[test_case(1; "lost_guard")]
-    #[test_case(2; "newer_save")]
-    #[test_case(3; "rejected_claim")]
-    fn failed_restore_checkpoint_keeps_durable_and_pending_state(failure: u8) {
-        smol::block_on(async {
-            let (_tmp, dir) = state_dir();
-            let (writer, _wake_rx) = manual_writer();
-            let mut old = AppSession::new(MODEL, CWD);
-            let root = AgentId::generate();
-            old.bind_root_id(root).unwrap();
-            old.push_message(Message::user(BASE_MSG.into()));
-            let id = old.id;
-            writer.seed(Arc::new(old.clone()));
-            let journal = Arc::new(SessionJournal::from_session(&old).unwrap());
-            writer.bind_journal(id, Arc::clone(&journal));
-            let old_fence = writer.session_save_fence(id);
-            let (lease, _) = guarded_writer(&writer, &dir, id);
-            let (mut disk, _warnings) = disk_writer(&dir);
-            disk.write(&old).unwrap();
-            let directory = dir.ensure_subdir(SESSIONS_DIR).unwrap();
-            let path = directory.join(format!("{id}.jsonl"));
-            let before = std::fs::read(&path).unwrap();
-            let token = journal
-                .prepare_branch_restore(root, journal.snapshot())
-                .await
-                .unwrap();
-            let mut replacement = old.clone();
-            token.snapshot().apply_to(&mut replacement).unwrap();
-            let branch = StoredBranch {
-                id: MakimaId::generate(),
-                created_at: old.updated_at,
-                at_seq: old.sequence_high_water().unwrap(),
-                agent: root,
-                offset: old.messages().len(),
-            };
-            replacement.push_branch(branch.clone());
-            let publication = CheckpointPublication::default();
-            let claim = if failure == 3 {
-                Arc::new(|_: &CheckpointPublication| Err(Arc::from(CHECKPOINT_CANCELLED)))
-                    as CheckpointClaim
-            } else {
-                publication_claim()
-            };
-            let response = enqueue_restore_checkpoint(
-                &writer.pending,
-                &writer.wake,
-                RestoredSessionCheckpoint {
-                    session_id: id,
-                    session: Arc::new(replacement),
-                    journal: token.snapshot().clone(),
-                    branch,
-                    publication: publication.clone(),
-                    claim,
-                    guard: lease.publication_guard(),
-                },
-            )
-            .unwrap();
-            if failure == 0 {
-                publication.cancel();
-            }
-            if failure == 1 {
-                lease.release().unwrap();
-            }
-            if failure == 2 {
-                let mut fresh = old.clone();
-                fresh.set_title(TITLE.into());
-                writer.send_fenced(Arc::new(fresh), &old_fence);
-            }
-            let latest = writer.latest_snapshot(id).unwrap();
-            let save = lock(&writer.pending).restore_checkpoints.remove(0);
-            let error = disk
-                .write_restore_checkpoint(&writer.pending, &save)
-                .unwrap_err();
-            assert_eq!(
-                error,
-                if failure == 0 || failure == 3 {
-                    CHECKPOINT_CANCELLED
-                } else {
-                    CHECKPOINT_REPLACED
-                }
-            );
-            assert_eq!(std::fs::read(path).unwrap(), before);
-            assert!(Arc::ptr_eq(&writer.latest_snapshot(id).unwrap(), &latest));
-            assert!(save_fence_current(
-                &lock(&writer.pending),
-                id,
-                Some(&old_fence)
-            ));
-            save.reply.send(Err(error)).unwrap();
-            assert!(response.recv().unwrap().is_err());
-            assert_eq!(
-                std::fs::read_dir(directory.join("branches").join(id.to_string()))
-                    .map(|entries| entries.count())
-                    .unwrap_or(0),
-                0
-            );
-            drop(token);
         });
     }
 

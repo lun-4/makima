@@ -137,7 +137,7 @@ fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
     try_pair!(observe(lua, &ctx, this));
     if !this.manager.is_live(this.id) {
         let snapshot = try_pair!(this.manager.journal().checkpoint_snapshot());
-        let view = try_pair!(snapshot.fold(snapshot.seq));
+        let view = try_pair!(snapshot.fold());
         let scope = try_pair!(
             view.scopes
                 .get(&Some(this.id))

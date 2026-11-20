@@ -57,7 +57,6 @@ const PARTICIPANT_CLOSED_MESSAGE: &str =
 struct CatalogState {
     definitions: BTreeMap<Arc<str>, Vec<SessionOptionDefinition>>,
     sessions: HashMap<MakimaId, CatalogSession>,
-    activations: HashMap<MakimaId, u64>,
     revision: u64,
 }
 
@@ -76,7 +75,6 @@ pub struct SessionOptionCatalog {
 struct DirectoryEntry {
     handle: SessionCoordinatorHandle,
     mailbox: SessionMailbox,
-    published: bool,
 }
 
 struct PublicationLifetime {
@@ -178,39 +176,6 @@ pub struct SessionCoordinatorHandle {
     read: SessionReadHandle,
     catalog: SessionOptionCatalog,
     publication_lifetime: Arc<PublicationLifetime>,
-}
-
-pub struct PreparedRewindProjection {
-    reservation: SessionOptionsReservation,
-    candidate: Option<SessionOptionsCandidate>,
-    permissions: Option<(Arc<PermissionManager>, PermissionSnapshot)>,
-    binding: ActorBinding,
-    commit: ConfigCommit,
-    snapshot: Option<SessionOptionsSnapshot>,
-}
-
-impl PreparedRewindProjection {
-    pub fn install(&mut self) -> Result<(), SessionCoordinatorError> {
-        let Some(candidate) = self.candidate.take() else {
-            return Ok(());
-        };
-        let mut snapshots =
-            SessionOptions::commit_batch_unpublished(vec![(&self.reservation, candidate)], || {
-                Ok(())
-            })?;
-        if let Some((permissions, snapshot)) = self.permissions.take() {
-            permissions.restore(snapshot);
-        }
-        self.snapshot = snapshots.pop();
-        Ok(())
-    }
-
-    pub fn publish(&self) {
-        if let Some(snapshot) = &self.snapshot {
-            SessionOptions::publish_batch([(&self.reservation, snapshot)]);
-            (self.binding.project_config)(&self.commit);
-        }
-    }
 }
 
 pub struct ContextReloadTicket {
@@ -433,10 +398,6 @@ pub struct PreparedSessionCoordinator {
     rx: flume::Receiver<Operation>,
 }
 
-pub struct ReservedSessionCoordinator {
-    prepared: PreparedSessionCoordinator,
-}
-
 #[derive(Clone)]
 pub struct SessionReadHandle {
     session_id: MakimaId,
@@ -616,9 +577,6 @@ impl SessionOptionCatalog {
         F: Fn(MakimaId, Arc<str>, Arc<str>) -> Fut,
         Fut: Future<Output = Result<(), SessionCoordinatorError>>,
     {
-        if let Some(session_id) = lock(&self.state).activations.keys().next().copied() {
-            return Err(SessionCoordinatorError::SessionBusy(session_id));
-        }
         let plugin = plugin.into();
         let (_invocation, invocation) = CancelToken::new();
         let publication = CheckpointPublication::default();
@@ -782,7 +740,6 @@ impl SessionCoordinatorHandle {
     pub fn resolve(session_id: MakimaId) -> Result<Self, SessionCoordinatorError> {
         lock(&DIRECTORY)
             .get(&session_id)
-            .filter(|entry| entry.published)
             .map(|entry| entry.handle.clone())
             .ok_or(SessionCoordinatorError::StaleSession(session_id))
     }
@@ -813,7 +770,7 @@ impl SessionCoordinatorHandle {
         let directory = lock(&DIRECTORY);
         let entry = directory
             .get(&self.session_id)
-            .filter(|entry| entry.published && entry.handle.generation == self.generation)
+            .filter(|entry| entry.handle.generation == self.generation)
             .ok_or(SessionCoordinatorError::StaleSession(self.session_id))?;
         Ok(entry
             .handle
@@ -825,7 +782,7 @@ impl SessionCoordinatorHandle {
     pub fn mailbox(&self) -> Result<SessionMailbox, SessionCoordinatorError> {
         lock(&DIRECTORY)
             .get(&self.session_id)
-            .filter(|entry| entry.published && entry.handle.generation == self.generation)
+            .filter(|entry| entry.handle.generation == self.generation)
             .map(|entry| entry.mailbox.clone())
             .ok_or(SessionCoordinatorError::StaleSession(self.session_id))
     }
@@ -899,85 +856,6 @@ impl SessionCoordinatorHandle {
         drop(binding);
         reservation.commit(candidate);
         Ok(())
-    }
-
-    pub fn prepare_rewind_projection(
-        &self,
-        commit: ConfigCommit,
-        snapshot: &SessionJournalSnapshot,
-        session_scope: bool,
-    ) -> Result<PreparedRewindProjection, SessionCoordinatorError> {
-        let binding = self.actor_binding()?;
-        let reservation = self.reserve_options()?;
-        let view = snapshot.fold(snapshot.seq).map_err(|error| {
-            SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                session_id: self.session_id,
-                message: Arc::from(error.to_string()),
-            })
-        })?;
-        let saved = view.scopes.get(&Some(binding.agent.id()));
-        let mut values = saved
-            .and_then(|scope| scope.config.as_ref())
-            .map(|config| config.options.clone())
-            .unwrap_or_default();
-        values.insert(MODEL_OPTION_ID.into(), commit.config.model.spec());
-        values.insert(
-            FAST_OPTION_ID.into(),
-            if commit.config.fast {
-                ENABLED_VALUE
-            } else {
-                DISABLED_VALUE
-            }
-            .into(),
-        );
-        values.insert(
-            WORKFLOW_OPTION_ID.into(),
-            if commit.config.workflow {
-                ENABLED_VALUE
-            } else {
-                DISABLED_VALUE
-            }
-            .into(),
-        );
-        values.insert(
-            THINKING_OPTION_ID.into(),
-            commit.config.thinking.to_string(),
-        );
-        if session_scope {
-            let yolo = view
-                .scopes
-                .get(&None)
-                .and_then(|scope| scope.yolo)
-                .unwrap_or(false);
-            values.insert(
-                YOLO_OPTION_ID.into(),
-                if yolo { ENABLED_VALUE } else { DISABLED_VALUE }.into(),
-            );
-        }
-        let candidate = self.read.options.prepare_restore(&values)?;
-        let permissions = if session_scope {
-            let scope = view.scopes.get(&None);
-            let rules = scope.map_or(&[][..], |scope| scope.rules.as_slice());
-            let restored =
-                PermissionSnapshot::from_stored(rules, scope.and_then(|scope| scope.yolo))
-                    .map_err(|error| {
-                        SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                            session_id: self.session_id,
-                            message: Arc::from(error.to_string()),
-                        })
-                    })?;
-            Some((self.permissions()?, restored))
-        } else {
-            None
-        };
-        Ok(PreparedRewindProjection {
-            reservation,
-            candidate: Some(candidate),
-            permissions,
-            binding,
-            commit,
-            snapshot: None,
-        })
     }
 
     fn actor_binding(&self) -> Result<ActorBinding, SessionCoordinatorError> {
@@ -1451,7 +1329,7 @@ impl SessionCoordinatorHandle {
         let directory = lock(&DIRECTORY);
         let entry = directory
             .get(&self.session_id)
-            .filter(|entry| entry.published && entry.handle.generation == self.generation)
+            .filter(|entry| entry.handle.generation == self.generation)
             .ok_or(SessionCoordinatorError::StaleSession(self.session_id))?;
         entry.handle.publication_lifetime.cancel();
         let (reply, response) = flume::bounded(1);
@@ -1494,7 +1372,7 @@ impl SessionCoordinatorHandle {
     fn ensure_live(&self) -> Result<(), SessionCoordinatorError> {
         if lock(&DIRECTORY)
             .get(&self.session_id)
-            .is_some_and(|entry| entry.published && entry.handle.generation == self.generation)
+            .is_some_and(|entry| entry.handle.generation == self.generation)
         {
             Ok(())
         } else {
@@ -1553,32 +1431,6 @@ impl PreparedSessionCoordinator {
         })
     }
 
-    pub fn reserve_activation(self) -> Result<ReservedSessionCoordinator, SessionCoordinatorError> {
-        let handle = &self.handle;
-        let mut directory = lock(&DIRECTORY);
-        if directory.contains_key(&handle.session_id) {
-            return Err(SessionCoordinatorError::DuplicateSession(handle.session_id));
-        }
-        let mut catalog = lock(&handle.catalog.state);
-        if self.catalog_revision != catalog.revision {
-            reconcile_options(&handle.read.options, &catalog.definitions)?;
-        }
-        catalog
-            .activations
-            .insert(handle.session_id, handle.generation);
-        directory.insert(
-            handle.session_id,
-            DirectoryEntry {
-                handle: handle.clone(),
-                mailbox: self.mailbox.clone(),
-                published: false,
-            },
-        );
-        drop(catalog);
-        drop(directory);
-        Ok(ReservedSessionCoordinator { prepared: self })
-    }
-
     pub fn activate(self) -> Result<SessionCoordinatorHandle, SessionCoordinatorError> {
         self.activate_inner(None)
     }
@@ -1606,9 +1458,7 @@ impl PreparedSessionCoordinator {
         let mut directory = lock(&DIRECTORY);
         let retired = match (directory.get(&handle.session_id), replaced_generation) {
             (None, None) => None,
-            (Some(entry), Some(generation))
-                if entry.published && entry.handle.generation == generation =>
-            {
+            (Some(entry), Some(generation)) if entry.handle.generation == generation => {
                 Some(entry.handle.clone())
             }
             (Some(_), None) => {
@@ -1628,7 +1478,6 @@ impl PreparedSessionCoordinator {
             DirectoryEntry {
                 handle: handle.clone(),
                 mailbox,
-                published: true,
             },
         );
         catalog_state.sessions.insert(
@@ -1646,53 +1495,6 @@ impl PreparedSessionCoordinator {
             let _ = retired.tx.send(Operation::Close { reply });
         }
         Ok(handle)
-    }
-}
-
-impl ReservedSessionCoordinator {
-    pub fn handle(&self) -> SessionCoordinatorHandle {
-        self.prepared.handle.clone()
-    }
-
-    pub fn publish(self) -> SessionCoordinatorHandle {
-        let handle = self.handle();
-        {
-            let mut directory = lock(&DIRECTORY);
-            let mut catalog = lock(&handle.catalog.state);
-            directory.insert(
-                handle.session_id,
-                DirectoryEntry {
-                    handle: handle.clone(),
-                    mailbox: self.prepared.mailbox.clone(),
-                    published: true,
-                },
-            );
-            catalog.activations.remove(&handle.session_id);
-            catalog.sessions.insert(
-                handle.session_id,
-                CatalogSession {
-                    generation: handle.generation,
-                    tx: handle.tx.clone(),
-                },
-            );
-        }
-        smol::spawn(run(handle.clone(), self.prepared.rx.clone())).detach();
-        handle
-    }
-}
-
-impl Drop for ReservedSessionCoordinator {
-    fn drop(&mut self) {
-        let handle = &self.prepared.handle;
-        let mut directory = lock(&DIRECTORY);
-        let mut catalog = lock(&handle.catalog.state);
-        if catalog.activations.get(&handle.session_id) == Some(&handle.generation) {
-            catalog.activations.remove(&handle.session_id);
-            directory.remove(&handle.session_id);
-            drop(catalog);
-            drop(directory);
-            handle.publication_lifetime.cancel();
-        }
     }
 }
 
@@ -2148,9 +1950,6 @@ async fn finish_plugin_options(
         }
         let directory = lock(&DIRECTORY);
         let mut state = lock(&catalog.state);
-        if let Some(session_id) = state.activations.keys().next().copied() {
-            return Err(SessionCoordinatorError::SessionBusy(session_id));
-        }
         if revision != state.revision
             || prepared.len() != state.sessions.len()
             || prepared.iter().any(|(staged, decision)| {
@@ -2711,7 +2510,7 @@ fn unregister(session_id: MakimaId, generation: u64) {
     let mut directory = lock(&DIRECTORY);
     if directory
         .get(&session_id)
-        .is_some_and(|entry| entry.published && entry.handle.generation == generation)
+        .is_some_and(|entry| entry.handle.generation == generation)
         && let Some(entry) = directory.remove(&session_id)
     {
         entry.handle.publication_lifetime.cancel();
@@ -3673,207 +3472,6 @@ pub(crate) mod tests {
         });
     }
 
-    #[test_case(false; "aborted")]
-    #[test_case(true; "published")]
-    fn reserved_activation_binds_observers_without_publishing(publish: bool) {
-        smol::block_on(async {
-            let id = MakimaId::generate();
-            let parameters = params(id, writer(false));
-            let catalog = parameters.catalog.clone();
-            let reservation = PreparedSessionCoordinator::new(parameters)
-                .unwrap()
-                .reserve_activation()
-                .unwrap();
-            let handle = reservation.handle();
-            let projected = Arc::new(Mutex::new(Vec::new()));
-            handle.read().project_options({
-                let projected = Arc::clone(&projected);
-                let catalog = catalog.clone();
-                move |snapshot| {
-                    drop(lock(&DIRECTORY));
-                    assert!(catalog.state.try_lock().is_ok());
-                    lock(&projected).push(snapshot.enabled(WORKFLOW_OPTION_ID));
-                }
-            });
-            let agent = bind_config(&handle, (*projection_config(true)).clone(), Arc::default());
-            assert_eq!(*lock(&projected), [false, true]);
-            assert_eq!(
-                SessionCoordinatorHandle::resolve(id).err(),
-                Some(SessionCoordinatorError::StaleSession(id))
-            );
-            assert_eq!(
-                handle.mailbox().err(),
-                Some(SessionCoordinatorError::StaleSession(id))
-            );
-            assert_eq!(
-                handle
-                    .register_publication(&CheckpointPublication::default())
-                    .err(),
-                Some(SessionCoordinatorError::StaleSession(id))
-            );
-            assert_eq!(
-                PreparedSessionCoordinator::new(params(id, writer(false)))
-                    .unwrap()
-                    .activate()
-                    .err(),
-                Some(SessionCoordinatorError::DuplicateSession(id))
-            );
-            assert_eq!(
-                PreparedSessionCoordinator::new(params(id, writer(false)))
-                    .unwrap()
-                    .reserve_activation()
-                    .err(),
-                Some(SessionCoordinatorError::DuplicateSession(id))
-            );
-            assert_eq!(
-                handle.close().await,
-                Err(SessionCoordinatorError::StaleSession(id))
-            );
-            assert!(matches!(
-                handle.set_option(YOLO_OPTION_ID, ENABLED_VALUE).await,
-                Err(ConfigChangeError::Coordinator(SessionCoordinatorError::StaleSession(stale))) if stale == id
-            ));
-            assert!(lock(&catalog.state).sessions.is_empty());
-            let (reply, response) = flume::bounded(1);
-            handle.tx.send(Operation::Barrier(reply)).unwrap();
-            assert_eq!(response.try_recv(), Err(flume::TryRecvError::Empty));
-            handle.retire();
-            assert_eq!(
-                lock(&catalog.state).activations.get(&id),
-                Some(&handle.generation)
-            );
-            if publish {
-                let published = reservation.publish();
-                assert_eq!(published.runtime_epoch(), handle.runtime_epoch());
-                assert_eq!(
-                    SessionCoordinatorHandle::resolve(id)
-                        .unwrap()
-                        .runtime_epoch(),
-                    handle.runtime_epoch()
-                );
-                assert!(lock(&catalog.state).activations.is_empty());
-                assert_eq!(lock(&catalog.state).sessions.len(), 1);
-                response.recv_async().await.unwrap();
-                handle
-                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
-                    .await
-                    .unwrap();
-                assert!(handle.permissions().unwrap().is_yolo());
-                published.close().await.unwrap();
-            } else {
-                drop(reservation);
-                assert_eq!(response.try_recv(), Err(flume::TryRecvError::Empty));
-                assert!(lock(&catalog.state).activations.is_empty());
-                assert_eq!(
-                    handle.ensure_bindable(),
-                    Err(SessionCoordinatorError::StaleSession(id))
-                );
-                drop(handle);
-                assert_eq!(response.try_recv(), Err(flume::TryRecvError::Disconnected));
-                let mut parameters = params(id, writer(false));
-                parameters.catalog = catalog.clone();
-                SessionCoordinatorHandle::register(parameters)
-                    .unwrap()
-                    .close()
-                    .await
-                    .unwrap();
-            }
-            agent.close_subtree().unwrap();
-        });
-    }
-
-    #[test_case(false; "aborted")]
-    #[test_case(true; "published")]
-    fn reserved_activation_pins_reconciled_catalog(publish: bool) {
-        smol::block_on(async {
-            let id = MakimaId::generate();
-            let parameters = params(id, writer(false));
-            let catalog = parameters.catalog.clone();
-            let prepared = PreparedSessionCoordinator::new(parameters).unwrap();
-            catalog
-                .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
-                .await
-                .unwrap();
-            let reserved = prepared.reserve_activation().unwrap();
-            assert_eq!(
-                reserved.handle().read().options().values()["test.choice"],
-                "a"
-            );
-            assert_eq!(
-                catalog
-                    .replace_plugin_options("test", vec![plugin_option(2, &["b"], "b")])
-                    .await,
-                Err(SessionCoordinatorError::SessionBusy(id))
-            );
-            let handle = if publish {
-                Some(reserved.publish())
-            } else {
-                drop(reserved);
-                None
-            };
-            catalog
-                .replace_plugin_options("test", vec![plugin_option(2, &["b"], "b")])
-                .await
-                .unwrap();
-            if let Some(handle) = handle {
-                assert_eq!(handle.read().options().values()["test.choice"], "b");
-                handle.close().await.unwrap();
-            }
-        });
-    }
-
-    #[test]
-    fn reserved_activation_blocks_in_flight_catalog_commit() {
-        smol::block_on(async {
-            let catalog = SessionOptionCatalog::default();
-            let active = register_with_catalog(MakimaId::generate(), writer(false), &catalog);
-            let before = active.read().options();
-            let (reached, waiting) = flume::bounded(1);
-            let (release, released) = flume::bounded(1);
-            let replacement = smol::spawn({
-                let catalog = catalog.clone();
-                async move {
-                    catalog
-                        .replace_plugin_options_with_validator(
-                            "test",
-                            vec![plugin_option(1, &["a"], "a")],
-                            move |_, _, _| {
-                                let reached = reached.clone();
-                                let released = released.clone();
-                                async move {
-                                    reached.send_async(()).await.unwrap();
-                                    released.recv_async().await.unwrap();
-                                    Ok(())
-                                }
-                            },
-                        )
-                        .await
-                }
-            });
-            waiting.recv_async().await.unwrap();
-            let id = MakimaId::generate();
-            let mut parameters = params(id, writer(false));
-            parameters.catalog = catalog.clone();
-            let reserved = PreparedSessionCoordinator::new(parameters)
-                .unwrap()
-                .reserve_activation()
-                .unwrap();
-            release.send_async(()).await.unwrap();
-            assert_eq!(
-                replacement.await,
-                Err(SessionCoordinatorError::SessionBusy(id))
-            );
-            assert_eq!(active.read().options(), before);
-            assert!(catalog.plugin_definitions("test").is_empty());
-            drop(reserved);
-            catalog
-                .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
-                .await
-                .unwrap();
-            active.close().await.unwrap();
-        });
-    }
-
     #[test]
     fn prepared_session_reconciles_plugin_replacement_before_activation() {
         smol::block_on(async {
@@ -4733,91 +4331,6 @@ pub(crate) mod tests {
                 saved,
             }
         }
-    }
-
-    #[test]
-    fn unpolled_context_reload_ticket_rejects_after_root_rewind() {
-        use crate::rewind::RewindBoundary;
-
-        const CHANGED_INSTRUCTIONS: &str = "Use the changed root instructions.";
-        smol::block_on(async {
-            let fixture = ContextReloadFixture::new().await;
-            let coordinator = &fixture.coordinator;
-            let actor = fixture.agent.actor().unwrap();
-            let journal = fixture.agent.manager().journal();
-            coordinator.reload_context().await.unwrap();
-            journal
-                .commit(JournalCommit {
-                    boundary: Some((
-                        fixture.agent.id(),
-                        actor.config_snapshot().unwrap().generation,
-                    )),
-                    histories: [(fixture.agent.id(), HistorySnapshot::default())].into(),
-                    ..Default::default()
-                })
-                .unwrap();
-            let boundary_snapshot = journal.snapshot();
-            let boundary = RewindBoundary {
-                agent: fixture.agent.id(),
-                seq: boundary_snapshot
-                    .state
-                    .iter()
-                    .rev()
-                    .find(|record| matches!(record.change, StateChange::Boundary { .. }))
-                    .unwrap()
-                    .seq,
-                epoch: boundary_snapshot.epoch,
-            };
-            smol::fs::write(
-                fixture
-                    .directory
-                    .path()
-                    .join(ContextReloadFixture::INSTRUCTIONS_FILE),
-                CHANGED_INSTRUCTIONS,
-            )
-            .await
-            .unwrap();
-            coordinator.reload_context().await.unwrap();
-            let captured = journal.state_access(fixture.agent.id(), None);
-            let publication = CheckpointPublication::default();
-            let ticket = coordinator
-                .reserve_context_reload_for_actor(
-                    actor.clone(),
-                    move || {
-                        root_context(&captured).map(|_| ()).map_err(|error| {
-                            ConfigChangeError::Actor(ActorError::InvalidConfig(error.to_string()))
-                        })
-                    },
-                    publication.clone(),
-                    publication_claim(),
-                )
-                .unwrap();
-            let mut replacement = journal.prepare_rewind(boundary).await.unwrap();
-            replacement.install().unwrap();
-            drop(replacement);
-            let restored = journal.snapshot();
-            let access = journal.state_access(fixture.agent.id(), None);
-            let restored_text = root_context(&access)
-                .unwrap()
-                .unwrap()
-                .instructions
-                .text
-                .clone();
-            assert!(restored_text.contains(RELOAD_INSTRUCTIONS));
-            assert!(!restored_text.contains(CHANGED_INSTRUCTIONS));
-            let checkpoint_count = lock(&fixture.saved).len();
-            assert!(ticket.commit().await.is_err());
-            assert!(publication.is_cancelled());
-            assert_eq!(journal.snapshot().state, restored.state);
-            assert_eq!(journal.snapshot().epoch, restored.epoch);
-            assert_eq!(
-                root_context(&access).unwrap().unwrap().instructions.text,
-                restored_text
-            );
-            assert_eq!(lock(&fixture.saved).len(), checkpoint_count);
-            actor.shutdown();
-            coordinator.close().await.unwrap();
-        });
     }
 
     #[test_case(false; "supplied_publication_cancelled")]
@@ -5889,7 +5402,7 @@ pub(crate) mod tests {
             coordinator.set_option(YOLO_OPTION_ID, value).await.unwrap();
             assert_eq!(permissions.snapshot().yolo, Some(seed));
             let published = lock(&saved).last().unwrap().journal.clone().unwrap();
-            let folded = published.fold(published.seq).unwrap();
+            let folded = published.fold().unwrap();
             let rules = &folded.scopes[&None];
             assert_eq!(rules.yolo, Some(seed));
             let restarted = PermissionManager::new(

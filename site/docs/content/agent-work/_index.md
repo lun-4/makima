@@ -21,15 +21,11 @@ Closing the application releases running instances without permanently closing t
 
 Instruction changes on disk do not silently replace the session's recorded context. See [Recorded context](/docs/context/#recorded-context) for `/reload-context`.
 
-## Rewind and branches
+## Rewind
 
-In the TUI, `Esc Esc` on an idle agent opens rewind. Selecting a restoration point restores conversation history, configuration, and recorded state, including context and plan state. Rewind never changes files on disk, except that it can rewrite the plan file from recorded plan state.
+Rewind is being reworked. In this version `Esc Esc` on an idle agent only shows a notice.
 
-Rewind stops active work in the affected subtree before changing its history. Restored history does not automatically replay turns. Requeued child reports remain held until explicit user input allows delivery. A child rewind leaves session-wide settings and unrelated agent history unchanged.
-
-Rewind retains the previous state as a branch. Selecting it under Branches in the rewind picker redoes the restore. Retained branches survive restart. A pruned branch is shown as expired and cannot be restored. Compaction can make older restoration points unavailable.
-
-Approving a plan with clear context creates a separate implementation session linked to the planning session. Rewind can follow that link to an eligible planning boundary. It reopens the parent conversation and preserves the implementation session separately. Redo stays within the parent session; it does not switch back to the implementation session. A parent open elsewhere or with an incompatible working directory cannot be restored.
+Approving a plan with clear context creates a separate implementation session linked to the planning session.
 
 ## Messages and turns
 
@@ -43,7 +39,7 @@ Acceptance does not mean the model has received the message. A pending message c
 
 Main and subagent views share input, queue, status, and controls. The subagent label identifies the viewed agent. The draft, attachments, and input history remain shared across view changes.
 
-Model, mode, plan, compact, rewind, shell commands, reference expansion, and file completion target the viewed agent. Each new child inherits its parent's working directory. Later directory changes affect only the target agent and take effect in queue order. Commands and pickers keep their original target when the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply.
+Model, mode, plan, compact, shell commands, reference expansion, and file completion target the viewed agent. Each new child inherits its parent's working directory. Later directory changes affect only the target agent and take effect in queue order. Commands and pickers keep their original target when the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply.
 
 Reset and new-session operations remain session-wide. The Lua `makima.session.*` APIs retain session scope.
 

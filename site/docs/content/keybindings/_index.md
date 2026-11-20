@@ -40,7 +40,6 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+Alt+G` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
-| `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
 
 ### macOS-specific
@@ -120,7 +119,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 

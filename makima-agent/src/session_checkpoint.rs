@@ -3923,15 +3923,6 @@ mod tests {
             StoredSession::load(id, &dir).unwrap().messages(),
             history.messages.as_ref()
         );
-        assert!(
-            journal
-                .preview_rewind(crate::rewind::RewindBoundary {
-                    agent: root,
-                    seq: boundary_seq,
-                    epoch: journal.snapshot().epoch,
-                })
-                .is_ok()
-        );
     }
 
     #[test_case::test_case(false, false, false; "ordinary_io_error")]

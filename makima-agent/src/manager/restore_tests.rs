@@ -684,7 +684,7 @@ fn restore(
     limits: AgentLimits,
 ) -> Result<AgentManagerHandle, ManagerError> {
     let snapshot = journal.checkpoint_snapshot().unwrap();
-    let view = snapshot.fold(snapshot.seq).unwrap();
+    let view = snapshot.fold().unwrap();
     AgentManagerHandle::restore_graph(limits, Arc::clone(journal), view, snapshot.histories)
 }
 
@@ -997,7 +997,7 @@ fn report_arriving_during_failed_finish_with_is_observed_once_after_retry() {
         );
         let queued = journal.checkpoint_snapshot().unwrap();
         assert!(matches!(
-            queued.fold(queued.seq).unwrap().scopes[&Some(parent)].deliveries[&identity],
+            queued.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
             StoredDeliveryOp::Queued(_)
         ));
         assert_eq!(manager.active_agent_count(), 2);
@@ -1013,7 +1013,7 @@ fn report_arriving_during_failed_finish_with_is_observed_once_after_retry() {
         assert_checkpoint(&journal, &queued);
         let rolled_back = journal.checkpoint_snapshot().unwrap();
         assert!(matches!(
-            rolled_back.fold(rolled_back.seq).unwrap().scopes[&Some(parent)].deliveries[&identity],
+            rolled_back.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
             StoredDeliveryOp::Queued(_)
         ));
         assert_eq!(manager.active_agent_count(), 2);
@@ -1047,7 +1047,7 @@ fn report_arriving_during_failed_finish_with_is_observed_once_after_retry() {
             .unwrap();
         let consumed = journal.checkpoint_snapshot().unwrap();
         assert_eq!(
-            consumed.fold(consumed.seq).unwrap().scopes[&Some(parent)].deliveries[&identity],
+            consumed.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
             StoredDeliveryOp::Consumed
         );
         let source = ObservationSource::ChildResult {
@@ -1136,7 +1136,7 @@ fn report_withdrawn_during_initializer_is_not_resurrected() {
         let actor = activation.await.unwrap().actor().unwrap();
         assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
         let withdrawn = journal.checkpoint_snapshot().unwrap();
-        let view = withdrawn.fold(withdrawn.seq).unwrap();
+        let view = withdrawn.fold().unwrap();
         assert_eq!(
             view.scopes[&Some(parent)].deliveries[&id],
             StoredDeliveryOp::Withdrawn
@@ -1185,7 +1185,7 @@ fn closing_dormant_restored_report_releases_hold_and_persists_drop() {
         GraphLifecycle::Closed
     );
     let snapshot = journal.checkpoint_snapshot().unwrap();
-    let view = snapshot.fold(snapshot.seq).unwrap();
+    let view = snapshot.fold().unwrap();
     assert_eq!(
         view.scopes[&Some(parent)].deliveries[&id],
         StoredDeliveryOp::Dropped
@@ -1623,7 +1623,7 @@ fn rejects_mixed_checkpoint_inputs(history: bool) {
     let records = records();
     let journal = journal(&records);
     let before = journal.checkpoint_snapshot().unwrap();
-    let mut view = before.fold(before.seq).unwrap();
+    let mut view = before.fold().unwrap();
     let mut histories = before.histories.clone();
     if history {
         histories.get_mut(&records[1].id).unwrap().epoch += 1;
@@ -1708,7 +1708,6 @@ enum InitializationCut {
     DropWaiter,
     Shutdown,
     ShutdownWithoutDrainBudget,
-    Rewind,
 }
 
 struct InitializationBackend {
@@ -1760,7 +1759,6 @@ impl ActorBackend for InitializationBackend {
 #[test_case(InitializationCut::DropWaiter; "dropped_waiter")]
 #[test_case(InitializationCut::Shutdown; "shutdown")]
 #[test_case(InitializationCut::ShutdownWithoutDrainBudget; "shutdown_zero_budget_waits_for_finishing_activation")]
-#[test_case(InitializationCut::Rewind; "rewind")]
 fn finish_with_retains_claimed_publication_until_work_returns(cut: InitializationCut) {
     smol::block_on(async {
         let records = records();
@@ -1834,13 +1832,11 @@ fn finish_with_retains_claimed_publication_until_work_returns(cut: Initializatio
             SHUTDOWN_TIMEOUT
         };
         let mut shutdown = Box::pin(manager.shutdown(shutdown_timeout));
-        let mut rewind = Box::pin(manager.begin_rewind(id));
         match cut {
             InitializationCut::DropWaiter => drop(first.take()),
             InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
                 assert!(poll_once(shutdown.as_mut()).await.is_none());
             }
-            InitializationCut::Rewind => assert!(poll_once(rewind.as_mut()).await.is_none()),
         }
         assert_checkpoint(&journal, &before);
         assert_eq!(
@@ -1864,7 +1860,6 @@ fn finish_with_retains_claimed_publication_until_work_returns(cut: Initializatio
             InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
                 assert!(poll_once(shutdown.as_mut()).await.is_none());
             }
-            InitializationCut::Rewind => assert!(poll_once(rewind.as_mut()).await.is_none()),
         }
         release.send(()).unwrap();
         let agent = sibling.await.unwrap();
@@ -1889,19 +1884,6 @@ fn finish_with_retains_claimed_publication_until_work_returns(cut: Initializatio
                 ));
                 manager.wait_until_reaped().await;
                 assert!(manager.cleanup_finished());
-            }
-            InitializationCut::Rewind => {
-                let guard = rewind.await.unwrap();
-                assert!(guard.actor_guards().contains_key(&id));
-                assert_checkpoint(&journal, &candidate);
-                drop(guard);
-                assert!(
-                    manager
-                        .shutdown(SHUTDOWN_TIMEOUT)
-                        .await
-                        .timed_out
-                        .is_empty()
-                );
             }
             InitializationCut::DropWaiter => {
                 agent.validate_live().unwrap();

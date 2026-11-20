@@ -472,7 +472,7 @@ fn task_tools_restore_policy_and_exact_turns(kind: &str) {
             .unwrap();
     let persisted_view = persisted.latest_state().unwrap();
     let snapshot = host.manager.journal().checkpoint_snapshot().unwrap();
-    let folded = snapshot.fold(snapshot.seq).unwrap();
+    let folded = snapshot.fold().unwrap();
     assert_eq!(
         persisted_view.scopes[&Some(host.root.target.id())].context,
         folded.scopes[&Some(host.root.target.id())].context
@@ -624,7 +624,7 @@ fn task_policy_size_rejection_never_admits_orphan_work() {
     let host = task_restart_host(dir.path());
     task_restart_run(&host, json!({ "action": "oversize" }));
     let snapshot = host.manager.journal().checkpoint_snapshot().unwrap();
-    let folded = snapshot.fold(snapshot.seq).unwrap();
+    let folded = snapshot.fold().unwrap();
     let children: Vec<_> = folded
         .agents
         .values()

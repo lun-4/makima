@@ -22,7 +22,6 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
-pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod split_layout;
@@ -31,16 +30,12 @@ pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 
-use makima_storage::id::MakimaId;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use makima_agent::actor::HistoryBoundary;
-use makima_agent::{
-    AgentId, AgentInput, AgentRef, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId,
-};
+use makima_agent::{AgentId, AgentInput, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId};
 use makima_lua::orchestration::PinnedCommandTarget;
 use makima_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
@@ -237,19 +232,6 @@ pub enum Action {
         agent: Option<makima_agent::AgentId>,
     },
     ReplaceSession(Box<SessionReplacementRequest>),
-    RewindAgent {
-        target: AgentRef,
-        boundary: HistoryBoundary,
-        durable: Option<makima_agent::rewind::RewindBoundary>,
-    },
-    RestoreBranch {
-        target: AgentRef,
-        id: MakimaId,
-    },
-    RewindParent {
-        session: MakimaId,
-        seq: u64,
-    },
     ChangeModel(String),
     SelectPinnedModel {
         target: Box<PinnedCommandTarget>,

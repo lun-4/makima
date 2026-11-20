@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_int;
 use std::future::Future;
 use std::panic::catch_unwind;
@@ -16,7 +16,6 @@ use event_listener::Event;
 
 use include_dir::Dir;
 use makima_agent::cancel::{CancelMap, CancelToken, CancelTrigger, PublicationRegistration};
-use makima_agent::journal::SessionJournalSnapshot;
 use makima_agent::manager::AgentIncarnation;
 use makima_agent::permissions::PluginRuleStore;
 use makima_agent::prompt::{PromptId, PromptSource, ResolvedSlots, Slot};
@@ -26,8 +25,7 @@ use makima_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use makima_agent::{
-    AgentId, BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf, SnapshotLine, SnapshotSpan,
-    SpanStyle,
+    BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
 };
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
@@ -38,7 +36,6 @@ use mlua::{
 
 use crate::agent_errors::INVOCATION_EXPIRED;
 use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
-use crate::loader::PreparedStateRestore;
 use crate::splash::{SplashFrame, SplashPull};
 use serde_json::Value;
 
@@ -97,7 +94,6 @@ const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
 const LUA_COMMAND_ATTACHMENTS: &str = "Lua commands cannot include non-text content";
 const LUA_HOST_STOPPED: &str = "Lua host stopped";
-const STATE_MIGRATION_EFFECT: &str = "state_migration_has_no_invocation_authority";
 pub const COMMAND_HANDLER_UNAVAILABLE: &str = "command handler is unavailable";
 const INTERRUPT_DEADLINE_MSG: &str = "plugin interrupted: deadline exceeded";
 static NEXT_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -219,18 +215,7 @@ pub enum Request {
         provider: crate::api::session::SessionSnapshotFn,
     },
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
-    ObserveStateRestored {
-        target: makima_agent::AgentRef,
-        reply: flume::Sender<()>,
-    },
     NotifyStateRestored(makima_agent::AgentRef),
-    PrepareStateRestore {
-        snapshot: SessionJournalSnapshot,
-        affected: BTreeSet<AgentId>,
-        session_scope: bool,
-        publication: CheckpointPublication,
-        reply: flume::Sender<Result<PreparedStateRestore, String>>,
-    },
     StateChanged {
         target: makima_agent::AgentRef,
         event: makima_agent::state::StateChangeEvent,
@@ -1530,12 +1515,7 @@ pub(crate) fn bind_plugin_owner(
     cell.validate_plugin_effect().map_err(mlua::Error::runtime)
 }
 
-struct StateRestoreMigration;
-
 pub(crate) fn validate_plugin_effect(lua: &Lua) -> Result<(), String> {
-    if lua.app_data_ref::<StateRestoreMigration>().is_some() {
-        return Err(STATE_MIGRATION_EFFECT.into());
-    }
     let Some(task) = lua.app_data_ref::<TaskHandle>() else {
         return Ok(());
     };
@@ -1681,10 +1661,6 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 }
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
-    if lua.app_data_ref::<StateRestoreMigration>().is_some() {
-        lua.remove_registry_value(work_fn)?;
-        return Err(mlua::Error::runtime(STATE_MIGRATION_EFFECT));
-    }
     let handle = lua.app_data_ref::<TaskHandle>();
     let (cancel, live_ctx, managed_turn, command_depth, command_invocation, ancestors) =
         match &handle {
@@ -1775,9 +1751,6 @@ pub(crate) fn enqueue_callback(
     cancel: CancelToken,
     target: Option<TrustedTarget>,
 ) -> mlua::Result<()> {
-    if lua.app_data_ref::<StateRestoreMigration>().is_some() {
-        return Err(mlua::Error::runtime(STATE_MIGRATION_EFFECT));
-    }
     let depth = event_depth(lua) + 1;
     let incarnation = target.as_ref().map(|target| {
         target
@@ -5400,24 +5373,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     match msg {
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
-                        Request::PrepareStateRestore { snapshot, affected, session_scope, publication, reply } => {
-                            let _scope = TaskScope::new(&rt.lua, TaskCell::new(
-                                CancelToken::none(),
-                                Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
-                                None,
-                            ));
-                            rt.lua.set_app_data(StateRestoreMigration);
-                            let result = crate::api::state::prepare_restore(
-                                &rt.lua, &snapshot, &affected, session_scope, publication,
-                            );
-                            rt.lua.remove_app_data::<StateRestoreMigration>();
-                            let _ = reply.send(result);
-                        }
-                        Request::ObserveStateRestored { target, reply } => {
-                            let journal = target.manager().journal();
-                            crate::api::state::observe(&rt.lua, &journal, &target);
-                            let _ = reply.send(());
-                        }
                         Request::NotifyStateRestored(target) => {
                             let journal = target.manager().journal();
                             crate::api::state::observe(&rt.lua, &journal, &target);

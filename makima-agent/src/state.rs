@@ -49,7 +49,6 @@ pub struct RawStateSnapshot {
 pub enum StateChangeReason {
     Commit,
     Resume,
-    Rewind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1059,7 +1058,7 @@ mod tests {
         let first_revision = state_slot.get(&access).unwrap().revision;
         journal.notify_state_transition(StateChangeReason::Resume);
         let second_revision = state_slot.set(&access, json!(2), None).unwrap();
-        journal.notify_state_transition(StateChangeReason::Rewind);
+        journal.notify_state_transition(StateChangeReason::Resume);
         assert!(receiver.try_recv().is_err());
         release.send(()).unwrap();
         first.join().unwrap();
@@ -1073,7 +1072,7 @@ mod tests {
                 (first_revision, StateChangeReason::Commit),
                 (first_revision, StateChangeReason::Resume),
                 (second_revision, StateChangeReason::Commit),
-                (second_revision, StateChangeReason::Rewind),
+                (second_revision, StateChangeReason::Resume),
             ]
         );
     }
@@ -1085,11 +1084,12 @@ mod tests {
         let slot = slot(&journal, StateScope::Agent, 1);
         slot.set(&access, json!(1), None).unwrap();
         let receiver = journal.subscribe_state_changes();
-        for reason in [StateChangeReason::Resume, StateChangeReason::Rewind] {
-            journal.notify_state_transition(reason);
-            assert_eq!(receiver.try_recv().unwrap().reason, reason);
-            assert_eq!(slot.get(&access).unwrap().value, Some(json!(1)));
-        }
+        journal.notify_state_transition(StateChangeReason::Resume);
+        assert_eq!(
+            receiver.try_recv().unwrap().reason,
+            StateChangeReason::Resume
+        );
+        assert_eq!(slot.get(&access).unwrap().value, Some(json!(1)));
         slot.delete(&access, None).unwrap();
         receiver.try_recv().unwrap();
         journal.notify_state_transition(StateChangeReason::Resume);

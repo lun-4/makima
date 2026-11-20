@@ -176,12 +176,7 @@ impl RecoveryCandidate {
             }
         }
         let mut state = session.state().to_vec();
-        let pinned = crate::rewind::recover_boundary_pins(&mut state)
-            .map_err(|error| failure(error.to_string()))?;
         for record in &mut state {
-            if pinned.contains(&record.seq) {
-                continue;
-            }
             if let StateChange::Boundary { offset, lens } = &mut record.change {
                 if let Some(agent) = record.agent
                     && lens
@@ -380,11 +375,7 @@ fn results(calls: Vec<String>) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AgentLimits, AgentManagerHandle,
-        rewind::{RewindBoundary, RewindError},
-        session_checkpoint::SessionLogCheckpoint,
-    };
+    use crate::{AgentLimits, AgentManagerHandle, session_checkpoint::SessionLogCheckpoint};
     use makima_storage::{
         StateDir,
         checkpoint::{CheckpointClaim, CheckpointPublication},
@@ -483,19 +474,12 @@ mod tests {
                 .generation,
             0
         );
-        let result = candidate.journal.preview_rewind(RewindBoundary {
-            agent: root,
-            seq,
-            epoch: snapshot.epoch,
-        });
         if offset > 1 {
             assert_eq!(boundary.lens[&root], (original_epoch, offset));
-            assert!(matches!(result, Err(RewindError::Compacted(id)) if id == root));
         } else {
             let expected = if offset == 0 { 0 } else { 2 };
             assert_eq!(boundary.offset, expected);
             assert_eq!(boundary.lens[&root], (history.epoch, expected));
-            assert_eq!(result.unwrap().histories[&root].messages.len(), expected);
         }
         let recovered_epoch = history.epoch;
         let again = RecoveryCandidate::prepare(candidate.session).unwrap();

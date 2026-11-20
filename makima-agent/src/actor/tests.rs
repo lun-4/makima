@@ -283,15 +283,10 @@ fn prepared_config_allows_observations_but_fences_user_boundaries(install: bool)
             snapshot.histories[&agent].messages[1].first_text_content(),
             Some(STREAMED)
         );
-        let boundary = snapshot
-            .state
-            .iter()
-            .rev()
-            .find(|record| matches!(record.change, StateChange::Boundary { .. }))
-            .unwrap();
-        let at_boundary = snapshot.fold(boundary.seq).unwrap();
         assert_eq!(
-            at_boundary.scopes[&Some(agent)].plugins.contains_key(SLOT),
+            snapshot.fold().unwrap().scopes[&Some(agent)]
+                .plugins
+                .contains_key(SLOT),
             install
         );
     });
@@ -3029,7 +3024,7 @@ fn admission_scope(
         .collect();
     assert_eq!(admissions, expected);
     snapshot
-        .fold(snapshot.seq)
+        .fold()
         .unwrap()
         .scopes
         .remove(&Some(agent))

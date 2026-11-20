@@ -4077,7 +4077,7 @@ mod tests {
 
     fn journal_plans(manager: &AgentManagerHandle) -> PlanSlot {
         let snapshot = manager.journal().snapshot();
-        let view = snapshot.fold(u64::MAX).unwrap();
+        let view = snapshot.fold().unwrap();
         crate::plan_state::plan_entries(&view).unwrap()
     }
 

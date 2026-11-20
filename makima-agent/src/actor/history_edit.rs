@@ -1,25 +1,14 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use makima_providers::provider::Provider;
-use makima_providers::{ContentBlock, ConversationEnd, Message, TokenUsage};
-use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StoredAgentConfig};
-use makima_storage::sessions::{HistorySnapshot, next_epoch};
+use makima_providers::{ConversationEnd, Message};
+use makima_storage::sessions::HistorySnapshot;
 
 use super::prepared::{CancelPublication, PreparedOperation};
 use super::{
-    ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, ChildDelivery, ConfigChange,
-    ConfigCommit, PreparedCommit, PreparedModel, PreparedOperationTicket, PreparedTransaction,
-    TurnResult, TurnTicket,
+    ActorError, ActorIdleGuard, ActorLifecycle, AgentActorHandle, PreparedCommit,
+    PreparedOperationTicket, PreparedTransaction,
 };
-use crate::{AgentId, AgentMode, History, ModeDef, TurnId, end_conversation_detached};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryBoundary {
-    pub agent_id: AgentId,
-    pub epoch: u64,
-    pub offset: usize,
-}
+use crate::{AgentId, History, end_conversation_detached};
 
 #[derive(Clone)]
 pub struct HistoryChange {
@@ -27,218 +16,6 @@ pub struct HistoryChange {
     pub epoch: u64,
     pub messages: Arc<Vec<Message>>,
     pub draft: Message,
-}
-
-#[derive(Clone, Default)]
-pub struct AgentStateSnapshot {
-    pub results: Vec<TurnResult>,
-    pub deliveries: Vec<Arc<ChildDelivery>>,
-    pub delivery_seen: Vec<TurnId>,
-    pub usage: TokenUsage,
-}
-
-pub struct PreparedActorRewind {
-    idle: ActorIdleGuard,
-    history: HistorySnapshot<Message>,
-    commit: ConfigCommit,
-    state: AgentStateSnapshot,
-    ended: Option<(Arc<dyn Provider>, Arc<str>)>,
-}
-
-pub struct InstalledActorRewind {
-    idle: ActorIdleGuard,
-    commit: ConfigCommit,
-    history: HistoryChange,
-    ended: Option<(Arc<dyn Provider>, Arc<str>)>,
-}
-
-impl PreparedActorRewind {
-    pub fn config(&self) -> &ConfigCommit {
-        &self.commit
-    }
-
-    pub fn history(&self) -> &HistorySnapshot<Message> {
-        &self.history
-    }
-
-    pub fn agent_id(&self) -> AgentId {
-        self.idle.actor.agent_id()
-    }
-
-    pub fn with_state(mut self, state: AgentStateSnapshot) -> Result<Self, ActorError> {
-        if state
-            .results
-            .iter()
-            .any(|result| result.outcome.agent_id() != self.idle.actor.agent_id())
-        {
-            return Err(ActorError::InvalidConfig(
-                "rewind result belongs to another actor".into(),
-            ));
-        }
-        self.state = state;
-        Ok(self)
-    }
-
-    pub fn install_held(self) -> InstalledActorRewind {
-        self.install_held_inner(
-            #[cfg(test)]
-            || {},
-        )
-    }
-
-    fn install_held_inner(
-        self,
-        #[cfg(test)] after_outcomes: impl FnOnce(),
-    ) -> InstalledActorRewind {
-        let Self {
-            idle,
-            history,
-            commit,
-            state: restored,
-            ended,
-        } = self;
-        {
-            let inner = &idle.actor.inner;
-            let mut outcomes = inner
-                .outcomes
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            #[cfg(test)]
-            after_outcomes();
-            let mut state = inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state.policy_generation = commit.generation;
-            state.policy = Some(Arc::clone(&commit.config));
-            state.latest = None;
-            state.latest_history_turn = None;
-            state.settled = None;
-            state.usage = restored.usage;
-            state.instructions.clear();
-            state.turn_work.clear();
-            state.deliveries.clear();
-            state.delivery_order.clear();
-            state.delivery_runs.clear();
-            state.delivery_seen = restored.delivery_seen.into();
-            state.delivery_suspended = true;
-            state.delivery_held = true;
-            for delivery in restored.deliveries {
-                super::delivery::restore_pending(&mut state, delivery, Vec::new());
-            }
-            state.retained_order.clear();
-            inner
-                .tickets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clear();
-            let mut tickets = inner
-                .retained_tickets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            outcomes.clear();
-            tickets.clear();
-            let previous_history = inner.history.load_full();
-            let shared_prefix_len = previous_history
-                .messages
-                .iter()
-                .zip(history.messages.iter())
-                .take_while(|(previous, restored)| previous == restored)
-                .count();
-            let mut coverage = inner
-                .coverage
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            for boundary in coverage.values_mut() {
-                *boundary = boundary.and_then(|(epoch, end)| {
-                    (epoch == previous_history.epoch && end <= shared_prefix_len)
-                        .then_some((history.epoch, end))
-                });
-            }
-            for result in restored
-                .results
-                .into_iter()
-                .rev()
-                .take(MAX_STORED_TURN_RESULTS)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-            {
-                let turn = result.outcome.turn_id();
-                state.latest = Some(result.outcome.clone());
-                state.retained_order.push_back(turn);
-                outcomes.insert(turn, result.outcome.clone());
-                tickets.insert(
-                    turn,
-                    TurnTicket::from_result_for_actor(result, Arc::clone(&inner.identity)),
-                );
-            }
-            coverage.retain(|turn, _| outcomes.contains_key(turn));
-            for turn in outcomes.keys() {
-                coverage.entry(*turn).or_insert(None);
-            }
-            if let Some(latest) = &state.latest {
-                let turn = latest.turn_id();
-                let boundary = coverage
-                    .entry(turn)
-                    .or_default()
-                    .get_or_insert((history.epoch, history.messages.len()));
-                state.latest_history_turn = Some((turn, boundary.0, boundary.1));
-            }
-            *inner
-                .latest_admitted
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) =
-                state.latest.as_ref().map(crate::TurnOutcome::turn_id);
-            inner.history.store(Arc::new(history.clone()));
-            if let Some(reservation) = state.owned_idle(&idle.owner) {
-                reservation.committing = false;
-            }
-        }
-        InstalledActorRewind {
-            history: HistoryChange {
-                agent_id: idle.actor.agent_id(),
-                epoch: history.epoch,
-                messages: history.messages,
-                draft: Message::user(String::new()),
-            },
-            idle,
-            commit,
-            ended,
-        }
-    }
-}
-
-impl InstalledActorRewind {
-    pub fn config(&self) -> &ConfigCommit {
-        &self.commit
-    }
-
-    pub fn notify(self) -> (ActorIdleGuard, ConfigCommit, HistoryChange) {
-        let Self {
-            idle,
-            commit,
-            history,
-            ended,
-        } = self;
-        {
-            let mut state = idle
-                .actor
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state
-                .config_observers
-                .retain(|observer| observer.send(commit.clone()).is_ok());
-            state.emit(super::ActorEvent::Config(commit.clone()));
-        }
-        if let Some((provider, ended)) = ended {
-            end_conversation_detached(&provider, ended, ConversationEnd::Rewound);
-        }
-        idle.actor.inner.policy_changed.notify(usize::MAX);
-        (idle, commit, history)
-    }
 }
 
 pub struct HistoryEditWork {
@@ -258,127 +35,7 @@ struct HistoryEditAction {
     completion: flume::Sender<PreparedEditResult>,
 }
 
-impl AgentActorHandle {
-    pub fn history_boundary_message(
-        &self,
-        boundary: &HistoryBoundary,
-    ) -> Result<Message, ActorError> {
-        let history = self.inner.history.load_full();
-        if boundary.agent_id != self.agent_id()
-            || boundary.epoch != history.epoch
-            || !valid_boundary(&history.messages, boundary.offset)
-        {
-            return Err(ActorError::StaleHistoryBoundary);
-        }
-        Ok(history.messages[boundary.offset].clone())
-    }
-
-    /// The boundary's message, to restore as the draft, and the history
-    /// before it, to replace the current history with.
-    pub fn rewind_snapshot(
-        &self,
-        boundary: &HistoryBoundary,
-    ) -> Result<(Message, HistorySnapshot<Message>), ActorError> {
-        let draft = self.history_boundary_message(boundary)?;
-        let history = self.inner.history.load_full();
-        let mut replacement = HistorySnapshot::new(history.messages[..boundary.offset].to_vec());
-        replacement.compacted = history.compacted;
-        Ok((draft, replacement))
-    }
-
-    pub fn history_boundaries(&self) -> Result<Vec<HistoryBoundary>, ActorError> {
-        Ok(self
-            .history_boundary_messages()?
-            .into_iter()
-            .map(|(boundary, _)| boundary)
-            .collect())
-    }
-
-    pub fn history_boundary_messages(&self) -> Result<Vec<(HistoryBoundary, Message)>, ActorError> {
-        {
-            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(super::lifecycle_error(state.lifecycle));
-            }
-        }
-        let history = self.inner.history.load_full();
-        let mut pending = HashSet::new();
-        let mut valid = true;
-        let mut boundaries = Vec::new();
-        for (offset, message) in history.messages.iter().enumerate() {
-            if valid && pending.is_empty() && History::is_boundary_message(message) {
-                boundaries.push((
-                    HistoryBoundary {
-                        agent_id: self.agent_id(),
-                        epoch: history.epoch,
-                        offset,
-                    },
-                    message.clone(),
-                ));
-            }
-            valid &= update_pending_tools(message, &mut pending);
-        }
-        Ok(boundaries)
-    }
-}
-
 impl ActorIdleGuard {
-    pub async fn prepare_rewind(
-        self,
-        history: HistorySnapshot<Message>,
-        saved: StoredAgentConfig,
-        prepared: PreparedModel,
-        mode: (AgentMode, ModeDef),
-    ) -> Result<PreparedActorRewind, ActorError> {
-        let source = self.source_snapshot()?;
-        let config = ConfigChange::resolved_restore(&saved, prepared, mode, &source.config.config)?;
-        self.actor.inner.validate_mode_config(&config)?;
-        let generation = source.config.generation.checked_add(1).ok_or_else(|| {
-            ActorError::InvalidConfig("configuration generation exhausted".into())
-        })?;
-        let mut history = history;
-        history.epoch = next_epoch();
-        history.conversation = source.history.conversation;
-        let mut replacement = History::restored_exact(history);
-        let ended = if replacement.is_empty() {
-            replacement.restart_conversation()
-        } else {
-            replacement.continue_conversation()
-        }
-        .map(|ended| (Arc::clone(&source.config.config.provider), ended));
-        {
-            let mut state = self
-                .actor
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if state.lifecycle != ActorLifecycle::Open {
-                return Err(super::lifecycle_error(state.lifecycle));
-            }
-            state
-                .owned_idle(&self.owner)
-                .filter(|reservation| {
-                    !reservation.committing
-                        && reservation.permission.is_none()
-                        && reservation.edit.is_none()
-                })
-                .ok_or(ActorError::Busy)?
-                .committing = true;
-        }
-        Ok(PreparedActorRewind {
-            commit: ConfigCommit {
-                identity: Arc::clone(&self.actor.inner.identity),
-                generation,
-                config: Arc::new(config),
-            },
-            history: replacement.snapshot().clone(),
-            idle: self,
-            state: AgentStateSnapshot::default(),
-            ended,
-        })
-    }
-
     pub async fn commit_prepared_transaction_held(
         mut self,
         operation: PreparedOperationTicket,
@@ -576,35 +233,6 @@ impl HistoryEditWork {
     }
 }
 
-fn valid_boundary(messages: &[Message], offset: usize) -> bool {
-    let Some(message) = messages.get(offset) else {
-        return false;
-    };
-    let mut pending = HashSet::new();
-    History::is_boundary_message(message)
-        && messages[..offset]
-            .iter()
-            .all(|message| update_pending_tools(message, &mut pending))
-        && pending.is_empty()
-}
-
-fn update_pending_tools<'a>(message: &'a Message, pending: &mut HashSet<&'a str>) -> bool {
-    for block in &message.content {
-        match block {
-            ContentBlock::ToolUse { id, .. } => {
-                pending.insert(id.as_str());
-            }
-            ContentBlock::ToolResult { tool_use_id, .. }
-                if !pending.remove(tool_use_id.as_str()) =>
-            {
-                return false;
-            }
-            _ => {}
-        }
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -615,17 +243,17 @@ mod tests {
     use futures_lite::future;
     use makima_providers::provider::{BoxFuture, Provider};
     use makima_providers::{
-        AgentError, ContentBlock, ConversationEnd, Invocation, Message, Model, ProviderEvent,
-        RequestDelivery, RequestOptions, Role, StreamResponse, TokenUsage,
+        AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, RequestDelivery,
+        RequestOptions, Role, StreamResponse, TokenUsage,
     };
     use makima_storage::checkpoint::CheckpointPublication;
     use makima_storage::conversation::ConversationState;
     use makima_storage::id::SessionRef;
-    use makima_storage::sessions::{HistorySnapshot, next_epoch};
+    use makima_storage::sessions::HistorySnapshot;
     use serde_json::Value;
     use test_case::test_case;
 
-    use super::{AgentStateSnapshot, HistoryBoundary, HistoryChange, valid_boundary};
+    use super::HistoryChange;
     use crate::actor::tests::{ScriptedBackend, input, policy};
     use crate::actor::{
         ActorBackend, ActorError, ActorHistory, AgentActorHandle, BackendResult, ChildDelivery,
@@ -637,7 +265,6 @@ mod tests {
     };
 
     const CHECKPOINT_ERROR: &str = "checkpoint unavailable";
-    const RESTORED_CWD: &str = "/rewind-fixture";
 
     fn idle_actor(messages: Vec<Message>) -> (AgentActorHandle, smol::Task<()>) {
         let (actor, runner) =
@@ -646,270 +273,6 @@ mod tests {
             .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
             .unwrap();
         (actor, runner)
-    }
-
-    #[test_case(false; "install_is_silent_until_notified")]
-    #[test_case(true; "dropping_candidate_preserves_live_state")]
-    fn prepared_rewind_installs_exact_candidate_without_journaling(abort: bool) {
-        smol::block_on(async {
-            use crate::actor::PreparedModel;
-            use crate::session_checkpoint::stored_agent_config;
-            use std::collections::BTreeMap;
-
-            const SAVED_CWD: &str = "/rewound";
-            const SAVED_TEXT: &str = "saved boundary";
-            let (actor, runner) = idle_actor(vec![Message::user("displaced".into())]);
-            let source = actor.config_snapshot().unwrap();
-            let before = actor.inner.history.load_full();
-            let observer = actor.subscribe_config_commits();
-            while observer.try_recv().is_ok() {}
-            let mut saved = stored_agent_config(&source.config, BTreeMap::new()).unwrap();
-            saved.cwd = SAVED_CWD.into();
-            saved.fast = true;
-            let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
-            let candidate = actor
-                .prepare_idle()
-                .unwrap()
-                .prepare_rewind(
-                    HistorySnapshot::new(vec![Message::user(SAVED_TEXT.into())]),
-                    saved,
-                    PreparedModel {
-                        provider: Arc::clone(&source.config.provider),
-                        model: source.config.model.clone(),
-                    },
-                    mode,
-                )
-                .await
-                .unwrap();
-            assert_eq!(candidate.config().generation, source.generation + 1);
-            assert_eq!(
-                actor.config_snapshot().unwrap().generation,
-                source.generation
-            );
-            assert!(Arc::ptr_eq(
-                &actor.inner.history.load_full().messages,
-                &before.messages
-            ));
-            if abort {
-                drop(candidate);
-                assert_eq!(
-                    actor.config_snapshot().unwrap().generation,
-                    source.generation
-                );
-                assert!(Arc::ptr_eq(
-                    &actor.inner.history.load_full().messages,
-                    &before.messages
-                ));
-                assert!(observer.try_recv().is_err());
-                drop(actor.prepare_idle().unwrap());
-            } else {
-                let installed = candidate.install_held();
-                assert!(observer.try_recv().is_err());
-                assert_eq!(
-                    actor.inner.history.load_full().messages[0].first_text_content(),
-                    Some(SAVED_TEXT)
-                );
-                let config = actor.config_snapshot().unwrap();
-                assert!(config.config.fast);
-                assert_eq!(config.config.context.cwd(), std::path::Path::new(SAVED_CWD));
-                let (idle, committed, change) = installed.notify();
-                assert_eq!(
-                    observer.try_recv().unwrap().generation,
-                    committed.generation
-                );
-                assert_eq!(change.epoch, actor.inner.history.load_full().epoch);
-                drop(idle);
-            }
-            actor.close();
-            runner.await;
-        });
-    }
-
-    async fn prepared_rewind(
-        actor: &AgentActorHandle,
-        history: HistorySnapshot<Message>,
-        state: AgentStateSnapshot,
-    ) -> super::PreparedActorRewind {
-        use crate::actor::PreparedModel;
-        use crate::session_checkpoint::stored_agent_config;
-        use std::collections::BTreeMap;
-
-        let source = actor.config_snapshot().unwrap();
-        let mut saved = stored_agent_config(&source.config, BTreeMap::new()).unwrap();
-        saved.cwd = RESTORED_CWD.into();
-        let mode = crate::modes::from_snapshot(&saved.mode).unwrap();
-        actor
-            .prepare_idle()
-            .unwrap()
-            .prepare_rewind(
-                history,
-                saved,
-                PreparedModel {
-                    provider: Arc::clone(&source.config.provider),
-                    model: source.config.model.clone(),
-                },
-                mode,
-            )
-            .await
-            .unwrap()
-            .with_state(state)
-            .unwrap()
-    }
-
-    #[test]
-    fn rewind_install_locks_outcomes_before_state() {
-        smol::block_on(async {
-            let (start, rx) = flume::bounded(1);
-            let (actor, runner) = AgentActorHandle::spawn_inner(
-                AgentId::generate(),
-                Vec::new(),
-                None,
-                Box::new(IdleBackend),
-                None,
-                None,
-                Some(rx),
-            );
-            actor
-                .initialize_config(EffectiveAgentConfig::new(policy(false), AgentMode::Build))
-                .unwrap();
-            let candidate = prepared_rewind(
-                &actor,
-                HistorySnapshot::new(Vec::new()),
-                AgentStateSnapshot::default(),
-            )
-            .await;
-            let installed = candidate.install_held_inner(|| {
-                assert!(actor.inner.outcomes.try_lock().is_err());
-                assert!(actor.inner.state.try_lock().is_ok());
-            });
-            drop(installed.notify());
-            actor.close();
-            drop(start);
-            runner.await;
-        });
-    }
-
-    #[test_case(false, false, None; "exact_prefix_rebases_older_boundaries")]
-    #[test_case(true, false, None; "divergent_suffix_does_not_expose_later_messages")]
-    #[test_case(false, true, None; "stale_epoch_is_unavailable")]
-    #[test_case(false, false, Some(1); "known_latest_boundary_is_not_widened")]
-    fn rewind_rebuilds_retained_transcript_coverage(
-        divergent: bool,
-        stale: bool,
-        latest_end: Option<usize>,
-    ) {
-        smol::block_on(async {
-            use crate::actor::TranscriptRequest;
-
-            const FIRST: &str = "first retained turn";
-            const SECOND: &str = "second retained turn";
-            const REPLACEMENT: &str = "restored replacement";
-            const DISPLACED: &str = "discarded turn";
-            const LAST_MESSAGES: usize = 10;
-            const MAX_BYTES: usize = 4096;
-            let (actor, runner) = idle_actor(vec![
-                Message::user(FIRST.into()),
-                Message::user(SECOND.into()),
-                Message::user(DISPLACED.into()),
-            ]);
-            let previous_epoch = actor.inner.history.load().epoch;
-            let turns = [TurnId::generate(), TurnId::generate(), TurnId::generate()];
-            let discarded = TurnId::generate();
-            let epoch = if stale { next_epoch() } else { previous_epoch };
-            actor.inner.coverage.lock().unwrap().extend([
-                (turns[0], Some((epoch, 1))),
-                (turns[1], Some((epoch, 2))),
-                (discarded, Some((previous_epoch, 3))),
-            ]);
-            if let Some(end) = latest_end {
-                actor
-                    .inner
-                    .coverage
-                    .lock()
-                    .unwrap()
-                    .insert(turns[2], Some((previous_epoch, end)));
-            }
-            let messages = vec![
-                Message::user(FIRST.into()),
-                Message::user(if divergent { REPLACEMENT } else { SECOND }.into()),
-            ];
-            let results = turns
-                .iter()
-                .map(|turn| TurnResult {
-                    outcome: TurnOutcome::completed(
-                        actor.agent_id(),
-                        *turn,
-                        TokenUsage::default(),
-                        1,
-                        DoneReason::EndTurn,
-                    ),
-                    text: String::new(),
-                    output: Vec::new(),
-                    provenance: Default::default(),
-                    duration_ms: 0,
-                })
-                .collect();
-            let candidate = prepared_rewind(
-                &actor,
-                HistorySnapshot::new(messages.clone()),
-                AgentStateSnapshot {
-                    results,
-                    ..Default::default()
-                },
-            )
-            .await;
-            let epoch = candidate.history().epoch;
-            let installed = candidate.install_held();
-            let request = TranscriptRequest {
-                through_turn: None,
-                last_messages: LAST_MESSAGES,
-                max_bytes: MAX_BYTES,
-            };
-            let snapshot = actor.transcript(request.clone()).unwrap();
-            let latest_end = latest_end.unwrap_or(messages.len());
-            assert_eq!(snapshot.through_turn, Some(turns[2]));
-            assert_eq!(
-                snapshot.messages,
-                serde_json::to_value(&messages[..latest_end]).unwrap()
-            );
-            assert_eq!(snapshot.epoch, epoch);
-            for (index, turn) in turns.iter().enumerate() {
-                assert!(actor.turn_ticket(*turn).unwrap().peek_result().is_some());
-                let snapshot = actor.transcript(TranscriptRequest {
-                    through_turn: Some(*turn),
-                    ..request.clone()
-                });
-                if index == 2 || (!stale && (index == 0 || !divergent)) {
-                    let expected = if index == 2 { latest_end } else { index + 1 };
-                    assert_eq!(
-                        snapshot.unwrap().messages,
-                        serde_json::to_value(&messages[..expected]).unwrap()
-                    );
-                } else {
-                    assert!(matches!(
-                        snapshot,
-                        Err(ActorError::UnavailableTurnHistory(id)) if id == *turn
-                    ));
-                }
-            }
-            assert!(matches!(
-                actor.transcript(TranscriptRequest {
-                    through_turn: Some(discarded),
-                    ..request.clone()
-                }),
-                Err(ActorError::UnknownTurn(id)) if id == discarded
-            ));
-            let mut active_history = actor.committed_history_snapshot();
-            Arc::make_mut(&mut active_history.messages).push(Message::user(DISPLACED.into()));
-            actor.inner.history.store(Arc::new(active_history));
-            assert_eq!(
-                actor.transcript(request).unwrap().messages,
-                serde_json::to_value(&messages[..latest_end]).unwrap()
-            );
-            drop(installed.notify());
-            actor.close();
-            runner.await;
-        });
     }
 
     fn published() -> PreparedPublication {
@@ -921,13 +284,15 @@ mod tests {
         })
     }
 
-    async fn rewind(
+    async fn replace_history(
         actor: &AgentActorHandle,
-        boundary: &HistoryBoundary,
+        keep: usize,
         publish: PreparedPublication,
     ) -> Result<HistoryChange, ActorError> {
         let guard = actor.prepare_idle()?;
-        let (_, replacement) = actor.rewind_snapshot(boundary)?;
+        let history = actor.inner.history.load_full();
+        let mut replacement = HistorySnapshot::new(history.messages[..keep].to_vec());
+        replacement.compacted = history.compacted;
         let operation = guard.reserve_prepared_operation(None)?;
         operation.resolve(None)?;
         operation.wait_ready().await?;
@@ -943,11 +308,11 @@ mod tests {
         let (_, _, change) = guard
             .commit_prepared_transaction_held(operation, Some(replacement), transaction)
             .await?;
-        Ok(change.expect("rewind replaces history"))
+        Ok(change.expect("replacement changes history"))
     }
 
     #[test]
-    fn approval_receipt_round_trips_recovery_and_rewinds_approved_plan() {
+    fn approval_receipt_round_trips_recovery() {
         use crate::{
             AgentContextSnapshot, AgentManagerHandle, ModeRegistry, ToolOutput, plan_state,
             session_checkpoint::stored_agent_config, session_recovery::RecoveryCandidate,
@@ -1038,26 +403,10 @@ mod tests {
             let recovered = RecoveryCandidate::prepare(session)
                 .unwrap()
                 .finalize_after_publication();
-            let journal = recovered.journal();
-            let mut replacement = journal
-                .prepare_rewind(crate::rewind::RewindBoundary {
-                    epoch: journal.snapshot().epoch,
-                    ..receipt
-                })
-                .await
-                .unwrap();
-            let view = replacement
-                .snapshot()
-                .fold(replacement.snapshot().seq)
-                .unwrap();
-            assert_eq!(
-                view.scopes[&Some(root.id())].config.as_ref(),
-                Some(&saved_config)
-            );
-            assert_eq!(
-                replacement.snapshot().histories[&root.id()].messages,
-                original.messages
-            );
+            let snapshot = recovered.journal().snapshot();
+            assert!(snapshot.state.iter().any(|record| record.seq == receipt.seq
+                && matches!(record.change, StateChange::Boundary { .. })));
+            let view = snapshot.fold().unwrap();
             let plans: PlanSlot = serde_json::from_value(
                 view.scopes[&None].plugins[makima_storage::plans::PLAN_STATE_KEY]
                     .value
@@ -1069,8 +418,6 @@ mod tests {
             assert_eq!(plan.path, path);
             assert_eq!(plan.approved.as_ref().unwrap().content, PLAN);
             assert_eq!(plan.staged_model.as_ref(), Some(&selection));
-            replacement.install().unwrap();
-            drop(replacement);
             actor.shutdown();
         });
     }
@@ -2263,10 +1610,9 @@ mod tests {
     }
 
     #[test]
-    fn rewind_serializes_concurrent_child_report() {
+    fn history_replacement_serializes_concurrent_child_report() {
         smol::block_on(async {
             let (actor, runner) = idle_actor(vec![Message::user("draft".into())]);
-            let boundary = actor.history_boundaries().unwrap().remove(0);
             let (entered, entry) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
             let publish: PreparedPublication = Box::new(move |_, publication| {
@@ -2278,7 +1624,7 @@ mod tests {
                 })
             });
             let rewound = actor.clone();
-            let edit = smol::spawn(async move { rewind(&rewound, &boundary, publish).await });
+            let edit = smol::spawn(async move { replace_history(&rewound, 0, publish).await });
             entry.recv_async().await.unwrap();
             let turn_id = TurnId::generate();
             let report = ChildDelivery {
@@ -2322,12 +1668,12 @@ mod tests {
     }
 
     #[test]
-    fn rewind_callback_panic_releases_reservation_without_publication() {
+    fn history_replacement_callback_panic_releases_reservation_without_publication() {
         smol::block_on(async {
             let (actor, runner) = idle_actor(vec![Message::user("draft".into())]);
-            let boundary = actor.history_boundaries().unwrap().remove(0);
-            let epoch = boundary.epoch;
-            let result = rewind(&actor, &boundary, Box::new(|_, _| panic!("callback panic"))).await;
+            let epoch = actor.inner.history.load().epoch;
+            let result =
+                replace_history(&actor, 0, Box::new(|_, _| panic!("callback panic"))).await;
             assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 1);
@@ -2338,28 +1684,25 @@ mod tests {
     }
 
     #[test]
-    fn rewind_checkpoint_failure_restores_history() {
+    fn history_replacement_checkpoint_failure_restores_history() {
         smol::block_on(async {
             let (actor, runner) = idle_actor(vec![
                 Message::user("first".into()),
                 Message::user("draft".into()),
             ]);
-            let boundary = actor.history_boundaries().unwrap().remove(1);
             let original = actor.inner.history.load_full();
-            let result = rewind(
+            let result = replace_history(
                 &actor,
-                &boundary,
+                1,
                 Box::new(|_, _| Box::pin(async { Err(CHECKPOINT_ERROR.to_owned()) })),
             )
             .await;
             assert!(matches!(result, Err(ActorError::HistoryCheckpoint(_))));
             assert_eq!(actor.inner.history.load().epoch, original.epoch);
             assert_eq!(actor.inner.history.load().messages.len(), 2);
-            let changed = rewind(&actor, &boundary, published()).await.unwrap();
+            let changed = replace_history(&actor, 1, published()).await.unwrap();
             assert_eq!(changed.messages.len(), 1);
             assert_ne!(changed.epoch, original.epoch);
-            let stale = rewind(&actor, &boundary, published()).await;
-            assert!(matches!(stale, Err(ActorError::StaleHistoryBoundary)));
             actor.close();
             runner.await;
         });
@@ -2396,8 +1739,8 @@ mod tests {
     #[test_case(1, Some(ConversationEnd::Rewound) ; "keeping_messages_rewinds")]
     #[test_case(0, Some(ConversationEnd::Closed) ; "keeping_nothing_closes")]
     #[test_case(1, None ; "undelivered_is_not_ended")]
-    fn rewind_ends_the_outgoing_conversation_and_close_keeps_the_new_one(
-        boundary: usize,
+    fn history_replacement_ends_the_outgoing_conversation_and_close_keeps_the_new_one(
+        keep: usize,
         expected: Option<ConversationEnd>,
     ) {
         smol::block_on(async {
@@ -2421,8 +1764,7 @@ mod tests {
             actor
                 .initialize_config(EffectiveAgentConfig::new(settings, AgentMode::Build))
                 .unwrap();
-            let boundary = actor.history_boundaries().unwrap().remove(boundary);
-            rewind(&actor, &boundary, published()).await.unwrap();
+            replace_history(&actor, keep, published()).await.unwrap();
             actor.close();
             runner.await;
             drop(actor);
@@ -2434,113 +1776,5 @@ mod tests {
             }
             assert_eq!(reasons, Vec::from_iter(expected));
         });
-    }
-
-    #[test_case(false; "foreign_actor")]
-    #[test_case(true; "invalidated_by_compaction")]
-    fn rewind_rejects_foreign_or_compacted_boundary(compacted: bool) {
-        smol::block_on(async {
-            const DRAFT: &str = "draft";
-            const RUN: u64 = 1;
-            let (actor, runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user(DRAFT.into())],
-                None,
-                Box::new(IdleBackend),
-            );
-            let (other, other_runner) = AgentActorHandle::spawn(
-                AgentId::generate(),
-                vec![Message::user(DRAFT.into())],
-                None,
-                Box::new(IdleBackend),
-            );
-            let boundary = if compacted {
-                actor.history_boundaries().unwrap().remove(0)
-            } else {
-                other.history_boundaries().unwrap().remove(0)
-            };
-            if compacted {
-                actor.push_compact(RUN, None).unwrap();
-                actor.runtime_barrier().await.unwrap();
-                assert!(actor.inner.history.load().compacted);
-                assert_ne!(boundary.epoch, actor.inner.history.load().epoch);
-            }
-            assert!(matches!(
-                actor.rewind_snapshot(&boundary),
-                Err(ActorError::StaleHistoryBoundary)
-            ));
-            actor.close();
-            other.close();
-            runner.await;
-            other_runner.await;
-        });
-    }
-
-    #[test]
-    fn boundary_messages_match_one_committed_snapshot() {
-        smol::block_on(async {
-            const FIRST: &str = "first";
-            const NEXT: &str = "next";
-            let messages = vec![
-                Message::user(FIRST.into()),
-                Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "answer".into(),
-                    }],
-                    ..Default::default()
-                },
-                Message::user(NEXT.into()),
-            ];
-            let (actor, runner) = idle_actor(messages);
-            let boundaries = actor.history_boundary_messages().unwrap();
-            assert_eq!(
-                boundaries
-                    .iter()
-                    .map(|(boundary, message)| (
-                        boundary.offset,
-                        message.first_text_content().unwrap()
-                    ))
-                    .collect::<Vec<_>>(),
-                vec![(0, FIRST), (2, NEXT)]
-            );
-            assert!(
-                boundaries
-                    .iter()
-                    .all(|(boundary, _)| boundary.agent_id == actor.agent_id()
-                        && boundary.epoch == boundaries[0].0.epoch)
-            );
-            let boundary = boundaries[1].0.clone();
-            rewind(&actor, &boundary, published()).await.unwrap();
-            assert!(actor.prepare_idle().is_ok());
-            assert_eq!(boundaries[1].1.first_text_content(), Some(NEXT));
-            assert!(matches!(
-                actor.history_boundary_message(&boundary),
-                Err(ActorError::StaleHistoryBoundary)
-            ));
-            actor.close();
-            runner.await;
-        });
-    }
-
-    #[test]
-    fn rewind_boundaries_preserve_complete_tool_groups() {
-        let messages = vec![
-            Message::user("first".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::tool_use(
-                    "tool",
-                    "read",
-                    serde_json::json!({}),
-                )],
-                ..Default::default()
-            },
-            Message::user("would split group".into()),
-        ];
-        assert!(valid_boundary(&messages, 0));
-        assert!(!valid_boundary(&messages, 1));
-        assert!(!valid_boundary(&messages, 2));
-        assert!(!valid_boundary(&messages, 3));
     }
 }

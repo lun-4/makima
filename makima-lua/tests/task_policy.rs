@@ -1653,7 +1653,7 @@ fn retired_task_policy_releases_space_for_later_spawns() {
             .unwrap()
             .unwrap();
         let snapshot = manager.journal().snapshot();
-        let folded = snapshot.fold(snapshot.seq).unwrap();
+        let folded = snapshot.fold().unwrap();
         let stored = folded.scopes[&None].plugins["task_policy_real/policy"]
             .value
             .as_ref()
@@ -1700,7 +1700,7 @@ fn failed_task_creation_returns_retained_quota(policy_failure: bool) {
             assert_eq!(error, ActorError::InstructionOverflow.to_string());
         }
         let snapshot = manager.journal().checkpoint_snapshot().unwrap();
-        let folded = snapshot.fold(snapshot.seq).unwrap();
+        let folded = snapshot.fold().unwrap();
         assert!(
             folded
                 .agents

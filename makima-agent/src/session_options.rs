@@ -739,53 +739,6 @@ impl SessionOptions {
         }))
     }
 
-    pub(crate) fn prepare_restore(
-        &self,
-        values: &BTreeMap<String, String>,
-    ) -> Result<SessionOptionsCandidate, SessionOptionError> {
-        let state = lock(&self.state);
-        let mut candidate = state.committed.clone();
-        if let Some(model) = values.get(MODEL_OPTION_ID)
-            && let Some(definition) = candidate
-                .definitions
-                .iter_mut()
-                .find(|definition| definition.id.as_ref() == MODEL_OPTION_ID)
-            && !definition.accepts(model)
-        {
-            let mut choices = definition.values.to_vec();
-            choices.push(SessionOptionValue {
-                value: Arc::from(model.as_str()),
-                name: Arc::from(model.as_str()),
-            });
-            definition.values = choices.into();
-        }
-        candidate.version = candidate
-            .version
-            .checked_add(1)
-            .ok_or(SessionOptionError::Busy)?;
-        candidate.pending_fast_model = values
-            .get(FAST_PENDING_MODEL_OPTION_ID)
-            .map(|value| Arc::from(value.as_str()));
-        for definition in &candidate.definitions {
-            let value = values
-                .get(definition.id.as_ref())
-                .map_or(definition.initial_value.as_ref(), String::as_str);
-            if !definition.accepts(value) {
-                return Err(SessionOptionError::InvalidValue {
-                    id: Arc::clone(&definition.id),
-                    value: Arc::from(value),
-                });
-            }
-            candidate
-                .values
-                .insert(Arc::clone(&definition.id), Arc::from(value));
-        }
-        Ok(SessionOptionsCandidate {
-            base_version: state.version,
-            state: candidate,
-        })
-    }
-
     pub(crate) fn unchanged_candidate(&self) -> SessionOptionsCandidate {
         let state = lock(&self.state);
         SessionOptionsCandidate {

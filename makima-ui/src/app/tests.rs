@@ -14,7 +14,6 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use makima_agent::actor::ActorHistory;
 use makima_agent::actor::HistoryChange;
-use makima_agent::agent::estimate_message_tokens;
 use makima_agent::command::{CommandScope, CustomCommand};
 use makima_agent::permissions::PermissionManager;
 use makima_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
@@ -32,15 +31,13 @@ use makima_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use makima_providers::model::FastSupport;
 use makima_providers::test_util::offline_ids;
 use makima_providers::{
-    ContentBlock, Effort, Message, ModelCapabilities, RequestOptions, Role, ThinkingConfig,
-    ThinkingSupport, TokenUsage,
+    ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
+    TokenUsage,
 };
-use makima_storage::id::MakimaId;
-use makima_storage::session_state::StoredBranch;
 use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -5068,21 +5065,12 @@ fn double_esc_cancels_flushes_and_fails_tools() {
 }
 
 #[test]
-fn double_esc_idle_opens_rewind_picker() {
-    let mut app = test_app();
-    bind_history_actor(&mut app, vec![Message::user("hello".into())]);
-
-    app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.rewind_picker.is_open());
-}
-
-#[test]
-fn double_esc_idle_no_user_turns_flashes_error() {
+fn double_esc_idle_flashes_rewind_reworked() {
     let mut app = test_app();
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.rewind_picker.is_open());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_REWIND_REWORKED));
 }
 
 #[test]
@@ -6370,15 +6358,6 @@ fn help_modal_consumes_keys_and_esc_closes() {
     &[KeybindContext::Editing]
     ; "task_picker"
 )]
-#[test_case(
-    |app: &mut App| {
-        bind_history_actor(app, vec![Message::user("test".into())]);
-        app.open_rewind_picker();
-    },
-    &[KeybindContext::RewindPicker],
-    &[KeybindContext::Editing]
-    ; "rewind_picker"
-)]
 fn active_contexts(setup: fn(&mut App), expected: &[KeybindContext], absent: &[KeybindContext]) {
     let mut app = test_app();
     setup(&mut app);
@@ -7510,288 +7489,6 @@ fn focused_queue_preserves_compact_and_stale_removal_identity() {
     assert_eq!(app.queue.panel_entries()[0].text, "after compact");
 }
 
-fn apply_rewind_action(app: &mut App, actions: Vec<Action>) {
-    let mut actions = actions.into_iter();
-    let Action::RewindAgent {
-        target, boundary, ..
-    } = actions.next().expect("rewind action")
-    else {
-        panic!("expected actor rewind");
-    };
-    assert!(actions.next().is_none());
-    let actor = target.actor().unwrap();
-    let guard = actor.prepare_idle().unwrap();
-    let (draft, replacement) = actor.rewind_snapshot(&boundary).unwrap();
-    let operation = guard.reserve_prepared_operation(None).unwrap();
-    let transaction = makima_agent::actor::PreparedTransaction {
-        publication: Default::default(),
-        options: None,
-        state_edits: Vec::new(),
-        boundary: false,
-        history_changed: true,
-        publish: Box::new(|_, publication| {
-            Box::pin(async move {
-                assert!(publication.try_publish());
-                Ok(())
-            })
-        }),
-        finalize: Box::new(|_| {}),
-    };
-    let (_, _, change) = smol::block_on(async {
-        operation.resolve(None).unwrap();
-        operation.wait_ready().await.unwrap();
-        guard
-            .commit_prepared_transaction_held(operation, Some(replacement), transaction)
-            .await
-    })
-    .unwrap();
-    let change = change.unwrap();
-    assert_eq!(change.agent_id, target.id());
-    app.apply_history_change(makima_agent::HistoryChange { draft, ..change });
-}
-
-fn build_rewind_app() -> App {
-    let mut app = test_app();
-
-    app.state.session_mut().replace_messages(vec![
-        Message::user("first prompt".into()),
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: "response 1".into(),
-            }],
-            ..Default::default()
-        },
-        Message::user("second prompt".into()),
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: "response 2".into(),
-            }],
-            ..Default::default()
-        },
-        Message::user("third prompt".into()),
-    ]);
-    app.state
-        .session_mut()
-        .insert_tool_output("tool-1".into(), ToolOutput::Plain("output".into()));
-    let messages = app.state.session.messages().to_vec();
-    bind_history_actor(&mut app, messages);
-    app.open_rewind_picker();
-    app
-}
-
-fn full_restore_child(app: &mut App, parent: AgentId, key: &str, text: &str) -> AgentId {
-    let id = AgentId::generate();
-    let session = app.state.session_mut();
-    let mut record = session.agents()[&parent].clone();
-    let seq = session.sequence_high_water().unwrap() + 1;
-    record.id = id;
-    record.parent = Some(parent);
-    record.depth += 1;
-    record.transcript_key = key.into();
-    record.label = Some(key.into());
-    record.created_seq = seq;
-    record.updated_seq = seq;
-    session.push_agent_revision(seq, record);
-    session.set_subagent_messages(key.into(), vec![Message::user(text.into())]);
-    let index = app.resolve_or_create_chat(&subagent_info_for_agent(id, key, key, None, None));
-    app.chats[index].parent_agent_id = Some(parent);
-    app.chats[index].push_user_message(text);
-    app.sync_subagents();
-    id
-}
-
-fn full_restore_app() -> (App, AgentId) {
-    let mut app = app_without_splash();
-    let root = bind_history_actor(&mut app, vec![Message::user(TYPED_DRAFT.into())]);
-    app.state.session_mut().bind_root_id(root.id()).unwrap();
-    bind_root(&mut app, root.clone());
-    app.agent_chat_index.insert(root.id(), 0);
-    app.main_chat().push_user_message(TYPED_DRAFT);
-    (app, root.id())
-}
-
-#[test_case(false; "root_selected")]
-#[test_case(true; "removed_child_selected")]
-fn full_root_restore_removes_later_child_chats_and_navigation(child_selected: bool) {
-    const KEPT_CHILD: &str = "kept child";
-    const LATER_CHILD: &str = "later child";
-    let (mut app, root) = full_restore_app();
-    let kept = full_restore_child(&mut app, root, TASK_ID, KEPT_CHILD);
-    let restored = app.state.session.as_ref().clone();
-    let later = full_restore_child(&mut app, root, SUB_TOOL_ID, LATER_CHILD);
-    app.main_chat().push_user_message(LIVE_AGENT_TEXT);
-    app.terminal_subagents.insert(later);
-    app.status = Status::Streaming;
-    app.active_chat = if child_selected {
-        app.agent_chat_index[&later]
-    } else {
-        0
-    };
-    app.input_box.set_input(UNSENT_DRAFT.into());
-    let run_id = app.run_id;
-    app.apply_full_restore(
-        restored,
-        &BTreeSet::from([root, kept, later]),
-        root,
-        Some(TYPED_DRAFT.into()),
-    );
-    assert_eq!(app.chats.len(), 2);
-    assert_eq!(app.active_chat, 0);
-    assert_eq!(app.status, Status::Idle);
-    assert_eq!(app.selected_agent_id(), Some(root));
-    assert_eq!(app.chats[0].message_count(), 1);
-    assert_eq!(app.chats[0].last_message_text(), TYPED_DRAFT);
-    assert!(app.agent_chat_index.contains_key(&kept));
-    assert!(!app.agent_chat_index.contains_key(&later));
-    assert!(!app.chat_index.contains_key(SUB_TOOL_ID));
-    assert!(!app.terminal_subagents.contains(&later));
-    assert!(!app.subagent_channels.contains_key(&later));
-    assert!(!app.subagent_channels.contains_key(&kept));
-    assert!(!app.state.session.agents().contains_key(&later));
-    assert!(
-        !app.state
-            .session
-            .subagent_messages()
-            .contains_key(SUB_TOOL_ID)
-    );
-    assert_eq!(app.state.session.subagents().len(), 1);
-    assert_eq!(app.state.session.subagents()[0].tool_use_id, TASK_ID);
-    assert_eq!(app.input_box.buffer.value(), TYPED_DRAFT);
-    assert_eq!(app.run_id, run_id);
-}
-
-#[test_case(0; "target_selected")]
-#[test_case(1; "root_selected")]
-#[test_case(2; "sibling_selected")]
-fn full_child_restore_preserves_outside_chats_and_target_draft(selected: usize) {
-    const TARGET_TEXT: &str = "restored child transcript";
-    const SIBLING_TEXT: &str = "sibling live transcript";
-    const RESTORED_SIBLING: &str = "older sibling transcript";
-    const ROOT_SCROLL: u16 = 3;
-    const SIBLING_SCROLL: u16 = 7;
-    let (mut app, root) = full_restore_app();
-    let target = full_restore_child(&mut app, root, TASK_ID, TARGET_TEXT);
-    let sibling = full_restore_child(&mut app, root, SUB_TOOL_ID, RESTORED_SIBLING);
-    let mut restored = app.state.session.as_ref().clone();
-    restored.meta.input_draft = Some(STORED_SESSION_TEXT.into());
-    let target_index = app.agent_chat_index[&target];
-    let sibling_index = app.agent_chat_index[&sibling];
-    app.chats[target_index].push_user_message(LIVE_AGENT_TEXT);
-    app.chats[0].push_user_message(LIVE_AGENT_TEXT);
-    app.chats[sibling_index].push_user_message(SIBLING_TEXT);
-    app.chats[sibling_index].mark_finished(DisplayRole::Done, DONE_TEXT);
-    for (index, scroll, model, thinking) in [
-        (0, ROOT_SCROLL, MODEL_SPEC_GLM4, ThinkingConfig::Off),
-        (
-            sibling_index,
-            SIBLING_SCROLL,
-            MODEL_SPEC_GPT9,
-            ThinkingConfig::Effort(Effort::High),
-        ),
-    ] {
-        app.chats[index].restore_scroll(scroll, false);
-        app.chats[index].model_id = Some(model.into());
-        app.chats[index].opts = Some(RequestOptions {
-            thinking,
-            fast: true,
-        });
-    }
-    let outside: Vec<_> = [root, sibling]
-        .into_iter()
-        .map(|id| {
-            let chat = &app.chats[app.agent_chat_index[&id]];
-            (
-                id,
-                (0..chat.message_count())
-                    .map(|offset| {
-                        let message = chat.message_at(offset).unwrap();
-                        (message.role.clone(), message.text.clone())
-                    })
-                    .collect::<Vec<_>>(),
-                chat.message_count(),
-                chat.scroll_top(),
-                chat.auto_scroll(),
-                chat.model_id.clone(),
-                chat.opts,
-                chat.is_finished(),
-            )
-        })
-        .collect();
-    let selected = [target, root, sibling][selected];
-    app.active_chat = app.agent_chat_index[&selected];
-    app.status = Status::Streaming;
-    app.input_box.set_input(UNSENT_DRAFT.into());
-    app.apply_full_restore(
-        restored,
-        &BTreeSet::from([target]),
-        target,
-        Some(TYPED_DRAFT.into()),
-    );
-    assert_eq!(app.selected_agent_id(), Some(selected));
-    assert_eq!(app.status, Status::Streaming);
-    for (id, text, count, scroll, auto_scroll, model, opts, finished) in outside {
-        let chat = &app.chats[app.agent_chat_index[&id]];
-        assert_eq!(
-            (0..chat.message_count())
-                .map(|offset| {
-                    let message = chat.message_at(offset).unwrap();
-                    (message.role.clone(), message.text.clone())
-                })
-                .collect::<Vec<_>>(),
-            text
-        );
-        assert_eq!(chat.message_count(), count);
-        assert_eq!(chat.scroll_top(), scroll);
-        assert_eq!(chat.auto_scroll(), auto_scroll);
-        assert_eq!(chat.model_id, model);
-        assert_eq!(chat.opts, opts);
-        assert_eq!(chat.is_finished(), finished);
-    }
-    let chat = &app.chats[app.agent_chat_index[&target]];
-    assert_eq!(chat.message_at(0).unwrap().text, TARGET_TEXT);
-    assert!(
-        !(0..chat.message_count())
-            .any(|offset| chat.message_at(offset).unwrap().text == LIVE_AGENT_TEXT)
-    );
-    assert_eq!(
-        app.input_box.buffer.value(),
-        if selected == target {
-            TYPED_DRAFT
-        } else {
-            UNSENT_DRAFT
-        }
-    );
-}
-
-#[test]
-fn expired_branch_selection_emits_no_restore_action() {
-    const EXPIRED_BRANCH: &str = "branch_expired";
-    let mut app = build_rewind_app();
-    let selected = app.selected_agent_id();
-    let run_id = app.run_id;
-    let branch = StoredBranch {
-        id: MakimaId::generate(),
-        created_at: app.state.session.updated_at,
-        at_seq: app.state.session.sequence_high_water().unwrap_or_default(),
-        agent: selected.unwrap(),
-        offset: 0,
-    };
-    app.state.session_mut().push_branch(branch.clone());
-    let session = Arc::clone(&app.state.session);
-    app.input_box.set_input(UNSENT_DRAFT.into());
-    assert!(app.open_rewind_picker().is_empty());
-    assert!(app.rewind_picker.handle_paste(&branch.id.to_string()));
-    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(EXPIRED_BRANCH));
-    assert_eq!(app.selected_agent_id(), selected);
-    assert!(Arc::ptr_eq(&app.state.session, &session));
-    assert_eq!(app.input_box.buffer.value(), UNSENT_DRAFT);
-    assert_eq!(app.run_id, run_id);
-}
-
 #[test]
 fn history_replacement_preserves_live_child_navigation() {
     use makima_providers::ObservationSource;
@@ -7915,49 +7612,6 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
         !(0..app.chats[index].message_count())
             .any(|offset| { app.chats[index].message_at(offset).unwrap().text == REMOVED_POST })
     );
-}
-
-#[test]
-fn rewind_to_middle_truncates_and_populates_input() {
-    let mut app = build_rewind_app();
-    let old_run_id = app.run_id;
-    let entry = app.rewind_picker.entry_at_offset(2).unwrap();
-    let actions = app.rewind_to(entry);
-
-    assert_eq!(app.state.session.messages().len(), 5);
-    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
-    assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.run_id, old_run_id);
-    let agent_id = app.selected_agent_id();
-    apply_rewind_action(&mut app, actions);
-    assert_eq!(app.selected_agent_id(), agent_id);
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert_eq!(app.input_box.buffer.value(), "second prompt");
-    assert_eq!(app.run_id, old_run_id);
-}
-
-#[test]
-fn rewind_to_first_turn_clears_everything() {
-    let mut app = build_rewind_app();
-    let baseline = 100_000 - estimate_message_tokens(app.state.session.messages());
-    app.state.context_size = 100_000;
-    app.state.token_usage.input = 500;
-    app.state.token_usage.output = 200;
-    let entry = app.rewind_picker.entry_at_offset(0).unwrap();
-    let actions = app.rewind_to(entry);
-
-    assert!(!app.state.session.messages().is_empty());
-    assert!(app.state.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(app.state.token_usage.input, 500);
-    assert_eq!(app.state.token_usage.output, 200);
-    assert_eq!(app.state.context_size, 100_000);
-    apply_rewind_action(&mut app, actions);
-    assert!(app.state.session.messages().is_empty());
-    assert!(!app.state.session.tool_outputs().contains_key("tool-1"));
-    assert_eq!(app.state.context_size, baseline);
-    assert_eq!(app.input_box.buffer.value(), "first prompt");
-    assert_eq!(app.state.token_usage.input, 500);
-    assert_eq!(app.state.token_usage.output, 200);
 }
 
 #[test_case(Duration::ZERO,          true  ; "keeps_fresh_error")]
@@ -8732,26 +8386,6 @@ fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: boo
         assert_eq!(app.status, Status::Idle);
         assert_actor_response(&mut app, SUMMARY);
     }
-}
-
-#[test]
-fn clearing_recovery_snapshot_does_not_admit_queued_text() {
-    const PENDING: &str = "next";
-    const FAILURE: &str = "boom";
-    let mut app = with_history(idle_busy_app());
-    app.queue_and_notify(queued_msg(PENDING));
-    app.update(agent_msg(AgentEvent::ControlError {
-        message: FAILURE.into(),
-    }));
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
-    assert!(app.queue.is_empty());
-
-    app.clear_recoverable_queue();
-    app.checkpoint();
-    assert!(app.recoverable_queue.is_empty());
-    assert!(app.queue.is_empty());
-    assert!(app.state.session.meta.queued_messages.is_empty());
 }
 
 // --- Plan form integration tests ---
@@ -11263,37 +10897,6 @@ fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
         panic!("expected one real tool result: {:?}", loaded.messages()[2]);
     };
     assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
-}
-
-#[test]
-fn checkpoint_after_rewind_persists_the_truncated_history() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let target = bind_history_actor(
-        &mut app,
-        vec![
-            Message::user("first prompt".into()),
-            Message::user("second prompt".into()),
-        ],
-    );
-    app.open_rewind_picker();
-    app.checkpoint();
-
-    let entry = app.rewind_picker.entry_at_offset(1).unwrap();
-    let actions = app.rewind_to(entry);
-    assert!(
-        app.shared_history.is_some(),
-        "live mirror remains installed"
-    );
-    apply_rewind_action(&mut app, actions);
-    assert_eq!(app.selected_agent_id(), Some(target.id()));
-    assert_eq!(
-        app.shared_history.as_ref().unwrap().load().messages.len(),
-        1
-    );
-    app.checkpoint_now();
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
 }
 
 #[test]

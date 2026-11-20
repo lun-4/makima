@@ -1,15 +1,13 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::chat::{Chat, DONE_TEXT, history_to_display_with_target};
 use crate::components::DisplayRole;
-use crate::components::rewind_picker::{RewindEntry, RewindSelection};
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
 use makima_agent::actor::HistoryChange;
 use makima_agent::agent::estimate_message_tokens;
-use makima_agent::{AgentId, HistorySnapshot, ModeId};
+use makima_agent::{HistorySnapshot, ModeId};
 #[cfg(test)]
 use makima_providers::Model;
 use makima_storage::id::MakimaId;
@@ -19,6 +17,7 @@ use makima_storage::sessions::{SessionMeta, StoredMode, StoredPost, StoredSubage
 use crate::AppSession;
 use makima_providers::RequestOptions;
 
+#[cfg(test)]
 use super::PendingInput;
 #[cfg(test)]
 use super::session_state::SessionState;
@@ -28,9 +27,6 @@ use makima_agent::permissions::PermissionSnapshot;
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
-const FLASH_AGENT_UNAVAILABLE: &str = "agent is no longer available";
-const FLASH_REWIND_UNAVAILABLE: &str = "rewind selection is no longer available";
-const BRANCH_EXPIRED: &str = "branch_expired";
 const DORMANT_AGENT_TEXT: &str = "Dormant";
 const CLOSED_AGENT_TEXT: &str = "Closed";
 const RETIRED_AGENT_TEXT: &str = "Retired";
@@ -92,13 +88,6 @@ impl App {
     /// the session mirrors from live state, then writes only if a mutator
     /// really changed something. No dirty flags and no per-event save calls,
     /// so there is nothing left to forget.
-    pub(crate) fn capture_restore_snapshot(&mut self) -> AppSession {
-        self.sync_subagents();
-        let meta = self.build_meta();
-        AppSession::checkpoint(&mut self.state.session, None, meta, self.state.token_usage);
-        self.state.session.as_ref().clone()
-    }
-
     pub(crate) fn checkpoint(&mut self) {
         self.checkpoint_with(SOFT_SAVE_DELAY);
     }
@@ -501,158 +490,6 @@ impl App {
                 provider: None,
             },
         ))]
-    }
-
-    pub(super) fn open_rewind_picker(&mut self) -> Vec<Action> {
-        let result = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| Some(target.id()) == self.selected_agent_id())
-            .ok_or_else(|| FLASH_AGENT_UNAVAILABLE.to_owned())
-            .and_then(|target| self.rewind_picker.open_actor(target));
-        let branches = self.state.session.list_branches_in(
-            &self
-                .storage
-                .path()
-                .join(makima_storage::sessions::SESSIONS_DIR),
-        );
-        let mut result = match branches {
-            Ok(branches) => {
-                let branches: Vec<_> = branches
-                    .into_iter()
-                    .filter(|entry| self.selected_agent_id() == Some(entry.branch.agent))
-                    .collect();
-                let has_branches = !branches.is_empty();
-                if has_branches && self.rewind_picker.target().is_some() {
-                    self.rewind_picker.append_branches(
-                        branches
-                            .into_iter()
-                            .rev()
-                            .map(|entry| (entry.branch.id, !entry.available)),
-                    );
-                    Ok(())
-                } else {
-                    result
-                }
-            }
-            Err(error) => Err(error.to_string()),
-        };
-        if self.selected_agent_id() == self.state.session.root_agent_id()
-            && let Some(link) = self.state.session.parent().cloned()
-        {
-            match AppSession::load(link.session, &self.storage)
-                .map_err(|error| error.to_string())
-                .and_then(|parent| {
-                    makima_agent::parent_rewind::boundaries(&parent, &link)
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(entries) => {
-                    self.rewind_picker.append_parent(link.session, entries);
-                    result = Ok(());
-                }
-                Err(error) => self.flash(error),
-            }
-        }
-        match result {
-            Ok(()) => vec![],
-            Err(msg) => {
-                self.status_bar.flash(msg);
-                vec![]
-            }
-        }
-    }
-
-    pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
-        if let RewindSelection::Parent { session, seq } = entry.selection {
-            return vec![Action::RewindParent { session, seq }];
-        }
-        if let Some(target) = self.rewind_picker.target() {
-            return match entry.selection {
-                RewindSelection::Boundary { boundary, durable } => {
-                    vec![Action::RewindAgent {
-                        target,
-                        boundary,
-                        durable,
-                    }]
-                }
-                RewindSelection::Parent { session, seq } => {
-                    vec![Action::RewindParent { session, seq }]
-                }
-                RewindSelection::Branch { id, expired: false } => {
-                    vec![Action::RestoreBranch { target, id }]
-                }
-                RewindSelection::Branch { expired: true, .. } => {
-                    self.flash(BRANCH_EXPIRED.into());
-                    vec![]
-                }
-            };
-        }
-        self.flash(FLASH_REWIND_UNAVAILABLE.into());
-        vec![]
-    }
-
-    pub(crate) fn apply_full_restore(
-        &mut self,
-        session: AppSession,
-        affected: &BTreeSet<AgentId>,
-        target: AgentId,
-        draft: Option<String>,
-    ) {
-        let selected = self.selected_agent_id();
-        let input = self.input_box.buffer.value();
-        let root = self.chats[0].agent_id;
-        let root_affected = root.is_some_and(|id| affected.contains(&id));
-        let mut previous = std::mem::take(&mut self.chats);
-        let mut main = Chat::new(
-            "Main".into(),
-            self.ui_config.clone(),
-            self.lua_event_handle.clone(),
-            Arc::clone(&self.theme_provider),
-        );
-        main.agent_id = root;
-        main.set_restore_channel(self.restore_event_tx.clone());
-        self.chats.push(main);
-        self.chat_index.clear();
-        self.agent_chat_index.clear();
-        self.terminal_subagents.retain(|id| !affected.contains(id));
-        self.stamped_subagent_outcomes
-            .retain(|(id, _)| !affected.contains(id));
-        self.subagent_channels
-            .retain(|id, _| !affected.contains(id));
-        self.pending_input = PendingInput::None;
-        self.state.token_usage = session.token_usage;
-        self.state.context_size = session.meta.context_size;
-        self.state.session = Arc::new(session);
-        if root_affected {
-            self.status = super::Status::Idle;
-            self.clear_exit_request();
-            self.clear_recoverable_queue();
-            let config = self.root_config();
-            self.state.adopt(&config);
-        }
-        self.close_all_overlays();
-        self.restore_display();
-        for chat in &mut self.chats {
-            if chat.agent_id.is_some_and(|id| !affected.contains(&id))
-                && let Some(index) = previous
-                    .iter()
-                    .position(|old| old.agent_id == chat.agent_id)
-            {
-                std::mem::swap(chat, &mut previous[index]);
-            }
-        }
-        self.active_chat = selected
-            .and_then(|id| self.agent_chat_index.get(&id).copied())
-            .unwrap_or(0);
-        let input = if self.selected_agent_id() == Some(target) {
-            draft.unwrap_or(input)
-        } else {
-            input
-        };
-        self.refresh_at_ref_labels(&input);
-        self.input_box.set_input(input);
-        self.input_box.buffer.move_to_end();
-        self.sync_focused_queue();
     }
 
     pub(crate) fn apply_history_change(&mut self, change: HistoryChange) {

@@ -174,7 +174,6 @@ pub enum KeybindContext {
     Picker,
     FormInput,
     TaskPicker,
-    RewindPicker,
     ThemePicker,
     ModelPicker,
     QueueFocus,
@@ -192,7 +191,6 @@ impl KeybindContext {
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
             Self::TaskPicker => "Task Picker",
-            Self::RewindPicker => "Rewind Picker",
             Self::ThemePicker => "Theme Picker",
             Self::ModelPicker => "Model Picker",
             Self::QueueFocus => "Queue",
@@ -205,7 +203,6 @@ impl KeybindContext {
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
             Self::TaskPicker
-            | Self::RewindPicker
             | Self::ThemePicker
             | Self::ModelPicker
             | Self::QueueFocus
@@ -462,12 +459,6 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::POP_QUEUE.label),
         description: "Pop queue",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Single("Esc Esc"),
-        description: "Rewind",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

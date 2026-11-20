@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
@@ -17,8 +17,6 @@ pub(crate) struct WorkLedger {
 #[derive(Debug, Default)]
 struct WorkState {
     agents: HashMap<AgentId, WorkAgent>,
-    rewind_fence: bool,
-    rewind_reporting: HashMap<AgentId, u64>,
     active_agents: usize,
     active_children: HashMap<AgentId, usize>,
 }
@@ -105,30 +103,6 @@ impl WorkLedger {
             agent_id,
             incarnation,
         }
-    }
-
-    pub(crate) fn fence_rewind(&self, agents: &BTreeSet<AgentId>) {
-        let mut state = self.lock();
-        state.rewind_fence = true;
-        state.rewind_reporting = state
-            .agents
-            .iter()
-            .filter_map(|(id, agent)| {
-                (!agents.contains(id) && !agent.open && !agent.removed && !agent.frozen)
-                    .then_some((*id, agent.incarnation))
-            })
-            .collect();
-        for id in agents {
-            if let Some(agent) = state.agents.get_mut(id) {
-                PublicationGuard::cancel_all(&mut agent.publications);
-            }
-        }
-    }
-
-    pub(crate) fn release_rewind(&self) {
-        let mut state = self.lock();
-        state.rewind_fence = false;
-        state.rewind_reporting.clear();
     }
 
     pub(crate) fn set_open(&self, agent_id: AgentId, open: bool) -> Result<(), ManagerError> {
@@ -294,9 +268,6 @@ impl WorkLedger {
         let mut chain = Vec::new();
         let mut next = Some(agent_id);
         while let Some(id) = next {
-            if !restored && state.rewind_fence {
-                return Err(ManagerError::RewindInProgress);
-            }
             let agent = state
                 .agents
                 .get(&id)
@@ -436,9 +407,6 @@ impl WorkAdmission {
         publication: &CheckpointPublication,
     ) -> Result<Arc<PublicationGuard>, ManagerError> {
         let mut state = self.ledger.lock();
-        if state.rewind_fence {
-            return Err(ManagerError::RewindInProgress);
-        }
         let agent = state
             .agents
             .get_mut(&self.agent_id)
@@ -458,9 +426,6 @@ impl WorkAdmission {
 
     pub(crate) fn validate_open(&self) -> Result<(), ManagerError> {
         let state = self.ledger.lock();
-        if state.rewind_fence {
-            return Err(ManagerError::RewindInProgress);
-        }
         let agent = state
             .agents
             .get(&self.agent_id)
@@ -482,11 +447,6 @@ impl WorkAdmission {
 
     pub(crate) fn set_reporting(&self, reporting: bool) -> Result<(), ManagerError> {
         let mut state = self.ledger.lock();
-        let fenced = state.rewind_fence;
-        let initializing = state.rewind_reporting.get(&self.agent_id) == Some(&self.incarnation);
-        if fenced && !initializing {
-            return Err(ManagerError::RewindInProgress);
-        }
         let agent = state
             .agents
             .get_mut(&self.agent_id)
@@ -494,9 +454,6 @@ impl WorkAdmission {
             .ok_or(ManagerError::UnknownAgent(self.agent_id))?;
         if agent.incarnation != self.incarnation {
             return Err(ManagerError::StaleIncarnation(self.agent_id));
-        }
-        if fenced && (agent.open || agent.frozen) {
-            return Err(ManagerError::RewindInProgress);
         }
         agent.reporting = reporting;
         Ok(())
@@ -551,7 +508,6 @@ impl Drop for WorkHold {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeSet,
         sync::{Arc, Barrier, mpsc},
         thread,
     };
@@ -564,87 +520,6 @@ mod tests {
         manager::{AgentLimits, ManagerError},
     };
     use makima_storage::checkpoint::CheckpointPublication;
-
-    #[test]
-    fn rewind_fence_blocks_admission_across_rebinding_until_release() {
-        let ledger = ledger(SATURATED_ACTIVE_LIMIT, SATURATED_CHILD_LIMIT);
-        let root = AgentId::generate();
-        let child = AgentId::generate();
-        let outside = ledger.register(root, None, INCARNATION, true);
-        let inside = ledger.register(child, Some(root), INCARNATION, true);
-        let pending = CheckpointPublication::default();
-        let _registration = inside.register_publication(&pending).unwrap();
-        ledger.fence_rewind(&BTreeSet::from([child]));
-        assert!(pending.is_cancelled());
-        assert!(matches!(
-            outside.try_reserve(),
-            Err(ManagerError::RewindInProgress)
-        ));
-        assert!(matches!(
-            inside.try_reserve(),
-            Err(ManagerError::RewindInProgress)
-        ));
-        let rebound = ledger.register(child, Some(root), NEXT_INCARNATION, true);
-        assert!(matches!(
-            rebound.validate_open(),
-            Err(ManagerError::RewindInProgress)
-        ));
-        assert!(matches!(
-            rebound.register_publication(&CheckpointPublication::default()),
-            Err(ManagerError::RewindInProgress)
-        ));
-        let hold = ledger.restore_hold(child).unwrap();
-        assert_eq!(ledger.active_agents(), 2);
-        drop(hold);
-        assert_eq!(ledger.active_agents(), 0);
-        ledger.release_rewind();
-        assert!(outside.try_reserve().is_ok());
-        assert!(rebound.try_reserve().is_ok());
-        assert!(
-            matches!(inside.try_reserve(), Err(ManagerError::StaleIncarnation(id)) if id == child)
-        );
-    }
-
-    #[test]
-    fn rewind_reporting_exemption_only_configures_preexisting_outside_initializer() {
-        let ledger = ledger(SATURATED_ACTIVE_LIMIT, SATURATED_CHILD_LIMIT);
-        let root = AgentId::generate();
-        let child = AgentId::generate();
-        let outside = ledger.register(root, None, INCARNATION, false);
-        let inside = ledger.register(child, Some(root), INCARNATION, false);
-        ledger.fence_rewind(&BTreeSet::from([child]));
-        outside.set_reporting(false).unwrap();
-        assert!(matches!(
-            inside.set_reporting(false),
-            Err(ManagerError::RewindInProgress)
-        ));
-        assert!(matches!(
-            outside.try_reserve(),
-            Err(ManagerError::RewindInProgress)
-        ));
-        assert!(matches!(
-            outside.register_publication(&CheckpointPublication::default()),
-            Err(ManagerError::RewindInProgress)
-        ));
-        outside.set_open(true).unwrap();
-        assert!(matches!(
-            outside.set_reporting(true),
-            Err(ManagerError::RewindInProgress)
-        ));
-        outside.set_open(false).unwrap();
-        let rebound = ledger.bind_incarnation(root, NEXT_INCARNATION).unwrap();
-        assert!(matches!(
-            rebound.set_reporting(true),
-            Err(ManagerError::RewindInProgress)
-        ));
-        let fresh = ledger.register(AgentId::generate(), None, INCARNATION, false);
-        assert!(matches!(
-            fresh.set_reporting(true),
-            Err(ManagerError::RewindInProgress)
-        ));
-        ledger.release_rewind();
-        rebound.set_reporting(true).unwrap();
-    }
 
     #[test_case(false; "pending")]
     #[test_case(true; "claimed")]

@@ -1185,7 +1185,7 @@ fn spawn_interactive(
     let mut restored_permissions = PermissionSnapshot::default();
     let manager = if restored_graph {
         snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| error.to_string())
             .and_then(|view| {
                 if let Some(scope) = view.scopes.get(&None) {
@@ -1304,9 +1304,7 @@ fn spawn_interactive(
                 let mut mode_fallback = false;
                 let config = if let Some(stored) = restored_config {
                     let restored = crate::plan_state::prepare_restore_for_agent(
-                        &snapshot
-                            .fold(snapshot.seq)
-                            .map_err(|error| error.to_string())?,
+                        &snapshot.fold().map_err(|error| error.to_string())?,
                         root_id,
                         &stored.mode,
                         &params.modes,
@@ -1611,7 +1609,7 @@ pub(crate) mod tests {
     use crate::test_util::StubBackend;
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
-    use makima_providers::provider::{Provider, unconfigured};
+    use makima_providers::provider::Provider;
     use makima_providers::{
         ContentBlock, ConversationEnd, Invocation, RequestDelivery, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -2215,7 +2213,7 @@ pub(crate) mod tests {
                             AgentMode::Build
                         ));
                         let snapshot = manager.journal().snapshot();
-                        let view = snapshot.fold(snapshot.seq).unwrap();
+                        let view = snapshot.fold().unwrap();
                         assert_eq!(
                             view.scopes[&Some(root_id)].config.as_ref().unwrap().mode.id,
                             crate::ModeId::Build.key()
@@ -2331,7 +2329,7 @@ pub(crate) mod tests {
                 .unwrap();
             let snapshot = handle.manager.journal().snapshot();
             assert_eq!(snapshot.state.iter().len(), before.iter().len() + 1);
-            let view = snapshot.fold(snapshot.seq).unwrap();
+            let view = snapshot.fold().unwrap();
             assert_eq!(view.scopes[&None].rules, rules);
             assert_eq!(
                 view.scopes[&None].yolo,
@@ -2595,7 +2593,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn oversized_results_survive_headless_restart_wake_and_rewind() {
+    fn oversized_results_survive_headless_restart_and_wake() {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -2626,7 +2624,7 @@ pub(crate) mod tests {
             let config = handle.manager.effective_config(root_id).unwrap().unwrap();
             let journal = handle.manager.journal();
             let snapshot = journal.checkpoint_snapshot().unwrap();
-            let view = snapshot.fold(snapshot.seq).unwrap();
+            let view = snapshot.fold().unwrap();
             let stored = &view.scopes[&Some(root_id)].results[0].1;
             assert!(matches!(stored.text, StoredPayload::Offloaded(_)));
             let child_id = AgentId::generate();
@@ -2751,37 +2749,12 @@ pub(crate) mod tests {
                     .peek_result(),
                 Some(child_result.clone())
             );
-            let snapshot = manager.journal().checkpoint_snapshot().unwrap();
-            let mut rewind = bounded(manager.begin_rewind(root_id)).await.unwrap();
-            let preparer: ModelPreparer = Arc::new(|spec| {
-                Box::pin(async move {
-                    Ok(PreparedModel {
-                        model: Model::from_spec(&spec).unwrap(),
-                        provider: unconfigured(),
-                    })
-                })
-            });
-            let prepared = bounded(rewind.prepare_actors(
-                &snapshot,
-                &ModelPolicy::default(),
-                &preparer,
-                &ModeRegistry::builtin(),
-            ))
-            .await
-            .unwrap();
-            let installed: Vec<_> = prepared
-                .into_iter()
-                .map(|actor| actor.install_held())
-                .collect();
-            rewind.reconcile(&snapshot).unwrap();
             assert_eq!(
                 actor.turn_ticket(ticket.turn_id()).unwrap().peek_result(),
                 Some(expected)
             );
             assert!(actor.withdraw_child_delivery(child_turn));
             assert!(requests.is_empty());
-            drop(installed);
-            drop(rewind);
             handle.task.cancel().await;
             assert!(
                 bounded(manager.shutdown(GATE_TIMEOUT))
@@ -2946,7 +2919,7 @@ pub(crate) mod tests {
             }
             assert_eq!(previous, GRANTS + rules.len());
             let snapshot = journal.snapshot();
-            let folded = snapshot.fold(snapshot.seq).unwrap();
+            let folded = snapshot.fold().unwrap();
             assert_eq!(
                 folded.scopes[&None].rules,
                 handle.permissions.snapshot().stored_rules()

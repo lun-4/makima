@@ -584,7 +584,7 @@ mod tests {
             })
             .unwrap();
         let snapshot = journal.checkpoint_snapshot().unwrap();
-        let view = snapshot.fold(snapshot.seq).unwrap();
+        let view = snapshot.fold().unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             journal,

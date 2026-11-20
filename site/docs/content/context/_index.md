@@ -62,7 +62,7 @@ Newly encountered instruction sources are still added when first loaded, includi
 
 Run `/reload-context` on the main agent to adopt the current instruction sources and available prompt contributions. It records the new context for subsequent requests. If prompt contributions are unavailable during reload, their recorded values remain in use. The command is unavailable on subagents; descendants use the recorded root context, with each child's own prompt fixed at spawn.
 
-Context reload is part of recorded session state. A conversation rewind can restore an earlier recorded context without changing the instruction files on disk. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) and [Rewind and branches](/docs/agent-work/#rewind-and-branches).
+Context reload is part of recorded session state. See [Persistence and resume](/docs/agent-work/#persistence-and-resume).
 
 ## Four places to put knowledge
 
@@ -83,7 +83,7 @@ Long sessions eventually approach the model's context limit. Makima reserves a s
 
 Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Makima parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
 
-Archives can be inspected with `jq` or an editor. Replacing the live session log by hand bypasses the checks that keep agent state and branches consistent. Use [rewind](/docs/agent-work/#rewind-and-branches) for supported restoration points instead.
+Archives can be inspected with `jq` or an editor. Replacing the live session log by hand bypasses the checks that keep agent state consistent.
 
 `MAKIMA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 

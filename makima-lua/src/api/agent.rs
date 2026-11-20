@@ -2217,7 +2217,7 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                 .map(|plugin| crate::orchestration::plugin_authority(&lua, plugin.clone()));
             let snapshot = activation_journal.snapshot();
             let view = snapshot
-                .fold(snapshot.seq)
+                .fold()
                 .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
             let prepared =
                 reactivation::prepare(&lua, &input.record, input.config.as_ref(), context, &view)

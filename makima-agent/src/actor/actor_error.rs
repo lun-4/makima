@@ -36,8 +36,6 @@ pub enum ActorError {
     WorkAdmission(String),
     #[error("the actor has pending work")]
     Busy,
-    #[error("history boundary no longer belongs to this actor history")]
-    StaleHistoryBoundary,
     #[error("history checkpoint failed: {0}")]
     HistoryCheckpoint(String),
     #[error("the after_turn boundary is not the latest settled turn")]

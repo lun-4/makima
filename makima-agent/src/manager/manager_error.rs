@@ -40,8 +40,6 @@ pub enum ManagerError {
     NonLiveAgent(AgentId),
     #[error("agent graph is shutting down")]
     GraphShutdown,
-    #[error("agent graph rewind is in progress")]
-    RewindInProgress,
     #[error("agent depth {depth} exceeds the configured maximum {max}")]
     DepthExceeded { depth: usize, max: usize },
     #[error(

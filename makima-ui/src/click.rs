@@ -7,7 +7,6 @@ pub enum PickerId {
     Model,
     Task,
     Theme,
-    Rewind,
     Login,
     Mcp,
     Lua,

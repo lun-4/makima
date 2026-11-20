@@ -1170,7 +1170,6 @@ fn restart_folded_config_and_shared_rules_override_legacy_metadata(yolo: bool) {
     let folded = SessionStateView::fold(
         &common::normalized_history_epoch_state(stored.state()),
         stored.agent_revisions(),
-        stored.sequence_high_water().unwrap(),
     )
     .unwrap();
     for id in [root_id, child_id] {
@@ -1231,7 +1230,6 @@ fn restart_folded_config_and_shared_rules_override_legacy_metadata(yolo: bool) {
         SessionStateView::fold(
             &common::normalized_history_epoch_state(reloaded.state()),
             reloaded.agent_revisions(),
-            reloaded.sequence_high_water().unwrap(),
         )
         .unwrap(),
         folded
@@ -1281,7 +1279,7 @@ fn restart_folded_config_and_shared_rules_override_legacy_metadata(yolo: bool) {
             Some(enabled)
         );
         let snapshot = host.manager.journal().snapshot();
-        let folded = snapshot.fold(snapshot.seq).unwrap();
+        let folded = snapshot.fold().unwrap();
         assert_eq!(folded.scopes[&None].yolo, Some(enabled));
     }
     command(
@@ -1433,7 +1431,7 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
         .unwrap();
     assert_eq!(config.mode.id().key(), "build");
     let snapshot = host.manager.journal().snapshot();
-    let folded = snapshot.fold(snapshot.seq).unwrap();
+    let folded = snapshot.fold().unwrap();
     assert_eq!(
         folded.scopes[&Some(child_id)]
             .config

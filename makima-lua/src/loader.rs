@@ -1,5 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
-use std::fmt;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,16 +6,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use include_dir::{Dir, include_dir};
-use makima_agent::cancel::PublicationRegistration;
-use makima_agent::journal::{JournalChange, SessionJournalSnapshot};
 use makima_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
-use makima_agent::session_coordinator::{SessionOptionCatalog, publication_claim};
+use makima_agent::session_coordinator::SessionOptionCatalog;
 use makima_agent::tools::{ToolRegistry, ToolSource};
-use makima_agent::{AgentId, AgentManagerHandle, AgentRef, CancelToken};
+use makima_agent::{AgentManagerHandle, AgentRef, CancelToken};
 use makima_commands::{CommandBehavior, CommandRegistry};
 use makima_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use makima_providers::{ProviderRegistry, Timeouts};
-use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
+use makima_storage::checkpoint::CheckpointPublication;
 
 use crate::api::completion::{CompletionCtx, ItemSpec};
 use crate::api::fs::{FsBackend, RealFs};
@@ -26,7 +23,7 @@ use crate::api::util::command::{CommandGenerationMap, HintReader, StatusContentR
 use crate::api::util::picker::PickerEvent;
 use crate::coalesced_latest::CoalescedLatest;
 use crate::error::PluginError;
-use crate::orchestration::{PluginAuthority, TrustedTarget};
+use crate::orchestration::TrustedTarget;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{
     self, ClickFallback, CommandArgumentContext, CommandArgumentLifecycle,
@@ -218,56 +215,6 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)
 });
-
-pub struct PreparedStateRestore {
-    pub changes: Vec<JournalChange>,
-    pub claim: CheckpointClaim,
-}
-
-impl fmt::Debug for PreparedStateRestore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PreparedStateRestore")
-            .field("changes", &self.changes)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PreparedStateRestore {
-    pub(crate) fn new(
-        changes: Vec<JournalChange>,
-        mut owners: Vec<Arc<PluginAuthority>>,
-        publication: CheckpointPublication,
-    ) -> Self {
-        owners.sort_unstable_by_key(|owner| owner.generation());
-        owners.dedup_by_key(|owner| owner.generation());
-        let registrations: Vec<PublicationRegistration> = owners
-            .iter()
-            .map(|owner| owner.register_publication(&publication))
-            .collect();
-        let base = publication_claim();
-        let claim = Arc::new(move |requested: &CheckpointPublication| {
-            let _registrations = &registrations;
-            if !publication.same_request(requested) {
-                return Err(Arc::from("state restore publication does not match"));
-            }
-            claim_state_restore(&owners, &|| base(requested))
-        });
-        Self { changes, claim }
-    }
-}
-
-fn claim_state_restore(
-    owners: &[Arc<PluginAuthority>],
-    claim: &dyn Fn() -> Result<(), Arc<str>>,
-) -> Result<(), Arc<str>> {
-    match owners.split_first() {
-        Some((owner, remaining)) => {
-            owner.claim_publication(|| claim_state_restore(remaining, claim))
-        }
-        None => claim(),
-    }
-}
 
 pub struct PluginHost {
     inner: LuaThread,
@@ -1188,40 +1135,6 @@ impl EventHandle {
                 shared.send(Request::SplashFrame(work)).is_ok()
             }),
         }
-    }
-
-    pub async fn prepare_state_restore(
-        &self,
-        snapshot: SessionJournalSnapshot,
-        affected: BTreeSet<AgentId>,
-        session_scope: bool,
-        publication: CheckpointPublication,
-    ) -> Result<PreparedStateRestore, String> {
-        let (reply, response) = flume::bounded(1);
-        self.tx
-            .send_async(Request::PrepareStateRestore {
-                snapshot,
-                affected,
-                session_scope,
-                publication,
-                reply,
-            })
-            .await
-            .map_err(|_| "Lua host stopped".to_owned())?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| "Lua host stopped".to_owned())?
-    }
-
-    /// Waits for journal observation without emitting resume notifications.
-    /// Call outside the Lua worker, before draining installed rewind notices.
-    pub fn observe_state_restored(&self, target: AgentRef) -> Result<(), String> {
-        let (reply, response) = flume::bounded(1);
-        self.tx
-            .send(Request::ObserveStateRestored { target, reply })
-            .map_err(|_| "Lua host stopped".to_owned())?;
-        response.recv().map_err(|_| "Lua host stopped".to_owned())
     }
 
     pub fn notify_state_restored(&self, target: makima_agent::AgentRef) {

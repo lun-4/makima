@@ -99,7 +99,7 @@ impl Fixture {
             })
             .unwrap();
         let snapshot = journal.checkpoint_snapshot().unwrap();
-        let view = snapshot.fold(snapshot.seq).unwrap();
+        let view = snapshot.fold().unwrap();
         let manager = AgentManagerHandle::restore_graph(
             AgentLimits::default(),
             journal,
@@ -267,7 +267,7 @@ fn latest_ticket_survives_close_before_terminal_result_is_published() {
             Err(ManagerError::NonLiveAgent(_))
         ));
         let snapshot = fixture.manager.journal().checkpoint_snapshot().unwrap();
-        let view = snapshot.fold(snapshot.seq).unwrap();
+        let view = snapshot.fold().unwrap();
         let results = &view.scopes[&Some(fixture.agent_id())].results;
         assert_eq!(results.back().unwrap().0, fixture.turn_id());
         assert!(results.iter().all(|(turn, _)| *turn != pending.turn_id()));

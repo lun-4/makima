@@ -45,10 +45,7 @@ mod context;
 mod types;
 pub use context::AgentContextSnapshot;
 mod history_edit;
-pub use history_edit::{
-    AgentStateSnapshot, HistoryBoundary, HistoryChange, HistoryEditWork, InstalledActorRewind,
-    PreparedActorRewind,
-};
+pub use history_edit::{HistoryChange, HistoryEditWork};
 
 #[cfg(test)]
 mod tests;

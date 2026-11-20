@@ -471,7 +471,6 @@ impl App {
             };
         }
 
-        render_if_open!(self.rewind_picker, Rewind);
         render_if_open!(self.theme_picker, Theme);
         render_if_open!(self.model_picker, Model);
         render_if_open!(self.login_picker, Login);
@@ -762,8 +761,6 @@ impl App {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
-        } else if self.rewind_picker.is_open() {
-            contexts.push(KeybindContext::RewindPicker);
         } else if self.task_picker.is_open() {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {

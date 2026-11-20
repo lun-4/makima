@@ -13,19 +13,13 @@ mod report_restart_tests;
 mod restore_tests;
 #[cfg(test)]
 mod result_tests;
-mod rewind;
-#[cfg(test)]
-mod rewind_tests;
 #[cfg(test)]
 mod tests;
-mod transition;
 mod types;
 mod work;
 pub(crate) use work::{WorkAdmission, WorkLedger, WorkReservation};
 
 pub use manager_error::{ManagerError, ReactivationError};
-pub use rewind::ManagerRewindGuard;
-pub use transition::ManagerTransitionGuard;
 pub use types::{
     AgentIncarnation, AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, AgentResidency,
     CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, PromptWaitError, ReactivationInput,
@@ -195,9 +189,6 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         let root = graph
             .nodes
             .get(&agent_id)
@@ -297,9 +288,6 @@ struct GraphState {
     revision: u64,
     next_reservation: u64,
     shutting_down: bool,
-    rewinding: bool,
-    rewind_affected: HashSet<AgentId>,
-    rewind_quiescent: bool,
     observers: Vec<(u64, flume::Sender<(AgentId, ActorEvent)>)>,
 }
 
@@ -326,8 +314,6 @@ pub(crate) struct ManagerInner {
     next_watcher: AtomicU64,
     shutdown: AtomicBool,
     reaped: Event,
-    #[cfg(test)]
-    runner_deferred: Mutex<Option<flume::Sender<()>>>,
     #[cfg(test)]
     commit_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
@@ -394,15 +380,10 @@ impl AgentManagerHandle {
                 revision: 0,
                 next_reservation: 1,
                 shutting_down: false,
-                rewinding: false,
-                rewind_affected: HashSet::new(),
-                rewind_quiescent: false,
                 observers: Vec::new(),
             }),
             shutdown: AtomicBool::new(false),
             reaped: Event::new(),
-            #[cfg(test)]
-            runner_deferred: Mutex::new(None),
             #[cfg(test)]
             commit_gate: Mutex::new(None),
             #[cfg(test)]
@@ -431,7 +412,7 @@ impl AgentManagerHandle {
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
         let folded = snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         if folded != view
             || histories.len() != snapshot.histories.len()
@@ -591,9 +572,6 @@ impl AgentManagerHandle {
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
             }
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             let node = graph
                 .nodes
                 .get(&agent_id)
@@ -646,7 +624,7 @@ impl AgentManagerHandle {
                     .checkpoint_snapshot()
                     .map_err(ManagerError::InvalidGraph)?;
                 let view = snapshot
-                    .fold(snapshot.seq)
+                    .fold()
                     .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
                 let input = ReactivationInput {
                     config: view
@@ -742,9 +720,6 @@ impl AgentManagerHandle {
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
             }
-            if graph.rewind_affected.contains(&incarnation.agent_id) {
-                return Err(ManagerError::RewindInProgress);
-            }
             if node.reservation != incarnation.reservation
                 || node.detach_pending
                 || node.lifecycle != GraphLifecycle::Dormant
@@ -787,7 +762,7 @@ impl AgentManagerHandle {
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
         let view = snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let scope = view.scopes.get(&Some(incarnation.agent_id));
         let results = scope
@@ -918,13 +893,8 @@ impl AgentManagerHandle {
     ) -> Result<(), ManagerError> {
         {
             let mut graph = self.lock_graph();
-            if !prepared {
-                if graph.shutting_down {
-                    return Err(ManagerError::GraphShutdown);
-                }
-                if graph.rewind_affected.contains(&incarnation.agent_id) {
-                    return Err(ManagerError::RewindInProgress);
-                }
+            if !prepared && graph.shutting_down {
+                return Err(ManagerError::GraphShutdown);
             }
             let node = graph
                 .nodes
@@ -981,7 +951,7 @@ impl AgentManagerHandle {
         let completion = self.0.activation_completion.read_arc().await;
         let attempt = {
             let graph = self.lock_graph();
-            if graph.shutting_down || graph.rewind_affected.contains(&initialization.agent.id()) {
+            if graph.shutting_down {
                 return Err(ReactivationError::Cancelled);
             }
             let node = graph
@@ -1195,9 +1165,6 @@ impl AgentManagerHandle {
     fn rollback_activation_held(&self, incarnation: &AgentIncarnation) {
         let resources = {
             let mut graph = self.lock_graph();
-            if graph.rewind_affected.contains(&incarnation.agent_id) {
-                return;
-            }
             let replacement = Self::next_reservation(&mut graph);
             let Some(node) = graph.nodes.get_mut(&incarnation.agent_id) else {
                 return;
@@ -1299,9 +1266,6 @@ impl AgentManagerHandle {
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
             }
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             if let Some(current) = current {
                 if graph
                     .nodes
@@ -1378,7 +1342,7 @@ impl AgentManagerHandle {
                 .checkpoint_snapshot()
                 .map_err(ManagerError::InvalidGraph)?;
             let view = snapshot
-                .fold(snapshot.seq)
+                .fold()
                 .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
             if view.scopes.iter().any(|(target, scope)| {
                 scope.deliveries.iter().any(|((source, _), delivery)| {
@@ -1417,18 +1381,13 @@ impl AgentManagerHandle {
             let manager = self.clone();
             let incarnation = incarnation.clone();
             smol::spawn(async move {
-                loop {
-                    let changed = manager.0.reaped.listen();
-                    let completion = manager.0.activation_completion.write_arc().await;
-                    let result = manager.detach_incarnation_after_completion(&incarnation);
-                    drop(completion);
-                    match result {
-                        Err(ManagerError::RewindInProgress) => changed.await,
-                        Err(ManagerError::StaleIncarnation(_) | ManagerError::UnknownAgent(_)) | Ok(()) => break,
-                        Err(error) => {
-                            warn!(agent_id = %incarnation.agent_id, %error, "deferred activation detach failed");
-                            break;
-                        }
+                let completion = manager.0.activation_completion.write_arc().await;
+                let result = manager.detach_incarnation_after_completion(&incarnation);
+                drop(completion);
+                match result {
+                    Err(ManagerError::StaleIncarnation(_) | ManagerError::UnknownAgent(_)) | Ok(()) => {}
+                    Err(error) => {
+                        warn!(agent_id = %incarnation.agent_id, %error, "deferred activation detach failed");
                     }
                 }
             })
@@ -1461,16 +1420,6 @@ impl AgentManagerHandle {
         }
         let actor = {
             let mut graph = self.lock_graph();
-            if graph.rewinding
-                && !(rollback
-                    && !graph.rewind_affected.contains(&incarnation.agent_id)
-                    && graph
-                        .nodes
-                        .get(&incarnation.agent_id)
-                        .is_some_and(|node| node.reservation_pending))
-            {
-                return Err(ManagerError::RewindInProgress);
-            }
             let node = graph
                 .nodes
                 .get_mut(&incarnation.agent_id)
@@ -1520,15 +1469,6 @@ impl AgentManagerHandle {
         self.validate_incarnation(incarnation)?;
         let resources = {
             let mut graph = self.lock_graph();
-            if graph.rewinding
-                && (graph.rewind_quiescent
-                    || !graph
-                        .nodes
-                        .get(&incarnation.agent_id)
-                        .is_some_and(|node| node.detach_pending))
-            {
-                return Err(ManagerError::RewindInProgress);
-            }
             if !self.tool_completions_finished(Some(incarnation.agent_id)) {
                 drop(graph);
                 return self.defer_incarnation_cleanup(incarnation, false);
@@ -1654,14 +1594,6 @@ impl AgentManagerHandle {
         source_incarnation: Option<JournalIncarnation>,
     ) -> Result<(), DeliveryRejection> {
         let graph = self.lock_graph();
-        if graph.rewind_quiescent
-            || graph.rewind_affected.contains(&parent_id)
-            || graph
-                .rewind_affected
-                .contains(&delivery.result.outcome.agent_id())
-        {
-            return Err(DeliveryRejection::ParentUnavailable);
-        }
         if let Some(source) = &source_incarnation
             && graph
                 .nodes
@@ -1825,9 +1757,6 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         let Some(node) = graph.nodes.get(&agent.agent_id) else {
             return Err(
                 if agent
@@ -1886,7 +1815,7 @@ impl AgentManagerHandle {
             .ok_or_else(|| ActorError::InvalidConfig("agent transcript is unavailable".into()))?;
         if let Some(turn) = request.through_turn {
             let view = snapshot
-                .fold(snapshot.seq)
+                .fold()
                 .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
             return Err(
                 if view
@@ -1975,7 +1904,7 @@ impl AgentManagerHandle {
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
         let view = snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         view.scopes
             .get(&Some(agent.agent_id))
@@ -2029,7 +1958,7 @@ impl AgentManagerHandle {
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
         let view = snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let stored = view
             .scopes
@@ -2314,9 +2243,6 @@ impl AgentManagerHandle {
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
             }
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             if graph.root_id.is_some() {
                 return Err(ManagerError::DuplicateRoot);
             }
@@ -2507,9 +2433,6 @@ impl AgentManagerHandle {
             let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
-            }
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
             }
             Self::reclaim_finished_closings(&mut graph, &self.0.journal);
             if let Some(current) = current
@@ -2810,9 +2733,6 @@ impl AgentManagerHandle {
 
     fn rollback_reservation(&self, agent_id: AgentId, reservation: u64) {
         let mut graph = self.lock_graph();
-        if graph.rewind_affected.contains(&agent_id) {
-            return;
-        }
         let Some(node) = graph.nodes.get(&agent_id) else {
             return;
         };
@@ -2848,68 +2768,50 @@ impl AgentManagerHandle {
             let Some(manager) = manager.upgrade() else {
                 return;
             };
-            loop {
-                let released = manager.reaped.listen();
-                {
-                    let mut graph = manager
-                        .graph
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if !graph.rewind_quiescent || !graph.rewind_affected.is_empty() {
-                        let closed = actor.lifecycle() == ActorLifecycle::Closed;
-                        if graph.rewind_quiescent || graph.rewind_affected.contains(&agent_id) {
-                            manager.reaped.notify(usize::MAX);
-                            return;
-                        }
-                        if let Some(node) = graph.nodes.get_mut(&agent_id)
-                            && node.reservation == reservation
-                            && !node.reservation_pending
-                            && !node.detach_pending
-                            && node.lifecycle == GraphLifecycle::Live
-                        {
-                            let _ =
-                                manager
-                                    .work
-                                    .set_open_for_incarnation(agent_id, reservation, false);
-                            node.residency = AgentResidency::Dormant;
-                            node.lifecycle = if closed {
-                                GraphLifecycle::Closed
-                            } else {
-                                GraphLifecycle::Dormant
-                            };
-                            if closed && let Some(mut record) = manager.journal.agent(agent_id) {
-                                record.lifecycle = StoredAgentLifecycle::Closed;
-                                if let Err(error) = manager.journal.commit(JournalCommit {
-                                    agents: vec![record],
-                                    ..Default::default()
-                                }) {
-                                    warn!(%agent_id, %error, "failed to record agent closure");
-                                }
-                            }
-                            graph.revision += 1;
-                        }
-                        if !closed
-                            && let Some(node) = graph.nodes.get_mut(&agent_id)
-                            && node.reservation == reservation
-                            && node.lifecycle == GraphLifecycle::Closing
-                            && !node.reservation_pending
-                            && !node.detach_pending
-                        {
-                            node.lifecycle = GraphLifecycle::Dormant;
-                            node.residency = AgentResidency::Dormant;
-                            graph.revision += 1;
-                        }
-                        Self::reclaim_finished_closings(&mut graph, &manager.journal);
-                        manager.reaped.notify(usize::MAX);
-                        return;
-                    }
-                    #[cfg(test)]
-                    if let Some(deferred) = manager.runner_deferred.lock().unwrap().take() {
-                        let _ = deferred.try_send(());
+            let mut graph = manager
+                .graph
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let closed = actor.lifecycle() == ActorLifecycle::Closed;
+            if let Some(node) = graph.nodes.get_mut(&agent_id)
+                && node.reservation == reservation
+                && !node.reservation_pending
+                && !node.detach_pending
+                && node.lifecycle == GraphLifecycle::Live
+            {
+                let _ = manager
+                    .work
+                    .set_open_for_incarnation(agent_id, reservation, false);
+                node.residency = AgentResidency::Dormant;
+                node.lifecycle = if closed {
+                    GraphLifecycle::Closed
+                } else {
+                    GraphLifecycle::Dormant
+                };
+                if closed && let Some(mut record) = manager.journal.agent(agent_id) {
+                    record.lifecycle = StoredAgentLifecycle::Closed;
+                    if let Err(error) = manager.journal.commit(JournalCommit {
+                        agents: vec![record],
+                        ..Default::default()
+                    }) {
+                        warn!(%agent_id, %error, "failed to record agent closure");
                     }
                 }
-                released.await;
+                graph.revision += 1;
             }
+            if !closed
+                && let Some(node) = graph.nodes.get_mut(&agent_id)
+                && node.reservation == reservation
+                && node.lifecycle == GraphLifecycle::Closing
+                && !node.reservation_pending
+                && !node.detach_pending
+            {
+                node.lifecycle = GraphLifecycle::Dormant;
+                node.residency = AgentResidency::Dormant;
+                graph.revision += 1;
+            }
+            Self::reclaim_finished_closings(&mut graph, &manager.journal);
+            manager.reaped.notify(usize::MAX);
         })
     }
 
@@ -2923,9 +2825,6 @@ impl AgentManagerHandle {
         admission.reservation = reservation;
         {
             let graph = self.lock_graph();
-            if graph.rewind_affected.contains(&agent_id) {
-                return Err(ManagerError::RewindInProgress);
-            }
             if graph
                 .nodes
                 .get(&agent_id)
@@ -2950,15 +2849,14 @@ impl AgentManagerHandle {
         let (actor, task) = spawn(admission);
         let task = self.track_runner(agent_id, reservation, actor.clone(), task);
         let mut graph = self.lock_graph();
-        let can_commit = !graph.rewind_affected.contains(&agent_id)
-            && graph.nodes.get(&agent_id).is_some_and(|node| {
-                node.reservation == reservation
-                    && node.reservation_pending
-                    && matches!(
-                        node.lifecycle,
-                        GraphLifecycle::Reserved | GraphLifecycle::Closing
-                    )
-            });
+        let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
+            node.reservation == reservation
+                && node.reservation_pending
+                && matches!(
+                    node.lifecycle,
+                    GraphLifecycle::Reserved | GraphLifecycle::Closing
+                )
+        });
         if !can_commit {
             drop(graph);
             actor.shutdown();
@@ -3027,7 +2925,6 @@ impl AgentManagerHandle {
         self.wait_at_commit_gate();
         let mut graph = self.lock_graph();
         let can_publish = !graph.shutting_down
-            && !graph.rewind_affected.contains(&agent_id)
             && graph.nodes.get(&agent_id).is_some_and(|node| {
                 node.reservation == reservation
                     && node.reservation_pending
@@ -3190,9 +3087,6 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         if let Some(node) = graph.nodes.get(&agent_id)
             && (node.reservation_pending || node.lifecycle != GraphLifecycle::Live)
         {
@@ -3247,9 +3141,6 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         if node.reservation_pending || node.lifecycle != GraphLifecycle::Live {
             return Err(ManagerError::NonLiveAgent(incarnation.agent_id));
         }
@@ -3272,9 +3163,6 @@ impl AgentManagerHandle {
 
     fn finish_failed_commit(&self, agent_id: AgentId, reservation: u64) {
         let mut graph = self.lock_graph();
-        if graph.rewind_affected.contains(&agent_id) {
-            return;
-        }
         if self.0.journal.agent(agent_id).is_none() {
             if let Some(node) = graph.nodes.get(&agent_id)
                 && node.reservation == reservation
@@ -3426,9 +3314,6 @@ impl AgentManagerHandle {
     ) -> Result<(Option<TurnId>, u64), ManagerError> {
         let (actor, cut) = {
             let mut graph = self.lock_graph();
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             let node = graph
                 .nodes
                 .get(&agent_id)
@@ -3531,9 +3416,6 @@ impl AgentManagerHandle {
     ) -> Result<(), ManagerError> {
         let (actor, cut, descendants) = {
             let mut graph = self.lock_graph();
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             if Self::subtree_ids(&graph, agent_id).iter().any(|id| {
                 graph
                     .nodes
@@ -3615,9 +3497,6 @@ impl AgentManagerHandle {
     ) -> Result<(), ManagerError> {
         let (actor, cut, descendants) = {
             let mut graph = self.lock_graph();
-            if graph.rewinding {
-                return Err(ManagerError::RewindInProgress);
-            }
             if Self::subtree_ids(&graph, agent_id).iter().any(|id| {
                 graph
                     .nodes
@@ -3977,9 +3856,6 @@ impl AgentManagerHandle {
         subtree: bool,
     ) -> Result<Vec<AgentActorHandle>, ManagerError> {
         let mut graph = self.lock_graph();
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         let node = graph
             .nodes
             .get(&agent_id)
@@ -4049,9 +3925,6 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if graph.rewinding {
-            return Err(ManagerError::RewindInProgress);
-        }
         let node = graph
             .nodes
             .get(&agent_id)
@@ -4087,7 +3960,7 @@ impl AgentManagerHandle {
             .checkpoint_snapshot()
             .map_err(ManagerError::InvalidGraph)?;
         let view = snapshot
-            .fold(snapshot.seq)
+            .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let changes = ids
             .iter()

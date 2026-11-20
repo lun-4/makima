@@ -22,7 +22,7 @@ use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use makima_agent::actor::{
-    ActorEvent, ConfigChange, ConfigCommit, HistoryChange, PreparedModel, PreparedTransaction,
+    ActorEvent, ConfigChange, ConfigCommit, PreparedModel, PreparedTransaction,
 };
 use makima_agent::command::{CONTEXT_RELOAD_ROOT_ONLY, CONTEXT_RELOADED, CustomCommand};
 use makima_agent::config_change::{
@@ -31,15 +31,14 @@ use makima_agent::config_change::{
 use makima_agent::context::root_context;
 use makima_agent::end_conversation_detached;
 use makima_agent::headless::{checkpoint_startup_config, default_model_preparer};
-use makima_agent::journal::{PreparedRewindNotification, SessionJournalSnapshot};
+use makima_agent::journal::SessionJournalSnapshot;
 use makima_agent::manager::AgentResidency;
 #[cfg(test)]
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
 use makima_agent::session_coordinator::{
-    ModelPreparer, PreparedSessionCoordinator, ReservedSessionCoordinator,
-    SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
-    canonical_directory, publication_claim,
+    ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
+    builtin_option_definitions, canonical_directory, publication_claim,
 };
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID,
@@ -125,7 +124,6 @@ mod approval;
 mod discovery_tests;
 #[cfg(test)]
 mod focus_tests;
-pub(crate) mod rewind;
 
 use approval::{ApprovalStep, PendingPlanApproval};
 
@@ -410,7 +408,6 @@ fn parse_session_id(id: &str) -> Result<MakimaId, String> {
 
 enum SessionLockState {
     Held(ClaimedSessionLock),
-    Shared(Arc<RenewingDeletionLease>),
     InFlight(flume::Receiver<HeartbeatCompletion>),
 }
 
@@ -423,7 +420,6 @@ impl SessionLockState {
     fn publication_guard(&self) -> Option<SessionPublicationGuard> {
         match self {
             Self::Held(lease) => Some(lease.publication_guard()),
-            Self::Shared(lease) => Some(lease.publication_guard()),
             Self::InFlight(_) => None,
         }
     }
@@ -639,13 +635,6 @@ enum LockSettlement {
 fn settle_lock_state(state: Option<SessionLockState>, timeout: Duration) -> LockSettlement {
     match state {
         Some(SessionLockState::Held(lease)) => LockSettlement::Held(lease),
-        Some(SessionLockState::Shared(lease)) => match Arc::try_unwrap(lease) {
-            Ok(lease) => match lease.into_claimed_lock() {
-                Ok(lease) => LockSettlement::Held(lease),
-                Err(_) => LockSettlement::TimedOut,
-            },
-            Err(_) => LockSettlement::None,
-        },
         Some(SessionLockState::InFlight(completion_rx)) => {
             let Some(mut completion) = collect_heartbeat(completion_rx, Some(timeout)) else {
                 return LockSettlement::TimedOut;
@@ -883,119 +872,7 @@ struct PreparedSessionRuntime {
     seed_snapshot: Option<(Arc<StorageWriter>, Arc<AppSession>)>,
 }
 
-struct ReservedSessionRuntime {
-    app: PreparedApp,
-    handles: PreparedAgentHandles,
-    model_slot: Arc<ProviderSlot>,
-    coordinator: ReservedSessionCoordinator,
-    checkpoint: Arc<CoordinatorCheckpointWriter>,
-    config_commits: flume::Receiver<ConfigCommit>,
-    session_lock: Arc<RenewingDeletionLease>,
-    shell_tx: flume::Sender<ShellEvent>,
-    shell_rx: flume::Receiver<ShellEvent>,
-}
-
-impl ReservedSessionRuntime {
-    fn publish(self, writer: &StorageWriter) -> SessionRuntime {
-        let Self {
-            app,
-            handles,
-            model_slot,
-            coordinator,
-            checkpoint,
-            config_commits,
-            session_lock,
-            shell_tx,
-            shell_rx,
-        } = self;
-        checkpoint.refresh_fence(&writer.session_save_fence(coordinator.handle().session_id()));
-        writer.bind_publication_guard(
-            coordinator.handle().session_id(),
-            session_lock.publication_guard(),
-        );
-        let session_lock = Some(SessionLockState::Shared(session_lock));
-        let coordinator = coordinator.publish();
-        let handles = handles.activate();
-        writer.bind_journal(
-            coordinator.session_id(),
-            handles.manager_and_root().0.journal(),
-        );
-        writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
-        let mut app = app.activate();
-        app.storage_fence = writer.session_save_fence(coordinator.session_id());
-        handles.apply_to_app(&mut app);
-        app.coordinator = Some(coordinator.clone());
-        let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
-        SessionRuntime {
-            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
-            lifetime_cancel,
-            lifetime_trigger: Some(lifetime_trigger),
-            config_commits,
-            projected_config: None,
-            app,
-            handles,
-            model_slot,
-            _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
-            coordinator,
-            shell_tx,
-            shell_rx,
-            last_status: SessionStatus::Idle,
-            notifications: RunNotificationState::default(),
-            session_lock,
-            lock_lost: false,
-            restore_pending: true,
-            pending_approval: None,
-        }
-    }
-}
-
 impl PreparedSessionRuntime {
-    fn reserve_before_publication(
-        mut self,
-        session_lock: Arc<RenewingDeletionLease>,
-    ) -> Result<ReservedSessionRuntime, String> {
-        self.initialize_before_publication()?;
-        let Self {
-            app,
-            handles,
-            model_slot,
-            coordinator,
-            checkpoint,
-            prepare_provider,
-            shell_tx,
-            shell_rx,
-            ..
-        } = self;
-        checkpoint.bind(Some(session_lock.publication_guard()));
-        let coordinator = coordinator
-            .reserve_activation()
-            .map_err(|error| error.to_string())?;
-        let config_commits = observe_config_commits(
-            handles.initialized(),
-            Arc::clone(&model_slot),
-            coordinator.handle(),
-            prepare_provider,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(ReservedSessionRuntime {
-            app,
-            handles,
-            model_slot,
-            coordinator,
-            checkpoint,
-            config_commits,
-            session_lock,
-            shell_tx,
-            shell_rx,
-        })
-    }
-
-    fn initialize_before_publication(&mut self) -> Result<(), String> {
-        let recovery = self.recovery.take().ok_or(NOT_LIVE_ERR)?;
-        self.handles
-            .initialize(recovery.finalize_after_publication())
-    }
-
     #[cfg(test)]
     fn seed_storage(&self) {
         if let Some((writer, session)) = &self.seed_snapshot {
@@ -1331,7 +1208,7 @@ fn replace_session_runtime(
     }
     let target_lock = if same_id {
         match current.session_lock.take() {
-            Some(state @ (SessionLockState::Held(_) | SessionLockState::Shared(_))) => Some(state),
+            Some(state @ SessionLockState::Held(_)) => Some(state),
             state => {
                 current.session_lock = state;
                 return Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into());
@@ -1359,30 +1236,6 @@ fn replace_session_runtime(
 }
 
 impl SessionRuntime {
-    fn share_session_lease(&mut self) -> Result<Arc<RenewingDeletionLease>, String> {
-        if let Some(SessionLockState::InFlight(completion_rx)) = &self.session_lock
-            && let Some(completion) =
-                collect_heartbeat(completion_rx.clone(), Some(AGENT_SHUTDOWN_TIMEOUT))
-        {
-            apply_heartbeat_completion(self, completion);
-        }
-        match self.session_lock.take() {
-            Some(SessionLockState::Held(lease)) => {
-                let lease = Arc::new(RenewingDeletionLease::new(lease));
-                self.session_lock = Some(SessionLockState::Shared(Arc::clone(&lease)));
-                Ok(lease)
-            }
-            Some(SessionLockState::Shared(lease)) => {
-                self.session_lock = Some(SessionLockState::Shared(Arc::clone(&lease)));
-                Ok(lease)
-            }
-            state => {
-                self.session_lock = state;
-                Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into())
-            }
-        }
-    }
-
     fn cancel_background_work(&mut self) {
         if let Some(trigger) = self.lifetime_trigger.take() {
             trigger.cancel();
@@ -1974,29 +1827,6 @@ enum InternalEvent {
         kind: SessionOpKind,
         result: Result<(), String>,
     },
-    RestoreSnapshot {
-        session: MakimaId,
-        runtime: Arc<()>,
-        reply: flume::Sender<Result<AppSession, String>>,
-    },
-    RestoreReady {
-        session: MakimaId,
-        runtime: Arc<()>,
-        result: Result<Box<rewind::InstalledRestore>, String>,
-    },
-    ParentRestoreReady {
-        runtime: Arc<()>,
-        result: Result<Box<rewind::PreparedParentRestore>, String>,
-    },
-    ParentRestoreObserved {
-        runtime: Arc<()>,
-        notifications: PreparedRewindNotification,
-        result: Result<(), String>,
-    },
-    ParentRestorePublished {
-        runtime: Arc<()>,
-        result: Result<Box<rewind::PublishedParentRestore>, String>,
-    },
     PlanApprovalReady {
         session: MakimaId,
         runtime: Arc<()>,
@@ -2032,9 +1862,6 @@ enum SessionOpKind {
     },
     /// OAuth refresh rebuilt the focused model's provider without changing its spec.
     ProviderRefreshed,
-    HistoryRewound {
-        change: Arc<Mutex<Option<HistoryChange>>>,
-    },
     /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
     OptionToggled {
         id: &'static str,
@@ -2755,63 +2582,6 @@ impl<'t> EventLoop<'t> {
 
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::RestoreSnapshot {
-                session,
-                runtime,
-                reply,
-            } => {
-                let result = self
-                    .position(session)
-                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
-                    .ok_or_else(|| RUNTIME_GONE_ERR.to_owned())
-                    .map(|idx| {
-                        while let Ok(envelope) = self.sessions[idx].handles.agent_rx.try_recv() {
-                            self.handle_agent(idx, Box::new(envelope));
-                        }
-                        while let Ok(event) = self.sessions[idx].handles.actor_rx.try_recv() {
-                            self.sessions[idx].app.handle_actor_event(event);
-                        }
-                        self.sessions[idx].app.capture_restore_snapshot()
-                    });
-                let _ = reply.send(result);
-            }
-            InternalEvent::RestoreReady {
-                session,
-                runtime,
-                result,
-            } => {
-                if let Some(idx) = self
-                    .position(session)
-                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
-                {
-                    self.complete_full_restore(idx, result);
-                }
-            }
-            InternalEvent::ParentRestoreReady { runtime, result } => {
-                if let Some(idx) = self.runtime_position(&runtime) {
-                    self.complete_parent_restore(idx, result);
-                } else if let Ok(restored) = result
-                    && let Err(error) = restored.abort()
-                {
-                    warn!(%error, "cancelled parent restore projection rollback failed");
-                }
-            }
-            InternalEvent::ParentRestoreObserved {
-                runtime,
-                notifications,
-                result,
-            } => {
-                if let Some(idx) = self.runtime_position(&runtime) {
-                    self.complete_parent_observation(idx, notifications, result);
-                }
-            }
-            InternalEvent::ParentRestorePublished { runtime, result } => {
-                if let Some(idx) = self.runtime_position(&runtime) {
-                    self.install_parent_restore(idx, result);
-                } else if let Ok(restored) = result {
-                    self.install_detached_parent_restore(*restored);
-                }
-            }
             InternalEvent::PlanApprovalReady {
                 session,
                 runtime,
@@ -4436,36 +4206,6 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].app.flash(message);
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
-            Action::RewindAgent {
-                target,
-                boundary,
-                durable,
-            } => {
-                let result = if let Some(boundary) = durable {
-                    self.dispatch_full_restore(
-                        idx,
-                        target,
-                        rewind::RestoreTarget::Boundary(boundary),
-                    )
-                } else {
-                    self.dispatch_rewind(idx, target, boundary)
-                };
-                if let Err(error) = result {
-                    self.sessions[idx].app.flash(error);
-                }
-            }
-            Action::RestoreBranch { target, id } => {
-                if let Err(error) =
-                    self.dispatch_full_restore(idx, target, rewind::RestoreTarget::Branch(id))
-                {
-                    self.sessions[idx].app.flash(error);
-                }
-            }
-            Action::RewindParent { session, seq } => {
-                if let Err(error) = self.dispatch_parent_restore(idx, session, seq) {
-                    self.restore_failed(idx, error);
-                }
-            }
             Action::ToggleSessionOption { id } => {
                 dispatch_option_toggle(&self.sessions[idx], id, &self.internal_tx);
             }
@@ -4651,23 +4391,6 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
-            SessionOpKind::HistoryRewound { change } => match result {
-                Ok(()) => {
-                    if let Some(change) = change
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take()
-                    {
-                        let app = &mut self.sessions[idx].app;
-                        if app.chats[0].agent_id == Some(change.agent_id) {
-                            app.state.session_mut().meta.queued_messages.clear();
-                            app.clear_recoverable_queue();
-                        }
-                        app.apply_history_change(change);
-                    }
-                }
-                Err(error) => self.sessions[idx].app.flash(error),
-            },
             SessionOpKind::OptionToggled { id, committed } => match result {
                 Ok(()) => {
                     if let Some(enabled) = committed
@@ -4784,63 +4507,6 @@ impl<'t> EventLoop<'t> {
         self.ctx
             .command_runtime
             .target_admission(&self.sessions[idx].app.command_target)
-    }
-
-    fn dispatch_rewind(
-        &self,
-        idx: usize,
-        target: AgentRef,
-        boundary: makima_agent::actor::HistoryBoundary,
-    ) -> Result<(), String> {
-        let actor = self.target_actor(idx, &target)?;
-        let guard = actor.prepare_idle().map_err(|error| error.to_string())?;
-        let (draft, replacement) = actor
-            .rewind_snapshot(&boundary)
-            .map_err(|error| error.to_string())?;
-        if target.id() == self.sessions[idx].handles.manager_and_root().1 {
-            self.sessions[idx].app.sync_live_children();
-        }
-        let operation = guard
-            .reserve_prepared_operation(None)
-            .map_err(|error| error.to_string())?;
-        let publication = CheckpointPublication::default();
-        operation
-            .register_publication(&publication)
-            .map_err(|error| error.to_string())?;
-        let transaction = self.reserve_history_transaction(idx, &target, publication)?;
-        let session = self.sessions[idx].id();
-        let runtime = self.sessions[idx].handles.identity();
-        let internal_tx = self.internal_tx.clone();
-        smol::spawn(async move {
-            let change = Arc::new(Mutex::new(None));
-            let result = async {
-                operation.resolve(None)?;
-                operation.wait_ready().await?;
-                let config = operation.ready_config()?;
-                Ok::<_, makima_agent::ActorError>(config)
-            }
-            .await
-            .map_err(|error| error.to_string());
-            let result = match result.and_then(|config| transaction(config, true)) {
-                Ok(transaction) => guard
-                    .commit_prepared_transaction_held(operation, Some(replacement), transaction)
-                    .await
-                    .map(|(_, _, updated)| {
-                        *change.lock().unwrap_or_else(|error| error.into_inner()) =
-                            updated.map(|updated| HistoryChange { draft, ..updated });
-                    })
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error),
-            };
-            let _ = internal_tx.send(InternalEvent::SessionOp {
-                session,
-                runtime,
-                kind: SessionOpKind::HistoryRewound { change },
-                result,
-            });
-        })
-        .detach();
-        Ok(())
     }
 
     fn pinned_actor(
@@ -8094,30 +7760,6 @@ end })
         assert!(!expected.exists());
     }
 
-    #[test]
-    fn sharing_the_lease_collects_an_in_flight_heartbeat() {
-        let harness = RuntimeHarness::new();
-        let session = harness.session();
-        let mut runtime = harness.runtime(session);
-        let Some(SessionLockState::Held(lease)) = runtime.session_lock.take() else {
-            panic!("expected held session lock");
-        };
-        let (completion_tx, completion_rx) = flume::bounded(1);
-        completion_tx
-            .send(HeartbeatCompletion {
-                result: Ok(session_lock::LockBeat::Held),
-                lease: Some(lease),
-            })
-            .unwrap();
-        runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
-        assert!(runtime.share_session_lease().is_ok());
-        assert!(matches!(
-            runtime.session_lock,
-            Some(SessionLockState::Shared(_))
-        ));
-        release_runtime(runtime);
-    }
-
     struct GatedDiskBackend {
         dir: PathBuf,
         entered: flume::Sender<()>,
@@ -9625,7 +9267,7 @@ end })
         assert_eq!(expected[TRANSIENT], DISABLED_VALUE);
         assert_eq!(expected[NEW_DEFAULT], DISABLED_VALUE);
         let snapshot = manager.journal().snapshot();
-        let folded = snapshot.fold(snapshot.seq).unwrap();
+        let folded = snapshot.fold().unwrap();
         assert_eq!(
             folded.scopes[&Some(root)].config.as_ref().unwrap().options,
             expected
@@ -10248,72 +9890,6 @@ end })
     }
 
     #[test]
-    fn committed_rewind_does_not_restore_failed_turn_queue() {
-        const RECOVERY_TEXT: &str = "retained after failure";
-        const REWOUND_TEXT: &str = "rewound prompt";
-        with_event_loop(|event_loop| {
-            let model = event_loop.sessions[0].app.root_config().model.clone();
-            let mut session = AppSession::new(&model.spec(), &event_loop.session_cwd);
-            session.push_message(Message::user(REWOUND_TEXT.into()));
-            let prepared = event_loop
-                .ctx
-                .prepare_runtime_with_provider(
-                    session,
-                    Some(PreparedProvider {
-                        model,
-                        provider: Arc::new(StubProvider),
-                    }),
-                )
-                .unwrap();
-            event_loop.replace_prepared_runtime(0, prepared).unwrap();
-            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
-            let actor = manager.actor(root).unwrap();
-            let guard = actor.prepare_idle().unwrap();
-            event_loop.submit_text(0, RECOVERY_TEXT.into()).unwrap();
-            let app = &mut event_loop.sessions[0].app;
-            app.status = Status::Streaming;
-            app.update(Msg::Agent(Box::new(Envelope {
-                event: AgentEvent::ControlError {
-                    message: OBSERVATION.into(),
-                },
-                subagent: None,
-                identity: Some(crate::app::tests::work_identity(app.run_id)),
-            })));
-            assert!(app.holds_recovery_text());
-            assert!(actor.pending_submissions().is_empty());
-            drop(guard);
-            let boundary = actor.history_boundaries().unwrap().pop().unwrap();
-            event_loop
-                .dispatch_rewind(0, manager.lookup(root).unwrap(), boundary)
-                .unwrap();
-            loop {
-                let event = event_loop
-                    .internal_rx
-                    .recv_timeout(SESSION_OP_TIMEOUT)
-                    .unwrap();
-                let rewound = matches!(
-                    &event,
-                    InternalEvent::SessionOp {
-                        kind: SessionOpKind::HistoryRewound { .. },
-                        result: Ok(()),
-                        ..
-                    }
-                );
-                event_loop.handle_internal(event);
-                if rewound {
-                    break;
-                }
-            }
-            let app = &mut event_loop.sessions[0].app;
-            assert_eq!(app.input_box.buffer.value(), REWOUND_TEXT);
-            assert!(!app.holds_recovery_text());
-            app.checkpoint_now();
-            assert!(app.state.session.meta.queued_messages.is_empty());
-            assert!(actor.pending_submissions().is_empty());
-        });
-    }
-
-    #[test]
     fn empty_history_replacement_restores_and_checkpoints_draft() {
         const DRAFT: &str = "first prompt";
 
@@ -10576,8 +10152,8 @@ end })
         release_runtime(runtime);
     }
 
-    #[test_case(false, true, false ; "rewind_preserves_enabled")]
-    #[test_case(true, false, false ; "rewind_preserves_disabled")]
+    #[test_case(false, true, false ; "same_session_preserves_enabled")]
+    #[test_case(true, false, false ; "same_session_preserves_disabled")]
     #[test_case(false, true, true ; "reset_preserves_enabled")]
     #[test_case(true, false, true ; "reset_preserves_disabled")]
     fn replacement_preserves_outgoing_yolo(startup_yolo: bool, current_yolo: bool, reset: bool) {
@@ -10645,7 +10221,7 @@ end })
         release_runtime(runtime);
     }
 
-    #[test_case(false ; "rewind")]
+    #[test_case(false ; "same_session")]
     #[test_case(true ; "reset")]
     fn replacement_preserves_unsaved_input_history(reset: bool) {
         const PROMPT: &str = "not saved to disk";
@@ -11353,124 +10929,6 @@ end })
             manager.actor(root).unwrap().close();
             assert!(event_loop.target_actor(0, &target).is_err());
             release_runtime(foreign);
-        });
-    }
-
-    #[test]
-    fn focused_history_operations_preserve_identity_and_children() {
-        const FIRST: &str = "first prompt";
-        const DRAFT: &str = "second prompt";
-        with_event_loop(|event_loop| {
-            let mut session = AppSession::new(
-                &event_loop.sessions[0].app.root_config().model.spec(),
-                &event_loop.session_cwd,
-            );
-            session.replace_messages(vec![
-                Message::user(FIRST.into()),
-                Message::user(DRAFT.into()),
-            ]);
-            let model = event_loop.sessions[0].app.root_config().model.clone();
-            let prepared = event_loop
-                .ctx
-                .prepare_runtime_with_provider(
-                    session,
-                    Some(PreparedProvider {
-                        model,
-                        provider: Arc::new(StubProvider),
-                    }),
-                )
-                .unwrap();
-            event_loop.replace_prepared_runtime(0, prepared).unwrap();
-            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
-            let target = manager.lookup(root).unwrap();
-            let actor = manager.actor(root).unwrap();
-            let identity = actor.identity();
-            let host = makima_lua::PluginHost::with_command_registry(
-                Arc::clone(makima_agent::tools::ToolRegistry::global_arc()),
-                event_loop.ctx.command_runtime.registry.clone(),
-                false,
-                makima_lua::ui_sink::HostUi::Frontend,
-            )
-            .unwrap();
-            host.event_handle()
-                .install_orchestration_services(event_loop.orchestration.clone());
-            host.load_source(
-                "rewind_child",
-                r#"
-                makima.api.register_command({
-                    name = "/rewind-child", tui_only = false,
-                    handler = function(_, ctx)
-                        assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true }))
-                        makima.ui.flash("rewind child ready")
-                    end,
-                })
-            "#,
-            )
-            .unwrap();
-            event_loop.sync_orchestration();
-            let outcome = smol::block_on(event_loop.ctx.command_runtime.registry.dispatch_input(
-                &event_loop.sessions[0].app.command_target,
-                "/rewind-child".into(),
-            ));
-            assert!(
-                matches!(
-                    outcome,
-                    makima_commands::InputDispatch::Dispatched(
-                        makima_commands::CommandOutcome::Completed
-                    )
-                ),
-                "{outcome:?}"
-            );
-            assert!(
-                matches!(host.ui_action_rx().recv_timeout(SESSION_OP_TIMEOUT).unwrap(), UiAction::Flash(text) if text == "rewind child ready")
-            );
-            let child = manager
-                .snapshot()
-                .into_iter()
-                .find(|node| node.parent_id == Some(root))
-                .unwrap()
-                .agent_id;
-            let child_actor = manager.actor(child).unwrap();
-            let child_identity = child_actor.identity();
-            let child_before = child_actor.snapshot();
-            let boundary = actor.history_boundaries().unwrap().pop().unwrap();
-            event_loop.dispatch_rewind(0, target, boundary).unwrap();
-            loop {
-                let event = event_loop
-                    .internal_rx
-                    .recv_timeout(SESSION_OP_TIMEOUT)
-                    .unwrap();
-                let rewound = matches!(
-                    &event,
-                    InternalEvent::SessionOp {
-                        kind: SessionOpKind::HistoryRewound { .. },
-                        ..
-                    }
-                );
-                event_loop.handle_internal(event);
-                if rewound {
-                    break;
-                }
-            }
-            assert!(Arc::ptr_eq(
-                &identity,
-                &manager.actor(root).unwrap().identity()
-            ));
-            assert_eq!(event_loop.sessions[0].app.state.session.messages().len(), 1);
-            assert_eq!(event_loop.sessions[0].app.input_box.buffer.value(), DRAFT);
-            assert_eq!(actor.history_boundaries().unwrap().len(), 1);
-            assert!(Arc::ptr_eq(
-                &child_identity,
-                &manager.actor(child).unwrap().identity()
-            ));
-            assert_eq!(child_actor.snapshot().status, child_before.status);
-            assert_eq!(child_actor.snapshot().latest, child_before.latest);
-            assert!(
-                manager
-                    .snapshot()
-                    .iter()
-                    .any(|node| { node.agent_id == child && node.parent_id == Some(root) })
-            );
         });
     }
 
@@ -12354,7 +11812,7 @@ end })
                 assert_eq!(lease.heartbeat().unwrap(), session_lock::LockBeat::Lost);
                 lease
             }
-            SessionLockState::Shared(_) | SessionLockState::InFlight(_) => {
+            SessionLockState::InFlight(_) => {
                 panic!("heartbeat was already in flight")
             }
         };
@@ -12386,7 +11844,7 @@ end })
         let mut runtime = harness.runtime(session.clone());
         let lease = match runtime.session_lock.take().unwrap() {
             SessionLockState::Held(lease) => lease,
-            SessionLockState::Shared(_) | SessionLockState::InFlight(_) => {
+            SessionLockState::InFlight(_) => {
                 panic!("heartbeat was already in flight")
             }
         };

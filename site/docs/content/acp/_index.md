@@ -54,7 +54,7 @@ ACP maps the target-scoped central registry to ACP command metadata. Commands th
 
 Loaded sessions retain durable agent IDs, child histories, committed configuration, and retained turn results. Children remain dormant until reactivated for work. Recovery marks unfinished admitted turns as `interrupted` rather than rerunning them. Recorded child-report delivery state survives restart. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) for reactivation limits.
 
-Rewind pickers require the TUI and are not advertised as ACP commands. See [Rewind and branches](/docs/agent-work/#rewind-and-branches).
+Rewind is not available over ACP. See [Rewind](/docs/agent-work/#rewind).
 
 ACP cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory and reports it in the transcript, but the editor can continue to display its original directory field.
 

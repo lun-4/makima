@@ -50,7 +50,6 @@ use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -133,6 +132,7 @@ pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
 /// carries no work identity and bypasses the per-run staleness filter.
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
+const FLASH_REWIND_REWORKED: &str = "rewind is being reworked";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
@@ -408,7 +408,6 @@ pub struct App {
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
-    pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -627,7 +626,6 @@ impl App {
             plan_approval_pending: false,
             login_picker,
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
-            rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -1237,7 +1235,6 @@ impl App {
                     .then(|| self.task_picker.content_len())
                     .flatten(),
                 PickerId::Theme => self.theme_picker.content_len(),
-                PickerId::Rewind => self.rewind_picker.content_len(),
                 PickerId::Login => self.login_picker.content_len(),
                 PickerId::Mcp => self.mcp_picker.content_len(),
                 PickerId::Lua => self.lua_picker.content_len(),
@@ -1267,7 +1264,6 @@ impl App {
                 PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
                 PickerId::Task => self.task_picker.scroll_line(),
                 PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
-                PickerId::Rewind => self.rewind_picker.scroll_line().unwrap_or(0),
                 PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
                 PickerId::Mcp => self.mcp_picker.scroll_line().unwrap_or(0),
                 PickerId::Lua => self.lua_picker.scroll_line().unwrap_or(0),
@@ -1289,7 +1285,6 @@ impl App {
                 PickerId::Model => self.model_picker.scroll_to_line(line),
                 PickerId::Task => self.task_picker.scroll_to_line(line),
                 PickerId::Theme => self.theme_picker.scroll_to_line(line),
-                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
                 PickerId::Login => self.login_picker.scroll_to_line(line),
                 PickerId::Mcp => self.mcp_picker.scroll_to_line(line),
                 PickerId::Lua => self.lua_picker.scroll_to_line(line),
@@ -1330,7 +1325,6 @@ impl App {
                     PickerId::Model => self.model_picker.click_input(pos),
                     PickerId::Task => self.task_picker.click_input(pos),
                     PickerId::Theme => self.theme_picker.click_input(pos),
-                    PickerId::Rewind => self.rewind_picker.click_input(pos),
                     PickerId::Login => self.login_picker.click_input(pos),
                     PickerId::Mcp => self.mcp_picker.click_input(pos),
                     PickerId::Lua => self.lua_picker.click_input(pos),
@@ -1532,11 +1526,6 @@ impl App {
                     }
                 }
             }
-            PickerId::Rewind => match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
-                RewindPickerAction::Close => vec![],
-            },
             PickerId::Theme => match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
@@ -1564,7 +1553,6 @@ impl App {
             PickerId::Model => self.model_picker.select(index),
             PickerId::Task => self.task_picker.select(index),
             PickerId::Theme => self.theme_picker.select(index),
-            PickerId::Rewind => self.rewind_picker.select(index),
             PickerId::Login => self.login_picker.click_row(index),
             PickerId::Mcp => self.mcp_picker.select(index),
             PickerId::Lua => self.lua_picker.select(index),
@@ -1679,7 +1667,6 @@ impl App {
             Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
             Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
             Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
-            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
             Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
             Surface::Picker(PickerId::Mcp) => self.mcp_picker.scroll(delta),
             Surface::Picker(PickerId::Lua) => self.lua_picker.scroll(delta),
@@ -2089,10 +2076,6 @@ impl App {
 
         if self.task_picker.is_open() {
             return Some(self.handle_picker_key(PickerId::Task, key));
-        }
-
-        if self.rewind_picker.is_open() {
-            return Some(self.handle_picker_key(PickerId::Rewind, key));
         }
 
         if self.theme_picker.is_open() {
@@ -2515,7 +2498,8 @@ impl App {
                             if streaming {
                                 self.handle_cancel()
                             } else {
-                                self.open_rewind_picker()
+                                self.status_bar.flash(FLASH_REWIND_REWORKED.into());
+                                vec![]
                             }
                         } else {
                             self.last_esc = Some(Instant::now());
@@ -3755,7 +3739,7 @@ impl App {
         self.flash(format!("cd {}", path.display()));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 12] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -3764,7 +3748,6 @@ impl App {
             &self.file_picker,
             &self.task_picker,
             &self.lua_picker,
-            &self.rewind_picker,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -3773,7 +3756,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -3782,7 +3765,6 @@ impl App {
             &mut self.file_picker,
             &mut self.task_picker,
             &mut self.lua_picker,
-            &mut self.rewind_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -4234,7 +4216,6 @@ impl App {
         }
         try_picker!(self.file_picker);
         try_picker!(self.task_picker);
-        try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

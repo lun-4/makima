@@ -401,66 +401,6 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
 }
 
 impl AgentActorHandle {
-    pub(crate) fn reconcile_rewind_delivery_work(
-        &self,
-        mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
-    ) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(journal) = &self.inner.journal {
-            let snapshot = journal.snapshot();
-            let mut deliveries = BTreeMap::new();
-            for record in snapshot.state.iter() {
-                if record.agent == Some(self.agent_id())
-                    && let StateChange::Delivery { id, op } = &record.change
-                {
-                    if deliveries.get(id).is_some_and(|(_, previous)| {
-                        !matches!(previous, StoredDeliveryOp::Queued(_))
-                    }) {
-                        continue;
-                    }
-                    deliveries.insert(*id, (record.seq, op.clone()));
-                }
-            }
-            state.deliveries.retain(|turn, pending| {
-                matches!(
-                    deliveries.get(&(pending.delivery.result.outcome.agent_id(), *turn)),
-                    Some((_, StoredDeliveryOp::Queued(_)))
-                )
-            });
-            let mut order = state
-                .deliveries
-                .iter()
-                .filter_map(|(turn, pending)| {
-                    deliveries
-                        .get(&(pending.delivery.result.outcome.agent_id(), *turn))
-                        .map(|(seq, _)| (*seq, *turn))
-                })
-                .collect::<Vec<_>>();
-            order.sort_unstable();
-            state.delivery_order = order.into_iter().map(|(_, turn)| turn).collect();
-            let pending = state.delivery_order.iter().copied().collect::<Vec<_>>();
-            state.delivery_runs.retain(|_, batch| {
-                batch.retain(|turn| pending.contains(turn));
-                !batch.is_empty()
-            });
-            state.delivery_seen = deliveries.keys().map(|(_, turn)| *turn).collect();
-            state.delivery_held = deliveries
-                .values()
-                .any(|(_, op)| matches!(op, StoredDeliveryOp::Queued(delivery) if delivery.held));
-            state.delivery_suspended = state.delivery_held;
-        }
-        for pending in state.deliveries.values_mut() {
-            pending.work = work(
-                pending.delivery.result.outcome.agent_id(),
-                pending.delivery.result.outcome.turn_id(),
-            );
-        }
-    }
-
     pub(crate) fn reconcile_pending_deliveries(
         &self,
         mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
@@ -859,99 +799,6 @@ mod tests {
         })
     }
 
-    #[test_case(None, false; "absent_report_pruned_unheld_outside_preserved")]
-    #[test_case(Some(StoredDeliveryOp::Dropped), true; "dropped_child_report_pruned_held_outside_preserved")]
-    #[test_case(Some(StoredDeliveryOp::Consumed), false; "consumed_child_report_pruned")]
-    #[test_case(Some(StoredDeliveryOp::Withdrawn), true; "withdrawn_child_report_pruned")]
-    fn rewind_reconciles_pending_reports_against_installed_journal(
-        terminal: Option<StoredDeliveryOp>,
-        held: bool,
-    ) {
-        smol::block_on(async {
-            use crate::journal::{JournalChange, JournalCommit};
-            use makima_storage::id::MakimaId;
-            use makima_storage::session_state::{StateChange, StoredDelivery};
-
-            let manager = crate::AgentManagerHandle::new(Default::default()).unwrap();
-            let (parent, task, _start) = deferred_actor(&manager, None);
-            let kept = delivery(AgentId::generate());
-            let removed = delivery(AgentId::generate());
-            let kept_turn = kept.result.outcome.turn_id();
-            let removed_turn = removed.result.outcome.turn_id();
-            {
-                let mut state = parent.inner.state.lock().unwrap();
-                super::restore_pending(&mut state, Arc::clone(&removed), Vec::new());
-                super::restore_pending(&mut state, Arc::clone(&kept), Vec::new());
-                state
-                    .delivery_runs
-                    .insert(TurnId::generate(), vec![removed_turn, kept_turn]);
-                state.delivery_suspended = !held;
-                state.delivery_held = !held;
-            }
-            let mut changes = vec![JournalChange {
-                agent: Some(parent.agent_id()),
-                generation: 0,
-                change: StateChange::Delivery {
-                    id: (kept.result.outcome.agent_id(), kept_turn),
-                    op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                        label: kept.label.clone(),
-                        result: kept.result.to_stored(MakimaId::generate(), None).unwrap(),
-                        preview_bytes: None,
-                        held,
-                    })),
-                },
-            }];
-            if let Some(op) = terminal {
-                changes.push(JournalChange {
-                    agent: Some(parent.agent_id()),
-                    generation: 0,
-                    change: StateChange::Delivery {
-                        id: (removed.result.outcome.agent_id(), removed_turn),
-                        op,
-                    },
-                });
-            }
-            let journal = manager.journal();
-            journal
-                .commit(JournalCommit {
-                    changes,
-                    ..Default::default()
-                })
-                .unwrap();
-            let revision = journal.snapshot().revision;
-            let mut reconciled = Vec::new();
-            parent.reconcile_rewind_delivery_work(|source, turn| {
-                reconciled.push((source, turn));
-                Vec::new()
-            });
-            assert_eq!(
-                reconciled,
-                vec![(kept.result.outcome.agent_id(), kept_turn)]
-            );
-            assert_eq!(journal.snapshot().revision, revision);
-            {
-                let state = parent.inner.state.lock().unwrap();
-                assert_eq!(state.deliveries.len(), 1);
-                assert!(state.deliveries.contains_key(&kept_turn));
-                assert_eq!(
-                    state.delivery_order.iter().copied().collect::<Vec<_>>(),
-                    vec![kept_turn]
-                );
-                assert!(
-                    state
-                        .delivery_runs
-                        .values()
-                        .all(|batch| batch == &[kept_turn])
-                );
-                assert_eq!(state.delivery_held, held);
-                assert_eq!(state.delivery_suspended, held);
-                assert_eq!(super::held(&parent.inner, &state), held);
-            }
-            parent.shutdown();
-            task.await;
-        });
-    }
-
     #[test_case(false; "saved")]
     #[test_case(true; "closed_store")]
     fn oversized_completion_offload_preserves_envelope(closed: bool) {
@@ -1142,7 +989,7 @@ mod tests {
         let journal = manager.journal();
         settle_conversions(&journal).await;
         let snapshot = journal.snapshot();
-        snapshot.fold(snapshot.seq).unwrap()
+        snapshot.fold().unwrap()
     }
 
     #[test_case(false; "persisted_parent")]
@@ -1330,7 +1177,7 @@ mod tests {
             inbox.commit_completions(&mut |message| {
                 history.push(message);
                 let snapshot = manager.journal().snapshot();
-                let view = snapshot.fold(snapshot.seq).unwrap();
+                let view = snapshot.fold().unwrap();
                 assert_eq!(
                     view.scopes[&Some(parent.agent_id())].deliveries[&id],
                     StoredDeliveryOp::Consumed,

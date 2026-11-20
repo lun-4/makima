@@ -7,14 +7,12 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use makima_agent::actor::{
     ActorEvent, ActorStatus, AgentActorHandle, ConfigChange, ConfigCommit, ConfigPatch,
-    PreparedModel,
+    PreparedModel, TranscriptRequest,
 };
 use makima_agent::config_change::ConfigChangeError;
-use makima_agent::journal::{JournalChange, JournalCommit, SessionJournal};
+use makima_agent::journal::{JournalChange, JournalCommit};
 use makima_agent::manager::ManagerError;
-use makima_agent::session_options::{
-    ENABLED_VALUE, FAST_PENDING_MODEL_OPTION_ID, SessionOptionError, WORKFLOW_OPTION_ID,
-};
+use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
 use makima_agent::tools::ToolRegistry;
 use makima_agent::{AgentInput, AgentMode, ModeId};
 use makima_domain::{Effort, ModelSelection, ThinkingConfig as DomainThinkingConfig};
@@ -36,7 +34,6 @@ use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateR
 use makima_storage::sessions::{StoredMode, read_prefs};
 use test_case::test_case;
 
-use super::super::rewind::tests::assert_persisted_state;
 use super::super::tests::{pump_until, shutdown_manager, sync_preparer, with_event_loop};
 use super::super::{
     EventLoop, InternalEvent, LOCK_LOST_MSG, PreparedProvider, reserve_config_change,
@@ -78,6 +75,7 @@ const RELATIVE_PLAN_FILE: &str = "relative-plan.md";
 const MUTATED_PLAN: &str = "# Late edit\nDo not implement this changed revision.\n";
 const MOVED_CWD: &str = "moved-cwd";
 const SESSION_LOG_EXTENSION: &str = "jsonl";
+const TRANSCRIPT_PROBE_BYTES: usize = 1024;
 const SESSION_LOG_BACKUP_EXTENSION: &str = "approval-backup";
 const DRAFT: &str = "draft typed before approval";
 const CLEAR_AND_IMPLEMENT_ROW: usize = 1;
@@ -731,7 +729,7 @@ fn managed_child_approval(
         })))
         .unwrap();
         let config = child.effective_config().unwrap();
-        let child_epoch = child.history_boundaries().unwrap()[0].epoch;
+        let child_epoch = history_epoch(&child);
         assert!(
             event_loop.sessions[index]
                 .app
@@ -1003,7 +1001,7 @@ fn managed_child_approval(
             assert!(event_loop.sessions[index].pending_approval.is_none());
             drop(child.prepare_idle().expect(LOCK_LOST_MSG));
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
-            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert_eq!(history_epoch(&child), child_epoch);
             assert!(requests.is_empty());
             shutdown_manager(&manager);
             return;
@@ -1048,7 +1046,7 @@ fn managed_child_approval(
                     .expect("deadline must release actor reservation"),
             );
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
-            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert_eq!(history_epoch(&child), child_epoch);
             assert_pending_fast(event_loop, index, Some(&pending_fast_model));
             assert!(requests.is_empty());
             drop(checkpoint_release);
@@ -1126,7 +1124,7 @@ fn managed_child_approval(
                 .expect("failed checkpoint must release actor reservation");
             drop(idle);
             assert!(Arc::ptr_eq(&config, &child.effective_config().unwrap()));
-            assert_eq!(child.history_boundaries().unwrap()[0].epoch, child_epoch);
+            assert_eq!(history_epoch(&child), child_epoch);
             assert!(requests.is_empty());
             assert_eq!(
                 event_loop.sessions[index].app.status_bar.flash_text(),
@@ -1443,10 +1441,20 @@ fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
     .unwrap();
 }
 
+fn history_epoch(actor: &AgentActorHandle) -> u64 {
+    actor
+        .transcript(TranscriptRequest {
+            through_turn: None,
+            last_messages: 1,
+            max_bytes: TRANSCRIPT_PROBE_BYTES,
+        })
+        .unwrap()
+        .epoch
+}
+
 fn checkpoint_settled(event_loop: &mut EventLoop<'_>, index: usize) {
     let manager = event_loop.sessions[index].handles.manager_and_root().0;
     smol::block_on(manager.wait_settled());
-    let _guard = manager.reserve_graph_transition().unwrap();
     checkpoint(event_loop, index);
 }
 
@@ -1799,375 +1807,6 @@ fn clear_context_links_new_runtime_and_preserves_planning_session() {
         assert_eq!(plans[&root].approved.as_ref().unwrap().content, PLAN);
         assert_eq!(plans[&root].staged_model, Some(implementation_selection()));
         assert_eq!(view.boundaries[&link.seq].offset, link.message_count);
-    });
-}
-
-#[test_case(false; "parent_lock_held")]
-#[test_case(true; "parent_cwd_changed")]
-fn parent_navigation_rejects_without_replacing_implementation(changed_cwd: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _, requests, _host) = setup(event_loop);
-        approve(event_loop, index, true);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.root_mode() == Mode::Build
-                && event_loop.sessions[index].app.status == Status::Idle
-                && !requests.is_empty()
-        });
-        requests.recv_timeout(WAIT).unwrap();
-        checkpoint_settled(event_loop, index);
-        let runtime = &event_loop.sessions[index];
-        let implementation = runtime.id();
-        let identity = runtime.handles.identity();
-        let link = runtime.app.state.session.parent().unwrap().clone();
-        let path = session_log(event_loop, link.session);
-        let mut held = None;
-        let expected = if changed_cwd {
-            let mut parent = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
-            let root = parent.root_agent_id().unwrap();
-            let mut config = parent.latest_state().unwrap().scopes[&Some(root)]
-                .config
-                .clone()
-                .unwrap();
-            config.cwd = PathBuf::from(&event_loop.session_cwd)
-                .join(MOVED_CWD)
-                .display()
-                .to_string();
-            let expected = session_lock::ResumeBlock::OtherCwd(config.cwd.clone()).to_string();
-            parent.push_state(StoredStateRecord {
-                seq: parent.next_state_seq(),
-                agent: Some(root),
-                generation: 0,
-                change: StateChange::Config(config),
-            });
-            parent.save(&event_loop.ctx.storage).unwrap();
-            expected
-        } else {
-            held = session_lock::claim(&event_loop.sessions_dir, &link.session).unwrap();
-            assert!(held.is_some());
-            session_lock::OPEN_ELSEWHERE_MSG.to_owned()
-        };
-        let before = fs::read(&path).unwrap();
-        let result = event_loop.dispatch_parent_restore(index, link.session, link.seq);
-        assert_eq!(result.unwrap_err(), expected);
-        assert_eq!(event_loop.sessions[index].id(), implementation);
-        assert!(Arc::ptr_eq(
-            &identity,
-            &event_loop.sessions[index].handles.identity()
-        ));
-        assert!(!event_loop.sessions[index].app.restore_in_progress);
-        assert_eq!(fs::read(path).unwrap(), before);
-        assert!(AppSession::load(implementation, &event_loop.ctx.storage).is_ok());
-        drop(held);
-    });
-}
-
-#[test_case(false, false; "normal_publication")]
-#[test_case(true, false; "implementation_lease_lost_after_publication")]
-#[test_case(false, true; "parent_navigation_after_cd")]
-fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(
-    lose_source_lease: bool,
-    after_cd: bool,
-) {
-    const LATEST_DRAFT: &str = "implementation draft typed immediately before parent navigation";
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        if after_cd {
-            let cwd = PathBuf::from(&event_loop.session_cwd).join(MOVED_CWD);
-            fs::create_dir_all(&cwd).unwrap();
-            let cwd = cwd.canonicalize().unwrap();
-            event_loop.handle_action(index, Action::ChangeDirectory(cwd.clone()));
-            pump_until(event_loop, |event_loop| {
-                event_loop.sessions[index].coordinator.read().cwd().as_ref() == Some(&cwd)
-                    && Path::new(&event_loop.sessions[index].app.state.session.cwd) == cwd
-            });
-            assert_ne!(Path::new(&event_loop.session_cwd), cwd);
-        }
-        approve(event_loop, index, true);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.root_mode() == Mode::Build
-                && event_loop.sessions[index].app.status == Status::Idle
-                && !requests.is_empty()
-        });
-        requests.recv_timeout(WAIT).unwrap();
-        checkpoint_settled(event_loop, index);
-        let implementation = event_loop.sessions[index].id();
-        let link = event_loop.sessions[index]
-            .app
-            .state
-            .session
-            .parent()
-            .unwrap()
-            .clone();
-        let before = AppSession::load(implementation, &event_loop.ctx.storage).unwrap();
-        assert!(
-            before
-                .state()
-                .iter()
-                .any(|record| matches!(&record.change, StateChange::Turn { .. }))
-        );
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .set_input(LATEST_DRAFT.into());
-        let source = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
-        let source_history = serde_json::to_value(source.messages()).unwrap();
-        fs::write(&path, MUTATED_PLAN).unwrap();
-        event_loop
-            .dispatch_parent_restore(index, link.session, link.seq)
-            .unwrap();
-        assert_eq!(event_loop.sessions[index].id(), implementation);
-        let published = loop {
-            let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
-            if matches!(event, InternalEvent::ParentRestorePublished { .. }) {
-                break event;
-            }
-            event_loop.handle_internal(event);
-        };
-        assert!(matches!(
-            &published,
-            InternalEvent::ParentRestorePublished { result: Ok(_), .. }
-        ));
-        assert_ne!(index, 0);
-        event_loop.focused = 0;
-        if lose_source_lease {
-            event_loop.sessions[index].cancel_background_work();
-            event_loop.sessions[index].lock_lost = true;
-        }
-        event_loop.handle_internal(published);
-        assert_eq!(event_loop.focused, 0);
-        assert_eq!(
-            event_loop.sessions[index].id(),
-            link.session,
-            "{:?}",
-            event_loop.sessions[index].app.status_bar.flash_text()
-        );
-        assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Plan);
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.restore_in_progress
-        });
-        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
-        let journal = event_loop.sessions[index]
-            .handles
-            .manager_and_root()
-            .0
-            .journal()
-            .checkpoint_snapshot()
-            .unwrap();
-        assert_persisted_state(&persisted, &journal);
-        assert_eq!(
-            persisted.agent_revisions(),
-            journal.agent_revisions.to_vec()
-        );
-        let root = persisted.root_agent_id().unwrap();
-        assert_eq!(
-            event_loop.sessions[index]
-                .app
-                .state
-                .session
-                .history_snapshot()
-                .epoch,
-            journal.histories[&root].epoch
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), PLAN);
-        assert_eq!(
-            serde_json::to_value(event_loop.sessions[index].app.state.session.messages()).unwrap(),
-            source_history
-        );
-        let after = AppSession::load(implementation, &event_loop.ctx.storage).unwrap();
-        assert_eq!(
-            serde_json::to_value(after.messages()).unwrap(),
-            serde_json::to_value(before.messages()).unwrap()
-        );
-        assert_persisted_state(
-            &after,
-            &SessionJournal::from_session(&before).unwrap().snapshot(),
-        );
-        assert_eq!(after.parent(), before.parent());
-        assert_eq!(after.meta.input_draft.as_deref(), Some(LATEST_DRAFT));
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .set_input(LATEST_DRAFT.into());
-        checkpoint(event_loop, index);
-        assert_eq!(
-            AppSession::load(link.session, &event_loop.ctx.storage)
-                .unwrap()
-                .meta
-                .input_draft
-                .as_deref(),
-            Some(LATEST_DRAFT)
-        );
-        let changed = smol::block_on(
-            event_loop.sessions[index]
-                .coordinator
-                .set_option(WORKFLOW_OPTION_ID, ENABLED_VALUE),
-        );
-        assert!(changed.is_ok(), "{changed:?}");
-        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
-        assert!(
-            persisted.latest_state().unwrap().scopes[&Some(root)]
-                .config
-                .as_ref()
-                .unwrap()
-                .workflow
-        );
-        let cwd = PathBuf::from(&event_loop.session_cwd).join(MOVED_CWD);
-        fs::create_dir_all(&cwd).unwrap();
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        let reservation = reserve_config_change(
-            &manager.lookup(root).unwrap(),
-            &event_loop.sessions[index].coordinator,
-            None,
-        )
-        .unwrap();
-        smol::block_on(reservation.commit_change(ConfigChange::WorkingDirectory(cwd.clone())))
-            .unwrap();
-        let persisted = AppSession::load(link.session, &event_loop.ctx.storage).unwrap();
-        assert_eq!(PathBuf::from(&persisted.cwd), cwd);
-        let branch = event_loop.sessions[index]
-            .app
-            .state
-            .session
-            .branches()
-            .last()
-            .unwrap()
-            .id;
-        let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
-        event_loop.handle_action(
-            index,
-            Action::RestoreBranch {
-                target: manager.lookup(root).unwrap(),
-                id: branch,
-            },
-        );
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.restore_in_progress
-        });
-        assert_eq!(event_loop.sessions[index].id(), link.session);
-        assert!(AppSession::load(implementation, &event_loop.ctx.storage).is_ok());
-        assert!(requests.is_empty());
-    });
-}
-
-#[test_case(false; "queued_result_dropped")]
-#[test_case(true; "source_lease_lost_before_publication")]
-fn queued_parent_restore_abort_repairs_projection_without_publishing(handle_after_loss: bool) {
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        approve(event_loop, index, true);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.root_mode() == Mode::Build
-                && event_loop.sessions[index].app.status == Status::Idle
-                && !requests.is_empty()
-        });
-        requests.recv_timeout(WAIT).unwrap();
-        checkpoint_settled(event_loop, index);
-        let link = event_loop.sessions[index]
-            .app
-            .state
-            .session
-            .parent()
-            .unwrap()
-            .clone();
-        let before = fs::read(session_log(event_loop, link.session)).unwrap();
-        let source_manager = event_loop.sessions[index].handles.manager_and_root().0;
-        fs::write(&path, MUTATED_PLAN).unwrap();
-        event_loop
-            .dispatch_parent_restore(index, link.session, link.seq)
-            .unwrap();
-        let ready = loop {
-            let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
-            if matches!(event, InternalEvent::ParentRestoreReady { .. }) {
-                break event;
-            }
-            event_loop.handle_internal(event);
-        };
-        assert!(matches!(
-            &ready,
-            InternalEvent::ParentRestoreReady { result: Ok(_), .. }
-        ));
-        assert_eq!(fs::read_to_string(&path).unwrap(), PLAN);
-        assert!(matches!(
-            source_manager.reserve_graph_transition(),
-            Err(ManagerError::RewindInProgress)
-        ));
-        event_loop.sessions[index].cancel_background_work();
-        if handle_after_loss {
-            event_loop.sessions[index].lock_lost = true;
-            event_loop.handle_internal(ready);
-        } else {
-            let (queued, receiver) = flume::bounded(1);
-            queued.send(ready).unwrap();
-            drop(queued);
-            drop(receiver);
-        }
-        assert!(source_manager.reserve_graph_transition().is_ok());
-        assert_eq!(fs::read_to_string(path).unwrap(), MUTATED_PLAN);
-        assert_eq!(
-            fs::read(session_log(event_loop, link.session)).unwrap(),
-            before
-        );
-        event_loop.sessions[index].app.restore_in_progress = false;
-    });
-}
-
-#[test]
-fn parent_provider_failure_restores_actual_plan_bytes_and_keeps_implementation() {
-    const FAILURE: &str = "parent rewind provider preparation failed";
-    with_event_loop(|event_loop| {
-        let (index, path, requests, _host) = setup(event_loop);
-        approve(event_loop, index, true);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].app.root_mode() == Mode::Build
-                && event_loop.sessions[index].app.status == Status::Idle
-                && !requests.is_empty()
-        });
-        requests.recv_timeout(WAIT).unwrap();
-        checkpoint_settled(event_loop, index);
-        let implementation = event_loop.sessions[index].id();
-        let identity = event_loop.sessions[index].handles.identity();
-        let link = event_loop.sessions[index]
-            .app
-            .state
-            .session
-            .parent()
-            .unwrap()
-            .clone();
-        let source_manager = event_loop.sessions[index].handles.manager_and_root().0;
-        let before = fs::read(session_log(event_loop, link.session)).unwrap();
-        fs::write(&path, MUTATED_PLAN).unwrap();
-        let preparations = Arc::new(AtomicUsize::new(0));
-        let invoked = Arc::clone(&preparations);
-        event_loop.ctx.prepare_provider = sync_preparer(move |_| {
-            invoked.fetch_add(1, Ordering::SeqCst);
-            Err(FAILURE.into())
-        });
-        event_loop
-            .dispatch_parent_restore(index, link.session, link.seq)
-            .unwrap();
-        pump_until(event_loop, |event_loop| {
-            !event_loop.sessions[index].app.restore_in_progress
-        });
-        assert_eq!(event_loop.sessions[index].id(), implementation);
-        assert!(Arc::ptr_eq(
-            &identity,
-            &event_loop.sessions[index].handles.identity()
-        ));
-        assert_eq!(
-            fs::read(session_log(event_loop, link.session)).unwrap(),
-            before
-        );
-        assert_eq!(fs::read_to_string(path).unwrap(), MUTATED_PLAN);
-        assert!(source_manager.reserve_graph_transition().is_ok());
-        assert_eq!(preparations.load(Ordering::SeqCst), 1);
-        assert!(
-            event_loop.sessions[index]
-                .app
-                .status_bar
-                .flash_text()
-                .is_some_and(|message| message.contains(FAILURE))
-        );
-        assert!(requests.is_empty());
     });
 }
 

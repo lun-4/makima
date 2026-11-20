@@ -1,26 +1,17 @@
 mod common;
 
 use common::{RestartHost, TestSession};
-use makima_agent::{
-    AgentId, AgentInput, TurnAdmissionOptions, TurnCancellationReason, TurnId, TurnOrigin,
-    TurnOutcome, TurnProvenance, TurnResult,
-    actor::{ActorEvent, ActorStatus, PreparedModel},
-    journal::{SessionJournal, SessionJournalSnapshot},
-    session_coordinator::ModelPreparer,
-};
+use makima_agent::{AgentId, TurnId, actor::ActorStatus};
 use makima_lua::test_support::{InMemoryFs, run_command};
 use makima_providers::{
     AgentError, Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions,
-    StreamResponse, TokenUsage,
+    StreamResponse,
     provider::{BoxFuture, Provider},
 };
 use makima_storage::{
     StateDir,
     id::SessionRef,
-    session_state::{
-        StateChange, StoredCancellationReason, StoredDelivery, StoredDeliveryOp, StoredStateRecord,
-        StoredTurnStatus,
-    },
+    session_state::{StateChange, StoredCancellationReason, StoredTurnStatus},
 };
 use serde_json::{Value, json};
 use std::sync::{
@@ -38,10 +29,6 @@ const PARENT: &str = "crash parent";
 const DESCENDANT: &str = "crash descendant";
 const REPLY: &str = "completed before crash";
 const SPAWN_TOOL: &str = "crash_spawn";
-const HELD_REPORT: &str = "retained report held across root replacement and restart";
-const HELD_PLUGIN_PROBE: &str = "plugin input must not release restored report";
-const HELD_USER: &str = "explicit user releases restored report";
-const HELD_NEXT_USER: &str = "later user does not redeliver restored report";
 const SOURCE: &str = r#"
 local ids_path = __IDS_PATH__
 local function read()
@@ -203,232 +190,6 @@ fn contains(request: &Request, text: &str) -> bool {
     serde_json::to_string(&request.messages)
         .unwrap()
         .contains(text)
-}
-
-fn wait_idle(events: &flume::Receiver<ActorEvent>) {
-    smol::block_on(common::bounded(async {
-        while !matches!(events.recv_async().await.unwrap(), ActorEvent::Idle { .. }) {}
-    }));
-}
-
-fn held_delivery(
-    snapshot: &SessionJournalSnapshot,
-    parent: AgentId,
-    source: AgentId,
-    turn: TurnId,
-) -> StoredDeliveryOp {
-    let view = snapshot.fold(snapshot.seq).unwrap();
-    view.scopes[&Some(parent)].deliveries[&(source, turn)].clone()
-}
-
-#[test]
-fn root_replacement_report_stays_held_after_restart_until_one_explicit_user_turn() {
-    let tmp = tempfile::tempdir().unwrap();
-    let state = StateDir::from_path(tmp.path().into());
-    let mut session = TestSession::new(
-        &common::default_model().spec(),
-        tmp.path().to_str().unwrap(),
-    );
-    session.save(&state).unwrap();
-    let session_id = session.id;
-    let fs = Arc::new(InMemoryFs::new());
-    fs.seed(
-        &tmp.path().join("plugins").join(format!("{PLUGIN}.lua")),
-        SOURCE
-            .replace("__IDS_PATH__", &json!(tmp.path().join(IDS)).to_string())
-            .into_bytes(),
-    );
-    let (send, requests) = flume::unbounded();
-    let provider = Arc::new(GatedProvider {
-        requests: send,
-        calls: AtomicUsize::new(0),
-    });
-    let host = RestartHost::open_with_provider(
-        tmp.path(),
-        session_id,
-        fs,
-        vec![PLUGIN.into()],
-        provider.clone(),
-    );
-    command(&host, "continuation");
-    request(&requests)
-        .reply
-        .send(common::canned_tool_use(SPAWN_TOOL, json!({})))
-        .unwrap();
-    request(&requests)
-        .reply
-        .send(common::canned_reply(REPLY))
-        .unwrap();
-    command(&host, "wait_parent");
-    let saved = ids(&host);
-    let parent: AgentId = saved["parent"].as_str().unwrap().parse().unwrap();
-    let source: AgentId = saved["descendant"].as_str().unwrap().parse().unwrap();
-    let turn = TurnId::generate();
-    let result = TurnResult {
-        outcome: TurnOutcome::cancelled(
-            source,
-            turn,
-            TokenUsage::default(),
-            0,
-            TurnCancellationReason::User,
-        ),
-        text: HELD_REPORT.into(),
-        output: Vec::new(),
-        provenance: TurnProvenance::default(),
-        duration_ms: 0,
-    };
-    let journal = host.manager.journal();
-    let root = host.root.target.id();
-    let mut guard = smol::block_on(common::bounded(host.manager.begin_rewind(root))).unwrap();
-    let mut restored = journal.checkpoint_snapshot().unwrap();
-    let generation = restored.fold(restored.seq).unwrap().scopes[&Some(parent)].generation;
-    let stored_result = result.to_stored(session_id, None).unwrap();
-    restored.seq += 1;
-    restored.state.push(StoredStateRecord {
-        seq: restored.seq,
-        agent: Some(source),
-        generation: 0,
-        change: StateChange::Turn {
-            turn,
-            result: stored_result.clone(),
-        },
-    });
-    restored.seq += 1;
-    restored.state.push(StoredStateRecord {
-        seq: restored.seq,
-        agent: Some(parent),
-        generation,
-        change: StateChange::Delivery {
-            id: (source, turn),
-            op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                label: None,
-                result: stored_result,
-                held: false,
-                preview_bytes: None,
-            })),
-        },
-    });
-    let mut replacement = smol::block_on(common::bounded(
-        journal.prepare_branch_restore(root, restored),
-    ))
-    .unwrap();
-    assert!(
-        matches!(held_delivery(replacement.snapshot(), parent, source, turn), StoredDeliveryOp::Queued(delivery) if delivery.held)
-    );
-    let prepared_provider = provider.clone();
-    let prepare: ModelPreparer = Arc::new(move |spec| {
-        let provider = prepared_provider.clone();
-        Box::pin(async move {
-            Ok(PreparedModel {
-                model: Model::from_spec(&spec).unwrap(),
-                provider,
-            })
-        })
-    });
-    let actors = smol::block_on(common::bounded(guard.prepare_actors(
-        replacement.snapshot(),
-        &host.root.template.model_policy,
-        &prepare,
-        &host.host.mode_registry(),
-    )))
-    .unwrap();
-    replacement = replacement.with_prepared_actors(&actors).unwrap();
-    let snapshot = replacement.snapshot().clone();
-    replacement.install().unwrap();
-    let installed: Vec<_> = actors
-        .into_iter()
-        .map(|actor| actor.install_held())
-        .collect();
-    guard.reconcile(&snapshot).unwrap();
-    let mut persisted = TestSession::load(session_id, &state).unwrap();
-    snapshot.apply_to(&mut persisted).unwrap();
-    persisted.save(&state).unwrap();
-    for actor in installed {
-        drop(actor.notify());
-    }
-    drop(guard);
-    drop(replacement);
-    let calls = provider.calls.load(Ordering::SeqCst);
-    let host = host.crash_restart_host(tmp.path());
-    let persisted = TestSession::load(session_id, &state).unwrap();
-    let persisted_journal = SessionJournal::from_session(&persisted).unwrap();
-    assert!(
-        matches!(held_delivery(&persisted_journal.snapshot(), parent, source, turn), StoredDeliveryOp::Queued(delivery) if delivery.held)
-    );
-    assert!(!host.manager.is_live(parent));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
-    command(&host, "held_probe");
-    let probe = request(&requests);
-    assert!(contains(&probe, HELD_PLUGIN_PROBE));
-    assert!(!contains(&probe, HELD_REPORT));
-    let actor = host.manager.actor(parent).unwrap();
-    let events = actor.subscribe_events();
-    let probe_turn: TurnId = ids(&host)["probe"].as_str().unwrap().parse().unwrap();
-    let probe_ticket = actor.turn_ticket(probe_turn).unwrap();
-    probe.reply.send(common::canned_reply(REPLY)).unwrap();
-    assert!(matches!(
-        smol::block_on(common::bounded(probe_ticket.wait())),
-        TurnOutcome::Completed { .. }
-    ));
-    wait_idle(&events);
-    let idle = actor.prepare_idle().unwrap();
-    assert!(
-        matches!(held_delivery(&host.manager.journal().snapshot(), parent, source, turn), StoredDeliveryOp::Queued(delivery) if delivery.held)
-    );
-    assert_eq!(provider.calls.load(Ordering::SeqCst), calls + 1);
-    assert!(requests.is_empty());
-    drop(idle);
-    for (index, text) in [HELD_USER, HELD_NEXT_USER].into_iter().enumerate() {
-        let ticket = actor
-            .admit_turn_with_options(
-                AgentInput::new(text.into(), Vec::new()),
-                None,
-                text.into(),
-                TurnAdmissionOptions {
-                    provenance: TurnProvenance {
-                        origin: TurnOrigin::User,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let next = request(&requests);
-        assert!(contains(&next, text));
-        assert_eq!(
-            next.messages
-                .iter()
-                .filter(|message| matches!(
-                    message.observation_source.as_ref(),
-                    Some(makima_providers::ObservationSource::ChildResult { .. })
-                ) && message
-                    .first_text_content()
-                    .is_some_and(|text| text.contains(HELD_REPORT)))
-                .count(),
-            1
-        );
-        next.reply.send(common::canned_reply(REPLY)).unwrap();
-        smol::block_on(common::bounded(ticket.wait()));
-        wait_idle(&events);
-        assert!(matches!(
-            held_delivery(&host.manager.journal().snapshot(), parent, source, turn),
-            StoredDeliveryOp::Consumed
-        ));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), calls + index + 2);
-    }
-    let consumed = host
-        .manager
-        .journal()
-        .snapshot()
-        .state
-        .iter()
-        .filter(|record| {
-            matches!(&record.change, StateChange::Delivery {
-                id, op: StoredDeliveryOp::Consumed,
-            } if *id == (source, turn))
-        })
-        .count();
-    assert_eq!(consumed, 1);
 }
 
 #[test_case(false; "running_and_queued_child")]
