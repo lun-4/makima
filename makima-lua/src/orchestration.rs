@@ -8,10 +8,10 @@ use makima_agent::command::command_input;
 use makima_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
 use makima_agent::headless::{InteractiveControl, InteractiveHandle, RootBinding};
 use makima_agent::manager::AgentIncarnation;
-use makima_agent::session_checkpoint::SessionLogCheckpoint;
 use makima_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::{
     AgentActorHandle, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
     tools::ToolContext,
@@ -23,7 +23,7 @@ use makima_commands::{
 use makima_providers::Message;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::sessions::{HistorySnapshot, StoredSubagent};
+use makima_storage::sessions::HistorySnapshot;
 use mlua::Lua;
 use std::{
     collections::HashMap,
@@ -378,29 +378,15 @@ pub type TurnCompletion =
 pub fn child_persistence(
     label: &'static str,
     services: Weak<AgentOrchestration>,
-    checkpoint: Arc<SessionLogCheckpoint>,
+    _writer: Arc<SessionWriter>,
 ) -> (ConfigMutationReserver, TurnCompletion) {
-    let destination = move |target: &AgentRef| -> Result<(String, String), String> {
-        let services = services
-            .upgrade()
-            .ok_or_else(|| format!("{label} orchestration is closed"))?;
-        let key = services.history_key(target)?;
-        let name = target
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .metadata
-            .label
-            .unwrap_or_default();
-        Ok((key, name))
-    };
-    let config_destination = destination.clone();
-    let completion_destination = destination;
-    let config_checkpoint = Arc::clone(&checkpoint);
-
+    let config_services = services.clone();
     let reserver: ConfigMutationReserver = Arc::new(move |target, publication| {
-        let (key, name) = config_destination(target)?;
-        let agent_id = target.id().to_string();
-        let checkpoint = Arc::clone(&config_checkpoint);
+        config_services
+            .upgrade()
+            .ok_or_else(|| format!("{label} orchestration is closed"))?
+            .history_key(target)?;
+        let journal = target.manager().journal();
         Ok(Box::new(move |_, claim| {
             Ok(PreparedTransaction {
                 publication,
@@ -409,55 +395,29 @@ pub fn child_persistence(
                 history_changed: false,
                 publish: Box::new(move |ready, publication| {
                     Box::pin(async move {
-                        checkpoint
-                            .checkpoint_child_config(
-                                StoredSubagent {
-                                    agent_id: Some(agent_id),
-                                    ..child_metadata(key, name)
-                                },
-                                ready.journal,
-                                publication,
-                                claim,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())
+                        claim(&publication).map_err(|error| error.to_string())?;
+                        if let Some(install) = ready.install {
+                            install()?;
+                        }
+                        journal.flush().await
                     })
                 }),
                 finalize: Box::new(|_| {}),
             })
         }))
     });
-
-    let completion: TurnCompletion = Arc::new(move |target, history| {
-        let child = (|| {
-            let (key, name) = completion_destination(target)?;
-            Ok::<_, String>(StoredSubagent {
-                agent_id: Some(target.id().to_string()),
-                ..child_metadata(key, name)
-            })
-        })();
-        let checkpoint = Arc::clone(&checkpoint);
+    let completion: TurnCompletion = Arc::new(move |target, _| {
+        let destination = services
+            .upgrade()
+            .ok_or_else(|| format!("{label} orchestration is closed"))
+            .and_then(|services| services.history_key(target));
+        let journal = target.manager().journal();
         Box::pin(async move {
-            checkpoint
-                .checkpoint_child(child?, history)
-                .await
-                .map_err(|error| error.to_string())
+            destination?;
+            journal.flush().await
         })
     });
-
     (reserver, completion)
-}
-
-pub fn child_metadata(key: String, name: String) -> StoredSubagent {
-    StoredSubagent {
-        agent_id: None,
-        ambiguous: false,
-        tool_use_id: key,
-        name,
-        model: None,
-        thinking: None,
-        fast: false,
-    }
 }
 
 /// A root binding that hands the bound root and its template to the frontend.
@@ -516,7 +476,7 @@ pub fn durable_frontend(
     catalog: &ModelCatalog,
     root: TrustedTarget,
     coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionLogCheckpoint>,
+    checkpoint: Arc<SessionWriter>,
 ) -> Arc<AgentOrchestration> {
     Arc::new_cyclic(|services| {
         let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
@@ -861,24 +821,14 @@ pub(crate) fn validate_pinned_target(
 mod tests {
     use super::{
         CommandContent, CommandError, CommandOutcome, InputDispatch, NEEDS_FRONTEND,
-        ScopeAuthority, WRONG_TASK, child_metadata, detached_outcome, install_plugin_authority,
-        plugin_authority, revoke_plugin,
+        ScopeAuthority, WRONG_TASK, detached_outcome, install_plugin_authority, plugin_authority,
+        revoke_plugin,
     };
     use crate::agent_errors::ORCHESTRATION_CONTEXT_EXPIRED;
     use crate::runtime::{TaskCell, TaskScope};
     use makima_agent::cancel::CancelToken;
     use mlua::Lua;
     use std::sync::Arc;
-
-    #[test]
-    fn child_metadata_contains_identity_only() {
-        let child = child_metadata("call-child".into(), "worker".into());
-        assert_eq!(child.tool_use_id, "call-child");
-        assert_eq!(child.name, "worker");
-        assert!(child.model.is_none());
-        assert!(child.thinking.is_none());
-        assert!(!child.fast);
-    }
 
     #[test]
     fn authority_rejects_sibling_scope_reload_and_scope_exit() {

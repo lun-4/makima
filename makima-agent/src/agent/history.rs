@@ -9,6 +9,7 @@ use makima_providers::{
     MessageKind, Role,
 };
 use makima_storage::conversation::ConversationState;
+use makima_storage::id::MakimaId;
 use makima_storage::session_state::{StateChange, StoredDeliveryOp};
 use makima_storage::sessions::next_epoch;
 use tracing::warn;
@@ -95,10 +96,11 @@ impl History {
     }
 
     pub fn restored_snapshot(snapshot: HistorySnapshot) -> Self {
-        let mut history = Self::restored(Arc::unwrap_or_clone(snapshot.messages));
-        history.snapshot.compacted = snapshot.compacted;
-        if let Some(conversation) = snapshot.conversation {
-            history.set_conversation(conversation);
+        let mut history = Self::restored_exact(snapshot);
+        let mut messages = history.snapshot.messages.as_ref().clone();
+        sanitize_restored(&mut messages);
+        if messages != *history.snapshot.messages {
+            history.rewrite(|current| *current = messages);
         }
         history
     }
@@ -275,6 +277,7 @@ impl History {
         {
             let mut history = self.snapshot.clone();
             Arc::make_mut(&mut history.messages).push(msg);
+            Arc::make_mut(&mut history.ids).push(MakimaId::generate());
             let result = journal.commit_with_apply(
                 |snapshot| {
                     if explicit_user {
@@ -408,6 +411,8 @@ impl History {
         let previous_snapshot = self.snapshot.clone();
         let previous_conversation = self.conversation.clone();
         self.snapshot.epoch = next_epoch();
+        self.snapshot.covered = self.snapshot.ids.last().copied();
+        self.snapshot.ids = Arc::new(messages.iter().map(|_| MakimaId::generate()).collect());
         self.snapshot.messages = Arc::new(messages);
         self.snapshot.compacted = true;
         let ended = self.set_conversation(ConversationState::fresh(None));
@@ -442,13 +447,33 @@ impl History {
     /// An append: whatever a consumer already holds of the list stays good.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         f(Arc::make_mut(&mut self.snapshot.messages));
+        Arc::make_mut(&mut self.snapshot.ids)
+            .resize_with(self.snapshot.messages.len(), MakimaId::generate);
         self.publish();
     }
 
     /// Any other change, so a consumer has to start the list over.
     fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         self.snapshot.epoch = next_epoch();
+        self.snapshot.covered = self.snapshot.ids.last().copied();
+        let previous = Arc::clone(&self.snapshot.messages);
         f(Arc::make_mut(&mut self.snapshot.messages));
+        let mut remaining = previous.iter().zip(self.snapshot.ids.iter());
+        self.snapshot.ids = Arc::new(
+            self.snapshot
+                .messages
+                .iter()
+                .map(|message| {
+                    let mut matching = remaining.clone();
+                    if let Some((_, id)) = matching.find(|(before, _)| *before == message) {
+                        remaining = matching;
+                        *id
+                    } else {
+                        MakimaId::generate()
+                    }
+                })
+                .collect(),
+        );
         self.publish_replacement();
     }
 
@@ -639,6 +664,65 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+
+    #[test]
+    fn history_ids_survive_restore_append_and_compaction() {
+        let mut history = History::new(vec![Message::user(FIRST.into())]);
+        let first = history.snapshot().ids[0];
+        history = History::restored_snapshot(history.snapshot().clone());
+        assert_eq!(history.snapshot().ids[0], first);
+        history.push(Message::user(SECOND.into()));
+        let second = history.snapshot().ids[1];
+        assert_eq!(history.snapshot().ids[0], first);
+        assert_ne!(first, second);
+        history
+            .replace_compacted(vec![Message::user(GO.into())])
+            .unwrap();
+        assert_eq!(history.snapshot().covered, Some(second));
+        assert_eq!(history.snapshot().ids.len(), 1);
+        assert_ne!(history.snapshot().ids[0], first);
+        assert_ne!(history.snapshot().ids[0], second);
+    }
+
+    #[test]
+    fn truncate_and_cancelled_sanitation_preserve_retained_ids() {
+        let mut history = History::new(vec![
+            Message::user(FIRST.into()),
+            Message::user(SECOND.into()),
+            Message::user(GO.into()),
+        ]);
+        let original = history.snapshot().ids.clone();
+        history.truncate(2);
+        assert_eq!(history.snapshot().ids.as_slice(), &original[..2]);
+        history.sanitize_cancelled(0);
+        assert_eq!(&history.snapshot().ids[..2], &original[..2]);
+        assert_eq!(history.snapshot().ids.len(), history.len());
+        assert!(!original.contains(&history.snapshot().ids[2]));
+    }
+
+    #[test]
+    fn restored_sanitation_keeps_surviving_message_ids() {
+        let orphan = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: FIRST.into(),
+                content: FIRST.into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        };
+        let snapshot = HistorySnapshot::new(vec![
+            Message::user(FIRST.into()),
+            orphan,
+            Message::user(SECOND.into()),
+        ]);
+        let original = snapshot.ids.clone();
+        let history = History::restored_snapshot(snapshot);
+        assert_eq!(
+            history.snapshot().ids.as_slice(),
+            &[original[0], original[2]]
+        );
+    }
 
     #[test_case(true, false; "explicit_user_input_releases")]
     #[test_case(false, false; "plugin_input_keeps_held")]

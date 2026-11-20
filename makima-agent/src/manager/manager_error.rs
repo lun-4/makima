@@ -84,4 +84,6 @@ pub enum ManagerError {
     BusySubtree(AgentId),
     #[error("agent policy update failed: {0}")]
     Policy(String),
+    #[error("agent persistence failed: {0}")]
+    Persistence(String),
 }

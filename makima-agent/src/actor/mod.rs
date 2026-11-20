@@ -1400,6 +1400,25 @@ fn retire_and_publish(
                 };
                 let outcome = if let Err(error) = checkpoint_result {
                     tracing::warn!(%error, agent_id = %inner.agent_id, %turn_id, "terminal checkpoint failed");
+                    if let Some(journal) = &inner.journal {
+                        journal.set_checkpoint_error(Some(error.clone()));
+                    }
+                    let outcome = outcome.checkpoint_failed(error);
+                    replace_terminal_outcome(&inner, ticket.as_ref(), &outcome);
+                    outcome
+                } else {
+                    if let Some(journal) = &inner.journal {
+                        journal.set_checkpoint_error(None);
+                    }
+                    outcome
+                };
+                publish_terminal(&inner, turn_id, outcome, ticket, sender);
+            }).detach();
+        } else if let Some(journal) = inner.journal.clone().filter(|journal| journal.has_writer()) {
+            let inner = Arc::clone(inner);
+            smol::spawn(async move {
+                let outcome = if let Err(error) = journal.flush().await {
+                    tracing::warn!(%error, agent_id = %inner.agent_id, %turn_id, "terminal journal flush failed");
                     let outcome = outcome.checkpoint_failed(error);
                     replace_terminal_outcome(&inner, ticket.as_ref(), &outcome);
                     outcome
@@ -1407,7 +1426,8 @@ fn retire_and_publish(
                     outcome
                 };
                 publish_terminal(&inner, turn_id, outcome, ticket, sender);
-            }).detach();
+            })
+            .detach();
         } else {
             publish_terminal(inner, turn_id, outcome, ticket, sender);
         }

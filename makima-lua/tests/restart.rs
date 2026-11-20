@@ -532,6 +532,7 @@ fn reject_without_mutation(
         .cwd
         .join(SESSIONS_DIR)
         .join(format!("{}.jsonl", host.session.id));
+    smol::block_on(common::bounded(host.manager.journal().flush())).unwrap();
     let published = std::fs::read(&disk).unwrap();
     let ids = saved(host, path);
     let id = ids["agent_id"].as_str().unwrap().parse().unwrap();
@@ -543,7 +544,11 @@ fn reject_without_mutation(
         json!({ "action": "reject", "path": path, "error": error, "closed": closed }),
     );
     assert_eq!(provider.request_count(), requests);
-    assert_eq!(std::fs::read(disk).unwrap(), published);
+    smol::block_on(common::bounded(host.manager.journal().flush())).unwrap();
+    assert!(
+        std::fs::read(disk).unwrap() == published,
+        "rejected operation changed the durable session log"
+    );
     let after = host.manager.journal().checkpoint_snapshot().unwrap();
     assert_eq!(after.seq, journal.seq);
     assert_eq!(after.state, journal.state);
@@ -663,6 +668,7 @@ fn restart_reactivation_requires_current_discovery_and_retries_without_admission
         .path()
         .join(SESSIONS_DIR)
         .join(format!("{}.jsonl", host.session.id));
+    smol::block_on(common::bounded(host.manager.journal().flush())).unwrap();
     let before = std::fs::read(&disk).unwrap();
     let unavailable = if error == MODEL_UNAVAILABLE {
         format!("{error}: {model_spec}")

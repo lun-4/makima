@@ -252,10 +252,13 @@ impl<'a> ConfigChangeTicket<'a> {
         ) -> Result<(CheckpointClaim, ConfigChange), ConfigChangeError>,
     ) -> Result<ConfigCommit, ConfigChangeError> {
         let predecessor = self.wait_predecessor().await?;
+
         let (mutation, operation) = self.reserved.take().expect("waiting reserves the change");
         let (claim, change) = prepare(self.publication, predecessor).await?;
         operation.resolve(Some(change))?;
+
         operation.wait_ready().await?;
+
         let mut transaction = mutation(operation.ready_config()?, claim)?;
         transaction.state_edits.append(&mut self.state_edits);
         Ok(operation.commit_durable(transaction).await?.config)

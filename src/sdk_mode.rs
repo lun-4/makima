@@ -37,13 +37,13 @@ use makima_agent::mcp;
 use makima_agent::permissions::{
     PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer,
 };
-use makima_agent::session_checkpoint::SessionLogCheckpoint;
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_defaults;
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, SessionOptionError, YOLO_OPTION_ID,
 };
 use makima_agent::session_recovery::RecoveredSession;
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
@@ -70,7 +70,7 @@ use makima_storage::conversation::{ConversationRelation, ConversationState};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
 use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
-use makima_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, read_prefs};
+use makima_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -680,7 +680,7 @@ impl SdkCommands {
 struct SdkRuntime {
     handle: InteractiveHandle,
     coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionLogCheckpoint>,
+    checkpoint: Arc<SessionWriter>,
     _lock: Arc<session_lock::LockHeartbeat>,
     root: TrustedTarget,
     commands: Arc<SdkCommands>,
@@ -690,6 +690,7 @@ struct SdkRuntime {
     shared: Arc<Mutex<Shared>>,
     init: Value,
     resumed: bool,
+    usage_seed: (TokenUsage, HashMap<String, StoredTokenUsage>),
     tasks: Mutex<Vec<smol::Task<()>>>,
     discovery: Mutex<Option<Discovery>>,
 }
@@ -1015,6 +1016,10 @@ impl SdkRuntime {
                 handle,
                 coordinator: coordinator.clone(),
                 checkpoint,
+                usage_seed: (
+                    recovered.session().token_usage,
+                    recovered.session().usage_by_model().clone(),
+                ),
                 _lock: lock_guard,
                 root: trusted_root,
                 commands: sdk_commands,
@@ -1045,6 +1050,11 @@ impl SdkRuntime {
             .install_orchestration_services(self.orchestration.clone());
         let observer =
             HeadlessObserver::new(params.lua_handle.clone(), self.handle.session_id.id());
+        observer.persist_usage(
+            self.checkpoint.as_ref().clone(),
+            self.usage_seed.0,
+            self.usage_seed.1.clone(),
+        );
         observer.install(self.root.target.clone());
         if self.resumed {
             params
@@ -1723,7 +1733,7 @@ async fn recover_sdk_session(
     cwd: &str,
     modes: &ModeRegistry,
 ) -> Result<(
-    Arc<SessionLogCheckpoint>,
+    Arc<SessionWriter>,
     Arc<session_lock::LockHeartbeat>,
     RecoveredSession,
 )> {
@@ -1796,11 +1806,8 @@ async fn recover_sdk_session(
     if !restore_legacy && restored.parent.is_some() {
         seed.set_parent(restored.parent.clone());
     }
-    let checkpoint = Arc::new(SessionLogCheckpoint::open_with_session(
-        storage.clone(),
-        seed,
-        Some(lock_guard.publication_guard()),
-    )?);
+    let checkpoint = Arc::new(SessionWriter::open_session(&sessions_dir, &seed)?);
+    checkpoint.bind_publication_guard(Some(lock_guard.publication_guard()));
     let claim: CheckpointClaim = Arc::new(|publication| {
         publication
             .try_publish()
@@ -1808,7 +1815,7 @@ async fn recover_sdk_session(
             .ok_or_else(|| Arc::from(RECOVERY_CANCELLED))
     });
     let recovered = checkpoint
-        .recover(CheckpointPublication::default(), claim)
+        .recover(seed, CheckpointPublication::default(), claim)
         .await?;
     Ok((checkpoint, lock_guard, recovered))
 }
@@ -2767,6 +2774,31 @@ mod tests {
     const LEGACY_PLAN_FILE: &str = "legacy-sdk-plan.md";
     const LEGACY_PLAN_CONTENT: &str = "preserved legacy SDK plan";
 
+    struct TerminalSyncGate {
+        file: std::fs::File,
+        response: &'static str,
+        buffered: Vec<u8>,
+        gate: Option<(Sender<()>, Receiver<()>)>,
+    }
+
+    impl makima_agent::session_writer::SessionIo for TerminalSyncGate {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let written = Write::write(&mut self.file, bytes)?;
+            self.buffered.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            if String::from_utf8_lossy(&self.buffered).contains(self.response)
+                && let Some((entered, release)) = self.gate.take()
+            {
+                entered.send(()).map_err(std::io::Error::other)?;
+                release.recv().map_err(std::io::Error::other)?;
+            }
+            self.file.sync_all()
+        }
+    }
+
     fn reset_sdk_params(cwd: PathBuf) -> SdkParams {
         use clap::Parser;
         SdkParams {
@@ -3099,6 +3131,8 @@ mod tests {
                 change: StateChange::Config(config.clone()),
             });
             saved.save(&storage).unwrap();
+            let path = sessions_dir.join(format!("{}.jsonl", saved.id));
+            let before_recovery = std::fs::read(&path).unwrap();
             competing_lease.release().unwrap();
 
             let (checkpoint, lease, recovered) = recover_sdk_session(
@@ -3112,6 +3146,7 @@ mod tests {
             .await
             .unwrap();
             checkpoint.drain().await.unwrap();
+            assert!(std::fs::read(&path).unwrap().starts_with(&before_recovery));
             let durable = StoredSession::load(saved.id, &storage).unwrap();
             for session in [recovered.session(), &durable] {
                 assert_eq!(session.model, RESTORED_MODEL);
@@ -4391,7 +4426,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let state = recovered.session().state().to_vec();
+                let state: Vec<_> = recovered
+                    .session()
+                    .state()
+                    .iter()
+                    .filter(|record| matches!(record.change, StateChange::Turn { .. }))
+                    .cloned()
+                    .collect();
+                assert_eq!(state.len(), 2);
                 if let Some(first) = &first_state {
                     assert_eq!(first, &state);
                 } else {
@@ -4501,11 +4543,13 @@ mod tests {
             thinking: None,
             fast: false,
         }]);
-        session.meta.compacted = true;
-        session.meta.conversation = Some(ConversationState {
+        let mut compacted = session.history_snapshot();
+        compacted.compacted = true;
+        compacted.conversation = Some(ConversationState {
             sent: Some(STORED_SENT),
             ..ConversationState::new(STORED_CONVERSATION.into())
         });
+        session.adopt_history(&compacted);
         session.save(&storage).unwrap();
         let source_path = storage
             .path()
@@ -4625,19 +4669,11 @@ mod tests {
                 seed.id = handle.session_id.id();
                 seed
             });
-            handle
-                .manager
-                .journal()
-                .snapshot()
-                .apply_to(&mut seed)
-                .unwrap();
+            seed.set_parent(restored.parent.clone());
             let writer = Arc::new(
-                SessionLogCheckpoint::open_with_session(storage.clone(), seed, None).unwrap(),
+                SessionWriter::open_session(&storage.ensure_subdir(SESSIONS_DIR).unwrap(), &seed)
+                    .unwrap(),
             );
-            writer
-                .bind_root_id(root.id(), restored.parent.clone())
-                .await
-                .unwrap();
             writer.bind_journal(handle.manager.journal()).await.unwrap();
             let coordinator = SessionCoordinatorHandle::register(
                 makima_agent::session_coordinator::SessionCoordinatorParams {
@@ -4660,6 +4696,13 @@ mod tests {
             .unwrap();
             coordinator
                 .bind_permissions(Arc::clone(&handle.permissions))
+                .unwrap();
+            coordinator
+                .bind_actor(
+                    root.clone(),
+                    headless::default_model_preparer(Arc::default()),
+                    Arc::new(|_| {}),
+                )
                 .unwrap();
             let source = root
                 .actor()
@@ -5052,13 +5095,8 @@ mod tests {
                 makima_agent::session_coordinator::SessionCheckpoint,
             >| {
                 let checkpointed = Arc::clone(&checkpointed_clone);
-                let terminal_started = terminal_started.clone();
-                let terminal_resume = terminal_resume.clone();
+
                 Box::pin(async move {
-                    if request.snapshot.kind == SessionCheckpointKind::History {
-                        terminal_started.send_async(()).await.unwrap();
-                        terminal_resume.recv_async().await.unwrap();
-                    }
                     let ack = makima_storage::checkpoint::CheckpointAck::for_request(&request);
                     checkpointed.lock().unwrap().push(request.snapshot);
                     Ok(ack)
@@ -5122,16 +5160,31 @@ mod tests {
         let (child_completion_release, child_completion_resume) = flume::bounded(1);
         let root_id = agent.id();
         let child_storage = StateDir::from_path(state_dir.path().to_path_buf());
-        let child_checkpoint = Arc::new(
-            makima_agent::session_checkpoint::SessionLogCheckpoint::open(
-                child_storage.clone(),
-                id,
-                STARTUP_MODEL,
-                &cwd.to_string_lossy(),
-                None,
-            )
-            .unwrap(),
-        );
+        let mut child_seed = StoredSession::new(STARTUP_MODEL, &cwd.to_string_lossy());
+        child_seed.id = id;
+        child_seed.save(&child_storage).unwrap();
+        let child_path = child_storage
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{id}.jsonl"));
+        let next_seq = StoredSession::load(id, &child_storage)
+            .unwrap()
+            .sequence_high_water()
+            .unwrap_or_default()
+            + 1;
+        let child_checkpoint = Arc::new(SessionWriter::with_io(
+            id,
+            TerminalSyncGate {
+                file: std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(child_path)
+                    .unwrap(),
+                response: SDK_ROOT_RESPONSE,
+                buffered: Vec::new(),
+                gate: Some((terminal_started.clone(), terminal_resume.clone())),
+            },
+            next_seq,
+        ));
         smol::block_on(child_checkpoint.bind_journal(handle.manager.journal())).unwrap();
         let catalog = ModelCatalog::default();
         smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()], None));
@@ -5367,20 +5420,16 @@ mod tests {
         assert_eq!(child_config.thinking, makima_providers::ThinkingConfig::Off);
         assert!(!child_config.fast);
         let persisted = StoredSession::load(id, &child_storage).unwrap();
-        let stored = persisted
-            .subagents()
-            .iter()
-            .find(|stored| stored.tool_use_id == child_key)
-            .unwrap();
-        let mut expected = makima_lua::orchestration::child_metadata(
-            child_key.clone(),
-            child.metadata.label.clone().unwrap_or_default(),
-        );
-        expected.agent_id = Some(child.agent_id.to_string());
-        expected.model = Some(child_config.model.spec().to_string());
-        expected.thinking = Some(child_config.thinking.into());
-        expected.fast = child_config.fast;
-        assert_eq!(stored, &expected);
+        let stored = &persisted.agents()[&child.agent_id];
+        assert_eq!(stored.parent, Some(agent.id()));
+        assert_eq!(usize::try_from(stored.depth).unwrap(), child.depth);
+        assert_eq!(stored.transcript_key, child_key);
+        assert_eq!(stored.label, child.metadata.label);
+        let state = persisted.latest_state().unwrap();
+        let config = state.scopes[&Some(child.agent_id)].config.as_ref().unwrap();
+        assert_eq!(config.model, child_config.model.spec());
+        assert_eq!(config.thinking, Some(child_config.thinking.into()));
+        assert_eq!(config.fast, child_config.fast);
         let child_history = &persisted.subagent_messages()[&child_key];
         let current = child_ref.manager().journal().snapshot();
         assert!(
@@ -5513,7 +5562,7 @@ mod tests {
         assert!(coordinator.read().options().version > before_version);
         assert_eq!(
             checkpointed.lock().unwrap().len(),
-            initial_checkpoint_count + 3
+            initial_checkpoint_count + 2
         );
         catalog.attach(&services);
         smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()], None));
@@ -5524,8 +5573,8 @@ mod tests {
         }
         {
             let saved = checkpointed.lock().unwrap();
-            assert_eq!(saved.len(), initial_checkpoint_count + 4);
-            let published_options = &saved[initial_checkpoint_count + 3];
+            assert_eq!(saved.len(), initial_checkpoint_count + 3);
+            let published_options = &saved[initial_checkpoint_count + 2];
             assert_eq!(published_options.kind, SessionCheckpointKind::Options);
             assert!(published_options.history.is_none());
             assert!(published_options.config.is_none());
@@ -5534,7 +5583,7 @@ mod tests {
         smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()], None));
         assert_eq!(
             checkpointed.lock().unwrap().len(),
-            initial_checkpoint_count + 4
+            initial_checkpoint_count + 3
         );
         let manager = handle.manager.clone();
         let InteractiveHandle { input_tx, task, .. } = handle;
@@ -5562,11 +5611,10 @@ mod tests {
         assert_eq!(results[0]["result"], SDK_ROOT_RESPONSE);
         assert_eq!(results[0]["is_error"], false);
         let saved = checkpointed.lock().unwrap();
-        assert_eq!(saved.len(), initial_checkpoint_count + 4);
-        let terminal_history = &saved[initial_checkpoint_count + 1];
-        assert_eq!(terminal_history.kind, SessionCheckpointKind::History);
-        assert!(terminal_history.history.as_ref().unwrap().messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::Text { text } if text == SDK_ROOT_RESPONSE)));
+        assert_eq!(saved.len(), initial_checkpoint_count + 3);
         drop(saved);
+        let durable = StoredSession::load(id, &child_storage).unwrap();
+        assert!(durable.messages().iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::Text { text } if text == SDK_ROOT_RESPONSE)));
         let graph = manager.snapshot();
         assert!(!graph.is_empty());
         for node in graph {

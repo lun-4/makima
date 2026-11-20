@@ -36,9 +36,10 @@ use crate::manager::{
 };
 use crate::permissions::{PermissionManager, PermissionSnapshot, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
-use crate::session_checkpoint::{SessionLogCheckpoint, stored_agent_config};
+use crate::session_checkpoint::stored_agent_config;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::session_options::SessionOptionError;
+use crate::session_writer::SessionWriter;
 use crate::state::StateAccess;
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
@@ -790,8 +791,8 @@ impl ActorBackend for HeadlessBackend {
                                     snapshot.result.outcome.turn_id(),
                                 )
                                 .await?;
-                            if let Some(error) = journal.persistence_error() {
-                                return Err(error);
+                            if journal.has_writer() {
+                                return journal.flush().await;
                             }
                         }
                         persist_history(session_id, snapshot.history).await
@@ -1140,7 +1141,7 @@ pub fn spawn_interactive_with_checkpoint(
     prepare: ProviderPreparation,
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
-    checkpoint: Arc<SessionLogCheckpoint>,
+    checkpoint: Arc<SessionWriter>,
 ) -> InteractiveHandle {
     spawn_interactive(params, prepare, history, binding, true, Some(checkpoint))
 }
@@ -1159,7 +1160,7 @@ fn spawn_interactive(
     history: Option<crate::agent::HistorySnapshot>,
     binding: Option<RootBinding>,
     persist_turn_results: bool,
-    checkpoint: Option<Arc<SessionLogCheckpoint>>,
+    checkpoint: Option<Arc<SessionWriter>>,
 ) -> InteractiveHandle {
     let session_ref = params
         .session_id
@@ -1603,7 +1604,6 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
-    use crate::session_checkpoint::SessionLogCheckpoint;
     use crate::session_coordinator::tests::bind_initializing_actor;
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::test_util::StubBackend;
@@ -1627,6 +1627,7 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
     use test_case::test_case;
 
@@ -2137,9 +2138,8 @@ pub(crate) mod tests {
         )
     }
 
-    #[test_case(false; "publishes_build_before_readiness")]
-    #[test_case(true; "publication_failure_keeps_root_unavailable")]
-    fn restored_plan_fallback_is_published_before_admission(reject_publication: bool) {
+    #[test]
+    fn restored_plan_fallback_is_published_before_admission() {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -2165,10 +2165,15 @@ pub(crate) mod tests {
             session.save(&storage).unwrap();
             let id = session.id;
             let checkpoint = Arc::new(
-                SessionLogCheckpoint::open_with_session(storage.clone(), session, None).unwrap(),
+                SessionWriter::open_session(
+                    &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                    &session,
+                )
+                .unwrap(),
             );
             let recovered = checkpoint
                 .recover(
+                    session,
                     CheckpointPublication::default(),
                     Arc::new(|publication| {
                         assert!(publication.try_publish());
@@ -2177,14 +2182,6 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            let path = storage
-                .ensure_subdir(SESSIONS_DIR)
-                .unwrap()
-                .join(format!("{id}.jsonl"));
-            if reject_publication {
-                std::fs::remove_file(&path).unwrap();
-                std::fs::create_dir(&path).unwrap();
-            }
             let mut params = interactive_params(id, Vec::new());
             params.providers = Arc::new(makima_providers::test_util::offline_ids(&["anthropic"]));
             params.root_id = Some(root_id);
@@ -2237,22 +2234,17 @@ pub(crate) mod tests {
                 })),
                 checkpoint,
             );
-            if reject_publication {
-                assert!(bounded(handle.initialized_root()).await.is_err());
-                assert!(handle.manager.lookup(root_id).unwrap().actor().is_err());
-            } else {
-                bounded(entering.recv_async()).await.unwrap();
-                assert!(handle.root.current().is_none());
-                let mut admission = Box::pin(handle.input_tx.admit(first_input()));
-                assert!(future::poll_once(admission.as_mut()).await.is_none());
-                drop(admission);
-                release.send(()).unwrap();
-                let root = bounded(handle.initialized_root()).await.unwrap();
-                assert!(matches!(
-                    root.effective_config().unwrap().unwrap().mode,
-                    AgentMode::Build
-                ));
-            }
+            bounded(entering.recv_async()).await.unwrap();
+            assert!(handle.root.current().is_none());
+            let mut admission = Box::pin(handle.input_tx.admit(first_input()));
+            assert!(future::poll_once(admission.as_mut()).await.is_none());
+            drop(admission);
+            release.send(()).unwrap();
+            let root = bounded(handle.initialized_root()).await.unwrap();
+            assert!(matches!(
+                root.effective_config().unwrap().unwrap().mode,
+                AgentMode::Build
+            ));
             assert!(requests.is_empty());
             bounded(handle.task.cancel()).await;
         });
@@ -2477,20 +2469,17 @@ pub(crate) mod tests {
             session.bind_root_id(root_id).unwrap();
             let mut params = interactive_params(session.id, Vec::new());
             params.root_id = Some(root_id);
-            let writer = SessionLogCheckpoint::open_with_session(storage, session, None).unwrap();
-            let (entered, entering) = flume::bounded(1);
-            let (release, released) = flume::bounded::<()>(1);
-            let claim = Arc::new(
-                move |_: &makima_storage::checkpoint::CheckpointPublication| {
-                    entered.send(()).unwrap();
-                    released.recv().unwrap();
-                    Err(Arc::from(SAVE_ERROR))
-                },
-            );
+            let writer = SessionWriter::open_session(
+                &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                &session,
+            )
+            .unwrap();
+            let claim = Arc::new(|_: &CheckpointPublication| Err(Arc::from(SAVE_ERROR)));
             let (prepared, preparations) = flume::unbounded();
             let startup = smol::spawn(async move {
                 let recovered = writer
                     .recover(
+                        session,
                         makima_storage::checkpoint::CheckpointPublication::default(),
                         claim,
                     )
@@ -2511,9 +2500,6 @@ pub(crate) mod tests {
                     None,
                 ))
             });
-            bounded(entering.recv_async()).await.unwrap();
-            assert!(preparations.is_empty());
-            release.send(()).unwrap();
             assert!(bounded(startup).await.is_err());
             assert!(preparations.is_empty());
         });
@@ -2546,14 +2532,18 @@ pub(crate) mod tests {
             });
             let session_id = session.id;
             session.save(&storage).unwrap();
-            let writer =
-                SessionLogCheckpoint::open_with_session(storage.clone(), session, None).unwrap();
+            let writer = SessionWriter::open_session(
+                &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                &session,
+            )
+            .unwrap();
             let claim: makima_storage::checkpoint::CheckpointClaim = Arc::new(|publication| {
                 assert!(publication.try_publish());
                 Ok(())
             });
             let recovered = writer
                 .recover(
+                    session,
                     makima_storage::checkpoint::CheckpointPublication::default(),
                     claim,
                 )
@@ -2846,10 +2836,12 @@ pub(crate) mod tests {
                 .permissions
                 .restore(PermissionSnapshot::from_stored(&rules, yolo).unwrap());
             let journal = handle.manager.journal();
-            let mut session = session;
-            journal.snapshot().apply_to(&mut session).unwrap();
             let writer = Arc::new(
-                SessionLogCheckpoint::open_with_session(storage.clone(), session, None).unwrap(),
+                SessionWriter::open_session(
+                    &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                    &session,
+                )
+                .unwrap(),
             );
             writer.bind_journal(Arc::clone(&journal)).await.unwrap();
             let coordinator = coordinator(handle.session_id.id(), writer);
@@ -2983,9 +2975,12 @@ pub(crate) mod tests {
                 assert_eq!(source.history.conversation, initial.conversation);
                 assert_eq!(source.history.compacted, initial.compacted);
             }
-            journal.snapshot().apply_to(&mut session).unwrap();
             let writer = Arc::new(
-                SessionLogCheckpoint::open_with_session(storage.clone(), session, None).unwrap(),
+                SessionWriter::open_session(
+                    &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                    &session,
+                )
+                .unwrap(),
             );
             writer.bind_journal(Arc::clone(&journal)).await.unwrap();
             let coordinator = coordinator(handle.session_id.id(), writer.clone());
@@ -3095,12 +3090,14 @@ pub(crate) mod tests {
         smol::block_on(async {
             let (seen, checkpoints) = flume::bounded(1);
             let (publish, publishing) = flume::bounded(1);
+            let checkpoint_calls = Arc::new(AtomicUsize::new(0));
             let journal = Arc::new(OnceLock::<Arc<SessionJournal>>::new());
             let checkpoint_journal = Arc::clone(&journal);
             let checkpoint: Checkpoint = Arc::new(
                 move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
                     let seen = seen.clone();
                     let publishing = publishing.clone();
+                    let fail = fail && checkpoint_calls.fetch_add(1, Ordering::SeqCst) == 0;
                     let journal = checkpoint_journal.get().unwrap().snapshot();
                     Box::pin(async move {
                         seen.send_async(journal).await.unwrap();
@@ -3231,11 +3228,21 @@ pub(crate) mod tests {
                 assert!(report.joined.contains(&root.id()));
                 bounded_terminal(&mut settled, TERMINAL_SETTLEMENT, &handle, &ticket).await;
             }
-            if fail {
+            if fail && setup_failure {
                 assert!(matches!(&outcome, TurnOutcome::Failed { failure, .. }
                     if failure.user_message.contains(SAVE_ERROR)));
             } else {
                 assert_eq!(outcome, sealed.outcome);
+            }
+            if fail {
+                assert!(
+                    journal
+                        .get()
+                        .unwrap()
+                        .persistence_error()
+                        .unwrap()
+                        .contains(SAVE_ERROR)
+                );
             }
             let terminals: Vec<_> = handle
                 .event_rx
@@ -3252,7 +3259,9 @@ pub(crate) mod tests {
                 release.send_async(()).await.unwrap();
                 bounded(checkpoints.recv_async()).await.unwrap();
                 publish.send_async(()).await.unwrap();
-                bounded(first.wait()).await;
+                let completed = bounded(first.wait()).await;
+                assert!(matches!(completed, TurnOutcome::Completed { .. }));
+                assert!(journal.get().unwrap().persistence_error().is_none());
             }
             let manager = handle.manager.clone();
             future::or(handle.task.cancel(), async {

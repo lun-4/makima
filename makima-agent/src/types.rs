@@ -694,9 +694,11 @@ impl TurnOutcome {
         }
     }
 
-    /// The turn's outcome once its history could not be checkpointed: a
-    /// failure that keeps what the turn used and cost.
+    /// Converts an unsuccessful durability receipt into a failure without replacing cancellation.
     pub fn checkpoint_failed(&self, error: String) -> Self {
+        if matches!(self, Self::Cancelled { .. }) {
+            return self.clone();
+        }
         Self::Failed {
             agent_id: self.agent_id(),
             turn_id: self.turn_id(),
@@ -1506,6 +1508,19 @@ mod tests {
     use makima_storage::id::MakimaIdParseError;
     use std::str::FromStr;
     use test_case::test_case;
+
+    #[test]
+    fn checkpoint_failure_preserves_cancelled_turn() {
+        const FAILURE: &str = "session ownership lost";
+        let outcome = TurnOutcome::cancelled(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        );
+        assert_eq!(outcome.checkpoint_failed(FAILURE.into()), outcome);
+    }
 
     #[test_case(false; "send")]
     #[test_case(true; "try_send")]

@@ -6,7 +6,7 @@ use makima_storage::{
     StorageError,
     id::MakimaId,
     session_lock::SessionPublicationGuard,
-    sessions::{Session, SessionError, migrate_v2_before_append, plan_session_append_with_aliases},
+    sessions::{Session, SessionError, SessionRecord, append_record, initialize_session_log},
 };
 use serde_json::Value;
 use std::{
@@ -18,6 +18,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, OnceLock, Weak},
     task::{Context, Poll},
+    thread,
     time::Duration,
 };
 use tracing::warn;
@@ -28,7 +29,7 @@ const CLOSED: &str = "session writer closed";
 type WriterSlot = Arc<OnceLock<Result<Arc<WriterHandle>, WriterError>>>;
 static WRITERS: OnceLock<Mutex<HashMap<PathBuf, WriterSlot>>> = OnceLock::new();
 
-pub type OpenedSessionIo = (Box<dyn SessionIo>, u64, Vec<u8>);
+pub type OpenedSessionIo = (Box<dyn SessionIo>, u64);
 
 pub trait SessionIo: Send + 'static {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
@@ -104,37 +105,42 @@ struct Request {
 
 enum Payload {
     Close,
-    Records(Vec<Value>),
-    Checkpoint(Box<StoredSession>),
+    Records(Vec<Record>),
 }
 
 pub type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+pub type Record = SessionRecord<Message, TokenUsage, ToolOutput>;
 
 struct WriterHandle {
     session_id: MakimaId,
     tx: flume::Sender<Request>,
     status: Arc<Mutex<WriterStatus>>,
     journals: Arc<Mutex<Vec<Weak<SessionJournal>>>>,
+    publication_guard: Mutex<Option<SessionPublicationGuard>>,
 }
 
 #[derive(Clone)]
 pub struct SessionWriter(Arc<WriterHandle>);
 
 impl SessionWriter {
-    /// Opens a JSONL log once per canonical path. The directory must exist.
+    pub fn session_id(&self) -> MakimaId {
+        self.0.session_id
+    }
+
+    /// Opens a JSONL log once per absolute path.
     pub fn open(path: &Path, session_id: MakimaId) -> Result<Self, WriterError> {
-        Self::open_with_snapshot(path, session_id, None)
+        Self::open_initialized(path, session_id, None)
     }
 
     pub fn open_session(directory: &Path, session: &StoredSession) -> Result<Self, WriterError> {
-        Self::open_with_snapshot(
+        Self::open_initialized(
             &directory.join(format!("{}.jsonl", session.id)),
             session.id,
             Some(session),
         )
     }
 
-    fn open_with_snapshot(
+    fn open_initialized(
         path: &Path,
         session_id: MakimaId,
         session: Option<&StoredSession>,
@@ -153,9 +159,9 @@ impl SessionWriter {
                 let directory = path.parent().unwrap_or_else(|| Path::new("."));
                 create_dir_all(directory)?;
                 if let Some(session) = &session {
-                    migrate_v2_before_append(directory, session).map_err(io::Error::other)?;
+                    initialize_session_log(directory, session).map_err(io::Error::other)?;
                 }
-                let (file, next_seq, history) = open_log(&path)?;
+                let (file, next_seq) = open_log(&path)?;
                 let directory = File::open(directory)?;
                 Ok((
                     Box::new(SessionFile {
@@ -164,7 +170,6 @@ impl SessionWriter {
                         directory_synced: false,
                     }),
                     next_seq,
-                    history,
                 ))
             })
             .0)
@@ -174,7 +179,7 @@ impl SessionWriter {
     }
 
     pub fn with_io(session_id: MakimaId, io: impl SessionIo, next_seq: u64) -> Self {
-        let mut opened = Some((Box::new(io) as Box<dyn SessionIo>, next_seq, Vec::new()));
+        let mut opened = Some((Box::new(io) as Box<dyn SessionIo>, next_seq));
         Self::with_factory(session_id, move || {
             opened.take().ok_or_else(|| io::Error::other(CLOSED))
         })
@@ -187,38 +192,76 @@ impl SessionWriter {
         let (tx, rx) = flume::unbounded();
         let status = Arc::new(Mutex::new(WriterStatus::default()));
         let journals = Arc::new(Mutex::new(Vec::new()));
-        smol::spawn(initialize(
-            session_id,
-            Box::new(factory),
-            rx,
-            Arc::clone(&status),
-            Arc::clone(&journals),
-        ))
-        .detach();
+        let worker_status = Arc::clone(&status);
+        let worker_journals = Arc::clone(&journals);
+        thread::spawn(move || {
+            smol::block_on(initialize(
+                session_id,
+                Box::new(factory),
+                rx,
+                worker_status,
+                worker_journals,
+            ));
+        });
         Self(Arc::new(WriterHandle {
             session_id,
             tx,
             status,
             journals,
+            publication_guard: Mutex::new(None),
         }))
     }
 
+    pub fn bind_publication_guard(&self, guard: Option<SessionPublicationGuard>) {
+        *self
+            .0
+            .publication_guard
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = guard;
+    }
+
     /// Enqueues immediately, even when the returned receipt is not polled.
-    pub fn append(&self, records: Vec<Value>) -> Receipt {
+    pub fn append(&self, records: Vec<Record>) -> Receipt {
         self.enqueue(Payload::Records(records), None)
     }
 
-    pub fn checkpoint(&self, session: StoredSession) -> Receipt {
-        self.enqueue(Payload::Checkpoint(Box::new(session)), None)
+    /// Discards unsaved records and stops this writer. Use only before deletion.
+    pub fn close(&self) -> Receipt {
+        self.enqueue(Payload::Close, None)
+    }
+
+    pub fn append_owned(&self, records: Vec<Record>, guard: SessionPublicationGuard) -> Receipt {
+        self.enqueue(Payload::Records(records), Some(guard))
     }
 
     fn enqueue(&self, payload: Payload, guard: Option<SessionPublicationGuard>) -> Receipt {
+        let guard = guard.or_else(|| {
+            self.0
+                .publication_guard
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        });
         let (reply, response) = flume::bounded(1);
+        let count = match &payload {
+            Payload::Records(records) => records.len(),
+            Payload::Close => 0,
+        };
+        let mut status = self
+            .0
+            .status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        status.unsaved_records += count;
         let sent = self.0.tx.send(Request {
             payload,
             guard,
             reply,
         });
+        if sent.is_err() {
+            status.unsaved_records -= count;
+        }
+        drop(status);
         let session_id = self.0.session_id;
         Receipt(Box::pin(async move {
             sent.map_err(|_| writer_error(session_id, CLOSED))?;
@@ -235,14 +278,20 @@ impl SessionWriter {
             .journals
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        journals.retain(|journal| journal.strong_count() > 0);
-        if !journals
-            .iter()
-            .any(|current| current.ptr_eq(&Arc::downgrade(journal)))
-        {
-            journals.push(Arc::downgrade(journal));
-        }
+        journals.clear();
+        journals.push(Arc::downgrade(journal));
+        drop(journals);
         journal.set_writer_error(self.status().error.map(|error| error.to_string()));
+    }
+
+    pub(crate) fn journals(&self) -> Vec<Arc<SessionJournal>> {
+        self.0
+            .journals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
     }
 
     pub fn status(&self) -> WriterStatus {
@@ -261,7 +310,7 @@ fn writer_error(session_id: MakimaId, error: impl ToString) -> WriterError {
     }
 }
 
-fn open_log(path: &Path) -> io::Result<(File, u64, Vec<u8>)> {
+fn open_log(path: &Path) -> io::Result<(File, u64)> {
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -289,8 +338,7 @@ fn open_log(path: &Path) -> io::Result<(File, u64, Vec<u8>)> {
     }
     file.set_len(complete as u64)?;
     file.seek(SeekFrom::End(0))?;
-    bytes.truncate(complete);
-    Ok((file, next_seq, bytes))
+    Ok((file, next_seq))
 }
 
 async fn initialize(
@@ -328,31 +376,17 @@ async fn initialize(
         .await;
         factory = returned_factory;
         match opened {
-            Ok((io, next_seq, history)) => {
-                run(
-                    session_id,
-                    (io, next_seq, history),
-                    rx,
-                    status,
-                    journals,
-                    pending,
-                )
-                .await;
+            Ok((io, next_seq)) => {
+                drop(factory);
+                run(session_id, (io, next_seq), rx, status, journals, pending).await;
                 return;
             }
             Err(error) => {
                 let error = writer_error(session_id, error);
-                *status.lock().unwrap_or_else(|error| error.into_inner()) = WriterStatus {
-                    unsaved_records: pending
-                        .iter()
-                        .map(|request| match &request.payload {
-                            Payload::Records(records) => records.len(),
-                            Payload::Checkpoint(_) => 1,
-                            Payload::Close => 0,
-                        })
-                        .sum(),
-                    error: Some(error.clone()),
-                };
+                status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .error = Some(error.clone());
                 update_journals(&journals, Some(error.to_string()));
                 for request in &mut pending {
                     let _ = request.reply.try_send(Err(error.clone()));
@@ -376,16 +410,16 @@ async fn run(
     journals: Arc<Mutex<Vec<Weak<SessionJournal>>>>,
     mut pending: Vec<Request>,
 ) {
-    let (mut io, mut next_seq, mut history) = opened;
+    let (mut io, mut next_seq) = opened;
     let mut bytes = Vec::new();
     let mut written = 0;
     let mut retained = 0;
+    let mut needs_sync = false;
     let mut replies = Vec::new();
-    let mut pending_aliases = Vec::new();
     let mut publication_guard: Option<SessionPublicationGuard> = None;
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        let request = if retained == 0 && pending.is_empty() {
+        let request = if !needs_sync && pending.is_empty() {
             match rx.recv_async().await {
                 Ok(request) => Some(request),
                 Err(_) => break,
@@ -405,34 +439,10 @@ async fn run(
                     let _ = request.reply.send(Ok(AppendAck { next_seq }));
                     return;
                 }
-                Payload::Records(records) => Ok(records),
-                Payload::Checkpoint(session) => {
-                    plan_session_append_with_aliases(&history, session.as_ref())
-                        .map_err(|error| writer_error(session_id, error))
-                        .and_then(|planned| {
-                            let records = planned
-                                .bytes
-                                .split(|byte| *byte == b'\n')
-                                .filter(|line| !line.is_empty())
-                                .map(|line| {
-                                    serde_json::from_slice(line)
-                                        .map_err(|error| writer_error(session_id, error))
-                                })
-                                .collect::<Result<Vec<Value>, _>>()?;
-                            pending_aliases.push((session, planned.aliases));
-                            Ok(records)
-                        })
-                }
-            };
-            let records: Vec<Value> = match records {
-                Ok(records) => records,
-                Err(error) => {
-                    let _ = request.reply.send(Err(error));
-                    continue;
-                }
+                Payload::Records(records) => records,
             };
             let result = records.iter().try_for_each(|record| {
-                let mut record = record.clone();
+                let mut record = serde_json::to_value(record)?;
                 let object = record
                     .as_object_mut()
                     .ok_or_else(|| io::Error::other("session records must be JSON objects"))?;
@@ -445,24 +455,23 @@ async fn run(
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
-                serde_json::to_writer(&mut encoded, &record)?;
-                encoded.push(b'\n');
+                append_record(&mut encoded, &record).map_err(io::Error::other)?;
                 Ok::<_, io::Error>(())
             });
             if let Err(error) = result {
+                status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .unsaved_records -= records.len();
                 let _ = request.reply.send(Err(writer_error(session_id, error)));
                 continue;
             }
             next_seq = seq;
             retained += records.len();
-            history.extend_from_slice(&encoded);
             bytes.extend(encoded);
             replies.push(request.reply);
+            needs_sync = true;
         }
-        status
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .unsaved_records = retained;
         let result = smol::unblock(move || {
             let mut write = || {
                 while written < bytes.len() {
@@ -487,9 +496,10 @@ async fn run(
         (io, bytes, written, publication_guard) = (result.0, result.1, result.2, result.3);
         match result.4 {
             Ok(()) => {
-                *status.lock().unwrap_or_else(|error| error.into_inner()) = WriterStatus::default();
-                for (session, aliases) in pending_aliases.drain(..) {
-                    session.commit_message_aliases(&aliases);
+                {
+                    let mut status = status.lock().unwrap_or_else(|error| error.into_inner());
+                    status.unsaved_records -= retained;
+                    status.error = None;
                 }
                 update_journals(&journals, None);
                 for reply in replies.drain(..) {
@@ -498,6 +508,7 @@ async fn run(
                 bytes.clear();
                 written = 0;
                 retained = 0;
+                needs_sync = false;
                 publication_guard = None;
                 backoff = INITIAL_BACKOFF;
             }
@@ -531,19 +542,9 @@ fn update_journals(journals: &Mutex<Vec<Weak<SessionJournal>>>, error: Option<St
     });
 }
 
-pub struct StagedCheckpoint {
-    directory: PathBuf,
-    session: StoredSession,
-}
-
-pub fn stage_checkpoint(
-    directory: &Path,
-    session: &StoredSession,
-) -> Result<StagedCheckpoint, SessionError> {
-    Ok(StagedCheckpoint {
-        directory: directory.to_owned(),
-        session: session.clone(),
-    })
+pub fn delete(directory: &Path, session_id: MakimaId) -> Result<(), SessionError> {
+    forget(directory, session_id)?;
+    StoredSession::delete_from(session_id, directory)
 }
 
 pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError> {
@@ -574,66 +575,14 @@ pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError
     Ok(())
 }
 
-pub fn checkpoint(directory: &Path, session: &StoredSession) -> Result<(), SessionError> {
-    save_snapshot(directory, session)
-}
-
-pub fn save_snapshot(directory: &Path, session: &StoredSession) -> Result<(), SessionError> {
-    let writer = SessionWriter::open_session(directory, session)
-        .map_err(|error| StorageError::from(io::Error::other(error)))?;
-    smol::block_on(writer.checkpoint(session.clone()))
-        .map_err(|error| StorageError::from(io::Error::other(error)))?;
-    Ok(())
-}
-
-impl StagedCheckpoint {
-    pub fn publish(
-        self,
-        guard: &SessionPublicationGuard,
-        claim: impl FnOnce() -> bool,
-    ) -> Result<bool, SessionError> {
-        let receipt = guard
-            .publish(|| {
-                if !claim() {
-                    return Ok(None);
-                }
-                let writer = SessionWriter::open_session(&self.directory, &self.session)
-                    .map_err(|error| StorageError::from(io::Error::other(error)))?;
-                Ok::<_, SessionError>(Some(writer.enqueue(
-                    Payload::Checkpoint(Box::new(self.session)),
-                    Some(guard.clone()),
-                )))
-            })
-            .map_err(StorageError::from)?
-            .transpose()?
-            .flatten();
-        let Some(receipt) = receipt else {
-            return Ok(false);
-        };
-        smol::block_on(receipt).map_err(|error| StorageError::from(io::Error::other(error)))?;
-        Ok(true)
-    }
-
-    pub fn publish_unowned(self, claim: impl FnOnce() -> bool) -> Result<bool, SessionError> {
-        if !claim() {
-            return Ok(false);
-        }
-        save_snapshot(&self.directory, &self.session)?;
-        Ok(true)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        SessionIo, SessionWriter, StoredSession, WriterStatus, checkpoint, open_log,
-        stage_checkpoint,
-    };
+    use super::{Record, SessionIo, SessionWriter, StoredSession, WriterStatus, open_log};
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
     use makima_storage::id::MakimaId;
     use makima_storage::session_state::StateChange;
-    use makima_storage::sessions::{encode_records, plan_session_append};
+    use makima_storage::sessions::encode_records;
     use serde_json::{Value, json};
     use std::{
         fs::{read, remove_file, write},
@@ -643,6 +592,13 @@ mod tests {
     use test_case::test_case;
 
     const DISK_FULL: i32 = libc::ENOSPC;
+
+    fn output(id: &str) -> Record {
+        Record::Out {
+            id: id.into(),
+            d: crate::ToolOutput::Plain(id.into()),
+        }
+    }
 
     struct FakeIo {
         bytes: Arc<Mutex<Vec<u8>>>,
@@ -690,6 +646,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn synchronous_receipt_wait_does_not_need_the_global_executor() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (synced, _) = flume::unbounded();
+        let writer = SessionWriter::with_io(
+            MakimaId::generate(),
+            FakeIo {
+                bytes: Arc::clone(&bytes),
+                fail_write: false,
+                fail_sync: false,
+                partial: false,
+                synced,
+                retry_gate: None,
+            },
+            0,
+        );
+        let ack = smol::block_on(writer.append(vec![output("synchronous")])).unwrap();
+        assert_eq!(ack.next_seq, 1);
+        assert!(!bytes.lock().unwrap().is_empty());
+        smol::block_on(writer.close()).unwrap();
+    }
+
     #[test_case(true, false, false; "enospc")]
     #[test_case(false, true, false; "fsync")]
     #[test_case(true, false, true; "partial_write")]
@@ -718,7 +696,7 @@ mod tests {
                 SessionJournal::from_session(&StoredSession::new("test", "/test")).unwrap(),
             );
             writer.attach_journal(&journal);
-            let receipt = writer.append(vec![json!({"t": "test", "value": 1})]);
+            let receipt = writer.append(vec![output("first")]);
             assert!(receipt.await.is_err());
             let WriterStatus {
                 unsaved_records,
@@ -741,7 +719,86 @@ mod tests {
                 .map(|line| serde_json::from_slice(line).unwrap())
                 .collect();
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0]["value"], 1);
+            assert_eq!(records[0]["id"], "first");
+        });
+    }
+
+    #[test_case(false; "lost_before_initialization")]
+    #[test_case(true; "lost_after_initialization")]
+    fn bound_publication_guard_fences_plain_appends(initialized: bool) {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let session = StoredSession::new("writer-test-model", "/writer-test");
+            let lease = makima_storage::session_lock::claim(dir.path(), &session.id)
+                .unwrap()
+                .unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            writer.bind_publication_guard(Some(lease.publication_guard()));
+            if initialized {
+                writer.append(Vec::new()).await.unwrap();
+            }
+            let path = dir.path().join(format!("{}.jsonl", session.id));
+            let before = read(&path).ok();
+            lease.release().unwrap();
+            let error = writer
+                .clone()
+                .append(vec![output("stale")])
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("session ownership lost"));
+            assert_eq!(read(&path).ok(), before);
+            super::forget(dir.path(), session.id).unwrap();
+        });
+    }
+
+    #[test]
+    fn barrier_sync_failure_retries_without_another_append() {
+        smol::block_on(async {
+            let (synced, durable) = flume::unbounded();
+            let (release_retry, retry_gate) = flume::bounded(1);
+            let writer = SessionWriter::with_io(
+                MakimaId::generate(),
+                FakeIo {
+                    bytes: Arc::new(Mutex::new(Vec::new())),
+                    fail_write: false,
+                    fail_sync: true,
+                    partial: false,
+                    synced,
+                    retry_gate: Some(retry_gate),
+                },
+                0,
+            );
+            assert!(writer.append(Vec::new()).await.is_err());
+            assert!(writer.status().error.is_some());
+            release_retry.send(()).unwrap();
+            durable.recv_async().await.unwrap();
+            writer.append(Vec::new()).await.unwrap();
+            assert!(writer.status().error.is_none());
+        });
+    }
+
+    #[test]
+    fn successful_initialization_releases_factory_captures() {
+        smol::block_on(async {
+            let captured = Arc::new(());
+            let weak = Arc::downgrade(&captured);
+            let (synced, _) = flume::unbounded();
+            let writer = SessionWriter::with_factory(MakimaId::generate(), move || {
+                let _ = &captured;
+                Ok((
+                    Box::new(FakeIo {
+                        bytes: Arc::new(Mutex::new(Vec::new())),
+                        fail_write: false,
+                        fail_sync: false,
+                        partial: false,
+                        synced: synced.clone(),
+                        retry_gate: None,
+                    }),
+                    0,
+                ))
+            });
+            writer.append(Vec::new()).await.unwrap();
+            assert!(weak.upgrade().is_none());
         });
     }
 
@@ -769,10 +826,9 @@ mod tests {
                         retry_gate: None,
                     }),
                     17,
-                    Vec::new(),
                 ))
             });
-            let receipt = writer.append(vec![json!({"value": "retained"})]);
+            let receipt = writer.append(vec![output("retained")]);
             assert!(receipt.await.is_err());
             assert_eq!(writer.status().unsaved_records, 1);
             assert!(writer.status().error.is_some());
@@ -782,45 +838,150 @@ mod tests {
             let bytes = bytes.lock().unwrap();
             let record: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(record["seq"], 17);
-            assert_eq!(record["value"], "retained");
+            assert_eq!(record["id"], "retained");
             assert!(writer.status().error.is_none());
         });
     }
 
     #[test]
-    fn snapshot_bridge_appends_without_rewriting_or_duplicating_records() {
-        const MODEL: &str = "writer-test-model";
-        const CWD: &str = "/writer-test";
-        const FIRST: &str = "first message";
-        const SECOND: &str = "second message";
-        let dir = tempfile::tempdir().unwrap();
-        let mut session = StoredSession::new(MODEL, CWD);
-        session.push_message(Message::user(FIRST.into()));
-        checkpoint(dir.path(), &session).unwrap();
-        let path = dir.path().join(format!("{}.jsonl", session.id));
-        let prefix = read(&path).unwrap();
-        checkpoint(dir.path(), &session).unwrap();
-        assert_eq!(read(&path).unwrap(), prefix);
-        session.push_message(Message::user(SECOND.into()));
-        assert!(
-            stage_checkpoint(dir.path(), &session)
-                .unwrap()
-                .publish_unowned(|| true)
-                .unwrap()
-        );
-        let bytes = read(&path).unwrap();
-        assert!(bytes.starts_with(&prefix));
-        assert!(bytes.len() > prefix.len());
-        let loaded = StoredSession::load_from(session.id, dir.path()).unwrap();
-        assert_eq!(loaded.messages().len(), 2);
+    fn typed_root_child_compaction_posts_and_draft_reload() {
+        use makima_domain::{Post, PostLevel};
+        use makima_storage::{
+            id::AgentId,
+            sessions::{LegacyPlan, SessionMeta, StoredPost},
+        };
+        use std::collections::{BTreeMap, HashMap};
+
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("writer-test-model", "/writer-test");
+            let root = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let child = AgentId::generate();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            writer.append(Vec::new()).await.unwrap();
+            let path = dir.path().join(format!("{}.jsonl", session.id));
+            let prefix = read(&path).unwrap();
+            let original = MakimaId::generate();
+            let summary = MakimaId::generate();
+            let child_message = MakimaId::generate();
+            let mut child_record = session.agents()[&root].clone();
+            child_record.id = child;
+            child_record.parent = Some(root);
+            child_record.depth = 1;
+            child_record.transcript_key = "child".into();
+            child_record.created_seq = session.next_state_seq();
+            child_record.updated_seq = session.next_state_seq();
+            let records = vec![
+                Record::Agent {
+                    seq: session.next_state_seq(),
+                    d: child_record,
+                },
+                Record::Msg {
+                    id: original,
+                    agent: root,
+                    d: Message::user("original".into()),
+                },
+                Record::Msg {
+                    id: child_message,
+                    agent: child,
+                    d: Message::user("child".into()),
+                },
+                Record::Compaction {
+                    agent: root,
+                    messages: vec![Message::user("summary".into())],
+                    ids: vec![summary],
+                    covered: Some(original),
+                },
+                Record::Post {
+                    d: StoredPost {
+                        chat: None,
+                        after_message: Some(original),
+                        post: Post {
+                            text: "post".into(),
+                            level: PostLevel::Info,
+                            agent: None,
+                        },
+                    },
+                },
+                Record::Meta {
+                    title: session.title.clone(),
+                    parent: None,
+                    parent_recorded: true,
+                    message_count: 1,
+                    token_usage: session.token_usage,
+                    updated_at: session.updated_at,
+                    sequence_high_water: None,
+                    history_epochs: BTreeMap::new(),
+                    subagents: Vec::new(),
+                    subagent_conversations: HashMap::new(),
+                    usage_by_model: HashMap::new(),
+                    legacy_config: None,
+                    meta: Box::new(SessionMeta {
+                        input_draft: Some("draft".into()),
+                        queued_messages: vec!["queued".into()],
+                        ..SessionMeta::default()
+                    }),
+                    legacy_plan: LegacyPlan::default(),
+                },
+                Record::History {
+                    agent: root,
+                    compacted: true,
+                    conversation: Some(makima_storage::conversation::ConversationState::new(
+                        "root-conversation".into(),
+                    )),
+                },
+                Record::History {
+                    agent: child,
+                    compacted: true,
+                    conversation: Some(makima_storage::conversation::ConversationState::new(
+                        "child-conversation".into(),
+                    )),
+                },
+            ];
+            let receipt = writer.append(records);
+            receipt.await.unwrap();
+            let bytes = read(&path).unwrap();
+            assert!(bytes.starts_with(&prefix));
+            let loaded = StoredSession::load_from(session.id, dir.path()).unwrap();
+            assert_eq!(loaded.last_message_id(), Some(summary));
+            assert_eq!(loaded.messages().len(), 1);
+            assert_eq!(loaded.subagent_messages()["child"].len(), 1);
+            assert_eq!(loaded.chat_message_ids(Some("child")), vec![child_message]);
+            assert_eq!(loaded.posts()[0].after_message, Some(original));
+            assert_eq!(loaded.meta.input_draft.as_deref(), Some("draft"));
+            assert_eq!(loaded.meta.queued_messages, ["queued"]);
+            assert!(loaded.history_snapshot().compacted);
+            assert_eq!(
+                loaded.history_snapshot().conversation.unwrap().id.as_ref(),
+                "root-conversation"
+            );
+            let child_history = loaded.subagent_history_snapshot("child").unwrap();
+            assert!(child_history.compacted);
+            assert_eq!(
+                child_history.conversation.unwrap().id.as_ref(),
+                "child-conversation"
+            );
+            assert!(
+                loaded
+                    .context_events()
+                    .iter()
+                    .any(|event| event["id"] == json!(original))
+            );
+            let reopened = SessionWriter::open_session(dir.path(), &session).unwrap();
+            reopened.append(Vec::new()).await.unwrap();
+            assert_eq!(read(&path).unwrap(), bytes);
+        });
     }
 
     #[test]
     fn first_writer_open_archives_and_migrates_v2_once() {
         let dir = tempfile::tempdir().unwrap();
-        let session = StoredSession::new("writer-test-model", "/writer-test");
-        let mut records: Vec<Value> = plan_session_append(&[], &session)
-            .unwrap()
+        let mut session = StoredSession::new("writer-test-model", "/writer-test");
+        session.save_to(dir.path()).unwrap();
+        let path = dir.path().join(format!("{}.jsonl", session.id));
+        let bytes = read(&path).unwrap();
+        let mut records: Vec<Value> = bytes
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
@@ -829,7 +990,12 @@ mod tests {
         let legacy = encode_records(&records).unwrap();
         let path = dir.path().join(format!("{}.jsonl", session.id));
         write(&path, &legacy).unwrap();
-        checkpoint(dir.path(), &session).unwrap();
+        smol::block_on(
+            SessionWriter::open_session(dir.path(), &session)
+                .unwrap()
+                .append(Vec::new()),
+        )
+        .unwrap();
         let archive = dir
             .path()
             .join("archive")
@@ -840,7 +1006,12 @@ mod tests {
         let header: Value =
             serde_json::from_slice(migrated.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
         assert_eq!(header["v"], 3);
-        checkpoint(dir.path(), &session).unwrap();
+        smol::block_on(
+            SessionWriter::open_session(dir.path(), &session)
+                .unwrap()
+                .append(Vec::new()),
+        )
+        .unwrap();
         assert_eq!(read(path).unwrap(), migrated);
     }
 
@@ -848,29 +1019,25 @@ mod tests {
     fn explicitly_forgotten_session_can_be_recreated_at_same_path() {
         let dir = tempfile::tempdir().unwrap();
         let session = StoredSession::new("writer-test-model", "/writer-test");
-        checkpoint(dir.path(), &session).unwrap();
+        smol::block_on(
+            SessionWriter::open_session(dir.path(), &session)
+                .unwrap()
+                .append(Vec::new()),
+        )
+        .unwrap();
         super::forget(dir.path(), session.id).unwrap();
         let path = dir.path().join(format!("{}.jsonl", session.id));
         remove_file(&path).unwrap();
-        checkpoint(dir.path(), &session).unwrap();
+        smol::block_on(
+            SessionWriter::open_session(dir.path(), &session)
+                .unwrap()
+                .append(Vec::new()),
+        )
+        .unwrap();
         assert_eq!(
             StoredSession::load_from(session.id, dir.path()).unwrap().id,
             session.id
         );
-    }
-
-    #[test]
-    fn rejected_stage_never_opens_or_creates_a_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = StoredSession::new("writer-test-model", "/writer-test");
-        let path = dir.path().join(format!("{}.jsonl", session.id));
-        assert!(
-            !stage_checkpoint(dir.path(), &session)
-                .unwrap()
-                .publish_unowned(|| false)
-                .unwrap()
-        );
-        assert!(!path.exists());
     }
 
     struct BlockedIo {
@@ -903,7 +1070,8 @@ mod tests {
                 },
                 0,
             );
-            let first = writer.append(vec![json!({"value": 1})]);
+            let first = writer.append(vec![output("first")]);
+            assert_eq!(writer.status().unsaved_records, 1);
             blocked.recv_async().await.unwrap();
             assert_eq!(writer.status().unsaved_records, 1);
             let journal =
@@ -924,7 +1092,7 @@ mod tests {
                 })
                 .unwrap();
             assert!(journal.snapshot().revision > before);
-            let second = writer.append(vec![json!({"value": 2})]);
+            let second = writer.append(vec![output("second")]);
             release.send(()).unwrap();
             first.await.unwrap();
             blocked.recv_async().await.unwrap();
@@ -941,9 +1109,8 @@ mod tests {
         let mut bytes = complete.to_vec();
         bytes.extend_from_slice(b"{\"t\":");
         write(&path, bytes).unwrap();
-        let (_, next_seq, history) = open_log(&path).unwrap();
+        let (_, next_seq) = open_log(&path).unwrap();
         assert_eq!(next_seq, 8);
-        assert_eq!(history, complete);
         assert_eq!(read(&path).unwrap(), complete);
     }
 
@@ -964,8 +1131,8 @@ mod tests {
                 },
                 12,
             );
-            let first = writer.append(vec![json!({"value": "first"})]);
-            let second = writer.append(vec![json!({"value": "second"})]);
+            let first = writer.append(vec![output("first")]);
+            let second = writer.append(vec![output("second")]);
             second.await.unwrap();
             first.await.unwrap();
             let bytes = bytes.lock().unwrap();
@@ -976,7 +1143,7 @@ mod tests {
                 .collect();
             assert_eq!(records[0]["seq"], 12);
             assert_eq!(records[1]["seq"], 13);
-            assert_eq!(records[0]["value"], "first");
+            assert_eq!(records[0]["id"], "first");
         });
     }
 }

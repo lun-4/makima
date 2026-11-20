@@ -8,13 +8,14 @@ use async_lock::{RwLock, RwLockReadGuardArc, RwLockWriteGuardArc};
 use event_listener::Event;
 use imbl::{OrdMap, OrdSet};
 use makima_providers::{Message, TokenUsage};
+use makima_storage::conversation::ConversationState;
 use makima_storage::id::{AgentId, MakimaId, TurnId};
 use makima_storage::session_state::{
     SessionStateReducer, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
     StoredAgentRecord, StoredDelivery, StoredDeliveryOp, StoredPayload, StoredPluginValue,
     StoredStateRecord, StoredTurnResult,
 };
-use makima_storage::sessions::{Session, StoredRule};
+use makima_storage::sessions::{Session, SessionRecord, StoredRule};
 use thiserror::Error;
 
 use crate::actor::{
@@ -22,6 +23,7 @@ use crate::actor::{
     MAX_PENDING_PREVIEW_BYTES, StoredTurnProgress, TurnResult, TurnResultStorageError,
 };
 use crate::context::{CONTEXT_MANIFEST, ContextUpdate, manifest_hash};
+use crate::session_writer::SessionWriter;
 use crate::state::{
     StateChangeEvent, StateChangeReason, StateEdit, StateError, StateRevision, StateRuntime,
     StateScope, read_slot, validate_access, validate_record,
@@ -33,6 +35,8 @@ mod records;
 pub use records::{JournalRecord, JournalRecords};
 
 const CONVERSION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SPAWN_PUBLICATION_PENDING: &str =
+    "cannot publish spawn while an earlier journal change is pending";
 
 fn context_address(source: &str) -> String {
     format!("\0context:{source}")
@@ -95,6 +99,7 @@ fn restored_preview_bytes(delivery: &StoredDelivery) -> usize {
 }
 
 pub(crate) type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+type JournalSessionRecord = SessionRecord<Message, TokenUsage, ToolOutput>;
 type PendingDeliveryEnvelope = (AgentId, TurnId, Option<Arc<ChildDelivery>>);
 
 #[derive(Debug, Error)]
@@ -318,6 +323,15 @@ pub struct JournalPending {
 struct StagedCommit {
     snapshot: SessionJournalSnapshot,
     pending: Option<JournalPending>,
+    histories: BTreeSet<AgentId>,
+}
+
+#[derive(Clone)]
+struct EmittedHistory {
+    epoch: u64,
+    len: usize,
+    compacted: bool,
+    conversation: Option<ConversationState>,
 }
 
 struct RuntimeResult {
@@ -353,6 +367,9 @@ pub(crate) struct JournalState {
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
     aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
+    writer: Option<SessionWriter>,
+    unwritten: Vec<JournalSessionRecord>,
+    emitted_histories: BTreeMap<AgentId, EmittedHistory>,
 }
 
 /// An owned publication lane, acquired before reading runtime state that the
@@ -428,6 +445,7 @@ impl JournalPrepared {
         }
         for (guard, candidate) in guards.iter_mut().zip(candidates) {
             **guard = candidate;
+            SessionJournal::emit_unwritten(guard);
         }
         drop(guards);
         for token in tokens {
@@ -492,6 +510,9 @@ impl JournalPrepared {
             })
             .map(|(agent, history)| (*agent, history.clone()))
             .collect();
+        state.staged[index]
+            .histories
+            .extend(history_changes.keys().copied());
         for entry in state.staged.iter_mut().skip(index) {
             entry.snapshot.histories.extend(history_changes.clone());
             entry
@@ -513,7 +534,7 @@ impl JournalPrepared {
         for address in SessionJournal::state_addresses(&self.commit) {
             state.plugin_state.reservations.remove(&address);
         }
-        SessionJournal::advance_ready(state);
+        SessionJournal::collect_ready(state);
         state.published_revision = state.published_revision.max(self.candidate.revision);
         state
             .plugin_state
@@ -577,6 +598,9 @@ impl Default for SessionJournal {
                 conversion_errors: BTreeMap::new(),
                 aborted_preparations: BTreeSet::new(),
                 incarnations: BTreeMap::new(),
+                writer: None,
+                unwritten: Vec::new(),
+                emitted_histories: BTreeMap::new(),
             }),
             conversion_changed: Event::new(),
         }
@@ -625,6 +649,7 @@ impl SessionJournal {
                 };
                 snapshot.histories.insert(record.id, history);
             }
+            state.emitted_histories = Self::history_baseline(&state.snapshot);
             state.ready = state.snapshot.clone();
             state.session_id = Some(session.id);
         }
@@ -682,6 +707,7 @@ impl SessionJournal {
         let journal = Self::default();
         {
             let mut state = journal.lock();
+            state.emitted_histories = Self::history_baseline(&snapshot);
             state.snapshot = snapshot.clone();
             state.ready = snapshot;
             state.session_id = Some(session.id);
@@ -788,6 +814,97 @@ impl SessionJournal {
         Ok(())
     }
 
+    pub fn bind_writer(&self, writer: SessionWriter) -> Result<(), JournalError> {
+        let mut state = self.lock();
+        if state.session_id.is_some_and(|id| id != writer.session_id()) {
+            return Err(JournalError::StaleCheckpoint);
+        }
+        state.session_id = Some(writer.session_id());
+        state.writer.get_or_insert(writer);
+        Self::emit_unwritten(&mut state);
+        Ok(())
+    }
+
+    pub fn has_writer(&self) -> bool {
+        self.lock().writer.is_some()
+    }
+
+    pub fn flush_spawn(&self) -> Result<(), String> {
+        let (writer, target) = {
+            let mut state = self.lock();
+            let Some(writer) = state.writer.clone() else {
+                return Ok(());
+            };
+            if !state.staged.is_empty() {
+                return Err(SPAWN_PUBLICATION_PENDING.into());
+            }
+            Self::emit_unwritten(&mut state);
+            (writer, state.ready.revision)
+        };
+        smol::block_on(writer.append(Vec::new())).map_err(|error| error.to_string())?;
+        let mut state = self.lock();
+        state.published_revision = state.published_revision.max(target);
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> Result<(), String> {
+        if !self.persistent {
+            return Ok(());
+        }
+        let target = self.lock().snapshot.revision;
+        loop {
+            let listener = self.conversion_changed.listen();
+            let ready = {
+                let mut state = self.lock();
+                if let Some(error) = state.conversion_errors.values().next() {
+                    return Err(error.clone());
+                }
+                if state
+                    .staged
+                    .iter()
+                    .all(|entry| entry.snapshot.revision > target)
+                {
+                    Self::emit_unwritten(&mut state);
+                    Some(
+                        state
+                            .writer
+                            .as_ref()
+                            .map(|writer| writer.append(Vec::new())),
+                    )
+                } else {
+                    None
+                }
+            };
+            let Some(receipt) = ready else {
+                listener.await;
+                continue;
+            };
+            let receipt = receipt.ok_or_else(|| "session journal has no writer".to_owned())?;
+            receipt.await.map_err(|error| error.to_string())?;
+            let mut state = self.lock();
+            state.published_revision = state.published_revision.max(target);
+            return Ok(());
+        }
+    }
+
+    fn history_baseline(snapshot: &SessionJournalSnapshot) -> BTreeMap<AgentId, EmittedHistory> {
+        snapshot
+            .histories
+            .iter()
+            .map(|(agent, history)| {
+                (
+                    *agent,
+                    EmittedHistory {
+                        epoch: history.epoch,
+                        len: history.messages.len(),
+                        compacted: history.compacted,
+                        conversation: history.conversation.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     pub fn session_id(&self) -> Option<MakimaId> {
         self.lock().session_id
     }
@@ -811,6 +928,12 @@ impl SessionJournal {
             .values()
             .next()
             .cloned()
+            .or_else(|| {
+                state
+                    .writer
+                    .as_ref()
+                    .and_then(|writer| writer.status().error.map(|error| error.to_string()))
+            })
             .or_else(|| state.writer_error.clone())
             .or_else(|| state.checkpoint_error.clone())
     }
@@ -908,6 +1031,7 @@ impl SessionJournal {
         state.staged.push_back(StagedCommit {
             snapshot: candidate,
             pending: None,
+            histories: BTreeSet::new(),
         });
         Self::advance_ready(&mut state);
         Ok(())
@@ -1359,6 +1483,7 @@ impl SessionJournal {
                         state.staged.push_back(StagedCommit {
                             snapshot: staged,
                             pending: Some(pending.clone()),
+                            histories: BTreeSet::new(),
                         });
                         pending
                     } else {
@@ -1547,6 +1672,7 @@ impl SessionJournal {
                 }
             })
             .collect();
+        let histories = commit.histories.keys().copied().collect();
         let candidate = Self::apply_commit(&state.snapshot, commit)?;
         for key in retired_deliveries {
             state.delivery_bytes.remove(&key);
@@ -1568,6 +1694,7 @@ impl SessionJournal {
         state.staged.push_back(StagedCommit {
             snapshot: candidate,
             pending: None,
+            histories,
         });
         Self::advance_ready(&mut state);
         apply();
@@ -1800,6 +1927,7 @@ impl SessionJournal {
             return Err(JournalError::InvalidPending);
         }
         let history_epochs = Self::changed_history_epochs(&state.snapshot, &commit);
+        let histories = commit.histories.keys().copied().collect();
         let mut candidate = Self::apply_commit(&state.snapshot, commit)?;
         if candidate.revision == state.snapshot.revision {
             candidate.revision = candidate
@@ -1833,6 +1961,7 @@ impl SessionJournal {
         state.staged.push_back(StagedCommit {
             snapshot: candidate,
             pending: Some(pending.clone()),
+            histories,
         });
         Ok(pending)
     }
@@ -1938,12 +2067,96 @@ impl SessionJournal {
     }
 
     fn advance_ready(state: &mut JournalState) {
+        Self::collect_ready(state);
+        Self::emit_unwritten(state);
+    }
+
+    fn emit_unwritten(state: &mut JournalState) {
+        if let Some(writer) = &state.writer
+            && !state.unwritten.is_empty()
+        {
+            drop(writer.append(take(&mut state.unwritten)));
+        }
+    }
+
+    fn collect_ready(state: &mut JournalState) {
         while state
             .staged
             .front()
             .is_some_and(|entry| entry.pending.is_none())
         {
             if let Some(entry) = state.staged.pop_front() {
+                let mut records: Vec<_> = entry
+                    .snapshot
+                    .state
+                    .after(state.ready.seq)
+                    .map(|record| (record.seq, SessionRecord::State { d: record.clone() }))
+                    .chain(entry.snapshot.agent_revisions.after(state.ready.seq).map(
+                        |(seq, agent)| {
+                            (
+                                *seq,
+                                SessionRecord::Agent {
+                                    seq: *seq,
+                                    d: agent.clone(),
+                                },
+                            )
+                        },
+                    ))
+                    .collect();
+                records.sort_by_key(|(seq, _)| *seq);
+                state
+                    .unwritten
+                    .extend(records.into_iter().map(|(_, record)| record));
+                for agent in entry.histories {
+                    let Some(history) = entry.snapshot.histories.get(&agent) else {
+                        continue;
+                    };
+                    let previous = state.emitted_histories.get(&agent);
+                    let appended = previous.is_none_or(|previous| {
+                        previous.epoch == history.epoch && previous.len <= history.messages.len()
+                    });
+                    if appended {
+                        let start = previous.map_or(0, |previous| previous.len);
+                        state.unwritten.extend(
+                            history
+                                .messages
+                                .iter()
+                                .zip(history.ids.iter())
+                                .skip(start)
+                                .map(|(message, id)| SessionRecord::Msg {
+                                    id: *id,
+                                    agent,
+                                    d: message.clone(),
+                                }),
+                        );
+                    } else {
+                        state.unwritten.push(SessionRecord::Compaction {
+                            agent,
+                            messages: history.messages.as_ref().clone(),
+                            ids: history.ids.as_ref().clone(),
+                            covered: history.covered,
+                        });
+                    }
+                    if previous.is_none_or(|previous| {
+                        previous.compacted != history.compacted
+                            || previous.conversation != history.conversation
+                    }) {
+                        state.unwritten.push(SessionRecord::History {
+                            agent,
+                            compacted: history.compacted,
+                            conversation: history.conversation.clone(),
+                        });
+                    }
+                    state.emitted_histories.insert(
+                        agent,
+                        EmittedHistory {
+                            epoch: history.epoch,
+                            len: history.messages.len(),
+                            compacted: history.compacted,
+                            conversation: history.conversation.clone(),
+                        },
+                    );
+                }
                 state.ready = entry.snapshot;
             }
         }
@@ -2098,6 +2311,191 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const SLOT: &str = "journal/incremental";
+
+    #[test]
+    fn spawn_flush_rejects_pending_changes_without_waiting_or_reordering() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new(FIRST, "/");
+        let journal = SessionJournal::from_session(&session).unwrap();
+        let writer =
+            crate::session_writer::SessionWriter::open_session(directory.path(), &session).unwrap();
+        journal.bind_writer(writer).unwrap();
+        let pending = journal.stage(JournalCommit::default(), 1).unwrap();
+        assert_eq!(
+            journal.flush_spawn().unwrap_err(),
+            super::SPAWN_PUBLICATION_PENDING
+        );
+        journal
+            .complete(pending, vec![admitted(AgentId::generate())])
+            .unwrap();
+        journal.flush_spawn().unwrap();
+        assert_eq!(journal.published_revision(), journal.snapshot().revision);
+    }
+
+    #[test]
+    fn writer_binding_flushes_backlog_once_and_waits_for_pending_conversion() {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let session = Session::new(FIRST, "/");
+            let journal = SessionJournal::from_session(&session).unwrap();
+            let agent = AgentId::generate();
+            journal
+                .commit(JournalCommit {
+                    changes: vec![admitted(agent)],
+                    ..Default::default()
+                })
+                .unwrap();
+            let writer =
+                crate::session_writer::SessionWriter::open_session(directory.path(), &session)
+                    .unwrap();
+            journal.bind_writer(writer.clone()).unwrap();
+            journal.bind_writer(writer).unwrap();
+            let pending = journal.stage(JournalCommit::default(), 1).unwrap();
+            let flush = journal.flush();
+            futures_lite::pin!(flush);
+            assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+            journal.complete(pending, vec![admitted(agent)]).unwrap();
+            flush.await.unwrap();
+            let path = directory.path().join(format!("{}.jsonl", session.id));
+            let log = std::fs::read_to_string(path).unwrap();
+            let records: Vec<serde_json::Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record["t"] == "state")
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn ready_emissions_preserve_history_events_and_stable_ids() {
+        let journal = SessionJournal::default();
+        let agent = AgentId::generate();
+        let mut history = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history.clone())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history.clone())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let first_id = history.ids[0];
+        history = HistorySnapshot::new(vec![Message::user(SECOND.into())]);
+        history.covered = Some(first_id);
+        let summary_id = history.ids[0];
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history)].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let state = journal.lock();
+        assert_eq!(state.unwritten.len(), 3);
+        assert!(
+            matches!(&state.unwritten[0], super::SessionRecord::Msg { id, agent: saved, .. } if *id == first_id && *saved == agent)
+        );
+        assert!(
+            matches!(&state.unwritten[2], super::SessionRecord::Compaction { ids, covered, .. } if ids == &[summary_id] && *covered == Some(first_id))
+        );
+    }
+
+    #[test]
+    fn history_metadata_changes_emit_without_repeating_messages() {
+        let journal = SessionJournal::default();
+        let agent = AgentId::generate();
+        let mut history = HistorySnapshot::new(vec![Message::user(FIRST.into())]);
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history.clone())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal.lock().unwritten.clear();
+        history.compacted = true;
+        history.conversation = Some(super::ConversationState::fresh(None));
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history.clone())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal
+            .commit(JournalCommit {
+                histories: [(agent, history.clone())].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let state = journal.lock();
+        assert_eq!(state.unwritten.len(), 1);
+        assert!(
+            matches!(&state.unwritten[0], super::SessionRecord::History { agent: saved, compacted: true, conversation } if *saved == agent && conversation == &history.conversation)
+        );
+    }
+
+    #[test_case(false; "complete_in_order")]
+    #[test_case(true; "complete_out_of_order")]
+    fn ready_emissions_wait_for_contiguous_conversions(reverse: bool) {
+        let journal = SessionJournal::default();
+        let agent = AgentId::generate();
+        let first = journal.stage(JournalCommit::default(), 1).unwrap();
+        let second = journal.stage(JournalCommit::default(), 1).unwrap();
+        if reverse {
+            journal
+                .complete(second.clone(), vec![admitted(agent)])
+                .unwrap();
+            assert!(journal.lock().unwritten.is_empty());
+        }
+        journal.complete(first, vec![admitted(agent)]).unwrap();
+        if !reverse {
+            assert_eq!(journal.lock().unwritten.len(), 1);
+            journal.complete(second, vec![admitted(agent)]).unwrap();
+        }
+        let state = journal.lock();
+        let sequences: Vec<_> = state
+            .unwritten
+            .iter()
+            .map(|record| match record {
+                super::SessionRecord::State { d } => d.seq,
+                _ => panic!("expected state record"),
+            })
+            .collect();
+        assert_eq!(sequences, [1, 2]);
+    }
+
+    #[test]
+    fn restored_baseline_emits_only_new_records() {
+        let source = SessionJournal::default();
+        let agent = AgentId::generate();
+        source
+            .commit(JournalCommit {
+                changes: vec![admitted(agent)],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut session = Session::new(FIRST, "/");
+        source.snapshot().apply_to(&mut session).unwrap();
+        let restored = SessionJournal::from_session(&session).unwrap();
+        assert!(restored.lock().unwritten.is_empty());
+        restored
+            .commit(JournalCommit {
+                changes: vec![admitted(agent)],
+                ..Default::default()
+            })
+            .unwrap();
+        let state = restored.lock();
+        assert_eq!(state.unwritten.len(), 1);
+        assert!(matches!(&state.unwritten[0], super::SessionRecord::State { d } if d.seq == 2));
+    }
 
     fn assert_reducer_matches_fold(snapshot: &super::SessionJournalSnapshot) {
         let full = makima_storage::session_state::SessionStateView::fold(

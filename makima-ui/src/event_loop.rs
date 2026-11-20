@@ -23,6 +23,7 @@ use crossterm::event::{
 };
 use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, PreparedModel, PreparedTransaction,
+    PreparedTransactionSnapshot,
 };
 use makima_agent::command::{CONTEXT_RELOAD_ROOT_ONLY, CONTEXT_RELOADED, CustomCommand};
 use makima_agent::config_change::{
@@ -74,10 +75,10 @@ use makima_providers::{
 };
 use makima_storage::StateDir;
 use makima_storage::StorageError;
-use makima_storage::checkpoint::CheckpointPublication;
+use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
-use makima_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
+use makima_storage::sessions::{SESSIONS_DIR, SessionError, SessionRecord, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -113,11 +114,9 @@ use crate::provider_usage::{
 };
 use crate::repaint::{Dirty, IDLE_POLL};
 
-use crate::storage_writer::{
-    CoordinatorCheckpointWriter, LOCK_LOST_REPLACEMENT_ERR, RecoveryPublication, StorageWriter,
-};
 use crate::terminal;
 use crate::theme::ThemesProvider;
+use makima_agent::session_writer::SessionWriter;
 
 mod approval;
 #[cfg(test)]
@@ -140,10 +139,11 @@ const NOT_LIVE_ERR: &str = "session not live";
 const NO_MAILBOX_ERR: &str = "no live session to move a tool call in";
 const MOVED_BACKGROUND_PREFIX: &str = "Moved to the background: ";
 const UNKNOWN_PROVIDER: &str = "Unknown";
-const RECOVERY_ROLLBACK_FAILED: &str = "recovery rollback failed";
+#[cfg(test)]
+const RECOVERY_ACTIVATION_FAILED: &str = "recovery activation failed";
 const RUNTIME_GONE_ERR: &str = "session closed while its model was preparing";
-const CHILD_HISTORY_IDENTITY_ERR: &str = "child history storage identity is unavailable";
 const LOCK_LOST_MSG: &str = "Session lock lost to another process; stopping without saving";
+const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
 
@@ -437,6 +437,8 @@ fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.cancel_background_work();
     runtime.session_lock = None;
     runtime.lock_lost = true;
+    runtime.app.writer_guard = None;
+    runtime.app.session_writer = None;
     runtime.end_plan_approval();
     runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
@@ -447,29 +449,16 @@ fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
 fn stop_runtime_after_recovery_failure(runtime: &mut SessionRuntime, error: &str) {
     runtime.cancel_background_work();
     runtime.lock_lost = true;
+    runtime.app.writer_guard = None;
+    runtime.app.session_writer = None;
     runtime.end_plan_approval();
     runtime.app.flash(error.to_owned());
     runtime.app.exit_request = ExitRequest::Error;
     runtime.coordinator.retire();
     let (manager, root) = runtime.handles.manager_and_root();
     if let Err(close_error) = manager.close_subtree(root) {
-        warn!(%close_error, "closing runtime after recovery rollback failed");
+        warn!(%close_error, "closing runtime after recovery activation failed");
     }
-}
-
-fn rollback_recovery_activation(
-    publication: Option<RecoveryPublication>,
-    current: &mut SessionRuntime,
-    error: ConfigChangeError,
-) -> ConfigChangeError {
-    if let Some(publication) = publication
-        && let Err(rollback_error) = smol::block_on(publication.rollback())
-    {
-        let error = format!("{error}; {RECOVERY_ROLLBACK_FAILED}: {rollback_error}");
-        stop_runtime_after_recovery_failure(current, &error);
-        return error.into();
-    }
-    error
 }
 
 fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: HeartbeatCompletion) {
@@ -773,9 +762,11 @@ fn checkpoint_runtime_config(
 ) -> Result<(), ConfigChangeError> {
     let (manager, root) = handles.manager_and_root();
     let target = manager.lookup(root)?;
-    smol::block_on(checkpoint_startup_config(&target, coordinator))
-        .map(|_| ())
-        .map_err(ConfigChangeError::from)
+    smol::block_on(async {
+        checkpoint_startup_config(&target, coordinator).await?;
+        manager.journal().flush().await
+    })
+    .map_err(ConfigChangeError::from)
 }
 
 fn project_session_journal(session: &mut AppSession, handles: &AgentHandles) -> Result<(), String> {
@@ -826,6 +817,7 @@ struct SessionRuntime {
     handles: AgentHandles,
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
+    checkpoint: Arc<SessionWriter>,
     _coordinator_retirement: CoordinatorRetirement,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -855,31 +847,21 @@ enum RuntimeOwnership {
 }
 
 struct PreparedSessionRuntime {
-    storage_writer: Arc<StorageWriter>,
     app: PreparedApp,
     handles: PreparedAgentHandles,
     recovery: Option<RecoveryCandidate>,
     session_lock: Option<ClaimedSessionLock>,
     model_slot: Arc<ProviderSlot>,
     coordinator: PreparedSessionCoordinator,
-    checkpoint: Arc<CoordinatorCheckpointWriter>,
+    checkpoint: Arc<SessionWriter>,
     prepare_provider: ModelPreparer,
     provider: Option<PreparedProvider>,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     resumed: bool,
-    #[cfg(test)]
-    seed_snapshot: Option<(Arc<StorageWriter>, Arc<AppSession>)>,
 }
 
 impl PreparedSessionRuntime {
-    #[cfg(test)]
-    fn seed_storage(&self) {
-        if let Some((writer, session)) = &self.seed_snapshot {
-            writer.seed(Arc::clone(session));
-        }
-    }
-
     #[cfg(test)]
     fn snapshot(&self) -> (MakimaId, makima_commands::InvocationTargetId, AgentId) {
         (
@@ -900,7 +882,6 @@ impl PreparedSessionRuntime {
         mut session_lock: Option<SessionLockState>,
     ) -> Result<SessionRuntime, ConfigChangeError> {
         let Self {
-            storage_writer,
             app,
             mut handles,
             recovery,
@@ -918,17 +899,20 @@ impl PreparedSessionRuntime {
         if session_lock.is_none() {
             session_lock = prepared_lock.map(SessionLockState::Held);
         }
-        let guard = session_lock
+        let _guard = session_lock
             .as_ref()
             .and_then(SessionLockState::publication_guard)
             .ok_or(LOCK_UNAVAILABLE_REPLACEMENT_ERR)?;
-        checkpoint.bind(Some(guard.clone()));
-        storage_writer.bind_publication_guard(app.session_id(), guard.clone());
+        checkpoint.bind_publication_guard(Some(_guard.clone()));
         let initialized_before_publication = recovery.is_none();
         let initialized = if let Some(recovery) = recovery {
-            smol::block_on(storage_writer.recover_checkpoint(recovery, guard))
-                .map_err(|error| error.to_string())
-                .and_then(|recovered| handles.initialize(recovered))
+            smol::block_on(recovery.publish(
+                &checkpoint,
+                CheckpointPublication::default(),
+                publication_claim(),
+            ))
+            .map_err(|error| error.to_string())
+            .and_then(|recovered| handles.initialize(recovered))
         } else {
             Ok(())
         };
@@ -962,11 +946,6 @@ impl PreparedSessionRuntime {
                 return Err(error);
             }
         };
-        storage_writer.bind_journal(
-            coordinator.session_id(),
-            handles.manager_and_root().0.journal(),
-        );
-        storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
         if !initialized_before_publication
             && let Err(error) = checkpoint_runtime_config(handles.initialized(), &coordinator)
         {
@@ -981,7 +960,6 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
-        app.storage_fence = storage_writer.session_save_fence(coordinator.session_id());
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
@@ -996,6 +974,7 @@ impl PreparedSessionRuntime {
             model_slot,
             _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
             coordinator,
+            checkpoint,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
@@ -1014,7 +993,6 @@ impl PreparedSessionRuntime {
         current: &mut SessionRuntime,
     ) -> std::result::Result<SessionRuntime, (ConfigChangeError, Option<SessionLockState>)> {
         let Self {
-            storage_writer,
             app,
             mut handles,
             recovery,
@@ -1032,44 +1010,41 @@ impl PreparedSessionRuntime {
         if session_lock.is_none() {
             session_lock = prepared_lock.map(SessionLockState::Held);
         }
-        let guard = match session_lock
+        let _guard = match session_lock
             .as_ref()
             .and_then(SessionLockState::publication_guard)
         {
             Some(guard) => guard,
             None => return Err((LOCK_UNAVAILABLE_REPLACEMENT_ERR.into(), session_lock)),
         };
-        checkpoint.bind(Some(guard.clone()));
-        storage_writer.bind_publication_guard(app.session_id(), guard.clone());
+        checkpoint.bind_publication_guard(Some(_guard.clone()));
         let same_session = app.session_id() == current.id();
         let initialized_before_publication = recovery.is_none();
-        let recovered = smol::block_on(async {
-            let Some(recovery) = recovery else {
-                return Ok((None, None));
-            };
-            if same_session {
-                storage_writer
-                    .recover_replacing(recovery, guard)
-                    .await
-                    .map(|(recovered, publication)| (Some(recovered), Some(publication)))
-            } else {
-                storage_writer
-                    .recover_checkpoint(recovery, guard)
-                    .await
-                    .map(|recovered| (Some(recovered), None))
-            }
-        });
-        let (recovered, publication) = match recovered {
-            Ok(recovered) => recovered,
-            Err(error) => return Err((error.to_string().into(), session_lock)),
-        };
-        if let Some(recovered) = recovered
-            && let Err(error) = handles.initialize(recovered)
-        {
-            return Err((
-                rollback_recovery_activation(publication, current, error.into()),
-                session_lock,
+        if let Some(recovery) = recovery {
+            let recovered = smol::block_on(recovery.publish(
+                &checkpoint,
+                CheckpointPublication::default(),
+                publication_claim(),
             ));
+            let initialized = recovered
+                .map_err(|error| error.to_string())
+                .and_then(|recovered| handles.initialize(recovered));
+            if let Err(error) = initialized {
+                return Err((error.into(), session_lock));
+            }
+        }
+        match _guard.publish(|| ()) {
+            Ok(Some(())) => {}
+            result => {
+                if same_session {
+                    stop_runtime_after_recovery_failure(current, LOCK_LOST_REPLACEMENT_ERR);
+                }
+                let error = result.err().map_or_else(
+                    || LOCK_LOST_REPLACEMENT_ERR.to_owned(),
+                    |error| error.to_string(),
+                );
+                return Err((error.into(), session_lock));
+            }
         }
         let activated = if same_session {
             coordinator.activate_replacing(&current.coordinator)
@@ -1079,10 +1054,7 @@ impl PreparedSessionRuntime {
         let coordinator = match activated {
             Ok(coordinator) => coordinator,
             Err(error) => {
-                return Err((
-                    rollback_recovery_activation(publication, current, error.into()),
-                    session_lock,
-                ));
+                return Err((error.into(), session_lock));
             }
         };
         let config_commits = match observe_config_commits(
@@ -1097,25 +1069,9 @@ impl PreparedSessionRuntime {
                 if same_session {
                     stop_runtime_after_recovery_failure(current, &error.to_string());
                 }
-                return Err((
-                    rollback_recovery_activation(publication, current, error),
-                    session_lock,
-                ));
+                return Err((error, session_lock));
             }
         };
-        if let Some(publication) = publication
-            && let Err(error) = publication.commit()
-        {
-            coordinator.retire();
-            let error = error.to_string();
-            stop_runtime_after_recovery_failure(current, &error);
-            return Err((error.into(), session_lock));
-        }
-        storage_writer.bind_journal(
-            coordinator.session_id(),
-            handles.manager_and_root().0.journal(),
-        );
-        storage_writer.bind_config_runtime(coordinator.session_id(), coordinator.runtime_epoch());
         if !initialized_before_publication
             && let Err(error) = checkpoint_runtime_config(handles.initialized(), &coordinator)
         {
@@ -1130,7 +1086,6 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
-        app.storage_fence = storage_writer.session_save_fence(coordinator.session_id());
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
@@ -1145,6 +1100,7 @@ impl PreparedSessionRuntime {
             model_slot,
             _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
             coordinator,
+            checkpoint,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
@@ -1172,7 +1128,7 @@ fn ensure_replacement_lock_available(
 
 /// Activates `prepared` in place of `current` and hands back the outgoing
 /// runtime. A deferred runner stays parked until the caller releases it. A
-/// rollback failure stops `current`; other failures return its target lock.
+/// Activation failures return the target lock without rewriting the log.
 fn swap_session_runtime(
     current: &mut SessionRuntime,
     prepared: PreparedSessionRuntime,
@@ -1370,7 +1326,6 @@ struct SpawnCtx {
     mcp_config_errors: McpConfigErrors,
     model_slot: Arc<ProviderSlot>,
     catalog: ModelCatalog,
-    storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     session_defaults: SessionDefaults,
     system_prompt: SystemPromptOverride,
@@ -1382,7 +1337,7 @@ struct SpawnCtx {
 struct CoordinatorDeps {
     catalog: makima_agent::session_coordinator::SessionOptionCatalog,
     model_policy: Arc<ModelPolicy>,
-    checkpoint: Arc<CoordinatorCheckpointWriter>,
+    checkpoint: Arc<SessionWriter>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1426,11 +1381,11 @@ fn prepare_coordinator(
 }
 
 impl SpawnCtx {
-    fn coordinator_deps(&self) -> CoordinatorDeps {
+    fn coordinator_deps(&self, checkpoint: Arc<SessionWriter>) -> CoordinatorDeps {
         CoordinatorDeps {
             catalog: self.lua_event_handle.session_option_catalog(),
             model_policy: Arc::clone(&self.model_policy),
-            checkpoint: self.storage_writer.coordinator_checkpoint(),
+            checkpoint,
         }
     }
 
@@ -1695,6 +1650,7 @@ impl SpawnCtx {
             session.meta.session_options.clone(),
         )?;
         session.resolve_legacy_config(stored)?;
+        let bootstrap = session.clone();
         let recovery = match exact {
             Some(snapshot) => {
                 let recovery = RecoveryCandidate::from_exact(session, snapshot.clone())?;
@@ -1724,7 +1680,7 @@ impl SpawnCtx {
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             self.status_content_reader.clone(),
-            Arc::clone(&self.storage_writer),
+            None,
             self.ui_config.clone(),
             self.input_history_size,
             Arc::clone(&permissions),
@@ -1753,7 +1709,13 @@ impl SpawnCtx {
             self.system_prompt.clone(),
             Arc::clone(&self.file_write_locks),
         );
-        let deps = self.coordinator_deps();
+        let writer = SessionWriter::open_session(&self.sessions_dir, &bootstrap)?;
+        writer.bind_publication_guard(Some(guard.clone()));
+        smol::block_on(writer.append_owned(Vec::new(), guard.clone()))?;
+        let checkpoint = Arc::new(writer.clone());
+        app.app.session_writer = Some(writer);
+        app.app.writer_guard = Some(guard.clone());
+        let deps = self.coordinator_deps(checkpoint);
         let coordinator = prepare_coordinator(
             &deps,
             &session,
@@ -1762,13 +1724,9 @@ impl SpawnCtx {
             &permissions,
             &coordinator_config,
         )?;
-        #[cfg(test)]
-        let seed_snapshot =
-            seed_snapshot.then(|| (Arc::clone(&self.storage_writer), Arc::new(session.clone())));
         app.app.trust_question = self.trust_question.clone();
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
         Ok(PreparedSessionRuntime {
-            storage_writer: Arc::clone(&self.storage_writer),
             app,
             handles,
             recovery: Some(recovery),
@@ -1781,8 +1739,6 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             resumed,
-            #[cfg(test)]
-            seed_snapshot,
         })
     }
 
@@ -2121,7 +2077,6 @@ impl<'t> EventLoop<'t> {
         let (internal_tx, internal_rx) = flume::unbounded();
         let (warn_tx, warn_rx) = flume::unbounded::<String>();
         let catalog = ModelCatalog::offline(Arc::clone(&providers), &model_policy);
-        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), warn_tx.clone()));
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
@@ -2167,7 +2122,6 @@ impl<'t> EventLoop<'t> {
             mcp_config_errors,
             model_slot,
             catalog,
-            storage_writer,
             model_policy,
             session_defaults,
             system_prompt: SystemPromptOverride {
@@ -2353,7 +2307,6 @@ impl<'t> EventLoop<'t> {
                 },
                 Some(runtime_config_mutations(
                     runtime,
-                    Arc::clone(&self.ctx.storage_writer),
                     Arc::clone(&self.orchestration),
                 )),
             );
@@ -2989,6 +2942,7 @@ impl<'t> EventLoop<'t> {
                     dirty = Dirty::YES;
                 }
             }
+            dirty |= rt.app.sync_writer_warning();
             let (session_dirty, actions) = tick_session(&mut rt.app, i == self.focused, now);
             dirty |= session_dirty;
             if !actions.is_empty() {
@@ -3480,14 +3434,14 @@ impl<'t> EventLoop<'t> {
                 if let Some(store) = &store {
                     store.request_close();
                 }
-                let storage_writer = Arc::clone(&self.ctx.storage_writer);
                 let sessions_dir = self.ctx.sessions_dir.clone();
                 smol::spawn(async move {
                     let session_lock = runtime.as_mut().and_then(|rt| rt.session_lock.take());
+                    let lock_dir = sessions_dir.clone();
                     let lease = smol::unblock(move || {
                         match settle_lock_state(session_lock, AGENT_SHUTDOWN_TIMEOUT) {
                             LockSettlement::Held(lease) => Ok(lease),
-                            LockSettlement::None => claim_lock(&sessions_dir, &id),
+                            LockSettlement::None => claim_lock(&lock_dir, &id),
                             LockSettlement::Lost | LockSettlement::TimedOut => {
                                 Err(eyre!(LOCK_LOST_MSG))
                             }
@@ -3498,6 +3452,18 @@ impl<'t> EventLoop<'t> {
                         Ok(lease) => RenewingDeletionLease::new(lease),
                         Err(error) => {
                             if let Some(rt) = runtime {
+                                let (manager, root) = rt.handles.manager_and_root();
+                                if let Ok(actor) = manager.actor(root) {
+                                    actor.cancel_all();
+                                }
+                                let _ = bounded_session_op(
+                                    async {
+                                        manager.wait_settled().await;
+                                        Ok(())
+                                    },
+                                    AGENT_SHUTDOWN_TIMEOUT,
+                                )
+                                .await;
                                 let shutdown = rt.handles.shutdown();
                                 let _ = rt.coordinator.close().await;
                                 shutdown.await;
@@ -3516,24 +3482,23 @@ impl<'t> EventLoop<'t> {
                         (lease, guard)
                     })
                     .await;
-                    let store = smol::unblock(move || {
+                    smol::unblock(move || {
                         if let Some(store) = &store {
                             store.close_and_drain();
                         }
-                        store
                     })
                     .await;
-                    let (done_tx, done_rx) = flume::bounded(1);
-                    storage_writer.delete_guarded(id, guard, store, move |res| {
-                        let _ = done_tx.send(res);
-                    });
-                    let reply = match done_rx.recv_async().await {
-                        Ok(Ok(())) | Ok(Err(SessionError::Storage(StorageError::NotFound(_)))) => {
-                            Ok(json!(true))
-                        }
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    };
+                    let reply = smol::unblock(move || {
+                        makima_agent::session_writer::forget(&sessions_dir, id)
+                            .map_err(|error| error.to_string())?;
+                        guard
+                            .publish(|| makima_agent::session_writer::delete(&sessions_dir, id))
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| LOCK_LOST_REPLACEMENT_ERR.to_owned())?
+                            .map(|_| json!(true))
+                            .map_err(|error| error.to_string())
+                    })
+                    .await;
                     smol::unblock(move || drop(lease)).await;
                     let _ = reply_tx.send(reply);
                 })
@@ -3587,12 +3552,23 @@ impl<'t> EventLoop<'t> {
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
+                        self.sessions[i].app.set_title(title);
                     } else {
                         let mut session =
                             AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
                         session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session));
+                        let lease = claim_lock(&self.ctx.sessions_dir, &id)
+                            .map_err(|error| error.to_string())?;
+                        let writer = SessionWriter::open_session(&self.ctx.sessions_dir, &session)
+                            .map_err(|error| error.to_string())?;
+                        writer.bind_publication_guard(Some(lease.publication_guard()));
+                        smol::block_on(writer.append_owned(
+                            vec![SessionRecord::Title {
+                                title: session.title.clone(),
+                            }],
+                            lease.publication_guard(),
+                        ))
+                        .map_err(|error| error.to_string())?;
                     }
                     Ok(json!(true))
                 })();
@@ -3667,7 +3643,7 @@ impl<'t> EventLoop<'t> {
         error: String,
         reply: flume::Sender<UiReply>,
     ) {
-        let writer = Arc::clone(&self.ctx.storage_writer);
+        let sessions_dir = self.ctx.sessions_dir.clone();
         smol::spawn(async move {
             let id = runtime.id();
             let SessionRuntime {
@@ -3681,20 +3657,22 @@ impl<'t> EventLoop<'t> {
             drop(app);
             handles.shutdown().await;
             let _ = coordinator.close().await;
-            writer.forget(id);
             let cleanup = match settle_lock_state(session_lock, AGENT_SHUTDOWN_TIMEOUT) {
                 LockSettlement::Held(lease) => {
                     let lease = RenewingDeletionLease::new(lease);
                     let guard = lease.publication_guard();
-                    let (done, deleted) = flume::bounded(1);
-                    writer.delete_guarded(id, guard, None, move |result| {
-                        let _ = done.send(result);
-                    });
-                    let result = deleted.recv_async().await;
+                    let result = smol::unblock(move || {
+                        makima_agent::session_writer::forget(&sessions_dir, id)
+                            .map_err(|error| error.to_string())?;
+                        guard
+                            .publish(|| makima_agent::session_writer::delete(&sessions_dir, id))
+                            .map_err(|error| error.to_string())?
+                            .ok_or_else(|| LOCK_LOST_REPLACEMENT_ERR.to_owned())?
+                            .map_err(|error| error.to_string())
+                    })
+                    .await;
                     drop(lease);
                     result
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result.map_err(|error| error.to_string()))
                 }
                 _ => Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into()),
             };
@@ -3900,21 +3878,7 @@ impl<'t> EventLoop<'t> {
         idx: usize,
         prepared: PreparedSessionRuntime,
     ) -> Result<(), String> {
-        let target_id = prepared.app.session_id();
-        let current_id = self.sessions[idx].id();
-        let old = match replace_session_runtime(
-            &mut self.sessions[idx],
-            prepared,
-            &self.ctx.model_slot,
-        ) {
-            Ok(old) => old,
-            Err(error) => {
-                if target_id != current_id {
-                    self.ctx.storage_writer.forget(target_id);
-                }
-                return Err(error);
-            }
-        };
+        let old = replace_session_runtime(&mut self.sessions[idx], prepared, &self.ctx.model_slot)?;
         smol::spawn(self.retire_runtime(idx, old, ())).detach();
         Ok(())
     }
@@ -3953,7 +3917,6 @@ impl<'t> EventLoop<'t> {
         }
         drop(app);
         let shutdown = handles.shutdown();
-        let storage_writer = Arc::clone(&self.ctx.storage_writer);
         async move {
             shutdown.await;
             drop(held);
@@ -3962,7 +3925,6 @@ impl<'t> EventLoop<'t> {
                     end_conversation_detached(&provider, conversation_id, ConversationEnd::Closed);
                 }
                 let _ = coordinator.close().await;
-                storage_writer.forget(retired_id);
             }
         }
     }
@@ -4776,22 +4738,7 @@ impl<'t> EventLoop<'t> {
                     .map_err(|error| error.to_string())
             }));
         }
-        let key = self.sessions[idx]
-            .app
-            .chats
-            .iter()
-            .find(|chat| chat.agent_id == Some(target.id()))
-            .and_then(|chat| chat.subagent_id.clone())
-            .ok_or_else(|| CHILD_HISTORY_IDENTITY_ERR.to_owned())?;
-        let guard = match &self.sessions[idx].session_lock {
-            Some(lock) if lock.publication_guard().is_some() => lock
-                .publication_guard()
-                .ok_or(LOCK_UNAVAILABLE_REPLACEMENT_ERR)?,
-            _ => return Err(LOCK_LOST_REPLACEMENT_ERR.to_owned()),
-        };
-        let writer = Arc::clone(&self.ctx.storage_writer);
-        let session_id = self.sessions[idx].id();
-        let fence = self.sessions[idx].app.storage_fence.clone();
+        let checkpoint = self.sessions[idx].checkpoint.clone();
         let registration = self.sessions[idx]
             .coordinator
             .register_publication(&publication)
@@ -4805,28 +4752,13 @@ impl<'t> EventLoop<'t> {
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
                         let _registration = registration;
-                        writer
-                            .checkpoint_staged_fenced(
-                                crate::storage_writer::StagedSessionCheckpoint {
-                                    session_id,
-                                    checkpoint: None,
-                                    journal: snapshot.journal,
-                                    history: history_changed.then_some((
-                                        makima_storage::sessions::HistoryDestination::Child(
-                                            key.clone(),
-                                        ),
-                                        snapshot.history,
-                                    )),
-                                    selected_config: Some(
-                                        makima_storage::sessions::HistoryDestination::Child(key),
-                                    ),
-                                    publication,
-                                    claim: publication_claim(),
-                                    guard,
-                                },
-                                &fence,
-                            )
-                            .await
+                        publish_writer_transaction(
+                            &checkpoint,
+                            snapshot,
+                            publication,
+                            publication_claim(),
+                        )
+                        .await
                     })
                 }),
                 finalize: Box::new(|_| {}),
@@ -5133,6 +5065,7 @@ impl<'t> EventLoop<'t> {
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         let mut coordinators = Vec::with_capacity(self.sessions.len());
         let mut session_leases = Vec::with_capacity(self.sessions.len());
+        let mut writers = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
                 mut app,
@@ -5161,6 +5094,9 @@ impl<'t> EventLoop<'t> {
                 }
                 LockSettlement::Lost | LockSettlement::None => {}
             }
+            if let Some(writer) = app.session_writer.clone() {
+                writers.push(writer);
+            }
             coordinators.push(coordinator);
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
@@ -5179,7 +5115,23 @@ impl<'t> EventLoop<'t> {
             smol::block_on(h.shutdown());
         }
         let mcp_shutdown_ms = lap();
-        self.ctx.storage_writer.shutdown(AGENT_SHUTDOWN_TIMEOUT);
+        for writer in writers {
+            let _ = smol::block_on(bounded_session_op(
+                async { writer.drain().await.map_err(|error| error.to_string()) },
+                AGENT_SHUTDOWN_TIMEOUT,
+            ));
+            let status = writer.status();
+            if status.unsaved_records > 0 {
+                eprintln!(
+                    "Warning: exiting with {} unsaved session records{}",
+                    status.unsaved_records,
+                    status
+                        .error
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         let storage_drain_ms = lap();
         for (id, lease) in session_leases {
             if let Err(error) = lease.release() {
@@ -5340,14 +5292,25 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
     }
 }
 
+async fn publish_writer_transaction(
+    writer: &SessionWriter,
+    snapshot: PreparedTransactionSnapshot,
+    publication: CheckpointPublication,
+    claim: CheckpointClaim,
+) -> Result<(), String> {
+    claim(&publication).map_err(|error| error.to_string())?;
+    if let Some(install) = snapshot.install {
+        install()?;
+    }
+    writer.drain().await.map_err(|error| error.to_string())
+}
+
 fn runtime_config_mutations(
     runtime: &SessionRuntime,
-    writer: Arc<StorageWriter>,
     orchestration: Arc<AgentOrchestration>,
 ) -> ConfigMutationReserver {
     let coordinator = runtime.coordinator.clone();
-    let session_id = runtime.id();
-    let fence = runtime.app.storage_fence.clone();
+    let checkpoint = runtime.checkpoint.clone();
     let orchestration = Arc::downgrade(&orchestration);
     let (manager, root_id) = runtime.handles.manager_and_root();
     let guard = match &runtime.session_lock {
@@ -5383,9 +5346,8 @@ fn runtime_config_mutations(
             .upgrade()
             .ok_or(NOT_LIVE_ERR)?
             .validate_target(target)?;
-        let guard = guard.clone().ok_or(LOCK_LOST_REPLACEMENT_ERR)?;
-        let writer = Arc::clone(&writer);
-        let fence = fence.clone();
+        guard.as_ref().ok_or(LOCK_LOST_REPLACEMENT_ERR)?;
+        let checkpoint = checkpoint.clone();
         let registration = coordinator.register_publication(&publication)?;
         Ok(Box::new(move |_, claim| {
             validate()?;
@@ -5397,21 +5359,7 @@ fn runtime_config_mutations(
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
                         let _registration = registration;
-                        writer
-                            .checkpoint_staged_fenced(
-                                crate::storage_writer::StagedSessionCheckpoint {
-                                    session_id,
-                                    checkpoint: None,
-                                    journal: snapshot.journal,
-                                    history: None,
-                                    selected_config: None,
-                                    publication,
-                                    claim,
-                                    guard,
-                                },
-                                &fence,
-                            )
-                            .await
+                        publish_writer_transaction(&checkpoint, snapshot, publication, claim).await
                     })
                 }),
                 finalize: Box::new(|_| {}),
@@ -5608,9 +5556,7 @@ mod tests {
     use makima_agent::{ActorBackend, AgentInput, BackendResult, ControlWork, WorkKind};
     use makima_domain::ThinkingConfig as DomainThinkingConfig;
     use makima_providers::{Invocation, RequestDelivery};
-    use makima_storage::checkpoint::{
-        CheckpointRequest, CheckpointVersion, CheckpointWriter, ClaimingWriter,
-    };
+    use makima_storage::checkpoint::ClaimingWriter;
 
     /// A preparer for tests, from a blocking one over the resolved model,
     /// run off the executor as a real prepare may block.
@@ -5985,11 +5931,7 @@ end })
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
                 )
                 .unwrap();
-            let reserve = runtime_config_mutations(
-                runtime,
-                Arc::clone(&event_loop.ctx.storage_writer),
-                Arc::clone(&event_loop.orchestration),
-            );
+            let reserve = runtime_config_mutations(runtime, Arc::clone(&event_loop.orchestration));
             if close_before_reservation {
                 child.close_subtree().unwrap();
                 assert!(reserve(&child, CheckpointPublication::default()).is_err());
@@ -6968,6 +6910,17 @@ end })
         model
     }
 
+    struct TestSessionIo;
+
+    impl makima_agent::session_writer::SessionIo for TestSessionIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A runtime whose app and provider slot both start on `model`.
     fn test_runtime(model: Model) -> SessionRuntime {
         let (model_slot, _change_rx) = ProviderSlot::new(model.clone(), Arc::new(StubProvider));
@@ -6995,6 +6948,11 @@ end })
             SystemPromptOverride::default(),
         );
         handles.apply_to_app(&mut app);
+        let checkpoint = Arc::new(SessionWriter::with_io(
+            app.state.session.id,
+            TestSessionIo,
+            0,
+        ));
         let coordinator = test_coordinator(app.state.session.id);
         let (shell_tx, shell_rx) = flume::unbounded();
         let config_commits = observe_config_commits(
@@ -7021,6 +6979,7 @@ end })
             model_slot,
             _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
             coordinator,
+            checkpoint,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
@@ -7265,10 +7224,6 @@ end })
                 .wait_active(TEST_DISCOVERY_TIMEOUT),
         );
         drop(event_loop.model_discovery);
-        event_loop
-            .ctx
-            .storage_writer
-            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
         for runtime in event_loop.sessions.drain(..) {
             release_runtime(runtime);
         }
@@ -7306,11 +7261,6 @@ end })
         );
         let app = &mut event_loop.sessions[0].app;
         app.active_chat = app.agent_chat_index[&child];
-        app.sync_live_children();
-        event_loop
-            .ctx
-            .storage_writer
-            .send(Arc::clone(&app.state.session));
         event_loop.sync_orchestration();
     }
 
@@ -7456,8 +7406,6 @@ end })
                 ProjectConfig::for_project(temp_dir.path()),
                 Arc::default(),
             ));
-            let storage_writer =
-                Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
             let host = PluginHost::with_command_registry(
                 Arc::new(ToolRegistry::new()),
                 command_runtime.registry.clone(),
@@ -7485,7 +7433,6 @@ end })
                 mcp_config_errors: McpConfigErrors::new(temp_dir.path().to_path_buf()),
                 model_slot,
                 catalog,
-                storage_writer,
                 model_policy: Arc::new(ModelPolicy::default()),
                 session_defaults: SessionDefaults::default(),
                 system_prompt: SystemPromptOverride::default(),
@@ -7525,28 +7472,52 @@ end })
             self.ctx().spawn_runtime(session).unwrap()
         }
 
+        fn append_fixture(&self, session: &AppSession, guard: SessionPublicationGuard) {
+            let saved = AppSession::load(session.id, &self.ctx().storage).unwrap();
+            let through = saved
+                .state()
+                .iter()
+                .map(|record| record.seq)
+                .chain(saved.agent_revisions().iter().map(|(seq, _)| *seq))
+                .max();
+            let mut records: Vec<_> = session
+                .state()
+                .iter()
+                .filter(|record| through.is_none_or(|seq| record.seq > seq))
+                .map(|record| (record.seq, SessionRecord::State { d: record.clone() }))
+                .chain(
+                    session
+                        .agent_revisions()
+                        .iter()
+                        .filter(|(seq, _)| through.is_none_or(|through| *seq > through))
+                        .map(|(seq, record)| {
+                            (
+                                *seq,
+                                SessionRecord::Agent {
+                                    seq: *seq,
+                                    d: record.clone(),
+                                },
+                            )
+                        }),
+                )
+                .collect();
+            records.sort_by_key(|(seq, _)| *seq);
+            let writer = SessionWriter::open_session(&self.ctx().sessions_dir, session).unwrap();
+            smol::block_on(writer.append_owned(
+                records.into_iter().map(|(_, record)| record).collect(),
+                guard,
+            ))
+            .unwrap();
+        }
+
         fn target_count(&self) -> usize {
             self.ctx().command_runtime.registry.target_count()
         }
 
         fn persist_runtime(&self, runtime: &mut SessionRuntime) {
             runtime.app.checkpoint_now();
-            let snapshot = Arc::clone(&runtime.app.state.session);
-            let version = CheckpointVersion {
-                revision: snapshot.revision(),
-                epoch: snapshot.history_snapshot().epoch,
-            };
-            let checkpoint = self.ctx().storage_writer.checkpoint(CheckpointRequest {
-                session_id: runtime.id(),
-                version,
-                snapshot,
-            });
-            let ack = smol::block_on(bounded_session_op(
-                async move { checkpoint.await.map_err(|error| error.to_string()) },
-                RUNTIME_SHUTDOWN_TIMEOUT,
-            ))
-            .unwrap();
-            assert_eq!(ack.version, version);
+            smol::block_on(runtime.checkpoint.drain()).unwrap();
+            smol::block_on(runtime.app.session_writer.as_ref().unwrap().drain()).unwrap();
         }
 
         fn restart(mut self, mut runtime: SessionRuntime) -> Self {
@@ -7569,9 +7540,7 @@ end })
         fn shutdown_writer(&mut self) -> StateDir {
             let ctx = self.ctx.take().unwrap();
             let storage = ctx.storage.clone();
-            let writer = Arc::clone(&ctx.storage_writer);
             drop(ctx);
-            writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
             storage
         }
     }
@@ -7601,9 +7570,7 @@ end })
             let Some(ctx) = self.ctx.take() else {
                 return;
             };
-            let storage_writer = Arc::clone(&ctx.storage_writer);
             drop(ctx);
-            storage_writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
         }
     }
 
@@ -7830,7 +7797,6 @@ end })
                     Some(Arc::clone(&store)),
                 )
                 .unwrap();
-            prepared.seed_storage();
             let runtime = prepared.activate(&event_loop.ctx.model_slot, None).unwrap();
             event_loop.push_runtime(runtime);
             let worker = std::thread::spawn({
@@ -8149,7 +8115,6 @@ end })
                 Some(Arc::clone(&store)),
             )
             .unwrap();
-        prepared.seed_storage();
         let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
         runtime.activate_deferred();
         session.model = runtime.app.root_config().model.spec();
@@ -8815,7 +8780,6 @@ end })
         let harness = RuntimeHarness::new();
         let prepared = harness.prepare();
         let mut session = prepared.recovery.as_ref().unwrap().session().clone();
-        drop(prepared);
         let root = session.root_agent_id().unwrap();
         let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
             .config
@@ -8863,6 +8827,11 @@ end })
                 value: Some(serde_json::to_value(plans).unwrap()),
             },
         });
+        harness.append_fixture(
+            &session,
+            prepared.session_lock.as_ref().unwrap().publication_guard(),
+        );
+        drop(prepared);
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
         if blocked {
@@ -9091,7 +9060,10 @@ end })
         let session_id = session.id;
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
         assert!(!prepared.handles.is_initialized());
-        assert!(AppSession::load(session_id, &harness.ctx().storage).is_err());
+        let bootstrap = AppSession::load(session_id, &harness.ctx().storage).unwrap();
+        assert_eq!(bootstrap.root_agent_id(), Some(root));
+        const NOT_ACTIVATED: &str = "must not enter unpublished mailbox";
+        assert!(SessionMailbox::notify(session_id, NOT_ACTIVATED.into(), false).is_err());
         let prepared_history = prepared
             .recovery
             .as_ref()
@@ -9213,11 +9185,23 @@ end })
         smol::block_on(catalog.replace_plugin_options(PLUGIN, definitions)).unwrap();
         let mut current = replace.then(|| harness.runtime(harness.session()));
         let session = if resumed {
-            let mut session = if let Some(current) = &current {
-                AppSession::load(current.id(), &harness.ctx().storage).unwrap()
+            let prepared = current.is_none().then(|| harness.prepare());
+            let (mut session, guard) = if let Some(current) = &current {
+                (
+                    AppSession::load(current.id(), &harness.ctx().storage).unwrap(),
+                    current
+                        .session_lock
+                        .as_ref()
+                        .unwrap()
+                        .publication_guard()
+                        .unwrap(),
+                )
             } else {
-                let prepared = harness.prepare();
-                prepared.recovery.as_ref().unwrap().session().clone()
+                let prepared = prepared.as_ref().unwrap();
+                (
+                    prepared.recovery.as_ref().unwrap().session().clone(),
+                    prepared.session_lock.as_ref().unwrap().publication_guard(),
+                )
             };
             let root = session.root_agent_id().unwrap();
             let folded = session.latest_state().unwrap();
@@ -9235,7 +9219,8 @@ end })
                 generation: folded.scopes[&Some(root)].generation,
                 change: StateChange::Config(stored),
             });
-            session.save(&harness.ctx().storage).unwrap();
+            harness.append_fixture(&session, guard);
+            drop(prepared);
             AppSession::load(session.id, &harness.ctx().storage).unwrap()
         } else {
             harness.session()
@@ -9269,6 +9254,7 @@ end })
         assert_eq!(expected[TRANSIENT], DISABLED_VALUE);
         assert_eq!(expected[NEW_DEFAULT], DISABLED_VALUE);
         let snapshot = manager.journal().snapshot();
+        assert_eq!(manager.journal().published_revision(), snapshot.revision);
         let folded = snapshot.fold().unwrap();
         assert_eq!(
             folded.scopes[&Some(root)].config.as_ref().unwrap().options,
@@ -9381,8 +9367,6 @@ end })
         let mut harness = RuntimeHarness::new();
         let prepared = harness.prepare();
         let mut current = prepared.recovery.as_ref().unwrap().session().clone();
-        drop(prepared);
-        current.save(&harness.ctx().storage).unwrap();
         let stale = AppSession::load(current.id, &harness.ctx().storage).unwrap();
         let root = current.root_agent_id().unwrap();
         let latest_model = Model::from_spec("openai/authoritative-checkpoint").unwrap();
@@ -9401,7 +9385,11 @@ end })
             generation: 1,
             change: StateChange::Config(config),
         });
-        current.save(&harness.ctx().storage).unwrap();
+        harness.append_fixture(
+            &current,
+            prepared.session_lock.as_ref().unwrap().publication_guard(),
+        );
+        drop(prepared);
         let (requested, requests) = flume::unbounded();
         let sessions = harness.ctx().sessions_dir.clone();
         let id = current.id;
@@ -9552,7 +9540,14 @@ end })
                 .as_deref(),
             Some(DRAFT)
         );
-        assert!(AppSession::load(id, &harness.ctx().storage).is_err());
+        assert_eq!(
+            AppSession::load(id, &harness.ctx().storage)
+                .unwrap()
+                .meta
+                .input_draft
+                .as_deref(),
+            Some(DRAFT)
+        );
     }
 
     #[test]
@@ -9570,7 +9565,6 @@ end })
             ProviderSlot::new(model, Arc::new(StubProvider)).0;
         let prepared = harness.prepare();
         let mut session = prepared.recovery.as_ref().unwrap().session().clone();
-        drop(prepared);
         let root = session.root_agent_id().unwrap();
         let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
             .config
@@ -9592,6 +9586,12 @@ end })
             generation: 1,
             change: StateChange::Config(stored.clone()),
         });
+        session.set_cwd(stored.cwd.clone());
+        harness.append_fixture(
+            &session,
+            prepared.session_lock.as_ref().unwrap().publication_guard(),
+        );
+        drop(prepared);
 
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
@@ -9630,10 +9630,14 @@ end })
         let session_id = session.id;
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
         let target_count = harness.target_count();
-        harness
-            .ctx()
-            .storage_writer
-            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        let bootstrap = fs::read(
+            harness
+                .ctx()
+                .sessions_dir
+                .join(format!("{session_id}.jsonl")),
+        )
+        .unwrap();
+        smol::block_on(prepared.app.app.session_writer.as_ref().unwrap().close()).unwrap();
         if let Some(current) = current.as_mut() {
             let identity = current.handles.identity();
             assert!(replace_session_runtime(current, prepared, &harness.ctx().model_slot).is_err());
@@ -9647,7 +9651,16 @@ end })
         }
         assert_eq!(harness.target_count(), target_count);
         assert!(SessionMailbox::notify(session_id, NOT_EXPOSED.into(), false).is_err());
-        assert!(AppSession::load(session_id, &harness.ctx().storage).is_err());
+        assert_eq!(
+            fs::read(
+                harness
+                    .ctx()
+                    .sessions_dir
+                    .join(format!("{session_id}.jsonl"))
+            )
+            .unwrap(),
+            bootstrap
+        );
         let lock = claim_lock(&harness.ctx().sessions_dir, &session_id).unwrap();
         lock.release().unwrap();
         if let Some(current) = current {
@@ -9657,7 +9670,7 @@ end })
 
     #[test]
     fn recovery_failure_stop_rejects_submissions_and_mailbox_runs() {
-        const FAILURE: &str = RECOVERY_ROLLBACK_FAILED;
+        const FAILURE: &str = RECOVERY_ACTIVATION_FAILED;
         const PROMPT: &str = "must not be admitted";
         let harness = RuntimeHarness::new();
         let mut runtime = harness.runtime(harness.session());
@@ -9736,139 +9749,34 @@ end })
         release_runtime(runtime);
     }
 
-    #[test_case(false; "rollback_restores_old_runtime")]
-    #[test_case(true; "rollback_failure_stops_old_runtime")]
-    fn failed_same_session_activation_restores_published_prefix_and_old_runtime_can_persist(
-        rollback_fails: bool,
-    ) {
-        use makima_storage::session_state::{StateChange, StoredStateRecord};
-
+    #[test]
+    fn failed_same_session_initialization_keeps_current_runtime() {
         const FAILURE: &str = "replacement root activation failed";
-        const PROMPT: &str = "new turn after recovery rollback";
         let harness = RuntimeHarness::new();
-        let (requests, received) = flume::unbounded();
-        let model = harness.ctx().model_slot.load().model.clone();
-        harness
-            .ctx()
-            .model_slot
-            .install(model, Arc::new(AnsweringProvider { requests }));
-        let (session, root, child, _, _) = interrupted_session(&harness);
-        let mut runtime = harness.runtime(session);
-        harness.persist_runtime(&mut runtime);
-        let before = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
-        let identity = runtime.handles.identity();
-        let journal = runtime.handles.manager_and_root().0.journal();
-        let mut replacement = before.clone();
-        let interrupted = TurnId::generate();
-        replacement.push_state(StoredStateRecord {
-            seq: before.state().last().unwrap().seq + 1,
-            agent: Some(root),
-            generation: 0,
-            change: StateChange::Admitted {
-                turn: interrupted,
-                origin: makima_storage::session_state::StoredTurnOrigin::User,
-            },
-        });
+        let mut runtime = harness.runtime(harness.session());
+        let before = runtime.handles.identity();
+        let session = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
         let mut prepared = harness
             .ctx()
-            .prepare_replacement_runtime(replacement, None, &runtime)
+            .prepare_replacement_runtime(session, None, &runtime)
             .unwrap();
         let (entered, entering) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
         prepared
             .handles
             .fail_initialization_after(entered, released, FAILURE);
-        let storage = harness.ctx().storage.clone();
-        let sessions_dir = harness.ctx().sessions_dir.clone();
-        let session_id = before.id;
-        let expected = before.clone();
         let observer = std::thread::spawn(move || {
             entering.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
-            let published = AppSession::load(session_id, &storage).unwrap();
-            assert_eq!(published.state(), expected.state());
-            assert_eq!(published.agent_revisions(), expected.agent_revisions());
-            assert_eq!(published.messages(), expected.messages());
-            assert!(
-                !published.latest_state().unwrap().scopes[&Some(root)]
-                    .results
-                    .iter()
-                    .any(|(turn, _)| *turn == interrupted)
-            );
-            if rollback_fails {
-                let lock_path = session_lock::lock_path(&sessions_dir, &session_id);
-                fs::write(lock_path, format!("{} replacement", std::process::id())).unwrap();
-            }
             release.send(()).unwrap();
-            published
         });
         let error = replace_session_runtime(&mut runtime, prepared, &harness.ctx().model_slot)
             .err()
-            .expect("gated replacement must fail");
-        let published = observer.join().unwrap();
+            .expect("initialization must fail");
+        observer.join().unwrap();
         assert!(error.contains(FAILURE), "{error}");
-        if rollback_fails {
-            assert!(error.contains(RECOVERY_ROLLBACK_FAILED), "{error}");
-            assert!(runtime.lock_lost);
-            assert!(!runtime.quiescent());
-            assert!(runtime.submit_text(PROMPT.into()).is_err());
-            let after = AppSession::load(before.id, &harness.ctx().storage).unwrap();
-            assert_eq!(after.state(), published.state());
-            assert_eq!(after.agent_revisions(), published.agent_revisions());
-            assert_eq!(runtime.app.exit_request, ExitRequest::Error);
-            release_runtime(runtime);
-            return;
-        }
-        assert!(Arc::ptr_eq(&runtime.handles.identity(), &identity));
-        assert!(Arc::ptr_eq(
-            &runtime.handles.manager_and_root().0.journal(),
-            &journal
-        ));
+        assert!(Arc::ptr_eq(&runtime.handles.identity(), &before));
         assert!(!runtime.lock_lost);
-        let rolled_back = AppSession::load(before.id, &harness.ctx().storage).unwrap();
-        assert_eq!(rolled_back.state(), before.state());
-        assert_eq!(rolled_back.agent_revisions(), before.agent_revisions());
-        assert_eq!(rolled_back.messages(), before.messages());
-        assert_eq!(rolled_back.subagent_messages(), before.subagent_messages());
-
-        runtime.submit_text(PROMPT.into()).unwrap();
-        received.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
-        let actor = runtime.handles.manager_and_root().0.actor(root).unwrap();
-        let ticket = actor.latest_ticket().unwrap();
-        let outcome = smol::block_on(bounded_session_op(
-            async { Ok(ticket.wait().await) },
-            RUNTIME_SHUTDOWN_TIMEOUT,
-        ))
-        .unwrap();
-        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
         harness.persist_runtime(&mut runtime);
-        let loaded = AppSession::load(before.id, &harness.ctx().storage).unwrap();
-        assert_eq!(loaded.root_agent_id(), Some(root));
-        assert_eq!(loaded.agents()[&child].parent, Some(root));
-        assert!(
-            loaded
-                .messages()
-                .iter()
-                .any(|message| message.user_text() == Some(PROMPT))
-        );
-        assert!(
-            loaded
-                .messages()
-                .iter()
-                .any(|message| message.first_text_content() == Some(PREPARED_ANSWER))
-        );
-        let state = loaded.latest_state().unwrap();
-        assert!(
-            state.scopes[&Some(root)]
-                .results
-                .iter()
-                .any(|(turn, _)| *turn == ticket.turn_id())
-        );
-        assert!(
-            !state.scopes[&Some(root)]
-                .results
-                .iter()
-                .any(|(turn, _)| *turn == interrupted)
-        );
         release_runtime(runtime);
     }
 
@@ -10312,7 +10220,6 @@ end })
             |harness| {
                 let prepared = harness.prepare();
                 let mut session = prepared.recovery.as_ref().unwrap().session().clone();
-                drop(prepared);
                 let root = session.root_agent_id().unwrap();
                 let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
                     .config
@@ -10362,6 +10269,11 @@ end })
                     generation: 0,
                     change: StateChange::Config(stored),
                 });
+                harness.append_fixture(
+                    &session,
+                    prepared.session_lock.as_ref().unwrap().publication_guard(),
+                );
+                drop(prepared);
                 harness.runtime(session)
             },
             |event_loop| {
@@ -11869,28 +11781,9 @@ end })
             .err()
             .expect("lost lease rejects preparation");
         assert_eq!(error, LOCK_LOST_REPLACEMENT_ERR);
-        assert_eq!(
-            serde_json::to_value(
-                harness
-                    .ctx()
-                    .storage_writer
-                    .latest_snapshot(id)
-                    .unwrap()
-                    .messages()
-            )
-            .unwrap(),
-            serde_json::to_value(stored_before.messages()).unwrap()
-        );
-
         assert!(runtime.lock_lost);
         assert!(runtime.session_lock.is_none());
         checkpoint_runtime(&mut runtime);
-        let (done_tx, done_rx) = flume::bounded(1);
-        harness
-            .ctx()
-            .storage_writer
-            .delete(MakimaId::generate(), move |_| done_tx.send(()).unwrap());
-        done_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
         assert_eq!(
             serde_json::to_value(
                 AppSession::load(id, &harness.ctx().storage)
@@ -12147,21 +12040,19 @@ end })
         };
         runtime.app.checkpoint_now();
 
+        let writer = runtime.app.session_writer.clone().unwrap();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
         let ctx = harness.ctx.take().unwrap();
         let storage = ctx.storage.clone();
         let sessions_dir = storage.path().join(SESSIONS_DIR);
-        let storage_writer = Arc::clone(&ctx.storage_writer);
         drop(ctx);
         assert!(
             session_lock::claim(&sessions_dir, &id).unwrap().is_none(),
             "lock released before storage drain"
         );
-        Arc::try_unwrap(storage_writer)
-            .unwrap_or_else(|_| panic!("test owns storage writer"))
-            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        smol::block_on(writer.drain()).ok();
         assert!(
             session_lock::claim(&sessions_dir, &id).unwrap().is_none(),
             "lock released by storage drain"
@@ -12217,16 +12108,14 @@ end })
         ));
         cleanup.join().unwrap();
 
+        let writer = runtime.app.session_writer.clone().unwrap();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
         let ctx = harness.ctx.take().unwrap();
         let storage = ctx.storage.clone();
-        let storage_writer = Arc::clone(&ctx.storage_writer);
         drop(ctx);
-        Arc::try_unwrap(storage_writer)
-            .unwrap_or_else(|_| panic!("test owns storage writer"))
-            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        smol::block_on(writer.drain()).ok();
 
         let stored = AppSession::load(id, &storage).unwrap();
         assert_eq!(stored.messages().len(), 1);
@@ -12268,16 +12157,14 @@ end })
             }
         });
 
+        let writer = runtime.app.session_writer.clone().unwrap();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
         let ctx = harness.ctx.take().unwrap();
         let storage = ctx.storage.clone();
-        let storage_writer = Arc::clone(&ctx.storage_writer);
         drop(ctx);
-        Arc::try_unwrap(storage_writer)
-            .unwrap_or_else(|_| panic!("test owns storage writer"))
-            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        smol::block_on(writer.drain()).ok();
 
         let stored = AppSession::load(id, &storage).unwrap();
         assert_eq!(stored.messages().len(), 1);

@@ -275,11 +275,6 @@ impl PreparedAgentHandles {
         self.handles.as_ref().expect("initialized agent handles")
     }
 
-    pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, makima_agent::AgentId) {
-        let handles = self.initialized();
-        (handles.manager.clone(), handles.root_id)
-    }
-
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
         self.mailbox
             .as_ref()

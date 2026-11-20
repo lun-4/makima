@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,13 +9,14 @@ use std::time::Duration;
 use test_case::test_case;
 
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
+use crate::session_writer::{SessionIo, SessionWriter};
 use event_listener::Event;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
 };
 use makima_storage::checkpoint::CheckpointPublication;
-use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_state::{
     StateChange, StoredAgentLifecycle, StoredDelivery, StoredDeliveryOp,
 };
@@ -38,6 +40,183 @@ const GRAPH_SUBSCRIBER: u64 = 1;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
 const SMALL_RETAINED_QUOTA: usize = 4;
+
+struct ReceiptGateIo {
+    entered: flume::Sender<()>,
+    release: Option<flume::Receiver<()>>,
+}
+
+impl SessionIo for ReceiptGateIo {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        if let Some(release) = self.release.take() {
+            self.entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let (entered, syncing) = flume::bounded(1);
+    let (release, gate) = flume::bounded(1);
+    let writer = SessionWriter::with_io(
+        MakimaId::generate(),
+        ReceiptGateIo {
+            entered,
+            release: Some(gate),
+        },
+        0,
+    );
+    manager.journal().bind_writer(writer).unwrap();
+    let spawning = manager.clone();
+    let task =
+        std::thread::spawn(move || spawning.create_root(Vec::new(), None, TestBackend::boxed()));
+    syncing.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    assert!(!task.is_finished());
+    let root_id = manager.root_id().unwrap();
+    assert_eq!(
+        manager.node(root_id).unwrap().graph_lifecycle,
+        GraphLifecycle::Reserved
+    );
+    assert!(manager.actor(root_id).is_err());
+    release.send(()).unwrap();
+    let root = task.join().unwrap().unwrap();
+    assert!(root.actor().is_ok());
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+}
+
+#[test]
+fn synchronous_spawn_on_global_executor_receives_durable_acknowledgment() {
+    let task = smol::spawn(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let session = crate::session_writer::StoredSession::new("spawn-test", "/");
+        let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+        manager.journal().bind_writer(writer).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        assert!(root.actor().is_ok());
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
+    smol::block_on(task);
+}
+
+#[test]
+fn generic_terminal_waits_for_writer_receipt_before_end() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let events = actor.subscribe_events();
+        let (entered, syncing) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let writer = SessionWriter::with_io(
+            MakimaId::generate(),
+            ReceiptGateIo {
+                entered,
+                release: Some(gate),
+            },
+            0,
+        );
+        manager.journal().bind_writer(writer).unwrap();
+        let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+        syncing.recv_async().await.unwrap();
+        yield_until(|| ticket.peek_result().is_some()).await;
+        assert!(ticket.peek().is_none());
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, crate::ActorEvent::End(_)))
+        );
+        release.send(()).unwrap();
+        ticket.wait_result().await;
+        while !matches!(
+            events.recv_async().await.unwrap(),
+            crate::ActorEvent::End(_)
+        ) {}
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
+}
+
+#[test_case(false; "closed")]
+#[test_case(true; "retired")]
+fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool) {
+    const HISTORY_TEXT: &str = "retained child transcript";
+    let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+    smol::block_on(async {
+        let child = current
+            .spawn_child(
+                AgentMetadata::default(),
+                vec![makima_providers::Message::user(HISTORY_TEXT.into())],
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
+        ticket.wait_result().await;
+        graph_quiescence_barrier(&[actor]).await.unwrap();
+        let request = crate::actor::TranscriptRequest {
+            through_turn: None,
+            last_messages: 100,
+            max_bytes: 65536,
+        };
+        assert_eq!(
+            child.transcript(request.clone()).unwrap().through_turn,
+            Some(ticket.turn_id())
+        );
+        let (entered, syncing) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let writer = SessionWriter::with_io(
+            MakimaId::generate(),
+            ReceiptGateIo {
+                entered,
+                release: Some(gate),
+            },
+            0,
+        );
+        manager.journal().bind_writer(writer.clone()).unwrap();
+        syncing.recv_async().await.unwrap();
+        let (finish_cleanup, cleanup) = flume::bounded(1);
+        {
+            let mut graph = manager.lock_graph();
+            let node = graph.nodes.get_mut(&child.id()).unwrap();
+            let task = node.task.take().unwrap();
+            node.task = Some(smol::spawn(async move {
+                cleanup.recv_async().await.unwrap();
+                task.await;
+            }));
+        }
+        if retire {
+            manager.retire(&current, child.id()).unwrap();
+        } else {
+            child.close_subtree().unwrap();
+        }
+        assert!(!manager.is_live(child.id()));
+        assert_eq!(
+            child.snapshot().unwrap().residency,
+            AgentResidency::Resident
+        );
+        let transcript = child.transcript(request).unwrap();
+        assert_eq!(transcript.through_turn, None);
+        assert!(transcript.messages.to_string().contains(HISTORY_TEXT));
+        assert!(writer.status().unsaved_records > 0);
+        finish_cleanup.send(()).unwrap();
+        release.send(()).unwrap();
+        manager.journal().flush().await.unwrap();
+        root_gate.release(1);
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
+}
 
 #[test]
 fn weak_manager_observer_does_not_retain_manager_or_journal() {

@@ -356,6 +356,7 @@ impl App {
                 self.main_chat().show_user_message(text, images);
             }
         }
+        self.persist_input();
         Ok(starting)
     }
 
@@ -368,12 +369,14 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        shared
+        let queued = shared
             .try_push(QueueItem {
                 input,
                 displayed: None,
             })
-            .is_ok()
+            .is_ok();
+        self.persist_input();
+        queued
     }
 
     pub(crate) fn start_mailbox_run(

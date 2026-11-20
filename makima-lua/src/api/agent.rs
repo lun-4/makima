@@ -1924,6 +1924,12 @@ async fn build_session(
         let _ = agent.close_subtree();
         return Ok(err_pair(error));
     }
+    if agent.manager().journal().has_writer()
+        && let Err(error) = agent.manager().journal().flush_spawn()
+    {
+        let _ = agent.close_subtree();
+        return Ok(err_pair(error));
+    }
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
     if !options.silent

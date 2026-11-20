@@ -285,6 +285,8 @@ impl EventLoop<'_> {
                     compacted: false,
                     conversation: None,
                     messages: Arc::new(Vec::new()),
+                    ids: Arc::new(Vec::new()),
+                    covered: source.history.ids.last().copied(),
                 });
             let observer = async move {
                 let (idle, committed, history) = idle

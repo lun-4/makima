@@ -1,51 +1,36 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
 
 use crate::chat::{Chat, DONE_TEXT, history_to_display_with_target};
 use crate::components::DisplayRole;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
 use makima_agent::actor::HistoryChange;
 use makima_agent::agent::estimate_message_tokens;
+use makima_agent::session_writer::Record;
 use makima_agent::{HistorySnapshot, ModeId};
 #[cfg(test)]
 use makima_providers::Model;
 use makima_storage::id::MakimaId;
 use makima_storage::session_state::StoredAgentLifecycle;
-use makima_storage::sessions::{SessionMeta, StoredMode, StoredPost, StoredSubagent};
+use makima_storage::sessions::{
+    SessionMeta, SessionRecord, StoredMode, StoredPost, StoredSubagent,
+};
 
 use crate::AppSession;
 use makima_providers::RequestOptions;
 
+use super::App;
 #[cfg(test)]
 use super::PendingInput;
 #[cfg(test)]
 use super::session_state::SessionState;
-use super::{App, Status};
 #[cfg(test)]
 use makima_agent::permissions::PermissionSnapshot;
 
-/// The shortest gap between two writes that carry only UI state.
-const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const DORMANT_AGENT_TEXT: &str = "Dormant";
 const CLOSED_AGENT_TEXT: &str = "Closed";
 const RETIRED_AGENT_TEXT: &str = "Retired";
 
-/// What `App::checkpoint` last handed to the writer: which session, how far
-/// along it was, and when. The id is part of it because a session swapped into
-/// the tab starts its revisions back at zero and would otherwise look older
-/// than the stamp left by the one it replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Sent {
-    pub id: MakimaId,
-    pub revision: u64,
-    pub content_revision: u64,
-    pub at: Instant,
-}
-
-/// The one content check: `App::checkpoint` saves a session only when this
-/// holds, and the shutdown report reuses it to say which tabs were saved, so
-/// the report and the disk can never disagree.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
         || !session.posts().is_empty()
@@ -84,24 +69,32 @@ impl App {
         session_has_content(&self.state.session)
     }
 
-    /// The event loop runs this once per frame per session. It syncs whatever
-    /// the session mirrors from live state, then writes only if a mutator
-    /// really changed something. No dirty flags and no per-event save calls,
-    /// so there is nothing left to forget.
     pub(crate) fn checkpoint(&mut self) {
-        self.checkpoint_with(SOFT_SAVE_DELAY);
+        if self.restore_in_progress {
+            return;
+        }
+        self.persist_input();
+        let snapshot = self
+            .shared_history
+            .as_ref()
+            .map(|history| history.load_full());
+        let title = self.state.session.title.clone();
+        let meta = self.build_meta();
+        AppSession::checkpoint(
+            &mut self.state.session,
+            snapshot.as_deref(),
+            meta,
+            self.state.token_usage,
+        );
+        if self.state.session.title != title {
+            self.append_ui_record(SessionRecord::Title {
+                title: self.state.session.title.clone(),
+            });
+        }
     }
 
-    /// A checkpoint for the paths that get no later frame, so a draft typed a
-    /// keystroke ago still reaches disk: shutdown, and swapping the session out
-    /// from under the tab.
     pub(crate) fn checkpoint_now(&mut self) {
-        self.checkpoint_with(Duration::ZERO);
-    }
-
-    pub(crate) fn sync_live_children(&self) {
-        self.storage_writer
-            .set_live_children(self.state.session.id, self.live_child_keys());
+        self.checkpoint();
     }
 
     fn live_child_keys(&self) -> Vec<String> {
@@ -118,57 +111,50 @@ impl App {
             .collect()
     }
 
-    pub(super) fn checkpoint_with(&mut self, soft_delay: Duration) {
+    pub(crate) fn sync_writer_warning(&mut self) -> crate::repaint::Dirty {
+        let warning = self
+            .session_writer
+            .as_ref()
+            .and_then(|writer| writer.status().error.map(|error| error.to_string()));
+        self.status_bar.set_writer_warning(warning)
+    }
+
+    pub(crate) fn append_ui_record(&self, record: Record) {
+        if let Some(writer) = &self.session_writer {
+            let receipt = match &self.writer_guard {
+                Some(guard) => writer.append_owned(vec![record], guard.clone()),
+                None => writer.append(vec![record]),
+            };
+            drop(receipt);
+        }
+    }
+
+    pub(crate) fn persist_input(&mut self) {
         if self.restore_in_progress {
             return;
         }
-        self.sync_live_children();
-        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let meta = self.build_meta();
-        AppSession::checkpoint(
-            &mut self.state.session,
-            snapshot.as_deref(),
-            meta,
-            self.state.token_usage,
-        );
-
-        if !self.has_content() {
-            // A draft typed and then deleted is already on disk, and a file with
-            // nothing in it is a session the picker still offers to resume. Idle
-            // only: submitting empties the draft a frame before the agent mirrors
-            // the prompt back, and that gap is not an abandoned session.
-            let id = self.state.session.id;
-            if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
-            {
-                self.storage_writer.delete_empty(id);
-            }
-            return;
+        if self.state.session.meta.input_draft != meta.input_draft {
+            self.append_ui_record(SessionRecord::Draft {
+                text: meta.input_draft.clone(),
+            });
+            self.state.session_mut().meta.input_draft = meta.input_draft;
         }
-        let session = &self.state.session;
-        let sent = Sent {
-            id: session.id,
-            revision: session.revision(),
-            content_revision: session.content_revision(),
-            at: Instant::now(),
-        };
-        if let Some(last) = &self.last_sent
-            && last.id == sent.id
-        {
-            if last.revision == sent.revision {
-                return;
-            }
-            // Only UI state moved: a keystroke in the draft, the queue or a
-            // session rule. Each one costs a meta record plus an fsync, so they
-            // land at most once per `soft_delay`, which bounds what a crash
-            // takes with it. Anything the agent produced skips the wait.
-            if last.content_revision == sent.content_revision && last.at.elapsed() < soft_delay {
-                return;
-            }
+        if self.state.session.meta.queued_messages != meta.queued_messages {
+            self.append_ui_record(SessionRecord::Queued {
+                messages: meta.queued_messages.clone(),
+            });
+            self.state.session_mut().meta.queued_messages = meta.queued_messages;
         }
+    }
 
-        self.storage_writer
-            .send_fenced(Arc::clone(&self.state.session), &self.storage_fence);
-        self.last_sent = Some(sent);
+    pub(crate) fn set_title(&mut self, title: String) {
+        if self.state.session.title != title {
+            self.append_ui_record(SessionRecord::Title {
+                title: title.clone(),
+            });
+            self.state.session_mut().set_title(title);
+        }
     }
 
     /// Presentation metadata, with legacy Config and Rules fields left neutral.
@@ -403,12 +389,12 @@ impl App {
             chat.set_restore_target(target);
         }
 
-        let posts = canonical_posts(&self.state.session);
+        let posts = self.state.session.posts();
         let (display, items) = history_to_display_with_target(
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(&posts, None),
+            &posts_in(posts, None),
             self.chats[0].agent_id.and_then(|id| {
                 self.root_agent
                     .as_ref()
@@ -416,7 +402,7 @@ impl App {
             }),
             &self.state.session.chat_message_ids(None),
         );
-        self.main_chat().load_messages(display);
+        self.chats[0].load_messages(display);
         self.fire_restore_items(items);
 
         for index in 1..self.chats.len() {
@@ -428,7 +414,7 @@ impl App {
                     messages,
                     self.state.session.tool_outputs(),
                     &self.ui_config.tool_output_lines,
-                    &posts_in(&posts, Some(key)),
+                    &posts_in(posts, Some(key)),
                     self.chats[index].agent_id.and_then(|id| {
                         self.root_agent
                             .as_ref()
@@ -526,24 +512,37 @@ impl App {
                 .replace_shared_messages(Arc::clone(&change.messages));
             self.state.context_size =
                 baseline.saturating_add(estimate_message_tokens(&change.messages));
-            self.state.session_mut().meta.input_draft = Some(draft.clone());
-        } else if let Some(key) = self.chats[index].subagent_id.clone()
-            && !self.state.session_mut().adopt_subagent_history(
-                key,
-                &HistorySnapshot {
-                    epoch: change.epoch,
-                    compacted: false,
-                    conversation: None,
-                    messages: Arc::clone(&change.messages),
-                },
-            )
-        {
-            return;
+        } else if let Some(key) = self.chats[index].subagent_id.clone() {
+            let mut previous = self
+                .state
+                .session
+                .subagent_history_snapshot(&key)
+                .unwrap_or_default();
+            if previous.epoch != change.epoch || previous.messages != change.messages {
+                previous.ids = Arc::new(
+                    change
+                        .messages
+                        .iter()
+                        .map(|_| MakimaId::generate())
+                        .collect(),
+                );
+            }
+            let snapshot = HistorySnapshot {
+                epoch: change.epoch,
+                compacted: false,
+                conversation: None,
+                messages: Arc::clone(&change.messages),
+                ..previous
+            };
+            if !self
+                .state
+                .session_mut()
+                .adopt_subagent_history(key, &snapshot)
+            {
+                return;
+            }
         }
         let chat = self.chats[index].subagent_id.clone();
-        self.state
-            .session_mut()
-            .prune_posts(chat.as_deref(), change.messages.len());
         if index == 0 {
             let live_children = self.live_child_keys();
             self.state.session_mut().prune_orphans_preserving(
@@ -556,12 +555,12 @@ impl App {
                 &live_children,
             );
         }
-        let posts = canonical_posts(&self.state.session);
+        let posts = self.state.session.posts();
         let (display, items) = history_to_display_with_target(
             &change.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(&posts, chat.as_deref()),
+            &posts_in(posts, chat.as_deref()),
             self.chats[index].agent_id.and_then(|id| {
                 self.root_agent
                     .as_ref()
@@ -575,6 +574,7 @@ impl App {
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
+        self.persist_input();
     }
 
     #[cfg(test)]
@@ -620,20 +620,6 @@ impl App {
     }
 }
 
-fn canonical_posts(session: &AppSession) -> Vec<StoredPost> {
-    session
-        .posts()
-        .iter()
-        .cloned()
-        .map(|mut post| {
-            post.after_message = post
-                .after_message
-                .map(|id| session.canonical_message_id(id));
-            post
-        })
-        .collect()
-}
-
 fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPost> {
     posts
         .iter()
@@ -648,7 +634,7 @@ mod tests {
     use makima_agent::{AgentId, SubagentInfo};
     use makima_domain::{Post, PostLevel};
     use makima_providers::{Effort, Message, ModelSelection, RequestOptions, ThinkingConfig};
-    use makima_storage::id::MakimaId;
+
     use makima_storage::session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentSpec, StoredModeCeiling,
         StoredModeSnapshot, StoredStateRecord,
@@ -666,7 +652,7 @@ mod tests {
 
     #[test_case::test_case(false; "root")]
     #[test_case::test_case(true; "child")]
-    fn aliased_post_anchor_is_visible_before_reload(child: bool) {
+    fn stable_post_anchor_survives_display_restore_and_history_change(child: bool) {
         const PROMPT: &str = "original prompt";
         const POST: &str = "review result";
         let mut app = super::super::tests::test_app();
@@ -689,20 +675,18 @@ mod tests {
         } else {
             session.push_message(Message::user(PROMPT.into()));
         }
-        let provisional = session.chat_message_ids(chat)[0];
+        let message_id = session.chat_message_ids(chat)[0];
         session.push_post(StoredPost {
             chat: chat.map(str::to_owned),
-            after_message: Some(provisional),
+            after_message: Some(message_id),
             post: Post {
                 text: POST.into(),
                 level: PostLevel::Info,
                 agent: None,
             },
         });
-        let canonical = MakimaId::generate();
-        session.commit_message_aliases(&[(provisional, canonical)].into());
-        assert_eq!(session.chat_message_ids(chat), [canonical]);
-        assert_eq!(session.posts()[0].after_message, Some(provisional));
+        assert_eq!(session.chat_message_ids(chat), [message_id]);
+        assert_eq!(session.posts()[0].after_message, Some(message_id));
         let history = if child {
             session.subagent_history_snapshot(TRANSCRIPT).unwrap()
         } else {
@@ -725,10 +709,7 @@ mod tests {
             (0..app.chats[index].message_count())
                 .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST })
         );
-        assert_eq!(
-            app.state.session.posts()[0].after_message,
-            Some(provisional)
-        );
+        assert_eq!(app.state.session.posts()[0].after_message, Some(message_id));
         app.push_post(
             None,
             Post {
@@ -736,11 +717,11 @@ mod tests {
                 level: PostLevel::Info,
                 agent: None,
             },
-            Some(Some(provisional)),
+            Some(Some(message_id)),
         );
         assert_eq!(
             app.state.session.posts().last().unwrap().after_message,
-            Some(canonical)
+            Some(message_id)
         );
     }
 

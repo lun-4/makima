@@ -102,8 +102,10 @@ use makima_storage::model::persist_model;
 use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::StoredPost;
 
-use crate::storage_writer::{SessionSaveFence, StorageWriter};
 use crate::theme::ThemesProvider;
+use makima_agent::session_writer::SessionWriter;
+use makima_storage::session_lock::SessionPublicationGuard;
+use makima_storage::sessions::SessionRecord;
 use ratatui::layout::Position;
 
 const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
@@ -121,7 +123,6 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 use mouse::EDGE_SCROLL_LINES;
 use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
 pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, RESTORE_IN_PROGRESS, SubmitOutcome};
-use session::Sent;
 pub(crate) use session::session_has_content;
 use session_state::{ConfigSource, SessionState};
 
@@ -470,10 +471,9 @@ pub struct App {
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
-    storage_writer: Arc<StorageWriter>,
-    pub(crate) storage_fence: SessionSaveFence,
+    pub(crate) session_writer: Option<SessionWriter>,
+    pub(crate) writer_guard: Option<SessionPublicationGuard>,
     pub(crate) restore_in_progress: bool,
-    last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
@@ -562,7 +562,7 @@ impl App {
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         status_content_reader: StatusContentReader,
-        storage_writer: Arc<StorageWriter>,
+        session_writer: Option<SessionWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
@@ -590,7 +590,6 @@ impl App {
             storage.clone(),
             Arc::clone(&model_policy),
         );
-        let storage_fence = storage_writer.session_save_fence(state.session.id);
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
@@ -676,10 +675,9 @@ impl App {
             shared_history: None,
             btw_system: None,
             image_paste_rx: vec![],
-            storage_writer,
-            storage_fence,
+            session_writer,
+            writer_guard: None,
             restore_in_progress: false,
-            last_sent: None,
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
@@ -722,7 +720,7 @@ impl App {
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         status_content_reader: StatusContentReader,
-        storage_writer: Arc<StorageWriter>,
+        session_writer: Option<SessionWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
@@ -767,7 +765,7 @@ impl App {
             keymap_reader,
             hint_reader,
             status_content_reader,
-            storage_writer,
+            session_writer,
             ui_config,
             input_history_size,
             permissions,
@@ -1181,6 +1179,7 @@ impl App {
             }
             Msg::Agent(envelope) => self.handle_agent_event(*envelope),
         };
+        self.persist_input();
         self.sync_plan_form_target();
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
@@ -1750,6 +1749,10 @@ impl App {
     }
 
     fn settle_background_call(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
+        self.append_ui_record(SessionRecord::Out {
+            id: done.id.clone(),
+            d: done.output.clone(),
+        });
         self.state
             .session_mut()
             .insert_tool_output(done.id.clone(), done.output.clone());
@@ -2929,6 +2932,7 @@ impl App {
                         conversation_id,
                         messages,
                     } => {
+                        let history = self.state.session.subagent_history_snapshot(&tool_use_id);
                         self.state.session_mut().adopt_subagent_history(
                             tool_use_id,
                             &HistorySnapshot {
@@ -2936,6 +2940,7 @@ impl App {
                                 compacted: false,
                                 conversation: conversation_id.map(ConversationState::new),
                                 messages: Arc::new(messages),
+                                ..history.unwrap_or_default()
                             },
                         );
                     }
@@ -3027,6 +3032,7 @@ impl App {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             self.sync_task_picker();
+            let history = self.state.session.subagent_history_snapshot(&tool_use_id);
             self.state.session_mut().adopt_subagent_history(
                 tool_use_id,
                 &HistorySnapshot {
@@ -3034,6 +3040,7 @@ impl App {
                     compacted: false,
                     conversation: conversation_id.map(ConversationState::new),
                     messages: Arc::new(messages),
+                    ..history.unwrap_or_default()
                 },
             );
             return vec![];
@@ -3081,6 +3088,10 @@ impl App {
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
+            self.append_ui_record(SessionRecord::Out {
+                id: e.id.clone(),
+                d: e.output.clone(),
+            });
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
@@ -3257,6 +3268,10 @@ impl App {
         self.state
             .session_mut()
             .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
+        self.append_ui_record(SessionRecord::Usage {
+            token_usage: self.state.token_usage,
+            usage_by_model: self.state.session.usage_by_model().clone(),
+        });
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went
@@ -3310,13 +3325,14 @@ impl App {
         self.chats[chat_idx].push_post(&post);
         let session = &self.state.session;
         let after_message = committed_message
-            .unwrap_or_else(|| session.chat_message_ids(chat.as_deref()).last().copied())
-            .map(|id| session.canonical_message_id(id));
-        self.state.session_mut().push_post(StoredPost {
+            .unwrap_or_else(|| session.chat_message_ids(chat.as_deref()).last().copied());
+        let stored = StoredPost {
             chat,
             after_message,
             post,
-        });
+        };
+        self.append_ui_record(SessionRecord::Post { d: stored.clone() });
+        self.state.session_mut().push_post(stored);
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {

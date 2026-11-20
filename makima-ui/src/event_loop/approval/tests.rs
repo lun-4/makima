@@ -13,6 +13,7 @@ use makima_agent::config_change::ConfigChangeError;
 use makima_agent::journal::{JournalChange, JournalCommit};
 use makima_agent::manager::ManagerError;
 use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
+use makima_agent::session_writer::Record;
 use makima_agent::tools::ToolRegistry;
 use makima_agent::{AgentInput, AgentMode, ModeId};
 use makima_domain::{Effort, ModelSelection, ThinkingConfig as DomainThinkingConfig};
@@ -25,8 +26,7 @@ use makima_providers::{
     ModelCapabilities, ProviderEvent, RequestDelivery, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingSupport, TokenUsage,
 };
-use makima_storage::checkpoint::{CheckpointRequest, CheckpointVersion};
-use makima_storage::id::{AgentId, MakimaId, SessionRef};
+use makima_storage::id::{AgentId, SessionRef};
 use makima_storage::model::{read_model, read_recents};
 use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
 use makima_storage::session_lock;
@@ -49,7 +49,6 @@ use crate::model_capabilities::test_support::seeded;
 use crate::plan_approval::{
     APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message, read_plan,
 };
-use crate::storage_writer::{SAVE_FAILED_PREFIX, StorageWriter};
 
 mod options;
 mod pending_fast;
@@ -74,9 +73,7 @@ const PLAN_FILE: &str = "approval-plan.md";
 const RELATIVE_PLAN_FILE: &str = "relative-plan.md";
 const MUTATED_PLAN: &str = "# Late edit\nDo not implement this changed revision.\n";
 const MOVED_CWD: &str = "moved-cwd";
-const SESSION_LOG_EXTENSION: &str = "jsonl";
 const TRANSCRIPT_PROBE_BYTES: usize = 1024;
-const SESSION_LOG_BACKUP_EXTENSION: &str = "approval-backup";
 const DRAFT: &str = "draft typed before approval";
 const CLEAR_AND_IMPLEMENT_ROW: usize = 1;
 const IMPLEMENT_ROW: usize = 2;
@@ -580,12 +577,9 @@ fn managed_child_approval(
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let root_actor = manager.actor(root).unwrap();
         let mode = AgentMode::Build;
-        let reservation = reserve_config_change(
-            &manager.lookup(root).unwrap(),
-            &event_loop.sessions[index].coordinator,
-            None,
-        )
-        .unwrap();
+        let target = manager.lookup(root).unwrap();
+        let reservation =
+            reserve_config_change(&target, &event_loop.sessions[index].coordinator, None).unwrap();
         smol::block_on(reservation.commit_change(ConfigChange::Mode {
             mode: mode.clone(),
             mode_def: Some(host.event_handle().mode_registry().current(&mode)),
@@ -1423,26 +1417,17 @@ fn disable_fast() -> ConfigPatch {
     }
 }
 
-fn session_log(event_loop: &EventLoop<'_>, id: MakimaId) -> PathBuf {
-    event_loop
-        .sessions_dir
-        .join(format!("{id}.{SESSION_LOG_EXTENSION}"))
-}
-
 fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
     event_loop.sessions[index].app.checkpoint_now();
     let runtime = &event_loop.sessions[index];
-    smol::block_on(event_loop.ctx.storage_writer.checkpoint_fenced(
-        CheckpointRequest {
-            session_id: runtime.id(),
-            version: CheckpointVersion {
-                revision: runtime.app.state.session.revision(),
-                epoch: runtime.app.state.session.history_snapshot().epoch,
-            },
-            snapshot: Arc::clone(&runtime.app.state.session),
-        },
-        &runtime.app.storage_fence,
-    ))
+    smol::block_on(
+        runtime
+            .app
+            .session_writer
+            .as_ref()
+            .unwrap()
+            .append(Vec::new()),
+    )
     .unwrap();
 }
 
@@ -2306,11 +2291,8 @@ fn cancel_before_ready_preserves_plan(fresh: bool) {
 
 #[test_case(false; "existing_context")]
 #[test_case(true; "fresh_context")]
-fn save_failure_retains_committed_selection(fresh: bool) {
+fn typed_draft_append_preserves_committed_selection(fresh: bool) {
     with_event_loop(|event_loop| {
-        let (warnings, warning_rx) = flume::unbounded();
-        event_loop.ctx.storage_writer =
-            Arc::new(StorageWriter::new(event_loop.ctx.storage.clone(), warnings));
         let (index, _, requests, _host) = setup(event_loop);
         approve(event_loop, index, fresh);
         pump_until(event_loop, |event_loop| {
@@ -2330,38 +2312,20 @@ fn save_failure_retains_committed_selection(fresh: bool) {
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
         checkpoint_settled(event_loop, index);
-        let log = session_log(event_loop, id);
-        let moved = log.with_extension(SESSION_LOG_BACKUP_EXTENSION);
-        fs::rename(&log, &moved).unwrap();
-        let (deleted, deletion) = flume::bounded(1);
-        event_loop.ctx.storage_writer.delete(id, move |result| {
-            deleted.send(result).unwrap();
-        });
-        deletion.recv_timeout(WAIT).unwrap().unwrap();
-        makima_agent::session_writer::forget(log.parent().unwrap(), id).unwrap();
-        fs::create_dir(&log).unwrap();
-        let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
-        event_loop
-            .ctx
-            .storage_writer
-            .bind_journal(id, manager.journal());
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .set_input(DRAFT.into());
-        event_loop.sessions[index].app.checkpoint_now();
-        let warning = warning_rx.recv_timeout(WAIT).unwrap();
-        assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
+        let app = &event_loop.sessions[index].app;
+        smol::block_on(app.session_writer.as_ref().unwrap().append_owned(
+            vec![Record::Draft {
+                text: Some(DRAFT.into()),
+            }],
+            app.writer_guard.clone().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(
             event_loop.sessions[index].app.root_config().model.spec(),
             TARGET_MODEL
         );
         assert_eq!(event_loop.sessions[index].app.root_mode(), Mode::Build);
-        fs::remove_dir(&log).unwrap();
-        fs::rename(&moved, &log).unwrap();
-        event_loop.sessions[index].app.checkpoint_now();
-        checkpoint(event_loop, index);
         let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
         assert_eq!(restored.meta.input_draft.as_deref(), Some(DRAFT));
         let (_, root) = event_loop.sessions[index].handles.manager_and_root();

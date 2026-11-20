@@ -124,6 +124,7 @@ impl PreparedTransaction {
         }
         let context_updates = snapshot.context_updates.clone();
         let context_event_sender = snapshot.context_event_sender.clone();
+
         let prepared =
             if let Some((journal, incarnation)) = snapshot.journal_context.take() {
                 let mut config = stored_agent_config(&snapshot.config, BTreeMap::new())
@@ -198,6 +199,7 @@ impl PreparedTransaction {
             } else {
                 None
             };
+
         snapshot.journal = prepared
             .as_ref()
             .filter(|prepared| prepared.is_persistent())
@@ -214,6 +216,7 @@ impl PreparedTransaction {
             {
                 prepared.install().map_err(|error| error.to_string())?;
             }
+
             *install_flag
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = true;
@@ -228,6 +231,7 @@ impl PreparedTransaction {
             .await
             .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_FUTURE_PANICKED.into()))?
             .map_err(ActorError::HistoryCheckpoint);
+
         let installed = *installed.lock().unwrap_or_else(|error| error.into_inner());
         if !installed {
             result.as_ref().map_err(Clone::clone)?;

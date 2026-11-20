@@ -298,6 +298,7 @@ mod tests {
                 Message::user(TEXT.into()),
             ]
             .into(),
+            ..HistorySnapshot::default()
         };
         let snapshot = transcript_snapshot(
             &history,

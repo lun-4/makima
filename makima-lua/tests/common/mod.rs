@@ -28,10 +28,11 @@ use makima_agent::config_change::unresolved_model;
 use makima_agent::journal::SessionJournal;
 use makima_agent::manager::ResidentAgent;
 use makima_agent::permissions::PermissionSnapshot;
-use makima_agent::session_checkpoint::{SessionLogCheckpoint, stored_agent_config};
+use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::template::Vars;
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::tools::test_support::stub_ctx;
@@ -541,6 +542,7 @@ impl RestartHost {
                     stored_agent_config(&initial, session.meta.session_options.clone()).unwrap(),
                 )
                 .unwrap();
+            session.save(&state).unwrap();
         }
         let root_id = session.root_agent_id().unwrap();
         let restored = session.latest_state().unwrap();
@@ -562,7 +564,8 @@ impl RestartHost {
         )
         .unwrap();
         let checkpoint = Arc::new(
-            SessionLogCheckpoint::open_with_session(state, session.clone(), None).unwrap(),
+            SessionWriter::open_session(&state.ensure_subdir(SESSIONS_DIR).unwrap(), &session)
+                .unwrap(),
         );
         context
             .permissions
@@ -740,8 +743,11 @@ impl RestartHost {
         std::fs::write(&path, published).unwrap();
         let state = StateDir::from_path(state_dir.into());
         let seed = TestSession::load(session_id, &state).unwrap();
-        let checkpoint = SessionLogCheckpoint::open_with_session(state, seed, None).unwrap();
+        let checkpoint =
+            SessionWriter::open_session(&state.ensure_subdir(SESSIONS_DIR).unwrap(), &seed)
+                .unwrap();
         smol::block_on(bounded(checkpoint.recover(
+            seed,
             CheckpointPublication::default(),
             Arc::new(|publication| {
                 assert!(publication.try_publish());

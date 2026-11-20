@@ -16,6 +16,7 @@ use makima_agent::actor::ActorHistory;
 use makima_agent::actor::HistoryChange;
 use makima_agent::command::{CommandScope, CustomCommand};
 use makima_agent::permissions::PermissionManager;
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
@@ -45,7 +46,6 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_case::test_case;
 
-const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
@@ -81,13 +81,13 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
 }
 
-fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
+fn build_app(dir: StateDir, writer: Option<SessionWriter>) -> App {
     build_app_with_registry(dir, writer, makima_commands::CommandRegistry::new())
 }
 
 fn build_app_with_handle(
     dir: StateDir,
-    writer: Arc<StorageWriter>,
+    writer: Option<SessionWriter>,
     handle: makima_lua::EventHandle,
 ) -> App {
     build_app_with_full(
@@ -101,7 +101,7 @@ fn build_app_with_handle(
 
 fn build_app_with_registry(
     dir: StateDir,
-    writer: Arc<StorageWriter>,
+    writer: Option<SessionWriter>,
     registry: makima_commands::CommandRegistry,
 ) -> App {
     build_app_with_full(
@@ -345,7 +345,7 @@ fn lua_registry_with_commands(
 
 fn build_app_with_full(
     dir: StateDir,
-    writer: Arc<StorageWriter>,
+    writer: Option<SessionWriter>,
     registry: makima_commands::CommandRegistry,
     handle: makima_lua::EventHandle,
     ui: UiConfig,
@@ -391,13 +391,8 @@ fn build_app_with_full(
     )
 }
 
-fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
-}
-
 fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
     let model = test_model();
     let handle = makima_lua::EventHandle::disconnected_for_test();
     let command_runtime = Arc::new(crate::command_runtime::CommandRuntime::new_for_test(
@@ -421,7 +416,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         KeymapReader::empty(),
         HintReader::empty(),
         makima_lua::StatusContentReader::empty(),
-        writer,
+        None,
         UiConfig::default(),
         100,
         Arc::new(PermissionManager::new(
@@ -529,7 +524,7 @@ fn starting_submit_follows_the_turn_it_folds_into() {
 
 fn app_with_root(root: AgentRef) -> App {
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
+    let mut app = build_app(dir.clone(), None);
     bind_root(&mut app, root);
     app
 }
@@ -749,12 +744,19 @@ fn app_with_hints() -> (App, HintWriterHandle) {
     (app, writer)
 }
 
-fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+fn tempdir_app() -> (TempDir, StateDir, SessionWriter, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app(dir.clone(), Arc::clone(&writer));
-    bind_root(&mut app, parked_root());
+    let mut app = build_app(dir.clone(), None);
+    let root = parked_root();
+    app.state.session_mut().bind_root_id(root.id()).unwrap();
+    bind_root(&mut app, root);
+    let writer = SessionWriter::open_session(
+        &tmp.path().join(makima_storage::sessions::SESSIONS_DIR),
+        &app.state.session,
+    )
+    .unwrap();
+    app.session_writer = Some(writer.clone());
     (tmp, dir, writer, app)
 }
 
@@ -1419,7 +1421,7 @@ fn ordinary_paste_synchronizes_argument_completion() {
         max_args: Some(1),
         completion: true,
     });
-    let mut app = build_app_with_registry(dir.clone(), Arc::new(test_writer(dir)), registry);
+    let mut app = build_app_with_registry(dir.clone(), None, registry);
     let generation = app.command_palette.argument_generation();
 
     app.update(Msg::Paste("/deploy staging".into()));
@@ -2309,13 +2311,7 @@ fn lifecycle_app() -> (
             completion: true,
         },
     );
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/deploy a".into());
     let _ = app.command_palette.sync("/deploy a");
     settle_command_palette(&mut app);
@@ -2349,13 +2345,7 @@ fn argument_completion_retains_old_rows_while_request_pending() {
         max_args: Some(1),
         completion: true,
     });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/deploy a".into());
     let _ = app.command_palette.sync("/deploy a");
     app.command_palette.set_argument_completion(
@@ -2394,13 +2384,7 @@ fn unmatched_completion_items_keep_session_until_dismissal() {
             completion: true,
         },
     );
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/deploy z".into());
     let _ = app.command_palette.sync("/deploy z");
     settle_command_palette(&mut app);
@@ -2676,13 +2660,7 @@ fn argument_completion_enter_fills_then_next_enter_executes() {
         max_args: None,
         completion: true,
     });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/rename dråft tail".into());
     let _ = app.command_palette.sync("/rename dråft tail");
     app.input_box.buffer.set_cursor(0, 11);
@@ -2736,13 +2714,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
         autocomplete_height: 0.2,
         ..UiConfig::default()
     };
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        ui,
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, ui);
     app.input_box.set_input("/de a".into());
     let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
@@ -2811,13 +2783,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
             completion: true,
         },
     ]);
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/de a".into());
     let _ = app.command_palette.sync("/de a");
     settle_command_palette(&mut app);
@@ -2888,13 +2854,7 @@ fn argument_completion_enter_on_exact_match_executes_immediately() {
         max_args: None,
         completion: true,
     });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     app.input_box.set_input("/rename final".into());
     let _ = app.command_palette.sync("/rename final");
     app.command_palette.set_argument_completion(
@@ -3125,6 +3085,35 @@ fn tool_inside_subagent_chat_gets_its_turn_usage() {
         app.chats[1].tool_turn_usage(TOOL_ID),
         Some(SUB_TOKENS.format(SUB_COST).as_str())
     );
+}
+
+#[test]
+fn turn_usage_persists_without_checkpoint() {
+    const ROOT_MODEL: &str = "root-model";
+    const CHILD_MODEL: &str = "child-model";
+    const COST: f64 = 0.25;
+    const USAGE: TokenUsage = TokenUsage {
+        input: 100,
+        output: 50,
+        cache_read: 10,
+        cache_creation: 0,
+    };
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    for model in [ROOT_MODEL, CHILD_MODEL, ROOT_MODEL] {
+        let event = turn_complete(USAGE, model, Some(COST));
+        let AgentEvent::TurnComplete(turn) = event else {
+            unreachable!();
+        };
+        app.account_turn_complete(Some(0), &turn);
+    }
+    let id = app.state.session.id;
+    let expected_usage = app.state.token_usage;
+    let expected_models = app.state.session.usage_by_model().clone();
+    drain_writer(app, writer);
+    let restored = AppSession::load(id, &dir).unwrap();
+    assert_eq!(restored.token_usage, expected_usage);
+    assert_eq!(restored.usage_by_model(), &expected_models);
+    assert_eq!(restored.usage_by_model().len(), 2);
 }
 
 #[test]
@@ -6491,7 +6480,7 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
 }
 
 #[test]
-fn checkpoint_persists_observations_without_using_them_as_title() {
+fn checkpoint_mirrors_observations_without_using_them_as_title() {
     let mut app = test_app();
     let initial_title = app.state.session.title.clone();
     let _history = attach_live_history(
@@ -6515,24 +6504,16 @@ fn checkpoint_persists_observations_without_using_them_as_title() {
     assert_eq!(app.state.session.title, initial_title);
 }
 
-fn drain_writer(app: App, writer: Arc<StorageWriter>) {
+fn drain_writer(app: App, writer: SessionWriter) {
     drop(app);
-    Arc::try_unwrap(writer)
-        .ok()
-        .expect("app must hold the only other writer reference")
-        .shutdown(WRITER_DRAIN_TIMEOUT);
+    smol::block_on(writer.append(Vec::new())).unwrap();
 }
 
 #[test_case(false; "plain_post")]
 #[test_case(true; "root_linked_post")]
-fn checkpoint_saves_post_only_session(linked: bool) {
+fn post_mutation_persists_post_only_session(linked: bool) {
     let (_tmp, dir, writer, mut app) = tempdir_app();
-    let root = app
-        .state
-        .session
-        .root_agent_id()
-        .unwrap_or_else(AgentId::generate);
-    app.state.session_mut().bind_root_id(root).unwrap();
+    let root = app.state.session.root_agent_id().unwrap();
     let post = Post {
         text: POST_TEXT.into(),
         level: PostLevel::Info,
@@ -6541,11 +6522,11 @@ fn checkpoint_saves_post_only_session(linked: bool) {
     app.push_post(None, post.clone(), None);
     assert!(app.state.session.messages().is_empty());
     assert!(session_has_content(&app.state.session));
-    app.checkpoint_now();
     let id = app.state.session.id;
     drain_writer(app, writer);
     let loaded = AppSession::load(id, &dir).unwrap();
     assert!(loaded.messages().is_empty());
+    assert_eq!(loaded.root_agent_id(), Some(root));
     assert_eq!(
         loaded.posts(),
         [StoredPost {
@@ -6574,35 +6555,6 @@ fn checkpoint_saves_post_only_session(linked: bool) {
         assert_eq!(restored.active_chat, 0);
         assert_eq!(restored.status_bar.flash_text(), None);
     }
-}
-
-#[test]
-fn reload_persists_session_with_content_to_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
-    let actions = app.execute_command(cmd("/reload"), 0);
-    assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
-    app.checkpoint();
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    assert_eq!(AppSession::load(id, &dir).unwrap().messages().len(), 1);
-}
-
-#[test]
-fn reload_leaves_empty_session_unpersisted_on_disk() {
-    let (tmp, _dir, writer, mut app) = tempdir_app();
-    app.execute_command(cmd("/reload"), 0);
-    drain_writer(app, writer);
-
-    let sessions_dir = tmp.path().join(makima_storage::sessions::SESSIONS_DIR);
-    let entries = std::fs::read_dir(&sessions_dir)
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(entries, 0);
 }
 
 #[test]
@@ -6686,13 +6638,7 @@ fn typed_lua_command_with_args_executes() {
         max_args: None,
         completion: false,
     });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
 
     let actions = type_and_submit(&mut app, "/rename my title");
 
@@ -6803,13 +6749,7 @@ fn copy_tui_fixture() -> CopyTuiFixture {
         .unwrap();
     let registry = host.host().command_registry();
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
     Arc::get_mut(&mut app.state.session)
         .unwrap()
         .set_cwd(root.path().to_string_lossy().into_owned());
@@ -7168,13 +7108,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
         max_args: Some(0),
         completion: false,
     });
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
+    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
 
     app.run_cmdline("/sessions", 3).unwrap();
 
@@ -7188,7 +7122,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
 fn startup_session_picker_emits_plugin_request() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = makima_lua::test_support::probed_event_handle();
-    let app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
+    let app = build_app_with_handle(dir.clone(), None, handle);
 
     app.open_startup_session_picker();
 
@@ -7566,6 +7500,7 @@ fn history_replacement_preserves_live_child_navigation() {
 fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     const REMOVED_POST: &str = "removed review";
     const OTHER_POST: &str = "other chat review";
+    const UNANCHORED_POST: &str = "session notice";
     let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
     if !child {
         bind_history_actor(&mut app, Vec::new());
@@ -7607,7 +7542,7 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     let expected_posts = [
         retained.clone(),
         StoredPost {
-            chat,
+            chat: chat.clone(),
             after_message: Some(message_ids[1]),
             post: Post {
                 text: REMOVED_POST.into(),
@@ -7616,12 +7551,20 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
             },
         },
         other.clone(),
+        StoredPost {
+            chat: chat.clone(),
+            after_message: None,
+            post: Post {
+                text: UNANCHORED_POST.into(),
+                level: PostLevel::Info,
+                agent: None,
+            },
+        },
     ];
     for post in &expected_posts {
         app.state.session_mut().push_post(post.clone());
     }
-    let mut snapshot = original;
-    snapshot.messages = Arc::new(messages);
+    let snapshot = HistorySnapshot::new(messages);
     app.apply_history_change(HistoryChange {
         agent_id: app.chats[index].agent_id.unwrap(),
         epoch: snapshot.epoch,
@@ -7629,6 +7572,9 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
         draft: Message::user("next prompt".into()),
     });
     assert_eq!(app.state.session.posts(), expected_posts);
+    let active_ids = app.state.session.chat_message_ids(chat.as_deref());
+    assert_eq!(active_ids.len(), 1);
+    assert!(!active_ids.iter().any(|id| message_ids.contains(id)));
     let displayed: Vec<_> = (0..app.chats[index].message_count())
         .map(|offset| app.chats[index].message_at(offset).unwrap().text.clone())
         .collect();
@@ -7637,15 +7583,21 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
             .iter()
             .any(|text| text == REMOVED_POST || text == POST_TEXT)
     );
+    assert!(displayed.iter().any(|text| text == UNANCHORED_POST));
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let id = app.state.session.id;
     app.state.session_mut().save(&dir).unwrap();
     let restored = AppSession::load(id, &dir).unwrap();
     assert_eq!(restored.posts(), app.state.session.posts());
+    assert_eq!(restored.chat_message_ids(chat.as_deref()), active_ids);
     app.state.session = Arc::new(restored);
     app.reset_ui_chrome();
     app.restore_display();
+    assert!(
+        (0..app.chats[index].message_count())
+            .any(|offset| { app.chats[index].message_at(offset).unwrap().text == UNANCHORED_POST })
+    );
     assert!(
         !(0..app.chats[index].message_count())
             .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST_TEXT })
@@ -10844,12 +10796,6 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
-// -- Every frame checkpoints: one way in for a history, one trigger to save --
-
-/// Long enough that a waiting change is still waiting when the assert runs, on
-/// any machine, so none of these tests depend on the wall clock.
-const SOFT_DELAY_HELD: Duration = Duration::from_secs(3600);
-const MID_BATCH_RESULT: &str = "file contents";
 const TYPED_DRAFT: &str = "hi";
 const UNSENT_DRAFT: &str = "half typed thought";
 const LIVE_AGENT_TEXT: &str = "live agent turn";
@@ -10857,27 +10803,6 @@ const STORED_SESSION_TEXT: &str = "other session talk";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
-
-fn tool_use_msg(id: &str) -> Message {
-    Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::tool_use(id, "read", serde_json::json!({}))],
-        ..Default::default()
-    }
-}
-
-fn tool_result_msg(id: &str, text: &str) -> Message {
-    Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: text.into(),
-            is_error: false,
-        }],
-        display_text: Some(String::new()),
-        ..Default::default()
-    }
-}
 
 fn tool_text(id: &str) -> String {
     format!("output of {id}")
@@ -10891,60 +10816,10 @@ fn attach_live_history(app: &mut App, messages: Vec<Message>) -> History {
     history
 }
 
-/// Types [`TYPED_DRAFT`] one key per frame and hands back the stamp of the
-/// write the first key caused. The soft delay never elapses, so every key after
-/// the first is still waiting when the caller looks.
-fn type_draft_leaving_last_key_waiting(app: &mut App) -> Sent {
-    let mut keys = TYPED_DRAFT.chars();
-    app.update(Msg::Key(key(KeyCode::Char(keys.next().unwrap()))));
-    app.checkpoint();
-    let first = app
-        .last_sent
-        .clone()
-        .expect("the first keystroke puts the session on disk");
-
-    for c in keys {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-        app.checkpoint_with(SOFT_DELAY_HELD);
-    }
-    first
-}
-
-/// Checkpointing mid-batch used to freeze the tools as failed forever. The
-/// synthetic closing message made the snapshot as long as the real results that
-/// followed, so the append cursor never saw them.
 #[test]
-fn mid_batch_checkpoint_does_not_shadow_the_real_tool_results() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let mut history = attach_live_history(
-        &mut app,
-        vec![Message::user("go".into()), tool_use_msg("t1")],
-    );
-    app.checkpoint();
-
-    history.push(tool_result_msg("t1", MID_BATCH_RESULT));
-    app.checkpoint();
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-
-    let loaded = AppSession::load(id, &dir).unwrap();
-    assert_eq!(loaded.messages().len(), 3);
-    let [
-        ContentBlock::ToolResult {
-            content, is_error, ..
-        },
-    ] = &loaded.messages()[2].content[..]
-    else {
-        panic!("expected one real tool result: {:?}", loaded.messages()[2]);
-    };
-    assert_eq!((content.as_str(), *is_error), (MID_BATCH_RESULT, false));
-}
-
-#[test]
-fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let _live = attach_live_history(&mut app, vec![Message::user("old talk".into())]);
+fn reset_session_requests_replacement_without_mutating_the_current_session() {
+    let mut app = test_app();
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
     app.checkpoint();
     let old_id = app.state.session.id;
 
@@ -10956,19 +10831,16 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
     assert_ne!(new_id, old_id);
     assert_eq!(app.state.session.id, old_id);
 
-    drain_writer(app, writer);
-    assert_eq!(AppSession::load(old_id, &dir).unwrap().messages().len(), 1);
-    assert!(AppSession::load(new_id, &dir).is_err());
+    assert!(request.session.messages().is_empty());
+    assert_eq!(
+        app.state.session.messages()[0].user_text(),
+        Some(LIVE_AGENT_TEXT)
+    );
 }
 
-/// Two traps in one switch. `install_local_history` has to drop the mirror
-/// handle, or the old agent's messages land under the freshly loaded id. And
-/// `revision` is `#[serde(skip)]`, so the loaded session starts back at zero and
-/// can collide with the revision already sent for the one it replaced, which
-/// only keying `last_sent` by id survives.
 #[test]
-fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
+fn load_session_requests_replacement_without_leaking_live_history() {
+    let (_tmp, dir, _writer, mut app) = tempdir_app();
     let mut stored = AppSession::new("test-model", "/tmp/test");
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
     stored.save(&dir).unwrap();
@@ -10991,10 +10863,66 @@ fn load_session_persists_the_new_session_and_leaks_no_history_into_it() {
         Some(STORED_SESSION_TEXT)
     );
 
+    assert_eq!(
+        app.state.session.meta.input_draft.as_deref(),
+        Some(UNSENT_DRAFT)
+    );
+    assert_eq!(
+        app.state.session.messages()[0].user_text(),
+        Some(LIVE_AGENT_TEXT)
+    );
+}
+
+#[test_case(false; "typed_draft")]
+#[test_case(true; "deleted_draft")]
+fn draft_mutations_reach_disk_without_checkpoint(delete: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    for c in TYPED_DRAFT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    if delete {
+        for _ in TYPED_DRAFT.chars() {
+            app.update(Msg::Key(key(KeyCode::Backspace)));
+        }
+    }
+    let id = app.state.session.id;
     drain_writer(app, writer);
-    let previous = AppSession::load(live_id, &dir).unwrap();
-    assert_eq!(previous.meta.input_draft.as_deref(), Some(UNSENT_DRAFT));
-    assert_eq!(previous.messages()[0].user_text(), Some(LIVE_AGENT_TEXT));
+    let loaded = AppSession::load(id, &dir).unwrap();
+    assert_eq!(
+        loaded.meta.input_draft.as_deref(),
+        (!delete).then_some(TYPED_DRAFT)
+    );
+    assert!(loaded.messages().is_empty());
+}
+
+#[test_case(false; "queued_messages")]
+#[test_case(true; "removed_message")]
+fn queue_mutations_reach_disk_without_checkpoint(remove: bool) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.queue_and_notify(queued_msg(TYPED_DRAFT));
+    app.queue_and_notify(queued_msg(UNSENT_DRAFT));
+    if remove {
+        app.queue.set_focus_at(0);
+        app.update(Msg::Key(key(KeyCode::Enter)));
+    }
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    let loaded = AppSession::load(id, &dir).unwrap();
+    let expected = if remove {
+        vec![UNSENT_DRAFT]
+    } else {
+        vec![TYPED_DRAFT, UNSENT_DRAFT]
+    };
+    assert_eq!(loaded.meta.queued_messages, expected);
+}
+
+#[test]
+fn title_mutation_reaches_disk_without_checkpoint() {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    app.set_title(POST_TEXT.into());
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+    assert_eq!(AppSession::load(id, &dir).unwrap().title, POST_TEXT);
 }
 
 #[test]
@@ -11013,104 +10941,8 @@ fn idle_checkpoint_changes_nothing() {
     assert_eq!(app.state.session.updated_at, updated_at);
 }
 
-/// Issue #675: a crash between a keystroke and submit threw the draft away,
-/// because nothing was written until the turn ended. The first key lands within
-/// a frame now, and the keys behind it ride along on a later write rather than
-/// each costing an `fsync`.
 #[test]
-fn first_draft_keystroke_lands_and_the_rest_coalesce() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let first = type_draft_leaving_last_key_waiting(&mut app);
-    assert_eq!(
-        app.last_sent.as_ref(),
-        Some(&first),
-        "a keystroke on its own waits instead of costing a write",
-    );
-
-    app.checkpoint_with(Duration::ZERO);
-    assert_ne!(
-        app.last_sent.as_ref(),
-        Some(&first),
-        "and lands once the delay is up"
-    );
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-    assert!(saved.messages().is_empty());
-}
-
-#[test]
-fn a_content_change_writes_the_waiting_draft_with_it() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-
-    app.state
-        .session_mut()
-        .push_message(Message::user(LIVE_AGENT_TEXT.into()));
-    app.checkpoint_with(SOFT_DELAY_HELD);
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.messages().len(), 1, "content never waits");
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-}
-
-#[test]
-fn shutdown_writes_a_draft_that_is_still_waiting() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-
-    app.checkpoint_now();
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let saved = AppSession::load(id, &dir).unwrap();
-    assert_eq!(saved.meta.input_draft.as_deref(), Some(TYPED_DRAFT));
-}
-
-/// Submitting empties the draft a frame before the agent mirrors the prompt
-/// back. Delete the session in that gap and the user loses the one they were
-/// just starting.
-#[test]
-fn submitting_the_draft_keeps_the_session_on_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-    let id = app.state.session.id;
-
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    app.checkpoint();
-    assert!(!app.has_content(), "the submit window is what this covers");
-
-    drain_writer(app, writer);
-    assert!(AppSession::load(id, &dir).is_ok());
-}
-
-/// The draft put the session on disk, and deleting it leaves nothing worth
-/// keeping. Without the delete the file survives with the abandoned draft in
-/// it, and the picker offers an empty session to resume.
-#[test]
-fn deleting_the_draft_takes_the_session_off_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    type_draft_leaving_last_key_waiting(&mut app);
-    let id = app.state.session.id;
-
-    for _ in TYPED_DRAFT.chars() {
-        app.update(Msg::Key(key(KeyCode::Backspace)));
-    }
-    app.checkpoint();
-    assert!(app.last_sent.is_none(), "nothing is on disk to stamp");
-
-    drain_writer(app, writer);
-    assert!(AppSession::load(id, &dir).is_err());
-}
-
-/// The second result goes through the append cursor the first one opened, so a
-/// stale cursor would quietly drop or duplicate it.
-#[test]
-fn two_tool_results_checkpointed_separately_both_reach_disk() {
+fn tool_output_mutations_both_reach_disk() {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     app.state
         .session_mut()
@@ -11127,7 +10959,6 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
             annotation: None,
             written_path: None,
         }))));
-        app.checkpoint();
     }
 
     let id = app.state.session.id;
@@ -11192,7 +11023,7 @@ fn completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = makima_lua::test_support::event_handle_with_completion();
-    let mut app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
+    let mut app = build_app_with_handle(dir.clone(), None, handle);
     std::sync::Arc::get_mut(&mut app.state.session)
         .unwrap()
         .set_cwd(tmp.path().to_string_lossy().into_owned());
@@ -13304,8 +13135,7 @@ fn permission_request_bell_disabled() {
 fn test_idle_splash_pulls_lua_frame() {
     let (handle, _guard) = makima_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_handle(dir, writer, handle);
+    let mut app = build_app_with_handle(dir, None, handle);
     rendered(&mut app); // assigns the splash area in view
     // Cadence is SMOOTH at startup so ticks keep pulling; the first frame or
     // two can miss the pull timeout while the Lua JIT warms up, so loop.
@@ -13359,8 +13189,7 @@ end)
         )
         .unwrap();
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_handle(dir, writer, handle);
+    let mut app = build_app_with_handle(dir, None, handle);
     rendered(&mut app);
 
     let started = std::time::Instant::now();
@@ -13381,8 +13210,7 @@ end)
 fn test_splash_lifecycle_events() {
     let (handle, probe) = makima_lua::test_support::probed_event_handle();
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_handle(dir, writer, handle);
+    let mut app = build_app_with_handle(dir, None, handle);
 
     let _ = app.tick();
     let ev = probe.try_recv_autocmd();
@@ -13412,8 +13240,7 @@ fn test_splash_survives_reset_to_empty_session() {
     // and fail the moment a frame goes missing.
     let (handle, _guard) = makima_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_handle(dir, writer, handle.clone());
+    let mut app = build_app_with_handle(dir, None, handle.clone());
     rendered(&mut app); // assigns the splash area in view
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -13494,14 +13321,13 @@ fn test_splash_off_settles_idle() {
     // parallel version-change test that bumps the shared update global).
     let (handle, _guard) = (makima_lua::EventHandle::disconnected_for_test(), ());
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
     let ui = UiConfig {
         splash_animation: false,
         ..Default::default()
     };
     let mut app = build_app_with_full(
         dir,
-        writer,
+        None,
         makima_commands::CommandRegistry::new(),
         handle,
         ui,
@@ -13520,14 +13346,13 @@ fn test_splash_off_settles_idle() {
 fn test_splash_still_repulls_once_on_version_change() {
     let (handle, _guard) = makima_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     let dir = StateDir::from_path(env::temp_dir());
-    let writer = Arc::new(test_writer(dir.clone()));
     let ui = UiConfig {
         splash_animation: false,
         ..Default::default()
     };
     let mut app = build_app_with_full(
         dir,
-        writer,
+        None,
         makima_commands::CommandRegistry::new(),
         handle.clone(),
         ui,

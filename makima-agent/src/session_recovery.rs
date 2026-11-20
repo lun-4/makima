@@ -3,31 +3,31 @@ use crate::{
     agent::UNAVAILABLE_RESULT,
     journal::{SessionJournal, SessionJournalSnapshot},
     modes, plan_state,
+    session_writer::SessionWriter,
 };
 use makima_providers::{ContentBlock, Message, Role, TokenUsage};
 use makima_storage::{
     StateDir,
-    checkpoint::CheckpointError,
+    checkpoint::{CheckpointClaim, CheckpointError, CheckpointPublication},
+    id::MakimaId,
     session_state::{
         StateChange, StoredCancellationReason, StoredPayload, StoredStateRecord, StoredTurnOutcome,
         StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
     },
-    sessions::{HistorySnapshot, Session, next_epoch},
+    sessions::{HistorySnapshot, Session, SessionRecord, next_epoch},
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    mem::take,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, mem::take, sync::Arc};
 
 const SEQUENCE_EXHAUSTED: &str = "session recovery exhausted the state sequence";
 const DRAFT_SEPARATOR: &str = "\n\n";
+const WRONG_WRITER: &str = "recovery writer belongs to another session";
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
 pub struct RecoveryCandidate {
     session: StoredSession,
     journal: Arc<SessionJournal>,
+    records: Vec<SessionRecord<Message, TokenUsage, ToolOutput>>,
 }
 
 pub struct RecoveredSession {
@@ -98,6 +98,7 @@ impl RecoveryCandidate {
         Ok(Self {
             session,
             journal: Arc::new(journal),
+            records: Vec::new(),
         })
     }
 
@@ -107,6 +108,8 @@ impl RecoveryCandidate {
             session_id,
             message: Arc::from(message),
         };
+        let mut records = Vec::new();
+        let restore_draft = !session.meta.queued_messages.is_empty();
         for queued in take(&mut session.meta.queued_messages) {
             let draft = session.meta.input_draft.get_or_insert_with(String::new);
             if !draft.is_empty() {
@@ -117,23 +120,43 @@ impl RecoveryCandidate {
         let view = session
             .latest_state()
             .map_err(|error| failure(error.to_string()))?;
-        let epochs: BTreeMap<_, _> = view
-            .agents
-            .values()
-            .filter_map(|agent| {
-                let history = if agent.transcript_key.is_empty() {
-                    Some(session.history_snapshot())
-                } else {
-                    session.subagent_history_snapshot(&agent.transcript_key)
-                }?;
-                Some((agent.id, history.epoch))
-            })
-            .collect();
-        let mut histories = BTreeMap::new();
+        let mut seq = session
+            .state()
+            .iter()
+            .map(|record| record.seq)
+            .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
+            .chain(session.sequence_high_water())
+            .max()
+            .unwrap_or(0);
+        let previous_epoch = session.history_snapshot().epoch;
+        let covered = session.last_message_id();
         let history = sanitize(session.history_snapshot());
         session.adopt_history(&history);
-        if let Some(root) = session.root_agent_id() {
-            histories.insert(root, history.epoch);
+        if history.epoch != previous_epoch
+            && let Some(root) = session.root_agent_id()
+        {
+            records.push(SessionRecord::Compaction {
+                agent: root,
+                messages: history.messages.as_ref().clone(),
+                ids: history.ids.as_ref().clone(),
+                covered,
+            });
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+            let record = StoredStateRecord {
+                seq,
+                agent: Some(root),
+                generation: view
+                    .scopes
+                    .get(&Some(root))
+                    .map_or(0, |scope| scope.generation),
+                change: StateChange::Compaction {
+                    epoch: history.epoch,
+                },
+            };
+            session.push_state(record.clone());
+            records.push(SessionRecord::State { d: record });
         }
         let keys: BTreeSet<_> = session
             .subagent_messages()
@@ -148,41 +171,47 @@ impl RecoveryCandidate {
             .collect();
         for key in keys {
             let history = session.subagent_history_snapshot(&key).unwrap_or_default();
+            let previous_epoch = history.epoch;
+            let covered = session.chat_message_ids(Some(&key)).last().copied();
             let history = sanitize(history);
             session.adopt_subagent_history(key.clone(), &history);
             if let Some(agent) = view
                 .agents
                 .values()
                 .find(|agent| agent.transcript_key == key)
+                && history.epoch != previous_epoch
             {
-                histories.insert(agent.id, history.epoch);
+                records.push(SessionRecord::Compaction {
+                    agent: agent.id,
+                    messages: history.messages.as_ref().clone(),
+                    ids: history.ids.as_ref().clone(),
+                    covered,
+                });
+                seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                let record = StoredStateRecord {
+                    seq,
+                    agent: Some(agent.id),
+                    generation: view
+                        .scopes
+                        .get(&Some(agent.id))
+                        .map_or(0, |scope| scope.generation),
+                    change: StateChange::Compaction {
+                        epoch: history.epoch,
+                    },
+                };
+                session.push_state(record.clone());
+                records.push(SessionRecord::State { d: record });
             }
         }
-        let mut state = session.state().to_vec();
-        for record in &mut state {
-            if let StateChange::Compaction { epoch } = &mut record.change
-                && let Some(agent) = record.agent
-                && epochs.get(&agent) == Some(epoch)
-                && let Some(remap) = histories.get(&agent)
-            {
-                *epoch = *remap;
-            }
-        }
-        session.replace_state(state);
-        let mut seq = session
-            .state()
-            .iter()
-            .map(|record| record.seq)
-            .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
-            .max()
-            .unwrap_or(0);
         for (agent, scope) in view.scopes {
             let Some(agent) = agent else { continue };
             for (turn, origin) in scope.admitted {
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.to_owned()))?;
-                session.push_state(StoredStateRecord {
+                let record = StoredStateRecord {
                     seq,
                     agent: Some(agent),
                     generation: scope.generation,
@@ -214,13 +243,58 @@ impl RecoveryCandidate {
                             duration_ms: 0,
                         },
                     },
-                });
+                };
+                session.push_state(record.clone());
+                records.push(SessionRecord::State { d: record });
             }
+        }
+        if restore_draft {
+            records.push(SessionRecord::Draft {
+                text: session.meta.input_draft.clone(),
+            });
+            records.push(SessionRecord::Queued {
+                messages: session.meta.queued_messages.clone(),
+            });
         }
         let journal = Arc::new(
             SessionJournal::from_session(&session).map_err(|error| failure(error.to_string()))?,
         );
-        Ok(Self { session, journal })
+        Ok(Self {
+            session,
+            journal,
+            records,
+        })
+    }
+
+    pub async fn publish(
+        self,
+        writer: &SessionWriter,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> Result<RecoveredSession, CheckpointError> {
+        let session_id = self.session.id;
+        if writer.session_id() != session_id {
+            return Err(CheckpointError::Save {
+                session_id,
+                message: Arc::from(WRONG_WRITER),
+            });
+        }
+        claim(&publication).map_err(|message| CheckpointError::Save {
+            session_id,
+            message,
+        })?;
+        writer
+            .append(self.records)
+            .await
+            .map_err(|error| CheckpointError::Save {
+                session_id,
+                message: Arc::from(error.to_string()),
+            })?;
+        writer.bind_journal(Arc::clone(&self.journal)).await?;
+        Ok(RecoveredSession {
+            session: self.session,
+            journal: self.journal,
+        })
     }
 
     pub fn session(&self) -> &StoredSession {
@@ -232,6 +306,19 @@ impl RecoveryCandidate {
             session: self.session,
             journal: self.journal,
         }
+    }
+}
+
+impl SessionWriter {
+    pub async fn recover(
+        &self,
+        session: StoredSession,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> Result<RecoveredSession, CheckpointError> {
+        RecoveryCandidate::prepare(session)?
+            .publish(self, publication, claim)
+            .await
     }
 }
 
@@ -251,7 +338,8 @@ impl RecoveredSession {
 
 pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot<Message> {
     let mut messages: Vec<Message> = Vec::with_capacity(history.messages.len());
-    for mut message in history.messages.iter().cloned() {
+    let mut ids = Vec::with_capacity(history.messages.len());
+    for (index, mut message) in history.messages.iter().cloned().enumerate() {
         let previous = messages.last();
         let mut calls: Vec<_> = previous
             .filter(|message| matches!(message.role, Role::Assistant))
@@ -266,6 +354,7 @@ pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot
                 .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
             if !had_results && !calls.is_empty() {
                 messages.push(results(take(&mut calls)));
+                ids.push(MakimaId::generate());
             }
             message.content.retain(|block| !matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if !calls.contains(tool_use_id)));
             if had_results
@@ -285,9 +374,11 @@ pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot
             message.content.extend(missing.into_iter().map(unavailable));
         } else if !calls.is_empty() {
             messages.push(results(calls));
+            ids.push(MakimaId::generate());
         }
         if !message.content.is_empty() {
             messages.push(message);
+            ids.push(history.ids[index]);
         }
     }
     if let Some(last) = messages.last()
@@ -296,9 +387,12 @@ pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot
     {
         let calls = last.tool_uses().map(|(id, _, _)| id.to_owned()).collect();
         messages.push(results(calls));
+        ids.push(MakimaId::generate());
     }
     if history.messages.as_ref() != &messages {
         history.epoch = next_epoch();
+        history.covered = history.ids.last().copied();
+        history.ids = Arc::new(ids);
         history.messages = Arc::new(messages);
     }
     history
@@ -324,13 +418,12 @@ fn results(calls: Vec<String>) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentLimits, AgentManagerHandle, session_checkpoint::SessionLogCheckpoint};
+    use crate::{AgentLimits, AgentManagerHandle};
     use makima_storage::{
         StateDir,
         checkpoint::{CheckpointClaim, CheckpointPublication},
         id::{AgentId, TurnId},
         plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot},
-        session_lock,
         session_state::StoredTurnOrigin,
         sessions::SESSIONS_DIR,
     };
@@ -401,6 +494,51 @@ mod tests {
         let again = RecoveryCandidate::prepare(candidate.session).unwrap();
         assert_eq!(again.session.history_snapshot().epoch, history.epoch);
         assert_eq!(again.session.messages(), history.messages.as_ref());
+    }
+
+    #[test_case(false; "inserted_result_gets_a_new_id")]
+    #[test_case(true; "repaired_result_keeps_its_id")]
+    fn sanitization_preserves_surviving_message_ids(repair_existing: bool) {
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![unavailable(ORPHAN.into())],
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(TOOL, TOOL, json!({}))],
+                ..Default::default()
+            },
+        ];
+        if repair_existing {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![
+                    unavailable(ORPHAN.into()),
+                    ContentBlock::Text { text: DRAFT.into() },
+                ],
+                ..Default::default()
+            });
+        } else {
+            messages.push(Message::user(DRAFT.into()));
+        }
+        let original = HistorySnapshot::new(messages);
+        let history = sanitize(original.clone());
+        assert_ne!(history.epoch, original.epoch);
+        assert_eq!(history.covered, original.ids.last().copied());
+        assert_eq!(history.ids.len(), history.messages.len());
+        assert_eq!(history.ids[0], original.ids[1]);
+        if repair_existing {
+            assert_eq!(history.ids[1], original.ids[2]);
+        } else {
+            assert!(!original.ids.contains(&history.ids[1]));
+            assert_eq!(history.ids[2], original.ids[2]);
+        }
+        let again = sanitize(history.clone());
+        assert_eq!(again.epoch, history.epoch);
+        assert!(Arc::ptr_eq(&again.ids, &history.ids));
+        assert!(Arc::ptr_eq(&again.messages, &history.messages));
     }
 
     #[test]
@@ -628,9 +766,11 @@ mod tests {
         let original = vec![calls, orphan, actual];
         let expected = crate::agent::History::restored(original.clone()).into_vec();
         let mut history = session.history_snapshot();
+        history.ids = Arc::new(original.iter().map(|_| MakimaId::generate()).collect());
         history.messages = Arc::new(original.clone());
         session.adopt_history(&history);
         let mut history = session.subagent_history_snapshot(CHILD_KEY).unwrap();
+        history.ids = Arc::new(original.iter().map(|_| MakimaId::generate()).collect());
         history.messages = Arc::new(original);
         session.adopt_subagent_history(CHILD_KEY.into(), &history);
         let candidate = RecoveryCandidate::prepare(session).unwrap();
@@ -649,19 +789,28 @@ mod tests {
             let (mut session, root, child, root_turn, child_turn) = fixture();
             let id = session.id;
             session.save(&storage).unwrap();
+            let original_state = session.state().to_vec();
             let sessions = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-            let lease = session_lock::claim(&sessions, &id).unwrap().unwrap();
+            let path = sessions.join(format!("{id}.jsonl"));
+            let original = std::fs::read(&path).unwrap();
             let loaded = StoredSession::load(id, &storage).unwrap();
-            let writer = SessionLogCheckpoint::open_with_session(
-                storage.clone(),
-                loaded,
-                Some(lease.publication_guard()),
-            )
-            .unwrap();
+            let writer = SessionWriter::open_session(&sessions, &loaded).unwrap();
             let recovered = writer
-                .recover(CheckpointPublication::default(), claim())
+                .recover(loaded, CheckpointPublication::default(), claim())
                 .await
                 .unwrap();
+            assert!(std::fs::read(&path).unwrap().starts_with(&original));
+            assert_eq!(
+                &recovered.session().state()[..original_state.len()],
+                &original_state
+            );
+            let stored = StoredSession::load(id, &storage).unwrap();
+            for chat in [None, Some(CHILD_KEY)] {
+                assert_eq!(
+                    stored.chat_message_ids(chat),
+                    recovered.session().chat_message_ids(chat)
+                );
+            }
             let view = recovered.session().latest_state().unwrap();
             for (agent, turn) in [(root, root_turn), (child, child_turn)] {
                 let scope = &view.scopes[&Some(agent)];
@@ -687,20 +836,27 @@ mod tests {
             )
             .unwrap();
             assert!(manager.lookup(root).unwrap().actor().is_err());
+            for agent in [root, child] {
+                assert!(
+                    recovered.session().state()[original_state.len()..]
+                        .iter()
+                        .any(|record| {
+                            record.agent == Some(agent)
+                                && matches!(record.change, StateChange::Compaction { .. })
+                        })
+                );
+            }
+            let durable_bytes = std::fs::read(&path).unwrap();
             let durable_scopes = recovered.session().latest_state().unwrap().scopes;
             let durable_state = recovered.session().state().to_vec();
             drop(writer);
             let loaded = StoredSession::load(id, &storage).unwrap();
-            let writer = SessionLogCheckpoint::open_with_session(
-                storage.clone(),
-                loaded,
-                Some(lease.publication_guard()),
-            )
-            .unwrap();
+            let writer = SessionWriter::open_session(&sessions, &loaded).unwrap();
             let again = writer
-                .recover(CheckpointPublication::default(), claim())
+                .recover(loaded, CheckpointPublication::default(), claim())
                 .await
                 .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), durable_bytes);
             let after = again.session().latest_state().unwrap();
             assert_eq!(durable_state.len(), again.session().state().len());
             assert_eq!(durable_scopes, after.scopes);
@@ -713,10 +869,28 @@ mod tests {
         });
     }
 
-    #[test_case(0 ; "claim_rejected")]
-    #[test_case(1 ; "lease_lost")]
-    #[test_case(2 ; "rename_failed_after_claim")]
-    fn failed_recovery_does_not_publish_or_expose_results(failure: u8) {
+    #[test]
+    fn recovery_rejects_a_writer_for_another_session() {
+        smol::block_on(async {
+            let directory = TempDir::new().unwrap();
+            let writer_session = StoredSession::new(MODEL, CWD);
+            let writer = SessionWriter::open_session(directory.path(), &writer_session).unwrap();
+            let (session, _, _, _, _) = fixture();
+            let result = writer
+                .recover(
+                    session,
+                    CheckpointPublication::default(),
+                    Arc::new(|_| unreachable!()),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(CheckpointError::Save { message, .. }) if message.as_ref() == WRONG_WRITER)
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_recovery_does_not_publish_or_expose_results() {
         smol::block_on(async {
             let directory = TempDir::new().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -726,41 +900,14 @@ mod tests {
             let sessions = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let path = sessions.join(format!("{id}.jsonl"));
             let original = std::fs::read(&path).unwrap();
-            let lease = session_lock::claim(&sessions, &id).unwrap().unwrap();
-            let guard = lease.publication_guard();
-            let replacement = if failure == 1 {
-                lease.release().unwrap();
-                Some(session_lock::claim(&sessions, &id).unwrap().unwrap())
-            } else {
-                None
-            };
-            let writer =
-                SessionLogCheckpoint::open_with_session(storage.clone(), session, Some(guard))
-                    .unwrap();
-            let claim = match failure {
-                1 => claim(),
-                2 => {
-                    let path = path.clone();
-                    Arc::new(move |publication: &CheckpointPublication| {
-                        assert!(publication.try_publish());
-                        std::fs::remove_file(&path).unwrap();
-                        std::fs::create_dir(&path).unwrap();
-                        Ok(())
-                    }) as CheckpointClaim
-                }
-                _ => Arc::new(|_: &CheckpointPublication| Err(Arc::from(CLAIM_REJECTED)))
-                    as CheckpointClaim,
-            };
+            let writer = SessionWriter::open_session(&sessions, &session).unwrap();
+            let claim: CheckpointClaim = Arc::new(|_| Err(Arc::from(CLAIM_REJECTED)));
             assert!(
                 writer
-                    .recover(CheckpointPublication::default(), claim)
+                    .recover(session, CheckpointPublication::default(), claim)
                     .await
                     .is_err()
             );
-            if failure == 2 {
-                std::fs::remove_dir(&path).unwrap();
-                std::fs::write(&path, &original).unwrap();
-            }
             assert_eq!(std::fs::read(&path).unwrap(), original);
             let stored = StoredSession::load(id, &storage).unwrap();
             assert!(
@@ -768,7 +915,6 @@ mod tests {
                     .results
                     .is_empty()
             );
-            drop(replacement);
         });
     }
 }

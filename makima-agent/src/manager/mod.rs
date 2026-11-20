@@ -1795,7 +1795,10 @@ impl AgentManagerHandle {
                 .nodes
                 .get(&agent_id)
                 .ok_or_else(|| ActorError::InvalidConfig("agent is unknown".into()))?;
-            if node.residency == AgentResidency::Resident {
+            if node.lifecycle == GraphLifecycle::Live
+                && node.residency == AgentResidency::Resident
+                && !node.detach_pending
+            {
                 node.actor.clone()
             } else {
                 None
@@ -2876,36 +2879,6 @@ impl AgentManagerHandle {
         for (_, observer) in &graph.observers {
             actor.attach_graph_observer(observer.clone());
         }
-        if !closing && !cancel_on_commit {
-            if let Err(error) = self.journal_node(agent_id, &graph.nodes[&agent_id], &actor) {
-                drop(graph);
-                actor.close();
-                self.finish_failed_commit(agent_id, reservation);
-                return Err(error);
-            }
-            self.0.work.set_open(agent_id, true)?;
-            let node = graph.nodes.get_mut(&agent_id).unwrap();
-            node.reservation_pending = false;
-            node.lifecycle = GraphLifecycle::Live;
-            node.residency = AgentResidency::Resident;
-            graph.revision += 1;
-            let revision = graph.revision;
-            let depth = graph.nodes[&agent_id].depth;
-            let terminal = graph.nodes[&agent_id].terminal.clone();
-            let live_count = graph
-                .nodes
-                .values()
-                .filter(|node| node.lifecycle.consumes_capacity())
-                .count();
-            drop(graph);
-            self.0.reaped.notify(usize::MAX);
-            info!(manager_generation = self.0.generation, %agent_id, depth, revision, live_count, "agent node committed");
-            return Ok(AgentRef {
-                manager: self.clone(),
-                agent_id,
-                terminal,
-            });
-        }
         drop(graph);
         if closing {
             if shutting_down {
@@ -2920,10 +2893,12 @@ impl AgentManagerHandle {
                 ManagerError::NonLiveAgent(agent_id)
             });
         }
-        actor.cancel_existing();
-        #[cfg(test)]
-        self.wait_at_commit_gate();
-        let mut graph = self.lock_graph();
+        if cancel_on_commit {
+            actor.cancel_existing();
+            #[cfg(test)]
+            self.wait_at_commit_gate();
+        }
+        let graph = self.lock_graph();
         let can_publish = !graph.shutting_down
             && graph.nodes.get(&agent_id).is_some_and(|node| {
                 node.reservation == reservation
@@ -2952,6 +2927,34 @@ impl AgentManagerHandle {
             actor.close();
             self.finish_failed_commit(agent_id, reservation);
             return Err(error);
+        }
+        drop(graph);
+        if let Err(error) = self.0.journal.flush_spawn() {
+            actor.close();
+            self.finish_failed_commit(agent_id, reservation);
+            return Err(ManagerError::Persistence(error));
+        }
+        let mut graph = self.lock_graph();
+        let can_publish = !graph.shutting_down
+            && graph.nodes.get(&agent_id).is_some_and(|node| {
+                node.reservation == reservation
+                    && node.reservation_pending
+                    && node.lifecycle == GraphLifecycle::Reserved
+            });
+        if !can_publish {
+            let shutting_down = graph.shutting_down;
+            drop(graph);
+            if shutting_down {
+                actor.shutdown();
+            } else {
+                actor.close();
+            }
+            self.finish_failed_commit(agent_id, reservation);
+            return Err(if shutting_down {
+                ManagerError::GraphShutdown
+            } else {
+                ManagerError::NonLiveAgent(agent_id)
+            });
         }
         self.0.work.set_open(agent_id, true)?;
         let node = graph.nodes.get_mut(&agent_id).unwrap();

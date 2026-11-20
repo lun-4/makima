@@ -24,12 +24,12 @@ use makima_agent::journal::SessionJournal;
 use makima_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use makima_agent::mcp::{self, McpHandle};
 use makima_agent::permissions::{PermissionAnswer, TaggedAnswer};
-use makima_agent::session_checkpoint::SessionLogCheckpoint;
 use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
 };
 use makima_agent::session_defaults;
 use makima_agent::session_options::SessionOptionError;
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
 use makima_agent::{AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
@@ -217,7 +217,7 @@ struct SessionState {
     handle: InteractiveHandle,
     coordinator: Option<makima_agent::session_coordinator::SessionCoordinatorHandle>,
     orchestration: Option<Arc<AgentOrchestration>>,
-    checkpoint: Option<Arc<makima_agent::session_checkpoint::SessionLogCheckpoint>>,
+    checkpoint: Option<Arc<SessionWriter>>,
     mcp: Option<McpHandle>,
     pending: PendingState,
     command_registry: makima_commands::CommandRegistry,
@@ -249,7 +249,7 @@ struct SpawnSession {
 
 struct InstallSession<'a> {
     handle: InteractiveHandle,
-    recovered_writer: Option<(Arc<SessionLogCheckpoint>, Arc<session_lock::LockHeartbeat>)>,
+    recovered_writer: Option<(Arc<SessionWriter>, Arc<session_lock::LockHeartbeat>)>,
     root_target: Receiver<TrustedTarget>,
     mcp: Option<McpHandle>,
     current_model: String,
@@ -529,17 +529,15 @@ async fn new_session(
         .storage
         .ensure_subdir(SESSIONS_DIR)
         .map_err(|error| session_registration_error(error.to_string()))?;
-    let lock = start_session_lock_in(directory, seed.id).map_err(session_registration_error)?;
+    let lock =
+        start_session_lock_in(directory.clone(), seed.id).map_err(session_registration_error)?;
     let checkpoint = Arc::new(
-        SessionLogCheckpoint::open_with_session(
-            params.storage.clone(),
-            seed,
-            Some(lock.publication_guard()),
-        )
-        .map_err(|error| session_registration_error(error.to_string()))?,
+        SessionWriter::open_session(&directory, &seed)
+            .map_err(|error| session_registration_error(error.to_string()))?,
     );
+    checkpoint.bind_publication_guard(Some(lock.publication_guard()));
     let recovered = checkpoint
-        .recover(CheckpointPublication::default(), recovery_claim())
+        .recover(seed, CheckpointPublication::default(), recovery_claim())
         .await
         .map_err(|error| session_registration_error(error.to_string()))?;
     let (handle, root_target) = spawn_session(
@@ -619,15 +617,16 @@ async fn load_session(
         warn!(%warning, "legacy mode restoration fell back to build");
     }
     let checkpoint = Arc::new(
-        SessionLogCheckpoint::open_with_session(
-            params.storage.clone(),
-            restored.seed,
-            Some(lock.publication_guard()),
-        )
-        .map_err(|error| session_registration_error(error.to_string()))?,
+        SessionWriter::open_session(&directory, &restored.seed)
+            .map_err(|error| session_registration_error(error.to_string()))?,
     );
+    checkpoint.bind_publication_guard(Some(lock.publication_guard()));
     let recovered = checkpoint
-        .recover(CheckpointPublication::default(), recovery_claim())
+        .recover(
+            restored.seed,
+            CheckpointPublication::default(),
+            recovery_claim(),
+        )
         .await
         .map_err(|error| session_registration_error(error.to_string()))?;
     let history_snapshot = recovered.session().history_snapshot();
@@ -778,7 +777,7 @@ fn spawn_session_with_checkpoint(
     params: &AcpParams,
     session: SpawnSession,
     snapshot: Option<makima_agent::agent::HistorySnapshot>,
-    checkpoint: Option<Arc<SessionLogCheckpoint>>,
+    checkpoint: Option<Arc<SessionWriter>>,
 ) -> (InteractiveHandle, Receiver<TrustedTarget>) {
     let SpawnSession {
         model,
@@ -1095,12 +1094,15 @@ async fn install_session_with_lock(
         return Err(error.to_string());
     }
     let checkpoint = match recovered_checkpoint.map(Ok).unwrap_or_else(|| {
-        SessionLogCheckpoint::open_with_session(
-            params.storage.clone(),
-            seed,
-            Some(lock.publication_guard()),
-        )
-        .map(Arc::new)
+        params
+            .storage
+            .ensure_subdir(SESSIONS_DIR)
+            .map_err(|error| makima_agent::session_writer::WriterError {
+                session_id: seed.id,
+                message: error.to_string().into(),
+            })
+            .and_then(|directory| SessionWriter::open_session(&directory, &seed))
+            .map(Arc::new)
     }) {
         Ok(checkpoint) => checkpoint,
         Err(error) => {
@@ -1109,12 +1111,9 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
+    checkpoint.bind_publication_guard(Some(lock.publication_guard()));
     let bound = async {
-        let root = handle.initialized_root().await?;
-        checkpoint
-            .bind_root_id(root.id(), None)
-            .await
-            .map_err(|error| error.to_string())?;
+        handle.initialized_root().await?;
         checkpoint
             .bind_journal(handle.manager.journal())
             .await
@@ -1174,6 +1173,18 @@ async fn install_session_with_lock(
     let pending = PendingState::default();
     let project_trusted = handle.permissions.project_is_trusted();
     let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
+    let usage_seed = match StoredSession::load(handle.session_id.id(), &params.storage) {
+        Ok(seed) => seed,
+        Err(error) => {
+            rollback_install(handle, mcp, Some(coordinator)).await;
+            return Err(error.to_string());
+        }
+    };
+    observer.persist_usage(
+        checkpoint.as_ref().clone(),
+        usage_seed.token_usage,
+        usage_seed.usage_by_model().clone(),
+    );
     observer.install(trusted_root.target.clone());
     let event_pump = start_event_pump(
         handle.event_rx.clone(),
@@ -2887,11 +2898,52 @@ mod tests {
         }
     }
 
+    struct TerminalSyncGate {
+        bytes: Vec<u8>,
+        root: AgentId,
+        turns: Vec<String>,
+        gate: (Sender<()>, Receiver<()>),
+    }
+
+    impl makima_agent::session_writer::SessionIo for TerminalSyncGate {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            let root = self.root.to_string();
+            for line in self
+                .bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let record: Value = serde_json::from_slice(line).map_err(std::io::Error::other)?;
+                if record["t"] == "state"
+                    && record["d"]["agent"] == root
+                    && record["d"]["change"]["kind"] == "turn"
+                    && matches!(
+                        record["d"]["change"]["result"]["text"]["value"].as_str(),
+                        Some("root result" | "done")
+                    )
+                    && let Some(turn) = record["d"]["change"]["turn"].as_str()
+                    && !self.turns.iter().any(|seen| seen == turn)
+                {
+                    self.turns.push(turn.to_owned());
+                    self.gate.0.send(()).map_err(std::io::Error::other)?;
+                    self.gate.1.recv().map_err(std::io::Error::other)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     async fn managed_test_session(
         srv: &mut Server,
         nested: bool,
         permission: bool,
         completion: Option<TurnCompletion>,
+        sync_gate: Option<(Sender<()>, Receiver<()>)>,
         checkpoint: Arc<
             dyn makima_storage::checkpoint::CheckpointWriter<
                     makima_agent::session_coordinator::SessionCheckpoint,
@@ -3051,16 +3103,27 @@ mod tests {
         .await
         .unwrap();
         let state = TempDir::new().unwrap();
-        let child_checkpoint = Arc::new(
-            makima_agent::session_checkpoint::SessionLogCheckpoint::open(
-                StateDir::from_path(state.path().to_path_buf()),
+        let mut child_seed = StoredSession::new(FAST_SPEC, "/tmp");
+        child_seed.id = id.id();
+        let child_checkpoint = Arc::new(match sync_gate {
+            Some(gate) => SessionWriter::with_io(
                 id.id(),
-                FAST_SPEC,
-                "/tmp",
-                None,
-            )
-            .unwrap(),
-        );
+                TerminalSyncGate {
+                    bytes: Vec::new(),
+                    root: root.target.id(),
+                    turns: Vec::new(),
+                    gate,
+                },
+                1,
+            ),
+            None => {
+                SessionWriter::open_session(&state.path().join(SESSIONS_DIR), &child_seed).unwrap()
+            }
+        });
+        child_checkpoint
+            .bind_journal(handle.manager.journal())
+            .await
+            .unwrap();
         let services = Arc::new_cyclic(|services| {
             let (child_config, persist) = makima_lua::orchestration::child_persistence(
                 "ACP",
@@ -3620,6 +3683,11 @@ mod tests {
             session.meta.input_draft = Some(PARKED_THOUGHT.into());
             session.meta.queued_messages.push(PARKED_REPLY.into());
             session.save(&storage).unwrap();
+            let path = storage
+                .path()
+                .join(SESSIONS_DIR)
+                .join(format!("{}.jsonl", session.id));
+            let before_recovery = std::fs::read(&path).unwrap();
             let mut params = test_params(
                 providers.model(SPAWN_TEST_SPEC).unwrap(),
                 tmp.path().to_path_buf(),
@@ -3661,6 +3729,7 @@ mod tests {
                 assert!(probe.is_quiescent());
                 assert!(received.is_empty());
                 let loaded = StoredSession::load(session.id, &storage).unwrap();
+                assert!(std::fs::read(&path).unwrap().starts_with(&before_recovery));
                 assert!(loaded.meta.queued_messages.is_empty());
                 assert_eq!(
                     loaded.meta.input_draft.as_deref(),
@@ -3753,6 +3822,7 @@ mod tests {
                     ..Default::default()
                 },
             ]);
+            Arc::make_mut(&mut history.ids).extend([MakimaId::generate(), MakimaId::generate()]);
             let turn_id = TurnId::generate();
             let result = TurnResult {
                 outcome: TurnOutcome::completed(
@@ -4151,8 +4221,10 @@ mod tests {
             let id = state.handle.session_id.id();
             let input = state.handle.input_tx.clone();
             state.lock = Some(start_session_lock_in(sessions_dir.clone(), id).unwrap());
+            let mut seed = StoredSession::new(OFFLINE_SPEC, "/project");
+            seed.id = id;
             state.checkpoint = Some(Arc::new(
-                SessionLogCheckpoint::open(storage, id, OFFLINE_SPEC, "/project", None).unwrap(),
+                SessionWriter::open_session(&sessions_dir, &seed).unwrap(),
             ));
             let (result, ()) = smol::future::zip(finalize_session(&mut srv), async {
                 entering.recv_async().await.unwrap();
@@ -6281,7 +6353,8 @@ mod tests {
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let (_host, received, root_answer_rx, _state, notices) =
-                managed_test_session(&mut srv, true, true, None, successful_checkpoint()).await;
+                managed_test_session(&mut srv, true, true, None, None, successful_checkpoint())
+                    .await;
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
             handle_prompt(
                 &mut srv,
@@ -6925,23 +6998,7 @@ mod tests {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let (started_tx, started_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            let checkpoint = Arc::new(
-                move |request: makima_storage::checkpoint::CheckpointRequest<
-                    makima_agent::session_coordinator::SessionCheckpoint,
-                >| {
-                    let started = started_tx.clone();
-                    let release = release_rx.clone();
-                    Box::pin(async move {
-                        if request.snapshot.history.is_some() {
-                            started.send_async(()).await.unwrap();
-                            release.recv_async().await.unwrap();
-                        }
-                        Ok(makima_storage::checkpoint::CheckpointAck::for_request(
-                            &request,
-                        ))
-                    }) as makima_storage::checkpoint::CheckpointFuture
-                },
-            );
+            let checkpoint = successful_checkpoint();
             let (child_started_tx, child_started_rx) = flume::bounded(1);
             let (child_release_tx, child_release_rx) = flume::bounded(1);
             let completion: TurnCompletion = Arc::new(move |target, history| {
@@ -6958,8 +7015,15 @@ mod tests {
                     Ok(())
                 })
             });
-            let (_host, received, _, _state, _) =
-                managed_test_session(&mut srv, nested, false, Some(completion), checkpoint).await;
+            let (_host, received, _, _state, _) = managed_test_session(
+                &mut srv,
+                nested,
+                false,
+                Some(completion),
+                Some((started_tx, release_rx)),
+                checkpoint,
+            )
+            .await;
             let session = srv.session.as_ref().unwrap();
             let session_id = session.handle.session_id.to_string();
             let manager = session.handle.manager.clone();
