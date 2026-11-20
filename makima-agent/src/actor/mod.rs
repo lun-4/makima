@@ -1518,8 +1518,6 @@ pub(crate) fn correlation_run_id(correlation: &str) -> Option<u64> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryMutationError {
-    #[error("rewindable history messages require a boundary permit")]
-    BoundaryRequiresPermit,
     #[error("history publication failed: {0}")]
     Publication(#[from] JournalError),
 }
@@ -1562,7 +1560,7 @@ impl<'a> ActorHistory<'a> {
         if self.permitted {
             None
         } else {
-            self.history.boundary_permit().await
+            self.history.publication_permit().await
         }
     }
 

@@ -118,7 +118,6 @@ fn dropping_prepared_context_preserves_context_and_access_baseline() {
         let update = proposal(&access, FIRST, ContextPolicy::Admission);
         let before = journal.snapshot();
         let mut commit = context_commit(update.clone());
-        commit.boundary = Some((root, 0));
         commit.state_epoch_agents.insert(root);
         let prepared = journal.prepare(commit).await.unwrap();
         assert!(

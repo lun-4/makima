@@ -407,7 +407,6 @@ pub fn child_persistence(
                 options: None,
                 state_edits: Vec::new(),
                 history_changed: false,
-                boundary: false,
                 publish: Box::new(move |ready, publication| {
                     Box::pin(async move {
                         checkpoint
@@ -610,7 +609,6 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
             options: None,
             state_edits: Vec::new(),
             history_changed: false,
-            boundary: false,
             publish: Box::new(move |_, publication| {
                 Box::pin(async move { claim(&publication).map_err(|error| error.to_string()) })
             }),

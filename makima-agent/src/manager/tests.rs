@@ -2283,7 +2283,7 @@ fn nonpersistent_actor_history_fences_old_invocation_and_accepts_new(compact: bo
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
         assert!(!journal.snapshot().state.iter().any(|record| matches!(
             record.change,
-            StateChange::Boundary { .. } | StateChange::Turn { .. } | StateChange::Delivery { .. }
+            StateChange::Turn { .. } | StateChange::Delivery { .. }
         )));
         assert!(journal.snapshot().managed_histories.is_empty());
         manager.shutdown(COMPLETION_TIMEOUT).await;

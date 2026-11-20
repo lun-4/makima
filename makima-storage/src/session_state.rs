@@ -29,10 +29,6 @@ pub struct StoredStateRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateChange {
-    Boundary {
-        offset: usize,
-        lens: BTreeMap<AgentId, (u64, usize)>,
-    },
     Admitted {
         turn: TurnId,
         origin: StoredTurnOrigin,
@@ -145,8 +141,7 @@ pub struct StoredModeCeiling {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParentLink {
     pub session: MakimaId,
-    pub message_count: usize,
-    pub seq: u64,
+    pub message: Option<MakimaId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,14 +266,6 @@ pub enum StoredDeliveryOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredBoundary {
-    pub agent: Option<AgentId>,
-    pub generation: u64,
-    pub offset: usize,
-    pub lens: BTreeMap<AgentId, (u64, usize)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredContext {
     pub hash: String,
     pub content: String,
@@ -308,7 +295,6 @@ pub struct StoredScopeState {
 pub struct SessionStateView {
     pub agents: BTreeMap<AgentId, StoredAgentRecord>,
     pub scopes: BTreeMap<Option<AgentId>, StoredScopeState>,
-    pub boundaries: BTreeMap<u64, StoredBoundary>,
     pub compactions: BTreeMap<AgentId, (u64, u64)>,
 }
 
@@ -316,7 +302,6 @@ pub struct SessionStateView {
 pub struct SessionStateReducer {
     pub agents: OrdMap<AgentId, Arc<StoredAgentRecord>>,
     scopes: OrdMap<Option<AgentId>, ReducedScope>,
-    boundaries: OrdMap<u64, Arc<StoredBoundary>>,
     compactions: OrdMap<AgentId, (u64, u64)>,
     state_sequences: OrdSet<u64>,
     agent_sequences: OrdSet<u64>,
@@ -414,11 +399,6 @@ impl SessionStateReducer {
                 .iter()
                 .map(|(key, value)| (*key, value.materialize()))
                 .collect(),
-            boundaries: self
-                .boundaries
-                .iter()
-                .map(|(key, value)| (*key, value.as_ref().clone()))
-                .collect(),
             compactions: self
                 .compactions
                 .iter()
@@ -500,17 +480,6 @@ impl SessionStateReducer {
         let mut scope = self.scopes.get(&record.agent).cloned().unwrap_or_default();
         scope.generation = record.generation;
         match &record.change {
-            StateChange::Boundary { offset, lens } => {
-                self.boundaries.insert(
-                    seq,
-                    Arc::new(StoredBoundary {
-                        agent: record.agent,
-                        generation: record.generation,
-                        offset: *offset,
-                        lens: lens.clone(),
-                    }),
-                );
-            }
             StateChange::Admitted { turn, origin } => {
                 if !scope.results.iter().any(|(id, _)| id == turn) {
                     scope.admitted.insert(*turn, Arc::new(origin.clone()));
@@ -760,22 +729,36 @@ mod tests {
     #[test_case("consumed" ; "consumed")]
     #[test_case("withdrawn" ; "withdrawn")]
     #[test_case("dropped" ; "dropped")]
-    fn compaction_preserves_other_scopes_boundaries_and_tombstones(terminal: &str) {
+    fn compaction_preserves_other_scopes_and_tombstones(terminal: &str) {
         let root = AgentId::generate();
         let child = AgentId::generate();
         let turn = TurnId::generate();
         let queued = json!({"kind":"delivery","id":[child,turn],"op":{"op":"queued","delivery":{"label":null,"result":result(child,turn)}}});
         let records = [
-            (None, json!({"kind":"rules","rules":[{"tool":"write","effect":"deny"}],"yolo":false})),
-            (Some(child), json!({"kind":"context","source":"instructions","hash":"old","content":"old"})),
+            (
+                None,
+                json!({"kind":"rules","rules":[{"tool":"write","effect":"deny"}],"yolo":false}),
+            ),
+            (
+                Some(child),
+                json!({"kind":"context","source":"instructions","hash":"old","content":"old"}),
+            ),
             (Some(root), queued.clone()),
-            (Some(root), json!({"kind":"boundary","offset":0,"lens":{root.to_string():[1,0],child.to_string():[1,0]}})),
-            (Some(child), json!({"kind":"boundary","offset":0,"lens":{child.to_string():[1,0]}})),
-            (Some(root), json!({"kind":"delivery","id":[child,turn],"op":{"op":terminal}})),
+            (
+                Some(root),
+                json!({"kind":"delivery","id":[child,turn],"op":{"op":terminal}}),
+            ),
             (Some(root), json!({"kind":"compaction","epoch":2})),
             (Some(root), queued),
-            (Some(child), json!({"kind":"context","source":"instructions","hash":"new","content":"new"})),
-        ].into_iter().enumerate().map(|(index, (agent, change))| state(index as u64 + 1, agent, change)).collect::<Vec<_>>();
+            (
+                Some(child),
+                json!({"kind":"context","source":"instructions","hash":"new","content":"new"}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (agent, change))| state(index as u64 + 1, agent, change))
+        .collect::<Vec<_>>();
         let view = fold(&records);
         assert_eq!(view.scopes[&None].rules.len(), 1);
         assert_eq!(view.scopes[&None].yolo, Some(false));
@@ -787,8 +770,7 @@ mod tests {
             serde_json::to_value(&view.scopes[&Some(root)].deliveries[&(child, turn)]).unwrap(),
             json!({"op":terminal})
         );
-        assert_eq!(view.compactions[&root], (7, 2));
-        assert!(view.boundaries.contains_key(&4));
+        assert_eq!(view.compactions[&root], (5, 2));
     }
 
     #[test_case(None ; "deletion")]

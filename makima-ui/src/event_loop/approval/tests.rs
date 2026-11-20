@@ -652,8 +652,7 @@ fn managed_child_approval(
                 .iter()
                 .any(|chat| chat.agent_id == Some(child_id))
         });
-        let committed_messages = child.committed_message_count();
-        assert!(committed_messages > 0);
+        assert!(child.committed_message_count() > 0);
         let child_chat = event_loop.sessions[index]
             .app
             .chats
@@ -694,7 +693,13 @@ fn managed_child_approval(
                 .find(|post| post.chat.as_deref() == Some(child_key.as_str()))
                 .unwrap()
                 .after_message,
-            committed_messages,
+            event_loop.sessions[index]
+                .app
+                .state
+                .session
+                .chat_message_ids(Some(&child_key))
+                .last()
+                .copied(),
         );
         let child_events = child.subscribe_events();
         release.send(()).unwrap();
@@ -1784,7 +1789,6 @@ fn clear_context_links_new_runtime_and_preserves_planning_session() {
         assert_eq!(runtime.app.root_mode(), Mode::Build);
         let link = runtime.app.state.session.parent().unwrap().clone();
         assert_eq!(link.session, source);
-        assert_eq!(link.message_count, history.len());
         requests.recv_timeout(WAIT).unwrap();
         assert!(requests.is_empty());
         assert!(observed(event_loop, &host, index, RESET_COMMAND).is_empty());
@@ -1806,7 +1810,7 @@ fn clear_context_links_new_runtime_and_preserves_planning_session() {
         assert_eq!(plans[&root].path, path);
         assert_eq!(plans[&root].approved.as_ref().unwrap().content, PLAN);
         assert_eq!(plans[&root].staged_model, Some(implementation_selection()));
-        assert_eq!(view.boundaries[&link.seq].offset, link.message_count);
+        assert_eq!(link.message, parent.last_message_id());
     });
 }
 
@@ -2334,6 +2338,7 @@ fn save_failure_retains_committed_selection(fresh: bool) {
             deleted.send(result).unwrap();
         });
         deletion.recv_timeout(WAIT).unwrap().unwrap();
+        makima_agent::session_writer::forget(log.parent().unwrap(), id).unwrap();
         fs::create_dir(&log).unwrap();
         let (manager, _) = event_loop.sessions[index].handles.manager_and_root();
         event_loop

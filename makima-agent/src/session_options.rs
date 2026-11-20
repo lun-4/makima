@@ -221,6 +221,10 @@ pub(crate) struct SessionOptionsReservation {
 
 impl SessionOptionsReservation {
     pub(crate) fn commit(self, candidate: SessionOptionsCandidate) -> SessionOptionsSnapshot {
+        self.install(candidate)
+    }
+
+    pub(crate) fn install(&self, candidate: SessionOptionsCandidate) -> SessionOptionsSnapshot {
         let mut state = lock(&self.options.state);
         assert_eq!(candidate.base_version, self.base_version);
         state.committed = candidate.state;

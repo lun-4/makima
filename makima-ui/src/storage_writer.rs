@@ -20,7 +20,7 @@ use makima_storage::checkpoint::{
 use makima_storage::id::MakimaId;
 use makima_storage::session_lock::SessionPublicationGuard;
 use makima_storage::sessions::{
-    HistoryDestination, HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError, SessionLog,
+    HistoryDestination, HistoryIdentity, HistorySnapshot, SESSIONS_DIR, SessionError,
     StoredSubagent,
 };
 use makima_storage::{StateDir, StorageError};
@@ -32,6 +32,7 @@ use makima_agent::session_coordinator::{
     SessionCheckpoint, SessionCheckpointKind, publication_claim,
 };
 use makima_agent::session_recovery::{RecoveredSession, RecoveryCandidate};
+use makima_agent::session_writer;
 use makima_agent::tools::offload::OffloadStore;
 
 use crate::AppSession;
@@ -159,7 +160,7 @@ pub(crate) struct RecoveryPublication {
     id: MakimaId,
     incarnation: Arc<()>,
     guard: SessionPublicationGuard,
-    previous: Arc<AppSession>,
+    staged: session_writer::StagedCheckpoint,
     recovered: Arc<AppSession>,
     journal: Arc<SessionJournal>,
     _lane: Option<RwLockReadGuardArc<()>>,
@@ -172,6 +173,32 @@ struct RecoveryRollback {
 
 impl RecoveryPublication {
     pub(crate) fn commit(self) -> Result<(), CheckpointError> {
+        let failure = |message: String| CheckpointError::Save {
+            session_id: self.id,
+            message: Arc::from(message),
+        };
+        let published = self
+            .staged
+            .publish(&self.guard, || {
+                let state = lock(&self.pending);
+                !state.closed
+                    && state
+                        .incarnations
+                        .get(&self.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &self.incarnation))
+                    && state
+                        .recovery_transactions
+                        .get(&self.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &self.incarnation))
+            })
+            .map_err(|error| failure(error.to_string()))?;
+        if !published {
+            self.guard
+                .publish(|| ())
+                .map_err(|error| failure(error.to_string()))?
+                .ok_or_else(|| failure(LOCK_LOST_REPLACEMENT_ERR.into()))?;
+            return Err(failure(CHECKPOINT_REPLACED.into()));
+        }
         let mut state = lock(&self.pending);
         if state.closed
             || !state
@@ -188,10 +215,6 @@ impl RecoveryPublication {
                 message: Arc::from(CHECKPOINT_REPLACED),
             });
         }
-        let failure = |message: String| CheckpointError::Save {
-            session_id: self.id,
-            message: Arc::from(message),
-        };
         self.guard
             .publish(|| {
                 install_recovered(
@@ -558,7 +581,6 @@ impl StorageWriter {
                 let mut writer = Writer {
                     dir,
                     warn_tx,
-                    logs: HashMap::new(),
                     failing: HashSet::new(),
                 };
                 let mut retry_at: Option<Instant> = None;
@@ -1680,94 +1702,20 @@ fn child_identity(child: &StoredSubagent) -> StoredSubagent {
 }
 
 fn preserve_child_identity(incoming: &mut Arc<AppSession>, latest: &AppSession) {
-    let mut subagents = incoming.subagents().to_vec();
-    let mut incoming_ids = HashSet::new();
-    let incoming_duplicates: HashSet<_> = subagents
-        .iter()
-        .filter_map(|child| {
-            (!incoming_ids.insert(&child.tool_use_id)).then_some(&child.tool_use_id)
-        })
-        .cloned()
-        .collect();
-    let mut latest_ids = HashSet::new();
-    let latest_duplicates: HashSet<_> = latest
-        .subagents()
-        .iter()
-        .filter_map(|child| (!latest_ids.insert(&child.tool_use_id)).then_some(&child.tool_use_id))
-        .cloned()
-        .collect();
-    let mut agent_keys: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for child in incoming.subagents().iter().chain(latest.subagents()) {
-        if let Some(agent_id) = child.agent_id.as_deref() {
-            agent_keys
-                .entry(agent_id)
-                .or_default()
-                .insert(&child.tool_use_id);
-        }
-    }
-    let colliding_keys: HashSet<_> = agent_keys
+    let missing: Vec<_> = latest
+        .agents()
         .values()
-        .filter(|keys| keys.len() > 1)
-        .flat_map(|keys| keys.iter().copied())
+        .filter(|agent| agent.parent.is_some() && !incoming.agents().contains_key(&agent.id))
+        .cloned()
         .collect();
-    for child in &mut subagents {
-        if incoming_duplicates.contains(&child.tool_use_id)
-            || latest_duplicates.contains(&child.tool_use_id)
-            || colliding_keys.contains(child.tool_use_id.as_str())
-            || (child.agent_id.is_some()
-                && latest.subagent_messages().contains_key(&child.tool_use_id)
-                && !latest_ids.contains(&child.tool_use_id))
-        {
-            child.ambiguous = true;
-            child.agent_id = None;
-        }
+    if missing.is_empty() {
+        return;
     }
-    for current in latest.subagents() {
-        if let Some(child) = subagents
-            .iter_mut()
-            .find(|child| child.tool_use_id == current.tool_use_id)
-        {
-            child.ambiguous |= current.ambiguous
-                || matches!((&child.agent_id, &current.agent_id), (Some(a), Some(b)) if a != b)
-                || (child.agent_id.is_none()
-                    && current.agent_id.is_some()
-                    && incoming
-                        .subagent_messages()
-                        .contains_key(&child.tool_use_id))
-                || (current.agent_id.is_none()
-                    && child.agent_id.is_some()
-                    && latest.subagent_messages().contains_key(&child.tool_use_id));
-            if child.ambiguous {
-                child.agent_id = None;
-            } else if child.agent_id.is_none() {
-                child.agent_id.clone_from(&current.agent_id);
-            }
-        } else if incoming
-            .subagent_messages()
-            .contains_key(&current.tool_use_id)
-            || latest
-                .subagent_messages()
-                .contains_key(&current.tool_use_id)
-            || current.ambiguous
-            || latest_duplicates.contains(&current.tool_use_id)
-            || colliding_keys.contains(current.tool_use_id.as_str())
-        {
-            let mut child = child_identity(current);
-            if (child.agent_id.is_some()
-                && incoming
-                    .subagent_messages()
-                    .contains_key(&current.tool_use_id))
-                || latest_duplicates.contains(&child.tool_use_id)
-                || colliding_keys.contains(child.tool_use_id.as_str())
-            {
-                child.ambiguous = true;
-                child.agent_id = None;
-            }
-            subagents.push(child);
-        }
-    }
-    if subagents != incoming.subagents() {
-        Arc::make_mut(incoming).set_subagents(subagents);
+    let incoming = Arc::make_mut(incoming);
+    for mut agent in missing {
+        let seq = incoming.next_state_seq();
+        agent.updated_seq = seq;
+        incoming.push_agent_revision(seq, agent);
     }
 }
 
@@ -1829,18 +1777,13 @@ fn same_plan_metadata(left: &AppSession, right: &AppSession) -> bool {
 }
 
 fn prune_main_history(session: &mut AppSession, live_ids: Option<&[String]>) {
-    let preserved;
-    let live_ids = match live_ids {
-        Some(ids) => ids,
-        None => {
-            preserved = session
-                .subagent_messages()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            &preserved
-        }
-    };
+    let preserved: Vec<_> = session
+        .subagent_messages()
+        .keys()
+        .cloned()
+        .chain(live_ids.into_iter().flatten().cloned())
+        .collect();
+    let live_ids = &preserved;
     session.prune_orphans_preserving(
         |message| {
             message
@@ -1928,8 +1871,6 @@ fn fail_waiters(id: MakimaId, waiters: Vec<CheckpointWaiter>, message: &str) {
 struct Writer {
     dir: StateDir,
     warn_tx: flume::Sender<String>,
-    /// Only cursors that still describe their file.
-    logs: HashMap<MakimaId, SessionLog>,
     /// Sessions whose last write failed, so a sick disk warns once instead of
     /// once per frame.
     failing: HashSet<MakimaId>,
@@ -1937,7 +1878,6 @@ struct Writer {
 
 impl Writer {
     fn forget(&mut self, id: MakimaId) {
-        self.logs.remove(&id);
         self.failing.remove(&id);
     }
 
@@ -2123,11 +2063,31 @@ impl Writer {
                         state.publication_guards.get(&id).cloned()
                     };
                     let result = match guard {
-                        Some(guard) => guard
-                            .publish(|| self.write(&save.session))
-                            .map_err(StorageError::from)
+                        Some(guard) => self
+                            .dir
+                            .ensure_subdir(SESSIONS_DIR)
                             .map_err(SessionError::from)
-                            .and_then(|result| result.unwrap_or(Err(SessionError::OpenElsewhere))),
+                            .and_then(|directory| {
+                                session_writer::stage_checkpoint(&directory, &save.session)
+                            })
+                            .and_then(|staged| {
+                                staged.publish(&guard, || {
+                                    let state = lock(pending);
+                                    !state.closed
+                                        && !state
+                                            .generation_floors
+                                            .get(&id)
+                                            .is_some_and(|floor| save.generation < *floor)
+                                        && journal_current(&state, id, save.journal.as_ref())
+                                        && !matches!(
+                                            state.entries.get(&id),
+                                            Some(Entry::Delete(_, _, _))
+                                        )
+                                })
+                            })
+                            .and_then(|published| {
+                                published.then_some(()).ok_or(SessionError::OpenElsewhere)
+                            }),
                         None => self.write(&save.session),
                     };
                     drop(_barrier);
@@ -2197,6 +2157,15 @@ impl Writer {
                 }
                 Entry::Delete(done, guard, store) => {
                     self.forget(id);
+                    let closed = self
+                        .dir
+                        .ensure_subdir(SESSIONS_DIR)
+                        .map_err(SessionError::from)
+                        .and_then(|directory| session_writer::forget(&directory, id));
+                    if let Err(error) = closed {
+                        done(Err(error));
+                        continue;
+                    }
                     let result = match guard {
                         Some(guard) => guard
                             .publish(|| {
@@ -2312,33 +2281,11 @@ impl Writer {
         } else {
             None
         };
-        let previous = if save.transactional {
-            let state = lock(pending);
-            let mut previous = state
-                .acknowledged
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| failure(SNAPSHOT_UNAVAILABLE.into()))?;
-            let snapshot = old_journal
-                .as_ref()
-                .unwrap()
-                .journal
-                .checkpoint_snapshot()
-                .map_err(failure)?;
-            let captured = JournalCheckpoint {
-                snapshot: Arc::new(snapshot),
-                ..old_journal.as_ref().unwrap().clone()
-            };
-            project_journal(&state, id, Some(&captured), &mut previous).map_err(failure)?;
-            Some(previous)
-        } else {
-            None
-        };
         let directory = self
             .dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| failure(error.to_string()))?;
-        let staged = SessionLog::stage_checkpoint(&directory, save.candidate.session())
+        let staged = session_writer::stage_checkpoint(&directory, save.candidate.session())
             .map_err(|error| failure(error.to_string()))?;
         #[cfg(test)]
         {
@@ -2348,29 +2295,35 @@ impl Writer {
                 let _ = release.recv();
             }
         }
-        let mut state = lock(pending);
-        if state.closed {
-            return Err(CheckpointError::Closed(id));
-        }
-        let published = staged
-            .publish(&save.guard, || {
-                state
+        let claim = |state: &PendingState| {
+            !state.closed
+                && state
                     .incarnations
                     .get(&id)
                     .is_some_and(|current| Arc::ptr_eq(current, &save.incarnation))
-                    && !state.recovery_transactions.contains_key(&id)
-                    && state.latest_generations.get(&id).copied() == save.generation
-                    && !matches!(state.entries.get(&id), Some(Entry::Delete(_, _, _)))
-            })
-            .map_err(|error| failure(error.to_string()))?;
-        if !published {
+                && !state.recovery_transactions.contains_key(&id)
+                && state.latest_generations.get(&id).copied() == save.generation
+                && !matches!(state.entries.get(&id), Some(Entry::Delete(_, _, _)))
+        };
+        let staged = if save.transactional {
+            Some(staged)
+        } else {
+            let published = staged
+                .publish(&save.guard, || claim(&lock(pending)))
+                .map_err(|error| failure(error.to_string()))?;
+            if !published {
+                return Err(failure(CHECKPOINT_REPLACED.into()));
+            }
+            None
+        };
+        let mut state = lock(pending);
+        if save.transactional && !claim(&state) {
             return Err(failure(CHECKPOINT_REPLACED.into()));
         }
         let recovered = save.candidate.finalize_after_publication();
         let journal = recovered.journal();
         let session = Arc::new(recovered.session().clone());
-        self.logs.remove(&id);
-        let publication = if let Some(previous) = previous {
+        let publication = if let Some(staged) = staged {
             state
                 .recovery_transactions
                 .insert(id, Arc::clone(&save.incarnation));
@@ -2380,7 +2333,7 @@ impl Writer {
                 id,
                 incarnation: save.incarnation,
                 guard: save.guard,
-                previous,
+                staged,
                 recovered: session,
                 journal,
                 _lane: lane,
@@ -2404,34 +2357,29 @@ impl Writer {
             session_id: id,
             message: Arc::from(message),
         };
-        let directory = self
-            .dir
-            .ensure_subdir(SESSIONS_DIR)
-            .map_err(|error| failure(error.to_string()))?;
-        let staged = SessionLog::stage_checkpoint(&directory, publication.previous.as_ref())
-            .map_err(|error| failure(error.to_string()))?;
-        let mut state = lock(&publication.pending);
-        let published = staged
-            .publish(&publication.guard, || {
-                !state.closed
-                    && state
+        let released = publication
+            .guard
+            .publish(|| {
+                let mut state = lock(&publication.pending);
+                if state.closed
+                    || !state
                         .incarnations
                         .get(&id)
                         .is_some_and(|current| Arc::ptr_eq(current, &publication.incarnation))
-                    && state
+                    || !state
                         .recovery_transactions
                         .get(&id)
                         .is_some_and(|current| Arc::ptr_eq(current, &publication.incarnation))
+                {
+                    return false;
+                }
+                state.recovery_transactions.remove(&id);
+                true
             })
             .map_err(|error| failure(error.to_string()))?;
-        if !published {
+        if released != Some(true) {
             return Err(failure(CHECKPOINT_REPLACED.into()));
         }
-        self.logs.remove(&id);
-        state
-            .acknowledged
-            .insert(id, Arc::clone(&publication.previous));
-        state.recovery_transactions.remove(&id);
         Ok(())
     }
 
@@ -2506,7 +2454,7 @@ impl Writer {
             .dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| error.to_string())?;
-        let staged = SessionLog::stage_checkpoint(&directory, candidate.as_ref())
+        let staged = session_writer::stage_checkpoint(&directory, candidate.as_ref())
             .map_err(|error| error.to_string())?;
         #[cfg(test)]
         {
@@ -2519,7 +2467,7 @@ impl Writer {
         if let Some(error) = save.journal.as_ref().and_then(journal_persistence_error) {
             return Err(error);
         }
-        let mut state = lock(pending);
+        let state = lock(pending);
         let live_ids = state.live_children.get(&id).map(Vec::as_slice);
         let prepare_promotion = |session: &Arc<AppSession>| -> Result<Arc<AppSession>, String> {
             let mut promoted = Arc::clone(session);
@@ -2538,9 +2486,11 @@ impl Writer {
             Some(Entry::Save(queued)) => Some(prepare_promotion(&queued.session)?),
             _ => None,
         };
+        drop(state);
         let mut claim_error = None;
         let published = staged
             .publish(&request.guard, || {
+                let state = lock(pending);
                 if state.closed
                     || !journal_current(&state, id, save.journal.as_ref())
                     || !state
@@ -2587,7 +2537,7 @@ impl Writer {
                 claim_error.map_or_else(|| CHECKPOINT_CANCELLED.into(), |error| error.to_string())
             );
         }
-        self.logs.remove(&id);
+        let mut state = lock(pending);
         if !state
             .incarnations
             .get(&id)
@@ -2663,24 +2613,7 @@ impl Writer {
 
     fn write(&mut self, session: &AppSession) -> Result<(), SessionError> {
         let sessions_dir = self.dir.ensure_subdir(SESSIONS_DIR)?;
-        if let Some(mut log) = self.logs.remove(&session.id) {
-            // A failed `append` rolls the file back to the last record boundary,
-            // so the cursor still fits and is worth keeping: rebuilding it costs
-            // a second full write, the last thing a failing disk needs.
-            // Divergence is the one answer a cursor cannot survive.
-            let appended = log.append(session);
-            if !matches!(appended, Err(SessionError::LogDiverged { .. })) {
-                self.logs.insert(session.id, log);
-                return appended;
-            }
-        }
-        // No usable cursor, whether because this thread never wrote the file
-        // or because the log diverged, so the file starts over. Reading the
-        // old file back gains nothing: a cursor recovered from disk describes
-        // the session that was stored, never the live one.
-        self.logs
-            .insert(session.id, SessionLog::rewrite(&sessions_dir, session)?);
-        Ok(())
+        session_writer::checkpoint(&sessions_dir, session)
     }
 
     fn report_save(&mut self, pending: &Pending, save: &PendingSave, result: Result<(), &str>) {
@@ -2731,8 +2664,8 @@ mod tests {
         StreamResponse,
     };
     use makima_providers::{Effort, Message};
-    use makima_storage::id::AgentId;
     use makima_storage::id::SessionRef;
+    use makima_storage::id::{AgentId, MakimaId};
     use makima_storage::session_lock;
     use makima_storage::session_state::{
         StateChange, StateFoldError, StoredAgentConfig, StoredStateRecord,
@@ -2927,7 +2860,7 @@ mod tests {
             replacement.set_title(TITLE.into());
             new_owner
                 .publication_guard()
-                .publish(|| SessionLog::rewrite(&directory, &replacement))
+                .publish(|| session_writer::checkpoint(&directory, &replacement))
                 .unwrap()
                 .unwrap()
                 .unwrap();
@@ -3262,11 +3195,8 @@ mod tests {
                 .cloned()
         };
         let child = stored_child(TOOL_ID).unwrap();
-        assert_eq!(child.model.as_deref(), (!pending_metadata).then_some(MODEL));
-        assert_eq!(
-            child.thinking,
-            (!pending_metadata).then_some(StoredThinking::Adaptive)
-        );
+        assert_eq!(child.model.as_deref(), Some(MODEL));
+        assert_eq!(child.thinking, Some(StoredThinking::Adaptive));
         assert!(!child.fast);
         assert_eq!(stored_child(SIBLING_AGENT_ID), Some(sibling));
         assert_eq!(stored_child(ORPHAN_CHILD), None);
@@ -3358,11 +3288,11 @@ mod tests {
 
     #[test_case(false; "no_incoming_history")]
     #[test_case(true; "unidentified_incoming_history")]
-    fn missing_child_metadata_is_ambiguous_only_with_incoming_history(has_history: bool) {
+    fn missing_child_metadata_preserves_canonical_agents(has_history: bool) {
         let mut latest = AppSession::new(MODEL, CWD);
         latest.set_subagents(vec![StoredSubagent {
             tool_use_id: TOOL_ID.into(),
-            agent_id: Some(SIBLING_AGENT_ID.into()),
+            agent_id: Some(AgentId::generate().to_string()),
             ambiguous: false,
             name: TOOL_ID.into(),
             model: None,
@@ -3374,12 +3304,16 @@ mod tests {
             incoming.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         }
         let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
-        if has_history {
-            assert!(merged.subagents()[0].ambiguous);
-            assert_eq!(merged.subagents()[0].agent_id, None);
-        } else {
-            assert!(merged.subagents().is_empty());
-        }
+        let latest_id = latest.subagents()[0].agent_id.as_ref().unwrap();
+        assert!(
+            merged
+                .subagents()
+                .iter()
+                .any(|child| child.agent_id.as_ref() == Some(latest_id))
+        );
+        assert_eq!(merged.subagents().len(), if has_history { 2 } else { 1 });
+        let merged_again = merge_tui_snapshot(&merged, &latest, false, None);
+        assert_eq!(merged_again.agents(), merged.agents());
     }
 
     #[test_case(false; "no_latest_history")]
@@ -3389,7 +3323,7 @@ mod tests {
         if has_history {
             latest.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         }
-        let mut incoming = AppSession::new(MODEL, CWD);
+        let mut incoming = latest.clone();
         incoming.set_subagents(vec![StoredSubagent {
             tool_use_id: TOOL_ID.into(),
             agent_id: Some(SIBLING_AGENT_ID.into()),
@@ -3401,28 +3335,27 @@ mod tests {
         }]);
         let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
         let child = &merged.subagents()[0];
-        assert_eq!(child.ambiguous, has_history);
-        assert_eq!(
-            child.agent_id.as_deref(),
-            (!has_history).then_some(SIBLING_AGENT_ID)
-        );
+        assert!(!child.ambiguous);
+        if has_history {
+            assert_eq!(child.agent_id, latest.subagents()[0].agent_id);
+        }
         if has_history {
             assert_eq!(
                 merged.subagent_messages()[TOOL_ID][0].user_text(),
                 Some(BASE_MSG)
             );
             let merged_again = merge_tui_snapshot(&merged, &latest, false, None);
-            assert!(merged_again.subagents()[0].ambiguous);
-            assert!(merged_again.subagents()[0].agent_id.is_none());
+            assert_eq!(merged_again.subagents()[0].agent_id, child.agent_id);
         }
     }
 
     #[test]
-    fn legacy_child_without_history_adopts_known_identity() {
+    fn legacy_child_without_history_does_not_replace_canonical_identity() {
         let mut latest = AppSession::new(MODEL, CWD);
+        let agent_id = AgentId::generate().to_string();
         let mut child = StoredSubagent {
             tool_use_id: TOOL_ID.into(),
-            agent_id: Some(SIBLING_AGENT_ID.into()),
+            agent_id: Some(agent_id.clone()),
             ambiguous: false,
             name: TOOL_ID.into(),
             model: None,
@@ -3434,19 +3367,29 @@ mod tests {
         child.agent_id = None;
         let mut incoming = AppSession::new(MODEL, CWD);
         incoming.set_subagents(vec![child]);
+        let incoming_id = incoming.subagents()[0].agent_id.clone();
         let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
-        assert!(!merged.subagents()[0].ambiguous);
-        assert_eq!(
-            merged.subagents()[0].agent_id.as_deref(),
-            Some(SIBLING_AGENT_ID)
+        assert_eq!(merged.subagents().len(), 2);
+        assert!(
+            merged
+                .subagents()
+                .iter()
+                .any(|child| child.agent_id.as_deref() == Some(agent_id.as_str()))
+        );
+        assert!(
+            merged
+                .subagents()
+                .iter()
+                .any(|child| child.agent_id == incoming_id)
         );
     }
 
     #[test]
-    fn agent_id_collision_across_snapshots_is_sticky() {
+    fn agent_id_collision_does_not_rewrite_canonical_transcript_key() {
+        let agent_id = AgentId::generate().to_string();
         let child = StoredSubagent {
             tool_use_id: TOOL_ID.into(),
-            agent_id: Some(SIBLING_AGENT_ID.into()),
+            agent_id: Some(agent_id),
             ambiguous: false,
             name: TOOL_ID.into(),
             model: None,
@@ -3459,21 +3402,24 @@ mod tests {
         let mut other = child;
         other.tool_use_id = LIVE_CHILD.into();
         incoming.set_subagents(vec![other]);
+        let incoming_id = incoming.subagents()[0].agent_id.clone();
         let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
         assert_eq!(merged.subagents().len(), 2);
-        assert!(
-            merged
-                .subagents()
-                .iter()
-                .all(|child| child.ambiguous && child.agent_id.is_none())
-        );
+        let selected = merged
+            .subagents()
+            .iter()
+            .find(|child| child.tool_use_id == LIVE_CHILD)
+            .unwrap();
+        assert_eq!(selected.agent_id, incoming_id);
+        let preserved = merged
+            .subagents()
+            .iter()
+            .find(|child| child.tool_use_id == TOOL_ID)
+            .unwrap();
+        assert!(preserved.agent_id.is_some());
+        assert_ne!(preserved.agent_id, incoming_id);
         let merged_again = merge_tui_snapshot(&merged, &latest, false, None);
-        assert!(
-            merged_again
-                .subagents()
-                .iter()
-                .all(|child| child.ambiguous && child.agent_id.is_none())
-        );
+        assert_eq!(merged_again.agents(), merged.agents());
     }
 
     #[test]
@@ -3481,7 +3427,7 @@ mod tests {
         let mut latest = AppSession::new(MODEL, CWD);
         let child = StoredSubagent {
             tool_use_id: TOOL_ID.into(),
-            agent_id: Some("first".into()),
+            agent_id: Some(AgentId::generate().to_string()),
             ambiguous: false,
             name: TOOL_ID.into(),
             model: None,
@@ -3489,17 +3435,30 @@ mod tests {
             fast: false,
         };
         latest.set_subagents(vec![child.clone()]);
-        let mut incoming = latest.clone();
+        let mut incoming = AppSession::new(MODEL, CWD);
         let mut other = child;
-        other.agent_id = Some("second".into());
+        other.agent_id = Some(AgentId::generate().to_string());
         incoming.set_subagents(vec![other]);
+        let incoming_id = incoming.subagents()[0].agent_id.clone();
+        let latest_id = latest.subagents()[0].agent_id.clone();
         let mut incoming = Arc::new(incoming);
         preserve_child_identity(&mut incoming, &latest);
-        assert!(incoming.subagents()[0].ambiguous);
-        assert_eq!(incoming.subagents()[0].agent_id, None);
+        assert_eq!(incoming.subagents().len(), 2);
+        assert!(
+            incoming
+                .subagents()
+                .iter()
+                .any(|child| child.agent_id == incoming_id)
+        );
+        assert!(
+            incoming
+                .subagents()
+                .iter()
+                .any(|child| child.agent_id == latest_id)
+        );
+        let agents = incoming.agents().clone();
         preserve_child_identity(&mut incoming, &latest);
-        assert!(incoming.subagents()[0].ambiguous);
-        assert_eq!(incoming.subagents()[0].agent_id, None);
+        assert_eq!(incoming.agents(), &agents);
     }
 
     #[test]
@@ -4013,12 +3972,13 @@ mod tests {
     }
 
     #[test]
-    fn child_identity_merge_does_not_copy_legacy_config() {
+    fn child_identity_merge_preserves_canonical_config() {
         let mut latest = AppSession::new(NEXT_MODEL, NEXT_CWD);
+        let agent_id = AgentId::generate().to_string();
         latest.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         latest.set_subagents(vec![StoredSubagent {
             tool_use_id: TOOL_ID.into(),
-            agent_id: Some(SIBLING_AGENT_ID.into()),
+            agent_id: Some(agent_id.clone()),
             ambiguous: false,
             name: TOOL_ID.into(),
             model: Some(NEXT_MODEL.into()),
@@ -4034,11 +3994,11 @@ mod tests {
         }]);
         let merged = merge_tui_snapshot(&Arc::new(incoming), &latest, false, None);
         let child = &merged.subagents()[0];
-        assert_eq!(child.agent_id.as_deref(), Some(SIBLING_AGENT_ID));
+        assert_eq!(child.agent_id, latest.subagents()[0].agent_id);
         assert!(!child.ambiguous);
-        assert_eq!(child.model.as_deref(), Some(MODEL));
-        assert_eq!(child.thinking, Some(StoredThinking::Off));
-        assert!(!child.fast);
+        assert_eq!(child.model.as_deref(), Some(NEXT_MODEL));
+        assert_eq!(child.thinking, Some(StoredThinking::Adaptive));
+        assert!(child.fast);
     }
 
     #[test_case(false; "background")]
@@ -4442,6 +4402,11 @@ mod tests {
         replacement.adopt_history(&HistorySnapshot::new(vec![Message::user(
             REWOUND_MSG.into(),
         )]));
+        let path = dir
+            .ensure_subdir(SESSIONS_DIR)
+            .unwrap()
+            .join(format!("{id}.jsonl"));
+        let original_log = std::fs::read(&path).unwrap();
         let candidate = RecoveryCandidate::prepare(replacement).unwrap();
         let mut recovering =
             Box::pin(writer.recover_replacing(candidate, lease.publication_guard()));
@@ -4451,7 +4416,7 @@ mod tests {
         let (_, publication) = smol::block_on(recovering).unwrap();
         assert_eq!(
             message_texts(&AppSession::load(id, &dir).unwrap()),
-            [REWOUND_MSG]
+            [BASE_MSG]
         );
         assert!(Arc::ptr_eq(
             &lock(&writer.pending).journals[&id].journal,
@@ -4461,8 +4426,9 @@ mod tests {
         disk.flush(&writer.pending);
         assert_eq!(
             message_texts(&AppSession::load(id, &dir).unwrap()),
-            [REWOUND_MSG]
+            [BASE_MSG]
         );
+        assert_eq!(std::fs::read(&path).unwrap(), original_log);
         if rollback {
             if lose_guard {
                 lease.release().unwrap();
@@ -4474,6 +4440,7 @@ mod tests {
             disk.flush(&writer.pending);
             let result = smol::block_on(rolling_back);
             assert_eq!(result.is_err(), lose_guard);
+            assert_eq!(std::fs::read(&path).unwrap(), original_log);
             assert_eq!(
                 lock(&writer.pending)
                     .recovery_transactions
@@ -4495,6 +4462,7 @@ mod tests {
         } else if lose_guard {
             lease.release().unwrap();
             assert!(publication.commit().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original_log);
             assert!(
                 lock(&writer.pending)
                     .recovery_transactions
@@ -4506,7 +4474,7 @@ mod tests {
             ));
             assert_eq!(
                 message_texts(&AppSession::load(id, &dir).unwrap()),
-                [REWOUND_MSG]
+                [BASE_MSG]
             );
         } else {
             publication.commit().unwrap();
@@ -4701,7 +4669,7 @@ mod tests {
             expected.apply_to(&mut published).unwrap();
             let directory = dir.ensure_subdir(SESSIONS_DIR).unwrap();
             assert!(
-                SessionLog::stage_checkpoint(&directory, &published)
+                session_writer::stage_checkpoint(&directory, &published)
                     .unwrap()
                     .publish(&lease.publication_guard(), || true)
                     .unwrap()
@@ -5075,6 +5043,7 @@ mod tests {
         session.push_message(Message::user(BASE_MSG.into()));
         let id = session.id;
         let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
         let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
         journal_commit(&journal, root, false);
         let agent = if child {
@@ -5090,6 +5059,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
+            journal.snapshot().apply_to(&mut session).unwrap();
             session.set_subagents(vec![StoredSubagent {
                 tool_use_id: TOOL_ID.into(),
                 agent_id: Some(agent.to_string()),
@@ -5104,6 +5074,7 @@ mod tests {
         } else {
             root
         };
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
         let snapshot = |session: &AppSession| {
             if child {
                 session.subagent_history_snapshot(TOOL_ID).unwrap()
@@ -5275,7 +5246,6 @@ mod tests {
             Writer {
                 dir: dir.clone(),
                 warn_tx,
-                logs: HashMap::new(),
                 failing: HashSet::new(),
             },
             warn_rx,
@@ -5444,7 +5414,6 @@ mod tests {
         let saved_path = dir.path().join(TITLE);
         std::fs::rename(&sessions_path, &saved_path).unwrap();
         block_sessions_dir(&dir);
-        disk.logs.clear();
         disk.flush(&writer.pending);
         assert!(disk.failing.contains(&id));
         assert!(lock(&writer.pending).entries.contains_key(&id));
@@ -5603,7 +5572,6 @@ mod tests {
         let saved_path = dir.path().join(TITLE);
         std::fs::rename(&sessions_path, &saved_path).unwrap();
         block_sessions_dir(&dir);
-        disk.logs.clear();
         if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
             save.retry_attempt = CHECKPOINT_RETRY_BACKOFFS.len();
         }
@@ -5858,7 +5826,7 @@ mod tests {
         });
     }
 
-    fn stored_post(chat: Option<&str>, after_message: usize) -> StoredPost {
+    fn stored_post(chat: Option<&str>, after_message: Option<MakimaId>) -> StoredPost {
         StoredPost {
             chat: chat.map(str::to_owned),
             after_message,
@@ -5896,9 +5864,11 @@ mod tests {
     fn sending_compacted_history_keeps_child_state() {
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
+        session.push_message(Message::user(BASE_MSG.into()));
         session.set_subagent_messages(ORPHAN_CHILD.into(), vec![Message::user(BASE_MSG.into())]);
-        session.push_post(stored_post(None, 2));
-        session.push_post(stored_post(Some(ORPHAN_CHILD), 2));
+        session.push_post(stored_post(None, session.last_message_id()));
+        let child_anchor = session.chat_message_ids(Some(ORPHAN_CHILD))[0];
+        session.push_post(stored_post(Some(ORPHAN_CHILD), Some(child_anchor)));
         writer.seed(Arc::new(session.clone()));
         let mut history = HistorySnapshot::new(vec![Message::user(COORDINATOR_MSG.into())]);
         history.compacted = true;
@@ -5911,7 +5881,7 @@ mod tests {
     }
 
     #[test]
-    fn main_checkpoint_prunes_posts_and_orphans_before_acknowledgement() {
+    fn main_checkpoint_retains_post_anchors_and_agent_transcripts_before_acknowledgement() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
             let (writer, _warn_rx) = writer(&dir);
@@ -5920,8 +5890,16 @@ mod tests {
             for child in [LIVE_CHILD, ORPHAN_CHILD] {
                 session.set_subagent_messages(child.into(), vec![Message::user(BASE_MSG.into())]);
             }
-            session.push_post(stored_post(None, 1));
-            session.push_post(stored_post(None, 2));
+            let first_anchor = session.last_message_id().unwrap();
+            session.push_message(Message::user(RESUMED_MSG.into()));
+            let second_anchor = session.last_message_id().unwrap();
+            let expected_posts = [
+                stored_post(None, Some(first_anchor)),
+                stored_post(None, Some(second_anchor)),
+            ];
+            for post in &expected_posts {
+                session.push_post(post.clone());
+            }
             let id = session.id;
             writer.send(Arc::new(session));
             writer.set_live_children(id, vec![LIVE_CHILD.into()]);
@@ -5950,12 +5928,16 @@ mod tests {
                 .await
                 .unwrap();
             let loaded = AppSession::load(id, &dir).unwrap();
-            assert_eq!(loaded.posts(), [stored_post(None, 1)]);
+            assert_eq!(loaded.posts(), expected_posts);
+            let active_ids = loaded.chat_message_ids(None);
+            assert_eq!(active_ids.len(), 1);
+            assert!(!active_ids.contains(&first_anchor));
+            assert!(!active_ids.contains(&second_anchor));
             assert!(loaded.subagent_messages().contains_key(LIVE_CHILD));
-            assert!(!loaded.subagent_messages().contains_key(ORPHAN_CHILD));
+            assert!(loaded.subagent_messages().contains_key(ORPHAN_CHILD));
             let latest = writer.latest_snapshot(id).unwrap();
             assert_eq!(latest.posts(), loaded.posts());
-            assert!(!latest.subagent_messages().contains_key(ORPHAN_CHILD));
+            assert!(latest.subagent_messages().contains_key(ORPHAN_CHILD));
             writer.shutdown(DRAIN_TIMEOUT);
         });
     }
@@ -5967,15 +5949,29 @@ mod tests {
             let (writer, _warn_rx) = writer(&dir);
             let mut session = AppSession::new(MODEL, CWD);
             session.push_message(Message::user(BASE_MSG.into()));
-            session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
             session.set_subagent_messages(
                 SIBLING_AGENT_ID.into(),
                 vec![Message::user(BASE_MSG.into())],
             );
-            session.push_post(stored_post(None, 2));
-            session.push_post(stored_post(Some(TOOL_ID), 1));
-            session.push_post(stored_post(Some(TOOL_ID), 2));
-            session.push_post(stored_post(Some(SIBLING_AGENT_ID), 2));
+            session.set_subagent_messages(
+                TOOL_ID.into(),
+                vec![
+                    Message::user(BASE_MSG.into()),
+                    Message::user(RESUMED_MSG.into()),
+                ],
+            );
+            let root_anchor = session.last_message_id().unwrap();
+            let child_anchors = session.chat_message_ids(Some(TOOL_ID));
+            let sibling_anchor = session.chat_message_ids(Some(SIBLING_AGENT_ID))[0];
+            let expected_posts = [
+                stored_post(None, Some(root_anchor)),
+                stored_post(Some(TOOL_ID), Some(child_anchors[0])),
+                stored_post(Some(TOOL_ID), Some(child_anchors[1])),
+                stored_post(Some(SIBLING_AGENT_ID), Some(sibling_anchor)),
+            ];
+            for post in &expected_posts {
+                session.push_post(post.clone());
+            }
             let id = session.id;
             writer.send(Arc::new(session.clone()));
             let lease = session_lock::claim(&dir.ensure_subdir(SESSIONS_DIR).unwrap(), &id)
@@ -6002,12 +5998,20 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let expected_posts = [
-                stored_post(None, 2),
-                stored_post(Some(TOOL_ID), 1),
-                stored_post(Some(SIBLING_AGENT_ID), 2),
-            ];
-            assert_eq!(AppSession::load(id, &dir).unwrap().posts(), expected_posts);
+            let acknowledged = AppSession::load(id, &dir).unwrap();
+            assert_eq!(acknowledged.posts(), expected_posts);
+            assert_eq!(acknowledged.last_message_id(), Some(root_anchor));
+            assert_eq!(
+                acknowledged.chat_message_ids(Some(SIBLING_AGENT_ID)),
+                [sibling_anchor]
+            );
+            let active_child_ids = acknowledged.chat_message_ids(Some(TOOL_ID));
+            assert_eq!(active_child_ids.len(), 1);
+            assert!(
+                child_anchors
+                    .iter()
+                    .all(|id| !active_child_ids.contains(id))
+            );
             assert_eq!(writer.latest_snapshot(id).unwrap().posts(), expected_posts);
             session.set_title(TITLE.into());
             session.set_subagent_messages(
@@ -6067,7 +6071,6 @@ mod tests {
         let saved_path = dir.path().join(TITLE);
         std::fs::rename(&sessions_path, &saved_path).unwrap();
         block_sessions_dir(&dir);
-        disk.logs.clear();
         disk.flush(&writer.pending);
         assert!(disk.failing.contains(&id));
         std::fs::remove_file(&sessions_path).unwrap();
@@ -6214,8 +6217,15 @@ mod tests {
                 SIBLING_AGENT_ID.into(),
                 vec![Message::user(BASE_MSG.into())],
             );
-            session.push_post(stored_post(Some(TOOL_ID), 2));
-            session.push_post(stored_post(None, 2));
+            let child_anchor = session.chat_message_ids(Some(TOOL_ID))[0];
+            let root_anchor = session.last_message_id().unwrap();
+            let expected_posts = [
+                stored_post(Some(TOOL_ID), Some(child_anchor)),
+                stored_post(None, Some(root_anchor)),
+            ];
+            for post in &expected_posts {
+                session.push_post(post.clone());
+            }
             let id = session.id;
             writer.set_live_children(id, vec![TOOL_ID.into(), SIBLING_AGENT_ID.into()]);
             writer.send(Arc::new(session.clone()));
@@ -6306,7 +6316,17 @@ mod tests {
                     .map_or(0, |messages| messages.len()),
                 usize::from(!child || cancelled)
             );
-            assert_eq!(loaded.posts().len(), 1 + usize::from(cancelled));
+            assert_eq!(loaded.posts(), expected_posts);
+            assert_eq!(
+                loaded.chat_message_ids(None).contains(&root_anchor),
+                child || cancelled
+            );
+            assert_eq!(
+                loaded
+                    .chat_message_ids(Some(TOOL_ID))
+                    .contains(&child_anchor),
+                !child || cancelled
+            );
             assert_eq!(
                 serde_json::to_value(&loaded.subagent_messages()[SIBLING_AGENT_ID]).unwrap(),
                 serde_json::to_value(vec![Message::user(RESUMED_MSG.into())]).unwrap()
@@ -6836,8 +6856,8 @@ mod tests {
 
         let blocked = AppSession::new(MODEL, CWD);
         let blocked_id = blocked.id;
-        let blocked_tmp = sessions_dir.join(format!("{blocked_id}.jsonl.tmp"));
-        std::fs::create_dir(&blocked_tmp).unwrap();
+        let blocked_path = sessions_dir.join(format!("{blocked_id}.jsonl"));
+        std::fs::create_dir(&blocked_path).unwrap();
         let blocked_ack = writer.checkpoint(CheckpointRequest {
             session_id: blocked_id,
             version: CheckpointVersion {
@@ -6876,7 +6896,7 @@ mod tests {
         );
         assert_eq!(next_wake, Some(blocked_retry_at));
 
-        std::fs::remove_dir(blocked_tmp).unwrap();
+        std::fs::remove_dir(blocked_path).unwrap();
         if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&blocked_id) {
             save.retry_at = None;
         }

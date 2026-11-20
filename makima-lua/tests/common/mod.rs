@@ -136,14 +136,8 @@ const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
 pub fn normalized_history_epoch_state(state: &[StoredStateRecord]) -> Vec<StoredStateRecord> {
     let mut epochs = BTreeSet::new();
     for record in state {
-        match &record.change {
-            StateChange::Boundary { lens, .. } => {
-                epochs.extend(lens.values().map(|(epoch, _)| *epoch));
-            }
-            StateChange::Compaction { epoch } => {
-                epochs.insert(*epoch);
-            }
-            _ => {}
+        if let StateChange::Compaction { epoch } = &record.change {
+            epochs.insert(*epoch);
         }
     }
     let epochs: BTreeMap<_, _> = epochs
@@ -153,14 +147,8 @@ pub fn normalized_history_epoch_state(state: &[StoredStateRecord]) -> Vec<Stored
         .collect();
     let mut state = state.to_vec();
     for record in &mut state {
-        match &mut record.change {
-            StateChange::Boundary { lens, .. } => {
-                for (epoch, _) in lens.values_mut() {
-                    *epoch = epochs[epoch];
-                }
-            }
-            StateChange::Compaction { epoch } => *epoch = epochs[epoch],
-            _ => {}
+        if let StateChange::Compaction { epoch } = &mut record.change {
+            *epoch = epochs[epoch];
         }
     }
     state

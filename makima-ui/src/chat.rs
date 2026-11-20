@@ -19,6 +19,7 @@ use makima_agent::{
 use makima_config::{ToolKey, ToolOutputLines, UiConfig};
 use makima_lua::WinView;
 use makima_providers::{ContentBlock, ImageSource, Message, ObservationSource, Role};
+use makima_storage::id::MakimaId;
 use makima_storage::sessions::StoredPost;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -594,7 +595,7 @@ pub fn history_to_display(
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
-    history_to_display_with_target(messages, tool_outputs, tool_output_lines, posts, None)
+    history_to_display_with_target(messages, tool_outputs, tool_output_lines, posts, None, &[])
 }
 
 pub(crate) fn history_to_display_with_target(
@@ -603,12 +604,13 @@ pub(crate) fn history_to_display_with_target(
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
     state_target: Option<AgentRef>,
+    message_ids: &[MakimaId],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<makima_lua::RestoreItem> = Vec::new();
     for (boundary, msg) in messages.iter().enumerate() {
-        push_posts_at(&mut display, posts, boundary, messages.len());
+        push_posts_at(&mut display, posts, boundary, message_ids);
         if msg.is_observation() {
             if let Some(notice) = child_result_notice(msg) {
                 display.push(notice);
@@ -740,7 +742,7 @@ pub(crate) fn history_to_display_with_target(
             }
         }
     }
-    push_posts_at(&mut display, posts, messages.len(), messages.len());
+    push_posts_at(&mut display, posts, messages.len(), message_ids);
     (display, restore_items)
 }
 
@@ -813,17 +815,25 @@ pub(crate) fn format_child_result_notice(
     notice
 }
 
-/// Posts past the end, as after a compaction shortened the history, land last.
+/// Posts whose anchor is outside the active context are not displayed.
 fn push_posts_at(
     display: &mut Vec<DisplayMessage>,
     posts: &[&StoredPost],
     boundary: usize,
-    message_count: usize,
+    message_ids: &[MakimaId],
 ) {
     display.extend(
         posts
             .iter()
-            .filter(|stored| stored.after_message.min(message_count) == boundary)
+            .filter(|stored| match stored.after_message {
+                None => boundary == 0,
+                Some(id) => {
+                    boundary
+                        .checked_sub(1)
+                        .and_then(|index| message_ids.get(index))
+                        == Some(&id)
+                }
+            })
             .map(|stored| post_message(&stored.post)),
     );
 }
@@ -1248,7 +1258,7 @@ mod tests {
     #[test_case(0, 0 ; "before_first_message")]
     #[test_case(1, 1 ; "between_messages")]
     #[test_case(2, 2 ; "after_last_message")]
-    #[test_case(5, 2 ; "past_a_shortened_history")]
+    #[test_case(5, 0 ; "anchor_outside_active_context")]
     fn restored_post_lands_at_its_message_boundary(after_message: usize, expected_index: usize) {
         const POST_TEXT: &str = "reviewer started";
         let agent_id = AgentId::generate();
@@ -1262,22 +1272,34 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let message_ids = vec![MakimaId::generate(), MakimaId::generate()];
         let post = StoredPost {
             chat: None,
-            after_message,
+            after_message: after_message.checked_sub(1).map(|index| {
+                message_ids
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(MakimaId::generate)
+            }),
             post: Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Warn,
                 agent: Some(agent_id.to_string()),
             },
         };
-        let display = history_to_display(
+        let display = history_to_display_with_target(
             &msgs,
             &empty_outputs(),
             &ToolOutputLines::default(),
             &[&post],
+            None,
+            &message_ids,
         )
         .0;
+        if after_message > message_ids.len() {
+            assert_eq!(display.len(), 2);
+            return;
+        }
         assert_eq!(display.len(), 3);
         assert_eq!(
             display[expected_index].role,
@@ -1304,7 +1326,7 @@ mod tests {
         };
         let post = StoredPost {
             chat: None,
-            after_message: 1,
+            after_message: Some(MakimaId::generate()),
             post: Post {
                 text: REPLY_TEXT.into(),
                 level: PostLevel::Warn,
@@ -1316,11 +1338,13 @@ mod tests {
             observation,
             Message::user(REPLY_TEXT.into()),
         ];
-        let display = history_to_display(
+        let display = history_to_display_with_target(
             &messages,
             &empty_outputs(),
             &ToolOutputLines::default(),
             &[&post],
+            None,
+            &[post.after_message.unwrap()],
         )
         .0;
         assert_eq!(display.len(), 4);
@@ -1670,6 +1694,7 @@ mod tests {
             &ToolOutputLines::default(),
             &[],
             Some(target.clone()),
+            &[],
         );
         let captured = items[0].state_target.as_ref().unwrap();
         assert_eq!(captured.id(), agent);

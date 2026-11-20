@@ -67,7 +67,7 @@ pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
 };
-use makima_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
+use makima_agent::actor::{ActorLifecycle, EffectiveAgentConfig, TranscriptRequest};
 use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
 use makima_agent::permissions::PermissionManager;
 #[cfg(test)]
@@ -99,6 +99,7 @@ use makima_storage::StateDir;
 use makima_storage::conversation::ConversationState;
 use makima_storage::input_history::InputHistory;
 use makima_storage::model::persist_model;
+use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::StoredPost;
 
 use crate::storage_writer::{SessionSaveFence, StorageWriter};
@@ -1202,14 +1203,42 @@ impl App {
     }
 
     fn active_subagent_closed(&self) -> bool {
-        if !self.is_main_chat() && self.selected_agent_id().is_none() {
+        if self.is_main_chat() {
+            return false;
+        }
+        let Some(id) = self.selected_agent_id() else {
+            return true;
+        };
+        if self.terminal_subagents.contains(&id)
+            || self
+                .subagent_channels
+                .get(&id)
+                .is_some_and(|channels| channels.closed)
+        {
             return true;
         }
-        self.chats
-            .get(self.active_chat)
-            .and_then(|chat| chat.agent_id)
-            .and_then(|agent_id| self.subagent_channels.get(&agent_id))
-            .is_some_and(|channels| channels.closed)
+        let target = self
+            .command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| target.id() == id)
+            .or_else(|| {
+                self.root_agent
+                    .as_ref()
+                    .and_then(|root| root.manager().lookup(id).ok())
+            });
+        if let Some(actor) = target.and_then(|target| target.actor().ok()) {
+            return actor.snapshot().lifecycle != ActorLifecycle::Open;
+        }
+        self.subagent_channels.get(&id).map_or_else(
+            || {
+                self.state
+                    .session
+                    .agents()
+                    .get(&id)
+                    .is_some_and(|record| record.lifecycle != StoredAgentLifecycle::Open)
+            },
+            |channels| channels.closed,
+        )
     }
 
     fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
@@ -3266,7 +3295,7 @@ impl App {
         &mut self,
         subagent: Option<&SubagentInfo>,
         post: Post,
-        committed_messages: Option<usize>,
+        committed_message: Option<Option<makima_storage::id::MakimaId>>,
     ) {
         let (chat_idx, chat) = match subagent {
             Some(subagent) => (
@@ -3280,13 +3309,9 @@ impl App {
         };
         self.chats[chat_idx].push_post(&post);
         let session = &self.state.session;
-        let after_message = committed_messages.unwrap_or_else(|| match &chat {
-            Some(id) => session
-                .subagent_messages()
-                .get(id)
-                .map_or(0, |messages| messages.len()),
-            None => session.messages().len(),
-        });
+        let after_message = committed_message
+            .unwrap_or_else(|| session.chat_message_ids(chat.as_deref()).last().copied())
+            .map(|id| session.canonical_message_id(id));
         self.state.session_mut().push_post(StoredPost {
             chat,
             after_message,

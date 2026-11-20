@@ -34,6 +34,7 @@ use makima_providers::{
     ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
     TokenUsage,
 };
+use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
@@ -893,7 +894,7 @@ fn legacy_post_link_opens_migrated_chat_after_disk_restore(ambiguous: bool) {
         "subagents":[{"tool_use_id":TRANSCRIPT, "name":TRANSCRIPT, "ambiguous":ambiguous}]});
     let history =
         serde_json::json!({"t":"sub_msg", "sub":TRANSCRIPT, "d":Message::user(POST_TEXT.into())});
-    let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":0, "text":POST_TEXT, "agent":TRANSCRIPT}});
+    let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":null, "text":POST_TEXT, "agent":TRANSCRIPT}});
     std::fs::write(
         tmp.path().join(format!("{id}.jsonl")),
         format!("{header}\n{meta}\n{history}\n{post}\n"),
@@ -1080,7 +1081,7 @@ fn main_chat_post_is_recorded_and_restored() {
         app.state.session.posts(),
         [StoredPost {
             chat: None,
-            after_message: 0,
+            after_message: None,
             post,
         }]
     );
@@ -1178,7 +1179,7 @@ fn subagent_post_lands_in_the_child_chat() {
         app.state.session.posts(),
         [StoredPost {
             chat: Some(TASK_ID.into()),
-            after_message: 0,
+            after_message: None,
             post,
         }]
     );
@@ -1682,6 +1683,28 @@ fn completion_notice_navigates_to_child(
     }
 }
 
+fn register_restored_child(app: &mut App, id: AgentId, key: &str) {
+    let session = app.state.session_mut();
+    let root = session.root_agent_id().unwrap_or_else(AgentId::generate);
+    session.bind_root_id(root).unwrap();
+    let mut record = session.agents()[&root].clone();
+    record.id = id;
+    record.parent = Some(root);
+    record.depth = 1;
+    record.transcript_key = key.into();
+    record.label = session
+        .agents()
+        .values()
+        .find(|record| record.transcript_key == key)
+        .and_then(|record| record.label.clone())
+        .or_else(|| Some(key.into()));
+    record.lifecycle = StoredAgentLifecycle::Closed;
+    let seq = session.next_state_seq();
+    record.created_seq = seq;
+    record.updated_seq = seq;
+    session.push_agent_revision(seq, record);
+}
+
 #[test_case(false, "available"; "main_available")]
 #[test_case(true, "available"; "nested_available")]
 #[test_case(false, "ambiguous"; "main_ambiguous")]
@@ -1713,6 +1736,10 @@ fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
         thinking: None,
         fast: false,
     };
+    register_restored_child(&mut app, AgentId::generate(), PARENT);
+    if case != "missing" {
+        register_restored_child(&mut app, agent_id, KEY);
+    }
     let mut entries = vec![entry(PARENT, None, false)];
     if case != "missing" {
         entries.push(entry(KEY, Some(agent_id.to_string()), case == "ambiguous"));
@@ -1732,9 +1759,9 @@ fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
             .set_subagent_messages(PARENT.into(), vec![Message::user(PARENT.into())]);
     }
     app.restore_display();
-    let chat_index = if nested { 1 } else { 0 };
+    let chat_index = if nested { app.chat_index[PARENT] } else { 0 };
     let notice = app.chats[chat_index].message_at(0).unwrap();
-    let available = case == "available";
+    let available = case != "missing";
     assert_eq!(notice.result_agent, Some(agent_id));
     assert!(notice.text.contains("[View child transcript]"));
     assert!(
@@ -1766,7 +1793,7 @@ fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
 
 #[test_case(false; "duplicate_key")]
 #[test_case(true; "duplicate_agent_id")]
-fn restore_preserves_duplicate_identity_ambiguity(duplicate_id: bool) {
+fn restored_durable_identity_is_not_replaced_by_legacy_duplicates(duplicate_id: bool) {
     const KEY: &str = "duplicate-task";
     const OTHER: &str = "other-task";
     let mut app = test_app();
@@ -1786,19 +1813,15 @@ fn restore_preserves_duplicate_identity_ambiguity(duplicate_id: bool) {
     } else {
         other.agent_id = Some(AgentId::generate().to_string());
     }
-    app.state.session_mut().set_subagents(vec![entry, other]);
+    register_restored_child(&mut app, agent_id, KEY);
     app.state
         .session_mut()
         .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
+    app.state.session_mut().set_subagents(vec![entry, other]);
     app.restore_display();
-    assert!(!app.agent_chat_index.contains_key(&agent_id));
-    assert!(
-        app.state
-            .session
-            .subagents()
-            .iter()
-            .all(|entry| entry.ambiguous)
-    );
+    let index = app.chat_index[KEY];
+    assert_eq!(app.chats[index].agent_id, Some(agent_id));
+    assert_eq!(app.agent_chat_index[&agent_id], index);
 }
 
 #[test_case(false; "legacy_without_history")]
@@ -1821,10 +1844,11 @@ fn sync_subagents_legacy_identity_depends_on_history(has_history: bool) {
             .session_mut()
             .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
     }
+    let canonical_id = app.state.session.subagents()[0].agent_id.clone();
     app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
     let entry = &app.state.session.subagents()[0];
-    assert_eq!(entry.ambiguous, has_history);
-    assert_eq!(entry.agent_id, (!has_history).then(|| agent_id.to_string()));
+    assert!(!entry.ambiguous);
+    assert_eq!(entry.agent_id, canonical_id);
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]
@@ -4357,6 +4381,7 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
     const INPUT: &str = "hi this is a test";
     const TASK: &str = "restored-task";
     let mut app = test_app();
+    register_restored_child(&mut app, AgentId::generate(), TASK);
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: TASK.into(),
         agent_id: None,
@@ -4406,6 +4431,7 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
 fn restored_subagents_have_no_ago_and_are_finished() {
     let mut app = test_app();
     let id = "restored-sub".to_string();
+    register_restored_child(&mut app, AgentId::generate(), id.as_str());
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: id.clone(),
         agent_id: None,
@@ -4435,8 +4461,8 @@ fn restored_subagents_have_no_ago_and_are_finished() {
         }),
         None
     );
-    assert_eq!(sub.depth(), 0);
-    assert_eq!(sub.parent_chat_index, None);
+    assert_eq!(sub.depth(), 1);
+    assert_eq!(sub.parent_chat_index, Some(0));
 
     let root = AgentId::generate();
     let child = AgentId::generate();
@@ -6524,7 +6550,7 @@ fn checkpoint_saves_post_only_session(linked: bool) {
         loaded.posts(),
         [StoredPost {
             chat: None,
-            after_message: 0,
+            after_message: None,
             post
         }]
     );
@@ -7537,7 +7563,7 @@ fn history_replacement_preserves_live_child_navigation() {
 
 #[test_case(false; "main")]
 #[test_case(true; "child")]
-fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(child: bool) {
+fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     const REMOVED_POST: &str = "removed review";
     const OTHER_POST: &str = "other chat review";
     let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
@@ -7549,9 +7575,20 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
     let messages = vec![Message::user("kept prompt".into())];
     let chat = child.then_some(TASK_ID.to_owned());
     let other_chat = (!child).then_some(TASK_ID.to_owned());
+    let mut original = messages.clone();
+    original.push(Message::user(REMOVED_POST.into()));
+    let original = HistorySnapshot::new(original);
+    if let Some(key) = &chat {
+        app.state
+            .session_mut()
+            .adopt_subagent_history(key.clone(), &original);
+    } else {
+        app.state.session_mut().adopt_history(&original);
+    }
+    let message_ids = app.state.session.chat_message_ids(chat.as_deref());
     let retained = StoredPost {
         chat: chat.clone(),
-        after_message: 1,
+        after_message: Some(message_ids[0]),
         post: Post {
             text: POST_TEXT.into(),
             level: PostLevel::Error,
@@ -7560,18 +7597,18 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
     };
     let other = StoredPost {
         chat: other_chat,
-        after_message: 2,
+        after_message: Some(makima_storage::id::MakimaId::generate()),
         post: Post {
             text: OTHER_POST.into(),
             level: PostLevel::Info,
             agent: None,
         },
     };
-    for post in [
+    let expected_posts = [
         retained.clone(),
         StoredPost {
             chat,
-            after_message: 2,
+            after_message: Some(message_ids[1]),
             post: Post {
                 text: REMOVED_POST.into(),
                 level: PostLevel::Warn,
@@ -7579,22 +7616,27 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
             },
         },
         other.clone(),
-    ] {
-        app.state.session_mut().push_post(post);
+    ];
+    for post in &expected_posts {
+        app.state.session_mut().push_post(post.clone());
     }
-    let snapshot = HistorySnapshot::new(messages);
+    let mut snapshot = original;
+    snapshot.messages = Arc::new(messages);
     app.apply_history_change(HistoryChange {
         agent_id: app.chats[index].agent_id.unwrap(),
         epoch: snapshot.epoch,
         messages: snapshot.messages,
         draft: Message::user("next prompt".into()),
     });
-    assert_eq!(app.state.session.posts(), [retained, other]);
-    assert_last_is_post(&app.chats[index]);
+    assert_eq!(app.state.session.posts(), expected_posts);
     let displayed: Vec<_> = (0..app.chats[index].message_count())
         .map(|offset| app.chats[index].message_at(offset).unwrap().text.clone())
         .collect();
-    assert!(!displayed.iter().any(|text| text == REMOVED_POST));
+    assert!(
+        !displayed
+            .iter()
+            .any(|text| text == REMOVED_POST || text == POST_TEXT)
+    );
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let id = app.state.session.id;
@@ -7604,10 +7646,10 @@ fn history_replacement_prunes_only_selected_chat_posts_and_restores_display(chil
     app.state.session = Arc::new(restored);
     app.reset_ui_chrome();
     app.restore_display();
-    assert!((0..app.chats[index].message_count()).any(|offset| {
-        let message = app.chats[index].message_at(offset).unwrap();
-        message.text == POST_TEXT && message.role == DisplayRole::Post(PostLevel::Error)
-    }));
+    assert!(
+        !(0..app.chats[index].message_count())
+            .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST_TEXT })
+    );
     assert!(
         !(0..app.chats[index].message_count())
             .any(|offset| { app.chats[index].message_at(offset).unwrap().text == REMOVED_POST })

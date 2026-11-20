@@ -897,9 +897,7 @@ mod tests {
             assert!(!journal.snapshot().managed_histories.contains(&agent));
             assert!(!journal.snapshot().state.iter().any(|record| matches!(
                 record.change,
-                StateChange::Boundary { .. }
-                    | StateChange::Turn { .. }
-                    | StateChange::Delivery { .. }
+                StateChange::Turn { .. } | StateChange::Delivery { .. }
             )));
         }
     }

@@ -364,12 +364,12 @@ impl App {
             let mut records = self.state.session.agents().values().filter(|record| {
                 record.parent.is_some() && record.transcript_key == sa.tool_use_id
             });
-            let record = records
-                .next()
-                .filter(|_| !sa.ambiguous && records.next().is_none());
-            chat.agent_id = record
-                .map(|record| record.id)
-                .or_else(|| sa.agent_id.as_deref().and_then(|id| id.parse().ok()));
+            let record = records.next().filter(|_| records.next().is_none());
+            chat.agent_id = record.map(|record| record.id).or_else(|| {
+                (!sa.ambiguous)
+                    .then(|| sa.agent_id.as_deref().and_then(|id| id.parse().ok()))
+                    .flatten()
+            });
             chat.parent_agent_id = record.and_then(|record| record.parent);
             if let Some(id) = chat.agent_id {
                 self.agent_chat_index.insert(id, idx);
@@ -403,16 +403,18 @@ impl App {
             chat.set_restore_target(target);
         }
 
+        let posts = canonical_posts(&self.state.session);
         let (display, items) = history_to_display_with_target(
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(self.state.session.posts(), None),
+            &posts_in(&posts, None),
             self.chats[0].agent_id.and_then(|id| {
                 self.root_agent
                     .as_ref()
                     .map(|root| root.manager().reference(id))
             }),
+            &self.state.session.chat_message_ids(None),
         );
         self.main_chat().load_messages(display);
         self.fire_restore_items(items);
@@ -426,12 +428,13 @@ impl App {
                     messages,
                     self.state.session.tool_outputs(),
                     &self.ui_config.tool_output_lines,
-                    &posts_in(self.state.session.posts(), Some(key)),
+                    &posts_in(&posts, Some(key)),
                     self.chats[index].agent_id.and_then(|id| {
                         self.root_agent
                             .as_ref()
                             .map(|root| root.manager().reference(id))
                     }),
+                    &self.state.session.chat_message_ids(Some(key)),
                 );
                 self.chats[index].load_messages(display);
                 self.fire_restore_items(items);
@@ -553,16 +556,18 @@ impl App {
                 &live_children,
             );
         }
+        let posts = canonical_posts(&self.state.session);
         let (display, items) = history_to_display_with_target(
             &change.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(self.state.session.posts(), chat.as_deref()),
+            &posts_in(&posts, chat.as_deref()),
             self.chats[index].agent_id.and_then(|id| {
                 self.root_agent
                     .as_ref()
                     .map(|root| root.manager().reference(id))
             }),
+            &self.state.session.chat_message_ids(chat.as_deref()),
         );
         self.chats[index].load_messages(display);
         self.chats[index].context_size = context_size;
@@ -615,6 +620,20 @@ impl App {
     }
 }
 
+fn canonical_posts(session: &AppSession) -> Vec<StoredPost> {
+    session
+        .posts()
+        .iter()
+        .cloned()
+        .map(|mut post| {
+            post.after_message = post
+                .after_message
+                .map(|id| session.canonical_message_id(id));
+            post
+        })
+        .collect()
+}
+
 fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPost> {
     posts
         .iter()
@@ -624,15 +643,19 @@ fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPo
 
 #[cfg(test)]
 mod tests {
-    use makima_agent::actor::{ConfigChange, ConfigPatch};
+    use makima_agent::actor::{ConfigChange, ConfigPatch, HistoryChange};
     use makima_agent::permissions::PermissionSnapshot;
     use makima_agent::{AgentId, SubagentInfo};
+    use makima_domain::{Post, PostLevel};
     use makima_providers::{Effort, Message, ModelSelection, RequestOptions, ThinkingConfig};
+    use makima_storage::id::MakimaId;
     use makima_storage::session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentSpec, StoredModeCeiling,
         StoredModeSnapshot, StoredStateRecord,
     };
-    use makima_storage::sessions::{StoredEffect, StoredRule, StoredSubagent, StoredThinking};
+    use makima_storage::sessions::{
+        StoredEffect, StoredPost, StoredRule, StoredSubagent, StoredThinking,
+    };
 
     use super::{CLOSED_AGENT_TEXT, DORMANT_AGENT_TEXT, RETIRED_AGENT_TEXT, session_has_content};
 
@@ -640,6 +663,86 @@ mod tests {
     const CONFIG_MODEL: &str = "provider/committed";
     const CACHE_MODEL: &str = "provider/cache";
     const SPAWN_MODEL: &str = "provider/spawn";
+
+    #[test_case::test_case(false; "root")]
+    #[test_case::test_case(true; "child")]
+    fn aliased_post_anchor_is_visible_before_reload(child: bool) {
+        const PROMPT: &str = "original prompt";
+        const POST: &str = "review result";
+        let mut app = super::super::tests::test_app();
+        let root = AgentId::generate();
+        let child_id = AgentId::generate();
+        let session = app.state.session_mut();
+        session.bind_root_id(root).unwrap();
+        let chat = child.then_some(TRANSCRIPT);
+        if child {
+            let mut record = session.agents()[&root].clone();
+            record.id = child_id;
+            record.parent = Some(root);
+            record.depth = 1;
+            record.transcript_key = TRANSCRIPT.into();
+            let seq = session.next_state_seq();
+            record.created_seq = seq;
+            record.updated_seq = seq;
+            session.push_agent_revision(seq, record);
+            session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(PROMPT.into())]);
+        } else {
+            session.push_message(Message::user(PROMPT.into()));
+        }
+        let provisional = session.chat_message_ids(chat)[0];
+        session.push_post(StoredPost {
+            chat: chat.map(str::to_owned),
+            after_message: Some(provisional),
+            post: Post {
+                text: POST.into(),
+                level: PostLevel::Info,
+                agent: None,
+            },
+        });
+        let canonical = MakimaId::generate();
+        session.commit_message_aliases(&[(provisional, canonical)].into());
+        assert_eq!(session.chat_message_ids(chat), [canonical]);
+        assert_eq!(session.posts()[0].after_message, Some(provisional));
+        let history = if child {
+            session.subagent_history_snapshot(TRANSCRIPT).unwrap()
+        } else {
+            session.history_snapshot()
+        };
+        app.restore_display();
+        let agent = if child { child_id } else { root };
+        let index = app.agent_chat_index[&agent];
+        assert!(
+            (0..app.chats[index].message_count())
+                .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST })
+        );
+        app.apply_history_change(HistoryChange {
+            agent_id: agent,
+            epoch: history.epoch,
+            messages: history.messages,
+            draft: Message::user(PROMPT.into()),
+        });
+        assert!(
+            (0..app.chats[index].message_count())
+                .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST })
+        );
+        assert_eq!(
+            app.state.session.posts()[0].after_message,
+            Some(provisional)
+        );
+        app.push_post(
+            None,
+            Post {
+                text: POST.into(),
+                level: PostLevel::Info,
+                agent: None,
+            },
+            Some(Some(provisional)),
+        );
+        assert_eq!(
+            app.state.session.posts().last().unwrap().after_message,
+            Some(canonical)
+        );
+    }
 
     fn stored_config() -> StoredAgentConfig {
         StoredAgentConfig {
@@ -767,20 +870,17 @@ mod tests {
         session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(TRANSCRIPT.into())]);
         app.restore_display();
         let chat = &app.chats[1];
-        assert_eq!(chat.agent_id, (!ambiguous).then_some(child));
-        assert_eq!(
-            chat.model_id.as_deref(),
-            Some(if ambiguous { CACHE_MODEL } else { CONFIG_MODEL })
-        );
+        assert_eq!(chat.agent_id, Some(child));
+        assert_eq!(chat.model_id.as_deref(), Some(CONFIG_MODEL));
         assert_eq!(
             chat.opts,
             Some(RequestOptions {
-                thinking: if ambiguous || default_thinking {
+                thinking: if default_thinking {
                     ThinkingConfig::Off
                 } else {
                     ThinkingConfig::Effort(Effort::High)
                 },
-                fast: !ambiguous,
+                fast: true,
             })
         );
         app.chats[1].model_id = Some(SPAWN_MODEL.into());
@@ -790,9 +890,9 @@ mod tests {
         });
         app.sync_subagents();
         let cache = &app.state.session.subagents()[0];
-        assert!(cache.model.is_none());
-        assert!(cache.thinking.is_none());
-        assert!(!cache.fast);
+        assert_eq!(cache.model.as_deref(), Some(CONFIG_MODEL));
+        assert_eq!(cache.thinking, config.thinking);
+        assert!(cache.fast);
         assert_eq!(
             app.state.session.latest_state().unwrap().scopes[&Some(child)]
                 .config

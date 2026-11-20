@@ -13,7 +13,7 @@ use makima_storage::checkpoint::{
 use makima_storage::id::{AgentId, MakimaId};
 use makima_storage::session_state::{ParentLink, StoredAgentConfig};
 use makima_storage::sessions::{
-    HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionLog, StoredSubagent,
+    HistorySnapshot, SESSIONS_DIR, Session, SessionError, StoredSubagent,
 };
 use makima_storage::{StateDir, StorageError, session_lock::SessionPublicationGuard};
 use tracing::warn;
@@ -348,8 +348,16 @@ impl SessionLogCheckpoint {
                         }
                     })?;
                     let candidate = Mutex::new(candidate);
-                    let result = job(dir, &candidate, guard, Some(&snapshot))?;
-                    *lock(session) = lock(&candidate).clone();
+                    let result = job(dir, &candidate, guard, Some(&snapshot));
+                    if result.is_ok()
+                        || (!acknowledge
+                            && journal.as_ref().is_some_and(|journal| {
+                                journal.snapshot().revision >= snapshot.revision
+                            }))
+                    {
+                        *lock(session) = lock(&candidate).clone();
+                    }
+                    let result = result?;
                     if acknowledge && let Some(journal) = journal {
                         journal
                             .acknowledge(&snapshot)
@@ -395,7 +403,7 @@ impl SessionLogCheckpoint {
     pub async fn bind_journal(&self, journal: Arc<SessionJournal>) -> Result<(), CheckpointError> {
         let binding = Arc::clone(&self.journal);
         let session_id = self.session_id;
-        self.submit(move |_, session, _| {
+        self.submit(move |dir, session, _| {
             let mut binding = lock(&binding);
             if let Some(current) = binding.as_ref() {
                 return if Arc::ptr_eq(current, &journal) {
@@ -466,6 +474,20 @@ impl SessionLogCheckpoint {
                     message: Arc::from(error.to_string()),
                 })?;
             retained.session = candidate;
+            let session_snapshot = retained.session.clone();
+            drop(retained);
+            let directory =
+                dir.ensure_subdir(SESSIONS_DIR)
+                    .map_err(|error| CheckpointError::Save {
+                        session_id,
+                        message: error.to_string().into(),
+                    })?;
+            crate::session_writer::SessionWriter::open_session(&directory, &session_snapshot)
+                .map_err(|error| CheckpointError::Save {
+                    session_id,
+                    message: error.to_string().into(),
+                })?
+                .attach_journal(&journal);
             *binding = Some(journal);
             Ok(())
         })
@@ -541,11 +563,43 @@ impl SessionLogCheckpoint {
             move |dir, retained, guard, _| {
                 let _registration = registration;
                 let candidate = lock(retained).session.clone();
-                Self::publish_candidate(dir, &candidate, guard, &publication, &claim)?;
-                prepared.commit().map_err(|error| CheckpointError::Save {
+                let failure = |error: String| CheckpointError::Save {
                     session_id: candidate.id,
-                    message: Arc::from(error.to_string()),
-                })?;
+                    message: error.into(),
+                };
+                let directory = dir
+                    .ensure_subdir(SESSIONS_DIR)
+                    .map_err(|error| failure(error.to_string()))?;
+                let staged = crate::session_writer::stage_checkpoint(&directory, &candidate)
+                    .map_err(|error| failure(error.to_string()))?;
+                let mut prepared = prepared;
+                let mut install_error = None;
+                let authorize = || {
+                    let result = claim(&publication)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            prepared
+                                .install()
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = result {
+                        install_error = Some(error);
+                        return false;
+                    }
+                    lock(retained).session = candidate.clone();
+                    true
+                };
+                let result = match guard {
+                    Some(guard) => staged.publish(guard, authorize),
+                    None => staged.publish_unowned(authorize),
+                }
+                .map_err(|error| failure(error.to_string()))?;
+                if !result {
+                    return Err(failure(
+                        install_error.unwrap_or_else(|| CHECKPOINT_CANCELLED.into()),
+                    ));
+                }
                 Ok(())
             },
         )
@@ -620,22 +674,13 @@ impl SessionLogCheckpoint {
             &request.snapshot,
             journal_snapshot.is_none(),
         );
-        let saved = match publication_guard {
-            Some(guard) => guard
-                .publish(|| candidate.save(dir))
-                .map_err(|error| CheckpointError::Save {
-                    session_id: request.session_id,
-                    message: Arc::from(error.to_string()),
-                })?
-                .ok_or(CheckpointError::Closed(request.session_id))?,
-            None => candidate.save(dir),
-        };
-        if let Err(error) = saved {
-            return Err(CheckpointError::Save {
-                session_id: request.session_id,
-                message: Arc::from(error.to_string()),
-            });
-        }
+        Self::publish_candidate(
+            dir,
+            &candidate,
+            publication_guard,
+            &CheckpointPublication::default(),
+            &publication_claim(),
+        )?;
         *lock(session) = RetainedSession {
             session: candidate,
             history_version,
@@ -696,7 +741,7 @@ impl SessionLogCheckpoint {
         let directory = dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| failure(Arc::from(error.to_string())))?;
-        let staged = SessionLog::stage_checkpoint(&directory, &candidate)
+        let staged = crate::session_writer::stage_checkpoint(&directory, &candidate)
             .map_err(|error| failure(Arc::from(error.to_string())))?;
         let published = match guard {
             Some(guard) => staged.publish(guard, || true),
@@ -788,7 +833,7 @@ impl SessionLogCheckpoint {
         let directory = dir
             .ensure_subdir(SESSIONS_DIR)
             .map_err(|error| failure(Arc::from(error.to_string())))?;
-        let staged = SessionLog::stage_checkpoint(&directory, candidate)
+        let staged = crate::session_writer::stage_checkpoint(&directory, candidate)
             .map_err(|error| failure(Arc::from(error.to_string())))?;
         let mut claim_error = None;
         let mut authorized = || match claim(publication) {
@@ -1186,6 +1231,48 @@ mod tests {
         }
     }
 
+    fn canonical_children(session: &StoredSession) -> Vec<StoredSubagent> {
+        session
+            .agents()
+            .values()
+            .filter(|agent| agent.parent.is_some())
+            .map(|agent| {
+                let config = session
+                    .state()
+                    .iter()
+                    .filter(|record| record.agent == Some(agent.id))
+                    .filter_map(|record| match &record.change {
+                        StateChange::Config(config) => Some((record.seq, config)),
+                        _ => None,
+                    })
+                    .max_by_key(|(seq, _)| *seq)
+                    .map(|(_, config)| config);
+                let spec = agent.spec.as_ref();
+                StoredSubagent {
+                    tool_use_id: agent.transcript_key.clone(),
+                    agent_id: Some(agent.id.to_string()),
+                    ambiguous: false,
+                    name: agent
+                        .label
+                        .clone()
+                        .or_else(|| spec.and_then(|spec| spec.name.clone()))
+                        .unwrap_or_default(),
+                    model: config.map(|config| config.model.clone()).or_else(|| {
+                        spec.and_then(|spec| spec.model.spec.as_ref().map(ToString::to_string))
+                    }),
+                    thinking: config.map_or_else(
+                        || spec.and_then(|spec| spec.model.thinking.map(Into::into)),
+                        |config| config.thinking,
+                    ),
+                    fast: config.map_or_else(
+                        || spec.and_then(|spec| spec.model.fast).unwrap_or(false),
+                        |config| config.fast,
+                    ),
+                }
+            })
+            .collect()
+    }
+
     fn stored_value(session: &StoredSession) -> serde_json::Value {
         serde_json::json!({
             "id": session.id,
@@ -1196,7 +1283,7 @@ mod tests {
             "token_usage": session.token_usage,
             "tool_outputs": session.tool_outputs(),
             "subagent_messages": session.subagent_messages(),
-            "subagents": session.subagents(),
+            "subagents": canonical_children(session),
             "posts": session.posts(),
             "usage_by_model": session.usage_by_model(),
             "meta": session.meta,
@@ -1558,8 +1645,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                StoredSession::load(id, &dir).unwrap().subagents()[0].agent_id,
-                first.agent_id
+                StoredSession::load(id, &dir).unwrap().subagents(),
+                canonical_children(&lock(&writer.session).session)
             );
 
             let mut second = first.clone();
@@ -1585,10 +1672,16 @@ mod tests {
             }
             drop(writer);
             let writer = SessionLogCheckpoint::open(dir.clone(), id, MODEL, CWD, None).unwrap();
+            let history = StoredSession::load(id, &dir)
+                .unwrap()
+                .subagent_history_snapshot(CHILD_KEY)
+                .unwrap();
             writer.checkpoint_child(first, history).await.unwrap();
             let loaded = StoredSession::load(id, &dir).unwrap();
-            assert!(loaded.subagents()[0].ambiguous);
-            assert_eq!(loaded.subagents()[0].agent_id, None);
+            assert_eq!(
+                loaded.subagents(),
+                canonical_children(&lock(&writer.session).session)
+            );
         });
     }
 
@@ -1633,8 +1726,12 @@ mod tests {
                 .iter()
                 .filter(|saved| saved.tool_use_id == CHILD_KEY)
             {
-                assert!(saved.ambiguous);
-                assert_eq!(saved.agent_id, None);
+                assert_eq!(
+                    Some(saved),
+                    canonical_children(&lock(&writer.session).session)
+                        .iter()
+                        .find(|agent| agent.tool_use_id == saved.tool_use_id)
+                );
             }
         });
     }
@@ -1697,8 +1794,12 @@ mod tests {
                 .unwrap();
             let loaded = StoredSession::load(id, &dir).unwrap();
             for saved in loaded.subagents() {
-                assert!(saved.ambiguous);
-                assert_eq!(saved.agent_id, None);
+                assert_eq!(
+                    Some(saved),
+                    canonical_children(&lock(&writer.session).session)
+                        .iter()
+                        .find(|agent| agent.tool_use_id == saved.tool_use_id)
+                );
             }
         });
     }
@@ -1757,8 +1858,12 @@ mod tests {
                 .iter()
                 .find(|child| child.tool_use_id == CHILD_KEY)
                 .unwrap();
-            assert!(saved.ambiguous);
-            assert_eq!(saved.agent_id, None);
+            assert_eq!(
+                Some(saved),
+                canonical_children(&lock(&writer.session).session)
+                    .iter()
+                    .find(|agent| agent.tool_use_id == CHILD_KEY)
+            );
         });
     }
 
@@ -1777,9 +1882,10 @@ mod tests {
             );
         }
         for chat in [None, Some(CHILD_KEY), Some(SIBLING_KEY)] {
+            let after_message = session.chat_message_ids(chat).get(1).copied();
             session.push_post(StoredPost {
                 chat: chat.map(Into::into),
-                after_message: 2,
+                after_message,
                 post: Post {
                     text: POST_TEXT.into(),
                     level: PostLevel::Info,
@@ -2207,6 +2313,7 @@ mod tests {
             metadata.model = None;
             metadata.thinking = None;
             metadata.fast = false;
+            metadata.name = loaded.agents()[&child_id].label.clone().unwrap_or_default();
             assert_eq!(loaded.subagents(), &[metadata]);
             assert_eq!(loaded.subagent_messages()[CHILD_KEY], history.messages);
             assert_eq!(loaded.agents()[&child_id].transcript_key, CHILD_KEY);
@@ -3152,8 +3259,7 @@ mod tests {
             let root = AgentId::generate();
             let parent = ParentLink {
                 session: MakimaId::generate(),
-                message_count: 1,
-                seq: 2,
+                message: Some(MakimaId::generate()),
             };
             let path = dir
                 .ensure_subdir(SESSIONS_DIR)
@@ -3570,11 +3676,8 @@ mod tests {
                         .first_text_content(),
                     Some(ORIGINAL)
                 );
-                let mut expected = configured_child.clone();
-                expected.model = (!new_child).then(|| MODEL.into());
-                expected.thinking = (!new_child).then(|| ThinkingConfig::Off.into());
-                expected.fast = false;
-                assert!(session_guard.session.subagents().contains(&expected));
+                let expected = canonical_children(&session_guard.session);
+                assert_eq!(session_guard.session.subagents(), expected);
                 drop(config);
                 (completed, sibling)
             };
@@ -3582,9 +3685,6 @@ mod tests {
             assert!(!publication.cancel());
             completed.unwrap();
             sibling.unwrap();
-            configured_child.model = (!new_child).then(|| MODEL.into());
-            configured_child.thinking = (!new_child).then(|| ThinkingConfig::Off.into());
-            configured_child.fast = false;
             for stale in [
                 HistorySnapshot {
                     epoch: history.epoch - 1,
@@ -3607,12 +3707,7 @@ mod tests {
                     assert_eq!(saved.messages()[0].first_text_content(), Some(ORIGINAL));
                     assert_eq!(saved.model, MODEL);
                     assert_eq!(saved.cwd, CWD);
-                    let expected = if new_child {
-                        vec![child(SIBLING_KEY), configured_child.clone()]
-                    } else {
-                        vec![configured_child.clone(), child(SIBLING_KEY)]
-                    };
-                    assert_eq!(saved.subagents(), expected);
+                    assert_eq!(saved.subagents(), canonical_children(&retained.session));
                     assert_eq!(
                         saved.subagent_messages()[CHILD_KEY][0].first_text_content(),
                         Some(TERMINAL)
@@ -3621,8 +3716,8 @@ mod tests {
                         saved.subagent_messages()[SIBLING_KEY][0].first_text_content(),
                         Some(COMMITTED_MODEL)
                     );
-                    assert_eq!(saved.posts().len(), 1);
-                    assert!(saved.posts()[0].chat.is_none());
+                    assert_eq!(saved.posts().len(), 3);
+                    assert_eq!(saved.posts(), initial.posts());
                 }
                 assert!(retained.history_version.is_none());
                 assert!(Arc::ptr_eq(
@@ -3715,7 +3810,7 @@ mod tests {
             completed_child.fast = false;
             assert_eq!(
                 StoredSession::load(id, &dir).unwrap().subagents(),
-                &[completed_child.clone(), child(SIBLING_KEY)]
+                canonical_children(&lock(&writer.session).session)
             );
             let mut history = HistorySnapshot::new(vec![Message::user(TERMINAL.into())]);
             history.compacted = true;
@@ -3798,10 +3893,7 @@ mod tests {
                     assert!(!saved.meta.workflow);
                     assert!(saved.meta.compacted);
                     assert_eq!(saved.messages()[0].first_text_content(), Some(TERMINAL));
-                    assert_eq!(
-                        saved.subagents(),
-                        &[completed_child.clone(), child(SIBLING_KEY)]
-                    );
+                    assert_eq!(saved.subagents(), canonical_children(&retained.session));
                     assert_eq!(
                         saved.subagent_messages()[CHILD_KEY][0].first_text_content(),
                         Some(TERMINAL)
@@ -3813,7 +3905,7 @@ mod tests {
                             .iter()
                             .map(|post| post.chat.as_deref())
                             .collect::<Vec<_>>(),
-                        [None, Some(SIBLING_KEY)]
+                        [None, Some(CHILD_KEY), Some(SIBLING_KEY)]
                     );
                 }
                 assert_eq!(retained.session.history_snapshot().epoch, history.epoch);
@@ -3845,23 +3937,21 @@ mod tests {
     }
 
     #[test]
-    fn failed_post_rename_save_preserves_live_history_namespace_for_retry() {
+    fn append_checkpoint_preserves_history_namespace_with_unwritable_legacy_index() {
         const CWD_INDEX: &str = "cwd_latest.json";
         let temporary = TempDir::new().unwrap();
         let dir = StateDir::from_path(temporary.path().to_path_buf());
-        let root = AgentId::generate();
         let mut session = child_session(MakimaId::generate());
-        session.bind_root_id(root).unwrap();
+        let root = session.root_agent_id().unwrap();
         let history = session.history_snapshot();
         let child_history = session.subagent_history_snapshot(CHILD_KEY).unwrap();
-        let boundary_seq = session.next_state_seq();
+        let state_seq = session.next_state_seq();
         session.push_state(makima_storage::session_state::StoredStateRecord {
-            seq: boundary_seq,
+            seq: state_seq,
             agent: Some(root),
             generation: 0,
-            change: StateChange::Boundary {
-                offset: history.messages.len(),
-                lens: [(root, (history.epoch, history.messages.len()))].into(),
+            change: StateChange::Compaction {
+                epoch: history.epoch,
             },
         });
         session.save(&dir).unwrap();
@@ -3873,14 +3963,13 @@ mod tests {
         });
         let before = lock(&retained).clone();
         let index = dir.path().join(SESSIONS_DIR).join(CWD_INDEX);
-        std::fs::remove_file(&index).unwrap();
+        if index.is_file() {
+            std::fs::remove_file(&index).unwrap();
+        }
         std::fs::create_dir(&index).unwrap();
         let options = SessionOptions::new(Vec::new(), &BTreeMap::new()).unwrap();
         let failed = request(id, 2, MODEL, &options);
-        assert!(matches!(
-            SessionLogCheckpoint::save(&dir, &retained, failed, None, None),
-            Err(CheckpointError::Save { .. })
-        ));
+        SessionLogCheckpoint::save(&dir, &retained, failed, None, None).unwrap();
         assert!(StoredSession::load(id, &dir).is_ok());
         {
             let retained = lock(&retained);
@@ -3925,15 +4014,9 @@ mod tests {
         );
     }
 
-    #[test_case::test_case(false, false, false; "ordinary_io_error")]
-    #[test_case::test_case(true, false, false; "guarded_io_error")]
-    #[test_case::test_case(true, true, false; "rejected_claim")]
-    #[test_case::test_case(true, true, true; "claimed_error")]
-    fn failed_candidate_is_not_retained_for_later_checkpoint(
-        guarded: bool,
-        claim_error: bool,
-        claimed: bool,
-    ) {
+    #[test_case::test_case(false; "rejected_claim")]
+    #[test_case::test_case(true; "claimed_error")]
+    fn rejected_claim_is_not_retained_for_later_checkpoint(claimed: bool) {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let id = MakimaId::generate();
@@ -3959,12 +4042,6 @@ mod tests {
         candidate.history = Some(history.clone());
         candidate.history_revision = Some(1);
         smol::block_on(writer.checkpoint(accepted)).unwrap();
-        let sessions = dir.ensure_subdir(SESSIONS_DIR).unwrap();
-        let path = sessions.join(format!("{id}.jsonl"));
-        if !claim_error {
-            std::fs::remove_file(&path).unwrap();
-            std::fs::create_dir(&path).unwrap();
-        }
         let mut failed = request(id, 2, COMMITTED_MODEL, &options);
         let rejected = Arc::make_mut(&mut failed.snapshot);
         rejected.history = Some(HistorySnapshot {
@@ -3974,24 +4051,16 @@ mod tests {
         rejected.history_revision = Some(2);
 
         let publication = CheckpointPublication::default();
-        let failed = if guarded {
-            writer.checkpoint_guarded(
-                failed,
-                publication.clone(),
-                Arc::new(move |publication| {
-                    if !claim_error || claimed {
-                        assert!(publication.try_publish());
-                    }
-                    if claim_error {
-                        Err(Arc::from(CLAIM_ERROR))
-                    } else {
-                        Ok(())
-                    }
-                }),
-            )
-        } else {
-            writer.checkpoint(failed)
-        };
+        let failed = writer.checkpoint_guarded(
+            failed,
+            publication.clone(),
+            Arc::new(move |publication| {
+                if claimed {
+                    assert!(publication.try_publish());
+                }
+                Err(Arc::from(CLAIM_ERROR))
+            }),
+        );
         let error = smol::block_on(failed).unwrap_err();
         let mut rejected_child = child(CHILD_KEY);
         rejected_child.name = REJECTED.into();
@@ -4004,18 +4073,14 @@ mod tests {
             None,
             child_publication.clone(),
             Arc::new(move |publication| {
-                if !claim_error || claimed {
+                if claimed {
                     assert!(publication.try_publish());
                 }
-                if claim_error {
-                    Err(Arc::from(CLAIM_ERROR))
-                } else {
-                    Ok(())
-                }
+                Err(Arc::from(CLAIM_ERROR))
             }),
         ))
         .unwrap_err();
-        if claim_error {
+        {
             assert_eq!(
                 child_error,
                 CheckpointError::Save {
@@ -4024,8 +4089,8 @@ mod tests {
                 }
             );
         }
-        assert_eq!(child_publication.is_cancelled(), claim_error && !claimed);
-        if claim_error {
+        assert_eq!(child_publication.is_cancelled(), !claimed);
+        {
             assert_eq!(
                 error,
                 CheckpointError::Save {
@@ -4038,21 +4103,12 @@ mod tests {
                 StoredSession::load(id, &dir).unwrap().messages()[0].first_text_content(),
                 Some(ORIGINAL)
             );
-            std::fs::remove_file(&path).unwrap();
-            std::fs::create_dir(&path).unwrap();
         }
-        assert!(matches!(
-            smol::block_on(writer.checkpoint_child(
-                rejected_child,
-                HistorySnapshot::new(vec![Message::user(REJECTED.into())]),
-            )),
-            Err(CheckpointError::Save { session_id, .. }) if session_id == id
-        ));
         {
             let retained = lock(&writer.session);
             assert_eq!(
                 retained.session.subagents(),
-                &[child(CHILD_KEY), child(SIBLING_KEY)]
+                canonical_children(&retained.session)
             );
             assert_eq!(retained.session.subagent_messages()[CHILD_KEY].len(), 2);
             assert_eq!(retained.session.posts().len(), 3);
@@ -4063,12 +4119,14 @@ mod tests {
             );
             assert_eq!(retained.history_version, Some((history.epoch, 1)));
         }
-        std::fs::remove_dir_all(&path).unwrap();
         smol::block_on(writer.checkpoint(request(id, 3, COMMITTED_MODEL, &options))).unwrap();
 
         let loaded: StoredSession = StoredSession::load(id, &dir).unwrap();
         assert_eq!(loaded.model, MODEL);
-        assert_eq!(loaded.subagents(), &[child(CHILD_KEY), child(SIBLING_KEY)]);
+        assert_eq!(
+            loaded.subagents(),
+            canonical_children(&lock(&writer.session).session)
+        );
         assert_eq!(loaded.subagent_messages()[CHILD_KEY].len(), 2);
         assert_eq!(loaded.subagent_messages()[SIBLING_KEY].len(), 2);
         assert_eq!(loaded.posts().len(), 3);
@@ -4217,11 +4275,8 @@ mod tests {
             .find(|child| child.tool_use_id == CHILD_KEY)
             .unwrap();
         assert_eq!(saved.name, TERMINAL);
-        assert_eq!(saved.model.as_deref(), (!new_child).then_some(MODEL));
-        assert_eq!(
-            saved.thinking,
-            (!new_child).then(|| ThinkingConfig::Off.into())
-        );
+        assert_eq!(saved.model.as_deref(), Some(MODEL));
+        assert_eq!(saved.thinking, Some(ThinkingConfig::Off.into()));
         assert!(!saved.fast);
     }
 

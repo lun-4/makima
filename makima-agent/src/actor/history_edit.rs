@@ -158,7 +158,7 @@ impl HistoryEditWork {
                 super::drive_operations(&actor.inner, &mut state);
                 Err(error)
             }
-            Ok(finalize) => {
+            Ok((finalize, publication_error)) => {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
                     history.adopt_prepared_snapshot(snapshot.clone());
@@ -189,7 +189,8 @@ impl HistoryEditWork {
                     guard.release = false;
                 }
                 super::drive_operations(&actor.inner, &mut state);
-                committed.map(|committed| (committed, change))
+                committed
+                    .and_then(|committed| publication_error.map_or(Ok((committed, change)), Err))
             }
         };
         if let Ok((committed, _)) = &result
@@ -300,7 +301,6 @@ mod tests {
             state_edits: Vec::new(),
             options: None,
             history_changed: true,
-            boundary: false,
             publication: CheckpointPublication::default(),
             publish,
             finalize: Box::new(|_| {}),
@@ -357,22 +357,17 @@ mod tests {
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let committed = operation
-                .commit_durable(
-                    PreparedTransaction {
-                        publication: CheckpointPublication::default(),
-                        options: None,
-                        state_edits: vec![edit],
-                        history_changed: false,
-                        boundary: false,
-                        publish: published(),
-                        finalize: Box::new(|_| {}),
-                    }
-                    .with_boundary(),
-                )
+                .commit_durable(PreparedTransaction {
+                    publication: CheckpointPublication::default(),
+                    options: None,
+                    state_edits: vec![edit],
+                    history_changed: false,
+                    publish: published(),
+                    finalize: Box::new(|_| {}),
+                })
                 .await
                 .unwrap();
             assert!(committed.ticket.is_none());
-            let receipt = committed.boundary.unwrap();
             assert_eq!(committed.config.config.mode, mode);
             let later_config = stored_agent_config(
                 &EffectiveAgentConfig::new(policy(false), AgentMode::Build)
@@ -404,8 +399,6 @@ mod tests {
                 .unwrap()
                 .finalize_after_publication();
             let snapshot = recovered.journal().snapshot();
-            assert!(snapshot.state.iter().any(|record| record.seq == receipt.seq
-                && matches!(record.change, StateChange::Boundary { .. })));
             let view = snapshot.fold().unwrap();
             let plans: PlanSlot = serde_json::from_value(
                 view.scopes[&None].plugins[makima_storage::plans::PLAN_STATE_KEY]
@@ -422,11 +415,11 @@ mod tests {
         });
     }
 
-    #[test_case(false, false; "boundary_only_published")]
-    #[test_case(false, true; "boundary_only_cancelled")]
-    #[test_case(true, false; "approval_and_boundary_published")]
-    #[test_case(true, true; "approval_and_boundary_cancelled")]
-    fn prepared_boundary_receipt_matches_atomic_publication(with_edit: bool, cancel: bool) {
+    #[test_case(false, false; "state_only_published")]
+    #[test_case(false, true; "state_only_cancelled")]
+    #[test_case(true, false; "approval_state_published")]
+    #[test_case(true, true; "approval_state_cancelled")]
+    fn prepared_state_edit_matches_atomic_publication(with_edit: bool, cancel: bool) {
         smol::block_on(async {
             use std::time::Duration;
 
@@ -475,75 +468,68 @@ mod tests {
             let callback_journal = Arc::clone(&journal);
             let callback_before = before_journal.clone();
             let final_slot = slot.clone();
-            let final_access = access.clone();
             let operation = actor.reserve_prepared_operation(None).unwrap();
             operation.resolve(None).unwrap();
             operation.wait_ready().await.unwrap();
             let result = operation
-                .commit_durable(
-                    PreparedTransaction {
-                        state_edits,
-                        options: None,
-                        history_changed: false,
-                        boundary: false,
-                        publication: CheckpointPublication::default(),
-                        publish: Box::new(move |snapshot, publication| {
-                            Box::pin(async move {
-                                let candidate = snapshot.journal.unwrap();
-                                let boundary = snapshot.boundary.unwrap();
-                                assert_eq!(boundary.agent, final_access.target());
-                                assert_eq!(boundary.epoch, candidate.epoch);
-                                assert_eq!(callback_journal.snapshot().state, callback_before.state);
-                                assert!(candidate.state.iter().take(callback_before.state.iter().len()).eq(callback_before.state.iter()));
-                                let changes: Vec<_> = candidate.state.iter().skip(callback_before.state.iter().len()).collect();
-                                assert_eq!(changes.len(), usize::from(with_edit) + 1);
-                                if with_edit {
-                                    assert!(matches!(
-                                        &changes[0].change,
-                                        StateChange::Plugin { key, value: Some(Value::Bool(true)), .. }
-                                            if key == SLOT_KEY
-                                    ));
-                                    assert!(changes[0].seq < boundary.seq);
-                                }
-                                let record = changes.last().unwrap();
-                                assert_eq!(record.seq, boundary.seq);
-                                assert_eq!(record.generation, snapshot.commit.generation);
-                                let StateChange::Boundary { offset, lens } = &record.change else {
-                                    panic!("publication must end at its boundary")
-                                };
-                                assert_eq!(*offset, snapshot.history.messages.len());
-                                assert_eq!(
-                                    lens[&boundary.agent],
-                                    (snapshot.history.epoch, snapshot.history.messages.len())
-                                );
-                                for (id, history) in callback_before.histories.iter() {
-                                    let candidate_history = &candidate.histories[id];
-                                    assert_eq!(candidate_history.epoch, history.epoch);
-                                    assert_eq!(candidate_history.compacted, history.compacted);
-                                    assert_eq!(candidate_history.conversation, history.conversation);
-                                    assert!(Arc::ptr_eq(&candidate_history.messages, &history.messages));
-                                }
-                                captured.send((boundary, candidate.state)).unwrap();
-                                if cancel {
-                                    assert!(publication.cancel());
-                                } else {
-                                    assert!(publication.try_publish());
-                                }
-                                Ok(())
-                            })
-                        }),
-                        finalize: Box::new(move |commit| {
-                            assert_eq!(
-                                final_slot.get(&access).unwrap().value,
-                                with_edit.then_some(Value::Bool(true))
+                .commit_durable(PreparedTransaction {
+                    state_edits,
+                    options: None,
+                    history_changed: false,
+                    publication: CheckpointPublication::default(),
+                    publish: Box::new(move |snapshot, publication| {
+                        Box::pin(async move {
+                            let candidate = snapshot.journal.unwrap();
+                            assert_eq!(callback_journal.snapshot().state, callback_before.state);
+                            assert!(
+                                candidate
+                                    .state
+                                    .iter()
+                                    .take(callback_before.state.iter().len())
+                                    .eq(callback_before.state.iter())
                             );
-                            finalized.send(commit.generation).unwrap();
-                        }),
-                    }
-                    .with_boundary(),
-                )
+                            let changes: Vec<_> = candidate
+                                .state
+                                .iter()
+                                .skip(callback_before.state.iter().len())
+                                .collect();
+                            assert_eq!(changes.len(), usize::from(with_edit));
+                            if with_edit {
+                                assert!(matches!(
+                                    &changes[0].change,
+                                    StateChange::Plugin { key, value: Some(Value::Bool(true)), .. }
+                                        if key == SLOT_KEY
+                                ));
+                            }
+                            for (id, history) in callback_before.histories.iter() {
+                                let candidate_history = &candidate.histories[id];
+                                assert_eq!(candidate_history.epoch, history.epoch);
+                                assert_eq!(candidate_history.compacted, history.compacted);
+                                assert_eq!(candidate_history.conversation, history.conversation);
+                                assert!(Arc::ptr_eq(
+                                    &candidate_history.messages,
+                                    &history.messages
+                                ));
+                            }
+                            captured.send(candidate.state).unwrap();
+                            if cancel {
+                                assert!(publication.cancel());
+                            } else {
+                                assert!(publication.try_publish());
+                            }
+                            Ok(())
+                        })
+                    }),
+                    finalize: Box::new(move |commit| {
+                        assert_eq!(
+                            final_slot.get(&access).unwrap().value,
+                            with_edit.then_some(Value::Bool(true))
+                        );
+                        finalized.send(commit.generation).unwrap();
+                    }),
+                })
                 .await;
-            let (boundary, candidate_state) = capture.recv().unwrap();
+            let candidate_state = capture.recv().unwrap();
             if cancel {
                 assert!(matches!(result, Err(ActorError::PolicyCancelled)));
                 assert_eq!(journal.snapshot().state, before_journal.state);
@@ -551,7 +537,6 @@ mod tests {
                 assert!(finalization.try_recv().is_err());
             } else {
                 let committed = result.unwrap();
-                assert_eq!(committed.boundary, Some(boundary));
                 assert!(committed.ticket.is_none());
                 assert_eq!(committed.config.generation, before_config.generation);
                 assert_eq!(journal.snapshot().state, candidate_state);
@@ -568,11 +553,9 @@ mod tests {
                         state_edits: Vec::new(),
                         options: None,
                         history_changed: false,
-                        boundary: false,
                         publication: CheckpointPublication::default(),
-                        publish: Box::new(|snapshot, publication| {
+                        publish: Box::new(|_snapshot, publication| {
                             Box::pin(async move {
-                                assert!(snapshot.boundary.is_none());
                                 assert!(publication.try_publish());
                                 Ok(())
                             })
@@ -581,7 +564,6 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert!(committed.boundary.is_none());
                 assert!(committed.ticket.is_none());
                 assert_eq!(journal.snapshot().state, candidate_state);
             }
@@ -645,7 +627,6 @@ mod tests {
                     state_edits: vec![edit],
                     options: None,
                     history_changed: false,
-                    boundary: false,
                     publication: CheckpointPublication::default(),
                     publish: Box::new(move |snapshot, publication| {
                         Box::pin(async move {
@@ -721,7 +702,6 @@ mod tests {
                         state_edits: Vec::new(),
                         options: None,
                         history_changed: true,
-                        boundary: false,
                         publication: CheckpointPublication::default(),
                         publish: Box::new(move |snapshot, publication| {
                             Box::pin(async move {
@@ -780,7 +760,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|_, _| panic!("closed edit must not publish")),
                 finalize: Box::new(|_| panic!("closed edit must not finalize")),
@@ -837,7 +816,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|snapshot, publication| {
                     Box::pin(async move {
@@ -903,7 +881,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, token| {
                     Box::pin(async move {
@@ -1037,7 +1014,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1108,7 +1084,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|_, _| panic!("foreign operation must not publish")),
                 finalize: Box::new(|_| panic!("foreign operation must not finalize")),
@@ -1166,7 +1141,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1241,7 +1215,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: publication.clone(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1304,7 +1277,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1388,7 +1360,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: publication.clone(),
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -1574,7 +1545,6 @@ mod tests {
                 state_edits: Vec::new(),
                 options: None,
                 history_changed: true,
-                boundary: false,
                 publication: CheckpointPublication::default(),
                 publish: Box::new(|snapshot, _| {
                     Box::pin(async move {

@@ -14,7 +14,7 @@ use makima_storage::id::SessionRef;
 use makima_storage::sessions::{Effort as StoredEffort, StoredThinking};
 use test_case::test_case;
 
-use super::tests::{select_child_chat, with_event_loop, with_event_loop_providers};
+use super::tests::{pump_until, select_child_chat, with_event_loop, with_event_loop_providers};
 use super::{
     AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
     SessionRequest, UiAction,
@@ -635,6 +635,11 @@ fn blank_session_sends_always_thinking_to_the_provider() {
             }
             .clamped(&model)
         );
+        pump_until(event_loop, |event_loop| {
+            let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+            let snapshot = manager.actor(root).unwrap().snapshot();
+            snapshot.status == makima_agent::actor::ActorStatus::Idle && snapshot.latest.is_some()
+        });
     });
 }
 

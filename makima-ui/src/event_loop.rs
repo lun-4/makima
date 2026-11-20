@@ -3029,10 +3029,14 @@ impl<'t> EventLoop<'t> {
         if let AgentEvent::Post(post) = envelope.event {
             let after_message = envelope.subagent.as_ref().and_then(|info| {
                 let (manager, _) = rt.handles.manager_and_root();
-                manager
-                    .actor(info.agent_id)
-                    .ok()
-                    .map(|actor| actor.committed_message_count())
+                manager.actor(info.agent_id).ok().map(|_| {
+                    rt.app
+                        .state
+                        .session
+                        .chat_message_ids(Some(&info.parent_tool_use_id))
+                        .last()
+                        .copied()
+                })
             });
             rt.app
                 .push_post(envelope.subagent.as_ref(), post, after_message);
@@ -4797,7 +4801,6 @@ impl<'t> EventLoop<'t> {
                 publication,
                 options: None,
                 state_edits: Vec::new(),
-                boundary: false,
                 history_changed,
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -5390,7 +5393,6 @@ fn runtime_config_mutations(
                 publication,
                 options: None,
                 state_edits: Vec::new(),
-                boundary: false,
                 history_changed: false,
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
@@ -9779,11 +9781,15 @@ end })
         let storage = harness.ctx().storage.clone();
         let sessions_dir = harness.ctx().sessions_dir.clone();
         let session_id = before.id;
+        let expected = before.clone();
         let observer = std::thread::spawn(move || {
             entering.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
             let published = AppSession::load(session_id, &storage).unwrap();
+            assert_eq!(published.state(), expected.state());
+            assert_eq!(published.agent_revisions(), expected.agent_revisions());
+            assert_eq!(published.messages(), expected.messages());
             assert!(
-                published.latest_state().unwrap().scopes[&Some(root)]
+                !published.latest_state().unwrap().scopes[&Some(root)]
                     .results
                     .iter()
                     .any(|(turn, _)| *turn == interrupted)

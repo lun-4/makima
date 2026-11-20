@@ -6,7 +6,6 @@ use makima_agent::actor::{
     PreparedOperationTicket, PreparedTransaction, PreparedTurn, TurnTicket,
 };
 use makima_agent::config_change::prepare_selection;
-use makima_agent::rewind::RewindBoundary;
 use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
 use makima_agent::{
@@ -14,6 +13,7 @@ use makima_agent::{
 };
 use makima_providers::{Message, ModelSelection, PreparedProvider};
 use makima_storage::checkpoint::CheckpointPublication;
+use makima_storage::id::MakimaId;
 use makima_storage::session_state::ParentLink;
 use makima_storage::sessions::{HistorySnapshot, StoredRule};
 
@@ -79,7 +79,7 @@ pub(super) struct CommittedPlanApproval {
     config: ConfigCommit,
     history: Option<HistoryChange>,
     presentation: Option<ApprovalPresentation>,
-    linked: Option<(EffectiveAgentConfig, RewindBoundary, usize)>,
+    linked: Option<(EffectiveAgentConfig, Option<MakimaId>)>,
 }
 
 struct ApprovalPresentation {
@@ -257,6 +257,7 @@ impl EventLoop<'_> {
             return self.sessions[idx].abort_plan_approval(error.to_string());
         }
         let runtime = &mut self.sessions[idx];
+        let parent_message = runtime.app.state.session.last_message_id();
         let Some(pending) = runtime.pending_approval.as_mut() else {
             return;
         };
@@ -291,12 +292,9 @@ impl EventLoop<'_> {
                     .await
                     .map_err(|error| error.to_string())?;
                 let (presentation, linked) = if let Some(config) = linked_config {
-                    let boundary = committed
-                        .boundary
-                        .ok_or_else(|| APPROVAL_CHANGED.to_owned())?;
-                    let message_count = source.history.messages.len();
+                    let message = parent_message;
                     drop(idle);
-                    (None, Some((config, boundary, message_count)))
+                    (None, Some((config, message)))
                 } else {
                     let ticket = committed
                         .ticket
@@ -360,7 +358,7 @@ impl EventLoop<'_> {
             presentation,
             linked,
         } = committed;
-        if let Some((config, boundary, message_count)) = linked {
+        if let Some((config, message)) = linked {
             runtime.app.clear_plan_approval_pending(target.id());
             runtime.pending_approval.take();
             let mut session = AppSession::new(
@@ -369,8 +367,7 @@ impl EventLoop<'_> {
             );
             session.set_parent(Some(ParentLink {
                 session: runtime.id(),
-                message_count,
-                seq: boundary.seq,
+                message,
             }));
             session.meta.yolo = request.yolo;
             session.meta.session_rules = request.rules;
@@ -644,11 +641,6 @@ impl EventLoop<'_> {
                 request.clear_context && !request.linked,
             )?
             .with_state_edit(state_edit);
-            let transaction = if request.linked {
-                transaction.with_boundary()
-            } else {
-                transaction
-            };
             Ok(ApprovalStep::Prepared(Box::new(PreparedPlanApproval {
                 target,
                 request,

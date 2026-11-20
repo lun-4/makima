@@ -175,7 +175,7 @@ impl History {
         self
     }
 
-    pub(crate) async fn boundary_permit(&self) -> Option<RwLockReadGuardArc<()>> {
+    pub(crate) async fn publication_permit(&self) -> Option<RwLockReadGuardArc<()>> {
         match &self.journal {
             Some((_, journal)) => Some(journal.boundary_read().await),
             None => None,
@@ -186,9 +186,6 @@ impl History {
         &mut self,
         message: Message,
     ) -> Result<(), HistoryMutationError> {
-        if Self::is_boundary_message(&message) {
-            return Err(HistoryMutationError::BoundaryRequiresPermit);
-        }
         self.push(message);
         Ok(())
     }
@@ -253,7 +250,7 @@ impl History {
         &self.snapshot.messages
     }
 
-    pub(crate) fn is_boundary_message(message: &Message) -> bool {
+    pub(crate) fn is_user_input_message(message: &Message) -> bool {
         matches!(message.role, Role::User)
             && matches!(message.kind, MessageKind::Turn)
             && !message.content.is_empty()
@@ -268,9 +265,7 @@ impl History {
     }
 
     pub(crate) fn push_with_changes(&mut self, msg: Message, mut changes: Vec<JournalChange>) {
-        let offset = self.len();
-        let boundary = Self::is_boundary_message(&msg);
-        let explicit_user = boundary
+        let explicit_user = Self::is_user_input_message(&msg)
             && self
                 .explicit_user_input
                 .as_ref()
@@ -282,22 +277,6 @@ impl History {
             Arc::make_mut(&mut history.messages).push(msg);
             let result = journal.commit_with_apply(
                 |snapshot| {
-                    if boundary {
-                        let mut lens: BTreeMap<_, _> = snapshot
-                            .histories
-                            .iter()
-                            .map(|(id, history)| (*id, (history.epoch, history.messages.len())))
-                            .collect();
-                        lens.insert(*agent, (self.snapshot.epoch, offset));
-                        changes.insert(
-                            0,
-                            JournalChange {
-                                agent: Some(*agent),
-                                generation: self.snapshot.epoch,
-                                change: StateChange::Boundary { offset, lens },
-                            },
-                        );
-                    }
                     if explicit_user {
                         let mut deliveries = BTreeMap::new();
                         for record in snapshot.state.iter() {
@@ -650,13 +629,9 @@ pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: us
 
 #[cfg(test)]
 mod tests {
-    use crate::ToolOutput;
     use makima_providers::{ContentBlock, Message, Role, TokenUsage};
     use makima_storage::id::TurnId;
-    use makima_storage::session_state::{
-        StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
-    };
-    use makima_storage::sessions::Session;
+    use makima_storage::session_state::StoredDeliveryOp;
     use test_case::test_case;
 
     use super::*;
@@ -665,13 +640,10 @@ mod tests {
     const SECOND: &str = "second";
     const GO: &str = "go";
 
-    #[test_case(true, false; "explicit_user_boundary_releases")]
-    #[test_case(false, false; "plugin_boundary_keeps_held")]
+    #[test_case(true, false; "explicit_user_input_releases")]
+    #[test_case(false, false; "plugin_input_keeps_held")]
     #[test_case(true, true; "observation_keeps_held")]
-    fn restored_deliveries_release_only_with_persisted_user_boundary(
-        user: bool,
-        observation: bool,
-    ) {
+    fn restored_deliveries_release_only_with_explicit_user_input(user: bool, observation: bool) {
         use crate::actor::{ChildDelivery, TurnProvenance, TurnResult};
         use crate::{TurnCancellationReason, TurnOutcome};
         use makima_storage::id::MakimaId;
@@ -736,10 +708,6 @@ mod tests {
         };
         assert_eq!(delivery.held, !user || observation);
         if user && !observation {
-            assert!(matches!(
-                &snapshot.state.iter().rev().nth(1).unwrap().change,
-                StateChange::Boundary { .. }
-            ));
             assert!(
                 matches!(&snapshot.state.iter().next_back().unwrap().change, StateChange::Delivery { op: StoredDeliveryOp::Queued(delivery), .. } if !delivery.held)
             );
@@ -786,25 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn journal_captures_boundary_lens_and_delivery_observation_together() {
+    fn journal_captures_history_and_delivery_observation_together() {
         let journal = Arc::new(SessionJournal::default());
         let root = AgentId::generate();
         let child = AgentId::generate();
         let mut root_history = History::new(Vec::new()).with_journal(root, Arc::clone(&journal));
-        let child_history = History::new(Vec::new()).with_journal(child, Arc::clone(&journal));
+        let _child_history = History::new(Vec::new()).with_journal(child, Arc::clone(&journal));
         root_history.push(Message::user(FIRST.into()));
-        let boundary_snapshot = journal.snapshot();
-        let boundary = boundary_snapshot
-            .state
-            .iter()
-            .find_map(|record| match &record.change {
-                StateChange::Boundary { offset, lens } => Some((*offset, lens)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(boundary.0, 0);
-        assert_eq!(boundary.1[&root], (root_history.snapshot().epoch, 0));
-        assert_eq!(boundary.1[&child], (child_history.snapshot().epoch, 0));
+        let input_snapshot = journal.snapshot();
         let turn = TurnId::generate();
         root_history.push_with_changes(
             Message::observation(SECOND.into()),
@@ -818,74 +775,18 @@ mod tests {
             }],
         );
         let observed = journal.snapshot();
-        assert_eq!(observed.revision, boundary_snapshot.revision + 1);
+        assert_eq!(observed.revision, input_snapshot.revision + 1);
         assert_eq!(
             observed.state.iter().len(),
-            boundary_snapshot.state.iter().len() + 1
+            input_snapshot.state.iter().len() + 1
         );
         assert_eq!(observed.histories[&root].messages.len(), 2);
         assert!(observed.managed_histories.contains(&root));
-        assert_eq!(boundary_snapshot.histories[&root].messages.len(), 1);
+        assert_eq!(input_snapshot.histories[&root].messages.len(), 1);
         assert!(matches!(
             observed.state.iter().next_back().unwrap().change,
             StateChange::Delivery { .. }
         ));
-    }
-
-    #[test]
-    fn restored_empty_child_is_in_root_boundary_lens() {
-        const MODEL: &str = "test/model";
-        const CHILD_KEY: &str = "empty-child";
-        let mut session = Session::<Message, TokenUsage, ToolOutput>::new(MODEL, ".");
-        let root = AgentId::generate();
-        let child = AgentId::generate();
-        session.bind_root_id(root).unwrap();
-        let journal = SessionJournal::from_session(&session).unwrap();
-        journal
-            .commit(JournalCommit {
-                agents: vec![StoredAgentRecord {
-                    id: child,
-                    parent: Some(root),
-                    depth: 1,
-                    transcript_key: CHILD_KEY.into(),
-                    lifecycle: StoredAgentLifecycle::Open,
-                    ancestry_unknown: false,
-                    label: None,
-                    spawned_by_tool_use_id: None,
-                    spec: None,
-                    restorable: Ok(()),
-                    usage: Default::default(),
-                    created_seq: 0,
-                    updated_seq: 0,
-                    legacy: false,
-                }],
-                ..Default::default()
-            })
-            .unwrap();
-        journal.snapshot().apply_to(&mut session).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        session.save_to(directory.path()).unwrap();
-        let loaded =
-            Session::<Message, TokenUsage, ToolOutput>::load_from(session.id, directory.path())
-                .unwrap();
-        assert!(loaded.subagent_history_snapshot(CHILD_KEY).is_none());
-        let journal = Arc::new(SessionJournal::from_session(&loaded).unwrap());
-        let empty_epoch = journal.snapshot().histories[&child].epoch;
-        let mut history = History::restored_snapshot(loaded.history_snapshot())
-            .with_journal(root, Arc::clone(&journal));
-        history.push(Message::user(FIRST.into()));
-        let snapshot = journal.snapshot();
-        let lens = snapshot
-            .state
-            .iter()
-            .rev()
-            .find_map(|record| match &record.change {
-                StateChange::Boundary { lens, .. } => Some(lens),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(lens[&child], (empty_epoch, 0));
-        assert_eq!(lens[&root], (history.snapshot().epoch, 0));
     }
 
     #[test]

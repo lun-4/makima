@@ -190,7 +190,7 @@ impl ScriptedBackend {
 }
 
 #[test]
-fn boundary_facade_waits_before_drain_and_rejects_sync_user_messages() {
+fn history_batch_waits_for_prepared_publication() {
     smol::block_on(async {
         const TEXT: &str = "boundary input";
         let journal = Arc::new(SessionJournal::default());
@@ -213,11 +213,6 @@ fn boundary_facade_waits_before_drain_and_rejects_sync_user_messages() {
             .await
             .unwrap();
         let mut facade = super::ActorHistory::new(&mut history);
-        assert!(matches!(
-            facade.push_observation(Message::user(TEXT.into())),
-            Err(super::HistoryMutationError::BoundaryRequiresPermit)
-        ));
-        assert!(facade.is_empty());
         let mut batch = Box::pin(facade.input_batch());
         assert!(futures_lite::future::poll_once(&mut batch).await.is_none());
         prepared.install().unwrap();
@@ -228,9 +223,10 @@ fn boundary_facade_waits_before_drain_and_rejects_sync_user_messages() {
         drop(batch);
         assert_eq!(facade.len(), 1);
         let snapshot = journal.snapshot();
+        assert_eq!(snapshot.histories[&agent].messages.len(), 1);
         assert!(matches!(
             snapshot.state.iter().next_back().unwrap().change,
-            StateChange::Boundary { .. }
+            StateChange::Admitted { .. }
         ));
     });
 }
@@ -284,9 +280,12 @@ fn prepared_config_allows_observations_but_fences_user_boundaries(install: bool)
             Some(STREAMED)
         );
         assert_eq!(
-            snapshot.fold().unwrap().scopes[&Some(agent)]
-                .plugins
-                .contains_key(SLOT),
+            snapshot
+                .fold()
+                .unwrap()
+                .scopes
+                .get(&Some(agent))
+                .is_some_and(|scope| scope.plugins.contains_key(SLOT)),
             install
         );
     });

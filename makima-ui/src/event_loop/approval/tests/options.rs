@@ -11,7 +11,7 @@ use makima_agent::session_options::SessionOptionError;
 use makima_domain::{Effort, ModelSelection, ThinkingConfig};
 use makima_providers::model::FastSupport;
 use makima_providers::{RequestOptions, ThinkingSupport};
-use makima_storage::{id::MakimaId, session_state::StateChange};
+use makima_storage::id::MakimaId;
 use test_case::test_case;
 
 use super::{
@@ -78,7 +78,7 @@ pub(super) fn assert_linked_parent(
     assert_ne!(runtime.id(), source);
     let parent = runtime.app.state.session.parent().unwrap();
     assert_eq!(parent.session, source);
-    assert_eq!(parent.message_count, message_count);
+    assert_eq!(source_actor.committed_message_count(), message_count);
     let saved = AppSession::load(source, &event_loop.ctx.storage).unwrap();
     let root = saved.root_agent_id().unwrap();
     assert_eq!(root, source_actor.agent_id());
@@ -86,11 +86,7 @@ pub(super) fn assert_linked_parent(
         saved.messages(),
         source_actor.committed_history().as_slice()
     );
-    assert!(saved.state().iter().any(|record| {
-        record.seq == parent.seq
-            && record.agent == Some(root)
-            && matches!(&record.change, StateChange::Boundary { offset, .. } if *offset == message_count)
-    }));
+    assert_eq!(parent.message, saved.last_message_id());
     assert_ne!(runtime.handles.manager_and_root().1, root);
 }
 

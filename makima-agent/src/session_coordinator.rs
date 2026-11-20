@@ -330,7 +330,6 @@ impl SessionTransactionReservation {
         let final_registration = Arc::clone(&registration);
         Ok(PreparedTransaction {
             state_edits: Vec::new(),
-            boundary: false,
             publication: self.publication.clone(),
             options: Some(options.config_values()),
             history_changed,
@@ -351,6 +350,15 @@ impl SessionTransactionReservation {
                 let history = history_changed.then_some(snapshot.history);
                 let (version, history_revision) =
                     publish_read.next_version(options.version, history.is_some());
+                let install = snapshot.install.clone();
+                let claim = Arc::clone(&claim);
+                let claim: CheckpointClaim = Arc::new(move |publication| {
+                    claim(publication)?;
+                    if let Some(install) = &install {
+                        install().map_err(Arc::from)?;
+                    }
+                    Ok(())
+                });
                 let checkpoint = publish_read.checkpoint_writer().checkpoint_guarded(
                     CheckpointRequest {
                         session_id,
@@ -1656,6 +1664,8 @@ async fn handle_operation(
                 let Some(candidate) = candidate else {
                     return Ok(ctx.read.options());
                 };
+                let reservation = Arc::new(reservation);
+                let commit_reservation = Arc::clone(&reservation);
                 let mut publication = checkpoint_options_for_actor(
                     &ctx.read,
                     SessionOptions::candidate_snapshot(&candidate),
@@ -1666,10 +1676,13 @@ async fn handle_operation(
                         claim,
                     }),
                     id.as_ref() == YOLO_OPTION_ID,
+                    Some(Box::new(move || {
+                        commit_reservation.install(candidate);
+                    })),
                 )
                 .await?;
                 install_options_publication(&mut publication, ctx.session_id)?;
-                Ok(reservation.commit(candidate))
+                Ok(ctx.read.options())
             }
             .await;
             let _ = reply.send(result);
@@ -1703,6 +1716,8 @@ async fn handle_operation(
                     .prepare_set(YOLO_OPTION_ID, value)?
                     .unwrap_or_else(|| ctx.read.options.unchanged_candidate());
                 let _registration = ctx.register_publication(&publication)?;
+                let reservation = Arc::new(reservation);
+                let commit_reservation = Arc::clone(&reservation);
                 let mut prepared = checkpoint_options_for_actor(
                     &ctx.read,
                     SessionOptions::candidate_snapshot(&candidate),
@@ -1713,12 +1728,15 @@ async fn handle_operation(
                         claim,
                     }),
                     true,
+                    Some(Box::new(move || {
+                        commit_reservation.install(candidate);
+                    })),
                 )
                 .await
                 .map_err(SessionCoordinatorError::from)?;
                 install_options_publication(&mut prepared, ctx.session_id)
                     .map_err(SessionCoordinatorError::from)?;
-                Ok((enabled, reservation.commit(candidate)))
+                Ok((enabled, ctx.read.options()))
             }
             .await;
             let _ = reply.send(result);
@@ -2238,18 +2256,12 @@ fn install_options_publication(
     Ok(())
 }
 
-async fn checkpoint_options(
-    read: &SessionReadHandle,
-    options: SessionOptionsSnapshot,
-) -> Result<Option<OptionsPublication>, CheckpointError> {
-    checkpoint_options_for_actor(read, options, None, false).await
-}
-
 async fn checkpoint_options_for_actor(
     read: &SessionReadHandle,
     options: SessionOptionsSnapshot,
     admission: Option<OptionsAdmission>,
     explicit_yolo: bool,
+    commit: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<Option<OptionsPublication>, CheckpointError> {
     let yolo = options.enabled(YOLO_OPTION_ID);
     let permissions = lock(&read.permissions).clone();
@@ -2452,17 +2464,36 @@ async fn checkpoint_options_for_actor(
             config: None,
         }),
     };
-    let checkpoint = if let Some(admission) = &admission {
-        read.checkpoint_writer().checkpoint_guarded(
-            request,
-            admission.publication.clone(),
-            Arc::clone(&admission.claim),
-        )
-    } else {
-        read.checkpoint_writer().checkpoint(request)
-    };
+    let staged = Arc::new(Mutex::new((publication, commit)));
+    let install = Arc::clone(&staged);
+    let original_claim = admission
+        .as_ref()
+        .map(|admission| Arc::clone(&admission.claim));
+    let session_id = read.session_id;
+    let claim: CheckpointClaim = Arc::new(move |publication| {
+        if let Some(claim) = &original_claim {
+            claim(publication)?;
+        } else if !publication.try_publish() {
+            return Err(Arc::from(CHECKPOINT_CANCELLED));
+        }
+        let mut staged = lock(&install);
+        install_options_publication(&mut staged.0, session_id)
+            .map_err(|error| Arc::from(error.to_string()))?;
+        if let Some(commit) = staged.1.take() {
+            commit();
+        }
+        Ok(())
+    });
+    let checkpoint = read.checkpoint_writer().checkpoint_guarded(
+        request,
+        admission
+            .as_ref()
+            .map(|admission| admission.publication.clone())
+            .unwrap_or_default(),
+        claim,
+    );
     verify_ack(read.session_id, version, checkpoint).await?;
-    Ok(publication)
+    Ok(None)
 }
 
 async fn update_model_values(
@@ -2500,10 +2531,19 @@ async fn update_model_values(
     let Some(candidate) = read.options.prepare_replace_definition(definition)? else {
         return Ok(snapshot);
     };
-    let mut publication =
-        checkpoint_options(read, SessionOptions::candidate_snapshot(&candidate)).await?;
-    install_options_publication(&mut publication, read.session_id)?;
-    Ok(reservation.commit(candidate))
+    let reservation = Arc::new(reservation);
+    let commit_reservation = Arc::clone(&reservation);
+    checkpoint_options_for_actor(
+        read,
+        SessionOptions::candidate_snapshot(&candidate),
+        None,
+        false,
+        Some(Box::new(move || {
+            commit_reservation.install(candidate);
+        })),
+    )
+    .await?;
+    Ok(read.options())
 }
 
 fn unregister(session_id: MakimaId, generation: u64) {
@@ -4045,9 +4085,18 @@ pub(crate) mod tests {
             });
             reached_rx.recv_async().await.unwrap();
             assert_eq!(agent.effective_config().unwrap().unwrap().model.spec(), OLD);
-            assert!(agent.manager().journal().snapshot().state.iter().all(|record| {
-                !matches!(&record.change, StateChange::Config(config) if config.model == NEW)
-            }));
+            assert_eq!(
+                agent
+                    .manager()
+                    .journal()
+                    .snapshot()
+                    .state
+                    .iter()
+                    .any(|record| {
+                        matches!(&record.change, StateChange::Config(config) if config.model == NEW)
+                    }),
+                claimed
+            );
             *lock(&authority) = false;
             release_tx.send_async(()).await.unwrap();
             assert_eq!(operation.await.is_ok(), claimed);
@@ -4178,7 +4227,7 @@ pub(crate) mod tests {
     #[test_case(false, false; "reload_commits")]
     #[test_case(true, false; "reload_checkpoint_fails")]
     #[test_case(false, true; "reload_cancelled_before_claim")]
-    fn context_reload_installs_only_after_durable_publication(fail: bool, cancel: bool) {
+    fn context_reload_installs_at_authorized_admission(fail: bool, cancel: bool) {
         smol::block_on(async {
             let saved = Arc::new(Mutex::new(Vec::new()));
             let (reached, waiting) = flume::bounded(1);
@@ -4249,10 +4298,14 @@ pub(crate) mod tests {
                 assert_eq!(result.is_err(), fail);
             }
             assert_eq!(actor.config_snapshot().unwrap().generation, generation);
-            if fail || cancel {
+            if cancel {
                 assert_eq!(journal.snapshot().state, before.state);
                 assert_eq!(coordinator.read().options(), options);
                 assert!(root_context(&access).unwrap().is_none());
+                assert!(lock(&saved).is_empty());
+            } else if fail {
+                assert!(root_context(&access).unwrap().is_some());
+                assert!(journal.snapshot().revision > before.revision);
                 assert!(lock(&saved).is_empty());
             } else {
                 assert!(root_context(&access).unwrap().is_some());
@@ -4661,7 +4714,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ensure_root_context_checkpoint_failure_leaves_initialization_unpublished() {
+    fn ensure_root_context_checkpoint_failure_retains_admitted_initialization() {
         use crate::actor::ActorStatus;
 
         smol::block_on(async {
@@ -4701,8 +4754,8 @@ pub(crate) mod tests {
             assert!(actor.latest_ticket().is_none());
             release.send_async(()).await.unwrap();
             assert!(ensure.await.is_err());
-            assert!(root_context(&access).unwrap().is_none());
-            assert_eq!(journal.snapshot().state, before.state);
+            assert!(root_context(&access).unwrap().is_some());
+            assert!(journal.snapshot().revision > before.revision);
             assert_eq!(fixture.coordinator.read().options(), options);
             assert!(lock(&fixture.saved).is_empty());
             assert_eq!(actor.snapshot().status, ActorStatus::Idle);
@@ -4722,7 +4775,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(initialized.instructions.text.contains(RELOAD_INSTRUCTIONS));
             assert!(root_context(&access).unwrap().is_some());
-            assert_eq!(lock(&fixture.saved).len(), 1);
+            assert!(lock(&fixture.saved).is_empty());
             assert!(actor.latest_ticket().is_none());
             actor.shutdown();
             fixture.coordinator.close().await.unwrap();
@@ -4846,9 +4899,9 @@ pub(crate) mod tests {
                         .values()
                         .get(FAST_PENDING_MODEL_OPTION_ID)
                         .map(String::as_str),
-                    Some(MODEL)
+                    None
                 );
-                assert_eq!(journal.snapshot().state, before);
+                assert!(journal.snapshot().revision > 0);
                 release.send_async(()).await.unwrap();
                 let result = toggle.await;
                 if fail {
@@ -4860,9 +4913,13 @@ pub(crate) mod tests {
                             .values()
                             .get(FAST_PENDING_MODEL_OPTION_ID)
                             .map(String::as_str),
-                        Some(MODEL)
+                        None
                     );
-                    assert_eq!(journal.snapshot().state, before);
+                    assert_eq!(
+                        journal.snapshot().state.iter().len(),
+                        before.iter().len() + 1
+                    );
+                    assert!(!agent.effective_config().unwrap().unwrap().fast);
                     assert!(lock(&saved).is_empty());
                 } else {
                     let (enabled, snapshot) = result.unwrap();
@@ -5022,8 +5079,14 @@ pub(crate) mod tests {
                     .is_none()
             );
             waiting.recv_async().await.unwrap();
-            assert!(!permissions.is_yolo());
-            assert_eq!(coordinator.read().options().version, before.version);
+            assert_eq!(permissions.is_yolo(), claimed);
+            assert_eq!(
+                coordinator.read().options().enabled(YOLO_OPTION_ID),
+                claimed
+            );
+            if !claimed {
+                assert_eq!(coordinator.read().options().version, before.version);
+            }
             drop(operation);
             release.send_async(()).await.unwrap();
             coordinator.barrier().await;

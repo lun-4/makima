@@ -35,11 +35,6 @@ pub struct RecoveredSession {
     journal: Arc<SessionJournal>,
 }
 
-struct HistoryRemap {
-    epoch: u64,
-    offsets: Vec<usize>,
-}
-
 pub fn resolve_legacy_mode(
     session: &mut StoredSession,
     registry: &ModeRegistry,
@@ -135,16 +130,10 @@ impl RecoveryCandidate {
             })
             .collect();
         let mut histories = BTreeMap::new();
-        let (history, offsets) = sanitize(session.history_snapshot());
+        let history = sanitize(session.history_snapshot());
         session.adopt_history(&history);
         if let Some(root) = session.root_agent_id() {
-            histories.insert(
-                root,
-                HistoryRemap {
-                    epoch: history.epoch,
-                    offsets,
-                },
-            );
+            histories.insert(root, history.epoch);
         }
         let keys: BTreeSet<_> = session
             .subagent_messages()
@@ -159,49 +148,24 @@ impl RecoveryCandidate {
             .collect();
         for key in keys {
             let history = session.subagent_history_snapshot(&key).unwrap_or_default();
-            let (history, offsets) = sanitize(history);
+            let history = sanitize(history);
             session.adopt_subagent_history(key.clone(), &history);
             if let Some(agent) = view
                 .agents
                 .values()
                 .find(|agent| agent.transcript_key == key)
             {
-                histories.insert(
-                    agent.id,
-                    HistoryRemap {
-                        epoch: history.epoch,
-                        offsets,
-                    },
-                );
+                histories.insert(agent.id, history.epoch);
             }
         }
         let mut state = session.state().to_vec();
         for record in &mut state {
-            if let StateChange::Boundary { offset, lens } = &mut record.change {
-                if let Some(agent) = record.agent
-                    && lens
-                        .get(&agent)
-                        .is_some_and(|(epoch, _)| epochs.get(&agent) == Some(epoch))
-                    && let Some(remap) = histories.get(&agent)
-                    && *offset < remap.offsets.len()
-                {
-                    *offset = remap.offset(*offset);
-                }
-                for (agent, (epoch, len)) in lens {
-                    if epochs.get(agent) == Some(epoch)
-                        && let Some(remap) = histories.get(agent)
-                        && *len < remap.offsets.len()
-                    {
-                        *epoch = remap.epoch;
-                        *len = remap.offset(*len);
-                    }
-                }
-            } else if let StateChange::Compaction { epoch } = &mut record.change
+            if let StateChange::Compaction { epoch } = &mut record.change
                 && let Some(agent) = record.agent
                 && epochs.get(&agent) == Some(epoch)
                 && let Some(remap) = histories.get(&agent)
             {
-                *epoch = remap.epoch;
+                *epoch = *remap;
             }
         }
         session.replace_state(state);
@@ -285,20 +249,8 @@ impl RecoveredSession {
     }
 }
 
-impl HistoryRemap {
-    fn offset(&self, offset: usize) -> usize {
-        self.offsets
-            .get(offset)
-            .copied()
-            .unwrap_or_else(|| *self.offsets.last().unwrap_or(&0))
-    }
-}
-
-pub(crate) fn sanitize(
-    mut history: HistorySnapshot<Message>,
-) -> (HistorySnapshot<Message>, Vec<usize>) {
+pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot<Message> {
     let mut messages: Vec<Message> = Vec::with_capacity(history.messages.len());
-    let mut offsets = Vec::with_capacity(history.messages.len() + 1);
     for mut message in history.messages.iter().cloned() {
         let previous = messages.last();
         let mut calls: Vec<_> = previous
@@ -327,7 +279,6 @@ pub(crate) fn sanitize(
                     .retain(|block| !matches!(block, ContentBlock::Image { .. }));
             }
             if message.content.is_empty() {
-                offsets.push(messages.len());
                 continue;
             }
             let missing: Vec<_> = calls.into_iter().filter(|id| !message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id))).collect();
@@ -335,7 +286,6 @@ pub(crate) fn sanitize(
         } else if !calls.is_empty() {
             messages.push(results(calls));
         }
-        offsets.push(messages.len());
         if !message.content.is_empty() {
             messages.push(message);
         }
@@ -347,12 +297,11 @@ pub(crate) fn sanitize(
         let calls = last.tool_uses().map(|(id, _, _)| id.to_owned()).collect();
         messages.push(results(calls));
     }
-    offsets.push(messages.len());
     if history.messages.as_ref() != &messages {
         history.epoch = next_epoch();
         history.messages = Arc::new(messages);
     }
-    (history, offsets)
+    history
 }
 
 fn unavailable(tool_use_id: String) -> ContentBlock {
@@ -434,10 +383,8 @@ mod tests {
         }
     }
 
-    #[test_case(0; "valid_empty_prefix")]
-    #[test_case(1; "valid_end_prefix_includes_missing_result")]
-    #[test_case(2; "invalid_prefix_stays_invalid_after_growth")]
-    fn sanitization_growth_rebases_only_originally_valid_lenses(offset: usize) {
+    #[test]
+    fn sanitization_repairs_missing_results_once() {
         let mut session = StoredSession::new(MODEL, CWD);
         let root = AgentId::generate();
         session.bind_root_id(root).unwrap();
@@ -447,47 +394,13 @@ mod tests {
             ..Default::default()
         });
         let original_epoch = session.history_snapshot().epoch;
-        let seq = session.next_state_seq();
-        session.push_state(StoredStateRecord {
-            seq,
-            agent: Some(root),
-            generation: 0,
-            change: StateChange::Boundary {
-                offset,
-                lens: [(root, (original_epoch, offset))].into(),
-            },
-        });
         let candidate = RecoveryCandidate::prepare(session).unwrap();
-        let snapshot = candidate.journal.snapshot();
-        let history = &snapshot.histories[&root];
+        let history = candidate.session.history_snapshot();
         assert_eq!(history.messages.len(), 2);
         assert_ne!(history.epoch, original_epoch);
-        let view = candidate.session.latest_state().unwrap();
-        let boundary = &view.boundaries[&seq];
-        assert_eq!(
-            candidate
-                .session
-                .state()
-                .iter()
-                .find(|record| record.seq == seq)
-                .unwrap()
-                .generation,
-            0
-        );
-        if offset > 1 {
-            assert_eq!(boundary.lens[&root], (original_epoch, offset));
-        } else {
-            let expected = if offset == 0 { 0 } else { 2 };
-            assert_eq!(boundary.offset, expected);
-            assert_eq!(boundary.lens[&root], (history.epoch, expected));
-        }
-        let recovered_epoch = history.epoch;
         let again = RecoveryCandidate::prepare(candidate.session).unwrap();
-        assert_eq!(again.session.history_snapshot().epoch, recovered_epoch);
-        assert_eq!(
-            again.session.latest_state().unwrap().boundaries[&seq],
-            *boundary
-        );
+        assert_eq!(again.session.history_snapshot().epoch, history.epoch);
+        assert_eq!(again.session.messages(), history.messages.as_ref());
     }
 
     #[test]
@@ -658,15 +571,6 @@ mod tests {
         ]));
         session
             .adopt_subagent_history(CHILD_KEY.into(), &HistorySnapshot::new(vec![orphan, calls]));
-        let epoch = session.history_snapshot().epoch;
-        let child_epoch = session.subagent_history_snapshot(CHILD_KEY).unwrap().epoch;
-        let lens = BTreeMap::from([(root, (epoch, 2)), (child, (child_epoch, 1))]);
-        session.push_state(StoredStateRecord {
-            seq: 3,
-            agent: Some(root),
-            generation: 0,
-            change: StateChange::Boundary { offset: 2, lens },
-        });
         let root_turn = TurnId::generate();
         let child_turn = TurnId::generate();
         for (seq, agent, turn, origin) in [
@@ -696,7 +600,7 @@ mod tests {
 
     #[test]
     fn orphan_result_before_actual_result_preserves_root_and_child_results() {
-        let (mut session, root, child, _, _) = fixture();
+        let (mut session, _, _, _, _) = fixture();
         let calls = Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
@@ -735,10 +639,6 @@ mod tests {
             candidate.session().subagent_messages()[CHILD_KEY].as_ref(),
             &expected
         );
-        let boundary = &candidate.session().latest_state().unwrap().boundaries[&3];
-        assert_eq!(boundary.offset, 1);
-        assert_eq!(boundary.lens[&root].1, 1);
-        assert_eq!(boundary.lens[&child].1, 1);
     }
 
     #[test]
@@ -777,28 +677,6 @@ mod tests {
             }
             assert_eq!(recovered.session().messages().len(), 3);
             assert_eq!(recovered.session().subagent_messages()[CHILD_KEY].len(), 2);
-            let boundary = &view.boundaries[&3];
-            assert_eq!(boundary.offset, 2);
-            assert_eq!(
-                boundary.lens[&root],
-                (recovered.session().history_snapshot().epoch, 2)
-            );
-            assert_eq!(
-                boundary.lens[&child],
-                (
-                    recovered
-                        .session()
-                        .subagent_history_snapshot(CHILD_KEY)
-                        .unwrap()
-                        .epoch,
-                    0
-                )
-            );
-            assert!(recovered.session().meta.queued_messages.is_empty());
-            assert_eq!(
-                recovered.session().meta.input_draft.as_deref(),
-                Some(format!("{ORPHAN}{DRAFT_SEPARATOR}{DRAFT}").as_str())
-            );
             let journal = recovered.journal();
             let snapshot = journal.snapshot();
             let manager = AgentManagerHandle::restore_graph(

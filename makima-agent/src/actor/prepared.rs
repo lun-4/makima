@@ -17,7 +17,6 @@ use crate::context::{ContextPolicy, ContextUpdate};
 use crate::journal::{
     JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
 };
-use crate::rewind::RewindBoundary;
 use crate::session_checkpoint::stored_agent_config;
 use crate::session_options::{FAST_PENDING_MODEL_OPTION_ID, YOLO_OPTION_ID};
 use crate::state::StateEdit;
@@ -42,7 +41,6 @@ pub struct PreparedTurn {
 pub struct PreparedCommit {
     pub config: ConfigCommit,
     pub ticket: Option<TurnTicket>,
-    pub boundary: Option<RewindBoundary>,
 }
 
 #[derive(Clone)]
@@ -51,16 +49,16 @@ pub struct PreparedTransactionSnapshot {
     pub history: HistorySnapshot<Message>,
     pub commit: ConfigCommit,
     pub journal: Option<SessionJournalSnapshot>,
-    pub boundary: Option<RewindBoundary>,
     pub clear_pending_fast: bool,
+    pub install: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
     journal_context: Option<(Arc<SessionJournal>, JournalIncarnation)>,
     context_updates: Vec<ContextUpdate>,
     context_event_sender: Option<EventSender>,
 }
 
-/// Stages and publishes the captured candidate outside the actor lock. The host
-/// must claim `publication` at durable replacement, and finish rollback before
-/// returning an error. It must not await work on this actor's occupied runner.
+/// Publishes outside the actor lock. The host installs the snapshot inside its
+/// authorized admission claim, before enqueueing retained records. It must not
+/// await work on this actor's occupied runner.
 pub type PreparedPublication = Box<
     dyn FnOnce(
             PreparedTransactionSnapshot,
@@ -73,15 +71,13 @@ pub type PreparedPublication = Box<
 /// observers or the caller see success. It must not fail or reenter the actor.
 pub type PreparedFinalization = Box<dyn FnOnce(&ConfigCommit) + Send>;
 
-pub(super) type PreparedPublicationFinalization =
-    Box<dyn FnOnce(&ConfigCommit) -> Option<RewindBoundary> + Send>;
+pub(super) type PreparedPublicationFinalization = Box<dyn FnOnce(&ConfigCommit) + Send>;
 
 pub struct PreparedTransaction {
     pub publication: CheckpointPublication,
     pub options: Option<BTreeMap<String, String>>,
     pub state_edits: Vec<StateEdit>,
     pub history_changed: bool,
-    pub boundary: bool,
     pub publish: PreparedPublication,
     pub finalize: PreparedFinalization,
 }
@@ -101,11 +97,6 @@ impl Drop for CancelPublication {
 }
 
 impl PreparedTransaction {
-    pub fn with_boundary(mut self) -> Self {
-        self.boundary = true;
-        self
-    }
-
     pub fn with_state_edit(mut self, edit: StateEdit) -> Self {
         self.state_edits.push(edit);
         self
@@ -113,7 +104,7 @@ impl PreparedTransaction {
     pub(super) async fn publish(
         self,
         mut snapshot: PreparedTransactionSnapshot,
-    ) -> Result<PreparedPublicationFinalization, ActorError> {
+    ) -> Result<(PreparedPublicationFinalization, Option<ActorError>), ActorError> {
         if snapshot
             .journal_context
             .as_ref()
@@ -121,22 +112,19 @@ impl PreparedTransaction {
             && self.state_edits.is_empty()
             && snapshot.context_updates.is_empty()
             && !self.history_changed
-            && !self.boundary
         {
             snapshot.journal_context = None;
         }
         if snapshot.journal_context.is_none()
-            && (!self.state_edits.is_empty()
-                || !snapshot.context_updates.is_empty()
-                || self.boundary)
+            && (!self.state_edits.is_empty() || !snapshot.context_updates.is_empty())
         {
             return Err(ActorError::HistoryCheckpoint(
-                "state edit or boundary requires a session journal".into(),
+                "state edit requires a session journal".into(),
             ));
         }
         let context_updates = snapshot.context_updates.clone();
         let context_event_sender = snapshot.context_event_sender.clone();
-        let mut prepared =
+        let prepared =
             if let Some((journal, incarnation)) = snapshot.journal_context.take() {
                 let mut config = stored_agent_config(&snapshot.config, BTreeMap::new())
                     .map_err(|error| ActorError::InvalidConfig(error.to_string()))?;
@@ -147,7 +135,6 @@ impl PreparedTransaction {
                 let history_changed = self.history_changed;
                 let history = history_changed.then(|| snapshot.history.clone());
                 let generation = snapshot.commit.generation;
-                let boundary = self.boundary;
                 let persistent = journal.is_persistent();
                 Some(
                     journal
@@ -183,7 +170,6 @@ impl PreparedTransaction {
                             let history = history
                                 .or_else(|| current.histories.get(&incarnation.agent).cloned());
                             JournalCommit {
-                                boundary: boundary.then_some((incarnation.agent, generation)),
                                 state_edits,
                                 context_updates,
                                 state_epoch_agents: if history_changed {
@@ -216,55 +202,66 @@ impl PreparedTransaction {
             .as_ref()
             .filter(|prepared| prepared.is_persistent())
             .map(|prepared| prepared.snapshot().clone());
-        let boundary = prepared
-            .as_ref()
-            .filter(|_| self.boundary)
-            .and_then(|prepared| {
-                let snapshot = prepared.snapshot();
-                snapshot.state.iter().next_back().and_then(|record| {
-                    if !matches!(record.change, StateChange::Boundary { .. }) {
-                        return None;
-                    }
-                    record.agent.map(|agent| RewindBoundary {
-                        agent,
-                        seq: record.seq,
-                        epoch: snapshot.epoch,
-                    })
-                })
-            });
-        snapshot.boundary = boundary.clone();
+        let prepared = Arc::new(Mutex::new(prepared));
+        let installed = Arc::new(Mutex::new(false));
+        let install_prepared = Arc::clone(&prepared);
+        let install_flag = Arc::clone(&installed);
+        snapshot.install = Some(Arc::new(move || {
+            if let Some(prepared) = install_prepared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+            {
+                prepared.install().map_err(|error| error.to_string())?;
+            }
+            *install_flag
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = true;
+            Ok(())
+        }));
         let future = catch_unwind(AssertUnwindSafe(|| {
             (self.publish)(snapshot, self.publication.clone())
         }))
         .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_CALLBACK_PANICKED.into()))?;
-        AssertUnwindSafe(future)
+        let result = AssertUnwindSafe(future)
             .catch_unwind()
             .await
             .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_FUTURE_PANICKED.into()))?
-            .map_err(ActorError::HistoryCheckpoint)?;
-        if self.publication.is_cancelled() {
-            return Err(ActorError::PolicyCancelled);
-        }
-        if self.publication.cancel() {
-            return Err(ActorError::HistoryCheckpoint(
-                "publication callback succeeded without claiming durable publication".into(),
-            ));
-        }
-        if let Some(prepared) = &mut prepared {
-            prepared
-                .install()
-                .map_err(|error| ActorError::HistoryCheckpoint(error.to_string()))?;
-        }
-        Ok(Box::new(move |commit| {
-            let _prepared = prepared;
-            (self.finalize)(commit);
-            if let Some(sender) = context_event_sender {
-                for update in context_updates {
-                    update.notify(&sender);
-                }
+            .map_err(ActorError::HistoryCheckpoint);
+        let installed = *installed.lock().unwrap_or_else(|error| error.into_inner());
+        if !installed {
+            result.as_ref().map_err(Clone::clone)?;
+            if self.publication.is_cancelled() {
+                return Err(ActorError::PolicyCancelled);
             }
-            boundary
-        }))
+            if self.publication.cancel() {
+                return Err(ActorError::HistoryCheckpoint(
+                    "publication callback succeeded without claiming durable publication".into(),
+                ));
+            }
+            if let Some(prepared) = prepared
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+            {
+                prepared
+                    .install()
+                    .map_err(|error| ActorError::HistoryCheckpoint(error.to_string()))?;
+            }
+        }
+        let error = if installed { result.err() } else { None };
+        Ok((
+            Box::new(move |commit: &ConfigCommit| {
+                let _prepared = prepared;
+                (self.finalize)(commit);
+                if let Some(sender) = context_event_sender {
+                    for update in context_updates {
+                        update.notify(&sender);
+                    }
+                }
+            }),
+            error,
+        ))
     }
 }
 
@@ -674,7 +671,6 @@ impl PreparedOperationTicket {
                 {
                     update.notify(&sender);
                 }
-                None
             }),
         );
         if result.is_err() {
@@ -717,7 +713,9 @@ impl PreparedOperationTicket {
                 let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let id = operation.id;
                 let result = match result {
-                    Ok(finalize) => operation.commit_locked(&inner, &mut state, finalize),
+                    Ok((finalize, error)) => operation
+                        .commit_locked(&inner, &mut state, finalize)
+                        .and_then(|commit| error.map_or(Ok(commit), Err)),
                     Err(error) => {
                         operation.fail(error.clone());
                         Err(error)
@@ -779,8 +777,8 @@ impl PreparedOperation {
             history,
             commit: self.config_commit(inner, state),
             journal: None,
-            boundary: None,
             clear_pending_fast: self.clear_pending_fast,
+            install: None,
             journal_context: inner.context_journal(),
             context_updates: self
                 .ready
@@ -920,11 +918,10 @@ impl PreparedOperation {
             }
             ticket
         });
-        let boundary = finalize(&commit);
+        finalize(&commit);
         let result = PreparedCommit {
             config: commit.clone(),
             ticket,
-            boundary,
         };
         if changed {
             state
@@ -1239,7 +1236,11 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use makima_storage::{checkpoint::CheckpointPublication, sessions::HistorySnapshot};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use makima_providers::Message;
     use test_case::test_case;
@@ -1256,6 +1257,63 @@ mod tests {
     use crate::journal::JournalError;
     use crate::manager::{AgentLimits, AgentManagerHandle};
     use crate::tools::TurnToolBindings;
+
+    #[test_case(false; "preclaim_failure_does_not_finalize")]
+    #[test_case(true; "accepted_unsaved_publication_finalizes")]
+    fn publication_failure_preserves_only_installed_transactions(accepted: bool) {
+        smol::block_on(async {
+            const FAILURE: &str = "durability failure";
+            let finalized = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&finalized);
+            let config = Arc::new(EffectiveAgentConfig::new(policy(false), AgentMode::Build));
+            let commit = super::ConfigCommit {
+                identity: Arc::new(()),
+                generation: 1,
+                config: Arc::clone(&config),
+            };
+            let transaction = super::PreparedTransaction {
+                publication: CheckpointPublication::default(),
+                options: None,
+                state_edits: Vec::new(),
+                history_changed: false,
+                publish: Box::new(move |snapshot, publication| {
+                    Box::pin(async move {
+                        if accepted {
+                            assert!(publication.try_publish());
+                            snapshot.install.unwrap()().unwrap();
+                        }
+                        Err(FAILURE.into())
+                    })
+                }),
+                finalize: Box::new(move |_| observed.store(true, Ordering::SeqCst)),
+            };
+            let result = transaction
+                .publish(super::PreparedTransactionSnapshot {
+                    config,
+                    history: HistorySnapshot::default(),
+                    commit: commit.clone(),
+                    journal: None,
+                    clear_pending_fast: false,
+                    install: None,
+                    journal_context: None,
+                    context_updates: Vec::new(),
+                    context_event_sender: None,
+                })
+                .await;
+            if accepted {
+                let (finalize, error) = result.unwrap();
+                assert!(
+                    matches!(error, Some(ActorError::HistoryCheckpoint(message)) if message == FAILURE)
+                );
+                finalize(&commit);
+            } else {
+                assert!(
+                    matches!(result, Err(ActorError::HistoryCheckpoint(message)) if message == FAILURE)
+                );
+            }
+            assert_eq!(finalized.load(Ordering::SeqCst), accepted);
+        });
+    }
 
     #[test_case("commit"; "config_and_context_commit_together")]
     #[test_case("invalid_config"; "invalid_config_preserves_context")]

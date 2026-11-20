@@ -54,12 +54,12 @@ pub mod diff;
 pub mod permissions;
 pub mod plan_state;
 pub mod prompt;
-pub mod rewind;
 pub mod session_checkpoint;
 pub mod session_coordinator;
 pub mod session_defaults;
 pub mod session_options;
 pub mod session_recovery;
+pub mod session_writer;
 pub mod state;
 pub use state::{
     RawStateSnapshot, StateAccess, StateChangeEvent, StateChangeReason, StateEdit, StateError,

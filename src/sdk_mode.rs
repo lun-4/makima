@@ -1981,14 +1981,7 @@ fn fork_config_and_rules(session: &StoredSession) -> Result<Vec<StateChange>> {
 fn fork_parent(session: &StoredSession) -> ParentLink {
     ParentLink {
         session: session.id,
-        message_count: session.messages().len(),
-        seq: session
-            .state()
-            .iter()
-            .map(|record| record.seq)
-            .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
-            .max()
-            .unwrap_or_default(),
+        message: session.last_message_id(),
     }
 }
 
@@ -3063,6 +3056,11 @@ mod tests {
             let storage = StateDir::from_path(directory.path().to_path_buf());
             let cwd = directory.path().to_string_lossy().into_owned();
             let mut saved = StoredSession::new(STARTUP_MODEL, &cwd);
+            let parent = ParentLink {
+                session: MakimaId::generate(),
+                message: None,
+            };
+            saved.set_parent(Some(parent.clone()));
             if existing {
                 saved.save(&storage).unwrap();
             }
@@ -3081,12 +3079,6 @@ mod tests {
             saved.set_model(RESTORED_MODEL.into());
             saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
             saved.meta.input_draft = Some(SDK_CHILD_PROMPT.into());
-            let parent = ParentLink {
-                session: MakimaId::generate(),
-                message_count: 0,
-                seq: 0,
-            };
-            saved.set_parent(Some(parent.clone()));
             let modes = ModeRegistry::builtin();
             let config = StoredAgentConfig {
                 cwd: cwd.clone(),
@@ -4520,13 +4512,30 @@ mod tests {
             .join(SESSIONS_DIR)
             .join(format!("{}.jsonl", session.id));
         if legacy {
-            let records = std::fs::read_to_string(&source_path).unwrap();
-            let mut records: Vec<Value> = records
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            records.retain(|record| !matches!(record["t"].as_str(), Some("agent" | "state")));
-            records[0]["v"] = Value::from(2);
+            let header = serde_json::json!({
+                "t": "header", "v": 2, "id": session.id,
+                "model": STARTUP_MODEL, "cwd": THIS_CWD, "created_at": 1,
+            });
+            let mut records = vec![header];
+            records.extend(session.messages().iter().enumerate().map(|(index, message)| {
+                serde_json::json!({"t": "msg", "id": session.message_id(index).unwrap(), "d": message})
+            }));
+            let mut meta = serde_json::to_value(&session.meta).unwrap();
+            let meta = meta.as_object_mut().unwrap();
+            meta.insert("t".into(), Value::from("meta"));
+            meta.insert("title".into(), Value::from(session.title.clone()));
+            meta.insert(
+                "token_usage".into(),
+                serde_json::to_value(session.token_usage).unwrap(),
+            );
+            meta.insert("updated_at".into(), Value::from(2));
+            meta.insert(
+                "subagents".into(),
+                serde_json::json!([{
+                    "tool_use_id": SDK_NESTED_TOOL, "name": SDK_NESTED_TOOL,
+                }]),
+            );
+            records.push(Value::Object(meta.clone()));
             std::fs::write(
                 &source_path,
                 records
@@ -4537,6 +4546,9 @@ mod tests {
             .unwrap();
         }
         let source_bytes = std::fs::read(&source_path).unwrap();
+        let source_anchor = StoredSession::load(session.id, &storage)
+            .unwrap()
+            .last_message_id();
         let mut args = if latest {
             vec!["makima".to_owned(), "-l".to_owned()]
         } else {
@@ -4571,8 +4583,8 @@ mod tests {
             fork.then_some(session.id)
         );
         assert_eq!(
-            restored.parent.as_ref().map(|parent| parent.message_count),
-            fork.then_some(session.messages().len())
+            restored.parent.as_ref().map(|parent| parent.message),
+            fork.then_some(source_anchor)
         );
         assert_eq!(
             serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
@@ -5120,6 +5132,7 @@ mod tests {
             )
             .unwrap(),
         );
+        smol::block_on(child_checkpoint.bind_journal(handle.manager.journal())).unwrap();
         let catalog = ModelCatalog::default();
         smol::block_on(catalog.apply(vec![STARTUP_MODEL.into(), TARGET_MODEL.into()], None));
         let services = Arc::new_cyclic(|weak| {
@@ -5364,6 +5377,9 @@ mod tests {
             child.metadata.label.clone().unwrap_or_default(),
         );
         expected.agent_id = Some(child.agent_id.to_string());
+        expected.model = Some(child_config.model.spec().to_string());
+        expected.thinking = Some(child_config.thinking.into());
+        expected.fast = child_config.fast;
         assert_eq!(stored, &expected);
         let child_history = &persisted.subagent_messages()[&child_key];
         let current = child_ref.manager().journal().snapshot();

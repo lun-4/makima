@@ -134,7 +134,6 @@ pub struct JournalIncarnation {
 
 #[derive(Debug, Clone, Default)]
 pub struct JournalCommit {
-    pub boundary: Option<(AgentId, u64)>,
     pub state_edits: Vec<StateEdit>,
     pub context_updates: Vec<ContextUpdate>,
     pub state_epoch_agents: BTreeSet<AgentId>,
@@ -350,6 +349,7 @@ pub(crate) struct JournalState {
     delivery_bytes: BTreeMap<(AgentId, AgentId, TurnId), usize>,
     delivery_envelopes: BTreeMap<(AgentId, AgentId, TurnId), (u64, Arc<ChildDelivery>)>,
     checkpoint_error: Option<String>,
+    writer_error: Option<String>,
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
     aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
@@ -573,6 +573,7 @@ impl Default for SessionJournal {
                 delivery_bytes: BTreeMap::new(),
                 delivery_envelopes: BTreeMap::new(),
                 checkpoint_error: None,
+                writer_error: None,
                 conversion_errors: BTreeMap::new(),
                 aborted_preparations: BTreeSet::new(),
                 incarnations: BTreeMap::new(),
@@ -810,7 +811,12 @@ impl SessionJournal {
             .values()
             .next()
             .cloned()
+            .or_else(|| state.writer_error.clone())
             .or_else(|| state.checkpoint_error.clone())
+    }
+
+    pub(crate) fn set_writer_error(&self, error: Option<String>) {
+        self.lock().writer_error = error;
     }
 
     pub fn set_checkpoint_error(&self, error: Option<String>) {
@@ -1331,7 +1337,6 @@ impl SessionJournal {
                         && commit.histories.is_empty()
                         && commit.state_epoch_agents.is_empty()
                         && commit.managed_histories.is_empty()
-                        && commit.boundary.is_none()
                     {
                         return Err(JournalError::InvalidPending);
                     }
@@ -1705,35 +1710,6 @@ impl SessionJournal {
             validate_record(&change, 1)?;
             commit.changes.push(change);
         }
-        if let Some((agent, generation)) = commit.boundary.take() {
-            let history = commit
-                .histories
-                .get(&agent)
-                .or_else(|| state.snapshot.histories.get(&agent))
-                .ok_or_else(|| {
-                    JournalError::Preparation("boundary requires an agent history".into())
-                })?;
-            let mut lens: BTreeMap<_, _> = state
-                .snapshot
-                .histories
-                .iter()
-                .map(|(id, history)| (*id, (history.epoch, history.messages.len())))
-                .collect();
-            lens.extend(
-                commit
-                    .histories
-                    .iter()
-                    .map(|(id, history)| (*id, (history.epoch, history.messages.len()))),
-            );
-            commit.changes.push(JournalChange {
-                agent: Some(agent),
-                generation,
-                change: StateChange::Boundary {
-                    offset: history.messages.len(),
-                    lens,
-                },
-            });
-        }
         Ok(())
     }
 
@@ -1807,10 +1783,7 @@ impl SessionJournal {
         pending_change_count: usize,
     ) -> Result<JournalPending, JournalError> {
         Self::validate_incarnations(state, &commit.incarnations)?;
-        if !commit.state_edits.is_empty()
-            || !commit.context_updates.is_empty()
-            || commit.boundary.is_some()
-        {
+        if !commit.state_edits.is_empty() || !commit.context_updates.is_empty() {
             return Err(JournalError::InvalidPending);
         }
         for address in Self::state_addresses(&commit) {
@@ -2169,8 +2142,8 @@ mod tests {
     }
 
     #[test_case(false; "empty_snapshot")]
-    #[test_case(true; "snapshot_with_boundary")]
-    fn incremental_commit_rejects_bad_tail_atomically_and_shares_old_records(with_boundary: bool) {
+    #[test_case(true; "snapshot_with_state")]
+    fn incremental_commit_rejects_bad_tail_atomically_and_shares_old_records(with_state: bool) {
         let journal = SessionJournal::default();
         let agent = AgentId::generate();
         journal
@@ -2179,10 +2152,17 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        if with_boundary {
+        if with_state {
             journal
                 .commit(JournalCommit {
-                    boundary: Some((agent, 0)),
+                    changes: vec![JournalChange {
+                        agent: Some(agent),
+                        generation: 0,
+                        change: StateChange::Admitted {
+                            turn: TurnId::generate(),
+                            origin: StoredTurnOrigin::User,
+                        },
+                    }],
                     ..Default::default()
                 })
                 .unwrap();
@@ -2297,7 +2277,7 @@ mod tests {
 
     #[test_case(false; "cancelled_anchor_keeps_approval_unpublished")]
     #[test_case(true; "anchor_folds_resolved_approval_edit")]
-    fn prepared_boundary_follows_state_edit_without_changing_history(install: bool) {
+    fn prepared_state_edit_preserves_history(install: bool) {
         use crate::state::{StateScope, StateSlotSpec};
         use serde_json::Value;
         smol::block_on(async {
@@ -2325,21 +2305,14 @@ mod tests {
             let mut prepared = journal
                 .prepare(JournalCommit {
                     state_edits: vec![edit],
-                    boundary: Some((agent, 0)),
                     ..Default::default()
                 })
                 .await
                 .unwrap();
             let snapshot = prepared.snapshot();
-            let boundary = snapshot.state.iter().next_back().unwrap();
-            let reserved_sequence = boundary.seq;
-            assert!(
-                matches!(&boundary.change, StateChange::Boundary { offset, lens } if *offset == history.messages.len() && lens[&agent] == (history.epoch, history.messages.len()))
-            );
-            assert!(matches!(
-                snapshot.state.iter().rev().nth(1).unwrap().change,
-                StateChange::Plugin { .. }
-            ));
+            let record = snapshot.state.iter().next_back().unwrap();
+            let reserved_sequence = record.seq;
+            assert!(matches!(record.change, StateChange::Plugin { .. }));
             let view = snapshot.fold().unwrap();
             assert_eq!(view.scopes[&None].plugins[SLOT].value, Some(json!(SECOND)));
             assert_eq!(journal.snapshot().state, before.state);
@@ -2358,7 +2331,14 @@ mod tests {
             if !install {
                 let next = journal
                     .prepare(JournalCommit {
-                        boundary: Some((agent, 0)),
+                        changes: vec![JournalChange {
+                            agent: Some(agent),
+                            generation: 0,
+                            change: StateChange::Admitted {
+                                turn: TurnId::generate(),
+                                origin: StoredTurnOrigin::User,
+                            },
+                        }],
                         ..Default::default()
                     })
                     .await
