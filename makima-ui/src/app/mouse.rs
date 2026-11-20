@@ -395,7 +395,6 @@ impl App {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         match surface {
             Surface::Picker(picker) => self.handle_picker_key(picker, key),
-            Surface::Restore => self.handle_key(key),
             Surface::Help => {
                 self.help_modal.handle_key(key);
                 vec![]

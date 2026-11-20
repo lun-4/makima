@@ -52,7 +52,6 @@ pub mod context;
 #[cfg(test)]
 mod context_journal_tests;
 pub mod diff;
-pub mod file_restore;
 pub mod parent_rewind;
 pub mod permissions;
 pub mod plan_state;

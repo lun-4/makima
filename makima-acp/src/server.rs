@@ -18,9 +18,7 @@ use agent_client_protocol_schema::{
 };
 use event_listener::Event;
 use flume::{Receiver, Sender};
-use makima_agent::cancel::CancelToken;
 use makima_agent::config_change::ConfigChangeError;
-use makima_agent::file_restore::{OwnedRestoreLease, reconcile_session_guarded};
 use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCancel};
 use makima_agent::journal::SessionJournal;
 use makima_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
@@ -32,7 +30,7 @@ use makima_agent::session_coordinator::{
 };
 use makima_agent::session_defaults;
 use makima_agent::session_options::SessionOptionError;
-use makima_agent::tools::{FileWriteLocks, QuestionMode};
+use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
 use makima_agent::{AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
 use makima_commands::{
@@ -610,21 +608,6 @@ async fn load_session(
         .map_err(|error| session_registration_error(error.to_string()))?;
     let lock = start_session_lock_in(directory.clone(), session_ref.id())
         .map_err(session_registration_error)?;
-    reconcile_session_guarded(
-        &directory,
-        session_ref.id(),
-        BTreeMap::from([(
-            session_ref.id(),
-            OwnedRestoreLease {
-                guard: lock.publication_guard(),
-                keepalive: lock.clone(),
-            },
-        )]),
-        Arc::new(FileWriteLocks::new()),
-        CancelToken::none(),
-    )
-    .await
-    .map_err(|error| session_registration_error(error.to_string()))?;
     let mut restored = load_history_from(&params.storage, session_ref.id())?;
     if let Some(warning) = makima_agent::session_recovery::resolve_legacy_mode(
         &mut restored.seed,
@@ -2683,13 +2666,11 @@ mod tests {
     use makima_storage::StateDir;
     use makima_storage::checkpoint::{ClaimingWriter, accept_all};
     use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
-    use makima_storage::restore::{RestoreProgress, RestoreStore};
     use makima_storage::session_state::{
         StateChange, StoredCancellationReason, StoredStateRecord, StoredTurnOrigin,
         StoredTurnStatus,
     };
     use makima_storage::sessions::{Effort, Session, StoredThinking};
-    use makima_storage::test_util::pending_restore;
     use smol::future::poll_once;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -2703,8 +2684,6 @@ mod tests {
     const OFFLINE_SPEC: &str = "openai/gpt-5";
     const SAVED_PLAN_FILE: &str = "saved-plan.md";
     const SAVED_PLAN_CONTENT: &str = "saved legacy plan content";
-    const RESTORE_CHANGED: &str = "pending ACP restore content";
-    const RESTORE_CONFLICT: &str = "independent ACP edit";
 
     const THINKING_MODEL_ID: &str = "acp-load-thinker";
     const PRIMARY_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -7965,11 +7944,9 @@ mod tests {
 
     /// A loaded session comes back in the mode and thinking it was saved
     /// with, even when `always_thinking` says otherwise.
-    #[test_case(false, false; "v3")]
-    #[test_case(true, false; "v2")]
-    #[test_case(false, true; "v3_pending_restore")]
-    #[test_case(true, true; "pending_restore_after_persisted_v2_migration")]
-    fn load_restores_saved_mode_and_thinking_over_config(legacy: bool, pending: bool) {
+    #[test_case(false; "v3")]
+    #[test_case(true; "v2")]
+    fn load_restores_saved_mode_and_thinking_over_config(legacy: bool) {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             makima_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
@@ -8052,20 +8029,6 @@ mod tests {
                 )
                 .unwrap();
             }
-            let reference = pending.then(|| {
-                let mut stored = StoredSession::load(session.id, &storage).unwrap();
-                stored.save(&storage).unwrap();
-                let stored = StoredSession::load(session.id, &storage).unwrap();
-                let reference = pending_restore(
-                    &storage,
-                    &stored,
-                    &plan,
-                    SAVED_PLAN_CONTENT.as_bytes(),
-                    RESTORE_CHANGED.as_bytes(),
-                );
-                std::fs::write(&plan, RESTORE_CHANGED).unwrap();
-                reference
-            });
             let model = providers.model(&spec).unwrap();
             assert_eq!(model.supports_thinking(), Some(true));
             let mut params = test_params(model, tmp.path().to_path_buf());
@@ -8096,14 +8059,6 @@ mod tests {
             let root = srv.session.as_ref().unwrap().handle.manager.root().unwrap();
             let config = root.actor().unwrap().effective_config().unwrap();
             assert_eq!(config.mode, AgentMode::Plan(plan.clone()));
-            if let Some(reference) = reference {
-                let progress = RestoreStore::new(storage.clone())
-                    .load(&reference)
-                    .unwrap()
-                    .progress;
-                assert!(progress.contains(&RestoreProgress::RollbackIntent));
-                assert_eq!(progress.last(), Some(&RestoreProgress::Complete));
-            }
             assert_eq!(config.thinking, makima_agent::ThinkingConfig::Off);
             let migrated: Session<Message, TokenUsage, makima_agent::ToolOutput> =
                 Session::load(session.id, &storage).unwrap();
@@ -8162,90 +8117,6 @@ mod tests {
             assert!(resumed_plans[&root_id].written);
             assert_eq!(std::fs::read_to_string(&plan).unwrap(), SAVED_PLAN_CONTENT);
             close_session(&mut srv).await;
-        });
-    }
-
-    #[test_case(false; "published_forward")]
-    #[test_case(true; "published_conflict_blocks_config_and_transcript")]
-    fn acp_reconciles_published_restore_before_loading_config(conflict: bool) {
-        smol::block_on(async {
-            let directory = TempDir::new().unwrap();
-            let storage = StateDir::from_path(directory.path().to_path_buf());
-            let mut saved =
-                StoredSession::new(SPAWN_TEST_SPEC, &directory.path().to_string_lossy());
-            saved.bind_root_id(AgentId::generate()).unwrap();
-            saved.replace_messages(vec![Message::user(SAVED_PLAN_CONTENT.into())]);
-            saved.save(&storage).unwrap();
-            let path = directory.path().join(SAVED_PLAN_FILE);
-            let reference = pending_restore(
-                &storage,
-                &saved,
-                &path,
-                SAVED_PLAN_CONTENT.as_bytes(),
-                RESTORE_CHANGED.as_bytes(),
-            );
-            saved.push_restore_ref(reference.clone());
-            saved.save(&storage).unwrap();
-            std::fs::write(
-                &path,
-                if conflict {
-                    RESTORE_CONFLICT
-                } else {
-                    SAVED_PLAN_CONTENT
-                },
-            )
-            .unwrap();
-            let log = storage
-                .path()
-                .join(SESSIONS_DIR)
-                .join(format!("{}.jsonl", saved.id));
-            let before = std::fs::read(&log).unwrap();
-            let mut params = test_params(
-                Model::from_spec(SPAWN_TEST_SPEC).unwrap(),
-                directory.path().to_path_buf(),
-            );
-            params.providers = spec_providers();
-            let (out_tx, out_rx) = flume::unbounded();
-            let mut server = Server {
-                out_tx,
-                catalog: ModelCatalog::default(),
-                session: None,
-                elicitation: false,
-                supports_boolean: false,
-                lua_event_handle: params.lua_event_handle.clone(),
-                dispatch: None,
-            };
-            let raw = serde_json::json!({"params": {"sessionId": saved.id.to_string(), "cwd": directory.path(), "mcpServers": []}});
-            let result = within(load_session(&mut server, &raw, &params), EVENT_STREAM_ENDED).await;
-            if conflict {
-                assert!(result.is_err());
-                assert!(server.session.is_none());
-                assert!(out_rx.is_empty());
-                assert_eq!(std::fs::read(log).unwrap(), before);
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CONFLICT);
-                let snapshot = RestoreStore::new(storage.clone()).load(&reference).unwrap();
-                assert!(matches!(
-                    snapshot.progress.last(),
-                    Some(RestoreProgress::Conflict { .. })
-                ));
-                assert!(!snapshot.progress.contains(&RestoreProgress::Complete));
-                assert!(
-                    session_lock::claim(&storage.path().join(SESSIONS_DIR), &saved.id)
-                        .unwrap()
-                        .is_none()
-                );
-            } else {
-                result.unwrap();
-                assert!(server.session.is_some());
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CHANGED);
-                assert!(
-                    RestoreStore::new(storage)
-                        .pending(saved.id)
-                        .unwrap()
-                        .is_empty()
-                );
-                close_session(&mut server).await;
-            }
         });
     }
 

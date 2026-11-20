@@ -8,7 +8,7 @@
 //! `MakimaId` canonical form.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
@@ -29,7 +29,6 @@ use makima_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
 use makima_agent::config_change::ConfigChangeError;
-use makima_agent::file_restore::{OwnedRestoreLease, reconcile_session_guarded};
 use makima_agent::headless::{
     self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
     RootSubmission, WorkCancel,
@@ -45,7 +44,7 @@ use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, SessionOptionError, YOLO_OPTION_ID,
 };
 use makima_agent::session_recovery::RecoveredSession;
-use makima_agent::tools::{FileWriteLocks, QUESTION_TOOL_NAME, QuestionMode};
+use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
     ModeRegistry, PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
@@ -1743,22 +1742,6 @@ async fn recover_sdk_session(
             }
         },
     ));
-    reconcile_session_guarded(
-        &sessions_dir,
-        session_id.id(),
-        BTreeMap::from([(
-            session_id.id(),
-            OwnedRestoreLease {
-                guard: lock_guard.publication_guard(),
-                keepalive: lock_guard.clone(),
-            },
-        )]),
-        Arc::new(FileWriteLocks::new()),
-        CancelToken::none(),
-    )
-    .await
-    .map_err(|error| eyre!(error.to_string()))
-    .context("reconcile pending file restores")?;
     let owned_seed = match StoredSession::load(session_id.id(), storage) {
         Ok(seed) => Some(seed),
         Err(makima_storage::sessions::SessionError::Storage(
@@ -2751,10 +2734,9 @@ mod tests {
         StreamResponse,
     };
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
-    use makima_storage::restore::{RestoreProgress, RestoreStore};
     use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
     use makima_storage::sessions::{Prefs, StoredEffect, StoredRule, StoredThinking};
-    use makima_storage::test_util::pending_restore;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
     use test_case::test_case;
@@ -2791,8 +2773,6 @@ mod tests {
     const RESET_REJECTED: &str = "active reset rejected";
     const LEGACY_PLAN_FILE: &str = "legacy-sdk-plan.md";
     const LEGACY_PLAN_CONTENT: &str = "preserved legacy SDK plan";
-    const RESTORE_CHANGED: &str = "pending SDK restore content";
-    const RESTORE_CONFLICT: &str = "independent SDK edit";
 
     fn reset_sdk_params(cwd: PathBuf) -> SdkParams {
         use clap::Parser;
@@ -2974,11 +2954,8 @@ mod tests {
         });
     }
 
-    #[test_case(false; "unmodified_v2_resume")]
-    #[test_case(true; "pending_restore_after_persisted_v2_migration")]
-    fn sdk_legacy_v2_plan_resume_preserves_saved_path_and_written_state_before_idle_reset(
-        pending: bool,
-    ) {
+    #[test]
+    fn sdk_legacy_v2_plan_resume_preserves_saved_path_and_written_state_before_idle_reset() {
         use clap::Parser;
         let directory = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -3013,33 +2990,11 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        let reference = pending.then(|| {
-            let mut stored = StoredSession::load(saved.id, &storage).unwrap();
-            stored.save(&storage).unwrap();
-            let stored = StoredSession::load(saved.id, &storage).unwrap();
-            let reference = pending_restore(
-                &storage,
-                &stored,
-                &plan,
-                LEGACY_PLAN_CONTENT.as_bytes(),
-                RESTORE_CHANGED.as_bytes(),
-            );
-            std::fs::write(&plan, RESTORE_CHANGED).unwrap();
-            reference
-        });
         let mut params = reset_sdk_params(directory.path().to_path_buf());
         params.cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
         let (out_tx, _out_rx) = flume::unbounded();
         let session = SdkSession::new(params, storage.clone(), out_tx).unwrap();
         let resumed = session.current();
-        if let Some(reference) = reference {
-            let progress = RestoreStore::new(storage.clone())
-                .load(&reference)
-                .unwrap()
-                .progress;
-            assert!(progress.contains(&RestoreProgress::RollbackIntent));
-            assert_eq!(progress.last(), Some(&RestoreProgress::Complete));
-        }
         let root = resumed.root.target.id();
         assert_eq!(resumed.handle.session_id.id(), saved.id);
         assert_eq!(
@@ -3096,16 +3051,11 @@ mod tests {
         smol::block_on(fresh.close()).unwrap();
     }
 
-    #[test_case("-c", true, false; "valued_continue")]
-    #[test_case("--session-id", true, false; "pinned_existing")]
-    #[test_case("-l", true, false; "last")]
-    #[test_case("--session-id", false, false; "pinned_created_before_claim")]
-    #[test_case("-c", true, true; "restore_published_before_claim")]
-    fn sdk_recovery_reloads_checkpoint_published_after_resolution(
-        flag: &str,
-        existing: bool,
-        pending: bool,
-    ) {
+    #[test_case("-c", true; "valued_continue")]
+    #[test_case("--session-id", true; "pinned_existing")]
+    #[test_case("-l", true; "last")]
+    #[test_case("--session-id", false; "pinned_created_before_claim")]
+    fn sdk_recovery_reloads_checkpoint_published_after_resolution(flag: &str, existing: bool) {
         use clap::Parser;
 
         smol::block_on(async {
@@ -3157,20 +3107,6 @@ mod tests {
                 change: StateChange::Config(config.clone()),
             });
             saved.save(&storage).unwrap();
-            let path = directory.path().join(LEGACY_PLAN_FILE);
-            let reference = pending.then(|| {
-                let reference = pending_restore(
-                    &storage,
-                    &saved,
-                    &path,
-                    LEGACY_PLAN_CONTENT.as_bytes(),
-                    RESTORE_CHANGED.as_bytes(),
-                );
-                saved.push_restore_ref(reference.clone());
-                saved.save(&storage).unwrap();
-                std::fs::write(&path, LEGACY_PLAN_CONTENT).unwrap();
-                reference
-            });
             competing_lease.release().unwrap();
 
             let (checkpoint, lease, recovered) = recover_sdk_session(
@@ -3185,19 +3121,7 @@ mod tests {
             .unwrap();
             checkpoint.drain().await.unwrap();
             let durable = StoredSession::load(saved.id, &storage).unwrap();
-            if let Some(reference) = &reference {
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CHANGED);
-                assert_eq!(
-                    RestoreStore::new(storage.clone())
-                        .load(reference)
-                        .unwrap()
-                        .progress
-                        .last(),
-                    Some(&RestoreProgress::Complete)
-                );
-            }
             for session in [recovered.session(), &durable] {
-                assert_eq!(session.restore_refs(), saved.restore_refs());
                 assert_eq!(session.model, RESTORED_MODEL);
                 assert_eq!(session.root_agent_id(), Some(root));
                 assert_eq!(session.parent(), Some(&parent));
@@ -3475,83 +3399,6 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-        });
-    }
-
-    #[test_case(false; "published_forward")]
-    #[test_case(true; "published_conflict_blocks_recovery")]
-    fn sdk_reconciles_published_restore_before_checkpoint_recovery(conflict: bool) {
-        use clap::Parser;
-        smol::block_on(async {
-            let directory = tempfile::tempdir().unwrap();
-            let storage = StateDir::from_path(directory.path().to_path_buf());
-            let cwd = directory.path().to_string_lossy().into_owned();
-            let mut saved = StoredSession::new(RESET_MODEL, &cwd);
-            let root = AgentId::generate();
-            saved.bind_root_id(root).unwrap();
-            saved.save(&storage).unwrap();
-            let path = directory.path().join(LEGACY_PLAN_FILE);
-            let reference = pending_restore(
-                &storage,
-                &saved,
-                &path,
-                LEGACY_PLAN_CONTENT.as_bytes(),
-                RESTORE_CHANGED.as_bytes(),
-            );
-            saved.push_restore_ref(reference.clone());
-            saved.save(&storage).unwrap();
-            std::fs::write(
-                &path,
-                if conflict {
-                    RESTORE_CONFLICT
-                } else {
-                    LEGACY_PLAN_CONTENT
-                },
-            )
-            .unwrap();
-            let log = storage
-                .path()
-                .join(SESSIONS_DIR)
-                .join(format!("{}.jsonl", saved.id));
-            let before = std::fs::read(&log).unwrap();
-            let cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
-            let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
-            let result = recover_sdk_session(
-                &mut restored,
-                &storage,
-                &SessionRef::from(saved.id),
-                RESET_MODEL,
-                &cwd,
-                &ModeRegistry::builtin(),
-            )
-            .await;
-            if conflict {
-                assert!(result.is_err());
-                assert_eq!(std::fs::read(log).unwrap(), before);
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CONFLICT);
-                assert!(
-                    session_lock::claim(&storage.path().join(SESSIONS_DIR), &saved.id)
-                        .unwrap()
-                        .is_none()
-                );
-                let snapshot = RestoreStore::new(storage.clone()).load(&reference).unwrap();
-                assert!(matches!(
-                    snapshot.progress.last(),
-                    Some(RestoreProgress::Conflict { .. })
-                ));
-                assert!(!snapshot.progress.contains(&RestoreProgress::Complete));
-            } else {
-                let (checkpoint, lease, _) = result.unwrap();
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), RESTORE_CHANGED);
-                assert!(
-                    RestoreStore::new(storage.clone())
-                        .pending(saved.id)
-                        .unwrap()
-                        .is_empty()
-                );
-                checkpoint.drain().await.unwrap();
-                drop(lease);
-            }
         });
     }
 

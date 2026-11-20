@@ -96,7 +96,7 @@ One-shot `--print` always starts a new session in build mode and does not save i
 
 SDK sessions persist the agent graph, histories, committed configuration, and recorded context. Resuming restores durable agent IDs and retained results without replaying unfinished model requests or tools. Recovery marks unfinished admitted turns as `interrupted`; new input starts new work. Children remain dormant until reactivated for work. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) for reactivation limits and child-report delivery.
 
-Rewind pickers and restore dialogs require the TUI; SDK mode does not expose them as interactive commands. A session with an unfinished file restore must reconcile it before accepting new work. See [Rewind and branches](/docs/agent-work/#rewind-and-branches) for file conflicts and platform limits.
+Rewind pickers require the TUI; SDK mode does not expose them as interactive commands. See [Rewind and branches](/docs/agent-work/#rewind-and-branches).
 
 SDK `set_permission_mode` commits plan mode for `plan` and build mode for any other value, as durable session config, the same way `/mode` does in the TUI.
 

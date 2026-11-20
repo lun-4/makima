@@ -981,7 +981,7 @@ mod tests {
     fn grouped_pool_freezes_terminal_history_before_late_cleanup_after_restart(
         lifecycle: StoredAgentLifecycle,
     ) {
-        use crate::file_restore::StoredSession;
+        use crate::journal::StoredSession;
         smol::block_on(async {
             let (journal, root, _, sibling, child_boundary) = fixture();
             let mut terminal = journal.agent(sibling).unwrap();

@@ -36,7 +36,6 @@ use makima_lua::{
 };
 use makima_providers::Model;
 use makima_storage::id::{MakimaId, SessionRef};
-use makima_storage::session_state::StateChange;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
@@ -616,70 +615,6 @@ fn permission_scopes_valid_string_field_accepted() {
     );
     host.load_source("ok_scope_plugin", &src).unwrap();
     assert!(reg.has("ok_scope"));
-}
-
-#[test]
-fn batch_records_only_its_actual_bash_child_as_shell_execution() {
-    const SHELL_KIND: &str = "execute";
-    const OUTPUT: &str = "XY";
-    const UNKNOWN_TASK: &str = "unknown task_id";
-    let directory = tempfile::tempdir().unwrap();
-    let (reg, host) = builtins_host();
-    for entry in reg.iter().iter() {
-        assert_eq!(entry.tool.shell_execution(), entry.tool.name() == "bash");
-    }
-    let (mut ctx, _events, cancel) = common::ctx_with_canned_provider();
-    ctx.config.rtk = false;
-    let session = MakimaId::generate();
-    ctx.session_id = Some(SessionRef::from(session));
-    ctx.offload = Some(Arc::new(OffloadStore::for_session(
-        directory.path(),
-        ctx.session_id.as_ref().unwrap(),
-    )));
-    ctx.registry = Arc::clone(&reg);
-    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-    let config = common::effective_config(&ctx);
-    common::bind_parked_root(&host, &reg, &mut ctx, config, Default::default());
-    let manager = ctx.managed_turn.as_ref().unwrap().manager();
-    manager.journal().bind_session(session).unwrap();
-    let done = smol::block_on(futures_lite::future::race(
-        tool_dispatch::run(
-            String::new(),
-            "batch",
-            &json!({ "tool_calls": [
-                { "tool": "bash", "parameters": { "command": BASH_PROBE_COMMAND } },
-                { "tool": "task_wait", "parameters": { "task_id": UNKNOWN_TASK } },
-            ] }),
-            &ctx,
-            CallOrigin::Model,
-        ),
-        async {
-            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
-            panic!("batch shell recording did not settle");
-        },
-    ));
-    let output = done.output.as_text();
-    assert!(output.contains(OUTPUT), "{output}");
-    assert!(output.contains(UNKNOWN_TASK), "{output}");
-    let snapshot = manager.journal().checkpoint_snapshot().unwrap();
-    assert_eq!(
-        snapshot
-            .state
-            .iter()
-            .filter(|record| matches!(
-                &record.change, StateChange::ToolExecution { kind } if kind == SHELL_KIND
-            ))
-            .count(),
-        1
-    );
-    cancel.cancel();
-    assert!(
-        smol::block_on(common::bounded(
-            manager.shutdown(Duration::from_secs(ZERO_BASH_TIMEOUT_SECS,))
-        ))
-        .timed_out
-        .is_empty()
-    );
 }
 
 #[test]

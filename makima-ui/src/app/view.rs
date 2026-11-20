@@ -477,13 +477,6 @@ impl App {
         render_if_open!(self.login_picker, Login);
         render_if_open!(self.mcp_picker, Mcp);
 
-        if self.restore_form.is_open() {
-            let (outer, hits) = self.restore_form.view(frame, full);
-            self.hits.surface(Surface::Restore, outer, true);
-            self.absorb_hits(hits);
-            rects.push(outer);
-        }
-
         rects
     }
 
@@ -763,9 +756,7 @@ impl App {
         {
             return contexts;
         }
-        if self.restore_form.is_open() {
-            contexts.push(KeybindContext::FormInput);
-        } else if self.model_picker.is_open() && self.plan_form_active() {
+        if self.model_picker.is_open() && self.plan_form_active() {
             contexts.push(KeybindContext::ModelPicker);
         } else if self.plan_form_active() {
             contexts.push(KeybindContext::FormInput);

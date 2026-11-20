@@ -99,7 +99,7 @@ fn restored_preview_bytes(delivery: &StoredDelivery) -> usize {
         .map_or(0, str::len)
 }
 
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+pub(crate) type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 type PendingDeliveryEnvelope = (AgentId, TurnId, Option<Arc<ChildDelivery>>);
 
 #[derive(Debug, Error)]
@@ -2662,7 +2662,11 @@ mod tests {
                 seq,
                 agent: None,
                 generation: 0,
-                change: StateChange::ToolExecution { kind: SLOT.into() },
+                change: StateChange::Plugin {
+                    key: SLOT.into(),
+                    version: 1,
+                    value: None,
+                },
             })
             .collect();
         session.replace_state(records);

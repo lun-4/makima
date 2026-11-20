@@ -100,9 +100,9 @@ These invariants cover the actor, manager and agent frontends as they are curren
 68. Durable graph records, ids, retained results, configuration, state slots, and delivery disposition survive checkpointed restart. Active invocations, accepted input payloads, runtime resources, and permission prompts do not. Recovery terminalizes unfinished admissions as Interrupted and never reexecutes them.
 69. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
 
-## Journal, recovery, and file restoration
+## Journal, recovery, and rewind
 
-70. Agent revisions and state changes share one session journal sequence. Config, rules, context, plugin state, admissions, outcomes, deliveries, and file changes must not acquire independent competing orders.
+70. Agent revisions and state changes share one session journal sequence. Config, rules, context, plugin state, admissions, outcomes, and deliveries must not acquire independent competing orders.
 71. Teardown never records Closed or Retired for an open durable agent. Detachment revokes the old incarnation and retains ownership through tool completion and cleanup before making resources reusable.
 72. Recovery publishes sanitized history, interrupted results, and state before admission or observer activation. Configuration, permissions, plan state, registered plugin state, and recorded context must match that checkpoint.
 73. Delivery deduplication keys by `(AgentId, TurnId)` and records consumed, withdrawn, or dropped disposition durably. Restart and compaction must not redeliver a terminally disposed result from retained state.
@@ -110,14 +110,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 75. Session saves write v3; v2 import has no downgrade path. Grouped boundary snapshots are baseline v3 and require the string marker `boundary-pool-v1` and an explicit ordered `boundaries` list. The first v3 release writes an empty header feature set. Unknown versions, unsupported feature names, and complete unsupported record schemas fail closed.
 76. History epochs are opaque ordered identities within one namespace. Import remints distinct saved epochs while preserving order, equality, and all retained references. Independent imported namespaces must never be merged by equal raw epoch numbers.
 77. Rewind reserves the affected graph, actors, journal replacement, state changes, and frontend projections before publication. Branch restoration must preserve the displaced checkpoint and reject unavailable branch history rather than approximate it.
-78. File restoration validates all required blobs before writes and checks expected content under the same canonical locks used by mutable tools. Missing files use explicit Absent states. Unsafe path substitutions and unrelated content must not be overwritten.
-79. Manifest and blob references precede writes durably. Post-rename preparation errors return the visible transition reference so an unresolved receipt retains locks, barriers, and renewing session-lease owners until settlement.
-80. Baseline durability precedes file mutation. Before target publication, abort repairs toward before-state. After visible target publication, cancellation or sync failure retains forward repair and never rolls files back beneath the published conversation. New admission waits for target durability and file completion.
-81. Complete requires no unresolved latest per-path Conflict and no unfinished work. The engine verifies content before recording Applied or RolledBack. A later outcome can resolve an earlier conflict without changing the event schema.
-82. Inverse restore includes only paths actually applied by a completed published forward transition. Skipped paths remain untouched, and files-only restore does not change the conversation revision.
-83. Startup validates checkpoint and retained-branch transition references, including completed manifests, and discovers pending work from both endpoints. Missing or corrupt required metadata blocks admission. A readable Complete record is not acknowledged until its progress file sync succeeds.
-84. Restore recovery holds actual owned leases for owner, source, and target sessions, not publication guards alone. Deletion holds the restore namespace guard and cannot remove pending or referenced cross-session manifests, blobs, or inverse dependencies.
-85. Unsupported platforms reject file restore explicitly. Metadata-free legacy startup and deletion may use conservative read-only inspection; inspection errors or restore artifacts must fail closed rather than enabling path-based restoration.
+78. Rewind never reads, restores, or writes user files. Baseline durability precedes target publication. After visible target publication, cancellation or sync failure retains forward completion. New admission waits for target durability.
 
 ## Verification expectations
 

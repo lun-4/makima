@@ -666,22 +666,6 @@ impl PluginHost {
         Ok(reply_rx)
     }
 
-    #[cfg(feature = "memory-profile")]
-    pub fn profile_memory(&self, collect: bool) -> Result<usize, PluginError> {
-        let (reply, response) = flume::bounded(1);
-        self.inner
-            .tx
-            .send(Request::ProfileMemory { collect, reply })
-            .map_err(|_| PluginError::HostDead)?;
-        response
-            .recv()
-            .map_err(|_| PluginError::HostDead)?
-            .map_err(|source| PluginError::Lua {
-                plugin: "<memory-profile>".to_owned(),
-                source,
-            })
-    }
-
     #[cfg(feature = "test-support")]
     pub fn collect_garbage_for_test(&self) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);

@@ -59,7 +59,3 @@ makima-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }
 
-[[bench]]
-name = "boundary_pin_profile"
-harness = false
-

@@ -2,10 +2,9 @@ use async_lock::Mutex;
 use makima_agent::tools::FileWriteLocks;
 use makima_agent::{CancelToken, ModeRegistry};
 use makima_storage::StateDir;
-use makima_storage::session_lock::SessionPublicationGuard;
 use makima_storage::session_state::ParentLink;
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex as SyncMutex};
 
@@ -13,18 +12,12 @@ use makima_agent::actor::EffectiveAgentConfig;
 use makima_agent::actor::{ActorIdleGuard, InstalledActorRewind};
 use makima_agent::cancel::PublicationRegistration;
 use makima_agent::config_change::prepare_restore;
-use makima_agent::file_restore::AppliedRestore;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use makima_agent::file_restore::PreparedRestore;
-use makima_agent::file_restore::{
-    self, OwnedRestoreLease, PlanProjection, RestoreRequest, RestoreSegment, SUPPORTED,
-};
 use makima_agent::journal::{
-    JournalReplacement, PreparedRewindNotification, SessionJournal, SessionJournalSnapshot,
+    JournalChange, JournalReplacement, PreparedRewindNotification, SessionJournal,
+    SessionJournalSnapshot,
 };
 use makima_agent::manager::{ManagerRewindGuard, ManagerTransitionGuard};
 use makima_agent::permissions::PermissionSnapshot;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use makima_agent::plan_state::PlanProjectionRollback;
 use makima_agent::rewind::RewindBoundary;
 use makima_agent::session_coordinator::PreparedRewindProjection;
@@ -32,16 +25,11 @@ use makima_agent::{AgentId, AgentRef};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::MakimaId;
 use makima_storage::now_epoch;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use makima_storage::restore::RestoreStore;
-use makima_storage::restore::{RestoreChoice, RestoreEndpoint, TransitionRef};
-use makima_storage::restore_digest::session_digest;
 use makima_storage::session_lock;
-use makima_storage::session_lock::ClaimedSessionLock;
 use makima_storage::session_state::StoredBranch;
 use tracing::warn;
 
-use super::{EventLoop, InternalEvent, LOCK_LOST_REPLACEMENT_ERR, SessionLockState};
+use super::{EventLoop, InternalEvent, LOCK_LOST_REPLACEMENT_ERR};
 use crate::AppSession;
 use crate::app::RESTORE_IN_PROGRESS;
 use crate::storage_writer::{
@@ -51,9 +39,6 @@ use crate::storage_writer::{
 #[cfg(test)]
 pub(crate) mod tests;
 
-const FILE_RESTORE_UNSUPPORTED: &str =
-    "File restore is not supported on this platform; choose Conversation";
-const RESTORE_CANCELLED: &str = "Restore cancelled";
 const INVALID_PARENT_ROUTE: &str = "Parent restore route changed or contains a cycle";
 const PUBLISHED_INSTALL_FAILED: &str = "Published restore could not be installed";
 const PARENT_INITIALIZATION_CHANGED: &str =
@@ -66,7 +51,7 @@ pub(super) enum RestoreTarget {
     Branch(MakimaId),
 }
 
-struct PendingParentFiles(Option<RestoreFiles>);
+struct PendingParentFiles(Option<PlanRollback>);
 
 impl PendingParentFiles {
     fn abort(mut self) -> Result<(), String> {
@@ -134,7 +119,7 @@ pub(super) struct InstalledRestore {
     actors: Vec<InstalledActorRewind>,
     projection: Option<PreparedRewindProjection>,
     warnings: Vec<String>,
-    receipt: RestoreFiles,
+    receipt: PlanRollback,
 }
 
 impl EventLoop<'_> {
@@ -146,39 +131,6 @@ impl EventLoop<'_> {
             self.sessions[idx].app.restore_in_progress = false;
             self.sessions[idx].app.flash(error);
         }
-    }
-
-    pub(super) fn complete_files_restore(
-        &mut self,
-        idx: usize,
-        result: Result<Box<FilesRestore>, String>,
-    ) {
-        let restored = match result {
-            Ok(restored) => restored,
-            Err(error) => {
-                self.restore_failed(idx, error);
-                return;
-            }
-        };
-        let runtime = &mut self.sessions[idx];
-        Arc::make_mut(&mut runtime.app.state.session).push_branch(restored.branch);
-        Arc::make_mut(&mut runtime.app.state.session).push_restore_ref(restored.reference);
-        runtime.app.storage_fence = restored.fence;
-        let checkpoint = self.ctx.storage_writer.coordinator_checkpoint();
-        checkpoint.bind(
-            runtime
-                .session_lock
-                .as_ref()
-                .and_then(SessionLockState::publication_guard),
-        );
-        if let Err(error) = runtime.coordinator.rebind_checkpoint_writer(checkpoint) {
-            self.restore_failed(idx, format!("{PUBLISHED_INSTALL_FAILED}: {error}"));
-            return;
-        }
-        for warning in restored.warnings {
-            runtime.app.flash(warning);
-        }
-        runtime.app.restore_in_progress = false;
     }
 
     pub(super) fn dispatch_parent_restore(
@@ -202,20 +154,14 @@ impl EventLoop<'_> {
                 .reserve_graph_transition()
                 .map_err(|error| error.to_string())?,
         );
-        let source_id = runtime.id();
-        let sessions_dir = self.ctx.sessions_dir.clone();
-        let storage = self.ctx.storage.clone();
         let source_session = runtime.app.state.session.as_ref().clone();
         let source_lease = runtime.share_session_lease()?;
-        let supplied = BTreeMap::from([(source_id, owned_lease(&source_lease))]);
-        let (parent, link, route_leases, mut segments) = parent_route(
+        let (parent, link, route_leases) = parent_route(
             &source_session,
             session,
             seq,
-            &sessions_dir,
-            &storage,
-            supplied,
-            Arc::clone(&self.ctx.file_write_locks),
+            &self.ctx.sessions_dir,
+            &self.ctx.storage,
         )?;
         if !makima_agent::parent_rewind::boundaries(&parent, &link)
             .map_err(|error| error.to_string())?
@@ -243,11 +189,11 @@ impl EventLoop<'_> {
             .apply_to(&mut implementation)
             .map_err(|error| error.to_string())?;
         let implementation_checkpoint = CurrentSessionCheckpoint {
-            session: Arc::new(implementation.clone()),
-            journal: implementation_journal.clone(),
+            session: Arc::new(implementation),
+            journal: implementation_journal,
             publication: CheckpointPublication::default(),
             claim: super::publication_claim(),
-            guard: implementation_guard.clone(),
+            guard: implementation_guard,
             fence: runtime.app.storage_fence.clone(),
         };
         let writer = Arc::clone(&self.ctx.storage_writer);
@@ -279,47 +225,7 @@ impl EventLoop<'_> {
                     seq,
                     epoch: journal.snapshot().epoch,
                 };
-                if let Some(segment) = segments.last_mut() {
-                    segment.session = implementation.clone();
-                    segment.through_seq = implementation.sequence_high_water().unwrap_or_default();
-                    segment.affected = implementation.agents().keys().copied().collect();
-                }
-                let preview = plan_restore_files(&segments).map_err(|error| error.to_string())?;
-                let choice = confirm_restore(
-                    &internal,
-                    source_id,
-                    identity.clone(),
-                    &preview,
-                    RestoreChoice::ConversationAndFiles,
-                )
-                .await?;
-                if choice == RestoreChoice::FilesOnly {
-                    let barrier = (
-                        Arc::clone(&source_guard),
-                        route_leases,
-                        Arc::clone(&source_lease),
-                    );
-                    let result = publish_files_only(
-                        &writer,
-                        &sessions_dir,
-                        implementation,
-                        implementation_journal,
-                        preview,
-                        locks,
-                        cancel,
-                        &modes,
-                        implementation_guard,
-                        barrier,
-                    )
-                    .await;
-                    let _ = internal.send(InternalEvent::FilesRestoreReady {
-                        session: source_id,
-                        runtime: identity.clone(),
-                        result: result.map(Box::new),
-                    });
-                    return Ok(None);
-                }
-                let mut files: Option<RestoreFiles> = None;
+                let mut files: Option<PlanRollback> = None;
                 let outcome = async {
                     let mut replacement = journal
                         .prepare_rewind(boundary)
@@ -338,26 +244,11 @@ impl EventLoop<'_> {
                     replacement
                         .apply_migrations(state.changes)
                         .map_err(|error| error.to_string())?;
-                    let request = RestoreRequest {
-                        sessions_dir: sessions_dir.clone(),
-                        owner: source_id,
-                        source: endpoint(&implementation, None)?,
-                        target: endpoint(&parent, None)?,
-                        choice: choice.clone(),
-                        preview: if choice == RestoreChoice::ConversationOnly {
-                            file_restore::RestorePreview::default()
-                        } else {
-                            preview
-                        },
-                        projection: Some(PlanProjection {
-                            snapshot: replacement.snapshot().clone(),
-                            affected: replacement.affected_agents().clone(),
-                        }),
-                        locks,
-                        cancel: cancel.clone(),
-                    };
-                    let receipt = prepare_restore_files(
-                        request,
+                    let receipt = capture_plan_rollback(
+                        replacement.snapshot().clone(),
+                        replacement.affected_agents().clone(),
+                        &locks,
+                        &cancel,
                         (
                             Arc::clone(&source_guard),
                             route_leases,
@@ -366,10 +257,10 @@ impl EventLoop<'_> {
                     )
                     .await?;
                     files = Some(receipt);
-                    let applied = files.as_mut().ok_or(super::NOT_LIVE_ERR)?.apply(&modes)?;
-                    let warnings = applied.warnings;
+                    let (changes, warnings) =
+                        files.as_mut().ok_or(super::NOT_LIVE_ERR)?.apply(&modes)?;
                     replacement
-                        .apply_configs(applied.changes)
+                        .apply_configs(changes)
                         .map_err(|error| error.to_string())?;
                     let snapshot = replacement.snapshot().clone();
                     let view = snapshot
@@ -402,17 +293,11 @@ impl EventLoop<'_> {
                         at_seq: journal.snapshot().seq,
                         agent: root,
                         offset: parent.messages().len(),
-                        transition: files.as_ref().ok_or(super::NOT_LIVE_ERR)?.transition_ref(),
                     };
                     session.push_branch(branch.clone());
-                    if let Some(reference) =
-                        files.as_ref().ok_or(super::NOT_LIVE_ERR)?.transition_ref()
-                    {
-                        session.push_restore_ref(reference);
-                    }
                     writer.seed(Arc::new(parent));
                     writer.bind_journal(session.id, Arc::clone(&journal));
-                    Ok(Some(PreparedParentRestore {
+                    Ok(PreparedParentRestore {
                         session,
                         config,
                         lease: renewing,
@@ -424,7 +309,7 @@ impl EventLoop<'_> {
                         branch,
                         _publication: registration,
                         source_guard,
-                    }))
+                    })
                 }
                 .await;
                 if outcome.is_err()
@@ -437,14 +322,9 @@ impl EventLoop<'_> {
                 outcome
             }
             .await;
-            if let Ok(None) = result {
-                return;
-            }
             if let Err(error) = internal.send(InternalEvent::ParentRestoreReady {
                 runtime: identity,
-                result: result
-                    .and_then(|value| value.ok_or_else(|| super::NOT_LIVE_ERR.to_owned()))
-                    .map(Box::new),
+                result: result.map(Box::new),
             }) && let InternalEvent::ParentRestoreReady {
                 result: Ok(restored),
                 ..
@@ -775,7 +655,6 @@ impl EventLoop<'_> {
         } else {
             None
         };
-        let sessions_dir = self.ctx.sessions_dir.clone();
         let file_write_locks = Arc::clone(&self.ctx.file_write_locks);
         let cancel = runtime.lifetime_cancel.clone();
         runtime.app.restore_in_progress = true;
@@ -797,7 +676,7 @@ impl EventLoop<'_> {
                         .map_err(|error| error.to_string())?,
                 ));
                 let journal = manager.journal();
-                let mut rollback: Option<RestoreFiles> = None;
+                let mut rollback: Option<PlanRollback> = None;
                 let mut published = false;
                 let result = async {
                     let (reply, snapshot) = flume::bounded(1);
@@ -831,55 +710,6 @@ impl EventLoop<'_> {
                         .await_publication_sync(&save_fence, &cancel)
                         .await
                         .map_err(|error| format!("{ABORT_REPAIR_FAILED}: {error}"))?;
-                    let preview = match &selection {
-                        RestoreTarget::Boundary(boundary) => {
-                            plan_restore_files(&[RestoreSegment {
-                                session: current.clone(),
-                                after_seq: boundary.seq,
-                                through_seq: journal.snapshot().seq,
-                                affected: held.lock().await.affected_agents().clone(),
-                            }])
-                        }
-                        RestoreTarget::Branch(id) => match current
-                            .branches()
-                            .iter()
-                            .find(|branch| branch.id == *id)
-                            .and_then(|branch| branch.transition.as_ref())
-                        {
-                            Some(reference) => inverse_restore_files(&sessions_dir, reference),
-                            None => Ok(file_restore::RestorePreview::default()),
-                        },
-                    }
-                    .map_err(|error| error.to_string())?;
-                    let choice = confirm_restore(
-                        &internal,
-                        session_id,
-                        identity.clone(),
-                        &preview,
-                        RestoreChoice::ConversationOnly,
-                    )
-                    .await?;
-                    if choice == RestoreChoice::FilesOnly {
-                        let restored = publish_files_only(
-                            &writer,
-                            &sessions_dir,
-                            current,
-                            journal.checkpoint_snapshot()?,
-                            preview,
-                            file_write_locks,
-                            cancel.clone(),
-                            &modes,
-                            guard.clone(),
-                            (Arc::clone(&held), Arc::clone(&source_lease)),
-                        )
-                        .await;
-                        let _ = internal.send(InternalEvent::FilesRestoreReady {
-                            session: session_id,
-                            runtime: identity.clone(),
-                            result: restored.map(Box::new),
-                        });
-                        return Ok(None);
-                    }
                     let mut replacement = match &selection {
                         RestoreTarget::Boundary(boundary) => {
                             journal.prepare_rewind(boundary.clone()).await
@@ -909,42 +739,21 @@ impl EventLoop<'_> {
                     replacement
                         .apply_migrations(prepared_state.changes)
                         .map_err(|error| error.to_string())?;
-                    let request = RestoreRequest {
-                        sessions_dir: sessions_dir.clone(),
-                        owner: session_id,
-                        source: endpoint(&current, None)?,
-                        target: match &selection {
-                            RestoreTarget::Boundary(_) => endpoint(&current, None)?,
-                            RestoreTarget::Branch(id) => {
-                                endpoint(restored.as_ref().ok_or(super::NOT_LIVE_ERR)?, Some(*id))?
-                            }
-                        },
-                        choice: choice.clone(),
-                        preview: if choice == RestoreChoice::ConversationOnly {
-                            file_restore::RestorePreview::default()
-                        } else {
-                            preview
-                        },
-                        projection: Some(PlanProjection {
-                            snapshot: replacement.snapshot().clone(),
-                            affected: affected.clone(),
-                        }),
-                        locks: file_write_locks,
-                        cancel: cancel.clone(),
-                    };
-                    let receipt = prepare_restore_files(
-                        request,
+                    let receipt = capture_plan_rollback(
+                        replacement.snapshot().clone(),
+                        affected.clone(),
+                        &file_write_locks,
+                        &cancel,
                         (Arc::clone(&held), Arc::clone(&source_lease)),
                     )
                     .await?;
                     rollback = Some(receipt);
-                    let applied = rollback
+                    let (changes, warnings) = rollback
                         .as_mut()
                         .ok_or(super::NOT_LIVE_ERR)?
                         .apply(&modes)?;
-                    let warnings = applied.warnings;
                     replacement
-                        .apply_configs(applied.changes)
+                        .apply_configs(changes)
                         .map_err(|error| error.to_string())?;
                     let mut manager_guard = held.lock().await;
                     let actors = manager_guard
@@ -998,23 +807,12 @@ impl EventLoop<'_> {
                             .histories
                             .get(&target.id())
                             .map_or(0, |history| history.messages.len()),
-                        transition: rollback
-                            .as_ref()
-                            .ok_or(super::NOT_LIVE_ERR)?
-                            .transition_ref(),
                     };
                     let mut authoritative = current;
                     authoritative
                         .replace_authoritative(session)
                         .map_err(|error| error.to_string())?;
                     authoritative.push_branch(branch.clone());
-                    if let Some(reference) = rollback
-                        .as_ref()
-                        .ok_or(super::NOT_LIVE_ERR)?
-                        .transition_ref()
-                    {
-                        authoritative.push_restore_ref(reference);
-                    }
                     let _registration = coordinator
                         .register_publication(&publication)
                         .map_err(|error| error.to_string())?;
@@ -1064,7 +862,7 @@ impl EventLoop<'_> {
                         }
                     };
                     drop(manager_guard);
-                    Ok(Some(InstalledRestore {
+                    Ok(InstalledRestore {
                         session: authoritative,
                         target: target.id(),
                         draft,
@@ -1078,7 +876,7 @@ impl EventLoop<'_> {
                         receipt: rollback
                             .take()
                             .ok_or_else(|| super::NOT_LIVE_ERR.to_owned())?,
-                    }))
+                    })
                 }
                 .await;
                 if result.is_err()
@@ -1100,15 +898,10 @@ impl EventLoop<'_> {
                 result
             }
             .await;
-            if let Ok(None) = result {
-                return;
-            }
             let _ = internal.send(InternalEvent::RestoreReady {
                 session: session_id,
                 runtime: identity,
-                result: result
-                    .and_then(|value| value.ok_or_else(|| super::NOT_LIVE_ERR.to_owned()))
-                    .map(Box::new),
+                result: result.map(Box::new),
             });
         })
         .detach();
@@ -1204,376 +997,50 @@ impl EventLoop<'_> {
     }
 }
 
-async fn reconcile_owned_sessions(
-    sessions_dir: &Path,
-    session: MakimaId,
-    supplied: BTreeMap<MakimaId, OwnedRestoreLease>,
-    locks: Arc<FileWriteLocks>,
-    cancel: CancelToken,
-) -> Result<(), file_restore::RestoreError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        file_restore::reconcile_session_guarded(sessions_dir, session, supplied, locks, cancel)
-            .await
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (supplied, locks, cancel);
-        let state = sessions_dir
-            .parent()
-            .ok_or_else(|| file_restore::RestoreError::Invalid(FILE_RESTORE_UNSUPPORTED.into()))?;
-        if RestoreStore::new(StateDir::from_path(state.to_path_buf()))
-            .pending_for_session(session)?
-            .is_empty()
-        {
-            Ok(())
-        } else {
-            Err(file_restore::RestoreError::Invalid(
-                FILE_RESTORE_UNSUPPORTED.into(),
-            ))
-        }
-    }
-}
-
-pub(super) fn reconcile_startup(
-    sessions_dir: &Path,
-    session: MakimaId,
-    lease: Option<ClaimedSessionLock>,
-    locks: Arc<FileWriteLocks>,
-) -> Result<Option<ClaimedSessionLock>, String> {
-    let Some(lease) = lease else {
-        return Err(format!(
-            "{ABORT_REPAIR_FAILED}: startup requires an owned session lease"
-        ));
-    };
-    let lease = Arc::new(super::RenewingDeletionLease::new(lease));
-    let supplied = BTreeMap::from([(session, owned_lease(&lease))]);
-    smol::block_on(reconcile_owned_sessions(
-        sessions_dir,
-        session,
-        supplied,
-        locks,
-        CancelToken::none(),
-    ))
-    .map_err(|error| format!("{ABORT_REPAIR_FAILED}: {error}"))?;
-    Arc::try_unwrap(lease)
-        .map_err(|_| super::NOT_LIVE_ERR.to_owned())?
-        .into_claimed_lock()
-        .map(Some)
-}
-
 type RouteLease = Arc<super::RenewingDeletionLease>;
-type ParentRoute = (
-    AppSession,
-    ParentLink,
-    Vec<(MakimaId, RouteLease)>,
-    Vec<RestoreSegment>,
-);
+type ParentRoute = (AppSession, ParentLink, Vec<(MakimaId, RouteLease)>);
 
-fn owned_lease(lease: &RouteLease) -> OwnedRestoreLease {
-    OwnedRestoreLease {
-        guard: lease.publication_guard(),
-        keepalive: lease.clone(),
-    }
-}
-
-pub(super) struct FilesRestore {
-    branch: StoredBranch,
-    reference: TransitionRef,
-    fence: SessionSaveFence,
-    warnings: Vec<String>,
-}
-
-fn endpoint(session: &AppSession, branch: Option<MakimaId>) -> Result<RestoreEndpoint, String> {
-    Ok(RestoreEndpoint {
-        session: session.id,
-        branch,
-        seq: session.sequence_high_water().unwrap_or_default(),
-        digest: session_digest(session)
-            .map_err(file_restore::RestoreError::from)
-            .map_err(|error| error.to_string())?,
-    })
-}
-
-async fn confirm_restore(
-    internal: &flume::Sender<InternalEvent>,
-    session: MakimaId,
-    runtime: Arc<()>,
-    preview: &file_restore::RestorePreview,
-    default_choice: RestoreChoice,
-) -> Result<RestoreChoice, String> {
-    let (reply, choice) = flume::bounded(1);
-    internal
-        .send(InternalEvent::RestorePreview {
-            session,
-            runtime,
-            preview: crate::components::restore_form::RestorePreview {
-                affected_paths: preview.paths.iter().map(|path| path.path.clone()).collect(),
-                shell_count: preview.shell_commands,
-            },
-            default_choice: if SUPPORTED {
-                default_choice
-            } else {
-                RestoreChoice::ConversationOnly
-            },
-            reply,
-        })
-        .map_err(|_| super::RUNTIME_GONE_ERR.to_owned())?;
-    let choice = choice
-        .recv_async()
-        .await
-        .map_err(|_| RESTORE_CANCELLED.to_owned())?;
-    validate_restore_choice(&choice)?;
-    Ok(choice)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn protect_restore_receipt(
-    result: Result<PreparedRestore, file_restore::RestoreError>,
-    barrier: impl Any + Send,
-) -> Result<PreparedRestore, String> {
-    match result {
-        Ok(mut receipt) => {
-            receipt.retain_barrier(barrier);
-            Ok(receipt)
-        }
-        Err(file_restore::RestoreError::Unresolved {
-            reason,
-            mut receipt,
-        }) => {
-            receipt.retain_barrier(barrier);
-            match (*receipt).abort() {
-                Ok(()) => Err(reason),
-                Err(error) => Err(format!("{ABORT_REPAIR_FAILED}: {error}; {reason}")),
-            }
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-enum RestoreFiles {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    Secure(PreparedRestore),
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Legacy {
-        projection: PlanProjectionRollback,
-        snapshot: SessionJournalSnapshot,
-        affected: BTreeSet<AgentId>,
-        barriers: Vec<Box<dyn Any + Send>>,
-    },
-}
-
-impl RestoreFiles {
-    fn transition_ref(&self) -> Option<TransitionRef> {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Secure(receipt) => Some(receipt.transition_ref()),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Legacy { .. } => None,
-        }
-    }
-    fn retain_barrier(&mut self, barrier: impl Any + Send) {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Secure(receipt) => receipt.retain_barrier(barrier),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Legacy { barriers, .. } => barriers.push(Box::new(barrier)),
-        }
-    }
-    fn apply(&mut self, modes: &ModeRegistry) -> Result<AppliedRestore, String> {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Secure(receipt) => receipt.apply(modes).map_err(|error| error.to_string()),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Legacy {
-                projection,
-                snapshot,
-                affected,
-                ..
-            } => {
-                let (changes, warnings) = projection.project(snapshot, affected, modes)?;
-                Ok(AppliedRestore { changes, warnings })
-            }
-        }
-    }
-    fn abort(self) -> Result<(), String> {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Secure(receipt) => receipt.abort().map_err(|error| error.to_string()),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Legacy { projection, .. } => projection.rollback(),
-        }
-    }
-    fn complete(self) -> Result<(), String> {
-        match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Self::Secure(receipt) => receipt.complete().map_err(|error| error.to_string()),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            Self::Legacy { .. } => Ok(()),
-        }
-    }
-}
-
-#[cfg(test)]
-#[test_case::test_case(RestoreChoice::ConversationOnly)]
-#[test_case::test_case(RestoreChoice::ConversationAndFiles)]
-#[test_case::test_case(RestoreChoice::FilesOnly)]
-fn platform_restore_choice_is_explicit(choice: RestoreChoice) {
-    let supported = SUPPORTED || choice == RestoreChoice::ConversationOnly;
-    let result = validate_restore_choice(&choice);
-    assert_eq!(result.is_ok(), supported);
-    if !supported {
-        assert_eq!(result.unwrap_err(), FILE_RESTORE_UNSUPPORTED);
-    }
-}
-
-fn validate_restore_choice(choice: &RestoreChoice) -> Result<(), String> {
-    if !SUPPORTED && *choice != RestoreChoice::ConversationOnly {
-        return Err(FILE_RESTORE_UNSUPPORTED.into());
-    }
-    Ok(())
-}
-
-async fn prepare_restore_files(
-    request: RestoreRequest,
-    barrier: impl Any + Send,
-) -> Result<RestoreFiles, String> {
-    validate_restore_choice(&request.choice)?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        protect_restore_receipt(file_restore::prepare(request).await, barrier)
-            .map(RestoreFiles::Secure)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let projection = request.projection.ok_or(FILE_RESTORE_UNSUPPORTED)?;
-        let captured = PlanProjectionRollback::capture_locked(
-            &projection.snapshot,
-            &projection.affected,
-            &request.locks,
-            &request.cancel,
-        )
-        .await?;
-        Ok(RestoreFiles::Legacy {
-            projection: captured,
-            snapshot: projection.snapshot,
-            affected: projection.affected,
-            barriers: vec![Box::new(barrier)],
-        })
-    }
-}
-
-fn plan_restore_files(
-    segments: &[RestoreSegment],
-) -> Result<file_restore::RestorePreview, file_restore::RestoreError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        file_restore::plan(segments)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = segments;
-        Ok(file_restore::RestorePreview::default())
-    }
-}
-
-fn inverse_restore_files(
-    sessions_dir: &Path,
-    reference: &TransitionRef,
-) -> Result<file_restore::RestorePreview, file_restore::RestoreError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        file_restore::plan_inverse(sessions_dir, reference)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (sessions_dir, reference);
-        Ok(file_restore::RestorePreview::default())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn publish_files_only(
-    writer: &crate::storage_writer::StorageWriter,
-    sessions_dir: &Path,
-    mut session: AppSession,
+struct PlanRollback {
+    projection: PlanProjectionRollback,
     snapshot: SessionJournalSnapshot,
-    preview: file_restore::RestorePreview,
-    locks: Arc<FileWriteLocks>,
-    cancel: CancelToken,
-    modes: &ModeRegistry,
-    guard: SessionPublicationGuard,
-    barrier: impl Any + Send,
-) -> Result<FilesRestore, String> {
-    validate_restore_choice(&RestoreChoice::FilesOnly)?;
-    let root = session.root_agent_id().ok_or(super::NOT_LIVE_ERR)?;
-    let endpoint = endpoint(&session, None)?;
-    let request = RestoreRequest {
-        sessions_dir: sessions_dir.to_path_buf(),
-        owner: session.id,
-        source: endpoint.clone(),
-        target: endpoint,
-        choice: RestoreChoice::FilesOnly,
-        preview,
-        projection: None,
-        locks,
-        cancel: cancel.clone(),
-    };
-    let mut receipt = prepare_restore_files(request, barrier).await?;
-    let applied = match receipt.apply(modes) {
-        Ok(applied) => applied,
-        Err(error) => {
-            return match receipt.abort() {
-                Ok(()) => Err(error.to_string()),
-                Err(repair) => Err(format!("{ABORT_REPAIR_FAILED}: {repair}; {error}")),
-            };
-        }
-    };
-    let reference = receipt.transition_ref().ok_or(super::NOT_LIVE_ERR)?;
-    let branch = StoredBranch {
-        id: MakimaId::generate(),
-        created_at: now_epoch(),
-        at_seq: snapshot.seq,
-        agent: root,
-        offset: session.messages().len(),
-        transition: Some(reference.clone()),
-    };
-    session.push_branch(branch.clone());
-    session.push_restore_ref(reference.clone());
-    let publication = CheckpointPublication::default();
-    let _registration = cancel.register_publication(&publication);
-    let result = writer
-        .checkpoint_files_restore(RestoredSessionCheckpoint {
-            session_id: session.id,
-            session: Arc::new(session),
-            journal: snapshot,
-            branch: branch.clone(),
-            publication,
-            claim: super::publication_claim(),
-            guard,
-        })
-        .await;
-    match result {
-        Ok(fence) => {
-            writer
-                .await_publication_sync(&fence, &cancel)
-                .await
-                .map_err(|error| format!("{ABORT_REPAIR_FAILED}: {error}"))?;
-            receipt
-                .complete()
-                .map_err(|error| format!("{ABORT_REPAIR_FAILED}: {error}"))?;
-            Ok(FilesRestore {
-                branch,
-                reference,
-                fence,
-                warnings: applied.warnings,
-            })
-        }
-        Err(error) => match receipt.abort() {
-            Ok(()) => Err(error),
-            Err(repair) => Err(format!("{ABORT_REPAIR_FAILED}: {repair}; {error}")),
-        },
+    affected: BTreeSet<AgentId>,
+    barriers: Vec<Box<dyn Any + Send>>,
+}
+
+impl PlanRollback {
+    fn retain_barrier(&mut self, barrier: impl Any + Send) {
+        self.barriers.push(Box::new(barrier));
     }
+
+    fn apply(&mut self, modes: &ModeRegistry) -> Result<(Vec<JournalChange>, Vec<String>), String> {
+        self.projection
+            .project(&self.snapshot, &self.affected, modes)
+    }
+
+    fn abort(self) -> Result<(), String> {
+        self.projection.rollback()
+    }
+
+    fn complete(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+async fn capture_plan_rollback(
+    snapshot: SessionJournalSnapshot,
+    affected: BTreeSet<AgentId>,
+    locks: &FileWriteLocks,
+    cancel: &CancelToken,
+    barrier: impl Any + Send,
+) -> Result<PlanRollback, String> {
+    let projection =
+        PlanProjectionRollback::capture_locked(&snapshot, &affected, locks, cancel).await?;
+    Ok(PlanRollback {
+        projection,
+        snapshot,
+        affected,
+        barriers: vec![Box::new(barrier)],
+    })
 }
 
 fn parent_route(
@@ -1582,8 +1049,6 @@ fn parent_route(
     seq: u64,
     sessions_dir: &Path,
     storage: &StateDir,
-    mut supplied: BTreeMap<MakimaId, OwnedRestoreLease>,
-    locks: Arc<FileWriteLocks>,
 ) -> Result<ParentRoute, String> {
     let mut route = vec![source.clone()];
     let mut visited = BTreeSet::from([source.id]);
@@ -1611,53 +1076,17 @@ fn parent_route(
     let mut leases = Vec::new();
     for id in visited.into_iter().filter(|id| *id != source.id) {
         let lease = super::claim_lock(sessions_dir, &id).map_err(|error| error.to_string())?;
-        let lease = Arc::new(super::RenewingDeletionLease::new(lease));
-        supplied.insert(id, owned_lease(&lease));
-        leases.push((id, lease));
+        leases.push((id, Arc::new(super::RenewingDeletionLease::new(lease))));
     }
-    for (id, _) in &leases {
-        smol::block_on(reconcile_owned_sessions(
-            sessions_dir,
-            *id,
-            supplied.clone(),
-            Arc::clone(&locks),
-            CancelToken::none(),
-        ))
-        .map_err(|error| format!("{ABORT_REPAIR_FAILED}: {error}"))?;
-    }
-    for session in route.iter().filter(|session| session.id != source.id) {
+    for session in route.iter_mut().filter(|session| session.id != source.id) {
         let reloaded = AppSession::load(session.id, storage).map_err(|error| error.to_string())?;
-        if session_digest(session)
-            .map_err(file_restore::RestoreError::from)
-            .map_err(|error| error.to_string())?
-            != session_digest(&reloaded)
-                .map_err(file_restore::RestoreError::from)
-                .map_err(|error| error.to_string())?
-            || session.parent() != reloaded.parent()
-        {
+        if session.parent() != reloaded.parent() {
             return Err(INVALID_PARENT_ROUTE.into());
         }
+        *session = reloaded;
     }
-    route.reverse();
-    let parent = route.first().cloned().ok_or(super::NOT_LIVE_ERR)?;
-    let mut segments = Vec::new();
-    for (index, session) in route.iter().enumerate() {
-        let through_seq = route
-            .get(index + 1)
-            .and_then(|child| child.parent())
-            .map_or_else(
-                || session.sequence_high_water().unwrap_or_default(),
-                |link| link.seq,
-            );
-        segments.push(RestoreSegment {
-            session: session.clone(),
-            after_seq: if index == 0 { seq } else { 0 },
-            through_seq,
-            affected: session.agents().keys().copied().collect(),
-        });
-    }
-    plan_restore_files(&segments).map_err(|error| error.to_string())?;
-    Ok((parent, link, leases, segments))
+    let parent = route.pop().ok_or(super::NOT_LIVE_ERR)?;
+    Ok((parent, link, leases))
 }
 
 fn project_presentations(

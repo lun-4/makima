@@ -118,15 +118,17 @@ mod tests {
     use makima_storage::session_state::{StateChange, StateFoldError, StoredStateRecord};
     use test_case::test_case;
 
-    const TOOL_KIND: &str = "profile";
+    const SLOT: &str = "records/order";
 
     fn record(seq: u64) -> StoredStateRecord {
         StoredStateRecord {
             seq,
             agent: None,
             generation: 0,
-            change: StateChange::ToolExecution {
-                kind: TOOL_KIND.into(),
+            change: StateChange::Plugin {
+                key: SLOT.into(),
+                version: 1,
+                value: None,
             },
         }
     }

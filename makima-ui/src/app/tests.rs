@@ -6,7 +6,6 @@ use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::restore_form::{RestoreChoice, RestorePreview};
 use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
 use crate::model_capabilities::test_support::seeded;
 use crate::repaint::expect::{OWED, QUIET};
@@ -4085,58 +4084,6 @@ fn rendered_outside_click_dismisses_only_upper_modal() {
     assert!(app.selection_state.is_none());
 }
 
-#[test]
-fn restore_preview_mouse_selection_requires_confirmation_and_blocks_input() {
-    const DRAFT: &str = "draft kept while choosing restore mode";
-    let mut app = test_app();
-    app.input_box.set_input(DRAFT.into());
-    let (reply, choice) = flume::bounded(1);
-    app.open_restore_preview(
-        RestorePreview::default(),
-        RestoreChoice::ConversationAndFiles,
-        reply,
-    );
-    render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
-    assert_eq!(
-        app.hits.modal().map(|(surface, _)| surface),
-        Some(Surface::Restore)
-    );
-    assert!(
-        app.active_keybind_contexts()
-            .contains(&KeybindContext::FormInput)
-    );
-    app.update(Msg::Paste(DRAFT.into()));
-    assert_eq!(app.input_box.buffer.value(), DRAFT);
-    assert!(click_target(&mut app, ClickTarget::KeyHint(key(KeyCode::Char('3')))).is_empty());
-    assert!(choice.is_empty());
-    assert!(click_target(&mut app, ClickTarget::KeyHint(key(KeyCode::Enter))).is_empty());
-    assert_eq!(choice.try_recv().unwrap(), RestoreChoice::FilesOnly);
-    assert!(!app.restore_form.is_open());
-    assert_eq!(app.input_box.buffer.value(), DRAFT);
-}
-
-#[test_case(false; "outside_click")]
-#[test_case(true; "close_all_overlays")]
-fn cancelling_restore_preview_drops_confirmation(close_all: bool) {
-    let mut app = test_app();
-    let (reply, choice) = flume::bounded(1);
-    app.open_restore_preview(
-        RestorePreview::default(),
-        RestoreChoice::ConversationOnly,
-        reply,
-    );
-    if close_all {
-        app.close_all_overlays();
-    } else {
-        render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
-        app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0));
-        render_app(&mut app, RENDER_AREA.width, RENDER_AREA.height);
-        app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
-    }
-    assert!(!app.restore_form.is_open());
-    assert!(choice.is_disconnected());
-}
-
 #[test_case(false, false; "normal_current_choice")]
 #[test_case(false, true; "normal_to_yolo")]
 #[test_case(true, true; "yolo_current_choice")]
@@ -7830,7 +7777,6 @@ fn expired_branch_selection_emits_no_restore_action() {
         at_seq: app.state.session.sequence_high_water().unwrap_or_default(),
         agent: selected.unwrap(),
         offset: 0,
-        transition: None,
     };
     app.state.session_mut().push_branch(branch.clone());
     let session = Arc::clone(&app.state.session);

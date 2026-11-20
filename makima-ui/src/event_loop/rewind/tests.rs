@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(any(target_os = "linux", target_os = "macos")),
-    allow(unused_imports, dead_code)
-)]
-
 mod coherence;
 mod outside_snapshot;
 
@@ -14,14 +9,13 @@ use crate::components::{Action, DisplayRole, Status};
 use makima_agent::actor::{ActorStatus, ConfigChange, ConfigPatch, HistoryBoundary, PreparedModel};
 use makima_agent::command::CONTEXT_RELOAD_ROOT_ONLY;
 use makima_agent::context::root_context;
-use makima_agent::file_restore;
-use makima_agent::journal::{JournalChange, JournalCommit, SessionJournal, SessionJournalSnapshot};
+use makima_agent::journal::{JournalCommit, SessionJournal, SessionJournalSnapshot};
 use makima_agent::plan_state::{approval_edit, plan_entries};
 use makima_agent::rewind::RewindBoundary;
 use makima_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, WORKFLOW_OPTION_ID};
 use makima_agent::state::{StateScope, StateSlotSpec};
 use makima_agent::tools::ToolRegistry;
-use makima_agent::{AgentInput, AgentMode, AgentRef, CancelToken, Post, PostLevel, TurnOutcome};
+use makima_agent::{AgentInput, AgentMode, AgentRef, Post, PostLevel, TurnOutcome};
 use makima_commands::{CommandError, CommandOutcome, InputDispatch};
 use makima_config::{Effect, PermissionRule, ToolKey};
 use makima_lua::PluginHost;
@@ -30,14 +24,10 @@ use makima_providers::{
     AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
     RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
 };
-use makima_storage::blobs::{BlobStore, FileState};
 use makima_storage::checkpoint::{CheckpointRequest, CheckpointVersion};
-use makima_storage::id::{AgentId, MakimaId, SessionRef};
-use makima_storage::restore::{
-    PathRestore, RestoreChoice, RestoreProgress, RestoreStore, RestoreTransition,
-};
+use makima_storage::id::SessionRef;
 use makima_storage::session_lock;
-use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
+use makima_storage::session_state::{ParentLink, StateChange};
 use makima_storage::sessions::StoredRule;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -1046,7 +1036,6 @@ fn published_rewind_holds_actor_until_event_loop_installs_display() {
                 durable: Some(durable),
             },
         );
-        confirm_choice(event_loop, RestoreChoice::ConversationOnly);
         let event = loop {
             let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
             if let InternalEvent::RestoreReady {
@@ -1087,414 +1076,24 @@ fn published_rewind_holds_actor_until_event_loop_installs_display() {
     });
 }
 
-const FILE_BEFORE: &[u8] = b"file before restore";
-const FILE_AFTER: &[u8] = b"file after restore";
-const FILE_EXTERNAL: &[u8] = b"user-owned edit";
-const FILE_DRAFT: &str = "unsent files-only draft";
-const SHELL_TOOL_KIND: &str = "execute";
+const UNTOUCHED_FILE: &str = "rewind-untouched.txt";
+const UNTOUCHED_CONTENT: &[u8] = b"user-owned edit";
+const SYNC_FAILURE: &str = "injected restore directory sync failure";
 
-fn confirm_choice(
-    event_loop: &mut EventLoop<'_>,
-    choice: RestoreChoice,
-) -> crate::components::restore_form::RestorePreview {
-    loop {
-        let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
-        match event {
-            InternalEvent::RestorePreview { preview, reply, .. } => {
-                reply.send(choice).unwrap();
-                return preview;
-            }
-            event => event_loop.handle_internal(event),
-        }
-    }
-}
-
-fn file_state(blobs: &BlobStore, session: MakimaId, bytes: Option<&[u8]>) -> FileState {
-    bytes.map_or(FileState::Absent, |bytes| {
-        FileState::Blob(blobs.put(session, bytes).unwrap())
-    })
-}
-
-fn record_file(root: &AgentRef, path: &Path, before: FileState, after: FileState) {
-    root.manager()
-        .journal()
-        .commit(JournalCommit {
-            changes: vec![JournalChange {
-                agent: Some(root.id()),
-                generation: 0,
-                change: StateChange::File {
-                    path: path.to_path_buf(),
-                    before,
-                    after,
-                },
-            }],
-            ..Default::default()
-        })
-        .unwrap();
-    fs::write(path, FILE_AFTER).unwrap();
-}
-
-fn recorded_file(
-    event_loop: &EventLoop<'_>,
-    index: usize,
-    name: &str,
-    before: Option<&[u8]>,
-    after: Option<&[u8]>,
-) -> PathBuf {
-    let session = event_loop.sessions[index].id();
-    let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-    let path = PathBuf::from(&event_loop.session_cwd).join(name);
-    record_file(
-        &target(event_loop, index),
-        &path,
-        file_state(&blobs, session, before),
-        file_state(&blobs, session, after),
-    );
-    path
-}
-
-#[test_case(RestoreChoice::ConversationOnly; "conversation_only")]
-#[test_case(RestoreChoice::ConversationAndFiles; "conversation_and_files")]
-#[test_case(RestoreChoice::FilesOnly; "files_only")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn restore_choice_preserves_conflicts_and_redoes_only_applied_paths(choice: RestoreChoice) {
-    with_event_loop(|event_loop| {
-        let (index, _host) = two_turn_fixture(event_loop);
-        let root = target(event_loop, index);
-        let id = event_loop.sessions[index].id();
-        let [modified, _, deleted, conflict] = [
-            ("restore-modified.txt", Some(FILE_BEFORE), Some(FILE_AFTER)),
-            ("restore-created.txt", None, Some(FILE_AFTER)),
-            ("restore-deleted.txt", Some(FILE_BEFORE), None),
-            ("restore-conflict.txt", Some(FILE_BEFORE), Some(FILE_AFTER)),
-        ]
-        .map(|(name, before, after)| recorded_file(event_loop, index, name, before, after));
-        fs::remove_file(&deleted).unwrap();
-        root.manager()
-            .journal()
-            .commit(JournalCommit {
-                changes: vec![JournalChange {
-                    agent: Some(root.id()),
-                    generation: 0,
-                    change: StateChange::ToolExecution {
-                        kind: SHELL_TOOL_KIND.into(),
-                    },
-                }],
-                ..Default::default()
-            })
-            .unwrap();
-        fs::write(&conflict, FILE_EXTERNAL).unwrap();
-        let original = checkpoint(event_loop, index);
-        let journal = root.manager().journal();
-        let before_journal = journal.snapshot();
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .buffer
-            .insert_text(FILE_DRAFT);
-        let (history, durable) = boundary(event_loop, index, SECOND);
-        event_loop.handle_action(
-            index,
-            Action::RewindAgent {
-                target: root.clone(),
-                boundary: history,
-                durable: Some(durable),
-            },
-        );
-        let preview = confirm_choice(event_loop, choice.clone());
-        assert_eq!(preview.affected_paths.len(), 4);
-        assert_eq!(preview.shell_count, 1);
-        finish_restore(event_loop, index);
-        if choice == RestoreChoice::ConversationOnly {
-            assert_eq!(fs::read(&modified).unwrap(), FILE_AFTER);
-            assert!(!deleted.exists());
-        } else {
-            assert_eq!(fs::read(&modified).unwrap(), FILE_BEFORE);
-            assert_eq!(fs::read(&deleted).unwrap(), FILE_BEFORE);
-        }
-        if choice == RestoreChoice::FilesOnly {
-            assert_history(event_loop, index, original.messages());
-            assert_eq!(
-                event_loop.sessions[index].app.input_box.buffer.value(),
-                FILE_DRAFT
-            );
-            let after_journal = journal.snapshot();
-            assert_eq!(before_journal.epoch, after_journal.epoch);
-            assert_eq!(before_journal.revision, after_journal.revision);
-            assert_eq!(before_journal.seq, after_journal.seq);
-            assert_eq!(before_journal.state, after_journal.state);
-        }
-        let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        if choice == RestoreChoice::FilesOnly {
-            assert_eq!(restored.meta.input_draft.as_deref(), Some(FILE_DRAFT));
-            assert_persisted_state(&restored, &before_journal);
-        }
-        let branch = restored.branches().last().unwrap();
-        let reference = branch.transition.as_ref().unwrap();
-        assert!(restored.restore_refs().contains(reference));
-        let transition = RestoreStore::new(event_loop.ctx.storage.clone())
-            .load(reference)
-            .unwrap();
-        assert_eq!(transition.transition.choice, choice);
-        event_loop.handle_action(
-            index,
-            Action::RestoreBranch {
-                target: root,
-                id: branch.id,
-            },
-        );
-        confirm_choice(
-            event_loop,
-            if choice == RestoreChoice::FilesOnly {
-                RestoreChoice::FilesOnly
-            } else {
-                RestoreChoice::ConversationAndFiles
-            },
-        );
-        finish_restore(event_loop, index);
-        assert_eq!(fs::read(modified).unwrap(), FILE_AFTER);
-        assert!(!deleted.exists());
-        assert_history(event_loop, index, original.messages());
-        if choice == RestoreChoice::FilesOnly {
-            assert_eq!(
-                event_loop.sessions[index].app.input_box.buffer.value(),
-                FILE_DRAFT
-            );
-        }
-    });
-}
-
-fn offline_session(event_loop: &EventLoop<'_>) -> AppSession {
-    let mut session = AppSession::new(MODEL, &event_loop.session_cwd);
-    session.bind_root_id(AgentId::generate()).unwrap();
-    session.save_to(&event_loop.ctx.sessions_dir).unwrap();
-    session
-}
-
-fn offline_file(session: &mut AppSession, path: &Path, before: FileState, after: FileState) {
-    session.push_state(StoredStateRecord {
-        seq: session.next_state_seq(),
-        agent: session.root_agent_id(),
-        generation: 0,
-        change: StateChange::File {
-            path: path.to_path_buf(),
-            before,
-            after,
-        },
-    });
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn parent_route_follows_linked_writes_and_excludes_unlinked_parent_tail() {
-    with_event_loop(|event_loop| {
-        let mut parent = offline_session(event_loop);
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = PathBuf::from(&event_loop.session_cwd).join("linked-write.txt");
-        let unrelated = PathBuf::from(&event_loop.session_cwd).join("unlinked-parent-tail.txt");
-        let before = file_state(&blobs, parent.id, Some(FILE_BEFORE));
-        let middle = file_state(&blobs, parent.id, Some(FILE_EXTERNAL));
-        let after = file_state(&blobs, parent.id, Some(FILE_AFTER));
-        offline_file(&mut parent, &path, before.clone(), middle.clone());
-        let ceiling = parent.sequence_high_water().unwrap();
-        offline_file(&mut parent, &unrelated, FileState::Absent, after.clone());
-        parent.save_to(&event_loop.ctx.sessions_dir).unwrap();
-        let mut implementation = offline_session(event_loop);
-        implementation.set_parent(Some(ParentLink {
-            session: parent.id,
-            message_count: 0,
-            seq: ceiling,
-        }));
-        offline_file(&mut implementation, &path, middle, after.clone());
-        implementation
-            .save_to(&event_loop.ctx.sessions_dir)
-            .unwrap();
-        let (_, _, leases, segments) = super::parent_route(
-            &implementation,
-            parent.id,
-            0,
-            &event_loop.ctx.sessions_dir,
-            &event_loop.ctx.storage,
-            BTreeMap::new(),
-            Arc::clone(&event_loop.ctx.file_write_locks),
-        )
-        .unwrap();
-        let preview = file_restore::plan(&segments).unwrap();
-        assert_eq!(preview.paths.len(), 1);
-        assert_eq!(preview.paths[0].path, path);
-        assert_eq!(preview.paths[0].desired, before);
-        assert_eq!(preview.paths[0].expected, after);
-        assert_eq!(leases.len(), 1);
-        assert!(
-            session_lock::claim(&event_loop.ctx.sessions_dir, &parent.id)
-                .unwrap()
-                .is_none()
-        );
-        drop(leases);
-        parent.set_parent(Some(ParentLink {
-            session: implementation.id,
-            message_count: 0,
-            seq: 0,
-        }));
-        parent.save_to(&event_loop.ctx.sessions_dir).unwrap();
-        assert!(
-            super::parent_route(
-                &implementation,
-                MakimaId::generate(),
-                0,
-                &event_loop.ctx.sessions_dir,
-                &event_loop.ctx.storage,
-                BTreeMap::new(),
-                Arc::clone(&event_loop.ctx.file_write_locks)
-            )
-            .is_err()
-        );
-    });
-}
-
-#[test_case(false, false; "unpublished_crash_before_progress_rolls_back")]
-#[test_case(true, false; "published_crash_before_progress_completes")]
-#[test_case(true, true; "published_completion_reconciles_idempotently")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn startup_reconciles_both_endpoints_and_missing_progress(published: bool, completed: bool) {
-    with_event_loop(|event_loop| {
-        let source = offline_session(event_loop);
-        let mut target_session = offline_session(event_loop);
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = PathBuf::from(&event_loop.session_cwd).join("crash-progress.txt");
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let reference = store
-            .prepare(
-                source.id,
-                RestoreTransition {
-                    id: MakimaId::generate(),
-                    choice: RestoreChoice::ConversationAndFiles,
-                    source: super::endpoint(&source, None).unwrap(),
-                    target: super::endpoint(&target_session, None).unwrap(),
-                    inverse_of: None,
-                    paths: vec![PathRestore {
-                        path: path.clone(),
-                        before: file_state(&blobs, source.id, Some(FILE_BEFORE)),
-                        after: file_state(&blobs, source.id, Some(FILE_AFTER)),
-                    }],
-                    skipped: vec![],
-                },
-            )
-            .unwrap();
-        fs::write(&path, FILE_AFTER).unwrap();
-        if published {
-            target_session.push_restore_ref(reference.clone());
-            target_session
-                .save_to(&event_loop.ctx.sessions_dir)
-                .unwrap();
-        }
-        if completed {
-            store
-                .append(&reference, RestoreProgress::Applied { path: 0 })
-                .unwrap();
-            store.append(&reference, RestoreProgress::Complete).unwrap();
-        }
-        for id in [target_session.id, source.id] {
-            let lease = session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                .unwrap()
-                .unwrap();
-            let lease = super::reconcile_startup(
-                &event_loop.ctx.sessions_dir,
-                id,
-                Some(lease),
-                Arc::clone(&event_loop.ctx.file_write_locks),
-            )
-            .unwrap()
-            .unwrap();
-            lease.release().unwrap();
-        }
-        assert!(store.pending_for_session(source.id).unwrap().is_empty());
-        assert!(
-            store
-                .pending_for_session(target_session.id)
-                .unwrap()
-                .is_empty()
-        );
-    });
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn startup_conflict_prevents_runtime_admission_and_retains_both_endpoint_leases() {
-    with_event_loop(|event_loop| {
-        let source = offline_session(event_loop);
-        let target_session = offline_session(event_loop);
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = PathBuf::from(&event_loop.session_cwd).join("startup-conflict.txt");
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let reference = store
-            .prepare(
-                source.id,
-                RestoreTransition {
-                    id: MakimaId::generate(),
-                    choice: RestoreChoice::ConversationAndFiles,
-                    source: super::endpoint(&source, None).unwrap(),
-                    target: super::endpoint(&target_session, None).unwrap(),
-                    inverse_of: None,
-                    paths: vec![PathRestore {
-                        path: path.clone(),
-                        before: file_state(&blobs, source.id, Some(FILE_BEFORE)),
-                        after: file_state(&blobs, source.id, Some(FILE_AFTER)),
-                    }],
-                    skipped: vec![],
-                },
-            )
-            .unwrap();
-        fs::write(&path, FILE_EXTERNAL).unwrap();
-        let result = event_loop.ctx.prepare_runtime(target_session.clone());
-        assert!(result.is_err());
-        assert_eq!(fs::read(path).unwrap(), FILE_EXTERNAL);
-        assert_eq!(
-            store.pending_for_session(source.id).unwrap(),
-            vec![reference]
-        );
-        for id in [source.id, target_session.id] {
-            assert!(
-                session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    });
-}
-
-#[test_case(RestoreChoice::ConversationAndFiles, None, false; "parent_runtime_replaced")]
-#[test_case(RestoreChoice::FilesOnly, None, false; "implementation_conversation_retained")]
-#[test_case(RestoreChoice::ConversationAndFiles, Some(false), false; "parent_sync_recovers")]
-#[test_case(RestoreChoice::ConversationAndFiles, Some(true), false; "parent_sync_failure_stays_forward")]
-#[test_case(RestoreChoice::ConversationAndFiles, Some(false), true; "parent_baseline_sync_recovers")]
-#[test_case(RestoreChoice::ConversationAndFiles, Some(true), true; "parent_baseline_sync_failure_preserves_files")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
-    choice: RestoreChoice,
-    sync_failure: Option<bool>,
-    baseline: bool,
-) {
+#[test_case(None, false; "parent_runtime_replaced")]
+#[test_case(Some(false), false; "parent_sync_recovers")]
+#[test_case(Some(false), true; "parent_baseline_sync_recovers")]
+#[test_case(Some(true), true; "parent_baseline_sync_failure_keeps_implementation")]
+fn parent_restore_replaces_runtime_before_admission(sync_failure: Option<bool>, baseline: bool) {
     with_event_loop(|event_loop| {
         let (parent_index, _parent_host) = two_turn_fixture(event_loop);
         let parent_id = event_loop.sessions[parent_index].id();
         let (history, selected) = boundary(event_loop, parent_index, SECOND);
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = recorded_file(
-            event_loop,
-            parent_index,
-            "parent-runtime-linked.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_EXTERNAL),
-        );
-        let middle = file_state(&blobs, parent_id, Some(FILE_EXTERNAL));
-        fs::write(&path, FILE_EXTERNAL).unwrap();
         let parent = checkpoint(event_loop, parent_index);
         let expected = parent.messages()[..history.offset].to_vec();
         let old_parent = event_loop.remove_runtime(parent_index);
         super::super::tests::release_runtime(old_parent);
         let (index, _host) = setup(event_loop);
-        let implementation_root = target(event_loop, index);
         let implementation_id = event_loop.sessions[index].id();
         Arc::make_mut(&mut event_loop.sessions[index].app.state.session).set_parent(Some(
             ParentLink {
@@ -1504,18 +1103,10 @@ fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
             },
         ));
         turn(event_loop, index, THIRD);
-        let after = file_state(&blobs, implementation_id, Some(FILE_AFTER));
-        record_file(&implementation_root, &path, middle, after);
-        let implementation = checkpoint(event_loop, index);
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .buffer
-            .insert_text(FILE_DRAFT);
-        let journal_before = implementation_root.manager().journal().snapshot();
+        checkpoint(event_loop, index);
         let identity = event_loop.sessions[index].handles.identity();
         let writer = Arc::clone(&event_loop.ctx.storage_writer);
-        let mut sync = sync_failure.map(|_| {
+        let sync = sync_failure.map(|_| {
             if baseline {
                 writer.hold_current_sync(SYNC_FAILURE)
             } else {
@@ -1529,64 +1120,23 @@ fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
                 seq: selected.seq,
             },
         );
-        if baseline {
-            let (entered, release) = sync.take().unwrap();
-            assert_eq!(entered.recv_timeout(WAIT).unwrap(), implementation_id);
-            assert_eq!(fs::read(&path).unwrap(), FILE_AFTER);
-            assert!(
-                RestoreStore::new(event_loop.ctx.storage.clone())
-                    .pending_for_session(implementation_id)
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(event_loop.sessions[index].app.restore_in_progress);
-            assert!(event_loop.submit_text(index, FIRST.into()).is_err());
-            release
-                .send(if sync_failure.unwrap() {
-                    Err(SYNC_FAILURE.into())
-                } else {
-                    Ok(())
-                })
-                .unwrap();
-            writer.release_restore_sync();
-            if sync_failure.unwrap() {
-                pump_until(event_loop, |event_loop| {
-                    event_loop.sessions[index].lock_lost
-                });
-                assert_eq!(fs::read(path).unwrap(), FILE_AFTER);
-                assert_eq!(event_loop.sessions[index].id(), implementation_id);
-                assert!(
-                    AppSession::load(parent_id, &event_loop.ctx.storage)
-                        .unwrap()
-                        .restore_refs()
-                        .is_empty()
-                );
-                return;
-            }
-        }
-        let preview = confirm_choice(event_loop, choice.clone());
-        assert_eq!(preview.affected_paths, vec![path.clone()]);
         if let Some((entered, release)) = sync {
-            let mut published = None;
+            let mut held = None;
             pump_until(event_loop, |_| {
-                published = entered.try_recv().ok();
-                published.is_some()
+                held = entered.try_recv().ok();
+                held.is_some()
             });
-            assert_eq!(published, Some(parent_id));
+            assert_eq!(
+                held,
+                Some(if baseline {
+                    implementation_id
+                } else {
+                    parent_id
+                })
+            );
             assert_eq!(event_loop.sessions[index].id(), implementation_id);
             assert!(event_loop.sessions[index].app.restore_in_progress);
             assert!(event_loop.submit_text(index, FIRST.into()).is_err());
-            let visible = AppSession::load(parent_id, &event_loop.ctx.storage).unwrap();
-            let reference = visible.restore_refs().last().unwrap().clone();
-            let store = RestoreStore::new(event_loop.ctx.storage.clone());
-            assert!(
-                !store
-                    .load(&reference)
-                    .unwrap()
-                    .progress
-                    .contains(&RestoreProgress::Complete)
-            );
-            assert_eq!(fs::read(&path).unwrap(), FILE_BEFORE);
             let fail = sync_failure.unwrap();
             release
                 .send(if fail {
@@ -1595,79 +1145,29 @@ fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
                     Ok(())
                 })
                 .unwrap();
+            writer.release_restore_sync();
             if fail {
                 pump_until(event_loop, |event_loop| {
                     event_loop.sessions[index].lock_lost
                 });
-                writer.release_restore_sync();
                 assert_eq!(event_loop.sessions[index].id(), implementation_id);
-                assert_eq!(fs::read(&path).unwrap(), FILE_BEFORE);
-                let transition = store.load(&reference).unwrap();
-                assert!(
-                    !transition
-                        .progress
-                        .contains(&RestoreProgress::RollbackIntent)
+                assert_eq!(
+                    AppSession::load(parent_id, &event_loop.ctx.storage)
+                        .unwrap()
+                        .messages(),
+                    parent.messages()
                 );
-                assert!(!transition.progress.contains(&RestoreProgress::Complete));
-                let retired = event_loop.remove_runtime(index);
-                let manager = retired.handles.manager_and_root().0;
-                drop(retired);
-                for id in [implementation_id, parent_id] {
-                    assert!(
-                        session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                            .unwrap()
-                            .is_none()
-                    );
-                }
-                smol::block_on(file_restore::reconcile(
-                    &event_loop.ctx.sessions_dir,
-                    &reference,
-                    Arc::clone(&event_loop.ctx.file_write_locks),
-                    CancelToken::none(),
-                ))
-                .unwrap();
-                super::super::tests::shutdown_manager(&manager);
                 return;
             }
-            writer.release_restore_sync();
         }
         finish_restore(event_loop, index);
-        if choice == RestoreChoice::FilesOnly {
-            assert_eq!(event_loop.sessions[index].id(), implementation_id);
-            assert!(Arc::ptr_eq(
-                &identity,
-                &event_loop.sessions[index].handles.identity()
-            ));
-            assert_history(event_loop, index, implementation.messages());
-            assert_eq!(
-                event_loop.sessions[index].app.input_box.buffer.value(),
-                FILE_DRAFT
-            );
-            let after = target(event_loop, index).manager().journal().snapshot();
-            assert_eq!(after.epoch, journal_before.epoch);
-            assert_eq!(after.revision, journal_before.revision);
-            assert_eq!(after.state, journal_before.state);
-            assert_eq!(fs::read(path).unwrap(), FILE_BEFORE);
-            let disk = AppSession::load(implementation_id, &event_loop.ctx.storage).unwrap();
-            assert_eq!(disk.meta.input_draft.as_deref(), Some(FILE_DRAFT));
-            assert_persisted_state(&disk, &journal_before);
-            return;
-        }
         assert_eq!(event_loop.sessions[index].id(), parent_id);
         assert!(!Arc::ptr_eq(
             &identity,
             &event_loop.sessions[index].handles.identity()
         ));
-        assert_eq!(fs::read(path).unwrap(), FILE_BEFORE);
         assert_history(event_loop, index, &expected);
         let restored = AppSession::load(parent_id, &event_loop.ctx.storage).unwrap();
-        let reference = restored.restore_refs().last().unwrap();
-        let transition = RestoreStore::new(event_loop.ctx.storage.clone())
-            .load(reference)
-            .unwrap();
-        assert_eq!(transition.transition.source.session, implementation_id);
-        assert_eq!(transition.transition.target.session, parent_id);
-        assert!(transition.progress.contains(&RestoreProgress::Complete));
         assert_persisted_state(
             &restored,
             &target(event_loop, index).manager().journal().snapshot(),
@@ -1681,163 +1181,14 @@ fn parent_restore_replaces_runtime_and_restores_linked_files_before_admission(
     });
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn unresolved_rollback_keeps_source_lease_after_runtime_teardown() {
-    const PREPARE_FAILURE: &str = "injected preparation failure after file restore";
+#[test_case(false; "sync_recovers")]
+#[test_case(true; "sync_failure_stays_forward")]
+fn visible_restore_waits_for_durability_without_rollback(fail: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = two_turn_fixture(event_loop);
         let root = target(event_loop, index);
         let id = event_loop.sessions[index].id();
-        let path = recorded_file(
-            event_loop,
-            index,
-            "retained-source-lock.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_AFTER),
-        );
-        checkpoint(event_loop, index);
-        let changed = path.clone();
-        event_loop.ctx.prepare_provider = sync_preparer(move |_| {
-            fs::write(&changed, FILE_EXTERNAL).unwrap();
-            Err(Arc::from(PREPARE_FAILURE))
-        });
-        let (history, durable) = boundary(event_loop, index, SECOND);
-        event_loop.handle_action(
-            index,
-            Action::RewindAgent {
-                target: root,
-                boundary: history,
-                durable: Some(durable),
-            },
-        );
-        confirm_choice(event_loop, RestoreChoice::ConversationAndFiles);
-        pump_until(event_loop, |event_loop| {
-            event_loop.sessions[index].lock_lost
-        });
-        assert!(event_loop.sessions[index].app.restore_in_progress);
-        assert_eq!(fs::read(&path).unwrap(), FILE_EXTERNAL);
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let reference = store.pending_for_session(id).unwrap().pop().unwrap();
-        let retired = event_loop.remove_runtime(index);
-        let manager = retired.handles.manager_and_root().0;
-        drop(retired);
-        assert!(
-            session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                .unwrap()
-                .is_none()
-        );
-        fs::write(path, FILE_BEFORE).unwrap();
-        smol::block_on(file_restore::reconcile(
-            &event_loop.ctx.sessions_dir,
-            &reference,
-            Arc::clone(&event_loop.ctx.file_write_locks),
-            CancelToken::none(),
-        ))
-        .unwrap();
-        super::super::tests::shutdown_manager(&manager);
-    });
-}
-
-#[test_case(false; "ancestor_pending_is_reconciled_under_owned_route")]
-#[test_case(true; "ancestor_conflict_retains_route_owners")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn parent_route_reconciles_pending_ancestor_before_candidate_preparation(conflict: bool) {
-    with_event_loop(|event_loop| {
-        let parent = offline_session(event_loop);
-        let mut implementation = offline_session(event_loop);
-        implementation.set_parent(Some(ParentLink {
-            session: parent.id,
-            message_count: 0,
-            seq: 0,
-        }));
-        implementation
-            .save_to(&event_loop.ctx.sessions_dir)
-            .unwrap();
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = PathBuf::from(&event_loop.session_cwd).join("pending-ancestor.txt");
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let reference = store
-            .prepare(
-                parent.id,
-                RestoreTransition {
-                    id: MakimaId::generate(),
-                    choice: RestoreChoice::FilesOnly,
-                    source: super::endpoint(&implementation, None).unwrap(),
-                    target: super::endpoint(&parent, None).unwrap(),
-                    inverse_of: None,
-                    paths: vec![PathRestore {
-                        path: path.clone(),
-                        before: file_state(&blobs, parent.id, Some(FILE_BEFORE)),
-                        after: file_state(&blobs, parent.id, Some(FILE_AFTER)),
-                    }],
-                    skipped: vec![],
-                },
-            )
-            .unwrap();
-        fs::write(&path, if conflict { FILE_EXTERNAL } else { FILE_AFTER }).unwrap();
-        let result = super::parent_route(
-            &implementation,
-            parent.id,
-            0,
-            &event_loop.ctx.sessions_dir,
-            &event_loop.ctx.storage,
-            BTreeMap::new(),
-            Arc::clone(&event_loop.ctx.file_write_locks),
-        );
-        if conflict {
-            assert!(result.is_err());
-            assert_eq!(fs::read(path).unwrap(), FILE_EXTERNAL);
-            assert_eq!(
-                store.pending_for_session(parent.id).unwrap(),
-                vec![reference]
-            );
-            for id in [parent.id, implementation.id] {
-                assert!(
-                    session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                        .unwrap()
-                        .is_none()
-                );
-            }
-        } else {
-            let (_, _, leases, _) = result.unwrap();
-            assert_eq!(fs::read(path).unwrap(), FILE_BEFORE);
-            assert!(store.pending_for_session(parent.id).unwrap().is_empty());
-            assert!(
-                session_lock::claim(&event_loop.ctx.sessions_dir, &parent.id)
-                    .unwrap()
-                    .is_none()
-            );
-            drop(leases);
-        }
-    });
-}
-
-const SYNC_FAILURE: &str = "injected restore directory sync failure";
-
-#[test_case(false, false; "ordinary_sync_recovers")]
-#[test_case(false, true; "ordinary_sync_failure_stays_forward")]
-#[test_case(true, false; "files_only_sync_recovers")]
-#[test_case(true, true; "files_only_sync_failure_stays_forward")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn visible_restore_waits_for_durability_without_rollback(files_only: bool, fail: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _host) = two_turn_fixture(event_loop);
-        let root = target(event_loop, index);
-        let id = event_loop.sessions[index].id();
-        let path = recorded_file(
-            event_loop,
-            index,
-            "unsynced-runtime.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_AFTER),
-        );
         let original = checkpoint(event_loop, index);
-        event_loop.sessions[index]
-            .app
-            .input_box
-            .buffer
-            .insert_text(FILE_DRAFT);
         let writer = Arc::clone(&event_loop.ctx.storage_writer);
         let (entered, release) = writer.hold_restore_sync(SYNC_FAILURE);
         let (history, durable) = boundary(event_loop, index, SECOND);
@@ -1850,45 +1201,23 @@ fn visible_restore_waits_for_durability_without_rollback(files_only: bool, fail:
                 durable: Some(durable),
             },
         );
-        confirm_choice(
-            event_loop,
-            if files_only {
-                RestoreChoice::FilesOnly
-            } else {
-                RestoreChoice::ConversationAndFiles
-            },
-        );
-        assert_eq!(entered.recv_timeout(WAIT).unwrap(), id);
+        let mut published = None;
+        pump_until(event_loop, |_| {
+            published = entered.try_recv().ok();
+            published.is_some()
+        });
+        assert_eq!(published, Some(id));
         let visible = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        let reference = visible.restore_refs().last().unwrap().clone();
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let transition = store.load(&reference).unwrap();
-        assert!(!transition.progress.contains(&RestoreProgress::Complete));
-        assert_eq!(fs::read(&path).unwrap(), FILE_BEFORE);
         assert!(event_loop.sessions[index].app.restore_in_progress);
         assert!(event_loop.submit_text(index, THIRD.into()).is_err());
         assert!(root.actor().unwrap().prepare_idle().is_err());
-        for messages in [
-            root.actor().unwrap().committed_history(),
-            Arc::clone(&root.manager().journal().snapshot().histories[&root.id()].messages),
-        ] {
-            assert_eq!(
-                serde_json::to_value(messages).unwrap(),
-                serde_json::to_value(original.messages()).unwrap()
-            );
-        }
         assert_eq!(
             serde_json::to_value(event_loop.sessions[index].app.state.session.messages()).unwrap(),
             serde_json::to_value(original.messages()).unwrap()
         );
         assert_eq!(
             serde_json::to_value(visible.messages()).unwrap(),
-            serde_json::to_value(if files_only {
-                original.messages()
-            } else {
-                &expected
-            })
-            .unwrap()
+            serde_json::to_value(&expected).unwrap()
         );
         release
             .send(if fail {
@@ -1897,85 +1226,40 @@ fn visible_restore_waits_for_durability_without_rollback(files_only: bool, fail:
                 Ok(())
             })
             .unwrap();
+        writer.release_restore_sync();
         if fail {
             pump_until(event_loop, |event_loop| {
                 event_loop.sessions[index].lock_lost
             });
-            writer.release_restore_sync();
-            let transition = store.load(&reference).unwrap();
-            assert!(
-                !transition
-                    .progress
-                    .contains(&RestoreProgress::RollbackIntent)
-            );
-            assert!(!transition.progress.contains(&RestoreProgress::Complete));
-            assert_eq!(fs::read(&path).unwrap(), FILE_BEFORE);
             assert!(event_loop.sessions[index].app.restore_in_progress);
-            let retired = event_loop.remove_runtime(index);
-            let manager = retired.handles.manager_and_root().0;
-            drop(retired);
-            assert!(
-                session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                    .unwrap()
-                    .is_none()
+            assert_eq!(
+                serde_json::to_value(
+                    AppSession::load(id, &event_loop.ctx.storage)
+                        .unwrap()
+                        .messages()
+                )
+                .unwrap(),
+                serde_json::to_value(&expected).unwrap()
             );
-            smol::block_on(file_restore::reconcile(
-                &event_loop.ctx.sessions_dir,
-                &reference,
-                Arc::clone(&event_loop.ctx.file_write_locks),
-                CancelToken::none(),
-            ))
-            .unwrap();
-            super::super::tests::shutdown_manager(&manager);
         } else {
-            writer.release_restore_sync();
             finish_restore(event_loop, index);
-            assert!(
-                store
-                    .load(&reference)
-                    .unwrap()
-                    .progress
-                    .contains(&RestoreProgress::Complete)
-            );
-            assert_eq!(fs::read(&path).unwrap(), FILE_BEFORE);
-            assert_history(
-                event_loop,
-                index,
-                if files_only {
-                    original.messages()
-                } else {
-                    &expected
-                },
-            );
-            if files_only {
-                assert_eq!(
-                    event_loop.sessions[index].app.input_box.buffer.value(),
-                    FILE_DRAFT
-                );
-            }
+            assert_history(event_loop, index, &expected);
         }
     });
 }
 
-#[test_case(false; "baseline_sync_recovers_before_file_changes")]
-#[test_case(true; "baseline_sync_failure_never_stages_restore")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
+#[test_case(false; "baseline_sync_recovers")]
+#[test_case(true; "baseline_sync_failure_never_publishes")]
+fn ordinary_restore_waits_for_baseline_durability(fail: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = two_turn_fixture(event_loop);
         let root = target(event_loop, index);
         let id = event_loop.sessions[index].id();
-        let path = recorded_file(
-            event_loop,
-            index,
-            "baseline-sync-runtime.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_AFTER),
-        );
         let original = checkpoint(event_loop, index);
         let writer = Arc::clone(&event_loop.ctx.storage_writer);
         let (entered, release) = writer.hold_current_sync(SYNC_FAILURE);
         let (history, durable) = boundary(event_loop, index, SECOND);
+        let expected = original.messages()[..history.offset].to_vec();
         event_loop.handle_action(
             index,
             Action::RewindAgent {
@@ -1990,18 +1274,9 @@ fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
             baseline.is_some()
         });
         assert_eq!(baseline, Some(id));
-        assert_eq!(fs::read(&path).unwrap(), FILE_AFTER);
         assert!(event_loop.sessions[index].app.restore_in_progress);
         assert!(event_loop.submit_text(index, THIRD.into()).is_err());
         assert_history(event_loop, index, original.messages());
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        assert!(store.pending_for_session(id).unwrap().is_empty());
-        assert!(
-            AppSession::load(id, &event_loop.ctx.storage)
-                .unwrap()
-                .restore_refs()
-                .is_empty()
-        );
         release
             .send(if fail {
                 Err(SYNC_FAILURE.into())
@@ -2014,8 +1289,6 @@ fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
             pump_until(event_loop, |event_loop| {
                 event_loop.sessions[index].lock_lost
             });
-            assert_eq!(fs::read(path).unwrap(), FILE_AFTER);
-            assert!(store.pending_for_session(id).unwrap().is_empty());
             let disk = AppSession::load(id, &event_loop.ctx.storage).unwrap();
             assert_eq!(
                 serde_json::to_value(disk.messages()).unwrap(),
@@ -2027,173 +1300,19 @@ fn ordinary_restore_waits_for_baseline_durability_before_files(fail: bool) {
                 serde_json::to_value(original.messages()).unwrap()
             );
         } else {
-            confirm_choice(event_loop, RestoreChoice::ConversationAndFiles);
             finish_restore(event_loop, index);
-            assert_eq!(fs::read(path).unwrap(), FILE_BEFORE);
+            assert_history(event_loop, index, &expected);
         }
     });
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn cancelling_runtime_restore_preview_leaves_files_history_and_admission_intact() {
+#[test_case(true; "baseline_cancel")]
+#[test_case(false; "published_cancel")]
+fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool) {
     with_event_loop(|event_loop| {
         let (index, _host) = two_turn_fixture(event_loop);
         let root = target(event_loop, index);
         let id = event_loop.sessions[index].id();
-        let path = recorded_file(
-            event_loop,
-            index,
-            "cancel-restore-preview.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_AFTER),
-        );
-        let original = checkpoint(event_loop, index);
-        let before = root.manager().journal().snapshot();
-        let (history, durable) = boundary(event_loop, index, SECOND);
-        event_loop.handle_action(
-            index,
-            Action::RewindAgent {
-                target: root.clone(),
-                boundary: history,
-                durable: Some(durable),
-            },
-        );
-        loop {
-            match event_loop.internal_rx.recv_timeout(WAIT).unwrap() {
-                InternalEvent::RestorePreview { reply, .. } => {
-                    drop(reply);
-                    break;
-                }
-                event => event_loop.handle_internal(event),
-            }
-        }
-        finish_restore(event_loop, index);
-        assert_eq!(fs::read(path).unwrap(), FILE_AFTER);
-        assert_history(event_loop, index, original.messages());
-        let after = root.manager().journal().snapshot();
-        assert_eq!(before.epoch, after.epoch);
-        assert_eq!(before.revision, after.revision);
-        assert_eq!(before.state, after.state);
-        let disk = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        assert!(disk.restore_refs().is_empty());
-        assert!(disk.branches().is_empty());
-        turn(event_loop, index, THIRD);
-    });
-}
-
-#[test_case(false; "untouched_prepare_receipt_aborts_and_releases_barriers")]
-#[test_case(true; "prepare_abort_conflict_retains_actual_lease_and_graph_barriers")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn unresolved_prepare_receipt_is_protected_before_abort(conflict: bool) {
-    const PREPARE_ERROR: &str = "injected manifest post-rename sync failure";
-    with_event_loop(|event_loop| {
-        let (index, _host) = setup(event_loop);
-        turn(event_loop, index, FIRST);
-        let root = target(event_loop, index);
-        let session = checkpoint(event_loop, index);
-        let id = session.id;
-        let blobs = BlobStore::new(event_loop.ctx.storage.clone());
-        let path = PathBuf::from(&event_loop.session_cwd).join("unresolved-prepare.txt");
-        fs::write(&path, FILE_AFTER).unwrap();
-        let held = root.manager().reserve_graph_transition().unwrap();
-        let lease = event_loop.sessions[index].share_session_lease().unwrap();
-        let receipt = smol::block_on(file_restore::prepare(file_restore::RestoreRequest {
-            sessions_dir: event_loop.ctx.sessions_dir.clone(),
-            owner: id,
-            source: super::endpoint(&session, None).unwrap(),
-            target: super::endpoint(&session, None).unwrap(),
-            choice: RestoreChoice::FilesOnly,
-            preview: file_restore::RestorePreview {
-                paths: vec![file_restore::PlannedFile {
-                    path: path.clone(),
-                    expected: file_state(&blobs, id, Some(FILE_AFTER)),
-                    desired: file_state(&blobs, id, Some(FILE_BEFORE)),
-                    warning: None,
-                    inverse_of: None,
-                }],
-                shell_commands: 0,
-            },
-            projection: None,
-            locks: Arc::clone(&event_loop.ctx.file_write_locks),
-            cancel: CancelToken::none(),
-        }))
-        .unwrap();
-        let reference = receipt.transition_ref();
-        if conflict {
-            fs::write(&path, FILE_EXTERNAL).unwrap();
-        }
-        let result = super::protect_restore_receipt(
-            Err(file_restore::RestoreError::Unresolved {
-                reason: PREPARE_ERROR.into(),
-                receipt: Box::new(receipt),
-            }),
-            (held, lease),
-        );
-        let error = result.unwrap_err();
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        if conflict {
-            assert!(error.starts_with(super::ABORT_REPAIR_FAILED));
-            event_loop.restore_failed(index, error);
-            assert!(event_loop.sessions[index].app.restore_in_progress);
-            assert!(event_loop.sessions[index].lock_lost);
-            assert!(
-                !store
-                    .load(&reference)
-                    .unwrap()
-                    .progress
-                    .contains(&RestoreProgress::Complete)
-            );
-            assert_eq!(fs::read(&path).unwrap(), FILE_EXTERNAL);
-            let retired = event_loop.remove_runtime(index);
-            let manager = retired.handles.manager_and_root().0;
-            drop(retired);
-            assert!(
-                session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                    .unwrap()
-                    .is_none()
-            );
-            fs::write(path, FILE_AFTER).unwrap();
-            smol::block_on(file_restore::reconcile(
-                &event_loop.ctx.sessions_dir,
-                &reference,
-                Arc::clone(&event_loop.ctx.file_write_locks),
-                CancelToken::none(),
-            ))
-            .unwrap();
-            super::super::tests::shutdown_manager(&manager);
-        } else {
-            assert_eq!(error, PREPARE_ERROR);
-            assert_eq!(fs::read(path).unwrap(), FILE_AFTER);
-            assert!(
-                store
-                    .load(&reference)
-                    .unwrap()
-                    .progress
-                    .contains(&RestoreProgress::Complete)
-            );
-            assert!(root.actor().unwrap().prepare_idle().is_ok());
-            turn(event_loop, index, SECOND);
-        }
-    });
-}
-
-#[test_case(true, false; "baseline_cancel_releases_without_file_changes")]
-#[test_case(false, false; "conversation_restore_cancel_retains_forward_receipt")]
-#[test_case(false, true; "files_only_cancel_retains_forward_receipt")]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool, files_only: bool) {
-    with_event_loop(|event_loop| {
-        let (index, _host) = two_turn_fixture(event_loop);
-        let root = target(event_loop, index);
-        let id = event_loop.sessions[index].id();
-        let path = recorded_file(
-            event_loop,
-            index,
-            "cancel-sync-runtime.txt",
-            Some(FILE_BEFORE),
-            Some(FILE_AFTER),
-        );
         checkpoint(event_loop, index);
         let writer = Arc::clone(&event_loop.ctx.storage_writer);
         let (entered, _release) = if baseline {
@@ -2210,89 +1329,41 @@ fn runtime_cancellation_abandons_directory_sync_wait(baseline: bool, files_only:
                 durable: Some(durable),
             },
         );
-        if baseline {
-            let mut waiting = None;
-            pump_until(event_loop, |_| {
-                waiting = entered.try_recv().ok();
-                waiting.is_some()
-            });
-            assert_eq!(waiting, Some(id));
-        } else {
-            confirm_choice(
-                event_loop,
-                if files_only {
-                    RestoreChoice::FilesOnly
-                } else {
-                    RestoreChoice::ConversationAndFiles
-                },
-            );
-            assert_eq!(entered.recv_timeout(WAIT).unwrap(), id);
-        }
+        let mut waiting = None;
+        pump_until(event_loop, |_| {
+            waiting = entered.try_recv().ok();
+            waiting.is_some()
+        });
+        assert_eq!(waiting, Some(id));
         assert!(event_loop.submit_text(index, THIRD.into()).is_err());
         event_loop.sessions[index].cancel_background_work();
         pump_until(event_loop, |event_loop| {
             event_loop.sessions[index].lock_lost
         });
         writer.release_restore_sync();
-        let store = RestoreStore::new(event_loop.ctx.storage.clone());
-        let pending = store.pending_for_session(id).unwrap();
-        assert_eq!(
-            fs::read(path).unwrap(),
-            if baseline { FILE_AFTER } else { FILE_BEFORE }
-        );
-        if baseline {
-            assert!(pending.is_empty());
-        } else {
-            assert_eq!(pending.len(), 1);
-            let transition = store.load(&pending[0]).unwrap();
-            assert!(!transition.progress.contains(&RestoreProgress::Complete));
-            assert!(
-                !transition
-                    .progress
-                    .contains(&RestoreProgress::RollbackIntent)
-            );
-        }
         let source_lease = match event_loop.sessions[index].session_lock.as_ref().unwrap() {
             super::super::SessionLockState::Shared(lease) => Arc::downgrade(lease),
             _ => panic!("restore must retain a shared source lease"),
         };
         let retired = event_loop.remove_runtime(index);
-        if baseline {
-            super::super::tests::release_runtime(retired);
-            pump_until(event_loop, |_| source_lease.upgrade().is_none());
-            let mut claimed = None;
-            pump_until(event_loop, |event_loop| {
-                claimed = session_lock::claim(&event_loop.ctx.sessions_dir, &id).unwrap();
-                claimed.is_some()
-            });
-            claimed.unwrap().release().unwrap();
-        } else {
-            let manager = retired.handles.manager_and_root().0;
-            drop(retired);
-            assert!(
-                session_lock::claim(&event_loop.ctx.sessions_dir, &id)
-                    .unwrap()
-                    .is_none()
-            );
-            smol::block_on(file_restore::reconcile(
-                &event_loop.ctx.sessions_dir,
-                &pending[0],
-                Arc::clone(&event_loop.ctx.file_write_locks),
-                CancelToken::none(),
-            ))
-            .unwrap();
-            super::super::tests::shutdown_manager(&manager);
-        }
+        super::super::tests::release_runtime(retired);
+        pump_until(event_loop, |_| source_lease.upgrade().is_none());
+        let mut claimed = None;
+        pump_until(event_loop, |event_loop| {
+            claimed = session_lock::claim(&event_loop.ctx.sessions_dir, &id).unwrap();
+            claimed.is_some()
+        });
+        claimed.unwrap().release().unwrap();
     });
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn conversation_restore_uses_legacy_projection_without_file_restore_metadata() {
+fn conversation_rewind_leaves_files_untouched() {
     with_event_loop(|event_loop| {
         let (index, _host) = two_turn_fixture(event_loop);
         let root = target(event_loop, index);
-        let id = event_loop.sessions[index].id();
+        let path = PathBuf::from(&event_loop.session_cwd).join(UNTOUCHED_FILE);
+        fs::write(&path, UNTOUCHED_CONTENT).unwrap();
         let original = checkpoint(event_loop, index);
         let (history, durable) = boundary(event_loop, index, SECOND);
         let expected = original.messages()[..history.offset].to_vec();
@@ -2304,47 +1375,9 @@ fn conversation_restore_uses_legacy_projection_without_file_restore_metadata() {
                 durable: Some(durable),
             },
         );
-        confirm_choice(event_loop, RestoreChoice::ConversationOnly);
         finish_restore(event_loop, index);
         assert_history(event_loop, index, &expected);
-        let disk = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        assert!(disk.restore_refs().is_empty());
-        assert!(disk.branches().last().unwrap().transition.is_none());
-        assert!(!event_loop.ctx.sessions_dir.join("restores").exists());
-    });
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[test_case(RestoreChoice::ConversationAndFiles)]
-#[test_case(RestoreChoice::FilesOnly)]
-fn unsupported_runtime_file_choice_leaves_conversation_and_files_unchanged(choice: RestoreChoice) {
-    with_event_loop(|event_loop| {
-        let (index, _host) = two_turn_fixture(event_loop);
-        let root = target(event_loop, index);
-        let id = event_loop.sessions[index].id();
-        let path = PathBuf::from(&event_loop.session_cwd).join("unsupported-restore.txt");
-        fs::write(&path, FILE_EXTERNAL).unwrap();
-        let original = checkpoint(event_loop, index);
-        let (history, durable) = boundary(event_loop, index, SECOND);
-        event_loop.handle_action(
-            index,
-            Action::RewindAgent {
-                target: root,
-                boundary: history,
-                durable: Some(durable),
-            },
-        );
-        confirm_choice(event_loop, choice);
-        finish_restore(event_loop, index);
-        assert_history(event_loop, index, original.messages());
-        assert_eq!(fs::read(path).unwrap(), FILE_EXTERNAL);
-        let disk = AppSession::load(id, &event_loop.ctx.storage).unwrap();
-        assert!(disk.restore_refs().is_empty());
-        assert!(disk.branches().is_empty());
-        assert_eq!(
-            event_loop.sessions[index].app.status_bar.flash_text(),
-            Some(super::FILE_RESTORE_UNSUPPORTED)
-        );
+        assert_eq!(fs::read(path).unwrap(), UNTOUCHED_CONTENT);
         turn(event_loop, index, THIRD);
     });
 }

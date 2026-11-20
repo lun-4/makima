@@ -23,29 +23,13 @@ Instruction changes on disk do not silently replace the session's recorded conte
 
 ## Rewind and branches
 
-In the TUI, `Esc Esc` on an idle agent opens rewind. Selecting a restoration point opens a preview of affected file paths and shell commands. The restore choices are:
+In the TUI, `Esc Esc` on an idle agent opens rewind. Selecting a restoration point restores conversation history, configuration, and recorded state, including context and plan state. Rewind never changes files on disk, except that it can rewrite the plan file from recorded plan state.
 
-| Choice | Effect |
-|--------|--------|
-| Conversation | Restores conversation history, configuration, and recorded state, including context and plan state. Does not undo ordinary file edits. |
-| Conversation and files | Restores the conversation and recorded file edits. |
-| Files only | Restores recorded file edits without changing conversation history, configuration, plan state, or the input draft. |
+Rewind stops active work in the affected subtree before changing its history. Restored history does not automatically replay turns. Requeued child reports remain held until explicit user input allows delivery. A child rewind leaves session-wide settings and unrelated agent history unchanged.
 
-Conversation restore stops active work in the affected subtree before changing its history. Restored history does not automatically replay turns. Requeued child reports remain held until explicit user input allows delivery. A child rewind leaves session-wide settings and unrelated agent history unchanged.
-
-Rewind retains the previous state as a branch. Selecting it under Branches in the rewind picker redoes the restore. Retained branches and file redo survive restart. A pruned branch is shown as expired and cannot be restored. Compaction can make older restoration points unavailable.
+Rewind retains the previous state as a branch. Selecting it under Branches in the rewind picker redoes the restore. Retained branches survive restart. A pruned branch is shown as expired and cannot be restored. Compaction can make older restoration points unavailable.
 
 Approving a plan with clear context creates a separate implementation session linked to the planning session. Rewind can follow that link to an eligible planning boundary. It reopens the parent conversation and preserves the implementation session separately. Redo stays within the parent session; it does not switch back to the implementation session. A parent open elsewhere or with an incompatible working directory cannot be restored.
-
-### File restore limits
-
-File restore uses the before and after states recorded by mutating tools. It can undo a recorded creation, deletion, or edit. A file that no longer matches the expected state is skipped with a conflict warning, preserving user or external edits. Redo changes only paths that the earlier restore actually changed; it does not overwrite paths skipped because of conflicts.
-
-Shell commands are listed in the preview but are not reverted. Their filesystem changes are not captured as ordinary tool edits. Writes that a tool does not declare and record are also outside file restore. Conversation restore can rewrite the plan file from recorded plan state even when ordinary file restoration is not selected.
-
-File restore is supported on Linux and macOS. On Windows and other platforms, Conversation remains available, but file restore choices return an explicit unsupported error before changing files. If existing file-restore metadata cannot be inspected safely, session startup or deletion fails rather than ignoring that metadata.
-
-An interrupted file restore is reconciled before new work can start. Unresolved restore conflicts can keep the affected sessions blocked; a failed or pending restore must not be bypassed by deleting its metadata.
 
 ## Messages and turns
 

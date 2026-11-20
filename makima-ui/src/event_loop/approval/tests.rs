@@ -31,7 +31,6 @@ use makima_storage::checkpoint::{CheckpointRequest, CheckpointVersion};
 use makima_storage::id::{AgentId, MakimaId, SessionRef};
 use makima_storage::model::{read_model, read_recents};
 use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
-use makima_storage::restore::RestoreChoice;
 use makima_storage::session_lock;
 use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
 use makima_storage::sessions::{StoredMode, read_prefs};
@@ -1922,10 +1921,6 @@ fn parent_rewind_preserves_implementation_and_redo_stays_in_parent(
             if matches!(event, InternalEvent::ParentRestorePublished { .. }) {
                 break event;
             }
-            if let InternalEvent::RestorePreview { reply, .. } = &event {
-                reply.send(RestoreChoice::ConversationAndFiles).unwrap();
-                continue;
-            }
             event_loop.handle_internal(event);
         };
         assert!(matches!(
@@ -2084,10 +2079,6 @@ fn queued_parent_restore_abort_repairs_projection_without_publishing(handle_afte
             let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
             if matches!(event, InternalEvent::ParentRestoreReady { .. }) {
                 break event;
-            }
-            if let InternalEvent::RestorePreview { reply, .. } = &event {
-                reply.send(RestoreChoice::ConversationAndFiles).unwrap();
-                continue;
             }
             event_loop.handle_internal(event);
         };

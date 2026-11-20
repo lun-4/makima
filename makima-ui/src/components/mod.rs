@@ -22,7 +22,6 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
-pub(crate) mod restore_form;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;

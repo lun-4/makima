@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +13,6 @@ use tracing::{debug, error, warn};
 
 use crate::actor::ActorHistory;
 use crate::call_scope::{CallGuard, CallScope, MovedBy};
-use crate::file_restore::{SUPPORTED, recording::ToolRecording};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
@@ -864,13 +862,7 @@ async fn run_native_tool(
                     chain.push(guard.owner());
                     let mut exec_ctx = ctx.clone();
                     exec_ctx.write_lock_chain = Arc::new(chain);
-                    let path = match ctx.resolve_path(&target.to_string_lossy()) {
-                        Ok(path) => {
-                            makima_storage::paths::normalize_path(PathBuf::from(path).as_path())
-                        }
-                        Err(message) => return done_error(message),
-                    };
-                    Some((exec_ctx, guard, key, path))
+                    Some((exec_ctx, guard, key))
                 }
                 Err(msg) => return done_error(msg),
             }
@@ -893,15 +885,14 @@ async fn run_native_tool(
             .send(AgentEvent::ToolExecutionStart { id: id.clone() });
     }
 
-    let (exec_ctx, guard, key, path) = match locked {
-        Some((exec_ctx, guard, key, path)) => (exec_ctx, Some(guard), Some(key), Some(path)),
-        None => (ctx.clone(), None, None, None),
+    let (exec_ctx, guard, key) = match locked {
+        Some((exec_ctx, guard, key)) => (exec_ctx, Some(guard), Some(key)),
+        None => (ctx.clone(), None, None),
     };
-    let is_shell = entry.tool.shell_execution();
     let (result_tx, result_rx) = flume::bounded(1);
     let completion = async move {
         let _guard = guard;
-        let result = execute_recorded(invocation, &exec_ctx, path, is_shell).await;
+        let result = execute_caught(invocation, &exec_ctx).await;
         if result.output.is_ok()
             && let Some(key) = key
         {
@@ -954,38 +945,8 @@ async fn run_native_tool(
     }
 }
 
-async fn execute_recorded(
-    invocation: Box<dyn ToolInvocation>,
-    ctx: &ToolContext,
-    path: Option<PathBuf>,
-    is_shell: bool,
-) -> ToolExecResult {
-    let path = path.filter(|_| SUPPORTED);
-    let recording = match if path.is_some() || is_shell {
-        ToolRecording::from_context(ctx)
-    } else {
-        Ok(None)
-    } {
-        Ok(recording) => recording,
-        Err(message) => return Err(message).into(),
-    };
-    let setup = smol::unblock(move || {
-        let capture = recording
-            .as_ref()
-            .zip(path.as_ref())
-            .map(|(recording, path)| recording.capture(path))
-            .transpose()?;
-        if is_shell && let Some(recording) = &recording {
-            recording.shell_execution()?;
-        }
-        Ok::<_, String>((recording, capture))
-    })
-    .await;
-    let (recording, capture) = match setup {
-        Ok(setup) => setup,
-        Err(message) => return Err(message).into(),
-    };
-    let mut result = match AssertUnwindSafe(async move { invocation.execute(ctx).await })
+async fn execute_caught(invocation: Box<dyn ToolInvocation>, ctx: &ToolContext) -> ToolExecResult {
+    match AssertUnwindSafe(invocation.execute(ctx))
         .catch_unwind()
         .await
     {
@@ -995,17 +956,7 @@ async fn execute_recorded(
             panic_to_string(payload)
         ))
         .into(),
-    };
-    if let Some((recording, capture)) = recording.zip(capture)
-        && let Err(message) = smol::unblock(move || recording.finish(capture)).await
-    {
-        let message = format!("Tool ran, but file restore recording failed: {message}");
-        result.output = Err(match result.output {
-            Ok(_) => message,
-            Err(original) => format!("{original}\n{message}"),
-        });
     }
-    result
 }
 
 /// MCP, local, and search tools never go through invocation parsing,
@@ -1493,14 +1444,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use makima_config::{
         DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
     };
-    use makima_storage::StateDir;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use makima_storage::blobs::{BlobStore, FileState};
     use makima_storage::checkpoint::{CheckpointWriter, accept_all};
     use makima_storage::id::MakimaId;
     use test_case::test_case;
@@ -1510,9 +1458,6 @@ mod tests {
     use crate::agent::history::History;
     use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
-    use crate::file_restore::{StoredSession, recording::SHELL_KIND};
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use crate::manager::{GraphLifecycle, ReactivationError, ResidentAgent};
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
     use crate::permissions::{
@@ -1539,10 +1484,7 @@ mod tests {
         ControlWork, CurrentManagedTurn, DoneReason, EffectiveAgentConfig, RunSettings,
         TurnContext, TurnOutcome, WorkKind,
     };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use crate::{ModeDef, ModeId};
     use makima_storage::plans::PlanSlot;
-    use makima_storage::session_state::StateChange;
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -4137,343 +4079,6 @@ mod tests {
         let snapshot = manager.journal().snapshot();
         let view = snapshot.fold(u64::MAX).unwrap();
         crate::plan_state::plan_entries(&view).unwrap()
-    }
-
-    struct ShellMarkerProbe {
-        name: &'static str,
-        shell_execution: bool,
-        executed: Arc<AtomicUsize>,
-    }
-
-    impl Tool for ShellMarkerProbe {
-        fn name(&self) -> &str {
-            self.name
-        }
-        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
-            TEST_ID.into()
-        }
-        fn schema(&self) -> Value {
-            json!({"type": "object"})
-        }
-        fn tool_kind(&self) -> Option<&str> {
-            Some(SHELL_KIND)
-        }
-        fn shell_execution(&self) -> bool {
-            self.shell_execution
-        }
-        fn required_permission(&self) -> Option<Permission> {
-            Some(Permission::Run)
-        }
-        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-            Ok(Box::new(ShellMarkerInvocation(self.executed.clone())))
-        }
-    }
-
-    struct ShellMarkerInvocation(Arc<AtomicUsize>);
-
-    impl ToolInvocation for ShellMarkerInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain(TEST_ID.into()))
-        }
-        fn permission_scopes(
-            &self,
-            _: Option<&SessionRef>,
-        ) -> BoxFuture<'_, Option<PermissionScopes>> {
-            Box::pin(std::future::ready(Some(PermissionScopes::single(
-                TEST_ID.into(),
-            ))))
-        }
-        fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
-            Box::pin(async move {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(ToolOutput::Plain(TEST_ID.into())).into()
-            })
-        }
-    }
-
-    #[test_case(true, false, false, 1; "renamed_shell")]
-    #[test_case(false, true, false, 0; "execute_kind_without_shell_marker")]
-    #[test_case(true, false, true, 0; "permission_denial_records_nothing")]
-    #[test_case(true, true, false, 1; "shell_name_and_kind_once")]
-    fn central_dispatch_records_shell_marker_once_per_nested_execution(
-        shell_execution: bool,
-        named_execute: bool,
-        denied: bool,
-        markers_per_call: usize,
-    ) {
-        smol::block_on(async {
-            let directory = tempfile::tempdir().unwrap();
-            let state = StateDir::from_path(directory.path().canonicalize().unwrap());
-            let mut session = StoredSession::new(TEST_ID, state.path().to_str().unwrap());
-            session.save(&state).unwrap();
-            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-            manager.journal().bind_session(session.id).unwrap();
-            let (backend, current, release) = plan_write_backend();
-            let root = manager.create_root(Vec::new(), None, backend).unwrap();
-            let ticket = root
-                .actor()
-                .unwrap()
-                .admit_turn(
-                    crate::AgentInput::new(TEST_ID.into(), Vec::new()),
-                    None,
-                    TEST_ID.into(),
-                )
-                .unwrap();
-            let turn = current.recv_async().await.unwrap();
-            let name = if named_execute {
-                SHELL_KIND
-            } else {
-                HOOK_TOOL_NAME
-            };
-            let executed = Arc::new(AtomicUsize::new(0));
-            let mut ctx = if denied {
-                denying_ctx(ToolKey::native(name))
-            } else {
-                build_ctx()
-            };
-            ctx.managed_turn = Some(turn);
-            ctx.offload = Some(Arc::new(OffloadStore::for_session(
-                state.path(),
-                &SessionRef::from(session.id),
-            )));
-            ctx.registry = registered(Arc::new(ShellMarkerProbe {
-                name,
-                shell_execution,
-                executed: executed.clone(),
-            }));
-            pin(&mut ctx);
-            for _ in 0..2 {
-                let done = run(String::new(), name, &json!({}), &ctx, CallOrigin::Nested).await;
-                assert_eq!(done.is_error, denied);
-            }
-            let snapshot = manager.journal().snapshot();
-            let markers = snapshot
-                .state
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        &record.change, StateChange::ToolExecution { kind } if kind == SHELL_KIND
-                    )
-                })
-                .count();
-            assert_eq!(markers, markers_per_call * 2);
-            assert_eq!(executed.load(Ordering::SeqCst), if denied { 0 } else { 2 });
-            release.send(()).unwrap();
-            ticket.wait_result().await;
-            assert!(
-                manager
-                    .shutdown(HOOK_CALL_DEADLINE)
-                    .await
-                    .timed_out
-                    .is_empty()
-            );
-        });
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    #[test]
-    fn unsupported_restore_capture_does_not_block_persistent_mutation_dispatch() {
-        smol::block_on(async {
-            let directory = tempfile::tempdir().unwrap();
-            let state = StateDir::from_path(directory.path().canonicalize().unwrap());
-            let path = state.path().join(TEST_ID);
-            let mut session = StoredSession::new(TEST_ID, state.path().to_str().unwrap());
-            session.save(&state).unwrap();
-            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-            manager.journal().bind_session(session.id).unwrap();
-            let (backend, current, release) = plan_write_backend();
-            let root = manager.create_root(Vec::new(), None, backend).unwrap();
-            let ticket = root
-                .actor()
-                .unwrap()
-                .admit_turn(
-                    crate::AgentInput::new(TEST_ID.into(), Vec::new()),
-                    None,
-                    TEST_ID.into(),
-                )
-                .unwrap();
-            let mut ctx = build_ctx();
-            ctx.cwd = state.path().to_path_buf();
-            ctx.managed_turn = Some(current.recv_async().await.unwrap());
-            let gate = Gate::new();
-            gate.release();
-            let done = dispatch_gated(
-                registered(Arc::new(GatedWriteNamed {
-                    name: TEST_ID.into(),
-                    gate,
-                    fail: false,
-                    content: Some(PLAN_WRITE_CONTENT),
-                })),
-                ctx,
-                String::new(),
-                TEST_ID.into(),
-                path.display().to_string(),
-            )
-            .await;
-            assert!(!done.is_error, "{}", done.output.as_text());
-            assert_eq!(std::fs::read_to_string(path).unwrap(), PLAN_WRITE_CONTENT);
-            assert!(
-                !manager
-                    .journal()
-                    .snapshot()
-                    .state
-                    .iter()
-                    .any(|record| matches!(&record.change, StateChange::File { .. }))
-            );
-            release.send(()).unwrap();
-            ticket.wait_result().await;
-            assert!(
-                manager
-                    .shutdown(HOOK_CALL_DEADLINE)
-                    .await
-                    .timed_out
-                    .is_empty()
-            );
-        });
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn dormant_reactivation_waits_for_cancelled_nested_write_postcapture() {
-        smol::block_on(async {
-            let directory = tempfile::tempdir().unwrap();
-            let state = StateDir::from_path(directory.path().canonicalize().unwrap());
-            let path = state.path().join("nested-write");
-            let mut session = StoredSession::new(TEST_ID, state.path().to_str().unwrap());
-            session.save(&state).unwrap();
-            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-            manager.journal().bind_session(session.id).unwrap();
-            let (backend, current, release_backend) = plan_write_backend();
-            let mut definition = ModeDef::default_for(ModeId::Plan);
-            definition.restrict_write_to = Some(path.clone());
-            let config = plan_config(&path).with_mode_def(Some(definition));
-            let root = manager
-                .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-                    Ok::<_, String>(backend)
-                })
-                .unwrap();
-            let actor = root.actor().unwrap();
-            let ticket = actor
-                .admit_turn(
-                    crate::AgentInput::new(TEST_ID.into(), Vec::new()),
-                    None,
-                    TEST_ID.into(),
-                )
-                .unwrap();
-            let turn = current.recv_async().await.unwrap();
-            let incarnation = root.incarnation().unwrap();
-            let mut ctx = stub_ctx(&AgentMode::Plan(path.clone()));
-            ctx.cwd = state.path().to_path_buf();
-            ctx.managed_turn = Some(turn);
-            ctx.offload = Some(Arc::new(OffloadStore::for_session(
-                state.path(),
-                &SessionRef::from(session.id),
-            )));
-            let gate = Gate::new();
-            let registry = registered(Arc::new(GatedWriteNamed {
-                name: "write".into(),
-                gate: gate.clone(),
-                fail: false,
-                content: Some(PLAN_WRITE_CONTENT),
-            }));
-            let nested = smol::spawn(dispatch_gated(
-                registry,
-                ctx,
-                TEST_ID.into(),
-                "write".into(),
-                path.display().to_string(),
-            ));
-            gate.entered().await;
-            nested.cancel().await;
-            actor.shutdown();
-            release_backend.send(()).unwrap();
-            ticket.wait_result().await;
-            futures_lite::future::or(
-                async {
-                    while root.snapshot().unwrap().graph_lifecycle != GraphLifecycle::Dormant {
-                        futures_lite::future::yield_now().await;
-                    }
-                },
-                async {
-                    smol::Timer::after(HOOK_CALL_DEADLINE).await;
-                    panic!("old actor did not become dormant");
-                },
-            )
-            .await;
-            let error = manager
-                .ensure_resident_with(root.id(), |_| async {
-                    panic!("factory must not run before previous postcapture finishes")
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(
-                error,
-                crate::ManagerError::Reactivation(ReactivationError::ToolCompletionPending)
-            );
-            assert_eq!(manager.incarnation(root.id()).unwrap(), incarnation);
-            gate.release();
-            let replacement = futures_lite::future::or(
-                async {
-                    loop {
-                        let result = manager
-                            .ensure_resident_with(root.id(), |_| async {
-                                let (backend, _, _) = plan_write_backend();
-                                Ok(ResidentAgent {
-                                    backend,
-                                    config: config.clone(),
-                                    shared_messages: None,
-                                    start: None,
-                                    initialize: None,
-                                })
-                            })
-                            .await;
-                        match result {
-                            Ok(replacement) => break replacement,
-                            Err(crate::ManagerError::Reactivation(
-                                ReactivationError::ToolCompletionPending,
-                            )) => {
-                                futures_lite::future::yield_now().await;
-                            }
-                            Err(error) => panic!("reactivation failed: {error}"),
-                        }
-                    }
-                },
-                async {
-                    smol::Timer::after(HOOK_CALL_DEADLINE).await;
-                    panic!("previous write did not settle");
-                },
-            )
-            .await;
-            assert_ne!(replacement.incarnation().unwrap(), incarnation);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), PLAN_WRITE_CONTENT);
-            let snapshot = manager.journal().snapshot();
-            let after = snapshot
-                .state
-                .iter()
-                .find_map(|record| match &record.change {
-                    StateChange::File {
-                        path: written,
-                        before: FileState::Absent,
-                        after,
-                    } if written == &path => Some(after),
-                    _ => None,
-                })
-                .unwrap();
-            let FileState::Blob(reference) = after else {
-                panic!("nested write requires a recorded post-image");
-            };
-            assert_eq!(
-                BlobStore::new(state).read(reference).unwrap(),
-                PLAN_WRITE_CONTENT.as_bytes()
-            );
-            assert!(
-                manager
-                    .shutdown(HOOK_CALL_DEADLINE)
-                    .await
-                    .timed_out
-                    .is_empty()
-            );
-        });
     }
 
     #[test_case(false, false; "root_write")]

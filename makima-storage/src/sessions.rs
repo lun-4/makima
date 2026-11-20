@@ -21,7 +21,6 @@ use crate::conversation::ConversationState;
 use crate::id::{AgentId, MakimaId};
 use crate::offload_cleanup::Root;
 use crate::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
-use crate::restore::{RestoreError, RestoreStore, TransitionRef};
 use crate::session_lock::SessionPublicationGuard;
 use crate::session_state::{
     ParentLink, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
@@ -41,8 +40,6 @@ use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
 const LOG_FORMAT_VERSION: u32 = 3;
 const LEGACY_LOG_FORMAT_VERSION: u32 = 2;
 const BRANCH_DIR: &str = "branches";
-const BLOBS_DIR: &str = "blobs";
-const RESTORES_DIR: &str = "restores";
 const BRANCH_KEEP: usize = 20;
 const BRANCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
 type Publication = Arc<Mutex<u64>>;
@@ -92,8 +89,6 @@ pub fn next_epoch() -> u64 {
 pub enum SessionError {
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error(transparent)]
-    Restore(#[from] RestoreError),
     #[error("incompatible session version {found} (expected {expected})")]
     VersionMismatch { found: u32, expected: u32 },
     #[error("session requires unsupported features: {features:?}")]
@@ -326,7 +321,6 @@ pub struct Session<M, U, T> {
     legacy_root_unpublished: bool,
     legacy_config: Option<LegacyConfig>,
     branches: Vec<StoredBranch>,
-    restore_refs: Vec<TransitionRef>,
     parent: Option<ParentLink>,
     features: BTreeSet<String>,
     usage_by_model: HashMap<String, StoredTokenUsage>,
@@ -511,8 +505,6 @@ enum LogRecord<M, U, T> {
     Agent { seq: u64, d: StoredAgentRecord },
     #[serde(rename = "branch")]
     Branch { d: StoredBranch },
-    #[serde(rename = "restore_ref")]
-    RestoreRef { d: TransitionRef },
     #[serde(rename = "msg")]
     Msg { d: M },
     #[serde(rename = "out")]
@@ -570,7 +562,6 @@ pub struct SessionLog {
     saved_state_count: usize,
     saved_agent_revision_count: usize,
     saved_branch_count: usize,
-    saved_restore_ref_count: usize,
     appends: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
@@ -1165,15 +1156,6 @@ impl SessionLog {
                 &LogRecord::<&M, &U, &T>::Branch { d: branch.clone() },
             )?;
         }
-
-        for reference in &session.restore_refs[self.saved_restore_ref_count..] {
-            append_record(
-                &mut buf,
-                &LogRecord::<&M, &U, &T>::RestoreRef {
-                    d: reference.clone(),
-                },
-            )?;
-        }
         let meta = meta_record(session)?;
         if buf.is_empty() && meta == self.saved_meta {
             return Ok(());
@@ -1199,7 +1181,6 @@ impl SessionLog {
         self.saved_state_count = session.state.len();
         self.saved_agent_revision_count = session.agent_revisions.len();
         self.saved_branch_count = session.branches.len();
-        self.saved_restore_ref_count = session.restore_refs.len();
         self.saved_tool_ids.extend(new_tool_ids);
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
@@ -1234,7 +1215,6 @@ impl SessionLog {
             saved_state_count: session.state.len(),
             saved_agent_revision_count: session.agent_revisions.len(),
             saved_branch_count: session.branches.len(),
-            saved_restore_ref_count: session.restore_refs.len(),
             appends: 0,
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
@@ -1281,7 +1261,6 @@ impl SessionLog {
             || self.saved_state_count > session.state.len()
             || self.saved_agent_revision_count > session.agent_revisions.len()
             || self.saved_branch_count > session.branches.len()
-            || self.saved_restore_ref_count > session.restore_refs.len()
             || self
                 .saved_tool_ids
                 .iter()
@@ -1380,14 +1359,6 @@ where
         append_record(
             &mut buf,
             &LogRecord::<&M, &U, &T>::Branch { d: branch.clone() },
-        )?;
-    }
-    for reference in &session.restore_refs {
-        append_record(
-            &mut buf,
-            &LogRecord::<&M, &U, &T>::RestoreRef {
-                d: reference.clone(),
-            },
         )?;
     }
     buf.extend_from_slice(&meta_record(session)?);
@@ -1526,7 +1497,6 @@ where
     let mut state = Vec::new();
     let mut agent_revisions = Vec::new();
     let mut branches = Vec::new();
-    let mut restore_refs = Vec::new();
     let mut sequence_high_water = None;
     let mut history_epochs = BTreeMap::new();
     for line in data.split(|&b| b == b'\n') {
@@ -1605,11 +1575,6 @@ where
             LogRecord::State { d } => state.push(d),
             LogRecord::Agent { seq, d } => agent_revisions.push((seq, d)),
             LogRecord::Branch { d } => branches.push(d),
-            LogRecord::RestoreRef { d } => {
-                if !restore_refs.contains(&d) {
-                    restore_refs.push(d);
-                }
-            }
             LogRecord::Msg { d } => messages.push(d),
             LogRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
@@ -1675,7 +1640,6 @@ where
         legacy_config,
         agent_revisions,
         branches,
-        restore_refs,
         parent,
         features,
         usage_by_model,
@@ -2337,7 +2301,6 @@ where
             legacy_root_unpublished: false,
             legacy_config: None,
             branches: Vec::new(),
-            restore_refs: Vec::new(),
             parent: None,
             features: BTreeSet::new(),
             usage_by_model: HashMap::new(),
@@ -2500,13 +2463,6 @@ where
             }
         }
         replacement.branches = branches;
-        let mut restore_refs = self.restore_refs.clone();
-        for reference in &replacement.restore_refs {
-            if !restore_refs.contains(reference) {
-                restore_refs.push(reference.clone());
-            }
-        }
-        replacement.restore_refs = restore_refs;
         replacement.revision = self.revision;
         replacement.content_revision = self.content_revision;
         replacement.rewrites = self.rewrites;
@@ -2605,17 +2561,6 @@ where
             self.agents = latest_agents(&revisions);
             self.agent_revisions = revisions;
             self.rewrite();
-        }
-    }
-
-    pub fn restore_refs(&self) -> &[TransitionRef] {
-        &self.restore_refs
-    }
-
-    pub fn push_restore_ref(&mut self, reference: TransitionRef) {
-        if !self.restore_refs.contains(&reference) {
-            self.restore_refs.push(reference);
-            self.touch();
         }
     }
 
@@ -3188,13 +3133,6 @@ where
         if session_lock::open_elsewhere(dir, &id) {
             return Err(SessionError::OpenElsewhere);
         }
-        let _restore_guard = RestoreStore::guard_session_deletion_in(dir, id).map_err(|error| {
-            if matches!(&error, RestoreError::Io(error) if error.kind() == ErrorKind::NotFound) {
-                SessionError::Storage(StorageError::NotFound(id.to_string()))
-            } else {
-                SessionError::Restore(error)
-            }
-        })?;
         let removed = try_remove(&jsonl_path(dir, id))?;
         // Backups, not the session: failing to sweep them must not fail a
         // delete whose log is already gone, and their presence alone does not
@@ -3203,11 +3141,6 @@ where
         let paths = [
             (Path::new(ARCHIVE_DIR).join(&session_id), "archives"),
             (Path::new(BRANCH_DIR).join(&session_id), "branches"),
-            (Path::new(BLOBS_DIR).join(&session_id), "file blobs"),
-            (
-                Path::new(RESTORES_DIR).join(&session_id),
-                "file restore transitions",
-            ),
             (
                 Path::new(OFFLOAD_DIR).join(&session_id),
                 "offloaded tool output",
@@ -3263,7 +3196,6 @@ mod tests {
     use crate::conversation::{ConversationLink, ConversationRelation, ConversationState};
     use crate::id::{AgentId, MakimaId};
     use crate::plans::{PLAN_STATE_KEY, PlanSlot};
-    use crate::restore::TransitionRef;
     use crate::session_lock;
     use crate::session_state::{
         BOUNDARY_POOL_FORMAT, ParentLink, StateChange, StoredAgentConfig, StoredAgentLifecycle,
@@ -3278,7 +3210,6 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::fs::symlink_dir;
     use std::path::{Path, PathBuf};
-    use std::slice::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
@@ -3342,7 +3273,6 @@ mod tests {
             at_seq: session.next_state_seq().saturating_sub(1),
             agent: session.root_agent_id().unwrap(),
             offset: session.messages().len(),
-            transition: None,
         }
     }
 
@@ -3417,121 +3347,6 @@ mod tests {
             jsonl_path(directory.path(), session.id).exists(),
             sync_failure
         );
-    }
-
-    #[test]
-    fn restore_references_round_trip_append_deduplicate_and_survive_replacement() {
-        let (dir, mut session) = branch_fixture();
-        let original = session.clone();
-        let first = TransitionRef {
-            session: session.id,
-            transition: MakimaId::generate(),
-        };
-        let second = TransitionRef {
-            session: session.id,
-            transition: MakimaId::generate(),
-        };
-        session.push_restore_ref(first.clone());
-        let mut log = SessionLog::rewrite(dir.path(), &session).unwrap();
-        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
-        assert!(session.checkpoint_required());
-        assert!(loaded.checkpoint_required());
-        assert!(loaded.clone().checkpoint_required());
-        assert_eq!(loaded.restore_refs(), from_ref(&first));
-        let revision = session.revision();
-        session.push_restore_ref(first.clone());
-        assert_eq!(session.revision(), revision);
-        session.push_restore_ref(second.clone());
-        log.append(&session).unwrap();
-        let size = fs::metadata(jsonl_path(dir.path(), session.id))
-            .unwrap()
-            .len();
-        log.append(&session).unwrap();
-        assert_eq!(
-            fs::metadata(jsonl_path(dir.path(), session.id))
-                .unwrap()
-                .len(),
-            size
-        );
-        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
-        assert_eq!(loaded.restore_refs(), &[first.clone(), second.clone()]);
-        assert_eq!(loaded.messages(), original.messages());
-        assert_eq!(loaded.state(), original.state());
-
-        let mut replacement = original;
-        replacement.push_restore_ref(second.clone());
-        replacement.replace_messages(Vec::new());
-        session.replace_authoritative(replacement).unwrap();
-        session.save_to(dir.path()).unwrap();
-        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
-        assert_eq!(loaded.restore_refs(), &[first, second]);
-        assert!(loaded.messages().is_empty());
-    }
-
-    #[test_case(false, false ; "cancelled")]
-    #[test_case(true, false ; "published")]
-    #[test_case(true, true ; "published_unsynced")]
-    fn restore_reference_is_committed_only_by_checkpoint_publication(
-        publish: bool,
-        sync_failure: bool,
-    ) {
-        let (dir, session) = branch_fixture();
-        let reference = TransitionRef {
-            session: session.id,
-            transition: MakimaId::generate(),
-        };
-        let mut replacement = session.clone();
-        replacement.push_restore_ref(reference.clone());
-        let staged = SessionLog::stage_checkpoint(dir.path(), &replacement).unwrap();
-        assert!(
-            TestSession::load_from(session.id, dir.path())
-                .unwrap()
-                .restore_refs()
-                .is_empty()
-        );
-        let outcome = staged
-            .publish_with_sync(
-                || publish,
-                |_| {
-                    if sync_failure {
-                        Err(StorageError::Io(io::Error::other(POST_TEXT)))
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-            .unwrap();
-        assert_eq!(outcome.is_published(), publish);
-        assert_eq!(
-            matches!(outcome, PublicationOutcome::PublishedUnsynced(_)),
-            sync_failure
-        );
-        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
-        assert_eq!(
-            loaded.restore_refs(),
-            if publish { vec![reference] } else { Vec::new() }
-        );
-        assert_eq!(loaded.messages(), session.messages());
-        assert_eq!(loaded.state(), session.state());
-    }
-
-    #[test]
-    fn branch_transition_reference_round_trips_without_publishing_it() {
-        let (dir, mut session) = branch_fixture();
-        let reference = TransitionRef {
-            session: session.id,
-            transition: MakimaId::generate(),
-        };
-        let mut saved = branch(&session);
-        saved.transition = Some(reference);
-        session.push_branch(saved.clone());
-        SessionLog::stage_checkpoint_with_branch(dir.path(), &session, saved.clone())
-            .unwrap()
-            .publish_unowned(|| true)
-            .unwrap();
-        let loaded = TestSession::load_from(session.id, dir.path()).unwrap();
-        assert_eq!(loaded.branches(), &[saved]);
-        assert!(loaded.restore_refs().is_empty());
     }
 
     #[test]

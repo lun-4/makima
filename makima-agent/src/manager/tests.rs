@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,28 +7,18 @@ use std::time::Duration;
 
 use test_case::test_case;
 
-#[cfg(unix)]
-use crate::file_restore::{StoredSession, recording::ToolRecording};
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
-#[cfg(unix)]
-use crate::tools::{offload::OffloadStore, test_support::stub_ctx};
 use event_listener::Event;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
 };
-#[cfg(unix)]
-use makima_storage::StateDir;
-#[cfg(unix)]
-use makima_storage::blobs::{BlobStore, FileState};
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::SessionRef;
 use makima_storage::session_state::{
     StateChange, StoredAgentLifecycle, StoredDelivery, StoredDeliveryOp,
 };
 use makima_storage::sessions::Session;
-#[cfg(unix)]
-use makima_storage::sessions::{SESSIONS_DIR, offload_dir};
 use serde_json::Value;
 
 use super::{
@@ -50,124 +38,6 @@ const GRAPH_SUBSCRIBER: u64 = 1;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
 const SMALL_RETAINED_QUOTA: usize = 4;
-#[cfg(unix)]
-const TOOL_WRITE_BYTES: &[u8] = b"write completed after shutdown cut";
-#[cfg(unix)]
-const TOOL_WRITE_MODEL: &str = "shutdown-tool-recording";
-
-#[cfg(unix)]
-#[test_case(false; "shutdown_waits_for_postcapture")]
-#[test_case(true; "timeout_reaper_preserves_postcapture")]
-fn shutdown_drains_actual_write_before_incarnation_cleanup(timeout: bool) {
-    smol::block_on(async {
-        let temporary = tempfile::tempdir().unwrap();
-        let state = StateDir::from_path(temporary.path().canonicalize().unwrap());
-        let mut session = StoredSession::new(TOOL_WRITE_MODEL, temporary.path().to_str().unwrap());
-        session.save(&state).unwrap();
-        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-        manager.journal().bind_session(session.id).unwrap();
-        let (entered, current) = flume::bounded(1);
-        let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                Box::new(CancellableBackend {
-                    entered: move |context: &TurnContext| {
-                        entered.send(context.managed_turn.clone().unwrap()).unwrap();
-                    },
-                }),
-            )
-            .unwrap();
-        let actor = root.actor().unwrap();
-        let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
-        let turn = current.recv_async().await.unwrap();
-        let incarnation = root.incarnation().unwrap();
-        let mut ctx = stub_ctx(&AgentMode::Build);
-        ctx.managed_turn = Some(turn);
-        ctx.offload = Some(Arc::new(OffloadStore::on_disk(offload_dir(
-            &state.path().join(SESSIONS_DIR),
-            session.id,
-        ))));
-        let recording = ToolRecording::from_context(&ctx).unwrap().unwrap();
-        let path = temporary.path().canonicalize().unwrap().join("written");
-        let capture = recording.capture(&path).unwrap();
-        let write_path = path.clone();
-        let (write_entered, writing) = flume::bounded(1);
-        let (release, resume) = flume::bounded(1);
-        let (finished, recorded) = flume::bounded(1);
-        manager
-            .retain_tool_completion(root.id(), async move {
-                let result = smol::unblock(move || {
-                    write_entered.send(()).unwrap();
-                    resume.recv().unwrap();
-                    fs::write(write_path, TOOL_WRITE_BYTES).unwrap();
-                    recording.finish(capture)
-                })
-                .await;
-                finished.send(result).unwrap();
-            })
-            .unwrap();
-        writing.recv_async().await.unwrap();
-        let journal = manager.journal();
-        let publication = journal.reserve_publication().await;
-        let mut shutdown = Box::pin(manager.shutdown(if timeout {
-            Duration::ZERO
-        } else {
-            COMPLETION_TIMEOUT
-        }));
-        if timeout {
-            let report = shutdown.as_mut().await;
-            assert!(report.timed_out.contains(&root.id()));
-        } else {
-            manager.detach_incarnation(&incarnation).unwrap();
-            assert!(
-                futures_lite::future::poll_once(shutdown.as_mut())
-                    .await
-                    .is_none()
-            );
-        }
-        assert_eq!(
-            journal.incarnation(root.id()).reservation,
-            incarnation.reservation
-        );
-        assert!(actor.admit_turn(input(), None, String::new()).is_err());
-        assert!(manager.retain_tool_completion(root.id(), async {}).is_err());
-        release.send(()).unwrap();
-        recorded.recv_async().await.unwrap().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), TOOL_WRITE_BYTES);
-        let snapshot = journal.snapshot();
-        let after = snapshot
-            .state
-            .iter()
-            .find_map(|record| match &record.change {
-                StateChange::File {
-                    path: recorded_path,
-                    before: FileState::Absent,
-                    after,
-                } if recorded_path == &path => Some(after),
-                _ => None,
-            })
-            .unwrap();
-        let FileState::Blob(reference) = after else {
-            panic!("written file requires post-image");
-        };
-        assert_eq!(
-            BlobStore::new(state).read(reference).unwrap(),
-            TOOL_WRITE_BYTES
-        );
-        drop(publication);
-        if !timeout {
-            assert!(shutdown.await.timed_out.is_empty());
-        }
-        ticket.wait_result().await;
-        manager.wait_until_reaped().await;
-        assert!(manager.tool_completions_finished(None));
-        assert_ne!(
-            journal.incarnation(root.id()).reservation,
-            incarnation.reservation
-        );
-    });
-}
 
 #[test]
 fn weak_manager_observer_does_not_retain_manager_or_journal() {

@@ -326,11 +326,6 @@ pub enum Request {
     TestDrainTasks {
         reply: flume::Sender<()>,
     },
-    #[cfg(feature = "memory-profile")]
-    ProfileMemory {
-        collect: bool,
-        reply: flume::Sender<mlua::Result<usize>>,
-    },
     #[cfg(feature = "test-support")]
     TestCollectGarbage {
         reply: flume::Sender<mlua::Result<()>>,
@@ -3870,7 +3865,6 @@ impl LuaRuntime {
                     schema: t.schema,
                     audience: t.audience,
                     kind: t.kind.clone(),
-                    shell_execution: t.shell_execution,
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     generation,
@@ -5597,15 +5591,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 callbacks.drain().await;
                             }
                             let _ = reply.send(());
-                        }
-                        #[cfg(feature = "memory-profile")]
-                        Request::ProfileMemory { collect, reply } => {
-                            let result = if collect {
-                                rt.lua.gc_collect().and_then(|()| rt.lua.gc_collect())
-                            } else {
-                                Ok(())
-                            };
-                            let _ = reply.send(result.map(|()| rt.lua.used_memory()));
                         }
                         #[cfg(feature = "test-support")]
                         Request::TestCollectGarbage { reply } => {

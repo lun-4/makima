@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
 };
@@ -875,46 +875,6 @@ fn project_plan_entry(
     let mut projection = entry.clone();
     projection.path = path;
     restore_plan_file(&projection)
-}
-
-pub(crate) fn projection_files(
-    snapshot: &SessionJournalSnapshot,
-    affected: &BTreeSet<AgentId>,
-) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
-    let view = snapshot
-        .fold(snapshot.seq)
-        .map_err(|error| error.to_string())?;
-    let plans = plan_entries(&view)?;
-    let mut files = BTreeMap::new();
-    for agent in affected {
-        let Some(entry) = plans.get(agent) else {
-            continue;
-        };
-        let Some(approved) = &entry.approved else {
-            continue;
-        };
-        let Some(config) = view
-            .scopes
-            .get(&Some(*agent))
-            .and_then(|scope| scope.config.as_ref())
-        else {
-            continue;
-        };
-        let Ok(path) = validated_plan_path(&view, *agent, entry, Some(&config.mode)) else {
-            continue;
-        };
-        if content_sha256(&approved.content) != approved.sha256 {
-            continue;
-        }
-        let bytes = approved.content.as_bytes().to_vec();
-        if files
-            .insert(path, bytes.clone())
-            .is_some_and(|existing| existing != bytes)
-        {
-            return Err("Approved plans disagree on the content of a shared path".into());
-        }
-    }
-    Ok(files.into_iter().collect())
 }
 
 pub(crate) fn validated_plan_path(

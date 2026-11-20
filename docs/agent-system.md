@@ -112,7 +112,7 @@ After the claim, nothing can cancel the publication. The commit runs on an actor
 
 `SessionJournal` gives agent revisions and state changes one monotonic session sequence. Config, rules, recorded context, plugin slots, turn admissions and results, delivery disposition, file changes, and restoration boundaries share that order. Agent scope and session scope are explicit. Actor histories remain the mutable transcript authority; journal snapshots include the matching histories for checkpoint publication.
 
-Session JSONL format v3 stores agent revisions, state records, branch descriptors, restore references, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. Grouped boundary snapshots are part of baseline v3. Every pool requires the string marker `boundary-pool-v1` and an explicit ordered `boundaries` list. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable restore endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
+Session JSONL format v3 stores agent revisions, state records, branch descriptors, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. Grouped boundary snapshots are part of baseline v3. Every pool requires the string marker `boundary-pool-v1` and an explicit ordered `boundaries` list. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable restore endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
 
 Recovery sanitizes transcripts, repairs unavailable tool results, restores retained boundary snapshots, and records `Interrupted` cancellation for admitted turns without terminal results. It never reissues interrupted model requests, tools, shell commands, or queued input. Inactive root text returns to the draft. Recovery publishes its checkpoint before exposing the runtime or admitting work. Root and child Config records, saved mode snapshots, Rules, registered state slots, and recorded instructions supply restored state; runtime providers, tools, permissions, and authority are rebuilt. Instruction-file changes produce a reload notice but do not replace recorded content. `/reload-context` journals the new root content; children retain the system prompt resolved at spawn.
 
@@ -126,25 +126,15 @@ Decision: retain v2 import ambiguity markers and presentation fallbacks where du
 
 A restoration boundary names an agent, journal sequence, journal identity, and per-agent history epoch and length. Child rewind writes pinned boundary snapshots to preserve root boundaries that the child history replacement would otherwise make unreachable. Compaction does not create pins. A root rewind across a later compaction is refused unless an earlier child rewind already pinned that boundary. Conversation rewind replaces the selected agent and its recorded descendants, their configurations and state, and the applicable session-scoped state. Branch checkpoints preserve the displaced state for later restoration. Missing or pruned branch files are reported as expired.
 
-Grouped snapshots store a shared canonical state and agent-revision prefix, raw histories, and an ordered list of covered boundary sequences. Each boundary lens records an epoch and exact prefix length for every identity retained at that boundary, including closed and retired agents. A later cleanup append cannot extend that cutoff. Old boundaries without an unambiguous durable cutoff are not added to a group. Pools contain no nested boundary snapshots or external pool/history dependencies. Copied state can still contain blob or offload references.
+Grouped snapshots store a shared canonical state and agent-revision prefix, raw histories, and an ordered list of covered boundary sequences. Each boundary lens records an epoch and exact prefix length for every identity retained at that boundary, including closed and retired agents. A later cleanup append cannot extend that cutoff. Old boundaries without an unambiguous durable cutoff are not added to a group. Pools contain no nested boundary snapshots or external pool/history dependencies. Copied state can still contain offload references.
 
 Recovery validates grouped snapshots without eagerly sanitizing every covered prefix. Restoring a selected boundary first truncates raw histories to its recorded cutoffs, then sanitizes those exact prefixes and remaps their offsets and epochs. Sanitizing a full shared history before truncation would incorrectly retain a later tool result or omit the unavailable-result repair required by an earlier boundary.
 
-History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, compactions, and grouped snapshots. Independent imported namespaces must not be merged by comparing their raw epoch numbers. Restore endpoint digests use ordered epoch ranks so a valid import does not change the semantic digest. Agent ids, journal state, messages, tool outputs, and retained history relationships still participate in that digest.
+History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, compactions, and grouped snapshots. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
 
-### File restore and publication recovery
+### Rewind publication
 
-Conversation-only, conversation-and-files, and files-only restores share the publication boundary. Files-only restore keeps the conversation revision. Cross-session rewind follows recorded parent links through planning and implementation sessions; it does not include unrelated branches. The preview lists affected paths and shell command count. Shell side effects are not undone.
-
-Mutable-path tools capture an explicit Absent state or a content-addressed pre-image after acquiring the canonical write lock. Recording captures the actual post-image even when the tool reports failure. File restore holds the same locks and affected-agent transition barriers. Before any write, it verifies required blobs, source and target checkpoint sequence and semantic digest, path anchors, and expected content. Symlink, hardlink, path-escape, or unrelated content substitutions fail or become reported skips rather than overwrites. Linux and macOS support secure file restoration through atomic no-replace manifest publication. Other platforms reject file restoration; metadata-free compatibility startup and deletion require conservative read-only inspection. File-restoring choices fail explicitly on unsupported platforms.
-
-A transition manifest records the source and target endpoints, before/after states, skipped paths, and an optional inverse reference. Blob references and the manifest are staged and synced before file writes. Per-path Applied, Conflict, RollbackIntent, RolledBack, and Complete records describe progress. A later Applied or RolledBack outcome resolves an earlier conflict for that path. Complete rejects unresolved conflicts and unfinished work; the engine verifies content under lock before recording outcomes. Redo inverts only applied paths, so skipped paths remain untouched.
-
-The writer first confirms baseline checkpoint durability. File changes then precede publication of the target checkpoint and its transition reference. A failure before target publication aborts toward the recorded before-state. A visible target checkpoint requires forward completion even if directory sync fails or the waiter is cancelled. Target durability and file completion precede runtime activation and new admission. Sync failure or cancellation after publication retains the receipt, file locks, graph barriers, and actual renewing session-lease owners; it never silently rolls files back beneath the published conversation.
-
-Manifest publication has its own failure boundary. A manifest renamed into place remains a pending transition if a later sync or identity check fails. Storage returns its reference in a publication-aware error. The core constructs an unresolved receipt with the acquired locks, and the caller attaches its transition barriers and lease owners before attempting settlement or retaining it.
-
-Startup discovers pending transitions through both endpoints and validates references in the current checkpoint and retained branch checkpoints, including completed transitions needed for redo. Missing or corrupt referenced manifests fail closed. Reading Complete confirms progress-file durability before excluding the transition from pending repair. Startup claims or reuses owned leases for the manifest owner, source, and target in sorted order. An unresolved repair retains those owners and blocks admission. Session deletion holds the restore namespace guard and rejects unfinished or cross-session dependencies, including inverse references; deleting a referenced owner cannot discard its blobs or manifests.
+Rewind changes the conversation and recorded state only; it never restores files. Cross-session rewind follows recorded parent links through planning and implementation sessions; it does not include unrelated branches. The writer first confirms baseline checkpoint durability, then publishes the target checkpoint. A visible target checkpoint requires forward completion even if directory sync fails or the waiter is cancelled. Target durability precedes runtime activation and new admission.
 
 ## The actor
 
@@ -357,30 +347,6 @@ The bundled task plugin resolves durable task ids through the current manager. E
 
 TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `makima_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
 
-## Boundary snapshot measurements
-
-The `makima-agent/benches/boundary_pin_profile.rs` benchmark's `pins` mode measures one child rewind while preserving 10, 100, or 500 boundaries from two outside agents. Run it on Linux with `cargo bench -p makima-agent --bench boundary_pin_profile --profile dev -- pins`. Each outside-agent turn contributes 1 KiB of response text. These are single debug-profile CPU runs on the same remote build box, with debug assertions enabled, not release-build latency targets. Log sizes and RSS use decimal MB.
-
-| Outside boundaries | Initial log MB | Inline pins log MB | Grouped pool log MB | Inline peak RSS MB | Grouped peak RSS MB | Inline transition ms | Grouped transition ms | Inline load + recovery ms | Grouped load + recovery ms |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.039 | 0.271 | 0.070 | 44.1 | 40.4 | 15.2 | 6.0 | 11.2 | 3.7 |
-| 100 | 0.289 | 14.552 | 0.557 | 280.2 | 50.3 | 800.6 | 40.5 | 579.4 | 26.0 |
-| 500 | 1.401 | 335.835 | 2.723 | 5677.9 | 92.8 | 18212.6 | 195.1 | 13723.0 | 128.3 |
-
-Inline pins serialize one prefix per covered boundary; the grouped fixture writes one shared pool. Peak RSS is the maximum sampled process-lifetime peak and includes fixture construction and earlier phases. Transition time covers preparation plus publication/install and excludes measurement reporting. Load + recovery time sums only those named phases. The grouped run also publishes recovery and reloads the checkpoint to verify digest stability; its complete restart measurements are 17.7, 132.7, and 647.9 ms. The inline run omits those extra publication/reload checks, so total restart times are not directly comparable. These measurements show the retained-prefix growth cost for this fixture, not a bound for arbitrary session content.
-
-### Normal journal commit measurements
-
-The same benchmark's `commits` mode measures fixed-size normal journal mutations with one grouped boundary pool. Run it on Linux with `cargo bench -p makima-agent --bench boundary_pin_profile --profile dev -- commits`. The following before/after measurements were recorded before the subsequent compatibility and API cleanup. Before uses full-snapshot cloning and folding; after uses the incremental reducer.
-
-| Retained boundaries | Before mean ms | After mean ms | Before allocated B/commit | After allocated B/commit | Before allocation calls/commit | After allocation calls/commit |
-|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 0.843946 | 0.070003 | 567,237 | 13,634 | 3,309 | 43 |
-| 100 | 6.024690 | 0.075139 | 4,008,594 | 14,274 | 25,783 | 45 |
-| 500 | 32.182244 | 0.078900 | 19,318,895 | 14,274 | 125,661 | 45 |
-
-These are debug-profile measurements from the same remote build box, with debug assertions enabled. Each process measures 32 timed commits with allocation counting disabled, followed by 32 allocation-counted commits. Inputs are prepared before measurement; the allocation pass starts after the timing pass has added 32 state records. Allocation totals cover the calling thread and count requested allocation and reallocation sizes, not retained memory. Results cover normal in-memory journal commits, not checkpoint I/O or end-to-end turn latency, and are not release-build latency targets.
-
 ## Known implementation caveats
 
 These are current code observations, not intended invariants:
@@ -422,8 +388,7 @@ Live execution resources, accepted input payloads, pending permission prompts, s
 | Checkpoint-qualified restart recovery | `makima-agent/src/session_recovery.rs`, `makima-agent/src/session_checkpoint.rs` |
 | Plugin state and recorded instructions | `makima-agent/src/state.rs`, `makima-lua/src/api/state.rs`, `makima-agent/src/context.rs` |
 | Restoration boundaries and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/parent_rewind.rs`, `makima-agent/src/plan_state.rs` |
-| Secure file recording and restoration | `makima-agent/src/file_restore/`, `makima-storage/src/blobs.rs`, `makima-storage/src/restore.rs` |
-| Session format, branches and semantic digests | `makima-storage/src/sessions.rs`, `makima-storage/src/restore_digest.rs` |
+| Session format and branches | `makima-storage/src/sessions.rs` |
 | TUI restore publication and activation | `makima-ui/src/event_loop/rewind.rs`, `makima-ui/src/storage_writer.rs` |
 | Manager errors | `makima-agent/src/manager/manager_error.rs` |
 | TUI root construction/backend | `makima-ui/src/agent/mod.rs`, `makima-ui/src/agent/agent_loop.rs` |

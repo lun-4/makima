@@ -365,7 +365,6 @@ mod tests {
     };
     use makima_providers::{ContentBlock, Message, Role};
     use makima_storage::id::MakimaId;
-    use makima_storage::restore_digest::session_digest;
     use makima_storage::session_state::{StateChange, StoredStateRecord};
     use test_case::test_case;
 
@@ -775,11 +774,6 @@ mod tests {
             let recovery = RecoveryCandidate::prepare(loaded).unwrap();
             let mut published = recovery.session().clone();
             published.save_to(directory.path()).unwrap();
-            let reloaded = AppSession::load_from(session.id, directory.path()).unwrap();
-            assert_eq!(
-                session_digest(&reloaded).unwrap(),
-                session_digest(&published).unwrap()
-            );
             let recovered = recovery.finalize_after_publication();
             let recovered_journal = recovered.journal();
             let snapshot = recovered_journal.snapshot();

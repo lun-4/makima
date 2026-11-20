@@ -11,7 +11,6 @@ use makima_agent::state::{
 };
 use makima_agent::{AgentInput, AgentRef, CancelToken};
 use makima_commands::{CommandOutcome, InputDispatch};
-use makima_storage::restore::RestoreChoice;
 use makima_storage::session_state::StateChange;
 use serde_json::json;
 
@@ -270,7 +269,6 @@ fn root_restore_removes_later_resident_child_and_releases_only_coherent_notices(
                 durable: Some(durable),
             },
         );
-        super::confirm_choice(event_loop, RestoreChoice::ConversationOnly);
         let ready = loop {
             let event = event_loop.internal_rx.recv_timeout(WAIT).unwrap();
             if matches!(event, InternalEvent::RestoreReady { .. }) {

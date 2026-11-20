@@ -251,9 +251,6 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
-    fn shell_execution(&self) -> bool {
-        false
-    }
     fn required_permission(&self) -> Option<Permission> {
         None
     }

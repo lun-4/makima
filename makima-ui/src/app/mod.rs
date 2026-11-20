@@ -50,9 +50,6 @@ use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::restore_form::{
-    RestoreChoice, RestoreForm, RestoreFormAction, RestorePreview,
-};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -412,8 +409,6 @@ pub struct App {
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
-    pub(crate) restore_form: RestoreForm,
-    restore_choice_tx: Option<flume::Sender<RestoreChoice>>,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -633,8 +628,6 @@ impl App {
             login_picker,
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
-            restore_form: RestoreForm::new(),
-            restore_choice_tx: None,
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -1325,7 +1318,7 @@ impl App {
             }
             ClickTarget::KeyHint(key) => match self.hits.surface_at(pos) {
                 Some(Surface::Picker(picker)) => self.handle_picker_key(picker, key),
-                Some(Surface::Plan | Surface::Restore) => self.handle_key(key),
+                Some(Surface::Plan) => self.handle_key(key),
                 _ => vec![],
             },
             ClickTarget::PermissionChip => {
@@ -1694,7 +1687,6 @@ impl App {
             Surface::Picker(PickerId::File) => self.file_picker.scroll(delta),
             Surface::Help => self.help_modal.scroll(delta),
             Surface::Btw => self.btw_modal.scroll(delta),
-            Surface::Restore => self.restore_form.scroll(delta),
             Surface::Float(id) => self.float_mgr.scroll_window(id, delta),
             _ => {}
         }
@@ -2031,19 +2023,6 @@ impl App {
             return Some(vec![]);
         }
         if self.float_mgr.is_focused() && self.float_mgr.handle_key(key) {
-            return Some(vec![]);
-        }
-
-        if self.restore_form.is_open() {
-            match self.restore_form.handle_key(key) {
-                RestoreFormAction::Confirm(choice) => {
-                    if let Some(reply) = self.restore_choice_tx.take() {
-                        let _ = reply.send(choice);
-                    }
-                }
-                RestoreFormAction::Close => self.restore_choice_tx = None,
-                RestoreFormAction::Consumed => {}
-            }
             return Some(vec![]);
         }
 
@@ -3776,7 +3755,7 @@ impl App {
         self.flash(format!("cd {}", path.display()));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -3786,7 +3765,6 @@ impl App {
             &self.task_picker,
             &self.lua_picker,
             &self.rewind_picker,
-            &self.restore_form,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -3795,7 +3773,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -3805,7 +3783,6 @@ impl App {
             &mut self.task_picker,
             &mut self.lua_picker,
             &mut self.rewind_picker,
-            &mut self.restore_form,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -4098,19 +4075,7 @@ impl App {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }
 
-    pub(crate) fn open_restore_preview(
-        &mut self,
-        preview: RestorePreview,
-        default_choice: RestoreChoice,
-        reply: flume::Sender<RestoreChoice>,
-    ) {
-        self.close_all_overlays();
-        self.restore_choice_tx = Some(reply);
-        self.restore_form.open(preview, default_choice);
-    }
-
     pub fn close_all_overlays(&mut self) {
-        self.restore_choice_tx = None;
         self.close_model_picker();
         self.close_command_palette();
         self.file_completion.close();
@@ -4232,7 +4197,7 @@ impl App {
             self.permission_prompt.handle_paste(text);
             return;
         }
-        if self.help_modal.is_open() || self.btw_modal.is_open() || self.restore_form.is_open() {
+        if self.help_modal.is_open() || self.btw_modal.is_open() {
             return;
         }
         if self.float_mgr.is_focused() {

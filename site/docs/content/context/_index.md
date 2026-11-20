@@ -83,7 +83,7 @@ Long sessions eventually approach the model's context limit. Makima reserves a s
 
 Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Makima parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
 
-Archives can be inspected with `jq` or an editor. Replacing the live session log by hand bypasses the checks that keep agent state, branches, and file-restore records consistent. Use [rewind](/docs/agent-work/#rewind-and-branches) for supported restoration points instead; an archive is not a file-restore backup.
+Archives can be inspected with `jq` or an editor. Replacing the live session log by hand bypasses the checks that keep agent state and branches consistent. Use [rewind](/docs/agent-work/#rewind-and-branches) for supported restoration points instead.
 
 `MAKIMA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 

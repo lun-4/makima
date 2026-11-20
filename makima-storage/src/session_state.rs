@@ -1,7 +1,5 @@
 use crate::{
-    blobs::FileState,
     id::{AgentId, MakimaId, TurnId},
-    restore::TransitionRef,
     sessions::StoredRule,
 };
 use imbl::{OrdMap, OrdSet};
@@ -72,15 +70,6 @@ pub enum StateChange {
     Delivery {
         id: (AgentId, TurnId),
         op: StoredDeliveryOp,
-    },
-    File {
-        path: PathBuf,
-        before: FileState,
-        after: FileState,
-    },
-    ToolExecution {
-        #[serde(rename = "tool_kind")]
-        kind: String,
     },
     Compaction {
         epoch: u64,
@@ -173,8 +162,6 @@ pub struct StoredBranch {
     pub at_seq: u64,
     pub agent: AgentId,
     pub offset: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transition: Option<TransitionRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,12 +306,6 @@ pub struct StoredPluginValue {
     pub value: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredFileState {
-    pub before: FileState,
-    pub after: FileState,
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredScopeState {
     pub generation: u64,
@@ -336,7 +317,6 @@ pub struct StoredScopeState {
     pub admitted: BTreeMap<TurnId, StoredTurnOrigin>,
     pub results: VecDeque<(TurnId, StoredTurnResult)>,
     pub deliveries: BTreeMap<(AgentId, TurnId), StoredDeliveryOp>,
-    pub files: BTreeMap<PathBuf, StoredFileState>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -369,7 +349,6 @@ struct ReducedScope {
     results: Arc<VecDeque<(TurnId, StoredTurnResult)>>,
     deliveries: OrdMap<(AgentId, TurnId), Arc<StoredDeliveryOp>>,
     delivery_sequences: OrdMap<(AgentId, TurnId), u64>,
-    files: OrdMap<PathBuf, Arc<StoredFileState>>,
 }
 
 impl ReducedScope {
@@ -399,11 +378,6 @@ impl ReducedScope {
                 .deliveries
                 .iter()
                 .map(|(key, value)| (*key, value.as_ref().clone()))
-                .collect(),
-            files: self
-                .files
-                .iter()
-                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
                 .collect(),
         }
     }
@@ -629,20 +603,6 @@ impl SessionStateReducer {
                     scope.deliveries.insert(*id, Arc::new(op.clone()));
                 }
             }
-            StateChange::File {
-                path,
-                before,
-                after,
-            } => {
-                scope.files.insert(
-                    path.clone(),
-                    Arc::new(StoredFileState {
-                        before: before.clone(),
-                        after: after.clone(),
-                    }),
-                );
-            }
-            StateChange::ToolExecution { .. } => {}
             StateChange::Compaction { epoch } => {
                 let agent = record
                     .agent
@@ -852,13 +812,9 @@ mod tests {
         StoredAgentLifecycle, StoredAgentRecord, StoredDelivery, StoredDeliveryOp,
         StoredStateRecord, StoredTurnResult,
     };
-    use crate::{
-        blobs::FileState,
-        id::{AgentId, MakimaId, TurnId},
-    };
+    use crate::id::{AgentId, MakimaId, TurnId};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
-    use std::path::Path;
     use std::slice::from_ref;
     use test_case::test_case;
 
@@ -1200,7 +1156,6 @@ mod tests {
         let records = [
             (None, json!({"kind":"rules","rules":[{"tool":"write","effect":"deny"}],"yolo":false})),
             (Some(child), json!({"kind":"context","source":"instructions","hash":"old","content":"old"})),
-            (Some(root), json!({"kind":"file","path":"src/lib.rs","before":{"state":"absent"},"after":{"state":"absent"}})),
             (Some(root), queued.clone()),
             (Some(root), json!({"kind":"boundary","offset":0,"lens":{root.to_string():[1,0],child.to_string():[1,0]}})),
             (Some(child), json!({"kind":"boundary","offset":0,"lens":{child.to_string():[1,0]}})),
@@ -1217,22 +1172,18 @@ mod tests {
             "new"
         );
         assert_eq!(
-            view.scopes[&Some(root)].files[Path::new("src/lib.rs")].before,
-            FileState::Absent
-        );
-        assert_eq!(
             serde_json::to_value(&view.scopes[&Some(root)].deliveries[&(child, turn)]).unwrap(),
             json!({"op":terminal})
         );
-        assert_eq!(view.compactions[&root], (8, 2));
-        assert!(view.boundaries.contains_key(&5));
-        assert!(!view.boundary_available(5));
-        assert!(view.boundary_available(6));
+        assert_eq!(view.compactions[&root], (7, 2));
+        assert!(view.boundaries.contains_key(&4));
+        assert!(!view.boundary_available(4));
+        assert!(view.boundary_available(5));
         assert!(!view.boundary_available(999));
         assert!(
-            SessionStateView::fold(&records, &[], 5)
+            SessionStateView::fold(&records, &[], 4)
                 .unwrap()
-                .boundary_available(5)
+                .boundary_available(4)
         );
     }
 

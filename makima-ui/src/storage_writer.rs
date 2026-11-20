@@ -958,7 +958,7 @@ impl StorageWriter {
             .await?
     }
 
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(test)]
     pub(crate) fn hold_restore_sync(
         &self,
         error: &str,
@@ -971,7 +971,7 @@ impl StorageWriter {
         (observed, release)
     }
 
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(test)]
     pub(crate) fn hold_current_sync(
         &self,
         error: &str,
@@ -982,21 +982,10 @@ impl StorageWriter {
         gates
     }
 
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(test)]
     pub(crate) fn release_restore_sync(&self) {
         lock(&self.pending).restore_sync_gate = None;
         let _ = self.wake.send(());
-    }
-
-    pub async fn checkpoint_files_restore(
-        &self,
-        request: RestoredSessionCheckpoint,
-    ) -> Result<SessionSaveFence, String> {
-        let response = enqueue_restore_checkpoint_inner(&self.pending, &self.wake, request, true)?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| writer_gone().to_string())?
     }
 
     pub async fn recover_checkpoint(
@@ -1398,20 +1387,11 @@ fn enqueue_restore_checkpoint(
     wake: &flume::Sender<()>,
     request: RestoredSessionCheckpoint,
 ) -> Result<flume::Receiver<Result<SessionSaveFence, String>>, String> {
-    enqueue_restore_checkpoint_inner(pending, wake, request, false)
-}
-
-fn enqueue_restore_checkpoint_inner(
-    pending: &Pending,
-    wake: &flume::Sender<()>,
-    request: RestoredSessionCheckpoint,
-    files_only: bool,
-) -> Result<flume::Receiver<Result<SessionSaveFence, String>>, String> {
     let id = request.session_id;
     if request.session.id != id
         || request.session.state() != request.journal.state.to_vec()
         || request.session.agent_revisions() != request.journal.agent_revisions.to_vec()
-        || (!files_only && !request.journal.authoritative)
+        || !request.journal.authoritative
         || !request.session.branches().contains(&request.branch)
     {
         return Err(RESTORE_PROJECTION_MISMATCH.into());
@@ -1453,21 +1433,8 @@ fn enqueue_restore_checkpoint_inner(
         }
         if state.recovery_transactions.contains_key(&id)
             || !journal_current(&state, id, Some(&journal))
-            || if files_only {
-                journal.snapshot.epoch != request.journal.epoch
-                    || journal.snapshot.revision != request.journal.revision
-                    || journal.snapshot.seq != request.journal.seq
-                    || journal.snapshot.state != request.journal.state
-                    || journal.snapshot.agent_revisions != request.journal.agent_revisions
-                    || request
-                        .branch
-                        .transition
-                        .as_ref()
-                        .is_none_or(|reference| !request.session.restore_refs().contains(reference))
-            } else {
-                journal.snapshot.epoch == request.journal.epoch
-                    || journal.snapshot.revision >= request.journal.revision
-            }
+            || journal.snapshot.epoch == request.journal.epoch
+            || journal.snapshot.revision >= request.journal.revision
         {
             return Err(CHECKPOINT_REPLACED.into());
         }
@@ -3579,7 +3546,6 @@ mod tests {
             at_seq: journal.seq,
             agent: root,
             offset: session.messages().len(),
-            transition: None,
         };
         session.push_branch(branch.clone());
         session.save(&dir).unwrap();
@@ -3727,7 +3693,6 @@ mod tests {
                 at_seq: old.sequence_high_water().unwrap(),
                 agent: root,
                 offset: old.messages().len(),
-                transition: None,
             };
             target.push_branch(branch.clone());
             let expected = Arc::new(target);
@@ -4036,7 +4001,6 @@ mod tests {
                 at_seq: session.sequence_high_water().unwrap(),
                 agent: root,
                 offset: session.messages().len(),
-                transition: None,
             };
             session.push_branch(branch.clone());
             let expected = Arc::new(session);
@@ -4205,7 +4169,6 @@ mod tests {
                 at_seq: old.sequence_high_water().unwrap(),
                 agent: root,
                 offset: old.messages().len(),
-                transition: None,
             };
             replacement.push_branch(branch.clone());
             let publication = CheckpointPublication::default();

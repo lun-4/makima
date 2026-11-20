@@ -77,7 +77,6 @@ use makima_storage::StateDir;
 use makima_storage::StorageError;
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
-use makima_storage::restore::RestoreStore;
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
 use makima_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
 use serde_json::json;
@@ -103,7 +102,6 @@ use crate::color_compat;
 use crate::command_runtime::{CLOSED_TARGET_ERR, CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
-use crate::components::restore_form::{RestoreChoice, RestorePreview};
 use crate::components::{
     Action, ExitRequest, SessionReplacementKind, SessionReplacementRequest, Status,
 };
@@ -1692,7 +1690,7 @@ impl SpawnCtx {
         exact: Option<SessionJournalSnapshot>,
     ) -> Result<PreparedSessionRuntime> {
         let seed_snapshot = matches!(ownership, RuntimeOwnership::Claim);
-        let (session_lock, guard) = match ownership {
+        let (mut session_lock, guard) = match ownership {
             RuntimeOwnership::Claim => {
                 let lock = claim_lock(&self.sessions_dir, &session.id)?;
                 let guard = lock.publication_guard();
@@ -1700,29 +1698,7 @@ impl SpawnCtx {
             }
             RuntimeOwnership::Reuse(guard) => (None, guard),
         };
-        let session_lock = if exact.is_none() && session_lock.is_some() {
-            rewind::reconcile_startup(
-                &self.sessions_dir,
-                session.id,
-                session_lock,
-                Arc::clone(&self.file_write_locks),
-            )
-            .map_err(|error| eyre!(error))?
-        } else {
-            session_lock
-        };
-        if exact.is_none()
-            && session_lock.is_none()
-            && !RestoreStore::new(self.storage.clone())
-                .pending_for_session(session.id)?
-                .is_empty()
-        {
-            return Err(eyre!(
-                "Pending restore must be reconciled before replacing this runtime"
-            ));
-        }
         let resume_cwd = session.cwd.clone();
-        let mut session_lock = session_lock;
         let (renewing, authoritative) = if seed_snapshot && exact.is_none() {
             let lease = session_lock
                 .take()
@@ -1998,22 +1974,10 @@ enum InternalEvent {
         kind: SessionOpKind,
         result: Result<(), String>,
     },
-    RestorePreview {
-        session: MakimaId,
-        runtime: Arc<()>,
-        preview: RestorePreview,
-        default_choice: RestoreChoice,
-        reply: flume::Sender<RestoreChoice>,
-    },
     RestoreSnapshot {
         session: MakimaId,
         runtime: Arc<()>,
         reply: flume::Sender<Result<AppSession, String>>,
-    },
-    FilesRestoreReady {
-        session: MakimaId,
-        runtime: Arc<()>,
-        result: Result<Box<rewind::FilesRestore>, String>,
     },
     RestoreReady {
         session: MakimaId,
@@ -2791,22 +2755,6 @@ impl<'t> EventLoop<'t> {
 
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
-            InternalEvent::RestorePreview {
-                session,
-                runtime,
-                preview,
-                default_choice,
-                reply,
-            } => {
-                if let Some(idx) = self
-                    .position(session)
-                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
-                {
-                    self.sessions[idx]
-                        .app
-                        .open_restore_preview(preview, default_choice, reply);
-                }
-            }
             InternalEvent::RestoreSnapshot {
                 session,
                 runtime,
@@ -2826,18 +2774,6 @@ impl<'t> EventLoop<'t> {
                         self.sessions[idx].app.capture_restore_snapshot()
                     });
                 let _ = reply.send(result);
-            }
-            InternalEvent::FilesRestoreReady {
-                session,
-                runtime,
-                result,
-            } => {
-                if let Some(idx) = self
-                    .position(session)
-                    .filter(|idx| Arc::ptr_eq(&runtime, &self.sessions[*idx].handles.identity()))
-                {
-                    self.complete_files_restore(idx, result);
-                }
             }
             InternalEvent::RestoreReady {
                 session,
@@ -7513,16 +7449,7 @@ end })
         let deadline = Instant::now() + PUMP_TIMEOUT;
         loop {
             while let Ok(event) = event_loop.internal_rx.try_recv() {
-                if let InternalEvent::RestorePreview {
-                    reply,
-                    default_choice,
-                    ..
-                } = &event
-                {
-                    let _ = reply.send(default_choice.clone());
-                } else {
-                    event_loop.handle_internal(event);
-                }
+                event_loop.handle_internal(event);
             }
             for index in 0..event_loop.sessions.len() {
                 while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
