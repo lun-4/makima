@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -184,6 +184,13 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default), "general" (can modify files), or "plan_reviewer" (read-only plan audit, plan mode only) |
 | `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+
+### `task_list` {#task_list}
+
+List the root agent's existing tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
 
 ### `task_wait` {#task_wait}
 

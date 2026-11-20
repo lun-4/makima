@@ -431,6 +431,15 @@ impl App {
             self.absorb_hits(hits);
         }
 
+        if self.rewind_picker.is_open() {
+            let rect = self.rewind_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Rewind), rect, true);
+            rects.push(rect);
+            let hits = self.rewind_picker.hits();
+            self.absorb_hits(hits);
+        }
+
         if self.task_picker.is_open() {
             let rect = self.task_picker.view(frame, full);
             self.hits

@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::chat::{Chat, DONE_TEXT, history_to_display_with_target};
+use crate::chat::{Chat, DONE_TEXT, history_to_display_with_notes, history_to_display_with_target};
 use crate::components::DisplayRole;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
 use makima_agent::actor::HistoryChange;
@@ -13,7 +14,8 @@ use makima_providers::Model;
 use makima_storage::id::MakimaId;
 use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::{
-    SessionMeta, SessionRecord, StoredMode, StoredPost, StoredSubagent,
+    ContextEntry, SessionMeta, SessionRecord, StoredMode, StoredPost, StoredSubagent,
+    context_entries,
 };
 
 use crate::AppSession;
@@ -283,6 +285,46 @@ impl App {
         self.plan_approval_pending = false;
     }
 
+    fn root_fork_notes(&self) -> HashMap<MakimaId, String> {
+        self.state
+            .session
+            .root_agent_id()
+            .or_else(|| self.state.session.id.to_string().parse().ok())
+            .and_then(|root| context_entries(self.state.session.context_events(), root).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ContextEntry::Note { id, note } => Some((id, note)),
+                ContextEntry::Message { .. } => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn clear_rewind_queue(&mut self) {
+        self.queue.clear_root_user_work();
+        self.recoverable_queue.clear();
+        self.persist_input();
+    }
+
+    pub(crate) fn finish_rewind(&mut self, draft: String) {
+        let notes = self.root_fork_notes();
+        let (display, items) = history_to_display_with_notes(
+            self.state.session.messages(),
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), None),
+            self.root_agent.clone(),
+            (&self.state.session.chat_message_ids(None), &notes),
+        );
+        self.chats[0].load_messages(display);
+        self.fire_restore_items(items);
+        self.refresh_at_ref_labels(&draft);
+        self.input_box.set_input(draft);
+        self.input_box.buffer.move_to_end();
+        self.persist_input();
+        self.pending_dirty |= crate::repaint::Dirty::YES;
+    }
+
     pub(crate) fn restore_display(&mut self) {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
@@ -390,7 +432,8 @@ impl App {
         }
 
         let posts = self.state.session.posts();
-        let (display, items) = history_to_display_with_target(
+        let notes = self.root_fork_notes();
+        let (display, items) = history_to_display_with_notes(
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
@@ -400,7 +443,7 @@ impl App {
                     .as_ref()
                     .map(|root| root.manager().reference(id))
             }),
-            &self.state.session.chat_message_ids(None),
+            (&self.state.session.chat_message_ids(None), &notes),
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);

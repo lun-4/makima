@@ -14,7 +14,8 @@ use crate::markdown::truncate_output;
 use crate::selection::Selection;
 use makima_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use makima_agent::{
-    AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, PostLevel, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use makima_config::{ToolKey, ToolOutputLines, UiConfig};
 use makima_lua::WinView;
@@ -606,11 +607,42 @@ pub(crate) fn history_to_display_with_target(
     state_target: Option<AgentRef>,
     message_ids: &[MakimaId],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
+    history_to_display_with_notes(
+        messages,
+        tool_outputs,
+        tool_output_lines,
+        posts,
+        state_target,
+        (message_ids, &HashMap::new()),
+    )
+}
+
+pub(crate) fn history_to_display_with_notes(
+    messages: &[Message],
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_output_lines: &ToolOutputLines,
+    posts: &[&StoredPost],
+    state_target: Option<AgentRef>,
+    context: (&[MakimaId], &HashMap<MakimaId, String>),
+) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
+    let (message_ids, fork_notes) = context;
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<makima_lua::RestoreItem> = Vec::new();
+    let mut turn = 0;
     for (boundary, msg) in messages.iter().enumerate() {
         push_posts_at(&mut display, posts, boundary, message_ids);
+        if let Some(note) = message_ids.get(boundary).and_then(|id| fork_notes.get(id)) {
+            display.push(DisplayMessage::new(
+                DisplayRole::Done,
+                format!("Rewound from turn {}", turn + 1),
+            ));
+            display.push(DisplayMessage::new(
+                DisplayRole::Post(PostLevel::Info),
+                note.clone(),
+            ));
+            continue;
+        }
         if msg.is_observation() {
             if let Some(notice) = child_result_notice(msg) {
                 display.push(notice);
@@ -619,6 +651,7 @@ pub(crate) fn history_to_display_with_target(
         }
         match msg.role {
             Role::User => {
+                turn += 1;
                 // An empty `display_text` marks a message the transcript never
                 // shows, so its attachments must not sneak in either.
                 if msg.display_text.as_deref() == Some("") {
@@ -969,6 +1002,31 @@ mod tests {
     const USER_TEXT: &str = "look at this";
     const TASK_ID: &str = "call_t1";
     const REPLY_TEXT: &str = "i see it";
+
+    #[test]
+    fn fork_notes_render_without_cut_off_messages() {
+        const NOTE: &str = "Files may differ. Existing tasks keep running.";
+        let first = MakimaId::generate();
+        let note = MakimaId::generate();
+        let messages = vec![
+            Message::user(USER_TEXT.into()),
+            Message::observation(NOTE.into()),
+        ];
+        let notes = HashMap::from([(note, NOTE.to_owned())]);
+        let (display, _) = history_to_display_with_notes(
+            &messages,
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+            &[],
+            None,
+            (&[first, note], &notes),
+        );
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].text, USER_TEXT);
+        assert_eq!(display[1].role, DisplayRole::Done);
+        assert_eq!(display[1].text, "Rewound from turn 2");
+        assert_eq!(display[2].text, NOTE);
+    }
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))

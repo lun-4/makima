@@ -3548,13 +3548,23 @@ impl AgentManagerHandle {
 
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
         let completion = self.0.activation_completion.write_arc().await;
-        self.shutdown_after_completion(timeout, completion).await
+        self.shutdown_after_completion(timeout, completion, false)
+            .await
+    }
+
+    /// Stops this runtime without terminalizing unfinished turns in the journal.
+    /// Outstanding turn tickets remain unresolved; use a new manager on reopen.
+    pub async fn suspend(&self, timeout: Duration) -> ShutdownReport {
+        let completion = self.0.activation_completion.write_arc().await;
+        self.shutdown_after_completion(timeout, completion, true)
+            .await
     }
 
     async fn shutdown_after_completion(
         &self,
         timeout: Duration,
         completion: RwLockWriteGuardArc<()>,
+        preserve_turns: bool,
     ) -> ShutdownReport {
         let deadline = std::time::Instant::now() + timeout;
         let publication = if let Some(publication) = self.0.journal.try_publication_read() {
@@ -3574,6 +3584,11 @@ impl AgentManagerHandle {
         let Some(publication) = publication else {
             let mut timed_out = {
                 let mut graph = self.lock_graph();
+                if preserve_turns {
+                    for actor in graph.nodes.values().filter_map(|node| node.actor.as_ref()) {
+                        actor.preserve_unfinished_turns();
+                    }
+                }
                 graph.shutting_down = true;
                 self.0.journal.revoke_all_state_turns();
                 self.0.shutdown.store(true, Ordering::Release);
@@ -3624,6 +3639,9 @@ impl AgentManagerHandle {
                 .iter()
                 .filter_map(|id| {
                     let actor = graph.nodes[id].actor.clone()?;
+                    if preserve_turns {
+                        actor.preserve_unfinished_turns();
+                    }
                     let cut = actor.capture_close(true)?;
                     Some((actor, cut))
                 })

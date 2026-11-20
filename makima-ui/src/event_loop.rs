@@ -1762,6 +1762,10 @@ impl SpawnCtx {
 }
 
 enum InternalEvent {
+    RewindCommitted {
+        runtime: Arc<()>,
+        result: Result<makima_agent::rewind::RewindOutcome, String>,
+    },
     ModelsDiscovered,
     /// The UI slot's model prepared differently once discovery landed.
     ModelRediscovered {
@@ -2578,6 +2582,31 @@ impl<'t> EventLoop<'t> {
                 session,
                 result,
             } => self.complete_bring_up(target, *session, result),
+            InternalEvent::RewindCommitted { runtime, result } => {
+                if let Some(idx) = self.runtime_position(&runtime) {
+                    self.sessions[idx].app.rewind_pending = false;
+                    match result {
+                        Ok(makima_agent::rewind::RewindOutcome::Fork { history: _, draft }) => {
+                            let rt = &mut self.sessions[idx];
+                            let mut session =
+                                Arc::unwrap_or_clone(Arc::clone(&rt.app.state.session));
+                            match project_session_journal(&mut session, &rt.handles) {
+                                Ok(()) => {
+                                    rt.app.state.session = Arc::new(session);
+                                    rt.app.finish_rewind(
+                                        draft.user_text().unwrap_or_default().to_owned(),
+                                    );
+                                }
+                                Err(error) => rt.app.flash(error),
+                            }
+                        }
+                        Ok(makima_agent::rewind::RewindOutcome::PlanningSession(parent)) => {
+                            self.back_to_planning(idx, parent.session);
+                        }
+                        Err(error) => self.sessions[idx].app.flash(error),
+                    }
+                }
+            }
             InternalEvent::SessionOp {
                 session,
                 runtime,
@@ -3782,7 +3811,31 @@ impl<'t> EventLoop<'t> {
         };
         let reset_journal = matches!(kind, Some(SessionReplacementKind::Reset { .. }))
             .then(|| self.sessions[idx].handles.manager_and_root().0.journal());
-        self.replace_prepared_runtime(idx, prepared)?;
+        if matches!(kind, Some(SessionReplacementKind::Planning)) {
+            let mut old =
+                replace_session_runtime(&mut self.sessions[idx], prepared, &self.ctx.model_slot)?;
+            old.cancel_background_work();
+            smol::spawn(async move {
+                let SessionRuntime {
+                    handles,
+                    coordinator,
+                    session_lock,
+                    checkpoint,
+                    ..
+                } = old;
+                handles.suspend().await;
+                if let Err(error) = checkpoint.drain().await {
+                    warn!(%error, "planning switch writer drain failed");
+                }
+                let _ = coordinator.close().await;
+                if let Err(error) = release_lock_state(session_lock) {
+                    warn!(%error, "planning switch lock release failed");
+                }
+            })
+            .detach();
+        } else {
+            self.replace_prepared_runtime(idx, prepared)?;
+        }
         if let Some(message) = implementation {
             let runtime = &mut self.sessions[idx];
             runtime.app.input_box.set_input(String::new());
@@ -3803,7 +3856,7 @@ impl<'t> EventLoop<'t> {
             Some(SessionReplacementKind::Reset { ended_id }) => {
                 self.fire_session_reset(idx, *ended_id)
             }
-            Some(SessionReplacementKind::Linked) => {}
+            Some(SessionReplacementKind::Linked | SessionReplacementKind::Planning) => {}
             #[cfg(test)]
             Some(SessionReplacementKind::Load) => {}
             None => {}
@@ -3934,6 +3987,38 @@ impl<'t> EventLoop<'t> {
             .app
             .lua_event_handle
             .fire_autocmd("SessionReset", json!({ "session_id": ended_id }));
+    }
+
+    fn back_to_planning(&mut self, idx: usize, id: MakimaId) {
+        self.sessions[idx].app.checkpoint_now();
+        if let Some(parent) = self.position(id) {
+            self.set_focused(parent);
+            let session_lock = self.sessions[idx].session_lock.take();
+            let old = self.remove_runtime(idx);
+            smol::spawn(async move {
+                old.handles.suspend().await;
+                if let Err(error) = old.checkpoint.drain().await {
+                    warn!(%error, "planning switch writer drain failed");
+                }
+                let _ = old.coordinator.close().await;
+                if let Err(error) = release_lock_state(session_lock) {
+                    warn!(%error, "planning switch lock release failed");
+                }
+            })
+            .detach();
+            return;
+        }
+        match AppSession::load(id, &self.ctx.storage) {
+            Ok(session) => self.request_replacement(
+                idx,
+                SessionReplacementRequest {
+                    session,
+                    kind: SessionReplacementKind::Planning,
+                    provider: None,
+                },
+            ),
+            Err(error) => self.sessions[idx].app.flash(error.to_string()),
+        }
     }
 
     fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
@@ -4170,6 +4255,48 @@ impl<'t> EventLoop<'t> {
                     None => NO_MAILBOX_ERR.into(),
                 };
                 self.sessions[idx].app.flash(message);
+            }
+            Action::BeginRewind => {
+                let rt = &mut self.sessions[idx];
+                let result = rt
+                    .app
+                    .root_agent
+                    .as_ref()
+                    .ok_or_else(|| "Root agent is unavailable".to_owned())
+                    .and_then(|root| {
+                        root.begin_rewind(&rt.app.state.session)
+                            .map_err(|error| error.to_string())
+                    });
+                rt.app.rewind_pending = false;
+                match result {
+                    Ok(guard) => rt.app.show_rewind(guard),
+                    Err(error) => rt.app.flash(error),
+                }
+            }
+            Action::CommitRewind(index) => {
+                let rt = &mut self.sessions[idx];
+                let Some(guard) = rt.app.rewind_guard.take() else {
+                    rt.app.rewind_pending = false;
+                    return;
+                };
+                let Some(target) = guard.targets().get(index).map(|target| target.id.clone())
+                else {
+                    rt.app.rewind_pending = false;
+                    return;
+                };
+                if matches!(target, makima_agent::rewind::RewindTargetId::Message(_)) {
+                    rt.app.clear_rewind_queue();
+                }
+                let runtime = rt.handles.identity();
+                let tx = self.internal_tx.clone();
+                smol::spawn(async move {
+                    let result = guard
+                        .commit(target)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(InternalEvent::RewindCommitted { runtime, result });
+                })
+                .detach();
             }
             Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ToggleSessionOption { id } => {
@@ -7589,6 +7716,125 @@ end })
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn rewind_clears_admitted_user_work_before_releasing_guard() {
+        with_event_loop(|event_loop| {
+            let rt = &mut event_loop.sessions[0];
+            rt.app
+                .state
+                .session_mut()
+                .push_message(Message::user("rewind target".into()));
+            let root = rt.app.root_agent.as_ref().unwrap().clone();
+            let journal = root.manager().journal();
+            let mut history = rt.app.state.session.history_snapshot();
+            history.epoch = journal.snapshot().histories[&root.id()].epoch;
+            journal
+                .commit(makima_agent::journal::JournalCommit {
+                    histories: [(root.id(), history)].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let guard = root.begin_rewind(&rt.app.state.session).unwrap();
+            let index = guard
+                .targets()
+                .iter()
+                .position(|target| {
+                    matches!(target.id, makima_agent::rewind::RewindTargetId::Message(_))
+                })
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let ticket = actor
+                .admit_turn(
+                    AgentInput::new("queued user turn".into(), vec![]),
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            rt.app.persist_input();
+            assert!(!rt.app.state.session.meta.queued_messages.is_empty());
+            rt.app.rewind_guard = Some(guard);
+            event_loop.dispatch(0, vec![Action::CommitRewind(index)]);
+            assert_eq!(actor.snapshot().queued, 0);
+            assert!(event_loop.sessions[0].app.queue.is_empty());
+            assert!(
+                event_loop.sessions[0]
+                    .app
+                    .state
+                    .session
+                    .meta
+                    .queued_messages
+                    .is_empty()
+            );
+            let view = root.manager().journal().snapshot().fold().unwrap();
+            assert!(!view.scopes[&Some(root.id())].results.is_empty());
+            drop(ticket);
+            let completion = smol::block_on(event_loop.internal_rx.recv_async()).unwrap();
+            event_loop.handle_internal(completion);
+        });
+    }
+
+    #[test]
+    fn planning_switch_suspends_implementation_without_terminal_results() {
+        with_event_loop(|event_loop| {
+            const DRAFT: &str = "planning stays ready";
+            let implementation_id = event_loop.sessions[0].id();
+            let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+            let actor = manager.actor(root).unwrap();
+            let idle = actor.prepare_idle().unwrap();
+            actor
+                .admit_turn(
+                    AgentInput::new("queued implementation work".into(), vec![]),
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            let before = manager.journal().snapshot().fold().unwrap();
+            assert!(!before.scopes[&Some(root)].admitted.is_empty());
+            let mut parent = test_runtime(model_named("planning-model"));
+            parent.app.input_box.set_input(DRAFT.into());
+            parent.app.main_chat().push_user_message(DRAFT);
+            let parent_id = parent.id();
+            event_loop.push_runtime(parent);
+            event_loop.back_to_planning(0, parent_id);
+            assert!(event_loop.position(implementation_id).is_none());
+            assert_eq!(event_loop.sessions[event_loop.focused].id(), parent_id);
+            assert_eq!(
+                event_loop.sessions[event_loop.focused]
+                    .app
+                    .input_box
+                    .buffer
+                    .value(),
+                DRAFT
+            );
+            assert_eq!(
+                event_loop.sessions[event_loop.focused].app.chats[0].last_message_text(),
+                DRAFT
+            );
+            smol::block_on(async {
+                let actor_done = async {
+                    while !manager.runner_finished(root).unwrap_or(true) {
+                        smol::future::yield_now().await;
+                    }
+                };
+                futures_lite::future::or(actor_done, async {
+                    smol::Timer::after(RUNTIME_SHUTDOWN_TIMEOUT).await;
+                    panic!("planning switch did not suspend implementation");
+                })
+                .await;
+            });
+            let after = manager.journal().snapshot().fold().unwrap();
+            assert_eq!(
+                after.scopes[&Some(root)].admitted,
+                before.scopes[&Some(root)].admitted
+            );
+            assert_eq!(
+                after.scopes[&Some(root)].results,
+                before.scopes[&Some(root)].results
+            );
+            drop(idle);
+        });
     }
 
     #[test]

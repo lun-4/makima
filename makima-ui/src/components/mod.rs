@@ -198,6 +198,7 @@ pub enum SessionReplacementKind {
         ended_id: makima_storage::id::MakimaId,
     },
     Linked,
+    Planning,
     #[cfg(test)]
     Load,
 }
@@ -231,6 +232,8 @@ pub enum Action {
     MoveToBackground {
         agent: Option<makima_agent::AgentId>,
     },
+    BeginRewind,
+    CommitRewind(usize),
     ReplaceSession(Box<SessionReplacementRequest>),
     ChangeModel(String),
     SelectPinnedModel {

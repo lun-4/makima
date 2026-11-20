@@ -5080,12 +5080,128 @@ fn double_esc_cancels_flushes_and_fails_tools() {
 }
 
 #[test]
-fn double_esc_idle_flashes_rewind_reworked() {
+fn double_esc_idle_without_runtime_reports_unavailable() {
     let mut app = test_app();
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(FLASH_REWIND_REWORKED));
+    assert!(!app.rewind_picker.is_open());
+    assert!(!app.rewind_pending);
+}
+
+#[test]
+fn rewind_is_disabled_in_child_chat() {
+    let mut app = test_app();
+    app.chats.push(Chat::new(
+        "Child".into(),
+        app.ui_config.clone(),
+        app.lua_event_handle.clone(),
+        Arc::clone(&app.theme_provider),
+    ));
+    app.active_chat = 1;
+    assert!(app.open_rewind().is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_REWIND_ROOT_ONLY));
+    assert!(!app.rewind_pending);
+}
+
+#[test]
+fn rewind_picker_groups_targets_warns_and_routes_selection() {
+    use super::rewind::{PLANNING_WARNING, REWIND_WARNING, RewindEntry};
+    let mut app = test_app();
+    app.input_box.set_input("keep draft".into());
+    app.rewind_picker.open(
+        vec![
+            RewindEntry {
+                index: 0,
+                label: "Current prompt".into(),
+                section: "Current context".into(),
+                planning: false,
+            },
+            RewindEntry {
+                index: 1,
+                label: "Cut prompt".into(),
+                section: "Rewound".into(),
+                planning: false,
+            },
+            RewindEntry {
+                index: 2,
+                label: "Back to planning session".into(),
+                section: "Planning".into(),
+                planning: true,
+            },
+        ],
+        REWIND_WARNING,
+    );
+    assert_eq!(
+        app.rewind_picker.item(1).unwrap().section(),
+        Some("Rewound")
+    );
+    assert_eq!(
+        app.rewind_picker.item(2).unwrap().detail(),
+        Some(PLANNING_WARNING)
+    );
+    let actions = app.dispatch_click(
+        ClickTarget::PickerRow {
+            picker: PickerId::Rewind,
+            index: 2,
+        },
+        Position::default(),
+    );
+    assert!(matches!(actions.as_slice(), [Action::CommitRewind(2)]));
+    assert!(app.rewind_pending);
+    assert_eq!(app.input_box.buffer.value(), "keep draft");
+}
+
+#[test]
+fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
+    const FIRST: &str = "first prompt";
+    const CUT: &str = "cut prompt";
+    const NOTE: &str = "Files stay changed; tasks keep running.";
+    let mut app = test_app();
+    let session = app.state.session_mut();
+    session.push_message(Message::user(FIRST.into()));
+    session.push_message(Message::user(CUT.into()));
+    let target = session.chat_message_ids(None)[0];
+    session.fork(Some(target), NOTE.into()).unwrap();
+    app.main_chat().push_user_message(CUT);
+    app.chats.push(Chat::new(
+        "Child".into(),
+        app.ui_config.clone(),
+        app.lua_event_handle.clone(),
+        Arc::clone(&app.theme_provider),
+    ));
+    app.chats[1].push_user_message("child work");
+    app.recoverable_queue.push("queued prompt".into());
+    app.finish_rewind(CUT.into());
+    assert_eq!(app.input_box.buffer.value(), CUT);
+    assert_eq!(app.recoverable_queue, ["queued prompt"]);
+    assert_eq!(app.chats[1].last_message_text(), "child work");
+    assert_eq!(app.chats[0].message_count(), 3);
+    assert_eq!(app.chats[0].message_at(0).unwrap().text, FIRST);
+    assert_eq!(app.chats[0].message_at(1).unwrap().role, DisplayRole::Done);
+    assert_eq!(app.chats[0].last_message_text(), NOTE);
+}
+
+#[test]
+fn cancelling_rewind_picker_keeps_the_draft_and_chat() {
+    use super::rewind::RewindEntry;
+    let mut app = test_app();
+    app.input_box.set_input("keep draft".into());
+    app.main_chat().push_user_message("keep chat");
+    app.rewind_picker.open(
+        vec![RewindEntry {
+            index: 0,
+            label: "prompt".into(),
+            section: "Current context".into(),
+            planning: false,
+        }],
+        "Rewind",
+    );
+    assert!(app.update(Msg::Key(key(KeyCode::Esc))).is_empty());
+    assert!(!app.rewind_picker.is_open());
+    assert!(app.rewind_guard.is_none());
+    assert_eq!(app.input_box.buffer.value(), "keep draft");
+    assert_eq!(app.chats[0].last_message_text(), "keep chat");
 }
 
 #[test]

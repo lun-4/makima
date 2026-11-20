@@ -73,6 +73,29 @@ impl ActorIdleGuard {
         })
     }
 
+    pub(crate) fn rewind_history(&self) -> HistorySnapshot<Message> {
+        self.actor.inner.history.load_full().as_ref().clone()
+    }
+
+    pub(crate) fn install_rewind(
+        &self,
+        snapshot: HistorySnapshot<Message>,
+    ) -> Result<(), ActorError> {
+        let mut state = self
+            .actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        state.owned_idle(&self.owner).ok_or(ActorError::Busy)?;
+        state.latest_history_turn = None;
+        self.actor.inner.history.store(Arc::new(snapshot));
+        Ok(())
+    }
+
     pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ActorError> {
         if !self.actor.owns_ticket(ticket) {
             return Err(ActorError::PolicyCancelled);
@@ -196,6 +219,10 @@ impl AgentActorHandle {
             }
             listener.await;
         }
+    }
+
+    pub(crate) fn prepare_rewind(&self) -> Result<ActorIdleGuard, ActorError> {
+        self.prepare_idle()
     }
 
     pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {

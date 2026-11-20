@@ -4,6 +4,7 @@ use ratatui::layout::{Position, Rect};
 /// One UI surface family that owns a vertical scrollbar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerId {
+    Rewind,
     Model,
     Task,
     Theme,

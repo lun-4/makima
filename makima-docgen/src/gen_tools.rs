@@ -37,6 +37,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         "Agent & Knowledge",
         &[
             "task_spawn",
+            "task_list",
             "task_wait",
             "task_send",
             "task_despawn",

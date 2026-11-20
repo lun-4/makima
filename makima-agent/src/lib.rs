@@ -65,6 +65,8 @@ pub use state::{
     RawStateSnapshot, StateAccess, StateChangeEvent, StateChangeReason, StateEdit, StateError,
     StateRevision, StateScope, StateSlot, StateSlotSpec, StateSnapshot,
 };
+pub mod rewind;
+mod subagents;
 pub mod template;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;

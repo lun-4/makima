@@ -733,6 +733,43 @@ local function restore_despawn(input, output, is_error, ctx)
 end
 
 makima.api.register_tool({
+  name = "task_list",
+  description = "List the root agent's existing tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.",
+  kind = "search",
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  handler = function(_, ctx)
+    local tasks, err = task_policy(ctx)
+    if not tasks then
+      return { llm_output = err, is_error = true }
+    end
+    local ids = {}
+    for id in pairs(tasks) do
+      ids[#ids + 1] = id
+    end
+    table.sort(ids)
+    local lines = {}
+    for _, id in ipairs(ids) do
+      local agent = makima.agent.get(ctx, id)
+      local status
+      if agent then
+        local status_err
+        status, status_err = agent:status(ctx)
+        if not status then
+          return { llm_output = status_err, is_error = true }
+        end
+      end
+      local label = "done"
+      if status and status.status ~= "closed" then
+        label = (status.status == "working" or (status.queued or 0) > 0) and "running" or "idle"
+      end
+      lines[#lines + 1] = id .. ": " .. (tasks[id].description or "") .. " (" .. label .. ")"
+    end
+    return { llm_output = #lines > 0 and table.concat(lines, "\n") or "No tasks." }
+  end,
+})
+
+makima.api.register_tool({
   name = "task_spawn",
   description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Steer work with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
     .. description,

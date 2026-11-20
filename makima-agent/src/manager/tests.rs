@@ -40,6 +40,8 @@ const GRAPH_SUBSCRIBER: u64 = 1;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONDITION_TIMEOUT: &str = "condition never became true";
 const SMALL_RETAINED_QUOTA: usize = 4;
+const SUSPEND_PUBLICATION_SLOT: &str = "fixture/suspend-publication";
+const SUSPEND_PUBLICATION_VERSION: u32 = 1;
 
 struct ReceiptGateIo {
     entered: flume::Sender<()>,
@@ -2168,9 +2170,9 @@ impl ActorBackend for TestBackend {
                         .await
                         .unwrap();
                 }
-                for message in inbox.drain_completions() {
+                inbox.commit_completions(&mut |message| {
                     history.push_observation(message).unwrap();
-                }
+                });
                 inbox.instructions_submitted();
                 assert!(inbox.finish());
             }
@@ -4180,6 +4182,165 @@ fn panicking_child_factory_restores_capacity() {
     drop(current);
     drop(gate);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test_case(false, false; "suspend")]
+#[test_case(true, false; "suspend_zero_budget")]
+#[test_case(false, true; "suspend_publication_blocked")]
+fn suspend_preserves_active_and_queued_root_and_child_admissions(
+    zero_budget: bool,
+    blocked_publication: bool,
+) {
+    smol::block_on(async {
+        let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+        let child_gate = Gate::new();
+        let (entered, contexts) = flume::bounded(1);
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let root_actor = root.actor().unwrap();
+        let child_actor = child.actor().unwrap();
+        let root_active = root_actor.latest_ticket().unwrap();
+        let child_active = child_actor
+            .admit_turn(input(), None, "child-active".into())
+            .unwrap();
+        contexts.recv_async().await.unwrap();
+        let root_queued = root_actor
+            .admit_turn(input(), None, "root-queued".into())
+            .unwrap();
+        let child_queued = child_actor
+            .admit_turn(input(), None, "child-queued".into())
+            .unwrap();
+        let before = manager.journal().checkpoint_snapshot().unwrap();
+        for ticket in [&root_active, &root_queued, &child_active, &child_queued] {
+            assert!(before.state.iter().any(|record| matches!(
+                record.change,
+                StateChange::Admitted { turn, .. } if turn == ticket.turn_id()
+            )));
+        }
+        let events = manager.subscribe_events(GRAPH_SUBSCRIBER).unwrap();
+        let journal = manager.journal();
+        let publication = if blocked_publication {
+            Some(
+                journal
+                    .prepare(JournalCommit {
+                        incarnations: vec![journal.incarnation(root.id())],
+                        changes: vec![JournalChange {
+                            agent: Some(root.id()),
+                            generation: 0,
+                            change: StateChange::Plugin {
+                                key: SUSPEND_PUBLICATION_SLOT.into(),
+                                version: SUSPEND_PUBLICATION_VERSION,
+                                value: Some(Value::Null),
+                            },
+                        }],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let timeout = if zero_budget || blocked_publication {
+            Duration::ZERO
+        } else {
+            COMPLETION_TIMEOUT
+        };
+        let suspending = manager.clone();
+        let stopped = smol::spawn(async move { suspending.suspend(timeout).await });
+        yield_until(|| manager.lock_graph().shutting_down).await;
+        root_gate.release(1);
+        child_gate.release(1);
+        let report = stopped.await;
+        if !zero_budget && !blocked_publication {
+            assert!(report.timed_out.is_empty());
+            assert_eq!(report.joined.len(), 2);
+        }
+        drop(publication);
+        manager.wait_until_reaped().await;
+        assert!(manager.runner_finished(root.id()).unwrap());
+        assert!(manager.runner_finished(child.id()).unwrap());
+        assert!(matches!(
+            root_actor.admit_turn(input(), None, "after-suspend".into()),
+            Err(ActorError::Shutdown)
+        ));
+        for ticket in [&root_active, &root_queued, &child_active, &child_queued] {
+            assert!(ticket.peek_result().is_none());
+        }
+        let after = journal.checkpoint_snapshot().unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.agent_revisions, before.agent_revisions);
+        assert!(!after.state.iter().any(|record| matches!(
+            record.change,
+            StateChange::Turn { .. } | StateChange::Delivery { .. }
+        )));
+        for id in [root.id(), child.id()] {
+            assert_eq!(
+                journal.agent(id).unwrap().lifecycle,
+                StoredAgentLifecycle::Open
+            );
+        }
+        assert!(
+            !events
+                .events
+                .try_iter()
+                .any(|(_, event)| matches!(event, crate::ActorEvent::End(_)))
+        );
+        let mut session = Session::new("test/model", ".");
+        session.bind_root_id(root.id()).unwrap();
+        after.apply_to(&mut session).unwrap();
+        let reopened = SessionJournal::from_session(&session).unwrap();
+        assert_eq!(reopened.checkpoint_snapshot().unwrap().state, after.state);
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        assert_eq!(journal.checkpoint_snapshot().unwrap().state, after.state);
+    });
+}
+
+#[test]
+fn shutdown_still_terminalizes_active_and_queued_turns() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (entered, running) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(CancellableBackend {
+                    entered: move |_: &TurnContext| entered.send(()).unwrap(),
+                }),
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let active = actor.admit_turn(input(), None, "active".into()).unwrap();
+        running.recv_async().await.unwrap();
+        let queued = actor.admit_turn(input(), None, "queued".into()).unwrap();
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        for ticket in [&active, &queued] {
+            assert!(matches!(
+                ticket.wait().await,
+                TurnOutcome::Cancelled {
+                    reason: crate::TurnCancellationReason::Shutdown,
+                    ..
+                }
+            ));
+            assert!(manager.journal().checkpoint_snapshot().unwrap().state.iter().any(|record| {
+                matches!(record.change, StateChange::Turn { turn, .. } if turn == ticket.turn_id())
+            }));
+        }
+    });
 }
 
 #[test]
@@ -6324,5 +6485,212 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
                 .timed_out
                 .is_empty()
         );
+    });
+}
+
+#[test]
+fn rewind_admission_preserves_running_children_and_delivery_consumption() {
+    use crate::rewind::{RewindError, RewindOutcome, RewindTargetId};
+
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const REPORT_TEXT: &str = "rewind delivery regression report";
+    const RUNNING_LABEL: &str = "inspect running child";
+    const IDLE_LABEL: &str = "inspect idle child";
+    const DONE_LABEL: &str = "inspect closed child";
+    const GRANDCHILD_LABEL: &str = "exclude nested child";
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = crate::session_writer::StoredSession::new(MODEL, ".");
+        let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+        manager.journal().bind_writer(writer).unwrap();
+        let root_gate = Gate::new();
+        let (root_tx, root_rx) = flume::unbounded();
+        let root = manager
+            .create_root_with_config(
+                Some(config(MODEL, false)),
+                vec![makima_providers::Message::user(input().message)],
+                None,
+                |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        root_tx,
+                        Some(Arc::clone(&root_gate)),
+                    ))
+                },
+            )
+            .unwrap();
+        session.bind_root_id(root.id()).unwrap();
+        let actor = root.actor().unwrap();
+        let initial = actor.admit_turn(input(), None, String::new()).unwrap();
+        root_rx.recv_async().await.unwrap();
+        assert!(matches!(
+            root.begin_rewind(&session),
+            Err(RewindError::Busy)
+        ));
+        root_gate.release(1);
+        initial.wait().await;
+        manager.drain_graph_for_test().await.unwrap();
+        let target =
+            RewindTargetId::Message(manager.journal().snapshot().histories[&root.id()].ids[0]);
+
+        let child_gate = Gate::new();
+        let (child_tx, child_rx) = flume::unbounded();
+        let child = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(MODEL, false),
+                AgentMetadata {
+                    label: Some(RUNNING_LABEL.into()),
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+                |_| {
+                    Ok::<_, String>(TestBackend::reporting(
+                        child_tx,
+                        Some(Arc::clone(&child_gate)),
+                    ))
+                },
+            )
+            .unwrap();
+        let spawn = |parent, label: &str| {
+            manager
+                .spawn_child_trusted_with_config(
+                    parent,
+                    config(MODEL, false),
+                    AgentMetadata {
+                        label: Some(label.into()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    None,
+                    |_| Ok::<_, String>(TestBackend::boxed()),
+                )
+                .unwrap()
+        };
+        let idle = spawn(&root, IDLE_LABEL);
+        let done = spawn(&root, DONE_LABEL);
+        done.close_subtree().unwrap();
+        manager.drain_graph_for_test().await.unwrap();
+        spawn(&idle, GRANDCHILD_LABEL);
+        let child_actor = child.actor().unwrap();
+        child_actor.configure_parent_delivery(false).unwrap();
+        let child_ticket = child_actor
+            .admit_turn(input(), None, String::new())
+            .unwrap();
+        child_rx.recv_async().await.unwrap();
+        let child_before = manager.journal().snapshot().histories[&child.id()].clone();
+
+        let envelope = Arc::new(ChildDelivery {
+            label: None,
+            result: TurnResult {
+                outcome: TurnOutcome::completed(
+                    child.id(),
+                    crate::TurnId::generate(),
+                    TokenUsage::default(),
+                    1,
+                    crate::DoneReason::EndTurn,
+                ),
+                text: REPORT_TEXT.into(),
+                output: Vec::new(),
+                provenance: TurnProvenance::default(),
+                duration_ms: 0,
+            },
+        });
+        let report_id = (child.id(), envelope.result.outcome.turn_id());
+        let guard = root.begin_rewind(&session).unwrap();
+        manager.deliver(root.id(), Arc::clone(&envelope)).unwrap();
+        let queued = actor.admit_turn(input(), None, String::new()).unwrap();
+        actor.runtime_barrier().await.unwrap();
+        assert!(root_rx.is_empty());
+        assert!(queued.peek().is_none());
+        assert_eq!(
+            manager
+                .journal()
+                .pending_deliveries(root.id())
+                .unwrap()
+                .len(),
+            1
+        );
+        let RewindOutcome::Fork { history, .. } = guard.commit(target.clone()).await.unwrap()
+        else {
+            panic!("expected fork");
+        };
+        let note = history
+            .messages
+            .last()
+            .unwrap()
+            .first_text_content()
+            .unwrap();
+        assert!(note.contains("Existing subagents:"));
+        for (agent, label, status) in [
+            (&child, RUNNING_LABEL, "running"),
+            (&idle, IDLE_LABEL, "idle"),
+            (&done, DONE_LABEL, "done"),
+        ] {
+            assert!(
+                note.contains(&format!("{}: {label} ({status})", agent.id())),
+                "{note}"
+            );
+        }
+        assert!(!note.contains(GRANDCHILD_LABEL));
+        root_rx.recv_async().await.unwrap();
+        assert!(child_ticket.peek().is_none());
+        assert_eq!(
+            child_actor.snapshot().active_turn,
+            Some(child_ticket.turn_id())
+        );
+        assert_eq!(
+            manager.journal().snapshot().histories[&child.id()].messages,
+            child_before.messages
+        );
+        root_gate.release(1);
+        queued.wait().await;
+        yield_until(|| actor.is_settled()).await;
+        actor.runtime_barrier().await.unwrap();
+        assert_eq!(
+            manager.journal().snapshot().fold().unwrap().scopes[&Some(root.id())].deliveries
+                [&report_id],
+            StoredDeliveryOp::Consumed
+        );
+        assert!(
+            manager.journal().snapshot().histories[&root.id()]
+                .messages
+                .iter()
+                .any(|message| message
+                    .first_text_content()
+                    .is_some_and(|text| text.contains(REPORT_TEXT)))
+        );
+
+        let guard = root.begin_rewind(&session).unwrap();
+        manager.deliver(root.id(), Arc::clone(&envelope)).unwrap();
+        assert!(
+            manager
+                .journal()
+                .pending_deliveries(root.id())
+                .unwrap()
+                .is_empty()
+        );
+        guard.commit(target).await.unwrap();
+        actor.runtime_barrier().await.unwrap();
+        assert!(
+            manager
+                .journal()
+                .pending_deliveries(root.id())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !manager.journal().snapshot().histories[&root.id()]
+                .messages
+                .iter()
+                .any(|message| message
+                    .first_text_content()
+                    .is_some_and(|text| text.contains(REPORT_TEXT)))
+        );
+        assert!(child_ticket.peek().is_none());
+        child_gate.release(1);
+        child_ticket.wait().await;
+        manager.shutdown(COMPLETION_TIMEOUT).await;
     });
 }

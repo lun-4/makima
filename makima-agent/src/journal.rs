@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::take;
+use std::slice::from_ref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -370,6 +371,8 @@ pub(crate) struct JournalState {
     writer: Option<SessionWriter>,
     unwritten: Vec<JournalSessionRecord>,
     emitted_histories: BTreeMap<AgentId, EmittedHistory>,
+    context_events: Vec<serde_json::Value>,
+    captured_unwritten: usize,
 }
 
 /// An owned publication lane, acquired before reading runtime state that the
@@ -601,6 +604,8 @@ impl Default for SessionJournal {
                 writer: None,
                 unwritten: Vec::new(),
                 emitted_histories: BTreeMap::new(),
+                context_events: Vec::new(),
+                captured_unwritten: 0,
             }),
             conversion_changed: Event::new(),
         }
@@ -652,6 +657,7 @@ impl SessionJournal {
             state.emitted_histories = Self::history_baseline(&state.snapshot);
             state.ready = state.snapshot.clone();
             state.session_id = Some(session.id);
+            state.context_events = session.context_events().to_vec();
         }
         Ok(journal)
     }
@@ -711,6 +717,7 @@ impl SessionJournal {
             state.snapshot = snapshot.clone();
             state.ready = snapshot;
             state.session_id = Some(session.id);
+            state.context_events = session.context_events().to_vec();
         }
         Ok(journal)
     }
@@ -903,6 +910,53 @@ impl SessionJournal {
                 )
             })
             .collect()
+    }
+
+    pub fn context_events(&self) -> Vec<serde_json::Value> {
+        self.lock().context_events.clone()
+    }
+
+    pub(crate) fn install_rewind(
+        &self,
+        binding: JournalIncarnation,
+        history: HistorySnapshot,
+        record: JournalSessionRecord,
+    ) -> Result<(), JournalError> {
+        let mut state = self.lock();
+        Self::validate_incarnations(&state, from_ref(&binding))?;
+        let candidate = Self::apply_commit(
+            &state.snapshot,
+            JournalCommit {
+                incarnations: vec![binding.clone()],
+                histories: [(binding.agent, history.clone())].into(),
+                managed_histories: [binding.agent].into(),
+                ..Default::default()
+            },
+        )?;
+        state.snapshot = candidate.clone();
+        state.staged.push_back(StagedCommit {
+            snapshot: candidate,
+            pending: None,
+            histories: BTreeSet::new(),
+        });
+        state.emitted_histories.insert(
+            binding.agent,
+            EmittedHistory {
+                epoch: history.epoch,
+                len: history.messages.len(),
+                compacted: history.compacted,
+                conversation: history.conversation.clone(),
+            },
+        );
+        Self::collect_ready(&mut state);
+        state.unwritten.push(record);
+        state.unwritten.push(SessionRecord::History {
+            agent: binding.agent,
+            compacted: history.compacted,
+            conversation: history.conversation,
+        });
+        Self::emit_unwritten(&mut state);
+        Ok(())
     }
 
     pub fn session_id(&self) -> Option<MakimaId> {
@@ -2072,10 +2126,23 @@ impl SessionJournal {
     }
 
     fn emit_unwritten(state: &mut JournalState) {
+        for record in &state.unwritten[state.captured_unwritten.min(state.unwritten.len())..] {
+            if matches!(
+                record,
+                SessionRecord::Msg { .. }
+                    | SessionRecord::Compaction { .. }
+                    | SessionRecord::Fork { .. }
+            ) && let Ok(event) = serde_json::to_value(record)
+            {
+                state.context_events.push(event);
+            }
+        }
+        state.captured_unwritten = state.unwritten.len();
         if let Some(writer) = &state.writer
             && !state.unwritten.is_empty()
         {
             drop(writer.append(take(&mut state.unwritten)));
+            state.captured_unwritten = 0;
         }
     }
 

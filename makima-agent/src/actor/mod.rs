@@ -437,6 +437,7 @@ pub(crate) struct ActorState {
 
     pub(crate) lifecycle: ActorLifecycle,
     close_pending: bool,
+    suspended: bool,
     publication_registrations: Vec<Weak<PublicationGuard>>,
     pending_publications: usize,
     idle_pending: bool,
@@ -1106,6 +1107,7 @@ impl ActorState {
             parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
             close_pending: false,
+            suspended: false,
             publication_registrations: Vec::new(),
             pending_publications: 0,
             idle_pending: false,
@@ -1214,6 +1216,19 @@ fn retire_turn(
 ) -> Option<Option<TurnTicket>> {
     let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.suspended {
+        state.instructions.remove(&turn_id);
+        state.turn_work.remove(&turn_id);
+        if settle_runner {
+            state.settle_runner();
+        }
+        inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&turn_id);
+        return None;
+    }
     if let Some(reason) = state
         .processing
         .as_ref()
@@ -3339,6 +3354,17 @@ impl AgentActorHandle {
         }
         self.outcome(turn_id)
             .ok_or(ActorError::UnknownTurn(turn_id))
+    }
+
+    pub(crate) fn preserve_unfinished_turns(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle == ActorLifecycle::Open {
+            state.suspended = true;
+        }
     }
 
     pub(crate) fn capture_close(&self, shutdown: bool) -> Option<ActorCloseCut> {

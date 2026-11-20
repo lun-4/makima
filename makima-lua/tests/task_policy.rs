@@ -40,13 +40,15 @@ const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const MAX_STRUCTURED_RETRIES: usize = 2;
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 
+const TASK_LIST_TOOL: &str = "task_list";
+const NO_TASKS: &str = "No tasks.";
 const TASK_SPAWN_TOOL: &str = "task_spawn";
 const TASK_WAIT_TOOL: &str = "task_wait";
 const TASK_SEND_TOOL: &str = "task_send";
 const TASK_DESPAWN_TOOL: &str = "task_despawn";
 const TASK_STOP_TOOL: &str = "task_stop";
-/// The five task lifecycle tools a general child inherits from its parent.
-const NESTED_LIFECYCLE_TOOLS: [&str; 5] = [
+const NESTED_TASK_TOOLS: [&str; 6] = [
+    TASK_LIST_TOOL,
     TASK_SPAWN_TOOL,
     TASK_WAIT_TOOL,
     TASK_SEND_TOOL,
@@ -1640,6 +1642,10 @@ fn retired_task_policy_releases_space_for_later_spawns() {
         common::exec_tool(&reg, &ctx, TASK_WAIT_TOOL, task.clone()).unwrap();
         common::exec_tool(&reg, &ctx, TASK_DESPAWN_TOOL, task.clone()).unwrap();
         let id = task["task_id"].as_str().unwrap();
+        assert_eq!(
+            common::exec_tool_text(&reg, &ctx, TASK_LIST_TOOL, json!({})).unwrap(),
+            format!("{id}: {} (done)", "x".repeat(RETIRE_DESCRIPTION_BYTES))
+        );
         let done = makima_lua::test_support::run_command(
             &host.command_registry(),
             &format!("/task-retire {id}"),
@@ -1659,6 +1665,10 @@ fn retired_task_policy_releases_space_for_later_spawns() {
             .as_ref()
             .unwrap();
         assert!(stored.as_object().unwrap().is_empty());
+        assert_eq!(
+            common::exec_tool_text(&reg, &ctx, TASK_LIST_TOOL, json!({})).unwrap(),
+            NO_TASKS
+        );
         assert_eq!(
             manager
                 .journal()
@@ -2364,11 +2374,11 @@ fn task_policy_general_task_runs_in_custom_mode_real_driver() {
     assert_eq!(captured_tools.len(), 1);
     let mut child_tools = common::tool_names(&captured_tools[0]);
     child_tools.sort();
-    let mut expected = NESTED_LIFECYCLE_TOOLS.to_vec();
+    let mut expected = NESTED_TASK_TOOLS.to_vec();
     expected.sort();
     assert_eq!(
         child_tools, expected,
-        "the child inherits the parent's task lifecycle tools"
+        "the child inherits the parent's task tools"
     );
 }
 

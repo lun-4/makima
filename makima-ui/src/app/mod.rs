@@ -8,6 +8,7 @@ mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
+mod rewind;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -134,7 +135,7 @@ pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
 /// carries no work identity and bypasses the per-run staleness filter.
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
-const FLASH_REWIND_REWORKED: &str = "rewind is being reworked";
+const FLASH_REWIND_ROOT_ONLY: &str = "Rewind is only available in the root chat";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
@@ -399,6 +400,9 @@ pub struct App {
     pub(super) command_palette: CommandPalette,
     pub(crate) command_runtime: Arc<CommandRuntime>,
     pub(crate) command_target: TargetHandle,
+    pub(super) rewind_picker: ListPicker<rewind::RewindEntry>,
+    pub(crate) rewind_guard: Option<makima_agent::rewind::RewindGuard>,
+    pub(crate) rewind_pending: bool,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) background_calls: Vec<BackgroundCallView>,
@@ -611,6 +615,9 @@ impl App {
                 command_palette_defaults(&command_runtime),
                 Arc::from(state.session.cwd.as_str()),
             ),
+            rewind_picker: ListPicker::new().with_picker(PickerId::Rewind),
+            rewind_guard: None,
+            rewind_pending: false,
             task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
             background_calls: Vec::new(),
@@ -1257,6 +1264,7 @@ impl App {
             ScrollOwner::Input => Some(self.input_box.content_len()),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.content_len(),
+                PickerId::Rewind => self.rewind_picker.content_len(),
                 PickerId::Task => self
                     .task_picker
                     .is_open()
@@ -1290,6 +1298,7 @@ impl App {
             ScrollOwner::Input => self.input_box.scroll_y(),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
+                PickerId::Rewind => self.rewind_picker.scroll_line(),
                 PickerId::Task => self.task_picker.scroll_line(),
                 PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
                 PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
@@ -1311,6 +1320,7 @@ impl App {
             ScrollOwner::Input => self.input_box.scroll_to_line(line),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_to_line(line),
+                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
                 PickerId::Task => self.task_picker.scroll_to_line(line),
                 PickerId::Theme => self.theme_picker.scroll_to_line(line),
                 PickerId::Login => self.login_picker.scroll_to_line(line),
@@ -1351,6 +1361,7 @@ impl App {
             ClickTarget::PickerInput(picker) => {
                 match picker {
                     PickerId::Model => self.model_picker.click_input(pos),
+                    PickerId::Rewind => self.rewind_picker.click_input(pos),
                     PickerId::Task => self.task_picker.click_input(pos),
                     PickerId::Theme => self.theme_picker.click_input(pos),
                     PickerId::Login => self.login_picker.click_input(pos),
@@ -1460,6 +1471,7 @@ impl App {
 
     fn handle_picker_key(&mut self, picker: PickerId, key: KeyEvent) -> Vec<Action> {
         match picker {
+            PickerId::Rewind => self.handle_rewind_key(key),
             PickerId::Lua => match self.lua_picker.handle_key(key) {
                 LuaPickerAction::Confirming(msg) => {
                     self.flash(msg);
@@ -1579,6 +1591,7 @@ impl App {
     fn select_picker_row(&mut self, picker: PickerId, index: usize) -> bool {
         match picker {
             PickerId::Model => self.model_picker.select(index),
+            PickerId::Rewind => self.rewind_picker.select(index),
             PickerId::Task => self.task_picker.select(index),
             PickerId::Theme => self.theme_picker.select(index),
             PickerId::Login => self.login_picker.click_row(index),
@@ -1693,6 +1706,7 @@ impl App {
     fn scroll_surface(&mut self, surface: Surface, delta: i32) {
         match surface {
             Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
+            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
             Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
             Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
             Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
@@ -1999,6 +2013,13 @@ impl App {
         if key::DEFER_INPUT.matches(key) {
             self.toggle_defer_input();
             return Some(vec![]);
+        }
+
+        if self.rewind_pending {
+            return Some(vec![]);
+        }
+        if self.rewind_picker.is_open() {
+            return Some(self.handle_rewind_key(key));
         }
 
         if self.permission_active() {
@@ -2530,8 +2551,7 @@ impl App {
                             if streaming {
                                 self.handle_cancel()
                             } else {
-                                self.status_bar.flash(FLASH_REWIND_REWORKED.into());
-                                vec![]
+                                self.open_rewind()
                             }
                         } else {
                             self.last_esc = Some(Instant::now());
@@ -3780,13 +3800,14 @@ impl App {
         self.flash(format!("cd {}", path.display()));
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 12] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
+            &self.rewind_picker,
             &self.task_picker,
             &self.lua_picker,
             &self.theme_picker,
@@ -3797,13 +3818,14 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 12] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
+            &mut self.rewind_picker,
             &mut self.task_picker,
             &mut self.lua_picker,
             &mut self.theme_picker,
@@ -4099,6 +4121,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.rewind_guard = None;
         self.close_model_picker();
         self.close_command_palette();
         self.file_completion.close();
@@ -4216,6 +4239,12 @@ impl App {
     }
 
     fn route_paste(&mut self, text: &str) {
+        if self.rewind_pending {
+            return;
+        }
+        if self.rewind_picker.handle_paste(text) {
+            return;
+        }
         if self.permission_active() {
             self.permission_prompt.handle_paste(text);
             return;
@@ -4256,6 +4285,7 @@ impl App {
             };
         }
         try_picker!(self.file_picker);
+        try_picker!(self.rewind_picker);
         try_picker!(self.task_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);

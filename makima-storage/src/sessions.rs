@@ -86,6 +86,8 @@ pub enum SessionError {
     MissingHeader { path: String },
     #[error("session log diverged ({reason}); rewrite required")]
     LogDiverged { reason: &'static str },
+    #[error("fork target {target} is not an earlier root message")]
+    InvalidForkTarget { target: MakimaId },
     #[error("session is open in another terminal; close it there first")]
     OpenElsewhere,
     #[error(
@@ -495,6 +497,11 @@ pub enum SessionRecord<M, U, T> {
         #[serde(default)]
         covered: Option<MakimaId>,
     },
+    #[serde(rename = "fork")]
+    Fork {
+        target: Option<MakimaId>,
+        note: String,
+    },
     #[serde(rename = "history")]
     History {
         agent: AgentId,
@@ -663,27 +670,109 @@ pub fn encode_records<R: Serialize>(records: &[R]) -> Result<Vec<u8>, SessionErr
     Ok(bytes)
 }
 
-/// Builds an agent's active message ids without discarding historical events.
-pub fn context_message_ids(events: &[serde_json::Value], agent: AgentId) -> Vec<MakimaId> {
-    let agent = serde_json::json!(agent);
-    let mut ids = Vec::new();
-    for event in events {
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextEntry {
+    Message { id: MakimaId, d: serde_json::Value },
+    Note { id: MakimaId, note: String },
+}
+
+impl ContextEntry {
+    pub fn id(&self) -> MakimaId {
+        match self {
+            Self::Message { id, .. } | Self::Note { id, .. } => *id,
+        }
+    }
+
+    fn into_message<M: DeserializeOwned>(self) -> Result<M, serde_json::Error> {
+        serde_json::from_value(match self {
+            Self::Message { d, .. } => d,
+            Self::Note { note, .. } => serde_json::json!({
+                "role": "user",
+                "kind": "observation",
+                "content": [{"type": "text", "text": note}],
+            }),
+        })
+    }
+}
+
+/// Replays a root's events, retaining the historical line at each message for redo.
+/// Fork notes occupy stable ids outside the UUIDv7 namespace used by messages.
+pub fn context_entries(
+    events: &[serde_json::Value],
+    root: AgentId,
+) -> Result<Vec<ContextEntry>, SessionError> {
+    let agent = serde_json::json!(root);
+    let mut nodes: Vec<(Option<usize>, ContextEntry)> = Vec::new();
+    let mut head = None;
+    let mut lines = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if event["t"] == "fork" {
+            let target: Option<MakimaId> =
+                serde_json::from_value(event["target"].clone()).map_err(StorageError::from)?;
+            head = target
+                .map(|target| {
+                    lines
+                        .get(&target)
+                        .copied()
+                        .ok_or(SessionError::InvalidForkTarget { target })
+                })
+                .transpose()?;
+            let mut bytes = [0; 16];
+            bytes[8..].copy_from_slice(&(index as u64).to_be_bytes());
+            let id = serde_json::from_value(serde_json::json!(bs58::encode(bytes).into_string()))
+                .map_err(StorageError::from)?;
+            let note = serde_json::from_value(event["note"].clone()).map_err(StorageError::from)?;
+            nodes.push((head, ContextEntry::Note { id, note }));
+            head = Some(nodes.len() - 1);
+            lines.insert(id, nodes.len() - 1);
+            continue;
+        }
         if event["agent"] != agent {
             continue;
         }
         match event["t"].as_str() {
             Some("msg") => {
-                if let Ok(id) = serde_json::from_value(event["id"].clone()) {
-                    ids.push(id);
-                }
+                let id = serde_json::from_value(event["id"].clone()).map_err(StorageError::from)?;
+                nodes.push((
+                    head,
+                    ContextEntry::Message {
+                        id,
+                        d: event["d"].clone(),
+                    },
+                ));
+                head = Some(nodes.len() - 1);
+                lines.insert(id, nodes.len() - 1);
             }
             Some("compaction") => {
-                ids = serde_json::from_value(event["ids"].clone()).unwrap_or_default();
+                head = None;
+                let ids: Vec<MakimaId> =
+                    serde_json::from_value(event["ids"].clone()).map_err(StorageError::from)?;
+                if let Some(messages) = event["messages"].as_array() {
+                    for (id, d) in ids.into_iter().zip(messages) {
+                        nodes.push((head, ContextEntry::Message { id, d: d.clone() }));
+                        head = Some(nodes.len() - 1);
+                        lines.insert(id, nodes.len() - 1);
+                    }
+                }
             }
             _ => {}
         }
     }
-    ids
+    let mut entries = Vec::new();
+    while let Some(index) = head {
+        let (previous, entry) = &nodes[index];
+        entries.push(entry.clone());
+        head = *previous;
+    }
+    entries.reverse();
+    Ok(entries)
+}
+
+/// Builds active ids. Child event streams must exclude root fork records.
+pub fn context_message_ids(events: &[serde_json::Value], agent: AgentId) -> Vec<MakimaId> {
+    context_entries(events, agent)
+        .map(|entries| entries.iter().map(ContextEntry::id).collect())
+        .unwrap_or_default()
 }
 
 fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
@@ -1007,7 +1096,10 @@ where
             sequence_high_water = sequence_high_water.max(value["seq"].as_u64());
         }
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
-            && matches!(value["t"].as_str(), Some("msg" | "compaction" | "history"))
+            && matches!(
+                value["t"].as_str(),
+                Some("msg" | "compaction" | "history" | "fork")
+            )
         {
             context_events.push(decode_log_record(value));
         }
@@ -1085,7 +1177,7 @@ where
                 );
                 agent_messages.insert(agent, summary);
             }
-            SessionRecord::History { .. } => {}
+            SessionRecord::History { .. } | SessionRecord::Fork { .. } => {}
             SessionRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
             }
@@ -1160,6 +1252,15 @@ where
     if let Some(root_messages) = agent_messages.remove(&root) {
         messages = root_messages;
         message_ids = agent_message_ids.remove(&root).unwrap_or_default();
+    }
+    if context_events.iter().any(|event| event["t"] == "fork") {
+        let entries = context_entries(&context_events, root)?;
+        message_ids = entries.iter().map(ContextEntry::id).collect();
+        messages = entries
+            .into_iter()
+            .map(ContextEntry::into_message)
+            .collect::<Result<_, _>>()
+            .map_err(StorageError::from)?;
     }
     for agent in agents.values().filter(|agent| agent.parent.is_some()) {
         subagent_messages
@@ -1683,7 +1784,13 @@ impl<M, U, T> Session<M, U, T> {
         else {
             return Vec::new();
         };
-        context_message_ids(&self.context_events, agent)
+        let events: Vec<_> = self
+            .context_events
+            .iter()
+            .filter(|event| event["t"] != "fork")
+            .cloned()
+            .collect();
+        context_message_ids(&events, agent)
     }
 
     pub fn context_events(&self) -> &[serde_json::Value] {
@@ -2266,6 +2373,33 @@ where
             self.message_ids = next.iter().map(|_| MakimaId::generate()).collect();
             self.context_events.push(serde_json::json!({"t":"compaction", "agent":self.message_agent(), "messages": next, "ids": self.message_ids, "covered": covered}));
         }
+    }
+
+    pub fn fork(&mut self, target: Option<MakimaId>, note: String) -> Result<(), SessionError> {
+        let event = serde_json::to_value(SessionRecord::<M, U, T>::Fork { target, note })
+            .map_err(StorageError::from)?;
+        self.context_events.push(event);
+        let rebuilt =
+            context_entries(&self.context_events, self.message_agent()).and_then(|entries| {
+                let ids = entries.iter().map(ContextEntry::id).collect();
+                let messages = entries
+                    .into_iter()
+                    .map(ContextEntry::into_message)
+                    .collect::<Result<Vec<M>, _>>()
+                    .map_err(StorageError::from)?;
+                Ok((ids, messages))
+            });
+        let (ids, messages) = match rebuilt {
+            Ok(context) => context,
+            Err(error) => {
+                self.context_events.pop();
+                return Err(error);
+            }
+        };
+        self.message_ids = ids;
+        self.messages = Arc::new(messages);
+        self.rewrite_messages();
+        Ok(())
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -3059,6 +3193,132 @@ mod tests {
     const ORPHAN_CHILD: &str = "orphan-child";
     /// A pid no live process on this machine has.
     const FAKE_LOCK_PID: u32 = u32::MAX - 1;
+
+    #[test_case(false; "ordinary_branch")]
+    #[test_case(true; "precompaction_branch")]
+    fn fork_restores_historical_context_and_redo_after_reload(compact: bool) {
+        const NOTE: &str = "rewound; files may differ";
+        const REDO_NOTE: &str = "redo selected branch";
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let first = user_message("first");
+        let second = user_message("second");
+        session.push_message(first.clone());
+        let first_id = session.last_message_id().unwrap();
+        session.push_message(second.clone());
+        let second_id = session.last_message_id().unwrap();
+        if compact {
+            session.replace_messages(vec![user_message("summary")]);
+        }
+        session.save_to(directory.path()).unwrap();
+        let historical_events = session.context_events().to_vec();
+        session.fork(Some(first_id), NOTE.into()).unwrap();
+        assert_eq!(session.messages()[0], first);
+        assert_eq!(session.messages()[1]["content"][0]["text"], NOTE);
+        assert_eq!(session.messages()[1]["kind"], "observation");
+        session.push_message(user_message("new branch"));
+        session.save_to(directory.path()).unwrap();
+        assert!(session.context_events().starts_with(&historical_events));
+        let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert!(loaded.context_events().starts_with(&historical_events));
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(
+            loaded.chat_message_ids(None),
+            session.chat_message_ids(None)
+        );
+        loaded.fork(Some(second_id), REDO_NOTE.into()).unwrap();
+        assert_eq!(&loaded.messages()[..2], &[first, second]);
+        assert_eq!(loaded.messages()[2]["content"][0]["text"], REDO_NOTE);
+        loaded.save_to(directory.path()).unwrap();
+        let reloaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(reloaded.messages(), loaded.messages());
+        assert_eq!(
+            reloaded.chat_message_ids(None),
+            loaded.chat_message_ids(None)
+        );
+        assert_eq!(
+            reloaded
+                .context_events()
+                .iter()
+                .filter(|event| event["t"] == "fork")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fork_retains_prior_notes_and_does_not_rewind_children() {
+        const FIRST_NOTE: &str = "first rewind";
+        const SECOND_NOTE: &str = "second rewind";
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        session.push_message(user_message("first"));
+        let first_id = session.last_message_id().unwrap();
+        session.set_subagent_messages("child".into(), vec![user_message("child work")]);
+        let child_ids = session.chat_message_ids(Some("child"));
+        let child_messages = session.subagent_messages()["child"].clone();
+        let events = session.context_events().to_vec();
+        let child_target = child_ids[0];
+        assert!(
+            matches!(session.fork(Some(child_target), FIRST_NOTE.into()),
+            Err(SessionError::InvalidForkTarget { target }) if target == child_target)
+        );
+        assert_eq!(session.context_events(), events);
+        session.fork(Some(first_id), FIRST_NOTE.into()).unwrap();
+        let first_note = session.last_message_id().unwrap();
+        session.fork(Some(first_note), SECOND_NOTE.into()).unwrap();
+        assert_eq!(session.messages().len(), 3);
+        session.fork(Some(first_note), FIRST_NOTE.into()).unwrap();
+        session.push_message(user_message("continued"));
+        let continued = session.last_message_id().unwrap();
+        session.push_message(user_message("discarded"));
+        session.fork(Some(continued), SECOND_NOTE.into()).unwrap();
+        assert_eq!(session.messages().len(), 5);
+        assert_eq!(session.messages()[1]["content"][0]["text"], FIRST_NOTE);
+        assert_eq!(session.messages()[4]["content"][0]["text"], SECOND_NOTE);
+        assert_eq!(session.subagent_messages()["child"], child_messages);
+        assert_eq!(session.chat_message_ids(Some("child")), child_ids);
+        session.save_to(directory.path()).unwrap();
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.subagent_messages()["child"], child_messages);
+        assert_eq!(loaded.chat_message_ids(Some("child")), child_ids);
+    }
+
+    #[test]
+    fn fork_before_first_message_preserves_redo_after_reload() {
+        const NOTE: &str = "rewound to session start";
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let first = user_message("first");
+        session.push_message(first.clone());
+        let first_id = session.last_message_id().unwrap();
+        session.fork(None, NOTE.into()).unwrap();
+        assert_eq!(session.messages().len(), 1);
+        assert_eq!(session.messages()[0]["content"][0]["text"], NOTE);
+        session.save_to(directory.path()).unwrap();
+        let mut loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(
+            loaded.chat_message_ids(None),
+            session.chat_message_ids(None)
+        );
+        loaded.fork(Some(first_id), NOTE.into()).unwrap();
+        assert_eq!(loaded.messages()[0], first);
+    }
+
+    #[test]
+    fn invalid_fork_target_leaves_context_and_log_unchanged() {
+        let mut session = TestSession::new("model", "/project");
+        session.push_message(user_message("first"));
+        let messages = session.messages().to_vec();
+        let events = session.context_events().to_vec();
+        let target = MakimaId::generate();
+        assert!(matches!(session.fork(Some(target), String::new()),
+            Err(SessionError::InvalidForkTarget { target: found }) if found == target));
+        assert_eq!(session.messages(), messages);
+        assert_eq!(session.context_events(), events);
+    }
 
     #[test]
     fn state_compaction_epoch_survives_repeated_load_and_save() {

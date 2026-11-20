@@ -607,6 +607,12 @@ impl AgentHandles {
         self.manager.runner_finished(self.root_id).unwrap_or(true)
     }
 
+    pub(crate) fn suspend(self) -> smol::Task<()> {
+        smol::spawn(async move {
+            let _ = self.manager.suspend(Duration::from_secs(3)).await;
+        })
+    }
+
     pub(crate) fn shutdown(self) -> smol::Task<()> {
         self.subagent_cancels.cancel_all();
         smol::spawn(async move {
