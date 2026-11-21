@@ -159,6 +159,7 @@ jobs:
             Remove-Item -LiteralPath $root -Recurse -Force
           }
       - run: cargo test -p makima-agent --lib tools::offload
+      - run: cargo test -p makima-agent --lib shell::tests
       - run: cargo test -p makima-storage --lib sessions::tests::delete
       - run: just lint
       - run: just build

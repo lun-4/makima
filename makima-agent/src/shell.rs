@@ -1,10 +1,14 @@
 #[cfg(windows)]
 use std::env;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use makima_config::Shell;
 
+#[cfg(windows)]
+const CMD_SCRIPT_FLAG: &str = "/C";
 #[cfg(windows)]
 const GIT_INSTALL_ROOT: &str = "GIT_INSTALL_ROOT";
 /// Relative to `GIT_INSTALL_ROOT`. `bin/bash.exe` is the shim Git for Windows
@@ -17,6 +21,13 @@ const GIT_BASH: &str = "bin/bash.exe";
 pub fn command(shell: Shell, script: &str) -> Command {
     let (program, flag) = program_and_flag(shell, git_bash().as_deref());
     let mut command = Command::new(program);
+    #[cfg(windows)]
+    if flag == CMD_SCRIPT_FLAG {
+        command
+            .args(["/D", "/S", flag])
+            .raw_arg(format!(r#""{script}""#));
+        return command;
+    }
     command.arg(flag).arg(script);
     command
 }
@@ -53,7 +64,7 @@ fn program_and_flag(shell: Shell, git_bash: Option<&Path>) -> (PathBuf, &'static
         #[cfg(windows)]
         Shell::Powershell => ("powershell.exe".into(), "-Command"),
         #[cfg(windows)]
-        Shell::Cmd => ("cmd.exe".into(), "/C"),
+        Shell::Cmd => ("cmd.exe".into(), CMD_SCRIPT_FLAG),
         _ => (
             git_bash.map_or_else(|| PathBuf::from("bash"), Path::to_path_buf),
             "-c",
@@ -77,10 +88,22 @@ fn git_bash() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(windows)]
+    use std::{fs, io};
+
+    #[cfg(windows)]
+    use test_case::test_case;
+
+    #[cfg(windows)]
+    use super::{Path, PathBuf, name_of, program_and_flag, resolved};
+    use super::{Shell, command};
 
     #[cfg(windows)]
     const FAKE_GIT: &str = "/Program Files/Git/bin/bash.exe";
+    #[cfg(windows)]
+    const BATCH_SOURCE: &[u8] = b"@type \"%~1\"\r\n";
+    #[cfg(windows)]
+    const INPUT_CONTENT: &[u8] = b"hello from cmd\r\n";
 
     #[cfg(not(windows))]
     #[test]
@@ -109,6 +132,32 @@ mod tests {
         );
         assert_eq!(name_of(Shell::Cmd), "cmd");
         assert_eq!(name_of(Shell::Powershell), "powershell");
+    }
+
+    #[cfg(windows)]
+    #[test_case("quoted command.cmd", "input file.txt", "output file.txt" ; "spaces")]
+    #[test_case("quoted & command.cmd", "input & file.txt", "output & file.txt" ; "spaces_and_ampersands")]
+    fn cmd_script_preserves_quotes_and_redirection(
+        batch_file: &str,
+        input_file: &str,
+        output_file: &str,
+    ) -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join(batch_file), BATCH_SOURCE)?;
+        fs::write(dir.path().join(input_file), INPUT_CONTENT)?;
+
+        let script = format!(r#"".\{batch_file}" "{input_file}" > "{output_file}""#);
+        let output = command(Shell::Cmd, &script)
+            .current_dir(dir.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "cmd exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(fs::read(dir.path().join(output_file))?, INPUT_CONTENT);
+        Ok(())
     }
 
     #[cfg(windows)]
