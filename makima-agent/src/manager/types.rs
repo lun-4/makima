@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use makima_storage::session_state::{StoredAgentConfig, StoredAgentRecord};
+use makima_storage::session_state::{StoredAgentConfig, StoredAgentRecord, StoredAgentSpec};
 
 use crate::actor::{EffectiveAgentConfig, TranscriptRequest, TranscriptSnapshot};
 use crate::state::StateAccess;
@@ -64,6 +64,11 @@ pub struct AgentIncarnation {
     pub agent_id: AgentId,
     pub manager_generation: u64,
     pub reservation: u64,
+}
+
+pub struct SpawnRestoration {
+    pub spec: StoredAgentSpec,
+    pub restorable: Result<(), String>,
 }
 
 #[derive(Clone)]

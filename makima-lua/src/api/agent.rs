@@ -35,7 +35,7 @@ use makima_agent::config_change::{
 };
 use makima_agent::context::root_context;
 use makima_agent::headless::default_model_preparer;
-use makima_agent::manager::{AgentIncarnation, ReactivationError, ResidentAgent};
+use makima_agent::manager::{AgentIncarnation, ReactivationError, ResidentAgent, SpawnRestoration};
 use makima_agent::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use makima_agent::template::env_vars_for;
 use makima_agent::tools::interpreter_bridge;
@@ -48,10 +48,10 @@ use makima_agent::tools::{
     TurnToolBindings,
 };
 use makima_agent::{
-    Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentMode, AgentParams, AgentRef,
-    AgentRunParams, CurrentManagedTurn, Envelope, EventSender, History, HistorySnapshot,
-    McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo, ToolDoneEvent,
-    TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    Agent, AgentActorHandle, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode,
+    AgentParams, AgentRef, AgentRunParams, CurrentManagedTurn, Envelope, EventSender, History,
+    HistorySnapshot, McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo,
+    ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use makima_config::ToolKey;
 use makima_lua_macro::{lua_fn, lua_table};
@@ -1676,6 +1676,7 @@ fn spawn_session_actor(
     parent: &SessionParent,
     state: &Arc<LuaActorState>,
     initial_config: EffectiveAgentConfig,
+    restoration: SpawnRestoration,
     params: impl FnOnce(AgentId) -> AgentParams,
 ) -> Result<(AgentActorHandle, AgentRef), String> {
     let backend = || -> Box<dyn ActorBackend> {
@@ -1696,18 +1697,30 @@ fn spawn_session_actor(
         spawned_by_tool_use_id: parent.context.tool_use_id.clone(),
     };
     let child = if let Some(current) = &parent.managed_turn {
-        current.spawn_child_with_config(initial_config, metadata, Vec::new(), None, backend())
-    } else {
-        let trusted = parent.trusted.as_ref().expect("trusted spawn checked");
-        trusted.validate_target(lua, &trusted.target)?;
-        trusted.target.manager().spawn_child_trusted_with_config(
-            &trusted.target,
+        current.manager().spawn_child_with_config_and_restoration(
+            current,
             initial_config,
             metadata,
             Vec::new(),
             None,
+            Some(restoration),
             |_| Ok::<_, String>(backend()),
         )
+    } else {
+        let trusted = parent.trusted.as_ref().expect("trusted spawn checked");
+        trusted.validate_target(lua, &trusted.target)?;
+        trusted
+            .target
+            .manager()
+            .spawn_child_trusted_with_config_and_restoration(
+                &trusted.target,
+                initial_config,
+                metadata,
+                Vec::new(),
+                None,
+                Some(restoration),
+                |_| Ok::<_, String>(backend()),
+            )
     }
     .map_err(|error| error.to_string())?;
     init_params(child.id());
@@ -1908,6 +1921,7 @@ async fn build_session(
         &parent,
         &state,
         initial_config,
+        SpawnRestoration { spec, restorable },
         |agent_id| agent_params(
             &parent.context,
             agent_id,
@@ -1917,19 +1931,6 @@ async fn build_session(
         ),
     ));
     let incarnation = try_pair!(agent.manager().incarnation(agent.id()));
-    if let Err(error) = agent
-        .manager()
-        .set_agent_restoration(&incarnation, spec, restorable)
-    {
-        let _ = agent.close_subtree();
-        return Ok(err_pair(error));
-    }
-    if agent.manager().journal().has_writer()
-        && let Err(error) = agent.manager().journal().flush_spawn()
-    {
-        let _ = agent.close_subtree();
-        return Ok(err_pair(error));
-    }
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
     if !options.silent
@@ -2191,14 +2192,40 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
     if agent.manager.is_live(agent.id) {
         return Ok(());
     }
-    let guard = InvocationGuard::capture(lua)?;
+    activate_agent(lua, ctx, agent.manager.clone(), agent.id).await?;
+    handles::authorize_agent(lua, ctx, agent)?;
+    Ok(())
+}
+
+async fn activate_agent(
+    lua: &Lua,
+    ctx: &LuaCtx,
+    manager: AgentManagerHandle,
+    agent_id: AgentId,
+) -> Result<(), String> {
+    activate_agent_with_guard(
+        lua,
+        ctx,
+        manager,
+        agent_id,
+        Some(InvocationGuard::capture(lua)?),
+    )
+    .await
+}
+
+async fn activate_agent_with_guard(
+    lua: &Lua,
+    ctx: &LuaCtx,
+    manager: AgentManagerHandle,
+    agent_id: AgentId,
+    guard: Option<InvocationGuard>,
+) -> Result<(), String> {
     let activation_ctx = ctx.clone();
-    let manager = agent.manager.clone();
     let activation_manager = manager.clone();
     let activation_lua = lua.clone();
     let activation_journal = manager.journal();
     manager
-        .ensure_resident_with(agent.id, |input| async move {
+        .ensure_resident_with(agent_id, |input| async move {
             let lua = activation_lua;
             let services = crate::orchestration::services(&lua).ok_or_else(|| {
                 ReactivationError::Initialization("agent host is unavailable".into())
@@ -2228,9 +2255,11 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
             let prepared =
                 reactivation::prepare(&lua, &input.record, input.config.as_ref(), context, &view)
                     .await?;
-            guard
-                .validate(&lua)
-                .map_err(ReactivationError::Initialization)?;
+            if let Some(guard) = &guard {
+                guard
+                    .validate(&lua)
+                    .map_err(ReactivationError::Initialization)?;
+            }
             if let Some((plugin, authority)) = owner.as_ref().zip(authority.as_ref())
                 && (!authority.is_alive()
                     || !Arc::ptr_eq(
@@ -2311,12 +2340,14 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                 start: None,
                 initialize: Some(Box::new(move |initialization| {
                     Box::pin(async move {
-                        guard
-                            .validate(&lua)
-                            .map_err(ReactivationError::Initialization)?;
+                        if let Some(guard) = &guard {
+                            guard
+                                .validate(&lua)
+                                .map_err(ReactivationError::Initialization)?;
+                        }
                         initialization
                             .actor
-                            .configure_parent_delivery(state.auto_deliver && !state.silent)
+                            .configure_restored_parent_delivery(state.auto_deliver && !state.silent)
                             .map_err(|error| {
                                 ReactivationError::Initialization(error.to_string())
                             })?;
@@ -2351,9 +2382,14 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                             )?;
                             Ok(())
                         };
-                        guard
-                            .claim(authority.as_deref(), install)
-                            .map_err(ReactivationError::Initialization)?;
+                        match &guard {
+                            Some(guard) => guard.claim(authority.as_deref(), install),
+                            None => match authority.as_deref() {
+                                Some(owner) => owner.claim_effect(install),
+                                None => install(),
+                            },
+                        }
+                        .map_err(ReactivationError::Initialization)?;
                         let publication = CheckpointPublication::default();
                         let claim = activation_ctx
                             .publication_claim(&lua, &publication)
@@ -2365,11 +2401,15 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
                         let target = session.agent.clone();
                         let incarnation = session.incarnation.clone();
                         *cancel_actor.lock().unwrap() = Some(actor.clone());
-                        let cleanup = guard
-                            .claim(authority.as_deref(), || {
-                                Ok(handles::retain_session(&lua, session, owner))
-                            })
-                            .map_err(ReactivationError::Initialization)?;
+                        let retain = || Ok(handles::retain_session(&lua, session, owner));
+                        let cleanup = match &guard {
+                            Some(guard) => guard.claim(authority.as_deref(), retain),
+                            None => match authority.as_deref() {
+                                Some(owner) => owner.claim_effect(retain),
+                                None => retain(),
+                            },
+                        }
+                        .map_err(ReactivationError::Initialization)?;
                         let mut cleanup = RetainedSessionCleanup(Some(cleanup));
                         smol::spawn(relay_session_events_scoped(
                             sub_rx,
@@ -2438,8 +2478,53 @@ async fn ensure_agent_resident(lua: &Lua, ctx: &LuaCtx, agent: &LuaAgent) -> Res
         })
         .await
         .map_err(|error| error.to_string())?;
-    handles::authorize_agent(lua, ctx, agent)?;
     Ok(())
+}
+
+pub(crate) async fn wake_restored_children(lua: &Lua, root: AgentRef) {
+    let manager = root.manager();
+    let result = async {
+        let services = crate::orchestration::services(lua).ok_or("agent host is unavailable")?;
+        let template = services.template(&root)?;
+        let context = LuaCtx::handler(&template);
+        let view = manager
+            .journal()
+            .snapshot()
+            .fold()
+            .map_err(|error| error.to_string())?;
+        let mut children: Vec<_> = view
+            .agents
+            .values()
+            .filter(|record| {
+                record.parent.is_some()
+                    && view
+                        .scopes
+                        .get(&Some(record.id))
+                        .is_some_and(|scope| !scope.admitted.is_empty())
+            })
+            .collect();
+        children.sort_by_key(|record| record.depth);
+        for child in children {
+            if manager.is_live(child.id) {
+                continue;
+            }
+            tracing::info!(agent_id = %child.id, root_id = %root.id(), "activating restored child admissions");
+            match activate_agent_with_guard(lua, &context, manager.clone(), child.id, None).await {
+                Ok(()) => tracing::info!(agent_id = %child.id, "restored child admissions activated"),
+                Err(error) => {
+                    warn!(agent_id = %child.id, %error, "restored child activation failed");
+                    if let Err(error) = manager.fail_restored_turns(child.id, error).await {
+                        warn!(agent_id = %child.id, %error, "failed to terminalize restored child admissions");
+                    }
+                }
+            }
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(error) = result {
+        warn!(%error, "failed to wake restored child admissions");
+    }
 }
 
 pub(crate) fn detach_all_agents(lua: &Lua) {

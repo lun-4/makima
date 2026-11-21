@@ -1362,7 +1362,7 @@ fn gated_singleflight_preserves_identity_and_hides_uninitialized_actor(root: boo
     });
 }
 
-#[test_case(ReactivationError::ProviderUnavailable { provider: "offline".into() }; "provider")]
+#[test_case(ReactivationError::ProviderUnavailable { provider: "offline".into(), reason: "discovery failed".into() }; "provider")]
 #[test_case(ReactivationError::ToolUnavailable { tool: "missing".into() }; "tool")]
 #[test_case(ReactivationError::McpUnavailable { server: "offline".into() }; "mcp")]
 fn typed_factory_failure_preserves_exact_checkpoint_and_allows_retry(failure: ReactivationError) {
@@ -1575,13 +1575,11 @@ enum InvalidGraph {
     MissingParent,
     Cycle,
     Depth,
-    Pending,
 }
 
 #[test_case(InvalidGraph::MissingParent; "missing_parent")]
 #[test_case(InvalidGraph::Cycle; "parent_cycle")]
 #[test_case(InvalidGraph::Depth; "invalid_depth")]
-#[test_case(InvalidGraph::Pending; "pending_admission")]
 fn rejects_invalid_coherent_checkpoint_without_mutation(invalid: InvalidGraph) {
     let mut records = records();
     match invalid {
@@ -1591,24 +1589,8 @@ fn rejects_invalid_coherent_checkpoint_without_mutation(invalid: InvalidGraph) {
             records[2].parent = Some(records[1].id);
         }
         InvalidGraph::Depth => records[1].depth += 1,
-        InvalidGraph::Pending => {}
     }
     let journal = journal(&records);
-    if matches!(invalid, InvalidGraph::Pending) {
-        journal
-            .commit(JournalCommit {
-                changes: vec![JournalChange {
-                    agent: Some(records[1].id),
-                    generation: 0,
-                    change: StateChange::Admitted {
-                        turn: TurnId::generate(),
-                        origin: StoredTurnOrigin::User,
-                    },
-                }],
-                ..Default::default()
-            })
-            .unwrap();
-    }
     let before = journal.checkpoint_snapshot().unwrap();
     assert!(matches!(
         restore(&journal, AgentLimits::default()),
@@ -2322,4 +2304,157 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
                 .is_empty()
         );
     });
+}
+
+struct ContinuationBackend;
+
+impl ActorBackend for ContinuationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        input: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            assert!(input.message.is_empty());
+            assert!(input.images.is_empty());
+            assert!(input.preamble.is_empty());
+            assert_eq!(
+                history.snapshot().messages.as_slice(),
+                &[Message::user(HISTORY_TEXT.into())]
+            );
+            assert_eq!(context.provenance.origin, crate::actor::TurnOrigin::User);
+            BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                TokenUsage::default(),
+                0,
+                crate::DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+#[test_case(false; "root")]
+#[test_case(true; "child")]
+fn restored_admission_continues_original_turn_without_duplicate_input(child: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[usize::from(child)].id;
+        let journal = journal(&records);
+        let turns = [TurnId::generate(), TurnId::generate()];
+        journal
+            .commit(JournalCommit {
+                changes: turns
+                    .iter()
+                    .map(|turn| JournalChange {
+                        agent: Some(id),
+                        generation: 0,
+                        change: StateChange::Admitted {
+                            turn: *turn,
+                            origin: StoredTurnOrigin::User,
+                        },
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert_eq!(manager.pending_continuation_count().unwrap(), turns.len());
+        assert_eq!(manager.pending_continuation_agents().unwrap(), vec![id]);
+        let (release, ready) = flume::bounded(1);
+        manager
+            .ensure_resident_with(id, |_| async {
+                Ok(ResidentAgent {
+                    start: Some(ready),
+                    backend: Box::new(ContinuationBackend),
+                    initialize: Some(Box::new(|initialization| {
+                        Box::pin(async move {
+                            initialization
+                                .actor
+                                .configure_restored_parent_delivery(false)
+                                .map_err(|error| {
+                                    ReactivationError::Initialization(error.to_string())
+                                })
+                        })
+                    })),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        let actor = manager.actor(id).unwrap();
+        let tickets: Vec<_> = turns
+            .iter()
+            .map(|turn| actor.turn_ticket(*turn).unwrap())
+            .collect();
+        release.send(()).unwrap();
+        for ticket in tickets {
+            let outcome = ticket.wait().await;
+            assert!(matches!(outcome, crate::TurnOutcome::Completed { .. }));
+        }
+        assert_eq!(manager.pending_continuation_count().unwrap(), 0);
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn root_continuation_suppression_preserves_children_and_survives_restart() {
+    let records = records();
+    let journal = journal(&records);
+    let root = records[0].id;
+    let child = records[1].id;
+    journal
+        .commit(JournalCommit {
+            changes: [root, child]
+                .into_iter()
+                .map(|agent| JournalChange {
+                    agent: Some(agent),
+                    generation: 0,
+                    change: StateChange::Admitted {
+                        turn: TurnId::generate(),
+                        origin: StoredTurnOrigin::User,
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.suppress_root_continuations().unwrap(), 1);
+    assert_eq!(manager.suppress_root_continuations().unwrap(), 0);
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.pending_continuation_count().unwrap(), 1);
+    assert_eq!(manager.pending_continuation_agents().unwrap(), vec![child]);
+    assert!(
+        journal.snapshot().fold().unwrap().scopes[&Some(root)]
+            .admitted
+            .is_empty()
+    );
 }

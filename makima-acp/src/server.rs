@@ -614,7 +614,7 @@ async fn load_session(
     )
     .map_err(|error| session_registration_error(error.to_string()))?
     {
-        warn!(%warning, "legacy mode restoration fell back to build");
+        warn!(%warning, "legacy mode restoration fell back to read-only");
     }
     let checkpoint = Arc::new(
         SessionWriter::open_session(&directory, &restored.seed)
@@ -698,6 +698,25 @@ async fn load_session(
     let persisted_options = recovered_config
         .map(|config| &config.options)
         .unwrap_or(&restored.meta.session_options);
+    let mut continuation_count = recovered_state
+        .scopes
+        .values()
+        .map(|scope| scope.admitted.len())
+        .sum::<usize>();
+    if let (Some(config), Some(root)) = (recovered_config, root_id) {
+        let restored_mode = makima_agent::plan_state::prepare_restore_for_agent(
+            &recovered_state,
+            root,
+            &config.mode,
+            &srv.lua_event_handle.mode_registry(),
+        )
+        .map_err(|error| session_registration_error(error.to_string()))?;
+        if makima_agent::modes::is_read_only_fallback(&restored_mode.mode) {
+            continuation_count -= recovered_state.scopes[&Some(root)].admitted.len();
+        }
+    }
+    let continuation_notice =
+        makima_agent::session_recovery::continuation_notice(continuation_count);
     let replay_history = Arc::clone(&history_snapshot.messages);
     let (handle, root_target) = spawn_session_with_checkpoint(
         params,
@@ -744,6 +763,13 @@ async fn load_session(
     .map_err(session_registration_error)?;
     let mode = finalize_session(srv).await?;
     if let Some(session) = &srv.session {
+        if let Some(message) = &continuation_notice {
+            session_update(
+                &srv.out_tx,
+                &sid,
+                translate::text_delta(&format!("{message}\n")),
+            );
+        }
         srv.lua_event_handle
             .notify_state_restored(session.command_root.target.clone());
     }
@@ -971,8 +997,8 @@ async fn close_session(srv: &mut Server) {
     for request_id in operations.iter().flat_map(PendingOperation::requests) {
         respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
     }
+    state.handle.manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
     answer_cancelled_requests(&state.handle, permission_answers, elicitation);
-    state.handle.manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
     state.handle.manager.journal().invalidate_state_access();
     state.handle.task.cancel().await;
     if let Some(coordinator) = state.coordinator.take()
@@ -3635,7 +3661,10 @@ mod tests {
     }
 
     #[test]
-    fn acp_load_interrupts_root_and_child_once_without_reissuing_work() {
+    fn acp_load_retains_opted_out_recovery_results_without_reissuing_work() {
+        use makima_agent::session_recovery::RecoveryCandidate;
+
+        const CONTINUATION_DISABLED: &str = "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             let storage = StateDir::from_path(tmp.path().to_path_buf());
@@ -3683,6 +3712,24 @@ mod tests {
             session.meta.input_draft = Some(PARKED_THOUGHT.into());
             session.meta.queued_messages.push(PARKED_REPLY.into());
             session.save(&storage).unwrap();
+            let writer = SessionWriter::open_session(
+                &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                &session,
+            )
+            .unwrap();
+            RecoveryCandidate::prepare_with_continuation(session.clone(), false)
+                .unwrap()
+                .publish(
+                    &writer,
+                    Default::default(),
+                    Arc::new(|publication| {
+                        assert!(publication.try_publish());
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            drop(writer);
             let path = storage
                 .path()
                 .join(SESSIONS_DIR)
@@ -3717,13 +3764,20 @@ mod tests {
                 assert_eq!(child.snapshot().unwrap().residency, AgentResidency::Dormant);
                 for (agent, turn) in [(&root, root_turn), (&child, child_turn)] {
                     let result = agent.turn_ticket(turn).unwrap().wait_result().await;
-                    assert!(matches!(
-                        result.outcome,
-                        TurnOutcome::Cancelled {
-                            reason: TurnCancellationReason::Interrupted,
-                            ..
-                        }
-                    ));
+                    if agent.id() == root_id {
+                        assert!(matches!(
+                            result.outcome,
+                            TurnOutcome::Cancelled {
+                                reason: TurnCancellationReason::Interrupted,
+                                ..
+                            }
+                        ));
+                    } else {
+                        assert!(
+                            matches!(result.outcome, TurnOutcome::Failed { ref failure, .. }
+                            if failure.diagnostic == CONTINUATION_DISABLED && !failure.retryable)
+                        );
+                    }
                 }
                 let probe = root.actor().unwrap().runtime_barrier().await.unwrap();
                 assert!(probe.is_quiescent());
@@ -3743,9 +3797,22 @@ mod tests {
                     .collect();
                 assert_eq!(terminal.len(), 2);
                 for record in &terminal {
-                    assert!(
-                        matches!(&record.change, StateChange::Turn { result, .. } if matches!(result.outcome.status, StoredTurnStatus::Cancelled { reason: StoredCancellationReason::Interrupted }))
-                    );
+                    let StateChange::Turn { result, .. } = &record.change else {
+                        unreachable!()
+                    };
+                    if result.outcome.agent_id == root_id {
+                        assert!(matches!(
+                            result.outcome.status,
+                            StoredTurnStatus::Cancelled {
+                                reason: StoredCancellationReason::Interrupted
+                            }
+                        ));
+                    } else {
+                        assert!(
+                            matches!(&result.outcome.status, StoredTurnStatus::Failed { failure }
+                            if failure.diagnostic == CONTINUATION_DISABLED && !failure.retryable)
+                        );
+                    }
                 }
                 if let Some(first) = &first_results {
                     assert_eq!(first, &terminal);

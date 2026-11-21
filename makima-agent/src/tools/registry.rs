@@ -254,6 +254,10 @@ pub trait Tool: Send + Sync + 'static {
     fn required_permission(&self) -> Option<Permission> {
         None
     }
+    /// Stateless calls may be executed again after a process restart.
+    fn resumable(&self) -> bool {
+        false
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 

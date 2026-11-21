@@ -690,6 +690,7 @@ struct SdkRuntime {
     shared: Arc<Mutex<Shared>>,
     init: Value,
     resumed: bool,
+    continuation_notice: Option<String>,
     usage_seed: (TokenUsage, HashMap<String, StoredTokenUsage>),
     tasks: Mutex<Vec<smol::Task<()>>>,
     discovery: Mutex<Option<Discovery>>,
@@ -770,6 +771,28 @@ impl SdkRuntime {
         restored.meta = recovered.session().meta.clone();
         restored.model = Some(recovered.session().model.clone());
         let recovered_state = recovered.session().latest_state()?;
+        let mut continuation_count = recovered_state
+            .scopes
+            .values()
+            .map(|scope| scope.admitted.len())
+            .sum::<usize>();
+        if let Some(stored) = recovered_state
+            .scopes
+            .get(&Some(root_id))
+            .and_then(|scope| scope.config.as_ref())
+        {
+            let restored_mode = makima_agent::plan_state::prepare_restore_for_agent(
+                &recovered_state,
+                root_id,
+                &stored.mode,
+                &lua_handle.mode_registry(),
+            )?;
+            if makima_agent::modes::is_read_only_fallback(&restored_mode.mode) {
+                continuation_count -= recovered_state.scopes[&Some(root_id)].admitted.len();
+            }
+        }
+        let continuation_notice =
+            makima_agent::session_recovery::continuation_notice(continuation_count);
         let recovered_config = recovered_state
             .scopes
             .get(&Some(root_id))
@@ -1032,6 +1055,7 @@ impl SdkRuntime {
                 })),
                 init,
                 resumed,
+                continuation_notice,
                 tasks: Mutex::new(Vec::new()),
                 discovery: Mutex::new(None),
             }))
@@ -1057,6 +1081,13 @@ impl SdkRuntime {
         );
         observer.install(self.root.target.clone());
         if self.resumed {
+            if let Some(message) = &self.continuation_notice
+                && let Err(error) = self
+                    .writer
+                    .emit_system("warning", serde_json::json!({ "message": message }))
+            {
+                warn!(%error, "failed to emit continuation notice");
+            }
             params
                 .lua_handle
                 .notify_state_restored(self.root.target.clone());
@@ -1105,7 +1136,7 @@ impl SdkRuntime {
 
     async fn close(&self) -> Result<()> {
         self.discovery.lock().unwrap().take();
-        self.handle.manager.shutdown(SDK_SHUTDOWN_TIMEOUT).await;
+        self.handle.manager.suspend(SDK_SHUTDOWN_TIMEOUT).await;
         let closed = if SessionCoordinatorHandle::resolve(self.handle.session_id.id()).is_ok() {
             self.coordinator.close().await
         } else {
@@ -1801,7 +1832,7 @@ async fn recover_sdk_session(
         && let Some(warning) =
             makima_agent::session_recovery::resolve_legacy_mode(&mut seed, modes, storage)?
     {
-        warn!(%warning, "legacy mode restoration fell back to build");
+        warn!(%warning, "legacy mode restoration fell back to read-only");
     }
     if !restore_legacy && restored.parent.is_some() {
         seed.set_parent(restored.parent.clone());
@@ -4369,12 +4400,15 @@ mod tests {
     }
 
     #[test]
-    fn sdk_resume_interrupts_root_and_child_once_without_reissuing_work() {
+    fn sdk_resume_retains_opted_out_recovery_results_without_reissuing_work() {
+        use makima_agent::session_recovery::RecoveryCandidate;
+
         use clap::Parser;
         use makima_agent::TurnCancellationReason;
         use makima_agent::manager::AgentResidency;
         use makima_storage::session_state::{StateChange, StoredStateRecord, StoredTurnOrigin};
 
+        const CONTINUATION_DISABLED: &str = "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
         smol::block_on(async {
             let tmp = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(tmp.path().to_path_buf());
@@ -4411,6 +4445,24 @@ mod tests {
             session.meta.input_draft = Some(SDK_ROOT_PROMPT.into());
             session.meta.queued_messages.push(SDK_CHILD_PROMPT.into());
             session.save(&storage).unwrap();
+            let writer = SessionWriter::open_session(
+                &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
+                &session,
+            )
+            .unwrap();
+            RecoveryCandidate::prepare_with_continuation(session.clone(), false)
+                .unwrap()
+                .publish(
+                    &writer,
+                    Default::default(),
+                    Arc::new(|publication| {
+                        assert!(publication.try_publish());
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            drop(writer);
             let id = session.id;
             let mut first_state = None;
             for _ in 0..2 {
@@ -4470,13 +4522,20 @@ mod tests {
                 assert_eq!(child.snapshot().unwrap().residency, AgentResidency::Dormant);
                 for (agent, turn) in [(&root, root_turn), (&child, child_turn)] {
                     let result = agent.turn_ticket(turn).unwrap().wait_result().await;
-                    assert!(matches!(
-                        result.outcome,
-                        TurnOutcome::Cancelled {
-                            reason: TurnCancellationReason::Interrupted,
-                            ..
-                        }
-                    ));
+                    if agent.id() == root_id {
+                        assert!(matches!(
+                            result.outcome,
+                            TurnOutcome::Cancelled {
+                                reason: TurnCancellationReason::Interrupted,
+                                ..
+                            }
+                        ));
+                    } else {
+                        assert!(
+                            matches!(result.outcome, TurnOutcome::Failed { ref failure, .. }
+                            if failure.diagnostic == CONTINUATION_DISABLED && !failure.retryable)
+                        );
+                    }
                 }
                 let snapshot = handle.manager.journal().snapshot();
                 assert_eq!(

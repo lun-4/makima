@@ -351,13 +351,17 @@ pub(crate) struct AgentHandles {
     cwd: Arc<ArcSwap<PathBuf>>,
     pub(crate) offload: Option<Arc<OffloadStore>>,
     pub(crate) orchestration_template: makima_agent::tools::ToolContext,
-    subagent_cancels: Arc<CancelMap<String>>,
     manager: AgentManagerHandle,
     root_id: makima_agent::AgentId,
     runner_start: Option<flume::Sender<()>>,
 }
 
 impl AgentHandles {
+    #[cfg(test)]
+    pub(crate) fn runner_start_is_pending(&self) -> bool {
+        self.runner_start.is_some()
+    }
+
     pub(crate) fn release_runner(&mut self) {
         if let Some(start) = self.runner_start.take() {
             let _ = start.send(());
@@ -507,6 +511,11 @@ impl AgentHandles {
                     snapshot.histories,
                 )
                 .map_err(|error| error.to_string())?;
+                if makima_agent::modes::is_read_only_fallback(&initial_config.mode) {
+                    manager
+                        .suppress_root_continuations()
+                        .map_err(|error| error.to_string())?;
+                }
                 let mut prepared = spawn_agent_internal(
                     &model_slot,
                     initial_config,
@@ -584,10 +593,9 @@ impl AgentHandles {
     fn shutdown_actor(&self) {
         let manager = self.manager.clone();
         smol::spawn(async move {
-            let _ = manager.shutdown(Duration::from_secs(3)).await;
+            let _ = manager.suspend(Duration::from_secs(3)).await;
         })
         .detach();
-        self.subagent_cancels.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -614,10 +622,7 @@ impl AgentHandles {
     }
 
     pub(crate) fn shutdown(self) -> smol::Task<()> {
-        self.subagent_cancels.cancel_all();
-        smol::spawn(async move {
-            let _ = self.manager.shutdown(Duration::from_secs(3)).await;
-        })
+        self.suspend()
     }
 }
 
@@ -770,15 +775,6 @@ fn spawn_agent_internal(
     .map_err(|error| error.to_string())?;
     let root_id = root.id();
     let actor = Arc::new(root.actor().expect("committed root actor"));
-    if restored {
-        smol::block_on(
-            actor
-                .reserve_prepared_operation(None)
-                .map_err(|error| error.to_string())?
-                .commit_when_ready(None),
-        )
-        .map_err(|error| error.to_string())?;
-    }
     let queue_tx = actor_queue(Arc::clone(&actor));
 
     spawn_command_router(
@@ -805,7 +801,6 @@ fn spawn_agent_internal(
             offload,
             orchestration_template: orchestration_template
                 .expect("root factory prepares orchestration template"),
-            subagent_cancels,
             manager,
             root_id,
             runner_start: Some(runner_start),
@@ -919,6 +914,35 @@ mod tests {
             Arc::default(),
             SystemPromptOverride::default(),
         )
+    }
+
+    #[test]
+    fn shutdown_preserves_admitted_turn_for_restart() {
+        const INPUT: &str = "unfinished work";
+        let handles = stub_spawn(Vec::new());
+        let (manager, root) = handles.manager_and_root();
+        let actor = manager.actor(root).unwrap();
+        let idle = actor.prepare_idle().unwrap();
+        actor
+            .admit_turn(
+                makima_agent::AgentInput::new(INPUT.into(), vec![]),
+                None,
+                String::new(),
+            )
+            .unwrap();
+        let before = manager.journal().snapshot().fold().unwrap();
+        assert!(!before.scopes[&Some(root)].admitted.is_empty());
+        smol::block_on(handles.shutdown());
+        let after = manager.journal().snapshot().fold().unwrap();
+        assert_eq!(
+            after.scopes[&Some(root)].admitted,
+            before.scopes[&Some(root)].admitted
+        );
+        assert_eq!(
+            after.scopes[&Some(root)].results,
+            before.scopes[&Some(root)].results
+        );
+        drop(idle);
     }
 
     /// Instance generations come from a process-wide counter (sessions each

@@ -20,7 +20,7 @@ use makima_storage::sessions::{SessionMeta, StoredMode};
 use crate::AgentMode;
 use crate::prompt::PLAN_PROMPT;
 
-const RESTORE_BUILD_FALLBACK: &str = "Resuming in Build mode.";
+const READ_ONLY_MODE: &str = "recovery_read_only";
 const PLAN_NOT_REGULAR: &str = "plan path is not a regular file";
 
 /// Identity of an agent mode. Custom modes are keyed by a snake_case name.
@@ -173,22 +173,42 @@ pub struct RestoredMode {
     pub warning: Option<String>,
 }
 
+pub fn read_only_fallback(error: impl std::fmt::Display) -> RestoredMode {
+    let id = ModeId::Custom(READ_ONLY_MODE.into());
+    RestoredMode {
+        mode: AgentMode::Custom(id.clone()),
+        definition: ModeDef {
+            id,
+            label: "[READ ONLY]".into(),
+            system_prompt: None,
+            restrict_write_to: None,
+            tools: Some(Vec::new()),
+        },
+        warning: Some(format!(
+            "Could not restore the saved mode: {error}. Resumed in read-only mode; waiting for user input."
+        )),
+    }
+}
+
+pub fn is_read_only_fallback(mode: &AgentMode) -> bool {
+    matches!(mode, AgentMode::Custom(ModeId::Custom(id)) if id.as_ref() == READ_ONLY_MODE)
+}
+
 pub fn prepare_restore(
     snapshot: &StoredModeSnapshot,
-    registry: &ModeRegistry,
+    _registry: &ModeRegistry,
 ) -> Result<RestoredMode, ModeError> {
-    let (mode, definition) = from_snapshot(snapshot)?;
+    let (mode, definition) = match from_snapshot(snapshot) {
+        Ok(restored) => restored,
+        Err(error) => return Ok(read_only_fallback(error)),
+    };
     if let Some(path) = mode.plan_path()
         && let Err(error) = prepare_plan_file(path)
     {
-        return Ok(RestoredMode {
-            mode: AgentMode::Build,
-            definition: registry.current(&AgentMode::Build),
-            warning: Some(format!(
-                "Cannot restore plan file {}: {error}. {RESTORE_BUILD_FALLBACK}",
-                path.display()
-            )),
-        });
+        return Ok(read_only_fallback(format!(
+            "Cannot restore plan file {}: {error}",
+            path.display()
+        )));
     }
     Ok(RestoredMode {
         mode,
@@ -605,7 +625,7 @@ mod tests {
 
     #[test_case(false; "parent_is_file")]
     #[test_case(true; "plan_is_directory")]
-    fn prepare_restore_falls_back_to_resolved_build_when_plan_unusable(directory_at_plan: bool) {
+    fn prepare_restore_falls_back_to_read_only_when_plan_unusable(directory_at_plan: bool) {
         let directory = tempfile::tempdir().unwrap();
         let blocked = directory.path().join("blocked");
         let path = if directory_at_plan {
@@ -628,11 +648,20 @@ mod tests {
             })
             .unwrap();
         let restored = prepare_restore(&snapshot, &registry).unwrap();
-        assert_eq!(restored.mode, AgentMode::Build);
-        assert_eq!(restored.definition, registry.current(&AgentMode::Build));
+        assert!(is_read_only_fallback(&restored.mode));
+        assert_eq!(restored.definition.tools, Some(Vec::new()));
         let warning = restored.warning.unwrap();
         assert!(warning.contains(path.to_str().unwrap()));
-        assert!(warning.contains(RESTORE_BUILD_FALLBACK));
+        assert_eq!(
+            warning,
+            read_only_fallback(format!(
+                "Cannot restore plan file {}: {}",
+                path.display(),
+                prepare_plan_file(&path).unwrap_err()
+            ))
+            .warning
+            .unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -645,7 +674,7 @@ mod tests {
         make_fifo(&path).unwrap();
         let snapshot = ModeDef::default_for(ModeId::Plan).stored_snapshot(&AgentMode::Plan(path));
         let restored = prepare_restore(&snapshot, &reg()).unwrap();
-        assert_eq!(restored.mode, AgentMode::Build);
+        assert!(is_read_only_fallback(&restored.mode));
         assert!(restored.warning.is_some());
     }
 
@@ -665,13 +694,13 @@ mod tests {
         assert_eq!(restored.mode, AgentMode::Custom(definition.id.clone()));
         assert_eq!(restored.definition, definition);
         assert_eq!(restored.warning, None);
-        assert!(matches!(
-            prepare_restore(
-                &StoredModeSnapshot::from(&ModeDef::default_for(ModeId::Plan)),
-                &reg()
-            ),
-            Err(ModeError::MissingPlanPath)
-        ));
+        let missing = prepare_restore(
+            &StoredModeSnapshot::from(&ModeDef::default_for(ModeId::Plan)),
+            &reg(),
+        )
+        .unwrap();
+        assert!(is_read_only_fallback(&missing.mode));
+        assert_eq!(missing.definition.tools, Some(Vec::new()));
     }
 
     #[test]

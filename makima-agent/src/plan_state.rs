@@ -1,9 +1,9 @@
 use crate::AgentRef;
+use crate::ModeRegistry;
 use crate::modes::{self, ModeError, ModeId, RestoredMode};
 use crate::state::{
     StateAccess, StateEdit, StateError, StateRevision, StateScope, StateSlot, StateSlotSpec,
 };
-use crate::{AgentMode, ModeRegistry};
 use makima_domain::ModelSelection;
 use makima_storage::session_state::StoredModeSnapshot;
 #[cfg(not(unix))]
@@ -471,13 +471,9 @@ fn prepare_restore_for_agent_with(
         project(entry)
     });
     if let Err(error) = projection {
-        return Ok(RestoredMode {
-            mode: AgentMode::Build,
-            definition: registry.current(&AgentMode::Build),
-            warning: Some(format!(
-                "Cannot restore plan file: {error}. Resuming in Build mode"
-            )),
-        });
+        return Ok(modes::read_only_fallback(format!(
+            "Cannot restore plan file: {error}"
+        )));
     }
     let mut snapshot = snapshot.clone();
     if snapshot.id == ModeId::Plan.key()
@@ -486,13 +482,9 @@ fn prepare_restore_for_agent_with(
         match resolved_plan_path(view, agent, path) {
             Ok(path) => snapshot.restrict_write_to = Some(path),
             Err(error) => {
-                return Ok(RestoredMode {
-                    mode: AgentMode::Build,
-                    definition: registry.current(&AgentMode::Build),
-                    warning: Some(format!(
-                        "Cannot restore plan file: {error}. Resuming in Build mode"
-                    )),
-                });
+                return Ok(modes::read_only_fallback(format!(
+                    "Cannot restore plan file: {error}"
+                )));
             }
         }
     }
@@ -668,7 +660,7 @@ mod tests {
         let restored =
             super::prepare_restore_for_agent(&view, agent, &mode, &crate::ModeRegistry::builtin())
                 .unwrap();
-        assert_eq!(restored.mode, crate::AgentMode::Build);
+        assert!(crate::modes::is_read_only_fallback(&restored.mode));
         assert!(restored.warning.is_some());
         assert_eq!(fs::read_to_string(&path).unwrap(), MUTATED_CONTENT);
         assert!(!other.exists());
@@ -699,7 +691,7 @@ mod tests {
         let restored =
             super::prepare_restore_for_agent(&view, agent, mode, &crate::ModeRegistry::builtin())
                 .unwrap();
-        assert_eq!(restored.mode, crate::AgentMode::Build);
+        assert!(crate::modes::is_read_only_fallback(&restored.mode));
         assert!(restored.warning.is_some());
         assert_eq!(fs::read_to_string(sentinel).unwrap(), MUTATED_CONTENT);
     }
@@ -761,7 +753,7 @@ mod tests {
         let restored =
             super::prepare_restore_for_agent(&view, AgentId::generate(), &snapshot, &registry)
                 .unwrap();
-        assert_eq!(restored.mode, crate::AgentMode::Build);
+        assert_eq!(crate::modes::is_read_only_fallback(&restored.mode), !build);
         assert_eq!(restored.warning.is_some(), !build);
     }
 
@@ -810,7 +802,7 @@ mod tests {
         let snapshot = registry.current(&mode).stored_snapshot(&mode);
         let before = view.clone();
         let restored = super::prepare_restore_for_agent(&view, root, &snapshot, &registry).unwrap();
-        assert_eq!(restored.mode, crate::AgentMode::Build);
+        assert!(crate::modes::is_read_only_fallback(&restored.mode));
         assert!(restored.warning.is_some());
         assert_eq!(fs::read_to_string(path).unwrap(), MUTATED_CONTENT);
         assert_eq!(view, before);
@@ -895,7 +887,7 @@ mod tests {
             assert_eq!(fs::read_to_string(&absolute).unwrap(), APPROVED_CONTENT);
             assert!(restored.warning.is_none());
         } else {
-            assert_eq!(restored.mode, crate::AgentMode::Build);
+            assert!(crate::modes::is_read_only_fallback(&restored.mode));
             assert!(restored.warning.is_some());
             assert!(!absolute.exists());
         }
@@ -905,7 +897,7 @@ mod tests {
     #[cfg(unix)]
     #[test_case(false; "substituted_plan_symlink")]
     #[test_case(true; "substituted_ancestor_symlink")]
-    fn symlink_substitution_returns_build_without_overwriting_unrelated_file(ancestor: bool) {
+    fn symlink_substitution_returns_read_only_without_overwriting_unrelated_file(ancestor: bool) {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
         let base = directory.path().canonicalize().unwrap();
@@ -958,7 +950,7 @@ mod tests {
         };
         let before = view.clone();
         let restored = super::prepare_restore_for_agent(&view, root, &snapshot, &registry).unwrap();
-        assert_eq!(restored.mode, crate::AgentMode::Build);
+        assert!(crate::modes::is_read_only_fallback(&restored.mode));
         assert!(restored.warning.is_some());
         assert_eq!(fs::read_to_string(sentinel).unwrap(), MUTATED_CONTENT);
         assert_eq!(view, before);

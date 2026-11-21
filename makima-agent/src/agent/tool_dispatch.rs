@@ -1202,6 +1202,30 @@ pub(super) async fn process_tool_calls(
             message: error.to_string(),
         })?;
 
+    execute_tool_calls(tool_uses, false, recent_calls, history, event_tx, ctx).await
+}
+
+pub(super) async fn resume_tool_calls(
+    recent_calls: &mut RecentCalls,
+    history: ActorHistory<'_>,
+    event_tx: &crate::EventSender,
+    ctx: &ToolContext,
+) -> Result<(), AgentError> {
+    let calls = super::history::pending_tool_calls(history.as_slice());
+    if calls.is_empty() {
+        return Ok(());
+    }
+    execute_tool_calls(calls, true, recent_calls, history, event_tx, ctx).await
+}
+
+async fn execute_tool_calls(
+    tool_uses: Vec<(String, String, Value)>,
+    restarting: bool,
+    recent_calls: &mut RecentCalls,
+    mut history: ActorHistory<'_>,
+    event_tx: &crate::EventSender,
+    ctx: &ToolContext,
+) -> Result<(), AgentError> {
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
@@ -1212,7 +1236,14 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        if restarting
+            && !matches!(resolve(ctx, &name).route, Route::Native(ref entry) if entry.tool.resumable())
+        {
+            immediate_errors.push(ToolDoneEvent::error(
+                id.clone(),
+                super::history::RESTART_TOOL_INTERRUPTION,
+            ));
+        } else if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
@@ -1663,6 +1694,100 @@ mod tests {
     /// Its permission scope, its write target and its output are all its
     /// input, which is how a test sees the input each stage of dispatch got.
     struct HookMock(Option<Permission>);
+
+    struct RestartTool(bool);
+
+    impl Tool for RestartTool {
+        fn name(&self) -> &str {
+            HOOK_TOOL_NAME
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "restart probe".into()
+        }
+
+        fn schema(&self) -> Value {
+            HookMock(None).schema()
+        }
+
+        fn resumable(&self) -> bool {
+            self.0
+        }
+
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            HookMock(None).parse(input)
+        }
+    }
+
+    #[test_case(false; "nonresumable_is_interrupted")]
+    #[test_case(true; "resumable_runs_again")]
+    fn restart_dispatch_preserves_call_and_completed_results(resumable: bool) {
+        use makima_providers::{ContentBlock, Message, Role};
+
+        smol::block_on(async {
+            const FINISHED_ID: &str = "finished";
+            const FINISHED_OUTPUT: &str = "already done";
+            let (tx, _rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(tx);
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.event_tx = event_tx.clone();
+            ctx.registry = Arc::new(ToolRegistry::new());
+            ctx.registry
+                .register(
+                    Arc::new(RestartTool(resumable)),
+                    ToolSource::Lua {
+                        plugin: Arc::from(TEST_PLUGIN),
+                    },
+                )
+                .unwrap();
+            pin(&mut ctx);
+            let assistant = Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use(TEST_ID, HOOK_TOOL_NAME, call_input(HOOK_PLAIN)),
+                    ContentBlock::tool_use(FINISHED_ID, HOOK_TOOL_NAME, call_input(HOOK_DENIED)),
+                ],
+                ..Default::default()
+            };
+            let completed = Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: FINISHED_ID.into(),
+                    content: FINISHED_OUTPUT.into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![assistant.clone(), completed.clone()]);
+            resume_tool_calls(
+                &mut RecentCalls::new(),
+                ActorHistory::new(&mut history),
+                &event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.len(), 3);
+            assert_eq!(history.as_slice()[0], assistant);
+            assert_eq!(history.as_slice()[1], completed);
+            let results = &history.as_slice()[2].content;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0], ContentBlock::ToolResult { tool_use_id, content, is_error }
+                if tool_use_id == TEST_ID && *is_error != resumable
+                    && content == &if resumable { ran(HOOK_PLAIN) } else { super::super::history::RESTART_TOOL_INTERRUPTION.into() })
+            );
+            resume_tool_calls(
+                &mut RecentCalls::new(),
+                ActorHistory::new(&mut history),
+                &event_tx,
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.len(), 3);
+        });
+    }
 
     struct HookMockInvocation(String);
 

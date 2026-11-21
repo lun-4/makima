@@ -31,12 +31,13 @@ use makima_agent::config_change::{
 };
 use makima_agent::context::root_context;
 use makima_agent::end_conversation_detached;
-use makima_agent::headless::{checkpoint_startup_config, default_model_preparer};
-use makima_agent::journal::SessionJournalSnapshot;
+use makima_agent::headless::default_model_preparer;
+use makima_agent::journal::{JournalChange, JournalCommit, SessionJournalSnapshot};
 use makima_agent::manager::AgentResidency;
 #[cfg(test)]
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
+use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions, canonical_directory, publication_claim,
@@ -78,6 +79,7 @@ use makima_storage::StorageError;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
+use makima_storage::session_state::StateChange;
 use makima_storage::sessions::{SESSIONS_DIR, SessionError, SessionRecord, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
@@ -761,11 +763,30 @@ fn checkpoint_runtime_config(
     coordinator: &SessionCoordinatorHandle,
 ) -> Result<(), ConfigChangeError> {
     let (manager, root) = handles.manager_and_root();
-    let target = manager.lookup(root)?;
-    smol::block_on(async {
-        checkpoint_startup_config(&target, coordinator).await?;
-        manager.journal().flush().await
-    })
+    let actor = manager.actor(root)?;
+    let commit = actor
+        .config_snapshot()
+        .ok_or_else(|| ConfigChangeError::from("root configuration is unavailable".to_owned()))?;
+    let history = handles.history.load_full().as_ref().clone();
+    let config = stored_agent_config(&commit.config, coordinator.read().options().config_values())
+        .map_err(|error| ConfigChangeError::from(error.to_string()))?;
+    coordinator
+        .permissions()?
+        .commit_startup(JournalCommit {
+            changes: vec![JournalChange {
+                agent: Some(root),
+                generation: commit.generation,
+                change: StateChange::Config(config),
+            }],
+            histories: [(root, history.clone())].into(),
+            managed_histories: [root].into(),
+            ..Default::default()
+        })
+        .map_err(|error| ConfigChangeError::from(error.to_string()))?;
+    smol::block_on(bounded_session_op(
+        manager.journal().flush(),
+        SESSION_OP_TIMEOUT,
+    ))
     .map_err(ConfigChangeError::from)
 }
 
@@ -906,12 +927,19 @@ impl PreparedSessionRuntime {
         checkpoint.bind_publication_guard(Some(_guard.clone()));
         let initialized_before_publication = recovery.is_none();
         let initialized = if let Some(recovery) = recovery {
-            smol::block_on(recovery.publish(
-                &checkpoint,
-                CheckpointPublication::default(),
-                publication_claim(),
+            smol::block_on(bounded_session_op(
+                async {
+                    recovery
+                        .publish(
+                            &checkpoint,
+                            CheckpointPublication::default(),
+                            publication_claim(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                SESSION_OP_TIMEOUT,
             ))
-            .map_err(|error| error.to_string())
             .and_then(|recovered| handles.initialize(recovered))
         } else {
             Ok(())
@@ -1021,14 +1049,20 @@ impl PreparedSessionRuntime {
         let same_session = app.session_id() == current.id();
         let initialized_before_publication = recovery.is_none();
         if let Some(recovery) = recovery {
-            let recovered = smol::block_on(recovery.publish(
-                &checkpoint,
-                CheckpointPublication::default(),
-                publication_claim(),
+            let recovered = smol::block_on(bounded_session_op(
+                async {
+                    recovery
+                        .publish(
+                            &checkpoint,
+                            CheckpointPublication::default(),
+                            publication_claim(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                SESSION_OP_TIMEOUT,
             ));
-            let initialized = recovered
-                .map_err(|error| error.to_string())
-                .and_then(|recovered| handles.initialize(recovered));
+            let initialized = recovered.and_then(|recovered| handles.initialize(recovered));
             if let Err(error) = initialized {
                 return Err((error.into(), session_lock));
             }
@@ -1278,6 +1312,11 @@ impl SessionRuntime {
         if std::mem::take(&mut self.restore_pending) {
             self.app.restore_resumed_session();
             let (manager, root) = self.handles.manager_and_root();
+            if let Ok(count) = manager.pending_continuation_count()
+                && let Some(message) = makima_agent::session_recovery::continuation_notice(count)
+            {
+                self.app.flash(message);
+            }
             self.app
                 .lua_event_handle
                 .notify_state_restored(manager.reference(root));
@@ -5179,12 +5218,8 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
-        if let Some(ref h) = self.ctx.mcp_handle {
-            mcp::kill_process_groups(&h.reader().load().pids);
-        }
         for rt in &mut self.sessions {
             rt.cancel_background_work();
-            let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let kill_mcp_ms = lap();
         let heartbeat_deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
@@ -9081,7 +9116,7 @@ end })
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
         if blocked {
-            assert_eq!(config.mode, makima_agent::AgentMode::Build);
+            assert!(makima_agent::modes::is_read_only_fallback(&config.mode));
             assert!(runtime.app.state.plan.path().is_none());
         } else {
             assert_eq!(config.mode.plan_path(), Some(path.as_path()));
@@ -9299,9 +9334,9 @@ end })
 
     #[test_case(false; "startup")]
     #[test_case(true; "replacement")]
-    fn recovery_is_published_before_root_activation_and_queue_stays_inactive(replace: bool) {
-        use makima_storage::session_state::{StoredCancellationReason, StoredTurnStatus};
+    fn recovery_preserves_pending_turns_before_activation_and_queue_stays_inactive(replace: bool) {
         let harness = RuntimeHarness::new();
+        let mut outgoing = replace.then(|| harness.runtime(harness.session()));
         let (session, root, child, root_turn, child_turn) = interrupted_session(&harness);
         let session_id = session.id;
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
@@ -9316,31 +9351,20 @@ end })
             .unwrap()
             .session()
             .history_snapshot();
-        let mut runtime = if replace {
-            let mut current = harness.runtime(harness.session());
-            let old =
-                replace_session_runtime(&mut current, prepared, &harness.ctx().model_slot).unwrap();
-            release_runtime(old);
-            current
+        let mut runtime = if let Some(current) = outgoing.as_mut() {
+            prepared
+                .activate_replacing(&harness.ctx().model_slot, None, current)
+                .unwrap_or_else(|(error, _)| panic!("{error}"))
         } else {
             prepared.activate(&harness.ctx().model_slot, None).unwrap()
         };
+        assert!(runtime.handles.runner_start_is_pending());
         let loaded = AppSession::load(session_id, &harness.ctx().storage).unwrap();
         let view = loaded.latest_state().unwrap();
         for (agent, turn) in [(root, root_turn), (child, child_turn)] {
-            let result = &view.scopes[&Some(agent)]
-                .results
-                .iter()
-                .find(|(id, _)| *id == turn)
-                .unwrap()
-                .1;
-            assert_eq!(
-                result.outcome.status,
-                StoredTurnStatus::Cancelled {
-                    reason: StoredCancellationReason::Interrupted
-                }
-            );
-            assert!(view.scopes[&Some(agent)].admitted.is_empty());
+            let scope = &view.scopes[&Some(agent)];
+            assert!(scope.results.is_empty());
+            assert!(scope.admitted.contains_key(&turn));
         }
         assert_eq!(
             loaded
@@ -9349,7 +9373,7 @@ end })
                 .unwrap()
                 .content
                 .iter()
-                .filter(|block| matches!(block, makima_providers::ContentBlock::ToolResult { .. }))
+                .filter(|block| matches!(block, makima_providers::ContentBlock::ToolUse { .. }))
                 .count(),
             1
         );
@@ -9360,7 +9384,7 @@ end })
                 .unwrap()
                 .content
                 .iter()
-                .filter(|block| matches!(block, makima_providers::ContentBlock::ToolResult { .. }))
+                .filter(|block| matches!(block, makima_providers::ContentBlock::ToolUse { .. }))
                 .count(),
             1
         );
@@ -9375,8 +9399,8 @@ end })
         assert_eq!(history.messages, prepared_history.messages);
         assert_eq!(history.messages, loaded.history_snapshot().messages);
         assert!(Arc::ptr_eq(&history.messages, &prepared_history.messages));
-        runtime.activate_deferred();
         assert!(runtime.handles.queue.is_empty());
+        runtime.activate_deferred();
         assert_eq!(
             runtime.app.input_box.buffer.value(),
             loaded.meta.input_draft.unwrap()
@@ -9391,6 +9415,9 @@ end })
             root_turn
         );
         release_runtime(runtime);
+        if let Some(outgoing) = outgoing {
+            release_runtime(outgoing);
+        }
     }
 
     #[test_case(false, false; "fresh_startup")]
@@ -9869,49 +9896,73 @@ end })
     #[test_case(false; "startup")]
     #[test_case(true; "replacement")]
     fn recovery_publication_failure_does_not_expose_runtime(replace: bool) {
-        const NOT_EXPOSED: &str = "not exposed";
-        let harness = RuntimeHarness::new();
-        let mut current = replace.then(|| harness.runtime(harness.session()));
-        let (session, _, _, _, _) = interrupted_session(&harness);
-        let session_id = session.id;
-        let prepared = harness.ctx().prepare_runtime(session).unwrap();
-        let target_count = harness.target_count();
-        let bootstrap = fs::read(
-            harness
-                .ctx()
-                .sessions_dir
-                .join(format!("{session_id}.jsonl")),
-        )
-        .unwrap();
-        smol::block_on(prepared.app.app.session_writer.as_ref().unwrap().close()).unwrap();
-        if let Some(current) = current.as_mut() {
-            let identity = current.handles.identity();
-            assert!(replace_session_runtime(current, prepared, &harness.ctx().model_slot).is_err());
-            assert!(Arc::ptr_eq(&current.handles.identity(), &identity));
-            assert!(matches!(
-                current.session_lock,
-                Some(SessionLockState::Held(_))
-            ));
-        } else {
-            assert!(prepared.activate(&harness.ctx().model_slot, None).is_err());
-        }
-        assert_eq!(harness.target_count(), target_count);
-        assert!(SessionMailbox::notify(session_id, NOT_EXPOSED.into(), false).is_err());
-        assert_eq!(
-            fs::read(
+        let (finished, completion) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            const NOT_EXPOSED: &str = "not exposed";
+            let harness = RuntimeHarness::new();
+            let mut current = replace.then(|| harness.runtime(harness.session()));
+            let (session, _, _, _, _) = interrupted_session(&harness);
+            let session_id = session.id;
+            let prepared = harness.ctx().prepare_runtime(session).unwrap();
+            let target_count = harness.target_count();
+            let bootstrap = fs::read(
                 harness
                     .ctx()
                     .sessions_dir
-                    .join(format!("{session_id}.jsonl"))
+                    .join(format!("{session_id}.jsonl")),
             )
-            .unwrap(),
-            bootstrap
-        );
-        let lock = claim_lock(&harness.ctx().sessions_dir, &session_id).unwrap();
-        lock.release().unwrap();
-        if let Some(current) = current {
-            release_runtime(current);
-        }
+            .unwrap();
+            smol::block_on(bounded_session_op(
+                async {
+                    prepared
+                        .app
+                        .app
+                        .session_writer
+                        .as_ref()
+                        .unwrap()
+                        .close()
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                PUMP_TIMEOUT,
+            ))
+            .expect("closing recovery writer timed out");
+            if let Some(current) = current.as_mut() {
+                let identity = current.handles.identity();
+                assert!(
+                    replace_session_runtime(current, prepared, &harness.ctx().model_slot).is_err()
+                );
+                assert!(Arc::ptr_eq(&current.handles.identity(), &identity));
+                assert!(matches!(
+                    current.session_lock,
+                    Some(SessionLockState::Held(_))
+                ));
+            } else {
+                assert!(prepared.activate(&harness.ctx().model_slot, None).is_err());
+            }
+            assert_eq!(harness.target_count(), target_count);
+            assert!(SessionMailbox::notify(session_id, NOT_EXPOSED.into(), false).is_err());
+            assert_eq!(
+                fs::read(
+                    harness
+                        .ctx()
+                        .sessions_dir
+                        .join(format!("{session_id}.jsonl"))
+                )
+                .unwrap(),
+                bootstrap
+            );
+            let lock = claim_lock(&harness.ctx().sessions_dir, &session_id).unwrap();
+            lock.release().unwrap();
+            if let Some(current) = current {
+                release_runtime(current);
+            }
+            finished.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(SESSION_OP_TIMEOUT + PUMP_TIMEOUT)
+            .expect("recovery publication failure cleanup did not finish");
+        worker.join().unwrap();
     }
 
     #[test]
@@ -10418,8 +10469,8 @@ end })
         const PLUGIN: &str = "tui-reactivation-fallback";
         const COMMAND: &str = "/reactivate-plan-child";
         const CHILD: &str = "saved-plan-child";
-        const OBSERVED: &str = "reactivated child exposes build";
-        const BUILD: &str = "build";
+        const OBSERVED: &str = "reactivated child exposes read-only";
+        const READ_ONLY: &str = "recovery_read_only";
         const PLAN: &str = "plan";
 
         struct DiskConfigProvider {
@@ -10573,7 +10624,7 @@ end })
                                 local ticket, err = child:send(ctx, "resume the saved child", {{ when = "idle" }})
                                 assert(ticket, err)
                                 assert(child:is_live())
-                                assert(assert(child:config(ctx)).mode == "{BUILD}")
+                                assert(assert(child:config(ctx)).mode == "{READ_ONLY}")
                                 makima.ui.flash("{OBSERVED}")
                             end,
                         }})
@@ -10611,14 +10662,14 @@ end })
                 ));
                 let saved = received.recv_timeout(PUMP_TIMEOUT).unwrap().unwrap();
                 let child_config = saved.scopes[&Some(child)].config.as_ref().unwrap();
-                assert_eq!(child_config.mode.id, BUILD);
+                assert_eq!(child_config.mode.id, READ_ONLY);
                 assert!(child_config.mode.restrict_write_to.is_none());
                 assert_eq!(saved.scopes[&Some(root)], before.scopes[&Some(root)]);
                 let node = manager.node(child).unwrap();
                 assert_eq!(node.graph_lifecycle, GraphLifecycle::Live);
                 assert_eq!(node.residency, AgentResidency::Resident);
                 let config = manager.actor(child).unwrap().effective_config().unwrap();
-                assert_eq!(config.mode, AgentMode::Build);
+                assert!(makima_agent::modes::is_read_only_fallback(&config.mode));
                 assert!(
                     config
                         .mode_def

@@ -304,6 +304,8 @@ makima.api.register_command({
                 assert(#result.output == 1 and result.output[1].answer == 42 and result.captured.answer == 42)
                 local previous = assert(assert(agent:turn(ctx, ids.turn_id)):result(ctx))
                 assert(#previous.output == 1 and previous.output[1].answer == 41 and previous.captured.answer == 41)
+            elseif input.kind == "recovery_read_only" then
+                assert(result.text == input.reply)
             elseif input.kind ~= "mcp" and input.kind ~= "permissions" then
                 local history = makima.json.encode(assert(agent:transcript(ctx, { last_messages = 100, max_bytes = 65536 })).messages)
                 assert(history:find(input.model, 1, true) and history:find(input.cwd, 1, true) and history:find(input.mode or "plan", 1, true))
@@ -622,7 +624,7 @@ impl ProviderBackend for DiscoveredModels {
 #[test_case("removed_model", MODEL_UNAVAILABLE, CHILD_MODEL; "removed_model")]
 #[test_case("discovery_failure", PROVIDER_UNAVAILABLE, CHILD_MODEL; "discovery_failure")]
 #[test_case("removed_model", MODEL_UNAVAILABLE, "anthropic/namespace/model-v1"; "full_model_id")]
-fn restart_reactivation_requires_current_discovery_and_retries_without_admission(
+fn restart_reactivation_refreshes_catalog_miss_and_retries_without_admission(
     failure: &str,
     error: &str,
     model_spec: &str,
@@ -653,7 +655,7 @@ fn restart_reactivation_requires_current_discovery_and_retries_without_admission
         vec![RegisteredProvider {
             id: provider_id.into(),
             display_name: provider_id.into(),
-            models: vec![ModelInfo::id_only(model_id.into())],
+            models: Vec::new(),
             backend: Arc::new(DiscoveredModels {
                 models: Arc::clone(&models),
                 calls: Arc::clone(&calls),
@@ -695,6 +697,49 @@ fn restart_reactivation_requires_current_discovery_and_retries_without_admission
     if failure != "removed_provider" {
         assert_eq!(*calls.lock().unwrap(), 2);
     }
+}
+
+#[test_case(false; "discovery_would_remove_model")]
+#[test_case(true; "discovery_would_fail")]
+fn restart_reactivation_uses_cached_model_without_discovery(discovery_fails: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RestartProvider::new(vec![
+        common::canned_tool_use("restart_echo", json!({})),
+        common::canned_reply(REPLY),
+        common::canned_tool_use("restart_echo", json!({})),
+        common::canned_reply(REPLY),
+    ]);
+    let host = agent_host(dir.path(), provider.clone());
+    let path = dir.path().join(SAVED_IDS);
+    command(
+        &host,
+        json!({ "action": "create", "model": CHILD_MODEL, "path": path }),
+    );
+    let (provider_id, model_id) = Model::parse_spec(CHILD_MODEL).unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let registry = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+        id: provider_id.into(),
+        display_name: provider_id.into(),
+        models: vec![ModelInfo::id_only(model_id.into())],
+        backend: Arc::new(DiscoveredModels {
+            models: Arc::new(Mutex::new(if discovery_fails {
+                Err(DISCOVERY_ERROR.into())
+            } else {
+                Ok(Vec::new())
+            })),
+            calls: Arc::clone(&calls),
+            discovery_gate: None,
+        }),
+        auth: AuthSpec::default(),
+        docs: None,
+    }]));
+    let host = host.restart_host_with_provider_registry(dir.path(), registry);
+    command(
+        &host,
+        json!({ "action": "resume", "model": CHILD_MODEL, "path": path, "cwd": dir.path() }),
+    );
+    assert_eq!(*calls.lock().unwrap(), 0);
+    assert_eq!(provider.request_count(), 4);
 }
 
 #[test]
@@ -1366,13 +1411,12 @@ impl OrchestrationServices for FailedActivation {
 #[test_case(None; "successful_install")]
 #[test_case(Some(false); "failed_install_preserves_saved_config_then_retries")]
 #[test_case(Some(true); "cancelled_install_preserves_saved_config_then_retries")]
-fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_request(
+fn restart_child_with_blocked_saved_plan_falls_back_to_read_only_before_provider_request(
     cancel_install: Option<bool>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let provider = RestartProvider::new(vec![
         common::canned_reply(REPLY),
-        common::canned_tool_use("restart_echo", json!({})),
         common::canned_reply(REPLY),
     ]);
     let host = agent_host(dir.path(), provider.clone());
@@ -1422,11 +1466,11 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
         StateDir::from_path(dir.path().into()),
         host.session.id.into(),
         child_id,
-        "build".into(),
+        "recovery_read_only".into(),
     ));
     command(
         &host,
-        json!({ "action": "resume", "model": CHILD_MODEL, "mode": "build", "path": path, "cwd": dir.path() }),
+        json!({ "action": "resume", "model": CHILD_MODEL, "mode": "recovery_read_only", "kind": "recovery_read_only", "reply": REPLY, "path": path, "cwd": dir.path() }),
     );
     let config = host
         .manager
@@ -1435,7 +1479,7 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
         .effective_config()
         .unwrap()
         .unwrap();
-    assert_eq!(config.mode.id().key(), "build");
+    assert_eq!(config.mode.id().key(), "recovery_read_only");
     let snapshot = host.manager.journal().snapshot();
     let folded = snapshot.fold().unwrap();
     assert_eq!(
@@ -1445,7 +1489,7 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
             .unwrap()
             .mode
             .id,
-        "build"
+        "recovery_read_only"
     );
     assert!(
         config
@@ -1456,17 +1500,8 @@ fn restart_child_with_blocked_saved_plan_falls_back_to_build_before_provider_req
             .is_none()
     );
     let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        requests[2]
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .any(|block| {
-                matches!(block, ContentBlock::ToolResult { content, is_error: false, .. }
-            if serde_json::from_str::<Value>(content).is_ok_and(|echo| echo["mode"] == "build"))
-            })
-    );
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].tools.as_array().unwrap().is_empty());
 }
 
 #[test_case(false; "deleted_definition")]
@@ -1562,7 +1597,7 @@ fn concurrent_public_lua_sends_reactivate_one_resident_and_keep_both_turns() {
     let registry = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
         id: provider_id.into(),
         display_name: provider_id.into(),
-        models: vec![ModelInfo::id_only(model_id.into())],
+        models: Vec::new(),
         backend: Arc::new(DiscoveredModels {
             models: Arc::new(Mutex::new(Ok(vec![ModelInfo::id_only(model_id.into())]))),
             calls: Arc::clone(&calls),

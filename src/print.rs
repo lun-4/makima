@@ -426,7 +426,7 @@ fn with_print_session<T>(
         offload_cleanup,
         async move |deadline| {
             futures_lite::future::zip(
-                manager.shutdown(deadline.saturating_duration_since(Instant::now())),
+                manager.suspend(deadline.saturating_duration_since(Instant::now())),
                 async {
                     let _ = closing.close().await;
                 },
@@ -1443,13 +1443,12 @@ mod tests {
         assert_print_graph_settled(&manager);
         assert_eq!(manager.snapshot().len(), 1);
         assert_eq!(manager.snapshot()[0].agent_id, root.id());
-        assert!(matches!(
-            actor.snapshot().latest,
-            Some(TurnOutcome::Cancelled {
-                reason: TurnCancellationReason::Shutdown,
-                ..
-            })
-        ));
+        assert!(actor.snapshot().latest.is_none());
+        assert!(
+            manager.journal().snapshot().fold().unwrap().scopes[&Some(root.id())]
+                .results
+                .is_empty()
+        );
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         let _ = release.send(());
         assert!(execution.try_recv().is_err());

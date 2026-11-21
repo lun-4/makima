@@ -3837,6 +3837,7 @@ impl LuaRuntime {
                     description: t.description.clone(),
                     schema: t.schema,
                     audience: t.audience,
+                    resumable: t.resumable,
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
@@ -5377,6 +5378,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             let journal = target.manager().journal();
                             crate::api::state::observe(&rt.lua, &journal, &target);
                             journal.notify_state_transition(makima_agent::state::StateChangeReason::Resume);
+                            let lua = rt.lua.clone();
+                            let callback = GateGuard::new(&callbacks);
+                            ex.spawn(async move {
+                                let _callback = callback;
+                                run_detached(&lua, crate::api::agent::wake_restored_children(&lua, target)).await;
+                            }).detach();
                         }
                         Request::StateChanged { target, event } => {
                             if let Err(error) = crate::api::state::dispatch(&rt.lua, target, event) {
@@ -5387,6 +5394,12 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             rt.lua.set_app_data(services);
                             if let Ok(Some(target)) = crate::orchestration::resolve_target(&rt.lua, None) {
                                 crate::api::state::observe(&rt.lua, &target.target.manager().journal(), &target.target);
+                                let lua = rt.lua.clone();
+                                let callback = GateGuard::new(&callbacks);
+                                ex.spawn(async move {
+                                    let _callback = callback;
+                                    run_detached(&lua, crate::api::agent::wake_restored_children(&lua, target.target)).await;
+                                }).detach();
                             }
                         }
                         Request::IgnoreProject => {

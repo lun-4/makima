@@ -364,20 +364,14 @@ impl ActorInner {
     }
 
     /// Registers a live ticket and records it as the most recently admitted turn.
-    pub(crate) fn admit_ticket(&self, turn_id: TurnId, ticket: TurnTicket) {
+    pub(crate) fn admit_ticket(
+        &self,
+        turn_id: TurnId,
+        ticket: TurnTicket,
+        input: Option<&AgentInput>,
+    ) {
         if let Some(journal) = &self.journal
-            && let Err(error) = journal.commit(JournalCommit {
-                incarnations: self.journal_incarnation.clone().into_iter().collect(),
-                changes: vec![JournalChange {
-                    agent: Some(self.agent_id),
-                    generation: 0,
-                    change: StateChange::Admitted {
-                        turn: turn_id,
-                        origin: ticket.provenance().origin.clone().into(),
-                    },
-                }],
-                ..Default::default()
-            })
+            && let Err(error) = self.record_admission_input(journal, turn_id, &ticket, input)
         {
             tracing::warn!(%error, agent_id = %self.agent_id, %turn_id, "turn admission could not be journaled");
         }
@@ -389,6 +383,44 @@ impl ActorInner {
             .latest_admitted
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(turn_id);
+    }
+
+    fn record_admission_input(
+        &self,
+        journal: &SessionJournal,
+        turn_id: TurnId,
+        ticket: &TurnTicket,
+        input: Option<&AgentInput>,
+    ) -> Result<(), String> {
+        let input = input
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        journal
+            .commit(JournalCommit {
+                incarnations: self.journal_incarnation.clone().into_iter().collect(),
+                changes: vec![JournalChange {
+                    agent: Some(self.agent_id),
+                    generation: 0,
+                    change: StateChange::Admitted {
+                        turn: turn_id,
+                        origin: ticket.provenance().origin.clone().into(),
+                    },
+                }]
+                .into_iter()
+                .chain(input.map(|input| JournalChange {
+                    agent: Some(self.agent_id),
+                    generation: 0,
+                    change: StateChange::TurnInput {
+                        turn: turn_id,
+                        input: Some(input),
+                    },
+                }))
+                .collect(),
+                ..Default::default()
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1639,6 +1671,10 @@ impl<'a> ActorHistory<'a> {
 }
 
 impl HistoryBatch<'_> {
+    pub(crate) fn append_turn_input(&mut self, turn: TurnId, messages: Vec<Message>) {
+        self.history.append_turn_input(turn, messages);
+    }
+
     pub fn push_observation(&mut self, message: Message) -> Result<(), HistoryMutationError> {
         self.history.checked_observation(message)
     }
@@ -1662,7 +1698,15 @@ impl Deref for ActorHistory<'_> {
     }
 }
 
+pub struct RestoredTurnAdmission {
+    pub turn_id: TurnId,
+    pub input: AgentInput,
+    pub provenance: TurnProvenance,
+    pub(crate) work: Vec<WorkReservation>,
+}
+
 pub struct ActorRestoration {
+    pub admitted: Vec<RestoredTurnAdmission>,
     pub history: HistorySnapshot,
     pub results: Vec<TurnResult>,
     pub deliveries: Vec<Arc<ChildDelivery>>,
@@ -1881,6 +1925,44 @@ impl AgentActorHandle {
             state.usage = restoration.usage;
             state.policy_generation = restoration.generation;
             state.delivery_seen = restoration.delivery_seen.into();
+            let latest_continuation = restoration
+                .admitted
+                .last()
+                .map(|admission| admission.turn_id);
+            for admission in restoration.admitted {
+                let turn_id = admission.turn_id;
+                let ticket = TurnTicket::new(turn_id, Arc::clone(&inner.identity))
+                    .with_provenance(admission.provenance);
+                state.turn_work.insert(turn_id, admission.work);
+                state.next_operation_id = state.next_operation_id.wrapping_add(1);
+                let operation_id = state.next_operation_id;
+                let presentation = state.reserve_presentation(0);
+                let mut inbox = inbox::InstructionInbox::new(ticket.clone(), presentation);
+                inbox.operation = operation_id;
+                inbox.drained.push((ticket.provenance().clone(), 0));
+                state.instructions.insert(turn_id, inbox);
+                inner
+                    .tickets
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(turn_id, ticket.clone());
+                state.operations.push_back(ActorOperation::Turn {
+                    id: operation_id,
+                    input: Box::new(admission.input),
+                    event_sender: None,
+                    correlation: turn_id.to_string(),
+                    ticket,
+                    policy_constraint: None,
+                    identity: ActorWorkIdentity::new(
+                        agent_id,
+                        ActorWorkKind::Turn {
+                            operation_id,
+                            turn_id,
+                        },
+                        presentation,
+                    ),
+                });
+            }
             let manager = inner
                 .managed_admission
                 .as_ref()
@@ -1928,6 +2010,12 @@ impl AgentActorHandle {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .insert(turn, None);
+            }
+            if let Some(turn) = latest_continuation {
+                *inner
+                    .latest_admitted
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(turn);
             }
         }
         let actor = Arc::downgrade(&inner);
@@ -1987,6 +2075,13 @@ impl AgentActorHandle {
                     return;
                 }
             }
+            {
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                drive_operations(&inner, &mut state);
+            }
             drop(deferred_handle);
             runner::Runner::new(inner, history, backend, wake)
                 .run()
@@ -1995,8 +2090,39 @@ impl AgentActorHandle {
         (handle, task)
     }
 
+    pub fn configure_restored_parent_delivery(&self, auto_deliver: bool) -> Result<(), ActorError> {
+        let managed = self
+            .inner
+            .managed_admission
+            .as_ref()
+            .ok_or(ActorError::Busy)?;
+        let manager = managed
+            .manager
+            .upgrade()
+            .map(crate::AgentManagerHandle::from_inner)
+            .ok_or(ActorError::Busy)?;
+        let incarnation = manager
+            .incarnation(self.agent_id())
+            .map_err(|_| ActorError::Busy)?;
+        if incarnation.reservation != managed.reservation {
+            return Err(ActorError::Busy);
+        }
+        manager
+            .validate_activation(&incarnation)
+            .map_err(|_| ActorError::Busy)?;
+        self.configure_parent_delivery_inner(auto_deliver, true)
+    }
+
     /// Sets child-result routing before any work is admitted.
     pub fn configure_parent_delivery(&self, auto_deliver: bool) -> Result<(), ActorError> {
+        self.configure_parent_delivery_inner(auto_deliver, false)
+    }
+
+    fn configure_parent_delivery_inner(
+        &self,
+        auto_deliver: bool,
+        restoring: bool,
+    ) -> Result<(), ActorError> {
         let mut state = self
             .inner
             .state
@@ -2005,7 +2131,7 @@ impl AgentActorHandle {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
-        if state.next_operation_id != 0 || state.parent_delivery_policy.is_some() {
+        if (!restoring && state.next_operation_id != 0) || state.parent_delivery_policy.is_some() {
             return Err(ActorError::Busy);
         }
         if let Some(work) = self
@@ -2726,7 +2852,8 @@ impl AgentActorHandle {
             ));
             state.delivery_suspended = false;
             state.instructions.insert(turn_id, inbox);
-            self.inner.admit_ticket(turn_id, ticket.clone());
+            self.inner
+                .admit_ticket(turn_id, ticket.clone(), Some(&input));
             let reason = state.cancelled_correlations.get(&correlation).copied();
             let work = ActorOperation::Turn {
                 id,
@@ -2815,6 +2942,8 @@ impl AgentActorHandle {
             inbox.operation = after;
         }
         let reason = state.cancelled_correlations.get(&correlation).copied();
+        self.inner
+            .admit_ticket(turn_id, ticket.clone(), Some(&input));
         let work = ActorOperation::Turn {
             id: after,
             input: Box::new(input),
@@ -2824,7 +2953,6 @@ impl AgentActorHandle {
             policy_constraint: options.policy_constraint,
             identity,
         };
-        self.inner.admit_ticket(turn_id, ticket.clone());
         if let Some(reason) = reason {
             drop(state);
             settle_deferred(&self.inner, vec![work], reason);

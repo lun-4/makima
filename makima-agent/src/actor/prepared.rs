@@ -891,7 +891,7 @@ impl PreparedOperation {
             let turn_id = TurnId::generate();
             state.turn_work.insert(turn_id, self.work);
             let ticket = TurnTicket::new(turn_id, Arc::clone(&inner.identity));
-            inner.admit_ticket(turn_id, ticket.clone());
+            inner.admit_ticket(turn_id, ticket.clone(), Some(&turn.input));
             materialize(
                 inner,
                 state,

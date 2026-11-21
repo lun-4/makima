@@ -32,7 +32,7 @@ use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
 };
-use makima_agent::session_writer::SessionWriter;
+use makima_agent::session_writer::{SessionWriter, forget};
 use makima_agent::template::Vars;
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::tools::test_support::stub_ctx;
@@ -67,9 +67,13 @@ const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PARKED_ROOT_PROMPT: &str = "parked root turn";
 
 pub async fn bounded<T>(future: impl Future<Output = T>) -> T {
+    bounded_at("test operation", future).await
+}
+
+pub async fn bounded_at<T>(stage: &str, future: impl Future<Output = T>) -> T {
     futures_lite::future::race(future, async {
         smol::Timer::after(TEST_OPERATION_TIMEOUT).await;
-        panic!("test operation did not finish within {TEST_OPERATION_TIMEOUT:?}");
+        panic!("{stage} did not finish within {TEST_OPERATION_TIMEOUT:?}");
     })
     .await
 }
@@ -360,7 +364,11 @@ struct RestartShutdown {
 impl Drop for RestartShutdown {
     fn drop(&mut self) {
         if let Some(coordinator) = &self.coordinator {
-            smol::block_on(bounded(coordinator.close())).unwrap();
+            smol::block_on(bounded_at(
+                "restart host coordinator close",
+                coordinator.close(),
+            ))
+            .unwrap();
         }
         for (_, record) in self.manager.journal().snapshot().agent_revisions.iter() {
             if self.manager.is_live(record.id) {
@@ -368,7 +376,10 @@ impl Drop for RestartShutdown {
                 self.manager.detach_incarnation(&incarnation).unwrap();
             }
         }
-        let report = smol::block_on(bounded(self.manager.shutdown(TEST_OPERATION_TIMEOUT)));
+        let report = smol::block_on(bounded_at(
+            "restart host manager shutdown",
+            self.manager.shutdown(TEST_OPERATION_TIMEOUT),
+        ));
         assert!(report.timed_out.is_empty());
     }
 }
@@ -730,6 +741,11 @@ impl RestartHost {
     }
 
     pub fn crash_restart_host(self, state_dir: &Path) -> Self {
+        smol::block_on(bounded_at(
+            "crash restart capture durable prefix",
+            self.manager.journal().flush(),
+        ))
+        .unwrap();
         let path = state_dir
             .join(SESSIONS_DIR)
             .join(format!("{}.jsonl", self.session.id));
@@ -739,21 +755,30 @@ impl RestartHost {
         let session_id = self.session.id;
         let provider = self.provider.clone().expect("crash fixture provider");
         let providers = self.providers.clone().unwrap();
+        let report = smol::block_on(bounded_at(
+            "crash restart manager suspend",
+            self.manager.suspend(TEST_OPERATION_TIMEOUT),
+        ));
+        assert!(report.timed_out.is_empty(), "{report:?}");
         drop(self);
+        forget(&state_dir.join(SESSIONS_DIR), session_id).unwrap();
         std::fs::write(&path, published).unwrap();
         let state = StateDir::from_path(state_dir.into());
         let seed = TestSession::load(session_id, &state).unwrap();
         let checkpoint =
             SessionWriter::open_session(&state.ensure_subdir(SESSIONS_DIR).unwrap(), &seed)
                 .unwrap();
-        smol::block_on(bounded(checkpoint.recover(
-            seed,
-            CheckpointPublication::default(),
-            Arc::new(|publication| {
-                assert!(publication.try_publish());
-                Ok(())
-            }),
-        )))
+        smol::block_on(bounded_at(
+            "crash restart publish recovery",
+            checkpoint.recover(
+                seed,
+                CheckpointPublication::default(),
+                Arc::new(|publication| {
+                    assert!(publication.try_publish());
+                    Ok(())
+                }),
+            ),
+        ))
         .unwrap();
         drop(checkpoint);
         let fs = Arc::new(InMemoryFs::new());

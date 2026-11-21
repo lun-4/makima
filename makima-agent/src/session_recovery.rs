@@ -11,18 +11,33 @@ use makima_storage::{
     checkpoint::{CheckpointClaim, CheckpointError, CheckpointPublication},
     id::MakimaId,
     session_state::{
-        StateChange, StoredCancellationReason, StoredPayload, StoredStateRecord, StoredTurnOutcome,
+        StateChange, StoredCancellationReason, StoredDelivery, StoredDeliveryOp, StoredPayload,
+        StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
         StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
     },
     sessions::{HistorySnapshot, Session, SessionRecord, next_epoch},
 };
-use std::{collections::BTreeSet, mem::take, sync::Arc};
+use std::{collections::BTreeSet, env, mem::take, sync::Arc};
 
+const CONTINUATION_DISABLED: &str = "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
+const CONTINUE_ALL_AGENTS_ENV: &str = "MAKIMA_CONTINUE_ALL_AGENTS";
 const SEQUENCE_EXHAUSTED: &str = "session recovery exhausted the state sequence";
 const DRAFT_SEPARATOR: &str = "\n\n";
 const WRONG_WRITER: &str = "recovery writer belongs to another session";
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+
+pub fn continuation_notice(count: usize) -> Option<String> {
+    (count != 0).then(|| {
+        format!(
+            "continuing {count} interrupted turns (set {CONTINUE_ALL_AGENTS_ENV}=0 to stop this)"
+        )
+    })
+}
+
+pub fn continue_all_agents() -> bool {
+    env::var(CONTINUE_ALL_AGENTS_ENV).as_deref() != Ok("0")
+}
 
 pub struct RecoveryCandidate {
     session: StoredSession,
@@ -70,11 +85,10 @@ pub fn resolve_legacy_mode(
     };
     let (mode, definition, warning) = match restored {
         Ok((mode, definition)) => (mode, definition, None),
-        Err(error) => (
-            AgentMode::Build,
-            registry.current(&AgentMode::Build),
-            Some(error.to_string()),
-        ),
+        Err(error) => {
+            let fallback = modes::read_only_fallback(error);
+            (fallback.mode, fallback.definition, fallback.warning)
+        }
     };
     let restored = modes::prepare_restore(&definition.stored_snapshot(&mode), registry)
         .map_err(|error| failure(error.to_string()))?;
@@ -102,7 +116,14 @@ impl RecoveryCandidate {
         })
     }
 
-    pub fn prepare(mut session: StoredSession) -> Result<Self, CheckpointError> {
+    pub fn prepare(session: StoredSession) -> Result<Self, CheckpointError> {
+        Self::prepare_with_continuation(session, continue_all_agents())
+    }
+
+    pub fn prepare_with_continuation(
+        mut session: StoredSession,
+        continue_turns: bool,
+    ) -> Result<Self, CheckpointError> {
         let session_id = session.id;
         let failure = |message: String| CheckpointError::Save {
             session_id,
@@ -130,7 +151,11 @@ impl RecoveryCandidate {
             .unwrap_or(0);
         let previous_epoch = session.history_snapshot().epoch;
         let covered = session.last_message_id();
-        let history = sanitize(session.history_snapshot());
+        let history = if continue_turns {
+            session.history_snapshot()
+        } else {
+            sanitize(session.history_snapshot())
+        };
         session.adopt_history(&history);
         if history.epoch != previous_epoch
             && let Some(root) = session.root_agent_id()
@@ -173,7 +198,11 @@ impl RecoveryCandidate {
             let history = session.subagent_history_snapshot(&key).unwrap_or_default();
             let previous_epoch = history.epoch;
             let covered = session.chat_message_ids(Some(&key)).last().copied();
-            let history = sanitize(history);
+            let history = if continue_turns {
+                history
+            } else {
+                sanitize(history)
+            };
             session.adopt_subagent_history(key.clone(), &history);
             if let Some(agent) = view
                 .agents
@@ -205,12 +234,30 @@ impl RecoveryCandidate {
                 records.push(SessionRecord::State { d: record });
             }
         }
-        for (agent, scope) in view.scopes {
+        for (&agent, scope) in view.scopes.iter().filter(|_| !continue_turns) {
             let Some(agent) = agent else { continue };
-            for (turn, origin) in scope.admitted {
+            for (&turn, origin) in &scope.admitted {
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.to_owned()))?;
+                let child = view
+                    .agents
+                    .get(&agent)
+                    .filter(|record| record.parent.is_some());
+                let status = if child.is_some() {
+                    StoredTurnStatus::Failed {
+                        failure: StoredTurnFailure {
+                            kind: StoredTurnFailureKind::Internal,
+                            diagnostic: CONTINUATION_DISABLED.into(),
+                            user_message: CONTINUATION_DISABLED.into(),
+                            retryable: false,
+                        },
+                    }
+                } else {
+                    StoredTurnStatus::Cancelled {
+                        reason: StoredCancellationReason::Interrupted,
+                    }
+                };
                 let record = StoredStateRecord {
                     seq,
                     agent: Some(agent),
@@ -227,14 +274,12 @@ impl RecoveryCandidate {
                                 list_cost: None,
                                 context_size: 0,
                                 context_window: 0,
-                                status: StoredTurnStatus::Cancelled {
-                                    reason: StoredCancellationReason::Interrupted,
-                                },
+                                status,
                             },
                             text: StoredPayload::Inline(String::new()),
                             output: StoredPayload::Inline(Vec::new()),
                             provenance: StoredTurnProvenance {
-                                origin,
+                                origin: origin.clone(),
                                 plugin: None,
                                 plugin_generation: None,
                                 source_agent: None,
@@ -244,8 +289,42 @@ impl RecoveryCandidate {
                         },
                     },
                 };
-                session.push_state(record.clone());
-                records.push(SessionRecord::State { d: record });
+                if let Some(child) = child
+                    && let Some(parent) = child.parent
+                    && child
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.auto_deliver && !spec.silent)
+                    && let StateChange::Turn { result, .. } = &record.change
+                {
+                    seq = seq
+                        .checked_add(1)
+                        .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                    let delivery = StoredStateRecord {
+                        seq,
+                        agent: Some(parent),
+                        generation: view
+                            .scopes
+                            .get(&Some(parent))
+                            .map_or(0, |scope| scope.generation),
+                        change: StateChange::Delivery {
+                            id: (agent, turn),
+                            op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                                label: child.label.clone(),
+                                result: result.clone(),
+                                held: false,
+                                preview_bytes: None,
+                            })),
+                        },
+                    };
+                    session.push_state(record.clone());
+                    records.push(SessionRecord::State { d: record });
+                    session.push_state(delivery.clone());
+                    records.push(SessionRecord::State { d: delivery });
+                } else {
+                    session.push_state(record.clone());
+                    records.push(SessionRecord::State { d: record });
+                }
             }
         }
         if restore_draft {
@@ -487,11 +566,11 @@ mod tests {
             ..Default::default()
         });
         let original_epoch = session.history_snapshot().epoch;
-        let candidate = RecoveryCandidate::prepare(session).unwrap();
+        let candidate = RecoveryCandidate::prepare_with_continuation(session, false).unwrap();
         let history = candidate.session.history_snapshot();
         assert_eq!(history.messages.len(), 2);
         assert_ne!(history.epoch, original_epoch);
-        let again = RecoveryCandidate::prepare(candidate.session).unwrap();
+        let again = RecoveryCandidate::prepare_with_continuation(candidate.session, false).unwrap();
         assert_eq!(again.session.history_snapshot().epoch, history.epoch);
         assert_eq!(again.session.messages(), history.messages.as_ref());
     }
@@ -563,7 +642,7 @@ mod tests {
                 origin: StoredTurnOrigin::User,
             },
         });
-        let candidate = RecoveryCandidate::prepare(session).unwrap();
+        let candidate = RecoveryCandidate::prepare_with_continuation(session, false).unwrap();
         assert_ne!(candidate.session.history_snapshot().epoch, epoch);
         let terminal = candidate.session.state().iter().find(|record| {
             matches!(&record.change, StateChange::Turn { turn: id, .. } if *id == turn)
@@ -658,7 +737,14 @@ mod tests {
         assert_eq!(config.cwd, CWD);
         assert!(config.fast && config.workflow);
         assert_eq!(config.options[LEGACY_OPTION], DRAFT);
-        assert_eq!(config.mode.id, AgentMode::Build.id().key());
+        if removed {
+            assert!(config.mode.tools.as_ref().unwrap().is_empty());
+            assert!(modes::is_read_only_fallback(
+                &modes::from_snapshot(&config.mode).unwrap().0
+            ));
+        } else {
+            assert_eq!(config.mode.id, AgentMode::Build.id().key());
+        }
         registry
             .define(crate::ModeDefSpec {
                 name: AgentMode::Build.id().key().into(),
@@ -773,12 +859,40 @@ mod tests {
         history.ids = Arc::new(original.iter().map(|_| MakimaId::generate()).collect());
         history.messages = Arc::new(original);
         session.adopt_subagent_history(CHILD_KEY.into(), &history);
-        let candidate = RecoveryCandidate::prepare(session).unwrap();
+        let candidate = RecoveryCandidate::prepare_with_continuation(session, false).unwrap();
         assert_eq!(candidate.session().messages(), &expected);
         assert_eq!(
             candidate.session().subagent_messages()[CHILD_KEY].as_ref(),
             &expected
         );
+    }
+
+    #[test_case(false; "stop_unfinished_turns")]
+    #[test_case(true; "continue_unfinished_turns")]
+    fn restart_policy_preserves_admissions_and_inflight_calls(continue_turns: bool) {
+        let (session, root, child, root_turn, child_turn) = fixture();
+        let original = session.history_snapshot();
+        let candidate =
+            RecoveryCandidate::prepare_with_continuation(session, continue_turns).unwrap();
+        let view = candidate.session().latest_state().unwrap();
+        for (agent, turn) in [(root, root_turn), (child, child_turn)] {
+            let scope = &view.scopes[&Some(agent)];
+            assert_eq!(scope.admitted.contains_key(&turn), continue_turns);
+            assert_eq!(
+                scope.results.iter().any(|(id, _)| *id == turn),
+                !continue_turns
+            );
+        }
+        if continue_turns {
+            let restored = candidate.session().history_snapshot();
+            assert_eq!(restored.messages, original.messages);
+            assert_eq!(restored.epoch, original.epoch);
+            assert_eq!(restored.ids, original.ids);
+            assert!(candidate.records.iter().all(|record| matches!(
+                record,
+                SessionRecord::Draft { .. } | SessionRecord::Queued { .. }
+            )));
+        }
     }
 
     #[test]
@@ -795,8 +909,9 @@ mod tests {
             let original = std::fs::read(&path).unwrap();
             let loaded = StoredSession::load(id, &storage).unwrap();
             let writer = SessionWriter::open_session(&sessions, &loaded).unwrap();
-            let recovered = writer
-                .recover(loaded, CheckpointPublication::default(), claim())
+            let recovered = RecoveryCandidate::prepare_with_continuation(loaded, false)
+                .unwrap()
+                .publish(&writer, CheckpointPublication::default(), claim())
                 .await
                 .unwrap();
             assert!(std::fs::read(&path).unwrap().starts_with(&original));
@@ -816,12 +931,17 @@ mod tests {
                 let scope = &view.scopes[&Some(agent)];
                 assert!(scope.admitted.is_empty());
                 let result = scope.results.iter().find(|(id, _)| *id == turn).unwrap();
-                assert_eq!(
-                    result.1.outcome.status,
-                    StoredTurnStatus::Cancelled {
-                        reason: StoredCancellationReason::Interrupted
-                    }
-                );
+                if agent == root {
+                    assert_eq!(
+                        result.1.outcome.status,
+                        StoredTurnStatus::Cancelled {
+                            reason: StoredCancellationReason::Interrupted
+                        }
+                    );
+                } else {
+                    assert!(matches!(&result.1.outcome.status,
+                        StoredTurnStatus::Failed { failure } if failure.diagnostic == CONTINUATION_DISABLED));
+                }
                 assert!(scope.deliveries.is_empty());
             }
             assert_eq!(recovered.session().messages().len(), 3);
@@ -852,8 +972,9 @@ mod tests {
             drop(writer);
             let loaded = StoredSession::load(id, &storage).unwrap();
             let writer = SessionWriter::open_session(&sessions, &loaded).unwrap();
-            let again = writer
-                .recover(loaded, CheckpointPublication::default(), claim())
+            let again = RecoveryCandidate::prepare_with_continuation(loaded, false)
+                .unwrap()
+                .publish(&writer, CheckpointPublication::default(), claim())
                 .await
                 .unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), durable_bytes);

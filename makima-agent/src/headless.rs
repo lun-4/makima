@@ -1094,13 +1094,15 @@ impl ManagedLifetime {
 impl Drop for ManagedLifetime {
     fn drop(&mut self) {
         self.root.finish(Err(INITIALIZATION_CLOSED.into()));
-        self.children.cancel_all();
+        if self.manager.journal().session_id().is_none() {
+            self.children.cancel_all();
+        }
         if let Some(cleanup) = self.offload_cleanup() {
             cleanup.request();
         }
         let manager = self.manager.clone();
         smol::spawn(async move {
-            manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
+            manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
         })
         .detach();
     }
@@ -1313,7 +1315,7 @@ fn spawn_interactive(
                     .map_err(|error| error.to_string())?;
                     if let Some(warning) = restored.warning {
                         mode_fallback = true;
-                        warn!(%warning, "saved mode restoration fell back to build");
+                        warn!(%warning, "saved mode restoration fell back to read-only");
                         let _ = raw_tx.send(Envelope {
                             event: AgentEvent::ControlError { message: warning },
                             subagent: None,
@@ -1343,6 +1345,12 @@ fn spawn_interactive(
                     .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
                     .with_mode_def(Some(params.modes.current(&AgentMode::Build)))
                 };
+                if restored_graph && crate::modes::is_read_only_fallback(&config.mode) {
+                    mode_fallback = true;
+                    manager
+                        .suppress_root_continuations()
+                        .map_err(|error| error.to_string())?;
+                }
                 let backend = HeadlessBackend {
                     persist_turn_results,
                     params: AgentParams {
@@ -1555,7 +1563,7 @@ fn spawn_interactive(
                     let _ = EventSender::new(raw_tx).send(AgentEvent::ControlError { message });
                 }
             }
-            manager.shutdown(GRAPH_SHUTDOWN_TIMEOUT).await;
+            manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
             if let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
             }
@@ -2199,21 +2207,20 @@ pub(crate) mod tests {
                 Some(Box::new(move |manager, root, _, initialization| {
                     Box::pin(async move {
                         assert!(root.actor().is_err());
-                        assert!(matches!(
-                            initialization
+                        assert!(crate::modes::is_read_only_fallback(
+                            &initialization
                                 .unwrap()
                                 .actor
                                 .config_snapshot()
                                 .unwrap()
                                 .config
-                                .mode,
-                            AgentMode::Build
+                                .mode
                         ));
                         let snapshot = manager.journal().snapshot();
                         let view = snapshot.fold().unwrap();
                         assert_eq!(
                             view.scopes[&Some(root_id)].config.as_ref().unwrap().mode.id,
-                            crate::ModeId::Build.key()
+                            "recovery_read_only"
                         );
                         let saved =
                             Session::<Message, TokenUsage, ToolOutput>::load(id, &saved_storage)
@@ -2225,7 +2232,7 @@ pub(crate) mod tests {
                                 .unwrap()
                                 .mode
                                 .id,
-                            crate::ModeId::Build.key()
+                            "recovery_read_only"
                         );
                         entered.send_async(()).await.unwrap();
                         released.recv_async().await.unwrap();
@@ -2241,9 +2248,8 @@ pub(crate) mod tests {
             drop(admission);
             release.send(()).unwrap();
             let root = bounded(handle.initialized_root()).await.unwrap();
-            assert!(matches!(
-                root.effective_config().unwrap().unwrap().mode,
-                AgentMode::Build
+            assert!(crate::modes::is_read_only_fallback(
+                &root.effective_config().unwrap().unwrap().mode
             ));
             assert!(requests.is_empty());
             bounded(handle.task.cancel()).await;
@@ -2505,8 +2511,9 @@ pub(crate) mod tests {
         });
     }
 
-    #[test]
-    fn recovered_startup_preserves_identity_and_does_not_rerun_work() {
+    #[test_case(false; "continuation_disabled")]
+    #[test_case(true; "continue_root")]
+    fn recovered_startup_preserves_identity_and_resumes_work(continue_turns: bool) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -2541,14 +2548,18 @@ pub(crate) mod tests {
                 assert!(publication.try_publish());
                 Ok(())
             });
-            let recovered = writer
-                .recover(
-                    session,
-                    makima_storage::checkpoint::CheckpointPublication::default(),
-                    claim,
-                )
-                .await
-                .unwrap();
+            let recovered = crate::session_recovery::RecoveryCandidate::prepare_with_continuation(
+                session,
+                continue_turns,
+            )
+            .unwrap()
+            .publish(
+                &writer,
+                makima_storage::checkpoint::CheckpointPublication::default(),
+                claim,
+            )
+            .await
+            .unwrap();
             let mut params = interactive_params(session_id, Vec::new());
             params.root_id = Some(root_id);
             params.journal = Some(recovered.journal());
@@ -2564,20 +2575,37 @@ pub(crate) mod tests {
             let root = handle.initialized_root().await.unwrap();
             assert_eq!(root.id(), root_id);
             let result = root.turn_ticket(turn).unwrap().wait_result().await;
-            assert!(matches!(
-                result.outcome,
-                crate::TurnOutcome::Cancelled {
-                    reason: crate::TurnCancellationReason::Interrupted,
-                    ..
-                }
-            ));
-            assert!(requests.try_recv().is_err());
-            assert_eq!(
-                handle.manager.journal().snapshot().histories[&root_id]
-                    .messages
-                    .as_ref(),
-                recovered.session().messages()
-            );
+            if continue_turns {
+                assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+                let request = requests.try_recv().unwrap();
+                assert_eq!(request.0, FIRST);
+                assert_eq!(result.text, FIRST);
+                let history = handle.manager.journal().snapshot().histories[&root_id].clone();
+                assert_eq!(
+                    history
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == Role::User)
+                        .count(),
+                    1
+                );
+                assert!(requests.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    result.outcome,
+                    crate::TurnOutcome::Cancelled {
+                        reason: crate::TurnCancellationReason::Interrupted,
+                        ..
+                    }
+                ));
+                assert!(requests.try_recv().is_err());
+                assert_eq!(
+                    handle.manager.journal().snapshot().histories[&root_id]
+                        .messages
+                        .as_ref(),
+                    recovered.session().messages()
+                );
+            }
             handle.task.cancel().await;
         });
     }

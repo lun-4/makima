@@ -784,6 +784,7 @@ makima.api.register_tool({
 
 makima.api.register_tool({
   name = "task_wait",
+  resumable = true,
   description = "Wait for one exact task turn. Omit turn_id to select the latest turn once. Messages joining that turn extend its work; the wait never follows a later turn. Returns {status, result?, error?}, with per-turn usage and duration_ms. Timeout returns running without cancelling work; zero checks without waiting. Unavailable or evicted turn IDs return turn_result_unavailable. The caller releases its turn capacity while waiting. Also callable from code_execution. See [Agent work](/docs/agent-work/#task-waits) for completion and retention rules.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },

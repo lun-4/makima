@@ -56,39 +56,48 @@ pub(super) async fn prepare(
         .as_ref()
         .ok_or_else(|| not_restorable("saved spawn specification is unavailable"))?;
     let stored = stored.ok_or_else(|| not_restorable("saved configuration is unavailable"))?;
-    let model = allowed_model(&context, &stored.model).map_err(|error| match error {
-        ModelError::UnsupportedProvider(provider) => {
-            ReactivationError::ProviderUnavailable { provider }
-        }
-        _ => ReactivationError::ModelUnavailable {
-            model: stored.model.clone(),
-        },
-    })?;
-    let mut discovery_failed = false;
-    context
-        .providers
-        .fetch_all(&context.model_policy, true, |batch| {
-            if batch.provider.as_deref() == Some(model.provider.as_ref())
-                && !batch.warnings.is_empty()
-            {
-                discovery_failed = true;
+    let model = allowed_model(&context, &stored.model).map_err(|error| {
+        let reason = error.to_string();
+        match error {
+            ModelError::UnsupportedProvider(provider) => {
+                ReactivationError::ProviderUnavailable { provider, reason }
             }
-        })
-        .await;
-    if discovery_failed {
-        return Err(ReactivationError::ProviderUnavailable {
-            provider: model.provider.to_string(),
-        });
-    }
-    if !context
-        .providers
-        .offline_specs(&context.model_policy)
-        .iter()
-        .any(|available| available == &stored.model)
-    {
-        return Err(ReactivationError::ModelUnavailable {
-            model: stored.model.clone(),
-        });
+            _ => ReactivationError::ModelUnavailable {
+                model: stored.model.clone(),
+                reason,
+            },
+        }
+    })?;
+    let catalog_contains_model = || {
+        context
+            .providers
+            .offline_specs(&context.model_policy)
+            .iter()
+            .any(|available| available == &stored.model)
+    };
+    if !catalog_contains_model() {
+        let mut warnings = Vec::new();
+        context
+            .providers
+            .fetch_all(&context.model_policy, true, |batch| {
+                if batch.provider.as_deref() == Some(model.provider.as_ref()) {
+                    warnings.extend(batch.warnings);
+                }
+            })
+            .await;
+        if !catalog_contains_model() {
+            return Err(if warnings.is_empty() {
+                ReactivationError::ModelUnavailable {
+                    model: stored.model.clone(),
+                    reason: "saved model is absent from the refreshed catalog".into(),
+                }
+            } else {
+                ReactivationError::ProviderUnavailable {
+                    provider: model.provider.to_string(),
+                    reason: warnings.join("; "),
+                }
+            });
+        }
     }
     let prepare = lua
         .app_data_ref::<SessionProviderPreparer>()
@@ -96,8 +105,9 @@ pub(super) async fn prepare(
     let preparer = session_model_preparer(&context, prepare);
     let prepared = prepare_model(&stored.model, &context.model_policy, &preparer)
         .await
-        .map_err(|_| ReactivationError::ProviderUnavailable {
+        .map_err(|error| ReactivationError::ProviderUnavailable {
             provider: model.provider.to_string(),
+            reason: error.to_string(),
         })?;
     let modes::RestoredMode {
         mode,
@@ -386,10 +396,14 @@ mod tests {
             assert!(matches!(restored, Err(ReactivationError::ModeCeiling(_))));
         } else {
             let restored = restored.unwrap();
-            assert_eq!(restored.config.mode, AgentMode::Build);
-            assert_eq!(restored.config.mode_def.unwrap().id, ModeId::Build);
+            assert!(makima_agent::modes::is_read_only_fallback(
+                &restored.config.mode
+            ));
+            assert_eq!(restored.config.mode_def.unwrap().tools, Some(Vec::new()));
             assert!(restored.warning.is_some());
-            assert_eq!(restored.template.mode, AgentMode::Build);
+            assert!(makima_agent::modes::is_read_only_fallback(
+                &restored.template.mode
+            ));
         }
         assert_eq!(serde_json::to_vec(&record).unwrap(), before);
     }
@@ -436,6 +450,27 @@ mod tests {
             Some(TurnToolRoute::Native(_))
         ));
         assert!(template.tool_filter.matches(TOOL));
+    }
+
+    #[test_case::test_case(ToolAudience::empty(); "private")]
+    #[test_case::test_case(ToolAudience::INTERPRETER; "wrong_audience")]
+    fn saved_native_tool_cannot_restore_without_child_audience(audience: ToolAudience) {
+        let mut template = stub_ctx(&AgentMode::Build);
+        template.audience = ToolAudience::MAIN;
+        template.registry = Arc::new(ToolRegistry::new());
+        template
+            .registry
+            .register(
+                mock_tool(TOOL, audience),
+                ToolSource::Lua {
+                    plugin: TOOL.into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(restore_tools(&spec(vec![json!({"name": TOOL})], None), &mut template),
+            Err(ReactivationError::ToolUnavailable { tool }) if tool == TOOL)
+        );
     }
 
     #[test]

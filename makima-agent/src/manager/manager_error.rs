@@ -6,10 +6,10 @@ use crate::{AgentId, TurnId};
 pub enum ReactivationError {
     #[error("not_restorable: {reason}")]
     NotRestorable { reason: String },
-    #[error("provider_unavailable: {provider}")]
-    ProviderUnavailable { provider: String },
-    #[error("model_unavailable: {model}")]
-    ModelUnavailable { model: String },
+    #[error("provider_unavailable: {provider}: {reason}")]
+    ProviderUnavailable { provider: String, reason: String },
+    #[error("model_unavailable: {model}: {reason}")]
+    ModelUnavailable { model: String, reason: String },
     #[error("tool_unavailable: {tool}")]
     ToolUnavailable { tool: String },
     #[error("mcp_unavailable: {server}")]

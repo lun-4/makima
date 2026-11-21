@@ -18,13 +18,15 @@ use makima_providers::{
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_state::{
-    StateChange, StoredAgentLifecycle, StoredDelivery, StoredDeliveryOp,
+    StateChange, StoredAgentLifecycle, StoredAgentSpec, StoredDelivery, StoredDeliveryOp,
+    StoredModeCeiling,
 };
 use makima_storage::sessions::Session;
 use serde_json::Value;
 
 use super::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
+    SpawnRestoration,
 };
 use crate::actor::{
     ActorHistory, ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES,
@@ -46,6 +48,7 @@ const SUSPEND_PUBLICATION_VERSION: u32 = 1;
 struct ReceiptGateIo {
     entered: flume::Sender<()>,
     release: Option<flume::Receiver<()>>,
+    skip_syncs: usize,
 }
 
 impl SessionIo for ReceiptGateIo {
@@ -54,6 +57,10 @@ impl SessionIo for ReceiptGateIo {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        if self.skip_syncs > 0 {
+            self.skip_syncs -= 1;
+            return Ok(());
+        }
         if let Some(release) = self.release.take() {
             self.entered.send(()).unwrap();
             release.recv().unwrap();
@@ -72,6 +79,7 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
         ReceiptGateIo {
             entered,
             release: Some(gate),
+            skip_syncs: 0,
         },
         0,
     );
@@ -90,6 +98,101 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
     release.send(()).unwrap();
     let root = task.join().unwrap().unwrap();
     assert!(root.actor().is_ok());
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+}
+
+#[test_case(false; "restorable")]
+#[test_case(true; "private_tools")]
+fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_tools: bool) {
+    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const PRIVATE_REASON: &str = "private tools cannot be restored";
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+    let spec = StoredAgentSpec {
+        model: Default::default(),
+        system: String::new(),
+        tools: Vec::new(),
+        audience: "general_sub".into(),
+        mcp: false,
+        output_schema: None,
+        name: None,
+        silent: false,
+        auto_deliver: true,
+        inherit_provider: false,
+        mode_ceiling: StoredModeCeiling {
+            restrict_write_to: None,
+            tools: None,
+        },
+        plugin: None,
+    };
+    let expected_spec = serde_json::to_value(&spec).unwrap();
+    let restorable = if private_tools {
+        Err(PRIVATE_REASON.to_owned())
+    } else {
+        Ok(())
+    };
+    let expected_restorable = restorable.clone();
+    let (entered, syncing) = flume::bounded(1);
+    let (release, gate) = flume::bounded(1);
+    let writer = SessionWriter::with_io(
+        MakimaId::generate(),
+        ReceiptGateIo {
+            entered,
+            release: Some(gate),
+            skip_syncs: 1,
+        },
+        0,
+    );
+    manager.journal().bind_writer(writer.clone()).unwrap();
+    smol::block_on(writer.append(Vec::new())).unwrap();
+    let spawning = manager.clone();
+    let task = std::thread::spawn(move || {
+        spawning.spawn_child_trusted_with_config_and_restoration(
+            &root,
+            config(MODEL, false),
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            Some(SpawnRestoration { spec, restorable }),
+            |_| Ok::<_, String>(TestBackend::boxed()),
+        )
+    });
+    syncing.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    smol::block_on(yield_until(|| {
+        manager
+            .journal()
+            .snapshot()
+            .agent_revisions
+            .iter()
+            .any(|(_, record)| record.parent.is_some())
+    }));
+    let snapshot = manager.journal().snapshot();
+    let children: Vec<_> = snapshot
+        .agent_revisions
+        .iter()
+        .filter(|(_, record)| record.parent.is_some())
+        .collect();
+    assert_eq!(children.len(), 1);
+    let (_, child) = children[0];
+    assert_eq!(
+        serde_json::to_value(child.spec.as_ref().unwrap()).unwrap(),
+        expected_spec
+    );
+    assert_eq!(child.restorable, expected_restorable);
+    assert!(
+        snapshot
+            .state
+            .iter()
+            .any(|state| state.agent == Some(child.id)
+                && matches!(&state.change, StateChange::Config(saved) if saved.model == MODEL))
+    );
+    assert!(manager.actor(child.id).is_err());
+    assert!(!task.is_finished());
+    release.send(()).unwrap();
+    let child = task.join().unwrap().unwrap();
+    assert!(child.actor().is_ok());
     smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
 }
 
@@ -126,6 +229,7 @@ fn generic_terminal_waits_for_writer_receipt_before_end() {
             ReceiptGateIo {
                 entered,
                 release: Some(gate),
+                skip_syncs: 0,
             },
             0,
         );
@@ -183,6 +287,7 @@ fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool)
             ReceiptGateIo {
                 entered,
                 release: Some(gate),
+                skip_syncs: 0,
             },
             0,
         );

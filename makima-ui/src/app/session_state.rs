@@ -60,7 +60,6 @@ pub(crate) struct SessionState {
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
-const MODE_RESTORE_FAILED_WARNING: &str = "Could not restore the saved mode, resumed in build mode";
 
 impl SessionState {
     pub fn from_session(
@@ -185,10 +184,10 @@ impl SessionState {
                     |(key, _)| modes::resolve(registry, key, &current, storage),
                 );
                 restored.unwrap_or_else(|error| {
-                    tracing::warn!(%error, "resuming in build mode");
-                    self.warnings.push(MODE_RESTORE_FAILED_WARNING.into());
-                    let build = AgentMode::Build;
-                    (build.clone(), registry.current(&build))
+                    tracing::warn!(%error, "resuming in read-only mode");
+                    let fallback = modes::read_only_fallback(error);
+                    self.warnings.extend(fallback.warning);
+                    (fallback.mode, fallback.definition)
                 })
             }
         };
@@ -579,7 +578,7 @@ mod tests {
     #[test_case(false ; "durable_build_ignores_legacy_plan")]
     #[test_case(true ; "invalid_durable_plan_warns_before_adoption")]
     fn durable_mode_controls_fallback_warnings(invalid_plan: bool) {
-        const MISSING_SLOT_WARNING: &str = "Cannot restore plan file: Active Plan configuration has no plan slot entry. Resuming in Build mode";
+        const MISSING_SLOT_WARNING: &str = "Could not restore the saved mode: Cannot restore plan file: Active Plan configuration has no plan slot entry. Resumed in read-only mode; waiting for user input.";
         let model = test_model();
         let mut session = session_with_counters();
         let mut stored = stored_config(&model);
@@ -599,8 +598,8 @@ mod tests {
             SessionDefaults::default(),
         );
         let config = config.unwrap();
-        assert_eq!(config.mode, AgentMode::Build);
         if invalid_plan {
+            assert!(modes::is_read_only_fallback(&config.mode));
             assert_eq!(state.warnings, [MISSING_SLOT_WARNING]);
             assert!(state.plan.path().is_none());
             state.adopt(&config);
@@ -608,6 +607,7 @@ mod tests {
             assert!(state.plan.path().is_none());
             return;
         }
+        assert_eq!(config.mode, AgentMode::Build);
         assert!(state.warnings.is_empty());
         state.adopt(&config);
         assert!(state.warnings.is_empty());
@@ -615,7 +615,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_written_plan_resumes_build_without_recreating_ready_file() {
+    fn removed_legacy_mode_restores_without_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let mut session = session_with_counters();
+        session.meta.mode = Some(StoredMode::Custom("removed_mode".into()));
+        let (state, config) = restore(session, &storage);
+        assert!(modes::is_read_only_fallback(&config.mode));
+        assert_eq!(config.mode_def.unwrap().tools, Some(Vec::new()));
+        assert!(!state.warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_written_plan_resumes_read_only_without_recreating_ready_file() {
         let directory = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(directory.path().to_path_buf());
         let model = test_model();
@@ -653,7 +665,7 @@ mod tests {
             },
         });
         let (state, config) = restore(session, &storage);
-        assert_eq!(config.mode, AgentMode::Build);
+        assert!(modes::is_read_only_fallback(&config.mode));
         assert!(state.plan.path().is_none());
         assert!(!path.exists());
         assert!(!state.warnings.is_empty());
@@ -755,7 +767,7 @@ mod tests {
 
     #[test_case(Some(StoredMode::Plan), true ; "unallocatable_plan_path")]
     #[test_case(Some(StoredMode::Custom(MISSING_CUSTOM_MODE.into())), false ; "missing_custom_mode")]
-    fn unrestorable_mode_resumes_in_build_mode_and_warns(mode: Option<StoredMode>, blocked: bool) {
+    fn unrestorable_mode_resumes_read_only_and_warns(mode: Option<StoredMode>, blocked: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("state");
         if blocked {
@@ -765,11 +777,11 @@ mod tests {
             make_plan_session(mode.clone(), None),
             &StateDir::from_path(dir),
         );
-        assert_eq!(config.mode, AgentMode::Build);
-        assert_eq!(config.mode_def.unwrap().id, makima_agent::ModeId::Build);
+        assert!(modes::is_read_only_fallback(&config.mode));
+        assert_eq!(config.mode_def.unwrap().tools, Some(Vec::new()));
         assert!(state.plan.path().is_none());
         assert_eq!(state.session.meta.mode, mode);
-        assert_eq!(state.warnings, [MODE_RESTORE_FAILED_WARNING]);
+        assert_eq!(state.warnings.len(), 1);
     }
 
     #[test]

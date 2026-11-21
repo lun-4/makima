@@ -23,7 +23,8 @@ pub use manager_error::{ManagerError, ReactivationError};
 pub use types::{
     AgentIncarnation, AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, AgentResidency,
     CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, PromptWaitError, ReactivationInput,
-    ResidentAgent, ResidentInitialization, ResidentInitializer, ShutdownReport, TurnPermitLease,
+    ResidentAgent, ResidentInitialization, ResidentInitializer, ShutdownReport, SpawnRestoration,
+    TurnPermitLease,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -57,7 +58,7 @@ use crate::{
 };
 use makima_storage::session_state::{
     SessionStateView, StateChange, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
-    StoredDeliveryOp, StoredOffloadRef,
+    StoredDelivery, StoredDeliveryOp, StoredOffloadRef,
 };
 
 const OPAQUE_BACKEND: &str = "agent backend has no stored restoration specification";
@@ -429,11 +430,6 @@ impl AgentManagerHandle {
                 "recovery inputs do not match the journal checkpoint".into(),
             ));
         }
-        if view.scopes.values().any(|scope| !scope.admitted.is_empty()) {
-            return Err(ManagerError::InvalidGraph(
-                "recovery has unterminated admissions".into(),
-            ));
-        }
         let roots: Vec<_> = view
             .agents
             .values()
@@ -556,6 +552,187 @@ impl AgentManagerHandle {
             graph.nodes = nodes;
         }
         Ok(manager)
+    }
+
+    pub fn pending_continuation_agents(&self) -> Result<Vec<AgentId>, ManagerError> {
+        let view = self
+            .0
+            .journal
+            .snapshot()
+            .fold()
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        let graph = self.lock_graph();
+        Ok(view
+            .scopes
+            .iter()
+            .filter_map(|(agent, scope)| {
+                let agent = (*agent)?;
+                (!scope.admitted.is_empty()
+                    && graph.nodes.get(&agent).is_some_and(|node| {
+                        node.lifecycle == GraphLifecycle::Dormant
+                            && node.residency == AgentResidency::Dormant
+                    }))
+                .then_some(agent)
+            })
+            .collect())
+    }
+
+    pub fn pending_continuation_count(&self) -> Result<usize, ManagerError> {
+        let view = self
+            .0
+            .journal
+            .snapshot()
+            .fold()
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        Ok(view.scopes.values().map(|scope| scope.admitted.len()).sum())
+    }
+
+    pub fn suppress_root_continuations(&self) -> Result<usize, ManagerError> {
+        self.fail_pending_continuations(self.root_id()?, TurnCancellationReason::Interrupted)
+    }
+
+    pub fn fail_pending_continuations(
+        &self,
+        agent_id: AgentId,
+        reason: TurnCancellationReason,
+    ) -> Result<usize, ManagerError> {
+        self.settle_pending_continuations(agent_id, |turn| {
+            TurnOutcome::cancelled(agent_id, turn, TokenUsage::default(), 0, reason)
+        })
+    }
+
+    pub async fn fail_restored_turns(
+        &self,
+        agent_id: AgentId,
+        diagnostic: String,
+    ) -> Result<usize, ManagerError> {
+        self.settle_pending_continuations(agent_id, |turn| {
+            TurnOutcome::failed(
+                agent_id,
+                turn,
+                TokenUsage::default(),
+                0,
+                crate::TurnFailure {
+                    kind: crate::TurnFailureKind::Internal,
+                    user_message: diagnostic.clone(),
+                    diagnostic: diagnostic.clone(),
+                    retryable: false,
+                },
+            )
+        })
+    }
+
+    fn settle_pending_continuations(
+        &self,
+        agent_id: AgentId,
+        outcome: impl Fn(TurnId) -> TurnOutcome,
+    ) -> Result<usize, ManagerError> {
+        let graph = self.lock_graph();
+        let node = graph
+            .nodes
+            .get(&agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?;
+        if node.actor.is_some() || node.reservation_pending {
+            return Err(ManagerError::BusySubtree(agent_id));
+        }
+        let view = self
+            .0
+            .journal
+            .snapshot()
+            .fold()
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        let Some(scope) = view.scopes.get(&Some(agent_id)) else {
+            return Ok(0);
+        };
+        let mut changes = scope
+            .admitted
+            .iter()
+            .map(|(turn, origin)| {
+                let result = crate::actor::TurnResult {
+                    outcome: outcome(*turn),
+                    text: String::new(),
+                    output: Vec::new(),
+                    provenance: crate::actor::TurnProvenance {
+                        origin: origin.clone().into(),
+                        ..Default::default()
+                    },
+                    duration_ms: 0,
+                }
+                .to_stored(self.0.journal.snapshot().epoch, None)
+                .map_err(|error| ManagerError::Persistence(error.to_string()))?;
+                Ok(JournalChange {
+                    agent: Some(agent_id),
+                    generation: scope.generation,
+                    change: StateChange::Turn {
+                        turn: *turn,
+                        result,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, ManagerError>>()?;
+        let count = changes.len();
+        let record = view.agents.get(&agent_id);
+        let parent = record
+            .filter(|record| {
+                record
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.auto_deliver && !spec.silent)
+            })
+            .and_then(|record| record.parent);
+        let mut reports = Vec::new();
+        if let Some(parent) = parent {
+            for change in &changes {
+                let StateChange::Turn { turn, result } = &change.change else {
+                    continue;
+                };
+                let delivery = Arc::new(ChildDelivery {
+                    label: record.and_then(|record| record.label.clone()),
+                    result: crate::actor::TurnResult::from_stored(result.clone(), |_| {
+                        Err(IoError::new(
+                            ErrorKind::NotFound,
+                            "inline restored failure expected",
+                        ))
+                    })
+                    .map_err(|error| ManagerError::Persistence(error.to_string()))?,
+                });
+                reports.push((parent, *turn, result.clone(), delivery));
+            }
+        }
+        for (parent, turn, result, delivery) in &reports {
+            changes.push(JournalChange {
+                agent: Some(*parent),
+                generation: 0,
+                change: StateChange::Delivery {
+                    id: (agent_id, *turn),
+                    op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                        label: delivery.label.clone(),
+                        result: result.clone(),
+                        preview_bytes: None,
+                        held: false,
+                    })),
+                },
+            });
+        }
+        if count != 0 {
+            self.0
+                .journal
+                .commit(JournalCommit {
+                    changes,
+                    ..Default::default()
+                })
+                .map_err(|error| ManagerError::Persistence(error.to_string()))?;
+        }
+        drop(graph);
+        for (parent, _, _, delivery) in reports {
+            let mut work = self.0.work.restore_hold(agent_id)?;
+            let work = work.take_report().into_iter().collect();
+            self.deliver_reserved_for(parent, delivery, work, None)
+                .map_err(|error| {
+                    ManagerError::Persistence(format!("restored failure delivery: {error:?}"))
+                })?;
+        }
+        Ok(count)
     }
 
     pub async fn ensure_resident_with<F, Fut>(
@@ -800,7 +977,32 @@ impl AgentManagerHandle {
                 }
             }
         }
+        let admitted = scope
+            .into_iter()
+            .flat_map(|scope| &scope.admitted)
+            .map(|(turn_id, origin)| {
+                Ok(crate::actor::RestoredTurnAdmission {
+                    turn_id: *turn_id,
+                    input: scope
+                        .and_then(|scope| scope.turn_inputs.get(turn_id))
+                        .map(|input| serde_json::from_value(input.clone()))
+                        .transpose()
+                        .map_err(|error| {
+                            ManagerError::InvalidGraph(format!(
+                                "invalid saved input for {turn_id}: {error}"
+                            ))
+                        })?
+                        .unwrap_or_else(|| crate::AgentInput::new(String::new(), Vec::new())),
+                    provenance: crate::actor::TurnProvenance {
+                        origin: origin.clone().into(),
+                        ..Default::default()
+                    },
+                    work: vec![self.0.work.restore_hold(incarnation.agent_id)?],
+                })
+            })
+            .collect::<Result<Vec<_>, ManagerError>>()?;
         let restoration = ActorRestoration {
+            admitted,
             history,
             results,
             deliveries,
@@ -1712,7 +1914,7 @@ impl AgentManagerHandle {
             terminal: Arc::new(Mutex::new(None)),
         };
         self.0.work.register(id, None, 0, true);
-        self.journal_node(id, &node, actor).unwrap();
+        self.journal_node(id, &node, actor, None).unwrap();
         self.lock_graph().nodes.insert(id, node);
     }
 
@@ -2297,7 +2499,7 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(agent_id, reservation, |admission| {
+        self.commit_actor(agent_id, reservation, None, |admission| {
             AgentActorHandle::spawn_managed(
                 agent_id,
                 initial_messages,
@@ -2373,6 +2575,32 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.spawn_child_with_config_and_restoration(
+            current,
+            config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            None,
+            factory,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn spawn_child_with_config_and_restoration<F, E>(
+        &self,
+        current: &CurrentManagedTurn,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        restoration: Option<SpawnRestoration>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         self.validate_active(current)?;
         self.spawn_child_inner(
             current.agent_id(),
@@ -2381,6 +2609,7 @@ impl AgentManagerHandle {
             metadata,
             initial_messages,
             shared_messages,
+            restoration,
             factory,
         )
     }
@@ -2399,6 +2628,32 @@ impl AgentManagerHandle {
         F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
         E: ToString,
     {
+        self.spawn_child_trusted_with_config_and_restoration(
+            parent,
+            config,
+            metadata,
+            initial_messages,
+            shared_messages,
+            None,
+            factory,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn spawn_child_trusted_with_config_and_restoration<F, E>(
+        &self,
+        parent: &AgentRef,
+        config: crate::actor::EffectiveAgentConfig,
+        metadata: AgentMetadata,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        restoration: Option<SpawnRestoration>,
+        factory: F,
+    ) -> Result<AgentRef, ManagerError>
+    where
+        F: FnOnce(AgentId) -> Result<Box<dyn ActorBackend>, E>,
+        E: ToString,
+    {
         self.validate_live_ref(parent)?;
         self.spawn_child_inner(
             parent.id(),
@@ -2407,6 +2662,7 @@ impl AgentManagerHandle {
             metadata,
             initial_messages,
             shared_messages,
+            restoration,
             factory,
         )
     }
@@ -2420,6 +2676,7 @@ impl AgentManagerHandle {
         metadata: AgentMetadata,
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
+        restoration: Option<SpawnRestoration>,
         factory: F,
     ) -> Result<AgentRef, ManagerError>
     where
@@ -2539,7 +2796,7 @@ impl AgentManagerHandle {
                 return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
-        self.commit_actor(child_id, reservation, |admission| {
+        self.commit_actor(child_id, reservation, restoration, |admission| {
             AgentActorHandle::spawn_managed(
                 child_id,
                 initial_messages,
@@ -2822,6 +3079,7 @@ impl AgentManagerHandle {
         &self,
         agent_id: AgentId,
         reservation: u64,
+        restoration: Option<SpawnRestoration>,
         spawn: impl FnOnce(ManagedTurnAdmission) -> (AgentActorHandle, RunnerTask),
     ) -> Result<AgentRef, ManagerError> {
         let mut admission = ManagedTurnAdmission::new(Arc::downgrade(&self.0), agent_id);
@@ -2922,7 +3180,9 @@ impl AgentManagerHandle {
                 ManagerError::NonLiveAgent(agent_id)
             });
         }
-        if let Err(error) = self.journal_node(agent_id, &graph.nodes[&agent_id], &actor) {
+        if let Err(error) =
+            self.journal_node(agent_id, &graph.nodes[&agent_id], &actor, restoration)
+        {
             drop(graph);
             actor.close();
             self.finish_failed_commit(agent_id, reservation);
@@ -2985,6 +3245,7 @@ impl AgentManagerHandle {
         agent_id: AgentId,
         node: &Node,
         actor: &AgentActorHandle,
+        restoration: Option<SpawnRestoration>,
     ) -> Result<(), ManagerError> {
         let existing = self.0.journal.agent(agent_id);
         if existing
@@ -3032,6 +3293,10 @@ impl AgentManagerHandle {
             legacy: false,
         });
         record.lifecycle = StoredAgentLifecycle::Open;
+        if let Some(restoration) = restoration {
+            record.spec = Some(restoration.spec);
+            record.restorable = restoration.restorable;
+        }
         if node.parent_id.is_some() {
             record.label.clone_from(&node.metadata.label);
             record

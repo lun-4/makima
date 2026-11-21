@@ -24,9 +24,9 @@ pub use actor::{
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    ModelSource, RunSettings, SharedMessages, SharedModel, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, end_conversation_detached, find_subdirectory_instructions,
-    is_instruction_file,
+    ModelSource, RESTART_TOOL_INTERRUPTION, RunSettings, SharedMessages, SharedModel,
+    UNAVAILABLE_RESULT, USER_TOOL_INTERRUPTION, close_dangling_tool_calls,
+    end_conversation_detached, find_subdirectory_instructions, is_instruction_file,
 };
 pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{
@@ -83,6 +83,7 @@ pub use makima_domain::{POST_LEVELS, Post, PostLevel};
 pub use makima_providers::AgentError;
 use makima_providers::Message;
 pub use makima_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
+use serde::{Deserialize, Serialize};
 pub use types::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope,
     EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock,
@@ -149,13 +150,14 @@ pub fn batchable(input: &AgentInput) -> bool {
     input.prompt.is_none()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpPromptRef {
     pub qualified_name: String,
     pub arguments: HashMap<String, String>,
 }
 
 /// No `Default` on this struct so adding a field forces every call site to update.
+#[derive(Serialize, Deserialize)]
 pub struct AgentInput {
     pub message: String,
     pub images: Vec<ImageSource>,

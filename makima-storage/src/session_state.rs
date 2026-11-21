@@ -33,6 +33,10 @@ pub enum StateChange {
         turn: TurnId,
         origin: StoredTurnOrigin,
     },
+    TurnInput {
+        turn: TurnId,
+        input: Option<Value>,
+    },
     Config(StoredAgentConfig),
     Rules {
         rules: Vec<StoredRule>,
@@ -287,6 +291,7 @@ pub struct StoredScopeState {
     pub context: BTreeMap<String, StoredContext>,
     pub plugins: BTreeMap<String, StoredPluginValue>,
     pub admitted: BTreeMap<TurnId, StoredTurnOrigin>,
+    pub turn_inputs: BTreeMap<TurnId, Value>,
     pub results: VecDeque<(TurnId, StoredTurnResult)>,
     pub deliveries: BTreeMap<(AgentId, TurnId), StoredDeliveryOp>,
 }
@@ -316,6 +321,7 @@ struct ReducedScope {
     context: OrdMap<String, Arc<StoredContext>>,
     plugins: OrdMap<String, Arc<StoredPluginValue>>,
     admitted: OrdMap<TurnId, Arc<StoredTurnOrigin>>,
+    turn_inputs: OrdMap<TurnId, Arc<Value>>,
     results: Arc<VecDeque<(TurnId, StoredTurnResult)>>,
     deliveries: OrdMap<(AgentId, TurnId), Arc<StoredDeliveryOp>>,
     delivery_sequences: OrdMap<(AgentId, TurnId), u64>,
@@ -342,6 +348,11 @@ impl ReducedScope {
                 .admitted
                 .iter()
                 .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            turn_inputs: self
+                .turn_inputs
+                .iter()
+                .map(|(turn, input)| (*turn, input.as_ref().clone()))
                 .collect(),
             results: self.results.as_ref().clone(),
             deliveries: self
@@ -485,6 +496,15 @@ impl SessionStateReducer {
                     scope.admitted.insert(*turn, Arc::new(origin.clone()));
                 }
             }
+            StateChange::TurnInput { turn, input } => {
+                if let Some(input) = input {
+                    if !scope.results.iter().any(|(id, _)| id == turn) {
+                        scope.turn_inputs.insert(*turn, Arc::new(input.clone()));
+                    }
+                } else {
+                    scope.turn_inputs.remove(turn);
+                }
+            }
             StateChange::Config(config) => scope.config = Some(Arc::new(config.clone())),
             StateChange::Rules { rules, yolo } => {
                 scope.rules = Arc::new(rules.clone());
@@ -519,6 +539,7 @@ impl SessionStateReducer {
             }
             StateChange::Turn { turn, result } => {
                 scope.admitted.remove(turn);
+                scope.turn_inputs.remove(turn);
                 let results = Arc::make_mut(&mut scope.results);
                 results.retain(|(id, _)| id != turn);
                 results.push_back((*turn, result.clone()));
@@ -700,6 +721,44 @@ mod tests {
     }
     fn fold(state: &[StoredStateRecord]) -> SessionStateView {
         SessionStateView::fold(state, &[]).unwrap()
+    }
+
+    #[test_case(false; "consumed")]
+    #[test_case(true; "terminal")]
+    fn admitted_input_survives_roundtrip_until_consumed_or_terminal(terminal: bool) {
+        let agent = AgentId::generate();
+        let turn = TurnId::generate();
+        let input = json!({"message":"queued input", "images":[], "preamble":[{"saved":"preamble"}],
+            "prompt":{"qualified_name":"server.prompt", "arguments":{"key":"value"}}});
+        let mut records = vec![
+            state(
+                1,
+                Some(agent),
+                json!({"kind":"admitted", "turn":turn, "origin":"user"}),
+            ),
+            state(
+                2,
+                Some(agent),
+                json!({"kind":"turn_input", "turn":turn, "input":input}),
+            ),
+        ];
+        assert_eq!(
+            fold(&records).scopes[&Some(agent)].turn_inputs[&turn],
+            input
+        );
+        records.push(state(
+            3,
+            Some(agent),
+            if terminal {
+                json!({"kind":"turn", "turn":turn, "result":result(agent, turn)})
+            } else {
+                json!({"kind":"turn_input", "turn":turn, "input":null})
+            },
+        ));
+        let restored = fold(&records);
+        let scope = &restored.scopes[&Some(agent)];
+        assert!(scope.turn_inputs.is_empty());
+        assert_eq!(scope.admitted.contains_key(&turn), !terminal);
     }
 
     #[test_case(false ; "released")]

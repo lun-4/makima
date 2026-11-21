@@ -724,7 +724,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
         .flat_map(|pending| pending.work.iter().map(WorkReservation::hold_only))
         .collect::<Vec<_>>();
     state.turn_work.insert(turn_id, work);
-    inner.admit_ticket(turn_id, ticket.clone());
+    inner.admit_ticket(turn_id, ticket.clone(), None);
     for pending in state.deliveries.values_mut() {
         pending.arrived_during_run = false;
     }

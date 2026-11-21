@@ -684,6 +684,7 @@ fn restored_actor_hydrates_exact_history_and_tickets_before_start() {
         let (actor, task) = AgentActorHandle::spawn_managed_restored(
             agent,
             super::ActorRestoration {
+                admitted: Vec::new(),
                 history: history.clone(),
                 results: vec![result.clone()],
                 deliveries: vec![pending_delivery],

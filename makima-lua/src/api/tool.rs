@@ -65,6 +65,7 @@ const TOOL_HANDLER_RETURN_ERR: &str =
 const OUTPUT_TIMEOUT_ERR: &str = "timeout exceeded";
 const OUTPUT_CANCELLED_ERR: &str = "cancelled";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
+const RESUMABLE_PARSE_ERR: &str = "register_tool: 'resumable' must be a boolean";
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
 const ARGUMENTS_ERR: &str = "register_command: 'arguments' must be an array of argument tables";
@@ -213,6 +214,7 @@ pub(crate) struct PendingTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) resumable: bool,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
@@ -242,6 +244,7 @@ pub(crate) struct LuaTool {
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
     pub(crate) audience: ToolAudience,
+    pub(crate) resumable: bool,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
@@ -303,6 +306,10 @@ impl Tool for LuaTool {
 
     fn audience(&self) -> ToolAudience {
         self.audience
+    }
+
+    fn resumable(&self) -> bool {
+        self.resumable
     }
 
     fn tool_kind(&self) -> Option<&str> {
@@ -787,6 +794,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
+///   resumable       (boolean)  Default false. Stateless tools are resumable: opt in only when an in-flight call can safely run or wait again after restart. Other tools receive an interruption result instead.
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
 ///   header          (function) Optional. Called before execution, returns a string or BufHandle for the one-line header.
 ///   restore         (function) Optional. Called to re-render a previous tool result. Receives `(tool_name, input, output, ctx)`.
@@ -1729,6 +1737,11 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let resumable = match spec.get::<LuaValue>("resumable")? {
+        LuaValue::Nil => false,
+        LuaValue::Boolean(value) => value,
+        _ => return Err(mlua::Error::runtime(RESUMABLE_PARSE_ERR)),
+    };
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1761,6 +1774,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             description,
             schema: param_schema,
             audience,
+            resumable,
             kind,
             handler_key,
             header_key,
@@ -2855,6 +2869,59 @@ mod tests {
         assert_eq!(tool.description(&ctx), "test");
     }
 
+    #[test_case::test_case(None, false; "defaults_to_not_resumable")]
+    #[test_case::test_case(Some(false), false; "explicit_not_resumable")]
+    #[test_case::test_case(Some(true), true; "opt_in_resumable")]
+    fn register_tool_parses_resumable(value: Option<bool>, expected: bool) {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(
+                r#"{
+            name = "restart_probe", description = "Restart probe", schema = {},
+            handler = function() return "done" end,
+        }"#,
+            )
+            .eval()
+            .unwrap();
+        if let Some(value) = value {
+            spec.set("resumable", value).unwrap();
+        }
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        register_tool_from_lua(&lua, &spec, Arc::clone(&pending)).unwrap();
+        let tools = pending.lock().unwrap();
+        assert_eq!(tools[0].resumable, expected);
+        let tool = LuaTool {
+            resumable: tools[0].resumable,
+            ..make_lua_tool(None)
+        };
+        assert_eq!(tool.resumable(), expected);
+    }
+
+    #[test_case::test_case("\"true\""; "string")]
+    #[test_case::test_case("1"; "number")]
+    #[test_case::test_case("{}"; "table")]
+    fn register_tool_rejects_non_boolean_resumable(value: &str) {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(
+                r#"{
+            name = "restart_probe", description = "Restart probe", schema = {},
+            handler = function() return "done" end,
+        }"#,
+            )
+            .eval()
+            .unwrap();
+        spec.set("resumable", lua.load(value).eval::<LuaValue>().unwrap())
+            .unwrap();
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let error = register_tool_from_lua(&lua, &spec, Arc::clone(&pending)).unwrap_err();
+        assert!(
+            matches!(&error, mlua::Error::RuntimeError(message) if message == RESUMABLE_PARSE_ERR),
+            "{error:#}"
+        );
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
     fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
         let schema = try_from_json(&serde_json::json!({
             "type": "object",
@@ -2872,6 +2939,7 @@ mod tests {
             description: "test".into(),
             schema,
             audience: ToolAudience::default(),
+            resumable: false,
             kind: None,
             tx,
             plugin: Arc::from("test"),

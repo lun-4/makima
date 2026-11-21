@@ -466,27 +466,9 @@ impl<'h> Agent<'h> {
             prompt: _,
         } = input;
         let mut initial = self.history.input_batch().await;
-        for message in preamble {
-            initial.push(message);
-        }
+        let mut messages = preamble;
         if let Some(mailbox) = &self.mailbox {
-            for message in mailbox.drain() {
-                initial.push(message);
-            }
-        }
-        // Observers read this event as "the turn has taken its input", so the
-        // preamble has to be in the history they read before it goes out.
-        if let Some(submission) = self
-            .turn_inbox
-            .as_ref()
-            .and_then(|inbox| inbox.take_initial_submission())
-        {
-            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
-                text: submission.text,
-                images: submission.images,
-                mcp_startup_notice: submission.mcp_startup_notice,
-                already_displayed: submission.already_displayed,
-            });
+            messages.extend(mailbox.drain());
         }
         if !message.trim().is_empty() || !images.is_empty() {
             let mut user_message = Message::user_with_images(message.clone(), images);
@@ -507,9 +489,24 @@ impl<'h> Agent<'h> {
                     format!("{message}\n{notice}")
                 });
             }
-            initial.push(user_message);
+            messages.push(user_message);
         }
+        initial.append_turn_input(turn_id, messages);
         drop(initial);
+        // Observers read this event as "the turn has taken its input", so the
+        // preamble has to be in the history they read before it goes out.
+        if let Some(submission) = self
+            .turn_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.take_initial_submission())
+        {
+            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: submission.text,
+                images: submission.images,
+                mcp_startup_notice: submission.mcp_startup_notice,
+                already_displayed: submission.already_displayed,
+            });
+        }
         self.mode_def = self
             .admission
             .as_ref()
@@ -607,6 +604,18 @@ impl<'h> Agent<'h> {
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        if !super::history::pending_tool_calls(self.history.as_slice()).is_empty() {
+            let ctx = self.tool_context()?;
+            self.cancel
+                .race(tool_dispatch::resume_tool_calls(
+                    &mut self.recent_calls,
+                    self.history.reborrow(),
+                    &self.event_tx,
+                    &ctx,
+                ))
+                .await
+                .map_err(|_| AgentError::Cancelled)??;
+        }
         let mut completion_recovery_attempts = 0;
         loop {
             if self.cancel.is_cancelled() {
@@ -3520,6 +3529,89 @@ mod tests {
             .await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             assert_eq!(sent, Some(1));
+        });
+    }
+
+    #[test]
+    fn restart_closes_pending_calls_before_the_provider_request() {
+        smol::block_on(async {
+            const CALL_ID: &str = "interrupted-call";
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let assistant = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    CALL_ID,
+                    "bash",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![
+                Message::user("continue task".into()),
+                assistant.clone(),
+            ]);
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let outcome = run_admitted(
+                &mut agent,
+                TurnId::generate(),
+                AgentInput {
+                    message: String::new(),
+                    ..default_input()
+                },
+            )
+            .await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].len(), 3);
+            assert_eq!(captured[0][1], assistant);
+            assert!(matches!(&captured[0][2].content[0],
+                ContentBlock::ToolResult { tool_use_id, content, is_error: true }
+                if tool_use_id == CALL_ID && content == super::super::history::RESTART_TOOL_INTERRUPTION));
+        });
+    }
+
+    #[test]
+    fn dropping_a_partial_stream_does_not_publish_the_response() {
+        const PARTIAL: &str = "uncommitted answer";
+        smol::block_on(async {
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                ..Default::default()
+            };
+            let mirror: SharedMessages =
+                Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+            let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+            let (mut agent, events) = make_agent(provider, &mut history);
+            {
+                let mut run = pin!(run_admitted(
+                    &mut agent,
+                    TurnId::generate(),
+                    default_input()
+                ));
+                futures_lite::future::or(
+                    async {
+                        let _ = (&mut run).await;
+                        panic!("stream must remain pending");
+                    },
+                    async {
+                        loop {
+                            if matches!(
+                                events.recv_async().await.unwrap().event,
+                                AgentEvent::TextDelta { .. }
+                            ) {
+                                break;
+                            }
+                        }
+                    },
+                )
+                .await;
+            }
+            drop(agent);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.as_slice()[0].role, Role::User);
+            assert_eq!(mirror.load().messages.as_slice(), history.as_slice());
         });
     }
 

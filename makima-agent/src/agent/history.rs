@@ -12,17 +12,21 @@ use makima_storage::conversation::ConversationState;
 use makima_storage::id::MakimaId;
 use makima_storage::session_state::{StateChange, StoredDeliveryOp};
 use makima_storage::sessions::next_epoch;
+use serde_json::Value;
 use tracing::warn;
 
-use crate::AgentId;
 use crate::actor::HistoryMutationError;
 use crate::journal::{
     JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
     take_history_changes,
 };
+use crate::{AgentId, TurnId};
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
+pub const USER_TOOL_INTERRUPTION: &str =
+    "This tool call was interrupted by the user before it finished. It may have partly run.";
+pub const RESTART_TOOL_INTERRUPTION: &str = "This tool call was interrupted when makima stopped. It may have partly run. Check the current state before retrying, then continue your task.";
 
 pub type HistorySnapshot = makima_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
@@ -332,6 +336,26 @@ impl History {
         }
     }
 
+    pub(crate) fn append_turn_input(&mut self, turn: TurnId, mut messages: Vec<Message>) {
+        let mut changes = take_history_changes();
+        if let Some((agent, _)) = &self.journal {
+            changes.push(JournalChange {
+                agent: Some(*agent),
+                generation: self.snapshot.epoch,
+                change: StateChange::TurnInput { turn, input: None },
+            });
+        }
+        let last = messages.pop();
+        let count = messages.len();
+        Arc::make_mut(&mut self.snapshot.messages).extend(messages);
+        Arc::make_mut(&mut self.snapshot.ids).extend((0..count).map(|_| MakimaId::generate()));
+        if let Some(last) = last {
+            self.push_with_changes(last, changes);
+        } else if let Err(error) = self.publish_with_epoch(false, changes) {
+            warn!(%error, %turn, "turn input could not be journaled");
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.snapshot.messages.len()
     }
@@ -621,15 +645,35 @@ fn sanitize_restored(messages: &mut Vec<Message>) {
     }
 }
 
+pub(crate) fn pending_tool_calls(messages: &[Message]) -> Vec<(String, String, Value)> {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+    else {
+        return Vec::new();
+    };
+    messages[index]
+        .tool_uses()
+        .filter(|(id, _, _)| {
+            !messages[index + 1..].iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == *id)
+                })
+            })
+        })
+        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+        .collect()
+}
+
 pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
-    let Some(last) = messages.last() else { return };
-    if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
+    let pending = pending_tool_calls(messages);
+    if pending.is_empty() {
         return;
     }
-    let error_results: Vec<ContentBlock> = last
-        .tool_uses()
+    let error_results: Vec<ContentBlock> = pending
+        .into_iter()
         .map(|(id, _, _)| ContentBlock::ToolResult {
-            tool_use_id: id.to_owned(),
+            tool_use_id: id,
             content: note.to_owned(),
             is_error: true,
         })
@@ -643,11 +687,11 @@ pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
 }
 
 pub(crate) fn sanitize_cancelled_history(history: &mut History, rollback_len: usize) {
-    if history.len() <= rollback_len {
+    if history.len() <= rollback_len && pending_tool_calls(history.as_slice()).is_empty() {
         return;
     }
     history.edit(|msgs| {
-        close_dangling_tool_calls(msgs, CANCEL_MARKER);
+        close_dangling_tool_calls(msgs, USER_TOOL_INTERRUPTION);
         msgs.push(Message::synthetic(CANCEL_MARKER.into()));
     });
 }
@@ -730,7 +774,7 @@ mod tests {
     fn restored_deliveries_release_only_with_explicit_user_input(user: bool, observation: bool) {
         use crate::actor::{ChildDelivery, TurnProvenance, TurnResult};
         use crate::{TurnCancellationReason, TurnOutcome};
-        use makima_storage::id::MakimaId;
+        use makima_storage::id::{MakimaId, TurnId};
         use makima_storage::session_state::StoredDelivery;
 
         let journal = Arc::new(SessionJournal::default());
@@ -1224,6 +1268,25 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_resumed_calls_close_only_missing_results() {
+        let mut history = History::new(vec![
+            make_tool_use_msg(&["t1", "t2"]),
+            make_tool_result_msg(&["t1"]),
+            Message::user("queued while restarting".into()),
+        ]);
+        let rollback_len = history.len();
+        sanitize_cancelled_history(&mut history, rollback_len);
+        assert_eq!(history.len(), rollback_len + 2);
+        let results = &history.as_slice()[rollback_len];
+        assert_eq!(extract_error_ids(results), ["t2"]);
+        assert!(
+            matches!(&results.content[0], ContentBlock::ToolResult { content, .. }
+            if content == USER_TOOL_INTERRUPTION)
+        );
+        assert!(pending_tool_calls(history.as_slice()).is_empty());
+    }
+
+    #[test]
     fn close_dangling_is_noop_when_tool_result_already_present() {
         let mut messages = vec![
             Message::user("go".into()),
@@ -1261,7 +1324,7 @@ mod tests {
         assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
         assert!(snap.messages[2].content.iter().any(|b| matches!(
             b,
-            ContentBlock::ToolResult { content, .. } if content == CANCEL_MARKER
+            ContentBlock::ToolResult { content, .. } if content == USER_TOOL_INTERRUPTION
         )));
         assert!(matches!(
             &snap.messages[3].content[0],

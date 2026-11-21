@@ -13,7 +13,8 @@ pub use admission::{
 };
 pub use compaction::compact;
 pub use history::{
-    History, HistorySnapshot, SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls,
+    History, HistorySnapshot, RESTART_TOOL_INTERRUPTION, SharedMessages, UNAVAILABLE_RESULT,
+    USER_TOOL_INTERRUPTION, close_dangling_tool_calls,
 };
 pub use instructions::{
     InstructionSource, Instructions, LoadedInstructions, build_mode_system_prompt,
