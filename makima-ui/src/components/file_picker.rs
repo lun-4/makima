@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -92,6 +93,14 @@ pub struct FilePickerModal {
     scrollbar_hit: Option<ScrollbarHit>,
     row_hits: Vec<(Rect, usize)>,
     session: Option<Session>,
+}
+
+pub(super) fn normalize_file_query(query: &str) -> Cow<'_, str> {
+    if cfg!(windows) && query.contains('\\') {
+        Cow::Owned(query.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(query)
+    }
 }
 
 /// Spawns the async file walker for a cwd, shared by the file picker and the
@@ -514,9 +523,13 @@ fn edit_query(s: &mut Session, edit: impl FnOnce(&mut TextBuffer)) {
 
 fn reparse_pattern(s: &mut Session) {
     let query = s.search.value();
-    s.nucleo
-        .pattern
-        .reparse(0, &query, CaseMatching::Smart, Normalization::Smart, false);
+    s.nucleo.pattern.reparse(
+        0,
+        &normalize_file_query(&query),
+        CaseMatching::Smart,
+        Normalization::Smart,
+        false,
+    );
     s.publication.query_reparsed(
         s.nucleo.pattern.column_pattern(0),
         s.nucleo.injector().injected_items() > 0,
@@ -528,6 +541,7 @@ fn refresh_matches(s: &mut Session) {
     let coarse_match_count = snapshot.matched_item_count();
     let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
     let query = s.search.value();
+    let query = normalize_file_query(&query);
     let options = CompletionMatchOptions {
         case_matching: CaseMatching::Smart,
         normalization: Normalization::Smart,
@@ -749,6 +763,7 @@ mod tests {
     const NEVER_CONVERGED: &str = "picker never rebuilt its matches from later ticks";
 
     const MAIN_PATH: &str = "src/main.rs";
+    const MAIN_PATH_BACKSLASH: &str = r"src\main.rs";
     const README_PATH: &str = "docs/readme.md";
     const README_QUERY: &str = "readme";
 
@@ -1173,6 +1188,28 @@ mod tests {
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             FilePickerModalAction::Select(path) if path == MAIN_PATH
+        ));
+    }
+
+    #[test_case(MAIN_PATH; "forward_slashes")]
+    #[test_case(MAIN_PATH_BACKSLASH; "backslashes")]
+    fn picker_matches_path_without_rewriting_search(query: &str) {
+        let (mut picker, _done_tx) = pending_picker();
+        inject_file(&picker, MAIN_PATH);
+        #[cfg(not(windows))]
+        inject_file(&picker, MAIN_PATH_BACKSLASH);
+        let _ = tick_until(&mut picker, |s| !s.matches.is_empty()).expect(NEVER_CONVERGED);
+
+        assert!(picker.handle_paste(query));
+        let _ = tick_until(&mut picker, |s| s.publication.ready()).expect(NEVER_CONVERGED);
+
+        let s = picker.session.as_ref().unwrap();
+        assert_eq!(s.search.value(), query);
+        assert_eq!(s.matches.len(), 1);
+        let expected_path = if cfg!(windows) { MAIN_PATH } else { query };
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            FilePickerModalAction::Select(path) if path == expected_path
         ));
     }
 

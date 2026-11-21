@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::click::{ClickTarget, CompletionGrid, HitTarget, Surface};
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
+use crate::components::file_picker::normalize_file_query;
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -807,7 +809,7 @@ impl FileCompletionMenu {
             if let Discovery::Project { nucleo, .. } = &mut session.discovery {
                 nucleo.pattern.reparse(
                     0,
-                    &query.to_lowercase(),
+                    &normalize_file_query(query).to_lowercase(),
                     CaseMatching::Smart,
                     Normalization::Smart,
                     false,
@@ -1157,6 +1159,17 @@ fn refresh_file_matches(s: &mut Session) {
     s.materialized_count = materialized_count;
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
+    let file_intent;
+    let intent = match normalize_file_query(&s.intent.payload) {
+        Cow::Borrowed(_) => &s.intent,
+        Cow::Owned(payload) => {
+            file_intent = QueryIntent {
+                payload,
+                ..s.intent
+            };
+            &file_intent
+        }
+    };
     for (order, path) in paths.into_iter().enumerate() {
         let directory = ends_with_path_separator(&path);
         let item = if directory {
@@ -1164,7 +1177,7 @@ fn refresh_file_matches(s: &mut Session) {
         } else {
             CompletionItem::file(path)
         };
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, directory) {
+        if let Some(candidate) = match_candidate(item, intent, 0, order, directory) {
             s.file_matches.push(candidate);
         }
     }
@@ -1403,6 +1416,7 @@ fn cell_line<'a>(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1419,9 +1433,13 @@ mod tests {
     use makima_lua::ItemSpec;
 
     use super::*;
+    use tempfile::tempdir;
     use test_case::test_case;
 
     const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PROJECT_MATCHES_MISSING: &str = "project matcher did not settle";
+    const PROJECT_PATHS: [&str; 2] = ["src/main.rs", "src/math.rs"];
+    const BACKSLASH_PATHS: [&str; 2] = [r"src\main.rs", r"src\math.rs"];
 
     #[test_case(r"C:\Users\me\notes.md", true; "drive_backslash")]
     #[test_case("C:/Users/me/notes.md", true; "drive_slash")]
@@ -3105,6 +3123,64 @@ mod tests {
                 assert_eq!(rect.width, input_area.width);
             })
             .unwrap();
+    }
+
+    #[test_case(PROJECT_PATHS; "forward_slashes")]
+    #[test_case(BACKSLASH_PATHS; "backslashes")]
+    fn project_file_queries_match_on_open_and_update(queries: [&str; 2]) {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        for path in PROJECT_PATHS {
+            fs::write(root.path().join(path), []).unwrap();
+        }
+        #[cfg(not(windows))]
+        for path in BACKSLASH_PATHS {
+            fs::write(root.path().join(path), []).unwrap();
+        }
+
+        let references = queries.map(|query| item(query, "skill", &format!("@skill:{query}")));
+        let mut menu = FileCompletionMenu::new();
+        menu.open(
+            root.path().to_str().unwrap(),
+            references.to_vec(),
+            queries[0],
+            (0, queries[0].len() + 1),
+        );
+
+        for (index, query) in queries.into_iter().enumerate() {
+            if index > 0 {
+                menu.sync_query(query);
+            }
+            let path = if cfg!(windows) {
+                PROJECT_PATHS[index]
+            } else {
+                query
+            };
+            wait_for_matcher(
+                &mut menu,
+                |menu| {
+                    let session = menu.session.as_ref().unwrap();
+                    let Discovery::Project { nucleo, .. } = &session.discovery else {
+                        return false;
+                    };
+                    !session.walking
+                        && !session.matching
+                        && session.publication.ready()
+                        && nucleo.snapshot().item_count() == nucleo.injector().injected_items()
+                },
+                PROJECT_MATCHES_MISSING,
+            );
+            let session = menu.session.as_ref().unwrap();
+            assert_eq!(session.query, query);
+            assert_eq!(session.file_matches.len(), 1);
+            let file = &session.file_matches[0];
+            assert_eq!(file.item.label, path);
+            assert_eq!(file.item.insertion, format!("@{path}"));
+            assert_eq!(session.ref_matches.len(), 1);
+            let reference = &session.ref_matches[0];
+            assert_eq!(reference.item.label, references[index].label);
+            assert_eq!(reference.item.insertion, references[index].insertion);
+        }
     }
 
     #[test]
