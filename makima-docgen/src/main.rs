@@ -207,10 +207,10 @@ mod tests {
         let sinks = Sinks::default();
         let pages: [Page; 2] = [("one", generated_page), ("two", generated_page)];
 
-        run_generation(false, &pages, sinks.check(), sinks.write()).expect("generation");
+        let _ = run_generation(false, &pages, sinks.check(), sinks.write()).expect("generation");
         assert_eq!(sinks.counts(), (0, 2));
 
-        run_generation(true, &pages, sinks.check(), sinks.write()).expect("check");
+        let _ = run_generation(true, &pages, sinks.check(), sinks.write()).expect("check");
         assert_eq!(sinks.counts(), (2, 2));
     }
 }
