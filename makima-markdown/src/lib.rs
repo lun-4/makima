@@ -658,10 +658,7 @@ fn is_valid_italic_open(bytes: &[u8], pos: usize) -> bool {
             return false;
         }
     }
-    if ch == b'_' && pos > 0 && is_word_char(bytes[pos - 1]) {
-        return false;
-    }
-    true
+    !(ch == b'_' && pos > 0 && is_word_char(bytes[pos - 1]))
 }
 
 fn is_valid_strike_open(bytes: &[u8], pos: usize) -> bool {
