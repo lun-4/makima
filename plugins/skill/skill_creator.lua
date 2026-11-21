@@ -127,10 +127,14 @@ Useful shape:
 If <observable condition>, read [references/x.md](references/x.md).
 ```
 
-### 6. Validate by running it
+### 6. Validate it
 
-Run the skill's own commands, not just your eyes. Use a throwaway directory
-with realistic fixture inputs.
+For a review, leave the skill and project unchanged unless the user asks for
+edits. Check paths, syntax, and workflow without performing the workflow.
+
+When testing, run only commands that are relevant and authorized, in a
+throwaway directory with realistic fixtures. A review is not permission to
+publish, deploy, or touch live data. Report what you skipped and why.
 
 - [ ] Directory name and `name` agree; the name is lowercase, digits, and
       hyphens, at most 64 characters.
@@ -139,11 +143,11 @@ with realistic fixture inputs.
 - [ ] Every relative file mentioned in the body exists.
 - [ ] Every command block names its working directory, and the paths in it
       are valid from that directory.
-- [ ] Every fenced command was run verbatim from the working directory the
-      body states and succeeded.
-- [ ] The body's own output template passes the body's own validator.
-- [ ] Every code example in the body parses or runs (YAML, JSON, shell,
-      snippets).
+- [ ] Each command selected for testing was run from its documented working
+      directory in the fixture and behaved as expected.
+- [ ] If the body includes an output template and a validator, the template
+      passes that validator when tested.
+- [ ] Examples not run were checked for syntax where possible.
 - [ ] Empty sections, heading variants, and every behavior promised in the
       description or body each have a fixture that exercises them.
 - [ ] At least one negative case per documented check fails with the expected
@@ -168,13 +172,16 @@ Trigger test, worth doing for any skill the model should pick on its own:
 
 1. Write three prompts that should trigger it and three near misses that
    should not. Near misses share keywords but need a different job.
-2. If subagents are available, send each prompt to a research subagent with
-   realistic context and ask which skill, if any, it would load first, and
-   why. Do not reveal the expected answer.
+2. If subagents are available and the current skill catalog includes the
+   description you want to test, send each prompt to a research subagent
+   with realistic context. Ask which skill, if any, it would load first and
+   why. Do not reveal the expected answer. If the catalog is stale or
+   subagents are unavailable, report trigger testing as pending.
 3. If should-trigger prompts miss, tighten the description with the user's
    real words. If near misses trigger, add a boundary.
-4. Run the explicit path yourself: `@skill:<name>` followed by a real task.
-   Confirm the body is enough to finish it.
+4. Separately, smoke-test explicit invocation with `@skill:<name>` and a safe,
+   representative task. If you cannot submit the token yourself, give the
+   user a prompt to try. This checks the body, not automatic selection.
 
 Output test, only for skills with objective results:
 
@@ -185,8 +192,8 @@ Output test, only for skills with objective results:
 ### Updating an existing skill
 
 - Preserve the name and directory.
-- Read the current body first, then edit the smallest part that addresses the
-  problem.
+- Read the current body in full, then edit the smallest part that addresses
+  the problem.
 - Re-read the description after any scope change. Retest triggering if you
   changed it.
 - If the skill grew past its budget, move detail into `references/` instead of
