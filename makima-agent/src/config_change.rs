@@ -1,5 +1,6 @@
 //! The one sequence every agent config change commits through.
 
+use makima_domain::LockExt;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, MutexGuard};
@@ -150,11 +151,7 @@ pub async fn reserve_in_turn_for_actor<T>(
 }
 
 pub(crate) fn waiting(actor: &AgentActorHandle) -> MutexGuard<'_, VecDeque<Arc<()>>> {
-    actor
-        .inner
-        .config_waiters
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    actor.inner.config_waiters.lock_unpoisoned()
 }
 
 pub struct ConfigChangeTicket<'a> {

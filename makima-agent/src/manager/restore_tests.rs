@@ -37,7 +37,7 @@ use crate::{
     journal::{
         JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
     },
-    test_util::StubBackend,
+    test_util::{MockBackend, poll_until},
 };
 
 type StoredSession = Session<Message, TokenUsage, crate::ToolOutput>;
@@ -119,18 +119,11 @@ fn publication_commit(binding: &JournalIncarnation) -> JournalCommit {
 }
 
 async fn wait_for_incarnation_cleanup(journal: &SessionJournal, binding: &JournalIncarnation) {
-    or(
-        async {
-            while journal.incarnation(binding.agent) == *binding {
-                yield_now().await;
-            }
-        },
-        async {
-            smol::Timer::after(DETACH_TIMEOUT).await;
-            panic!("incarnation cleanup did not finish after publication released");
-        },
-    )
-    .await;
+    poll_until(DETACH_TIMEOUT, || {
+        (journal.incarnation(binding.agent) != *binding).then_some(())
+    })
+    .await
+    .expect("incarnation cleanup did not finish after publication released");
 }
 
 #[test]
@@ -176,25 +169,15 @@ fn detach_after_publication_waits_for_install_and_runtime_finalization() {
             ManagerError::Reactivation(ReactivationError::Cancelled)
         );
         token.install().unwrap();
-        or(
-            async {
-                loop {
-                    let finished = manager.lock_graph().nodes[&id]
-                        .task
-                        .as_ref()
-                        .is_some_and(smol::Task::is_finished);
-                    if finished {
-                        break;
-                    }
-                    yield_now().await;
-                }
-            },
-            async {
-                smol::Timer::after(DETACH_TIMEOUT).await;
-                panic!("detached actor runner did not finish before publication released");
-            },
-        )
-        .await;
+        poll_until(DETACH_TIMEOUT, || {
+            manager.lock_graph().nodes[&id]
+                .task
+                .as_ref()
+                .is_some_and(smol::Task::is_finished)
+                .then_some(())
+        })
+        .await
+        .expect("detached actor runner did not finish before publication released");
         assert_eq!(journal.incarnation(id), binding);
         assert_eq!(
             manager.node(id).unwrap().residency,
@@ -604,7 +587,7 @@ fn config() -> EffectiveAgentConfig {
 
 fn resident() -> ResidentAgent {
     ResidentAgent {
-        backend: Box::new(StubBackend),
+        backend: Box::new(MockBackend::STRICT),
         config: config(),
         shared_messages: None,
         start: None,
@@ -1719,7 +1702,7 @@ struct InitializationBackend {
     journal: Arc<SessionJournal>,
     returned: Arc<AtomicBool>,
     started: flume::Sender<(bool, bool)>,
-    stub: StubBackend,
+    stub: MockBackend,
 }
 
 impl ActorBackend for InitializationBackend {
@@ -1785,7 +1768,7 @@ fn finish_with_retains_claimed_publication_until_work_returns(cut: Initializatio
             journal: Arc::clone(&journal),
             returned,
             started,
-            stub: StubBackend,
+            stub: MockBackend::STRICT,
         };
         let mut first = Some(Box::pin(manager.ensure_resident_with(id, |_| async move {
             let mut resident = resident();
@@ -2069,13 +2052,7 @@ fn close_during_finish_with_is_busy_without_mutation_and_succeeds_after_finish(i
             let node = &graph.nodes[&id];
             assert!(node.actor.as_ref().unwrap().same_actor(&actor));
             assert!(node.task.is_some());
-            assert!(
-                node.activation
-                    .as_ref()
-                    .unwrap()
-                    .finishing
-                    .load(Ordering::Acquire)
-            );
+            assert!(node.activation_finishing);
         }
         assert!(poll_once(activation.as_mut()).await.is_none());
         release.send(()).unwrap();
@@ -2177,7 +2154,7 @@ fn folded_legacy_identities_are_readable_but_exempt_from_retention_quota() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                |_| Ok::<_, String>(Box::new(StubBackend) as Box<dyn ActorBackend>),
+                |_| Ok::<_, String>(Box::new(MockBackend::STRICT) as Box<dyn ActorBackend>),
             )
         };
         let child = spawn().unwrap();
@@ -2309,7 +2286,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
                 AgentMetadata::default(),
                 Vec::new(),
                 None,
-                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
             )
             .unwrap();
         assert_ne!(replacement.id(), id);
@@ -2329,52 +2306,28 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
     });
 }
 
-struct ContinuationBackend;
-
-impl ActorBackend for ContinuationBackend {
-    fn run_turn<'a>(
-        &'a mut self,
-        history: ActorHistory<'a>,
-        context: TurnContext,
-        input: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            assert!(input.message.is_empty());
-            assert!(input.images.is_empty());
-            assert!(input.preamble.is_empty());
-            assert_eq!(
-                history.snapshot().messages.as_slice(),
-                &[Message::user(HISTORY_TEXT.into())]
-            );
-            assert_eq!(context.provenance.origin, crate::actor::TurnOrigin::User);
-            BackendResult::EnteredRun(crate::TurnOutcome::completed(
-                context.agent_id,
-                context.turn_id.unwrap(),
-                TokenUsage::default(),
-                0,
-                crate::DoneReason::EndTurn,
-            ))
+fn continuation_backend() -> MockBackend {
+    MockBackend::STRICT
+        .with_noop_controls()
+        .with_turn(|history, context, input, _| {
+            Box::pin(async move {
+                assert!(input.message.is_empty());
+                assert!(input.images.is_empty());
+                assert!(input.preamble.is_empty());
+                assert_eq!(
+                    history.snapshot().messages.as_slice(),
+                    &[Message::user(HISTORY_TEXT.into())]
+                );
+                assert_eq!(context.provenance.origin, crate::actor::TurnOrigin::User);
+                BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    TokenUsage::default(),
+                    0,
+                    crate::DoneReason::EndTurn,
+                ))
+            })
         })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
 }
 
 #[test_case(false; "root")]
@@ -2409,7 +2362,7 @@ fn restored_admission_continues_original_turn_without_duplicate_input(child: boo
             .ensure_resident_with(id, |_| async {
                 Ok(ResidentAgent {
                     start: Some(ready),
-                    backend: Box::new(ContinuationBackend),
+                    backend: Box::new(continuation_backend()),
                     initialize: Some(Box::new(|initialization| {
                         Box::pin(async move {
                             initialization

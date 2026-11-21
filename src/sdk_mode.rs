@@ -7,6 +7,7 @@
 //! hyphenated-hex UUIDv7 shape that Claude Code SDK consumers expect, rather than makima's base58
 //! `MakimaId` canonical form.
 
+use makima_domain::LockExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
@@ -1073,7 +1074,7 @@ impl SdkRuntime {
             observer,
         }
         .spawn(self.handle.event_rx.clone());
-        self.tasks.lock().unwrap().extend([
+        self.tasks.lock_unpoisoned().extend([
             pump,
             watch_command_projection(
                 self.writer.clone(),
@@ -1081,7 +1082,7 @@ impl SdkRuntime {
                 self.commands.target.clone(),
             ),
         ]);
-        *self.discovery.lock().unwrap() = Some(self.catalog.discover(
+        *self.discovery.lock_unpoisoned() = Some(self.catalog.discover(
             Arc::clone(&params.model_policy),
             params.model.provider.to_string(),
             |_| {},
@@ -1100,7 +1101,7 @@ impl SdkRuntime {
     }
 
     async fn close(&self) -> Result<()> {
-        self.discovery.lock().unwrap().take();
+        self.discovery.lock_unpoisoned().take();
         self.handle.manager.suspend(SDK_SHUTDOWN_TIMEOUT).await;
         let closed = if SessionCoordinatorHandle::resolve(self.handle.session_id.id()).is_ok() {
             self.coordinator.close().await
@@ -1109,7 +1110,7 @@ impl SdkRuntime {
         };
         let drained = self.checkpoint.drain().await;
         self.handle.manager.journal().invalidate_state_access();
-        let tasks = mem::take(&mut *self.tasks.lock().unwrap());
+        let tasks = mem::take(&mut *self.tasks.lock_unpoisoned());
         for task in tasks {
             task.cancel().await;
         }
@@ -1156,7 +1157,7 @@ impl SdkSession {
         let mut init = runtime.init.clone();
         init["slash_commands"] = serde_json::to_value(runtime.commands.slash_commands())?;
         {
-            let mut current = session.current.lock().unwrap();
+            let mut current = session.current.lock_unpoisoned();
             runtime.writer.emit_system("init", init)?;
             *current = Some(Arc::clone(&runtime));
             runtime.activate(&session);
@@ -1167,8 +1168,7 @@ impl SdkSession {
     fn current(&self) -> Arc<SdkRuntime> {
         Arc::clone(
             self.current
-                .lock()
-                .unwrap()
+                .lock_unpoisoned()
                 .as_ref()
                 .expect("SDK runtime initialized"),
         )
@@ -1211,7 +1211,7 @@ impl SdkSession {
             return Err(sdk_command_error(error));
         }
         let published = (|| -> Result<(), CommandError> {
-            let mut current = self.current.lock().unwrap();
+            let mut current = self.current.lock_unpoisoned();
             prepared
                 .writer
                 .emit_system("init", prepared.init.clone())
@@ -1236,12 +1236,12 @@ impl SdkSession {
                 "session_id": old.handle.session_id.id(),
             }),
         );
-        self.retired.lock().unwrap().push(old);
+        self.retired.lock_unpoisoned().push(old);
         Ok(())
     }
 
     async fn drain_retired(&self) -> Result<()> {
-        let retired = mem::take(&mut *self.retired.lock().unwrap());
+        let retired = mem::take(&mut *self.retired.lock_unpoisoned());
         for runtime in retired {
             runtime.close().await?;
         }
@@ -1436,7 +1436,7 @@ fn handle_sdk_message(
             };
             let data = cr.response;
             if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                && let Some((ask_id, answer_tx)) = shared.lock().unwrap().pending.remove(req_id)
+                && let Some((ask_id, answer_tx)) = shared.lock_unpoisoned().pending.remove(req_id)
             {
                 let _ = answer_tx
                     .send(TaggedAnswer::new(ask_id, decode_permission_response(&data)).encode());
@@ -1449,7 +1449,7 @@ fn handle_sdk_message(
                 return Ok(true);
             };
             if let Some((ask_id, answer_tx)) =
-                shared.lock().unwrap().pending.remove(&ccr.request_id)
+                shared.lock_unpoisoned().pending.remove(&ccr.request_id)
             {
                 let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
             }
@@ -1487,7 +1487,7 @@ impl UserDispatch {
             shared,
         } = self;
         {
-            let mut shared = shared.lock().unwrap();
+            let mut shared = shared.lock_unpoisoned();
             if shared.work.is_empty() {
                 shared.turn_start = Instant::now();
             }
@@ -1699,7 +1699,7 @@ fn emit_command_result(
             "success"
         },
         is_error,
-        duration_ms: shared.lock().unwrap().turn_start.elapsed().as_millis(),
+        duration_ms: shared.lock_unpoisoned().turn_start.elapsed().as_millis(),
         duration_api_ms: 0,
         num_turns: 0,
         result,
@@ -1930,7 +1930,7 @@ fn admit_sdk_submission(
     submission: RootSubmission,
     input: AgentInput,
 ) -> Result<bool, String> {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = shared.lock_unpoisoned();
     check_sdk_work(&shared, |work| work.turn_id().is_none())?;
     let ticket = match submission.submit(input) {
         Ok((ticket, _)) => ticket,
@@ -1950,7 +1950,7 @@ fn admit_sdk_submission(
 /// Starts a local operation as the SDK's only work in flight and returns
 /// its number.
 fn begin_sdk_operation(shared: &Mutex<Shared>, cancel: CancelTrigger) -> Result<u64, &'static str> {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = shared.lock_unpoisoned();
     check_sdk_work(&shared, |_| true)?;
     shared.work.push(WorkCancel::Control(cancel));
     shared.operation += 1;
@@ -1960,7 +1960,7 @@ fn begin_sdk_operation(shared: &Mutex<Shared>, cancel: CancelTrigger) -> Result<
 /// Ends local operation {operation}, unless an interrupt already dropped it
 /// and other work began since.
 fn end_sdk_operation(shared: &Mutex<Shared>, operation: u64) {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = shared.lock_unpoisoned();
     if shared.operation == operation {
         shared.work.retain(|work| work.turn_id().is_some());
     }
@@ -1980,14 +1980,14 @@ fn check_sdk_work(shared: &Shared, conflicts: fn(&WorkCancel) -> bool) -> Result
 }
 
 fn end_sdk_work(shared: &Mutex<Shared>) {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = shared.lock_unpoisoned();
     shared.work.clear();
     shared.idle.notify(usize::MAX);
 }
 
 /// Returns whether {turn_id}'s result waits for the dispatch in flight.
 fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
-    let mut shared = shared.lock().unwrap();
+    let mut shared = shared.lock_unpoisoned();
     let tracked = shared.work.len();
     shared.work.retain(|work| work.turn_id() != Some(turn_id));
     if shared.work.is_empty() {
@@ -1998,7 +1998,7 @@ fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
 
 /// Cancels all SDK work in flight; the turns still report their results.
 fn cancel_sdk_work(shared: &Mutex<Shared>) {
-    let work = mem::take(&mut shared.lock().unwrap().work);
+    let work = mem::take(&mut shared.lock_unpoisoned().work);
     for work in work {
         work.cancel();
     }
@@ -2010,7 +2010,7 @@ fn cancel_sdk_work(shared: &Mutex<Shared>) {
 async fn end_dispatch(shared: &Mutex<Shared>, completed: bool) {
     let (reported, done) = flume::bounded(1);
     {
-        let shared = shared.lock().unwrap();
+        let shared = shared.lock_unpoisoned();
         if shared.output_closed || !shared.dispatching {
             return;
         }
@@ -2026,7 +2026,7 @@ async fn end_dispatch(shared: &Mutex<Shared>, completed: bool) {
 /// so it is cancelled and no new work starts.
 fn close_output(shared: &Mutex<Shared>) {
     {
-        let mut shared = shared.lock().unwrap();
+        let mut shared = shared.lock_unpoisoned();
         shared.output_closed = true;
         while shared.dispatch_end.1.try_recv().is_ok() {}
     }
@@ -2045,7 +2045,7 @@ async fn finish_in_flight(
     dispatched: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let unanswered = {
-        let mut shared = shared.lock().unwrap();
+        let mut shared = shared.lock_unpoisoned();
         shared.input_closed = true;
         mem::take(&mut shared.pending)
     };
@@ -2055,7 +2055,7 @@ async fn finish_in_flight(
     let until = |done: fn(&Shared) -> bool| async move {
         loop {
             let idle = {
-                let shared = shared.lock().unwrap();
+                let shared = shared.lock_unpoisoned();
                 if done(&shared) {
                     return;
                 }
@@ -2210,7 +2210,7 @@ struct EventPump {
 
 impl EventPump {
     fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
-        let dispatch_end = self.shared.lock().unwrap().dispatch_end.1.clone();
+        let dispatch_end = self.shared.lock_unpoisoned().dispatch_end.1.clone();
         smol::spawn(async move {
             loop {
                 let next =
@@ -2257,7 +2257,7 @@ impl EventPump {
             }
         }
         let mut held = {
-            let mut shared = self.shared.lock().unwrap();
+            let mut shared = self.shared.lock_unpoisoned();
             shared.dispatching = false;
             mem::take(&mut shared.held)
         };
@@ -2294,7 +2294,7 @@ impl EventPump {
         self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock().unwrap().pending.clear();
+        self.shared.lock_unpoisoned().pending.clear();
     }
 
     /// Emits a turn's result, or holds it for the dispatch in flight.
@@ -2306,7 +2306,12 @@ impl EventPump {
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = self
+            .shared
+            .lock_unpoisoned()
+            .turn_start
+            .elapsed()
+            .as_millis();
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         let payload = ResultPayload {
@@ -2325,7 +2330,7 @@ impl EventPump {
             permission_denials: Vec::new(),
         };
         if hold {
-            self.shared.lock().unwrap().held.push(payload);
+            self.shared.lock_unpoisoned().held.push(payload);
         } else {
             self.writer.emit(WireInner::Result(payload))?;
         }
@@ -2469,7 +2474,7 @@ impl EventPump {
                 self.request_counter += 1;
                 let req_id = format!("req_{}", self.request_counter);
                 {
-                    let mut shared = self.shared.lock().unwrap();
+                    let mut shared = self.shared.lock_unpoisoned();
                     if shared.input_closed {
                         drop(shared);
                         let _ =
@@ -3847,7 +3852,7 @@ mod tests {
                     panic!("{SDK_SETTLEMENT_TIMEOUT}");
                 },
             ));
-            assert!(shared.lock().unwrap().work.is_empty());
+            assert!(shared.lock_unpoisoned().work.is_empty());
             smol::block_on(coordinator.close()).unwrap();
             out_rx
                 .try_iter()
@@ -3867,8 +3872,7 @@ mod tests {
         let (answer_tx, answer_rx) = flume::unbounded();
         session
             .shared
-            .lock()
-            .unwrap()
+            .lock_unpoisoned()
             .pending
             .insert(ASK_ID.into(), (ASK_ID.into(), answer_tx));
         let results = session.end_input();
@@ -4033,7 +4037,7 @@ mod tests {
         let session = pending_sdk_session();
         cancel_sdk_work(&session.shared);
         assert_eq!(session.next_result()["is_error"], true);
-        assert!(session.shared.lock().unwrap().work.is_empty());
+        assert!(session.shared.lock_unpoisoned().work.is_empty());
         session.admit();
         let results = session.end_input();
         assert_eq!(results.len(), 1);
@@ -4105,11 +4109,11 @@ mod tests {
         let (trigger, later) = CancelToken::new();
         let current = begin_sdk_operation(&shared, trigger).unwrap();
         end_sdk_operation(&shared, interrupted);
-        assert_eq!(shared.lock().unwrap().work.len(), 1);
+        assert_eq!(shared.lock_unpoisoned().work.len(), 1);
         cancel_sdk_work(&shared);
         assert!(later.is_cancelled());
         end_sdk_operation(&shared, current);
-        assert!(shared.lock().unwrap().work.is_empty());
+        assert!(shared.lock_unpoisoned().work.is_empty());
     }
 
     fn local_work() -> CancelTrigger {
@@ -4118,8 +4122,7 @@ mod tests {
 
     fn tracked_turns(shared: &Mutex<Shared>) -> Vec<TurnId> {
         shared
-            .lock()
-            .unwrap()
+            .lock_unpoisoned()
             .work
             .iter()
             .filter_map(WorkCancel::turn_id)
@@ -5061,7 +5064,7 @@ mod tests {
 
                 Box::pin(async move {
                     let ack = makima_storage::checkpoint::CheckpointAck::for_request(&request);
-                    checkpointed.lock().unwrap().push(request.snapshot);
+                    checkpointed.lock_unpoisoned().push(request.snapshot);
                     Ok(ack)
                 }) as makima_storage::checkpoint::CheckpointFuture
             },
@@ -5216,7 +5219,7 @@ mod tests {
             .unwrap()
             .agent_id;
         let initial_checkpoint_count = {
-            let saved = checkpointed.lock().unwrap();
+            let saved = checkpointed.lock_unpoisoned();
             assert_eq!(saved.len(), 1);
             let initialized = &saved[0];
             assert_eq!(initialized.kind, SessionCheckpointKind::Config);
@@ -5247,7 +5250,10 @@ mod tests {
             InputDispatch::Dispatched(CommandOutcome::Failed(_))
         ));
         assert_eq!(coordinator.read().model().unwrap().as_ref(), STARTUP_MODEL);
-        assert_eq!(checkpointed.lock().unwrap().len(), initial_checkpoint_count);
+        assert_eq!(
+            checkpointed.lock_unpoisoned().len(),
+            initial_checkpoint_count
+        );
 
         let result =
             smol::block_on(commands.dispatch_input(&format!("/model {TARGET_MODEL}"), &[]));
@@ -5263,11 +5269,11 @@ mod tests {
             TARGET_MODEL
         );
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 1
         );
         assert_eq!(
-            checkpointed.lock().unwrap()[initial_checkpoint_count]
+            checkpointed.lock_unpoisoned()[initial_checkpoint_count]
                 .config
                 .as_ref()
                 .unwrap()
@@ -5296,7 +5302,7 @@ mod tests {
                 .any(|spec| spec == SDK_DISCOVERED_MODEL)
         );
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 1
         );
         host.wait_for_worker_barrier_for_test();
@@ -5325,7 +5331,7 @@ mod tests {
             smol::block_on(admit_sdk_turn(&shared, &handle.input_tx, input)),
             Ok(true)
         );
-        let ticket = match &shared.lock().unwrap().work[..] {
+        let ticket = match &shared.lock_unpoisoned().work[..] {
             [WorkCancel::Turn { ticket, .. }] => ticket.clone(),
             _ => panic!("one SDK turn in flight"),
         };
@@ -5338,7 +5344,7 @@ mod tests {
         };
         assert_eq!(permission["request"]["tool_name"], SDK_NESTED_TOOL);
         let request_id = permission["request_id"].as_str().unwrap();
-        let (ask_id, answer_tx) = shared.lock().unwrap().pending.remove(request_id).unwrap();
+        let (ask_id, answer_tx) = shared.lock_unpoisoned().pending.remove(request_id).unwrap();
         answer_tx
             .send(
                 TaggedAnswer::new(
@@ -5412,7 +5418,7 @@ mod tests {
         }));
         assert_eq!(coordinator.read().model().unwrap().as_ref(), TARGET_MODEL);
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 1
         );
         let child_ticket = child_ref.actor().unwrap().latest_ticket().unwrap();
@@ -5484,9 +5490,9 @@ mod tests {
                 .map(|line| serde_json::from_str::<Value>(&line).unwrap()),
         );
         assert!(output.iter().all(|message| message["type"] != "result"));
-        assert!(!shared.lock().unwrap().work.is_empty());
+        assert!(!shared.lock_unpoisoned().work.is_empty());
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 1
         );
         terminal_release.send(()).unwrap();
@@ -5503,7 +5509,7 @@ mod tests {
             smol::block_on(ticket.wait()),
             TurnOutcome::Completed { .. }
         ));
-        assert!(shared.lock().unwrap().work.is_empty());
+        assert!(shared.lock_unpoisoned().work.is_empty());
         let before_version = coordinator.read().options().version;
         let selected_thinking =
             makima_providers::ThinkingConfig::Effort(makima_providers::Effort::High);
@@ -5524,7 +5530,7 @@ mod tests {
         );
         assert!(coordinator.read().options().version > before_version);
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 2
         );
         catalog.attach(&services);
@@ -5535,7 +5541,7 @@ mod tests {
             assert!(values.iter().any(|value| &*value.value == spec));
         }
         {
-            let saved = checkpointed.lock().unwrap();
+            let saved = checkpointed.lock_unpoisoned();
             assert_eq!(saved.len(), initial_checkpoint_count + 3);
             let published_options = &saved[initial_checkpoint_count + 2];
             assert_eq!(published_options.kind, SessionCheckpointKind::Options);
@@ -5545,7 +5551,7 @@ mod tests {
         }
         smol::block_on(catalog.apply(vec![SDK_LATE_MODEL.into()], None));
         assert_eq!(
-            checkpointed.lock().unwrap().len(),
+            checkpointed.lock_unpoisoned().len(),
             initial_checkpoint_count + 3
         );
         let manager = handle.manager.clone();
@@ -5573,7 +5579,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["result"], SDK_ROOT_RESPONSE);
         assert_eq!(results[0]["is_error"], false);
-        let saved = checkpointed.lock().unwrap();
+        let saved = checkpointed.lock_unpoisoned();
         assert_eq!(saved.len(), initial_checkpoint_count + 3);
         drop(saved);
         let durable = StoredSession::load(id, &child_storage).unwrap();
@@ -5641,7 +5647,7 @@ mod tests {
                         Box::pin(async move {
                             let ack =
                                 makima_storage::checkpoint::CheckpointAck::for_request(&request);
-                            checkpointed.lock().unwrap().push(request.snapshot);
+                            checkpointed.lock_unpoisoned().push(request.snapshot);
                             Ok(ack)
                         }) as makima_storage::checkpoint::CheckpointFuture
                     },
@@ -5694,7 +5700,7 @@ mod tests {
 
         let committed = StdMutex::new(Vec::new());
         let set_mode = |key: &str| {
-            committed.lock().unwrap().push(key.to_owned());
+            committed.lock_unpoisoned().push(key.to_owned());
             Ok(())
         };
         set_permission_mode(mode, &coordinator, &set_mode).unwrap();
@@ -5705,7 +5711,7 @@ mod tests {
         } else {
             ModeId::Build.key()
         };
-        assert_eq!(*committed.lock().unwrap(), [expected]);
+        assert_eq!(*committed.lock_unpoisoned(), [expected]);
         let snapshot = coordinator.read().options();
         let yolo = snapshot
             .options
@@ -5718,7 +5724,7 @@ mod tests {
             yolo.current_value.as_ref(),
             makima_agent::session_options::DISABLED_VALUE
         );
-        let checkpointed = checkpointed.lock().unwrap();
+        let checkpointed = checkpointed.lock_unpoisoned();
         assert_eq!(checkpointed.len(), 1);
         let checkpointed_yolo = checkpointed[0]
             .options
@@ -6189,7 +6195,7 @@ mod tests {
         .unwrap();
 
         assert!(!cancel.is_cancelled());
-        assert_eq!(shared.lock().unwrap().work.len(), 1);
+        assert_eq!(shared.lock_unpoisoned().work.len(), 1);
         assert!(out_rx.is_empty());
         assert_eq!(pump.terminal_run_id, None);
 

@@ -20,6 +20,7 @@ use makima_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, ResolutionError, TargetHandle,
 };
+use makima_domain::LockExt;
 use makima_providers::Message;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
@@ -71,25 +72,16 @@ impl PluginAuthority {
     }
 
     fn revoke(&self) {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         self.alive.store(false, Ordering::Release);
-        self.publication_trigger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.publication_trigger.lock_unpoisoned().take();
     }
 
     pub(crate) fn register_publication(
         &self,
         publication: &CheckpointPublication,
     ) -> PublicationRegistration {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         self.publication_cancel.register_publication(publication)
     }
 
@@ -97,10 +89,7 @@ impl PluginAuthority {
         &self,
         claim: impl FnOnce() -> Result<(), Arc<str>>,
     ) -> Result<(), Arc<str>> {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         if !self.is_alive() {
             return Err(Arc::from(crate::agent_errors::INVOCATION_EXPIRED));
         }
@@ -111,10 +100,7 @@ impl PluginAuthority {
         &self,
         effect: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         if !self.is_alive() {
             return Err(crate::agent_errors::INVOCATION_EXPIRED.into());
         }

@@ -4,6 +4,7 @@
 
 #[cfg(unix)]
 use libc::O_NONBLOCK;
+use makima_domain::RwLockExt;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
@@ -340,22 +341,17 @@ impl ModeRegistry {
 
     fn insert(&self, def: ModeDef) {
         self.modes
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .write_unpoisoned()
             .insert(def.id.key().to_owned(), def);
     }
 
     pub fn get(&self, id: &ModeId) -> Option<ModeDef> {
-        self.modes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(id.key())
-            .cloned()
+        self.modes.read_unpoisoned().get(id.key()).cloned()
     }
 
     /// Ordered list of all defined modes (built-ins first, then custom).
     pub fn list(&self) -> Vec<ModeDef> {
-        let map = self.modes.read().unwrap_or_else(|e| e.into_inner());
+        let map = self.modes.read_unpoisoned();
         let mut out: Vec<ModeDef> = map.values().cloned().collect();
         out.sort_by_key(|d| match d.id {
             ModeId::Build => 0,

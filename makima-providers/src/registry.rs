@@ -3,9 +3,10 @@
 //! Resolution reads descriptors held here and never calls into a backend, so
 //! it stays cheap enough for the UI thread.
 
+use makima_domain::RwLockExt;
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use makima_config::ModelPolicy;
@@ -111,7 +112,7 @@ impl Entry {
     }
 
     fn models(&self) -> Arc<[ModelInfo]> {
-        Arc::clone(&self.models.read().unwrap_or_else(PoisonError::into_inner))
+        Arc::clone(&self.models.read_unpoisoned())
     }
 
     /// The descriptor whose id is the longest prefix of {model_id}, as the
@@ -319,7 +320,7 @@ impl ProviderRegistry {
         let entry = &self.entries[self.positions[&provider]].1;
         let warnings = match result {
             Ok(models) => {
-                *entry.models.write().unwrap_or_else(PoisonError::into_inner) = models.into();
+                *entry.models.write_unpoisoned() = models.into();
                 Vec::new()
             }
             Err(error) => {

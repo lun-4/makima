@@ -17,6 +17,7 @@ name = "makima"
 path = "src/main.rs"
 
 [dependencies]
+makima-domain = { workspace = true }
 makima-ui = { workspace = true }
 makima-agent = { workspace = true }
 makima-acp = { workspace = true }
@@ -44,6 +45,7 @@ event-listener = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
+makima-agent = { workspace = true, features = ["test-util"] }
 makima-providers = { workspace = true, features = ["test-util"] }
 makima-storage = { workspace = true, features = ["test-util"] }
 makima-config = { workspace = true, features = ["test-util"] }

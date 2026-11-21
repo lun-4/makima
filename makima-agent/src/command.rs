@@ -924,6 +924,7 @@ mod tests {
     use makima_commands::CommandHost;
     use makima_commands::ModelSelection;
     use makima_config::ModelPolicy;
+    use makima_domain::LockExt;
     use makima_providers::{Effort, ThinkingConfig};
     use makima_storage::checkpoint::ClaimingWriter;
     use tempfile::TempDir;
@@ -1018,10 +1019,7 @@ mod tests {
         ) -> CommandFuture<Result<makima_commands::HostResponse, CommandError>> {
             match request {
                 HostRequest::Builtin(operation) => {
-                    self.0
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .push(operation);
+                    self.0.lock_unpoisoned().push(operation);
                     Box::pin(async { Ok(makima_commands::HostResponse::Completed) })
                 }
                 HostRequest::Context(request) => Box::pin(async move {
@@ -1150,7 +1148,7 @@ mod tests {
             ))
         ));
 
-        let operations = host.0.lock().unwrap_or_else(|error| error.into_inner());
+        let operations = host.0.lock_unpoisoned();
         assert_eq!(operations.len(), 2);
         assert_eq!(
             operations[0],
@@ -1193,7 +1191,7 @@ mod tests {
         }
 
         assert_eq!(
-            *host.0.lock().unwrap_or_else(|error| error.into_inner()),
+            *host.0.lock_unpoisoned(),
             vec![
                 makima_commands::BuiltinOperation::OpenModelPicker,
                 makima_commands::BuiltinOperation::SetModel {
@@ -1226,13 +1224,7 @@ mod tests {
                 CommandError::Producer(message)
             )) if message.as_ref() == NONINTERACTIVE_MODEL_USAGE
         ));
-        assert!(
-            portable_host
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-        );
+        assert!(portable_host.0.lock_unpoisoned().is_empty());
     }
 
     const STRUCTURED_MODEL_SPEC: &str = "openai/gpt-5";

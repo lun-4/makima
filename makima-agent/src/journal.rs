@@ -1,8 +1,12 @@
+use makima_domain::LockExt;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::take;
 use std::slice::from_ref;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use async_lock::{RwLock, RwLockReadGuardArc, RwLockWriteGuardArc};
@@ -166,6 +170,7 @@ pub struct SessionJournalSnapshot {
     pub managed_histories: OrdSet<AgentId>,
     pub authoritative: bool,
     reducer: Option<ReducerCache>,
+    prepared_installed: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +256,7 @@ impl SessionJournalSnapshot {
             managed_histories: OrdSet::new(),
             authoritative: false,
             reducer: None,
+            prepared_installed: None,
         }
     }
 
@@ -372,7 +378,6 @@ pub(crate) struct JournalState {
     writer_error: Option<String>,
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
     last_failed_conversion: Option<((AgentId, TurnId), String)>,
-    aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
     writer: Option<SessionWriter>,
     unwritten: Vec<JournalSessionRecord>,
@@ -456,12 +461,16 @@ impl JournalPrepared {
             **guard = candidate;
             SessionJournal::emit_unwritten(guard);
         }
-        drop(guards);
-        for token in tokens {
-            if token.pending.is_none() {
+        for token in tokens.iter_mut() {
+            if token.pending.take().is_none() {
                 continue;
             }
-            token.pending = None;
+            if let Some(installed) = &token.candidate.prepared_installed {
+                installed.store(true, Ordering::Release);
+            }
+        }
+        drop(guards);
+        for token in tokens {
             token.journal.conversion_changed.notify(usize::MAX);
             token.journal.drain_state_notices();
         }
@@ -571,9 +580,21 @@ impl Drop for JournalPrepared {
         for address in SessionJournal::state_addresses(&self.commit) {
             state.plugin_state.reservations.remove(&address);
         }
-        state.aborted_preparations.insert(self.candidate.revision);
         SessionJournal::advance_ready(&mut state);
         self.journal.conversion_changed.notify(usize::MAX);
+    }
+}
+
+#[must_use]
+pub struct TerminalGuard {
+    journal: Arc<SessionJournal>,
+    key: (AgentId, TurnId),
+    revision: u64,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.journal.release_terminal(self.key, self.revision);
     }
 }
 
@@ -606,7 +627,6 @@ impl Default for SessionJournal {
                 writer_error: None,
                 conversion_errors: BTreeMap::new(),
                 last_failed_conversion: None,
-                aborted_preparations: BTreeSet::new(),
                 incarnations: BTreeMap::new(),
                 writer: None,
                 unwritten: Vec::new(),
@@ -1132,7 +1152,7 @@ impl SessionJournal {
         self: &Arc<Self>,
         result: TurnResult,
         store: Option<Arc<OffloadStore>>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<Option<TerminalGuard>, JournalError> {
         self.record_terminal_for(None, result, store)
     }
 
@@ -1141,15 +1161,15 @@ impl SessionJournal {
         incarnation: Option<JournalIncarnation>,
         result: TurnResult,
         store: Option<Arc<OffloadStore>>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<Option<TerminalGuard>, JournalError> {
         if !self.persistent {
-            return Ok(());
+            return Ok(None);
         }
         let key = (result.outcome.agent_id(), result.outcome.turn_id());
         let mut state = self.lock();
         Self::validate_incarnations(&state, &incarnation.clone().into_iter().collect::<Vec<_>>())?;
         if state.results.contains_key(&key) {
-            return Ok(());
+            return Ok(None);
         }
         let history = state.snapshot.histories.get(&key.0).cloned();
         let pending = Self::stage_locked(
@@ -1164,6 +1184,7 @@ impl SessionJournal {
             },
             1,
         )?;
+        let revision = pending.revision;
         state.results.insert(
             key,
             PendingResult {
@@ -1180,16 +1201,24 @@ impl SessionJournal {
                 incarnation,
             },
         );
-        Ok(())
+        Ok(Some(TerminalGuard {
+            journal: Arc::clone(self),
+            key,
+            revision,
+        }))
     }
 
-    pub fn release_terminal(self: &Arc<Self>, agent: AgentId, turn: TurnId) {
-        let key = (agent, turn);
+    fn release_terminal(self: &Arc<Self>, key: (AgentId, TurnId), revision: u64) {
         let mut state = self.lock();
         let Some(result) = state.results.get_mut(&key) else {
             return;
         };
-        if result.released {
+        if result.released
+            || result
+                .terminal
+                .as_ref()
+                .is_none_or(|pending| pending.revision != revision)
+        {
             return;
         }
         result.released = true;
@@ -1346,7 +1375,7 @@ impl SessionJournal {
             return;
         };
         let inline = {
-            let mut runtime = conversion.lock().unwrap_or_else(|error| error.into_inner());
+            let mut runtime = conversion.lock_unpoisoned();
             if runtime.stored.is_none() {
                 runtime.stored = runtime.result.to_stored(MakimaId::generate(), None).ok();
             }
@@ -1372,7 +1401,7 @@ impl SessionJournal {
                 };
                 let expected = Arc::clone(&conversion);
                 let converted = smol::unblock(move || {
-                    let mut runtime = expected.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut runtime = expected.lock_unpoisoned();
                     if let Some(stored) = &runtime.stored {
                         return Ok(stored.clone());
                     }
@@ -1410,7 +1439,7 @@ impl SessionJournal {
         error: String,
     ) {
         let (mut outcome, provenance, duration_ms) = {
-            let runtime = expected.lock().unwrap_or_else(|error| error.into_inner());
+            let runtime = expected.lock_unpoisoned();
             (
                 StoredTurnOutcome::from(runtime.result.outcome.clone()),
                 runtime.result.provenance.clone().into(),
@@ -1644,7 +1673,8 @@ impl SessionJournal {
                     }
                     Self::validate_incarnations(&state, &commit.incarnations)?;
                     self.resolve_state_edits(&mut state, &mut commit)?;
-                    let candidate = Self::apply_commit(&state.snapshot, commit.clone())?;
+                    let mut candidate = Self::apply_commit(&state.snapshot, commit.clone())?;
+                    candidate.prepared_installed = Some(Arc::new(AtomicBool::new(false)));
                     let pending = if commit.changes.is_empty() {
                         let mut staged = state.snapshot.clone();
                         staged.revision = candidate.revision;
@@ -2415,7 +2445,10 @@ impl SessionJournal {
         let mut state = self.lock();
         if snapshot.epoch != state.ready.epoch
             || snapshot.revision > state.ready.revision
-            || state.aborted_preparations.contains(&snapshot.revision)
+            || snapshot
+                .prepared_installed
+                .as_ref()
+                .is_some_and(|installed| !installed.load(Ordering::Acquire))
         {
             return Err(JournalError::StaleCheckpoint);
         }
@@ -2428,7 +2461,7 @@ impl SessionJournal {
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, JournalState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+        self.state.lock_unpoisoned()
     }
 }
 
@@ -2452,7 +2485,10 @@ mod tests {
     use makima_storage::sessions::Session;
     use makima_storage::test_util::test_record;
     use serde_json::json;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
+
+    use futures_lite::future::poll_once;
     use test_case::test_case;
 
     use async_lock::RwLockReadGuardArc;
@@ -2509,6 +2545,58 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const SLOT: &str = "journal/incremental";
+
+    #[test_case(false; "scope_exit")]
+    #[test_case(true; "unwind")]
+    fn terminal_guard_drop_unblocks_preparation(unwind: bool) {
+        smol::block_on(async {
+            let journal = Arc::new(SessionJournal::default());
+            let agent = AgentId::generate();
+            let admission = admitted(agent);
+            let StateChange::Admitted { turn, .. } = admission.change else {
+                unreachable!();
+            };
+            journal
+                .commit(JournalCommit {
+                    changes: vec![admission],
+                    ..Default::default()
+                })
+                .unwrap();
+            let terminal = journal
+                .record_terminal(
+                    TurnResult {
+                        outcome: TurnOutcome::cancelled(
+                            agent,
+                            turn,
+                            TokenUsage::default(),
+                            0,
+                            TurnCancellationReason::User,
+                        ),
+                        text: FIRST.into(),
+                        output: Vec::new(),
+                        provenance: TurnProvenance::default(),
+                        duration_ms: 0,
+                    },
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let mut prepared = Box::pin(journal.prepare(JournalCommit {
+                changes: vec![admitted(agent)],
+                ..Default::default()
+            }));
+            assert!(poll_once(&mut prepared).await.is_none());
+            let exit = catch_unwind(AssertUnwindSafe(move || {
+                let _terminal = terminal;
+                assert!(!unwind, "{FIRST}");
+            }));
+            assert_eq!(exit.is_err(), unwind);
+            let prepared = poll_once(&mut prepared).await.unwrap().unwrap();
+            prepared.commit().unwrap();
+            assert!(journal.pending_revision().is_none());
+            assert_eq!(journal.snapshot().state.iter().len(), 3);
+        });
+    }
 
     #[test]
     fn spawn_flush_rejects_pending_changes_without_waiting_or_reordering() {
@@ -3014,7 +3102,7 @@ mod tests {
                 duration_ms: 0,
             },
         });
-        journal
+        let _terminal = journal
             .record_terminal(delivery.result.clone(), None)
             .unwrap();
         journal
@@ -3164,7 +3252,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            journal
+            let first_terminal = journal
                 .record_terminal(
                     result(turn, FIRST.repeat(MAX_INLINE_TURN_RESULT_BYTES)),
                     Some(store),
@@ -3176,12 +3264,12 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            journal
+            let later_terminal = journal
                 .record_terminal(result(later, SECOND.into()), None)
                 .unwrap();
-            journal.release_terminal(agent, later);
+            drop(later_terminal);
             assert_eq!(journal.snapshot().revision, prefix);
-            journal.release_terminal(agent, turn);
+            drop(first_terminal);
             futures_lite::future::or(
                 async {
                     loop {
@@ -3270,7 +3358,7 @@ mod tests {
             duration_ms: 0,
         };
         journal.set_incarnation(agent, 1);
-        journal
+        let stale_terminal = journal
             .record_terminal_for(Some(journal.incarnation(agent)), result.clone(), None)
             .unwrap();
         let expected = Arc::clone(&journal.lock().results[&(agent, turn)].conversion);
@@ -3284,7 +3372,7 @@ mod tests {
             CONVERSION_ERROR.into()
         ));
         assert!(journal.checkpoint_snapshot().is_ok());
-        journal
+        let terminal = journal
             .record_terminal_for(Some(journal.incarnation(agent)), result, None)
             .unwrap();
         assert!(!journal.record_conversion_error(
@@ -3292,12 +3380,14 @@ mod tests {
             &expected,
             CONVERSION_ERROR.into()
         ));
+        drop(stale_terminal);
+        assert!(journal.pending_revision().is_some());
         journal
             .complete_conversion((agent, turn), &expected, stored)
             .unwrap();
         assert!(journal.lock().results.contains_key(&(agent, turn)));
         assert!(journal.persistence_error().is_none());
-        journal.release_terminal(agent, turn);
+        drop(terminal);
         assert!(journal.pending_revision().is_none());
     }
 
@@ -3552,6 +3642,7 @@ mod tests {
             assert_eq!(history_token.snapshot().seq, before_history.seq);
             history_token.commit().unwrap();
             assert_eq!(journal.snapshot().histories[&agent].messages.len(), 1);
+            assert_eq!(journal.acknowledge(&candidate).is_ok(), install);
         });
     }
 

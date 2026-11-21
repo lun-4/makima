@@ -1,14 +1,29 @@
 use crate::{
     ActorBackend, AgentInput, BackendResult, ControlWork, TurnContext, WorkKind,
-    actor::ActorHistory,
+    actor::{ActorHistory, AdmissionPreparation, PreparedReadiness},
+    agent::TurnSetup,
+    session_writer::{OpenedSessionIo, SessionIo, SessionWriter},
 };
+use makima_providers::provider::BoxFuture;
+use makima_storage::id::MakimaId;
 #[cfg(unix)]
-use std::{ffi::CString, io, os::unix::ffi::OsStrExt, path::Path};
-use std::{future::Future, pin::Pin};
+use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+use std::{io, time::Duration};
 
-const UNEXPECTED_OPERATION: &str = "StubBackend must not execute work";
+const UNEXPECTED_OPERATION: &str = "unexpected work in MockBackend";
 #[cfg(unix)]
 const FIFO_MODE: libc::mode_t = 0o600;
+
+impl SessionWriter {
+    pub fn with_io(session_id: MakimaId, io: impl SessionIo, next_seq: u64) -> Self {
+        let mut opened: Option<OpenedSessionIo> = Some((Box::new(io), next_seq));
+        Self::with_factory(session_id, move || {
+            opened
+                .take()
+                .ok_or_else(|| io::Error::other("test I/O already opened"))
+        })
+    }
+}
 
 /// Create a FIFO at {path}. rustix has no `mkfifoat` on Apple targets.
 #[cfg(unix)]
@@ -22,18 +37,94 @@ pub fn make_fifo(path: &Path) -> io::Result<()> {
     }
 }
 
-/// An inert backend for fixtures that must not execute turns, controls, or compaction.
-pub struct StubBackend;
+/// Poll state that has no notification API. The timeout only guards against hangs.
+pub async fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    futures_lite::future::or(
+        async {
+            loop {
+                if let Some(value) = probe() {
+                    return Some(value);
+                }
+                smol::future::yield_now().await;
+            }
+        },
+        async {
+            smol::Timer::after(timeout).await;
+            None
+        },
+    )
+    .await
+}
 
-impl ActorBackend for StubBackend {
+type MockTurn = dyn for<'a> FnMut(
+        ActorHistory<'a>,
+        TurnContext,
+        AgentInput,
+        WorkKind,
+    ) -> BoxFuture<'a, BackendResult>
+    + Send;
+
+/// A fixture backend with an optional scripted turn and admission setup.
+/// Unexpected work panics unless the fixture opts into no-op controls.
+pub struct MockBackend {
+    turn: Option<Box<MockTurn>>,
+    setup: Option<TurnSetup>,
+    noop_controls: bool,
+}
+
+impl MockBackend {
+    pub const STRICT: Self = Self {
+        turn: None,
+        setup: None,
+        noop_controls: false,
+    };
+
+    pub fn with_turn(
+        mut self,
+        turn: impl for<'a> FnMut(
+            ActorHistory<'a>,
+            TurnContext,
+            AgentInput,
+            WorkKind,
+        ) -> BoxFuture<'a, BackendResult>
+        + Send
+        + 'static,
+    ) -> Self {
+        self.turn = Some(Box::new(turn));
+        self
+    }
+
+    pub fn with_setup(mut self, setup: TurnSetup) -> Self {
+        self.setup = Some(setup);
+        self
+    }
+
+    pub fn with_noop_controls(mut self) -> Self {
+        self.noop_controls = true;
+        self
+    }
+}
+
+impl ActorBackend for MockBackend {
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+        self.setup.clone().map(TurnSetup::preparation)
+    }
+
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        self.setup.as_ref().map(|_| TurnSetup::readiness())
+    }
+
     fn run_turn<'a>(
         &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { panic!("{UNEXPECTED_OPERATION}") })
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        input: AgentInput,
+        work: WorkKind,
+    ) -> BoxFuture<'a, BackendResult> {
+        match &mut self.turn {
+            Some(turn) => turn(history, context, input, work),
+            None => Box::pin(async { panic!("{UNEXPECTED_OPERATION}: turn") }),
+        }
     }
 
     fn run_control<'a>(
@@ -41,8 +132,12 @@ impl ActorBackend for StubBackend {
         _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { panic!("{UNEXPECTED_OPERATION}") })
+    ) -> BoxFuture<'a, BackendResult> {
+        let enabled = self.noop_controls;
+        Box::pin(async move {
+            assert!(enabled, "{UNEXPECTED_OPERATION}: control");
+            BackendResult::ControlDone
+        })
     }
 
     fn run_compact<'a>(
@@ -50,7 +145,11 @@ impl ActorBackend for StubBackend {
         _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { panic!("{UNEXPECTED_OPERATION}") })
+    ) -> BoxFuture<'a, BackendResult> {
+        let enabled = self.noop_controls;
+        Box::pin(async move {
+            assert!(enabled, "{UNEXPECTED_OPERATION}: compact");
+            BackendResult::CompactDone
+        })
     }
 }

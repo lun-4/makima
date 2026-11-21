@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
@@ -52,11 +53,7 @@ pub(crate) struct PendingState(Arc<Mutex<BTreeMap<String, Arc<Definition>>>>);
 pub(crate) struct StateStore(BTreeMap<String, Arc<Definition>>);
 
 pub(crate) fn activate(lua: &Lua, plugin: &str, pending: &PendingState) {
-    let definitions = pending
-        .0
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
+    let definitions = pending.0.lock_unpoisoned().clone();
     if let Some(mut store) = lua.app_data_mut::<StateStore>() {
         store
             .0
@@ -131,7 +128,7 @@ pub(crate) fn create_state_table(
                 migrate: spec.get("migrate")?,
                 callbacks: Mutex::default(),
             });
-            let mut definitions = pending.0.lock().unwrap_or_else(|error| error.into_inner());
+            let mut definitions = pending.0.lock_unpoisoned();
             if definitions.contains_key(&key) {
                 return Err(mlua::Error::runtime("state slot already registered"));
             }
@@ -163,9 +160,8 @@ fn migrate_value(
     lua: &Lua,
     definition: &Definition,
     stored_version: u32,
-    value: &JsonValue,
+    mut value: JsonValue,
 ) -> Result<JsonValue, String> {
-    let mut value = value.clone();
     for version in stored_version..definition.version {
         let migrate = definition
             .migrate
@@ -195,7 +191,7 @@ fn read_value(
         ));
     }
     if raw.version < definition.version
-        && let Some(value) = raw.value.as_ref()
+        && let Some(value) = raw.value
     {
         if access.is_read_only() {
             return migrate_value(lua, definition, raw.version, value)
@@ -204,7 +200,7 @@ fn read_value(
         ctx.validate_state_migration(lua, access.target())?;
         let value = migrate_value(lua, definition, raw.version, value)?;
         let revision = ctx.claim_state_effect(lua, || {
-            slot.set(access, value.clone(), Some(raw.revision))
+            slot.set_json(access, Some(value.clone()), Some(raw.revision))
                 .map_err(|error| error.to_string())
         })?;
         return Ok((Some(value), revision));
@@ -274,12 +270,9 @@ fn mutate(
         .map_err(|error| error.to_string())?;
     let expect = expected_revision(opts)?;
     ctx.claim_state_effect(lua, || {
-        match value {
-            Some(value) => slot.set(&access, value, expect),
-            None => slot.delete(&access, expect),
-        }
-        .map(|revision| revision.0)
-        .map_err(|error| error.to_string())
+        slot.set_json(&access, value, expect)
+            .map(|revision| revision.0)
+            .map_err(|error| error.to_string())
     })
 }
 
@@ -355,11 +348,7 @@ impl UserData for LuaStateSlot {
                         return Ok(err_pair("state slot belongs to another plugin"));
                     }
                 }
-                this.0
-                    .callbacks
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push(callback);
+                this.0.callbacks.lock_unpoisoned().push(callback);
                 Ok((Some(true), None))
             },
         );
@@ -448,11 +437,7 @@ pub(crate) fn dispatch(lua: &Lua, target: AgentRef, event: StateChangeEvent) -> 
         .map(|id| crate::api::agent::lookup_agent(manager, id, lua))
         .transpose()
         .map_err(mlua::Error::runtime)?;
-    let callbacks = definition
-        .callbacks
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
+    let callbacks = definition.callbacks.lock_unpoisoned().clone();
     for callback in callbacks {
         let data = lua.create_table()?;
         if let Some(agent) = &event_agent {

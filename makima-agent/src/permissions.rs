@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -248,11 +249,12 @@ impl TaggedAnswer {
 pub struct PluginRuleStore(Mutex<HashMap<Arc<str>, Vec<PermissionRule>>>);
 
 impl PluginRuleStore {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Vec<PermissionRule>>> {
-        self.0.lock().unwrap_or_else(|e| {
+    fn lock(&self) -> MutexGuard<'_, HashMap<Arc<str>, Vec<PermissionRule>>> {
+        let guard = self.0.lock_unpoisoned();
+        if self.0.is_poisoned() {
             warn!("plugin rule mutex was poisoned, recovering");
-            e.into_inner()
-        })
+        }
+        guard
     }
 
     /// An empty `rules` removes the entry, so a reload that registers
@@ -402,31 +404,22 @@ impl PermissionManager {
                 binding: None,
             }),
             config_rules: self.config_rules.clone(),
-            builtin_rules: Mutex::new(
-                self.builtin_rules
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone(),
-            ),
+            builtin_rules: Mutex::new(self.builtin_rules.lock_unpoisoned().clone()),
             seed_yolo: self.seed_yolo,
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
-            cwd: Mutex::new(
-                self.cwd
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone(),
-            ),
+            cwd: Mutex::new(self.cwd.lock_unpoisoned().clone()),
             project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
         }
     }
 
     fn session(&self) -> MutexGuard<'_, SessionPermissions> {
-        self.session.lock().unwrap_or_else(|e| {
+        let guard = self.session.lock_unpoisoned();
+        if self.session.is_poisoned() {
             warn!("permission mutex was poisoned, recovering");
-            e.into_inner()
-        })
+        }
+        guard
     }
 
     /// The order of the checks below is the policy itself, not an accident of
@@ -441,10 +434,7 @@ impl PermissionManager {
     ) -> PermissionCheck {
         let session = self.session();
         let plugin = self.plugin_rules.snapshot();
-        let builtin = self
-            .builtin_rules
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let builtin = self.builtin_rules.lock_unpoisoned();
 
         let mut unclaimed_scopes: Vec<&str> = if force_prompt {
             Vec::new()
@@ -778,18 +768,15 @@ impl PermissionManager {
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {
-        *self.cwd.lock().unwrap_or_else(|error| error.into_inner()) = cwd.clone();
-        *self
-            .builtin_rules
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = builtin_rules(&cwd);
+        *self.cwd.lock_unpoisoned() = cwd.clone();
+        *self.builtin_rules.lock_unpoisoned() = builtin_rules(&cwd);
     }
 
     /// Outside-cwd paths are not blocked here. They flow through the normal
     /// permission prompt (which uses the same canonicalization via
     /// [`scope_matches`]). Only unresolvable boundaries are hard-blocked.
     pub fn boundary_block_reason(&self, path: &Path) -> Option<String> {
-        let cwd = self.cwd.lock().unwrap_or_else(|error| error.into_inner());
+        let cwd = self.cwd.lock_unpoisoned();
         match physical_boundary_check(&cwd, path) {
             Some(_) => None,
             None => Some(format!(

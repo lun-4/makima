@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,7 +34,7 @@ impl LoadedInstructions {
     }
 
     pub fn contains_or_insert(&self, path: PathBuf) -> bool {
-        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = self.0.lock_unpoisoned();
         !set.insert(path)
     }
 }
@@ -343,7 +344,7 @@ mod tests {
             crate::prompt::Slot::AfterInstructions,
             crate::prompt::SlotEntry {
                 plugin: Arc::from("memory"),
-                registration: 0,
+                name: "default".into(),
                 content: EXTRA.into(),
             },
         );

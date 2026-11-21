@@ -647,45 +647,21 @@ fn task_policy_size_rejection_never_admits_orphan_work() {
     );
 }
 
-struct RetirementBackend;
-
-impl ActorBackend for RetirementBackend {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        context: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            let reason = context.cancel_reason.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                context.agent_id,
-                context.turn_id.unwrap(),
-                Default::default(),
-                0,
-                reason,
-            ))
+fn retirement_backend() -> common::MockBackend {
+    common::MockBackend::STRICT
+        .with_noop_controls()
+        .with_turn(|_, context, _, _| {
+            Box::pin(async move {
+                let reason = context.cancel_reason.cancelled().await;
+                BackendResult::EnteredRun(TurnOutcome::cancelled(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    Default::default(),
+                    0,
+                    reason,
+                ))
+            })
         })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
 }
 
 #[test]
@@ -701,7 +677,7 @@ fn task_retire_command_rejects_busy_nonleaf_and_recovers_retained_quota() {
     let config = common::effective_config(&context);
     let root = manager
         .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>)
+            Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>)
         })
         .unwrap();
     let target = common::install_root(&host, root.clone(), context);
@@ -712,7 +688,7 @@ fn task_retire_command_rejects_busy_nonleaf_and_recovers_retained_quota() {
             Default::default(),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(RetirementBackend) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(retirement_backend()) as Box<dyn ActorBackend>),
         )
     };
     let child = spawn(&root).unwrap();

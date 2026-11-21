@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -162,10 +163,7 @@ impl ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return true;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         let pending_completions = await_completions
             && !state.deliveries.is_empty()
             && !super::delivery::held(&inner, &state);
@@ -190,10 +188,7 @@ impl TurnInbox for ActorTurnInbox {
 
     fn take_initial_submission(&self) -> Option<PendingSubmission> {
         let inner = self.inner.upgrade()?;
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         let submission = state.instructions.get_mut(&self.turn_id)?.initial.take()?;
         state.emit(super::ActorEvent::SubmissionConsumed(submission.clone()));
         Some(submission)
@@ -203,10 +198,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return Vec::new();
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Vec::new();
         }
@@ -285,10 +277,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if let Some(inbox) = state.instructions.get_mut(&self.turn_id) {
             inbox.open = false;
         }
@@ -298,10 +287,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if let Some(inbox) = state.instructions.get_mut(&self.turn_id) {
             inbox.drained.clear();
         }
@@ -311,10 +297,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
-        let state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = inner.state.lock_unpoisoned();
         state
             .instructions
             .get(&self.turn_id)

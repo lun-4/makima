@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1020,7 +1021,7 @@ pub(crate) fn create_ui_table(
                         ));
                     }
                 };
-                *pending.lock().unwrap_or_else(|e| e.into_inner()) = spans;
+                *pending.lock_unpoisoned() = spans;
                 return Ok(());
             }
             match value {

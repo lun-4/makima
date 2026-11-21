@@ -9,6 +9,7 @@
 //! `Request` RPCs on `EventHandle` (see `collect_completion_items` /
 //! `expand_references`), never touching `Lua` directly.
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -119,11 +120,7 @@ fn register_completion_source(
             .app_data_mut::<CompletionStore>()
             .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
         if crate::runtime::loading_plugin_is(lua, &plugin) {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(prefix, get_items);
+            pending.lock_unpoisoned().0.insert(prefix, get_items);
         } else {
             store.0.entry(plugin).or_default().insert(prefix, get_items);
         }
@@ -167,11 +164,7 @@ fn register_expander(
             .app_data_mut::<ExpanderStore>()
             .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
         if crate::runtime::loading_plugin_is(lua, &plugin) {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(prefix, f);
+            pending.lock_unpoisoned().0.insert(prefix, f);
         } else {
             store.0.entry(plugin).or_default().insert(prefix, f);
         }

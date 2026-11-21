@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -197,21 +198,12 @@ impl AgentRef {
     }
 
     pub fn snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {
-        if let Some(snapshot) = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-        {
+        if let Some(snapshot) = self.terminal.lock_unpoisoned().clone() {
             return Ok(snapshot);
         }
-        self.manager.node(self.agent_id).or_else(|error| {
-            self.terminal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-                .ok_or(error)
-        })
+        self.manager
+            .node(self.agent_id)
+            .or_else(|error| self.terminal.lock_unpoisoned().clone().ok_or(error))
     }
 
     pub fn effective_config(

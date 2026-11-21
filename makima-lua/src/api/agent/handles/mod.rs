@@ -5,8 +5,9 @@ pub(super) mod projection;
 mod subscriptions;
 mod tickets;
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use makima_agent::actor::ActorLifecycle;
 use makima_agent::{AgentActorHandle, AgentId, AgentManagerHandle, AgentRef, TurnTicket};
@@ -90,10 +91,6 @@ impl AgentOwner {
     }
 }
 impl AgentOwners {
-    fn lock(&self) -> MutexGuard<'_, HashMap<AgentId, AgentOwner>> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner())
-    }
-
     /// Record a spawned child, keeping its session alive until it is retired.
     fn insert(&self, session: LuaSession, plugin: Option<Arc<str>>) {
         let id = session.agent_id;
@@ -103,7 +100,7 @@ impl AgentOwners {
             state: Arc::downgrade(&session.state),
             hold: Some(session),
         };
-        let mut owners = self.lock();
+        let mut owners = self.0.lock_unpoisoned();
         if owner.hold.as_ref().is_some_and(|session| {
             session
                 .agent
@@ -129,7 +126,7 @@ impl AgentOwners {
     }
 
     fn retire_incarnation(&self, id: AgentId, identity: &Arc<()>) {
-        let retired = self.lock().get_mut(&id).and_then(|owner| {
+        let retired = self.0.lock_unpoisoned().get_mut(&id).and_then(|owner| {
             owner
                 .actor
                 .upgrade()
@@ -150,7 +147,8 @@ impl AgentOwners {
 
     fn retire_settled(&self) {
         let retired: Vec<_> = self
-            .lock()
+            .0
+            .lock_unpoisoned()
             .extract_if(|_, owner| owner.settled_closed())
             .collect();
         for (_, mut owner) in retired {
@@ -159,7 +157,10 @@ impl AgentOwners {
     }
 
     fn state(&self, id: AgentId) -> Option<Arc<LuaActorState>> {
-        self.lock().get(&id).and_then(|owner| owner.state.upgrade())
+        self.0
+            .lock_unpoisoned()
+            .get(&id)
+            .and_then(|owner| owner.state.upgrade())
     }
 }
 
@@ -180,7 +181,7 @@ pub(super) fn detach_all_agents(lua: &Lua) {
     else {
         return;
     };
-    let detached = std::mem::take(&mut *owners.lock());
+    let detached = std::mem::take(&mut *owners.0.lock_unpoisoned());
     drop(detached);
 }
 
@@ -192,7 +193,8 @@ pub(super) fn close_plugin_agents(lua: &Lua, plugin: &str) {
         return;
     };
     let retired: Vec<_> = owners
-        .lock()
+        .0
+        .lock_unpoisoned()
         .extract_if(|_, owner| owner.plugin.as_deref() == Some(plugin))
         .map(|(_, owner)| owner)
         .collect();
@@ -218,6 +220,7 @@ lua_class! {
 
 #[cfg(test)]
 mod tests {
+    use makima_domain::LockExt;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -852,7 +855,13 @@ mod tests {
             ).eval_async()).await.unwrap();
             let id = child.borrow::<LuaAgent>().unwrap().id;
             let owners = lua.app_data_ref::<AgentOwners>().unwrap().clone();
-            let old = owners.lock().get_mut(&id).unwrap().take_hold().unwrap();
+            let old = owners
+                .0
+                .lock_unpoisoned()
+                .get_mut(&id)
+                .unwrap()
+                .take_hold()
+                .unwrap();
             let old_identity = old.actor.identity();
             old.agent
                 .manager()
@@ -989,7 +998,13 @@ mod tests {
             let id = child.borrow::<LuaAgent>().unwrap().id;
             let record = root.manager.journal().agent(id).unwrap();
             let owners = lua.app_data_ref::<AgentOwners>().unwrap().clone();
-            let session = owners.lock().remove(&id).unwrap().hold.unwrap();
+            let session = owners
+                .0
+                .lock_unpoisoned()
+                .remove(&id)
+                .unwrap()
+                .hold
+                .unwrap();
             if restored {
                 root.manager
                     .detach_incarnation(&session.incarnation)
@@ -1182,12 +1197,12 @@ mod tests {
             let actor = child.manager.lookup(child.id).unwrap().actor().unwrap();
             assert_eq!(actor.snapshot().lifecycle, ActorLifecycle::Open);
             let sessions = lua.app_data_ref::<AgentOwners>().unwrap().clone();
-            assert!(sessions.lock().contains_key(&child.id));
+            assert!(sessions.0.lock_unpoisoned().contains_key(&child.id));
             drop(scope);
             assert_ne!(actor.snapshot().lifecycle, ActorLifecycle::Open);
             race(
                 async {
-                    while sessions.lock().contains_key(&child.id) {
+                    while sessions.0.lock_unpoisoned().contains_key(&child.id) {
                         smol::future::yield_now().await;
                     }
                 },
@@ -1235,7 +1250,11 @@ mod tests {
             assert_ne!(owned.snapshot().lifecycle, ActorLifecycle::Open);
             assert_eq!(other.snapshot().lifecycle, ActorLifecycle::Open);
             assert_eq!(
-                lua.app_data_ref::<AgentOwners>().unwrap().lock().len(),
+                lua.app_data_ref::<AgentOwners>()
+                    .unwrap()
+                    .0
+                    .lock_unpoisoned()
+                    .len(),
                 1,
                 "revocation drops only the revoked plugin's ownership record"
             );

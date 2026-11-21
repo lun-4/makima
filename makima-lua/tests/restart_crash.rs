@@ -1,3 +1,4 @@
+use makima_agent::test_util::poll_until;
 mod common;
 
 use common::{RestartHost, TestSession};
@@ -501,14 +502,14 @@ makima.api.register_tool = register
         }
     }
     parent.reply.send(wait).unwrap();
-    smol::block_on(common::bounded_at("task_wait handler entry", async {
-        loop {
-            if host.fs.files().iter().any(|(path, _)| path == &marker) {
-                break;
-            }
-            futures_lite::future::yield_now().await;
-        }
-    }));
+    smol::block_on(poll_until(RESTORED_REQUEST_TIMEOUT, || {
+        host.fs
+            .files()
+            .iter()
+            .any(|(path, _)| path == &marker)
+            .then_some(())
+    }))
+    .expect("task_wait handler did not enter");
     command(&host, "publish");
     let saved_ids = ids(&host);
     let prefix = TestSession::load(session_id, &state).unwrap();

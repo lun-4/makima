@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -1131,7 +1132,7 @@ impl<'h> Agent<'h> {
 
     fn invalidate_reports(&self) {
         if let Some(capture) = &self.local_tool_capture {
-            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+            *capture.lock_unpoisoned() = None;
         }
         if let Some(callback) = &self.instruction_consumed_callback {
             callback();
@@ -1159,7 +1160,7 @@ impl<'h> Agent<'h> {
             || {
                 self.pending_instruction_request = true;
                 if let Some(capture) = &self.local_tool_capture {
-                    *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    *capture.lock_unpoisoned() = None;
                 }
                 if let Some(callback) = &self.instruction_consumed_callback {
                     callback();
@@ -1214,7 +1215,7 @@ impl<'h> Agent<'h> {
                     || {
                         self.pending_instruction_request = true;
                         if let Some(capture) = &self.local_tool_capture {
-                            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                            *capture.lock_unpoisoned() = None;
                         }
                         if let Some(callback) = &self.instruction_consumed_callback {
                             callback();
@@ -1231,7 +1232,7 @@ impl<'h> Agent<'h> {
                     || {
                         self.pending_instruction_request = true;
                         if let Some(capture) = &self.local_tool_capture {
-                            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                            *capture.lock_unpoisoned() = None;
                         }
                         if let Some(callback) = &self.instruction_consumed_callback {
                             callback();
@@ -2615,7 +2616,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: ROOT_CONTEXT_PLUGIN.into(),
-                registration: 0,
+                name: "default".into(),
                 content: content.into(),
             },
         );

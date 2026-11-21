@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -565,11 +566,7 @@ impl RenewingDeletionLease {
         let (done_tx, done) = flume::bounded(1);
         std::thread::spawn(move || {
             loop {
-                match worker_lease
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .heartbeat()
-                {
+                match worker_lease.lock_unpoisoned().heartbeat() {
                     Ok(session_lock::LockBeat::Lost) => break,
                     Err(error) => warn!(%error, "pending deletion heartbeat failed"),
                     Ok(_) => {}
@@ -593,8 +590,7 @@ impl RenewingDeletionLease {
         self.lease
             .as_ref()
             .expect("held session lease")
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .publication_guard()
     }
 
@@ -4497,11 +4493,7 @@ impl<'t> EventLoop<'t> {
             }
             SessionOpKind::OptionToggled { id, committed } => match result {
                 Ok(()) => {
-                    if let Some(enabled) = committed
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take()
-                    {
+                    if let Some(enabled) = committed.lock_unpoisoned().take() {
                         complete_option_toggle(&mut self.sessions[idx].app, id, enabled);
                     }
                 }
@@ -4523,7 +4515,7 @@ impl<'t> EventLoop<'t> {
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
                 Ok(()) => {
-                    let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    let adopted = adopted.lock_unpoisoned().take();
                     if let Some(path) = adopted {
                         self.sessions[idx].app.apply_directory_change(path);
                     }
@@ -4842,7 +4834,7 @@ impl<'t> EventLoop<'t> {
                 .await
                 .map(|commit| {
                     if is_root {
-                        *adopted.lock().unwrap_or_else(|error| error.into_inner()) =
+                        *adopted.lock_unpoisoned() =
                             Some(commit.config.context.cwd().to_path_buf());
                     }
                 })
@@ -5661,7 +5653,7 @@ fn dispatch_option_change(
                 .map(|(enabled, _)| enabled),
         }
         .map(|enabled| {
-            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(enabled);
+            *slot.lock_unpoisoned() = Some(enabled);
         })
         .map_err(|error| error.to_string());
         let _ = internal_tx.send(InternalEvent::SessionOp {

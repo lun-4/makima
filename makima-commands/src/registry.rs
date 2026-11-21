@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,11 +160,7 @@ impl CommandRegistry {
     }
 
     pub fn create_producer(&self, precedence: ProducerPrecedence) -> Producer {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.0.state.lock_unpoisoned();
         let id = ProducerId::new(self.0.id, state.take_id());
         let creation_order = state.next_id;
         state.producers.push(ProducerSlot {
@@ -211,14 +208,7 @@ impl CommandRegistry {
         presentation_capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> PreparedTarget {
-        let id = InvocationTargetId::new(
-            self.0.id,
-            self.0
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take_id(),
-        );
+        let id = InvocationTargetId::new(self.0.id, self.0.state.lock_unpoisoned().take_id());
         PreparedTarget {
             registry: Arc::clone(&self.0),
             handle: TargetHandle(Arc::new(TargetCore {
@@ -234,20 +224,11 @@ impl CommandRegistry {
     }
 
     pub fn target_count(&self) -> usize {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .targets
-            .len()
+        self.0.state.lock_unpoisoned().targets.len()
     }
 
     pub fn claim_standard_commands(&self) -> bool {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.0.state.lock_unpoisoned();
         if state.standard_commands_registered {
             return false;
         }
@@ -256,19 +237,11 @@ impl CommandRegistry {
     }
 
     pub fn release_standard_commands(&self) {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .standard_commands_registered = false;
+        self.0.state.lock_unpoisoned().standard_commands_registered = false;
     }
 
     pub fn subscribe(&self) -> RegistrySubscription {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.0.state.lock_unpoisoned();
         let core = Arc::new(SubscriptionCore {
             generation: AtomicU64::new(state.generation),
             waker: Mutex::new(None),
@@ -307,11 +280,7 @@ impl CommandRegistry {
         {
             return Err(CompletionError::Unavailable);
         }
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.0.state.lock_unpoisoned();
         state
             .producers
             .iter()
@@ -348,11 +317,7 @@ impl CommandRegistry {
         spelling: &str,
     ) -> Result<ResolvedCommand, ResolutionError> {
         let normalized = normalize(spelling);
-        let state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.0.state.lock_unpoisoned();
         let capabilities =
             target_capabilities(&state, self.0.id, target).ok_or(ResolutionError::StaleTarget)?;
         state
@@ -370,11 +335,7 @@ impl CommandRegistry {
     }
 
     pub fn snapshot_for(&self, target: &TargetHandle) -> Result<RegistrySnapshot, CommandError> {
-        let state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.0.state.lock_unpoisoned();
         let record = target_record(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
         Ok(snapshot_for_capabilities(
             &state,
@@ -425,11 +386,7 @@ impl PreparedTarget {
     }
 
     pub fn snapshot(&self) -> RegistrySnapshot {
-        let state = self
-            .registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.registry.state.lock_unpoisoned();
         snapshot_for_capabilities(
             &state,
             self.record.capabilities,
@@ -438,11 +395,7 @@ impl PreparedTarget {
     }
 
     pub fn activate(self) -> TargetHandle {
-        let mut state = self
-            .registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.registry.state.lock_unpoisoned();
         let previous = state.targets.insert(self.handle.id(), self.record);
         debug_assert!(previous.is_none());
         drop(state);
@@ -461,12 +414,7 @@ impl Drop for TargetCore {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .targets
-            .remove(&self.id);
+        registry.state.lock_unpoisoned().targets.remove(&self.id);
     }
 }
 
@@ -482,11 +430,7 @@ impl RegistrySubscription {
             if current != generation {
                 return Poll::Ready(current);
             }
-            *subscription
-                .0
-                .waker
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(context.waker().clone());
+            *subscription.0.waker.lock_unpoisoned() = Some(context.waker().clone());
             let current = subscription.generation();
             if current != generation {
                 Poll::Ready(current)
@@ -546,14 +490,8 @@ impl Producer {
             .registry
             .upgrade()
             .ok_or(RegistrationError::StaleProducer)?;
-        let publication = registry
-            .publication
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut state = registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let publication = registry.publication.lock_unpoisoned();
+        let mut state = registry.state.lock_unpoisoned();
         let position = state
             .producers
             .iter()
@@ -576,10 +514,7 @@ impl Producer {
             .into_iter()
             .filter_map(CompletionInvalidation::prepare)
             .collect::<Vec<_>>();
-        let mut state = registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = registry.state.lock_unpoisoned();
         state.producers[position].records = records;
         state.producers[position].generation += 1;
         state.generation += 1;
@@ -600,14 +535,8 @@ impl Producer {
         let Some(registry) = self.registry.upgrade() else {
             return false;
         };
-        let publication = registry
-            .publication
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut state = registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let publication = registry.publication.lock_unpoisoned();
+        let mut state = registry.state.lock_unpoisoned();
         let Some(position) = state
             .producers
             .iter()
@@ -622,10 +551,7 @@ impl Producer {
             .into_iter()
             .filter_map(CompletionInvalidation::prepare)
             .collect::<Vec<_>>();
-        let mut state = registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = registry.state.lock_unpoisoned();
         state.producers.remove(position);
         state.generation += 1;
         state.rebuild();
@@ -671,12 +597,7 @@ impl RegistryState {
             subscriber
                 .generation
                 .store(self.generation, Ordering::Release);
-            if let Some(waker) = subscriber
-                .waker
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
+            if let Some(waker) = subscriber.waker.lock_unpoisoned().take() {
                 wakers.push(waker);
             }
             true

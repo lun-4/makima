@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::Arc;
 
 use makima_providers::Message;
@@ -42,12 +43,7 @@ impl ActorIdleGuard {
     }
 
     pub fn source_snapshot(&self) -> Result<ActorSourceSnapshot, ActorError> {
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -81,12 +77,7 @@ impl ActorIdleGuard {
         &self,
         snapshot: HistorySnapshot<Message>,
     ) -> Result<(), ActorError> {
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -100,18 +91,12 @@ impl ActorIdleGuard {
         if !self.actor.owns_ticket(ticket) {
             return Err(ActorError::PolicyCancelled);
         }
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         let retired = !self
             .actor
             .inner
             .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .contains_key(&ticket.turn_id());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -139,12 +124,7 @@ impl Drop for ActorIdleGuard {
         if !self.release {
             return;
         }
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         if state.owned_idle(&self.owner).is_some() {
             state.idle = None;
             super::drive_operations(&self.actor.inner, &mut state);
@@ -202,8 +182,7 @@ impl AgentActorHandle {
     pub(crate) fn has_pending_work(&self) -> bool {
         self.inner
             .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .has_pending_work(&self.inner.queue)
     }
 
@@ -212,7 +191,7 @@ impl AgentActorHandle {
         loop {
             let listener = self.inner.policy_changed.listen();
             {
-                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.inner.state.lock_unpoisoned();
                 if state.idle.is_none() || state.lifecycle != ActorLifecycle::Open {
                     return;
                 }
@@ -226,7 +205,7 @@ impl AgentActorHandle {
     }
 
     pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }

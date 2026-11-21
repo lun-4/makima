@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -72,10 +73,7 @@ type Revocation = Arc<RevocationSlot>;
 type RevocationSlot = Mutex<Option<CancelTrigger>>;
 
 fn revoke_now(revocation: &Revocation) {
-    revocation
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take();
+    revocation.lock_unpoisoned().take();
 }
 
 impl AutocmdEntry {
@@ -439,7 +437,7 @@ fn create_autocmd(
         }
     };
     if crate::runtime::loading_plugin_is(lua, &plugin) {
-        register(&mut pending.lock().unwrap_or_else(|error| error.into_inner()));
+        register(&mut pending.lock_unpoisoned());
     } else {
         register(
             &mut *lua
@@ -465,10 +463,7 @@ fn del_autocmd(
     id: u64,
 ) -> LuaResult<()> {
     if crate::runtime::loading_plugin_is(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(id);
+        pending.lock_unpoisoned().remove(id);
     } else if let Some(mut store) = lua.app_data_mut::<AutocmdStore>() {
         store.remove(id);
     }
@@ -511,7 +506,7 @@ fn exec_autocmds(
     for event in events {
         if crate::runtime::loading_plugin_is(lua, &plugin) {
             let snapshot = {
-                let mut store = pending.lock().unwrap_or_else(|error| error.into_inner());
+                let mut store = pending.lock_unpoisoned();
                 snapshot(&mut store, &event, pattern.as_deref(), None)
             };
             dispatch_snapshot(
@@ -545,7 +540,7 @@ mod tests {
     use makima_agent::actor::EffectiveAgentConfig;
     use makima_agent::agent::RunSettings;
     use makima_agent::manager::ResidentAgent;
-    use makima_agent::test_util::StubBackend;
+    use makima_agent::test_util::MockBackend;
     use makima_agent::tools::ToolContext;
     use makima_agent::tools::test_support::stub_ctx;
     use makima_agent::{ActorBackend, AgentMode, ManagerError};
@@ -596,7 +591,7 @@ mod tests {
             let manager = AgentManagerHandle::new(Default::default()).unwrap();
             let agent = manager
                 .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-                    Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend))
+                    Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT))
                 })
                 .unwrap();
             let old = agent.incarnation().unwrap();
@@ -656,7 +651,7 @@ mod tests {
             let replacement = manager
                 .ensure_resident_with(agent.id(), |_| async {
                     Ok(ResidentAgent {
-                        backend: Box::new(StubBackend),
+                        backend: Box::new(MockBackend::STRICT),
                         config,
                         shared_messages: None,
                         start: None,

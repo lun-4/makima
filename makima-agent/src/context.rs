@@ -10,7 +10,7 @@ use makima_storage::session_state::{StateChange, StoredAgentLifecycle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::Arc,
 };
@@ -47,47 +47,54 @@ pub struct ContextUpdate {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Manifest {
+    #[serde(rename = "version")]
     version: u32,
+    #[serde(rename = "sources")]
     sources: Vec<Source>,
+    #[serde(rename = "hashes")]
     hashes: BTreeMap<String, String>,
+    #[serde(rename = "seen_observations", default)]
     seen_observations: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 enum Source {
+    #[serde(rename = "instruction")]
     Instruction {
+        #[serde(rename = "path")]
         path: PathBuf,
+        #[serde(rename = "label")]
         label: String,
     },
+    #[serde(rename = "prompt")]
     Prompt {
-        prompt: PromptId,
+        #[serde(rename = "prompts")]
+        prompts: Vec<PromptId>,
+        #[serde(rename = "slot")]
         slot: Slot,
+        #[serde(rename = "plugin")]
         plugin: String,
-        registration: usize,
+        #[serde(rename = "name")]
+        name: String,
     },
 }
 
 #[derive(Serialize)]
-enum SourceKey<'a> {
-    Instruction {
-        path: &'a PathBuf,
-    },
-    Prompt {
-        prompt: PromptId,
-        slot: Slot,
-        plugin: &'a str,
-        registration: usize,
-    },
-}
-
-#[derive(Serialize)]
+#[serde(tag = "kind")]
 enum Observation<'a> {
+    #[serde(rename = "source")]
     Source {
+        #[serde(rename = "key")]
         key: &'a str,
+        #[serde(rename = "observed")]
         observed: Option<(&'a Source, &'a Option<String>)>,
     },
+    #[serde(rename = "order")]
     Order {
+        #[serde(rename = "group")]
         group: &'a str,
+        #[serde(rename = "keys")]
         keys: &'a [String],
     },
 }
@@ -101,21 +108,19 @@ struct RecordedContext {
 
 impl Source {
     fn key(&self) -> Result<String, StateError> {
-        let key = match self {
-            Self::Instruction { path, .. } => SourceKey::Instruction { path },
+        match self {
+            Self::Instruction { path, .. } => path
+                .to_str()
+                .map(|path| format!("instruction:{path}"))
+                .ok_or_else(|| StateError::InvalidValue("instruction path is not UTF-8".into())),
             Self::Prompt {
-                prompt,
-                slot,
-                plugin,
-                registration,
-            } => SourceKey::Prompt {
-                prompt: *prompt,
-                slot: *slot,
-                plugin,
-                registration: *registration,
-            },
-        };
-        encode(&key)
+                slot, plugin, name, ..
+            } => {
+                let plugin = escape_key_component(plugin);
+                let name = escape_key_component(name);
+                Ok(format!("prompt:{plugin}:{slot}:{name}"))
+            }
+        }
     }
 
     fn is_prompt(&self) -> bool {
@@ -152,7 +157,7 @@ impl ContextBinding {
         slots_complete: bool,
         policy: ContextPolicy,
     ) -> Result<(Arc<RootContext>, ContextUpdate), StateError> {
-        let observed = collect_sources(instructions, slots, slots_complete);
+        let observed = collect_sources(instructions, slots, slots_complete)?;
         let (effective, changes, notice) =
             self.recorded
                 .reconcile(observed, slots_complete, policy, self.access.target)?;
@@ -321,17 +326,23 @@ impl RecordedContext {
                     })?,
                 }),
                 Source::Prompt {
-                    prompt,
+                    prompts,
                     slot,
                     plugin,
-                    registration,
-                } => slots.observe(PromptSource {
-                    prompt: *prompt,
-                    slot: *slot,
-                    plugin: Arc::from(plugin.as_str()),
-                    registration: *registration,
-                    content: content.clone(),
-                }),
+                    name,
+                } => {
+                    let plugin: Arc<str> = Arc::from(plugin.as_str());
+                    let name: Arc<str> = Arc::from(name.as_str());
+                    for &prompt in prompts {
+                        slots.observe(PromptSource {
+                            prompt,
+                            slot: *slot,
+                            plugin: plugin.clone(),
+                            name: name.clone(),
+                            content: content.clone(),
+                        });
+                    }
+                }
             }
         }
         Ok(RootContext {
@@ -484,11 +495,15 @@ impl RecordedContext {
     }
 }
 
+fn escape_key_component(component: &str) -> String {
+    component.replace('%', "%25").replace(':', "%3A")
+}
+
 fn collect_sources(
     instructions: &Instructions,
     slots: &ResolvedSlots,
     slots_complete: bool,
-) -> Vec<(Source, Option<String>)> {
+) -> Result<Vec<(Source, Option<String>)>, StateError> {
     let mut sources: Vec<_> = instructions
         .sources
         .iter()
@@ -503,19 +518,36 @@ fn collect_sources(
         })
         .collect();
     if slots_complete {
-        sources.extend(slots.sources().into_iter().map(|source| {
-            (
-                Source::Prompt {
-                    prompt: source.prompt,
-                    slot: source.slot,
-                    plugin: source.plugin.to_string(),
-                    registration: source.registration,
-                },
-                source.content,
-            )
-        }));
+        let mut by_key = HashMap::new();
+        for source in slots.sources() {
+            let address = (&source.plugin, source.slot, &source.name);
+            let index = *by_key.entry(address).or_insert(sources.len());
+            if index == sources.len() {
+                sources.push((
+                    Source::Prompt {
+                        prompts: vec![source.prompt],
+                        slot: source.slot,
+                        plugin: source.plugin.to_string(),
+                        name: source.name.to_string(),
+                    },
+                    source.content.clone(),
+                ));
+            } else if let (Source::Prompt { prompts, .. }, content) = &mut sources[index] {
+                if *content != source.content || prompts.contains(&source.prompt) {
+                    return Err(StateError::InvalidValue(
+                        "duplicate observed context source".into(),
+                    ));
+                }
+                prompts.push(source.prompt);
+            }
+        }
+        for (source, _) in &mut sources {
+            if let Source::Prompt { prompts, .. } = source {
+                prompts.sort_by_cached_key(|prompt| prompt.to_string());
+            }
+        }
     }
-    sources
+    Ok(sources)
 }
 
 fn source_order<'a>(
@@ -526,11 +558,15 @@ fn source_order<'a>(
     for source in sources {
         let key = source.key()?;
         if common.contains(&key) {
-            let group = match source {
-                Source::Instruction { .. } => String::new(),
-                Source::Prompt { prompt, slot, .. } => encode(&(prompt, slot))?,
-            };
-            order.entry(group).or_default().push(key);
+            match source {
+                Source::Instruction { .. } => order.entry(String::new()).or_default().push(key),
+                Source::Prompt { prompts, slot, .. } => {
+                    for prompt in prompts {
+                        let group = format!("{prompt}:{slot}");
+                        order.entry(group).or_default().push(key.clone());
+                    }
+                }
+            }
         }
     }
     Ok(order)
@@ -596,6 +632,7 @@ mod tests {
     use makima_domain::PostLevel;
     use makima_storage::session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord};
     use makima_storage::test_util::test_record;
+    use serde_json::{Value, json};
     use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
     use test_case::test_case;
 
@@ -675,14 +712,14 @@ mod tests {
         )
     }
 
-    fn slots(sources: &[(usize, Option<&str>)]) -> ResolvedSlots {
+    fn slots(sources: &[(&str, Option<&str>)]) -> ResolvedSlots {
         let mut slots = ResolvedSlots::default();
-        for (registration, content) in sources {
+        for (name, content) in sources {
             slots.observe(PromptSource {
                 prompt: PromptId::System,
                 slot: Slot::Conventions,
                 plugin: Arc::from(PLUGIN),
-                registration: *registration,
+                name: (*name).into(),
                 content: content.map(Into::into),
             });
         }
@@ -717,13 +754,105 @@ mod tests {
         assert!(update.changes.is_empty());
     }
 
+    #[test_case("a:tool_usage:b", "c%" => "prompt:a%3Atool_usage%3Ab:tool_usage:c%25"; "escape_plugin")]
+    #[test_case("a", "b:tool_usage:c%" => "prompt:a:tool_usage:b%3Atool_usage%3Ac%25"; "escape_name")]
+    fn prompt_key_escapes_separators(plugin: &str, name: &str) -> String {
+        Source::Prompt {
+            prompts: vec![PromptId::System],
+            slot: Slot::ToolUsage,
+            plugin: plugin.into(),
+            name: name.into(),
+        }
+        .key()
+        .unwrap()
+    }
+
+    #[test]
+    fn context_wire_keys_share_one_source_across_prompt_targets() {
+        const PATH: &str = "/project/AGENTS.md";
+        const INSTRUCTION_KEY: &str = "instruction:/project/AGENTS.md";
+        const PROMPT_KEY: &str = "prompt:fixture/plugin:conventions:first";
+        let fixture = Fixture::new();
+        let instructions = instructions(&[(PATH, LABEL, FIRST)]);
+        let mut prompt_slots = slots(&[("first", Some(SECOND))]);
+        let mut shared = prompt_slots.sources()[0].clone();
+        shared.prompt = PromptId::General;
+        prompt_slots.observe(shared);
+        let (_, update) =
+            fixture.prepare(&instructions, &prompt_slots, true, ContextPolicy::Admission);
+        let records: BTreeMap<_, _> = update
+            .changes
+            .iter()
+            .map(|record| match &record.change {
+                StateChange::Context {
+                    source,
+                    hash,
+                    content,
+                } => (source.as_str(), (hash, content)),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[INSTRUCTION_KEY].1.as_str(), FIRST);
+        assert_eq!(records[PROMPT_KEY].1.as_str(), r#""second""#);
+        let mut manifest: Value = serde_json::from_str(records[CONTEXT_MANIFEST].1).unwrap();
+        let observations = manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("seen_observations")
+            .unwrap();
+        assert_eq!(observations.as_array().unwrap().len(), 3);
+        assert_eq!(
+            manifest,
+            json!({
+                "version": 1,
+                "sources": [
+                    {"kind": "instruction", "path": PATH, "label": LABEL},
+                    {"kind": "prompt", "prompts": ["general", "system"], "slot": "conventions",
+                     "plugin": PLUGIN, "name": "first"}
+                ],
+                "hashes": {
+                    (INSTRUCTION_KEY): records[INSTRUCTION_KEY].0,
+                    (PROMPT_KEY): records[PROMPT_KEY].0,
+                },
+            })
+        );
+        fixture.commit(update);
+        fixture
+            .journal
+            .commit(JournalCommit {
+                changes: vec![context_change(
+                    fixture.root,
+                    CONTEXT_MANIFEST.into(),
+                    manifest.to_string(),
+                )],
+                ..Default::default()
+            })
+            .unwrap();
+        let restored = fixture.read();
+        for prompt in [PromptId::System, PromptId::General] {
+            assert_eq!(
+                restored.slots.get(prompt, Slot::Conventions)[0].content,
+                SECOND
+            );
+        }
+        let (_, unchanged) =
+            fixture.prepare(&instructions, &prompt_slots, true, ContextPolicy::Admission);
+        assert!(!unchanged.notice);
+        assert_eq!(unchanged.changes.len(), 1);
+        assert!(matches!(
+            &unchanged.changes[0].change,
+            StateChange::Context { source, .. } if source == CONTEXT_MANIFEST
+        ));
+    }
+
     #[test]
     fn changed_and_removed_sources_keep_recorded_text_and_labels() {
         let fixture = Fixture::new();
         let original = instructions(&[(FIRST, LABEL, FIRST), (SECOND, LABEL, SECOND)]);
         let (_, initial) = fixture.prepare(
             &original,
-            &slots(&[(0, Some(FIRST))]),
+            &slots(&[("first", Some(FIRST))]),
             true,
             ContextPolicy::Admission,
         );
@@ -857,7 +986,7 @@ mod tests {
         let fixture = Fixture::new();
         let (_, initial) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, None)]),
+            &slots(&[("first", None)]),
             true,
             ContextPolicy::Admission,
         );
@@ -870,7 +999,7 @@ mod tests {
         assert!(fixture.read().slots.sources().is_empty());
         let (_, repeated) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, None)]),
+            &slots(&[("first", None)]),
             true,
             ContextPolicy::Admission,
         );
@@ -878,7 +1007,7 @@ mod tests {
         assert!(repeated.changes.is_empty());
         let (effective, first_content) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, content)]),
+            &slots(&[("first", content)]),
             true,
             ContextPolicy::Admission,
         );
@@ -887,7 +1016,7 @@ mod tests {
         fixture.commit(first_content);
         let (effective, absent) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, None)]),
+            &slots(&[("first", None)]),
             true,
             ContextPolicy::Admission,
         );
@@ -905,7 +1034,7 @@ mod tests {
             instructions(&[(FIRST, LABEL, FIRST)])
         };
         let baseline_slots = if prompt {
-            slots(&[(0, Some(FIRST))])
+            slots(&[("first", Some(FIRST))])
         } else {
             ResolvedSlots::default()
         };
@@ -942,7 +1071,7 @@ mod tests {
             instructions(&[(FIRST, LABEL, CHANGED)])
         };
         let changed_slots = if prompt {
-            slots(&[(0, Some(CHANGED))])
+            slots(&[("first", Some(CHANGED))])
         } else {
             ResolvedSlots::default()
         };
@@ -1022,14 +1151,14 @@ mod tests {
         let fixture = Fixture::new();
         let (_, initial) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, recorded)]),
+            &slots(&[("first", recorded)]),
             true,
             ContextPolicy::Admission,
         );
         fixture.commit(initial);
         let (effective, changed) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, observed)]),
+            &slots(&[("first", observed)]),
             true,
             ContextPolicy::Admission,
         );
@@ -1045,7 +1174,7 @@ mod tests {
         fixture.commit(changed);
         let (effective, reload) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, observed)]),
+            &slots(&[("first", observed)]),
             true,
             ContextPolicy::Reload,
         );
@@ -1055,7 +1184,7 @@ mod tests {
         assert!(fixture.read().slots.sources().is_empty());
         let (_, changed_again) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, recorded)]),
+            &slots(&[("first", recorded)]),
             true,
             ContextPolicy::Admission,
         );
@@ -1068,14 +1197,14 @@ mod tests {
         let fixture = Fixture::new();
         let (_, update) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, Some(FIRST)), (1, None)]),
+            &slots(&[("first", Some(FIRST)), ("second", None)]),
             true,
             ContextPolicy::Admission,
         );
         fixture.commit(update);
         let (effective, update) = fixture.prepare(
             &instructions(&[(FIRST, LABEL, FIRST)]),
-            &slots(&[(0, Some(CHANGED)), (2, Some(SECOND))]),
+            &slots(&[("first", Some(CHANGED)), ("third", Some(SECOND))]),
             false,
             policy,
         );
@@ -1093,7 +1222,7 @@ mod tests {
         let fixture = Fixture::new();
         let (_, initial) = fixture.prepare(
             &instructions(&[(FIRST, LABEL, FIRST)]),
-            &slots(&[(0, Some(FIRST))]),
+            &slots(&[("first", Some(FIRST))]),
             true,
             ContextPolicy::Admission,
         );
@@ -1109,7 +1238,7 @@ mod tests {
         assert!(fixture.read().slots.sources().is_empty());
         let (_, first_sight) = fixture.prepare(
             &instructions(&[(FIRST, OTHER_LABEL, CHANGED)]),
-            &slots(&[(0, None)]),
+            &slots(&[("first", None)]),
             true,
             ContextPolicy::Admission,
         );
@@ -1261,14 +1390,14 @@ mod tests {
     }
 
     #[test]
-    fn prompt_order_is_compared_per_bucket_and_retains_registration_identity() {
+    fn prompt_order_is_compared_per_bucket_and_retains_named_identity() {
         let fixture = Fixture::new();
-        let mut initial = slots(&[(0, Some(FIRST)), (1, Some(SECOND))]);
+        let mut initial = slots(&[("first", Some(FIRST)), ("second", Some(SECOND))]);
         initial.observe(PromptSource {
             prompt: PromptId::General,
             slot: Slot::Tone,
             plugin: Arc::from(PLUGIN),
-            registration: 0,
+            name: "default".into(),
             content: Some(SECOND.into()),
         });
         let (_, update) = fixture.prepare(
@@ -1283,7 +1412,7 @@ mod tests {
             prompt: PromptId::System,
             slot: Slot::Identity,
             plugin: Arc::from(PLUGIN),
-            registration: 0,
+            name: "default".into(),
             content: Some(THIRD.into()),
         });
         for _ in 0..2 {
@@ -1296,10 +1425,10 @@ mod tests {
             assert!(!update.notice);
             fixture.commit(update);
         }
-        let mut reversed = slots(&[(1, Some(SECOND)), (0, Some(FIRST))]);
+        let mut reversed = slots(&[("second", Some(SECOND)), ("first", Some(FIRST))]);
         for source in with_new_bucket.sources() {
             if source.slot != Slot::Conventions {
-                reversed.observe(source);
+                reversed.observe(source.clone());
             }
         }
         let (effective, update) = fixture.prepare(
@@ -1312,11 +1441,11 @@ mod tests {
         let conventions: Vec<_> = effective
             .slots
             .sources()
-            .into_iter()
+            .iter()
             .filter(|source| source.slot == Slot::Conventions)
             .collect();
-        assert_eq!(conventions[0].registration, 0);
-        assert_eq!(conventions[1].registration, 1);
+        assert_eq!(conventions[0].name.as_ref(), "first");
+        assert_eq!(conventions[1].name.as_ref(), "second");
         assert_eq!(conventions[1].content.as_deref(), Some(SECOND));
         fixture.commit(update);
         let (_, repeated) = fixture.prepare(
@@ -1333,7 +1462,7 @@ mod tests {
         let fixture = Fixture::new();
         let (_, initial) = fixture.prepare(
             &Instructions::default(),
-            &slots(&[(0, Some(FIRST))]),
+            &slots(&[("first", Some(FIRST))]),
             true,
             ContextPolicy::Admission,
         );
@@ -1343,7 +1472,7 @@ mod tests {
         let (_, first) = binding
             .prepare(
                 &Instructions::default(),
-                &slots(&[(0, Some(CHANGED))]),
+                &slots(&[("first", Some(CHANGED))]),
                 true,
                 ContextPolicy::Admission,
             )
@@ -1351,7 +1480,7 @@ mod tests {
         let (_, repeated) = binding
             .prepare(
                 &Instructions::default(),
-                &slots(&[(0, Some(CHANGED))]),
+                &slots(&[("first", Some(CHANGED))]),
                 true,
                 ContextPolicy::Admission,
             )
@@ -1362,7 +1491,7 @@ mod tests {
         assert!(matches!(
             binding.prepare(
                 &Instructions::default(),
-                &slots(&[(0, Some(FIRST)), (0, None)]),
+                &slots(&[("first", Some(FIRST)), ("first", None)]),
                 true,
                 ContextPolicy::Admission,
             ),

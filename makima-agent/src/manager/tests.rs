@@ -10,6 +10,7 @@ use test_case::test_case;
 
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
 use crate::session_writer::{SessionIo, SessionWriter};
+use crate::test_util::poll_until;
 use event_listener::Event;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
@@ -501,18 +502,9 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
 
 /// Yields until `cond` holds. Bounded only so a broken test cannot hang.
 async fn yield_until(cond: impl Fn() -> bool) {
-    futures_lite::future::or(
-        async {
-            while !cond() {
-                smol::future::yield_now().await;
-            }
-        },
-        async {
-            smol::Timer::after(COMPLETION_TIMEOUT).await;
-            panic!("{CONDITION_TIMEOUT}");
-        },
-    )
-    .await;
+    poll_until(COMPLETION_TIMEOUT, || cond().then_some(()))
+        .await
+        .expect(CONDITION_TIMEOUT);
 }
 
 /// The deferred runner waits on its start signal and the actor's policy
@@ -1080,9 +1072,7 @@ fn idle_guard_reports_closed_actor_as_non_live(managed: bool) {
         ));
         drop(guard);
         drop(start_tx);
-        while !manager.runner_finished(root.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
+        yield_until(|| manager.runner_finished(root.id()).unwrap()).await;
         assert!(matches!(
             manager.prepare_idle_subtree(root.id()),
             Err(ManagerError::NonLiveAgent(id)) if id == root.id()
@@ -4540,11 +4530,7 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
         Err(ManagerError::NonLiveAgent(id)) if id == root_id
     ));
     assert!(manager.lookup(root_id).is_err());
-    smol::block_on(async {
-        while !manager.runner_finished(root_id).unwrap() {
-            smol::future::yield_now().await;
-        }
-    });
+    smol::block_on(yield_until(|| manager.runner_finished(root_id).unwrap()));
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
     assert!(report.joined.is_empty());
     assert!(report.timed_out.is_empty());
@@ -4565,11 +4551,7 @@ fn shutdown_excludes_finished_child_runner_and_preserves_retained_node() {
         )
         .unwrap();
     child.close_subtree().unwrap();
-    smol::block_on(async {
-        while !manager.runner_finished(child.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
-    });
+    smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
@@ -4802,11 +4784,7 @@ fn closing_idle_child_retains_identity_quota_until_retired() {
         )
         .unwrap();
     manager.close_subtree(child.id()).unwrap();
-    smol::block_on(async {
-        while !manager.runner_finished(child.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
-    });
+    smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert!(matches!(
         manager.spawn_child(
             &current,
@@ -4863,11 +4841,7 @@ fn closing_descendants_does_not_resurrect_closed_tombstones() {
         )
         .unwrap();
     child.close_subtree().unwrap();
-    smol::block_on(async {
-        while !manager.runner_finished(child.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
-    });
+    smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
@@ -4904,11 +4878,7 @@ fn direct_actor_close_retains_identity_quota_when_runner_finishes() {
         .unwrap();
 
     child.actor().unwrap().close();
-    smol::block_on(async {
-        while !manager.runner_finished(child.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
-    });
+    smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Closed
@@ -4977,9 +4947,7 @@ fn closing_active_child_retains_identity_quota_after_runner_finishes() {
 
         child_gate.release(1);
         let outcome = ticket.wait().await;
-        while !manager.runner_finished(child.id()).unwrap() {
-            smol::future::yield_now().await;
-        }
+        yield_until(|| manager.runner_finished(child.id()).unwrap()).await;
         assert!(
             matches!(events.try_recv().unwrap(), crate::ActorEvent::End(result) if result.outcome == outcome)
         );

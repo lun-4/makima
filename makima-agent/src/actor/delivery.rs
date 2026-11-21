@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -268,10 +269,7 @@ pub(crate) fn admit_delivery_bound(
     let preview = Arc::new(delivery.preview(store));
     let message = preview.input().preamble.remove(0);
     let bytes = message.first_text_content().map_or(0, str::len);
-    let mut state = inner
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut state = inner.state.lock_unpoisoned();
     if state.lifecycle == ActorLifecycle::Shutdown {
         let journal = inner
             .journal
@@ -349,10 +347,7 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
         return;
     }
     let policy = {
-        let state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = inner.state.lock_unpoisoned();
         state.parent_delivery_policy.clone()
     };
     if !policy.is_some_and(|policy| policy.auto_deliver) {
@@ -367,8 +362,7 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
     });
     let work = inner
         .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_unpoisoned()
         .turn_work
         .get_mut(&ticket.turn_id())
         .into_iter()
@@ -391,8 +385,7 @@ pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
     if let Err(reason) = result {
         inner
             .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .emit(ActorEvent::Delivery(DeliveryEvent {
                 delivery,
                 status: DeliveryStatus::Rejected(reason),
@@ -405,11 +398,7 @@ impl AgentActorHandle {
         &self,
         mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
     ) -> Result<(), super::ActorError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         let Some(journal) = &self.inner.journal else {
             return Ok(());
         };
@@ -449,11 +438,7 @@ impl AgentActorHandle {
     }
 
     pub fn withdraw_child_delivery(&self, child_turn: TurnId) -> bool {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         let Some(pending) = state.deliveries.get(&child_turn) else {
             return false;
         };
@@ -562,10 +547,7 @@ pub(super) fn discard(
 }
 
 pub(super) fn settle(inner: &ActorInner, turn_id: TurnId, reason: Option<TurnCancellationReason>) {
-    let mut state = inner
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut state = inner.state.lock_unpoisoned();
     if let Some(batch) = state.delivery_runs.remove(&turn_id)
         && batch.iter().any(|id| state.deliveries.contains_key(id))
     {
@@ -606,10 +588,7 @@ pub(super) fn drain(inner: &Arc<ActorInner>, turn_id: TurnId) -> Vec<Message> {
 }
 
 pub(super) fn commit(inner: &Arc<ActorInner>, turn_id: TurnId, commit: &mut dyn FnMut(Message)) {
-    let mut state = inner
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut state = inner.state.lock_unpoisoned();
     if state.lifecycle != ActorLifecycle::Open
         || held(inner, &state)
         || state
@@ -769,7 +748,7 @@ mod tests {
         ActorBackend, ActorEvent, ActorHistory, BackendResult, ControlWork, TurnContext,
         TurnProvenance, TurnResult, WorkKind,
     };
-    use crate::test_util::StubBackend;
+    use crate::test_util::{MockBackend, poll_until};
     use crate::{
         AgentActorHandle, AgentId, AgentInput, History, TurnCancellationReason, TurnId, TurnOutcome,
     };
@@ -859,7 +838,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -888,7 +867,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -919,7 +898,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -971,18 +950,11 @@ mod tests {
     }
 
     async fn settle_conversions(journal: &crate::journal::SessionJournal) {
-        futures_lite::future::or(
-            async {
-                while journal.pending_revision().is_some() {
-                    smol::future::yield_now().await;
-                }
-            },
-            async {
-                smol::Timer::after(CONVERSION_TIMEOUT).await;
-                panic!("{CONVERSION_TIMEOUT_MESSAGE}");
-            },
-        )
-        .await;
+        poll_until(CONVERSION_TIMEOUT, || {
+            journal.pending_revision().is_none().then_some(())
+        })
+        .await
+        .expect(CONVERSION_TIMEOUT_MESSAGE);
     }
 
     async fn delivery_view(manager: &crate::AgentManagerHandle) -> SessionStateView {
@@ -1256,7 +1228,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1270,7 +1242,7 @@ mod tests {
                 managed.agent_id,
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 Some(managed),
                 None,
                 Some(rx),
@@ -1311,7 +1283,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1329,7 +1301,7 @@ mod tests {
                 managed.agent_id,
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 Some(managed),
                 Some(Arc::new(config)),
                 Some(rx),
@@ -1381,7 +1353,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(parent_rx),
@@ -1403,7 +1375,7 @@ mod tests {
                 admission.agent_id,
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 Some(admission),
                 None,
                 Some(child_rx),
@@ -1475,7 +1447,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1503,7 +1475,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1544,7 +1516,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1615,7 +1587,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1789,7 +1761,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1826,7 +1798,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1872,7 +1844,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),
@@ -1931,7 +1903,7 @@ mod tests {
             id,
             Vec::new(),
             None,
-            Box::new(StubBackend),
+            Box::new(MockBackend::STRICT),
             Some(managed),
             None,
             Some(rx),
@@ -1974,7 +1946,7 @@ mod tests {
                 parent,
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(ready),
@@ -2230,7 +2202,7 @@ mod tests {
                 AgentId::generate(),
                 Vec::new(),
                 None,
-                Box::new(StubBackend),
+                Box::new(MockBackend::STRICT),
                 None,
                 None,
                 Some(rx),

@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1025,8 +1026,7 @@ impl EventHandle {
             .as_ref()
             .and_then(|generations| {
                 generations
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
+                    .lock_unpoisoned()
                     .get(&(Arc::from(plugin), Arc::from(command)))
                     .copied()
             })
@@ -1455,7 +1455,7 @@ mod tests {
         SessionCoordinatorParams, builtin_option_definitions,
     };
     use makima_agent::session_options::{ENABLED_VALUE, YOLO_OPTION_ID};
-    use makima_agent::test_util::StubBackend;
+    use makima_agent::test_util::MockBackend;
     use makima_agent::tools::test_support::stub_ctx_with_session;
     use makima_agent::tools::{ToolContext, ToolRegistry};
     use makima_agent::{
@@ -1574,7 +1574,7 @@ mod tests {
         let manager = AgentManagerHandle::new(Default::default()).unwrap();
         let target = manager
             .create_root_with_config(Some(config), Vec::new(), None, |_| {
-                Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend))
+                Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT))
             })
             .unwrap();
         template
@@ -2028,7 +2028,7 @@ mod tests {
                         Default::default(),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
                     .unwrap();
                 TrustedTarget {
@@ -3476,11 +3476,11 @@ mod tests {
                 r#"
             {extra}
             makima.api.register_prompt_hint({{
-                slot = "tool_usage", prompt = {{ "system", "general", "system" }},
+                slot = "tool_usage", name = "first", prompt = {{ "system", "general", "system" }},
                 content = function() return {value} end,
             }})
             makima.api.register_prompt_hint({{
-                slot = "tool_usage", prompt = "system", content = "second",
+                slot = "tool_usage", name = "second", prompt = "system", content = "second",
             }})
         "#
             )
@@ -3494,31 +3494,14 @@ mod tests {
         let observations = absent.sources();
         assert_eq!(observations.len(), 3);
         assert_eq!(observations[0].content, None);
-        assert_eq!(observations[1].content.as_deref(), Some(SECOND));
-        assert_eq!(observations[2].content, None);
+        assert_eq!(observations[1].content, None);
+        assert_eq!(observations[2].content.as_deref(), Some(SECOND));
         assert_eq!(observations[0].prompt, PromptId::System);
-        assert_eq!(observations[2].prompt, PromptId::General);
-        let key = |entry: &PromptSource| {
-            (
-                entry.plugin.clone(),
-                entry.slot,
-                entry.registration,
-                entry.prompt,
-            )
-        };
-        assert_ne!(key(&observations[0]), key(&observations[1]));
+        assert_eq!(observations[1].prompt, PromptId::General);
+        let key = |entry: &PromptSource| (entry.plugin.clone(), entry.slot, entry.name.clone());
+        assert_eq!(key(&observations[0]), key(&observations[1]));
         assert_ne!(key(&observations[0]), key(&observations[2]));
-        let keys: Vec<_> = observations
-            .iter()
-            .map(|entry| {
-                (
-                    entry.plugin.clone(),
-                    entry.slot,
-                    entry.registration,
-                    entry.prompt,
-                )
-            })
-            .collect();
+        let keys: Vec<_> = observations.iter().map(key).collect();
         host.load_source(PLUGIN, &source(&format!("{FIRST:?}"), ""))
             .unwrap();
         let present = host.event_handle().collect_prompt_slots();
@@ -3526,19 +3509,7 @@ mod tests {
             contents(&present, PromptId::System, Slot::ToolUsage),
             [FIRST, SECOND]
         );
-        assert_eq!(
-            present
-                .sources()
-                .iter()
-                .map(|entry| (
-                    entry.plugin.clone(),
-                    entry.slot,
-                    entry.registration,
-                    entry.prompt
-                ))
-                .collect::<Vec<_>>(),
-            keys
-        );
+        assert_eq!(present.sources().iter().map(key).collect::<Vec<_>>(), keys);
         host.load_source(
             PLUGIN,
             &source(
@@ -3553,12 +3524,7 @@ mod tests {
                 .sources()
                 .iter()
                 .filter(|entry| entry.slot == Slot::ToolUsage)
-                .map(|entry| (
-                    entry.plugin.clone(),
-                    entry.slot,
-                    entry.registration,
-                    entry.prompt
-                ))
+                .map(key)
                 .collect::<Vec<_>>(),
             keys
         );
@@ -3586,10 +3552,10 @@ mod tests {
                 end,
             }})
             makima.api.register_prompt_hint({{
-                slot = "conventions", prompt = "system", content = {first:?},
+                slot = "conventions", name = {first:?}, prompt = "system", content = {first:?},
             }})
             makima.api.register_prompt_hint({{
-                slot = "conventions", prompt = "system", content = {last:?},
+                slot = "conventions", name = {last:?}, prompt = "system", content = {last:?},
             }})
         "#,
                 first = if reverse { "last" } else { "first" },
@@ -3613,14 +3579,7 @@ mod tests {
             .sources()
             .iter()
             .filter(|entry| entry.slot == Slot::Conventions)
-            .map(|entry| {
-                (
-                    entry.plugin.clone(),
-                    entry.slot,
-                    entry.registration,
-                    entry.prompt,
-                )
-            })
+            .map(|entry| (entry.name.clone(), entry.content.clone()))
             .collect();
         host.load_source(PLUGIN, &source(true)).unwrap();
         let reordered = host.event_handle().collect_prompt_slots();
@@ -3628,16 +3587,12 @@ mod tests {
             .sources()
             .iter()
             .filter(|entry| entry.slot == Slot::Conventions)
-            .map(|entry| {
-                (
-                    entry.plugin.clone(),
-                    entry.slot,
-                    entry.registration,
-                    entry.prompt,
-                )
-            })
+            .map(|entry| (entry.name.clone(), entry.content.clone()))
             .collect();
-        assert_eq!(reordered_keys, initial_keys);
+        assert_eq!(
+            reordered_keys,
+            initial_keys.into_iter().rev().collect::<Vec<_>>()
+        );
         assert_eq!(
             contents(&reordered, PromptId::System, Slot::Conventions),
             ["last", "first"]
@@ -3658,7 +3613,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
-            .create_root(Vec::new(), None, Box::new(StubBackend))
+            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
             .unwrap();
         let source = |value: &str| {
             format!(
@@ -3882,10 +3837,57 @@ mod tests {
     #[test_case(r#"{ content = "x" }"# ; "missing_slot")]
     #[test_case(r#"{ slot = "tool_usage", content = 42 }"# ; "content_wrong_type")]
     #[test_case(r#"{ slot = "tool_usage", content = "x", prompt = 42 }"# ; "prompt_wrong_type")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", name = "" }"# ; "empty_name")]
+    #[test_case(r#"{ slot = "tool_usage", content = "x", name = 42 }"# ; "name_wrong_type")]
     fn invalid_hint_spec_is_rejected(spec: &str) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let src = format!("makima.api.register_prompt_hint({spec})");
         assert!(host.load_source("bad", &src).is_err());
+    }
+
+    #[test_case("", ["#0", "#1"]; "unnamed_hints_use_ordinals")]
+    #[test_case(r#"name = "rule", "#, []; "duplicate_explicit_names_are_rejected")]
+    fn aggregate_hint_registrations<const N: usize>(name: &str, expected: [&str; N]) {
+        const DUPLICATE: &str = "duplicate prompt hint name";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = format!(
+            r#"
+            makima.api.register_prompt_hint({{ {name} slot = "tool_usage", prompt = "system", content = "first" }})
+            makima.api.register_prompt_hint({{ {name} slot = "tool_usage", prompt = "general", content = function() return "second" end }})
+            "#
+        );
+        let loaded = host.load_source("hints", &source);
+        if expected.is_empty() {
+            assert!(loaded.unwrap_err().to_string().contains(DUPLICATE));
+        } else {
+            loaded.unwrap();
+            let slots = host.event_handle().collect_prompt_slots();
+            assert_eq!(
+                slots
+                    .sources()
+                    .iter()
+                    .map(|source| source.name.as_ref())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn setting_the_same_singleton_slot_replaces_the_previous_source() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            makima.api.set_prompt({ slot = "identity", content = function() error("replaced") end })
+            makima.api.set_prompt({ slot = "identity", content = "replacement" })
+            "#,
+        );
+        assert_eq!(
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["replacement"]
+        );
+        assert_eq!(slots.sources().len(), 1);
+        assert_eq!(slots.sources()[0].name.as_ref(), "default");
     }
 
     #[test]

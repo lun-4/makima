@@ -6,7 +6,7 @@ use crate::{
     TurnId, TurnOutcome, TurnProvenance, TurnResult, TurnTicket,
     actor::EffectiveAgentConfig,
     journal::{JournalChange, JournalCommit, SessionJournal},
-    test_util::StubBackend,
+    test_util::MockBackend,
     tools::offload::OffloadStore,
 };
 use futures_lite::future::or;
@@ -154,7 +154,7 @@ impl Fixture {
         self.manager
             .ensure_resident_with(self.agent_id(), |_| async {
                 Ok(ResidentAgent {
-                    backend: Box::new(StubBackend),
+                    backend: Box::new(MockBackend::STRICT),
                     config: EffectiveAgentConfig::new(
                         RunSettings {
                             provider: unconfigured(),

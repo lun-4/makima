@@ -1,8 +1,9 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use event_listener::{Event, EventListener};
 use makima_providers::ThinkingConfig;
@@ -225,7 +226,7 @@ impl SessionOptionsReservation {
     }
 
     pub(crate) fn install(&self, candidate: SessionOptionsCandidate) -> SessionOptionsSnapshot {
-        let mut state = lock(&self.options.state);
+        let mut state = self.options.state.lock_unpoisoned();
         assert_eq!(candidate.base_version, self.base_version);
         state.committed = candidate.state;
         let snapshot = snapshot(&state);
@@ -237,7 +238,7 @@ impl SessionOptionsReservation {
 
 impl Drop for SessionOptionsReservation {
     fn drop(&mut self) {
-        lock(&self.options.state).reserved = false;
+        self.options.state.lock_unpoisoned().reserved = false;
         self.options.changed.notify(usize::MAX);
     }
 }
@@ -245,10 +246,6 @@ impl Drop for SessionOptionsReservation {
 pub struct SessionOptionsSubscription {
     options: Arc<SessionOptions>,
     observed_version: u64,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl SessionOptionDefinition {
@@ -350,7 +347,7 @@ impl SessionOptions {
     }
 
     pub fn snapshot(&self) -> SessionOptionsSnapshot {
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         snapshot(&state)
     }
 
@@ -358,7 +355,7 @@ impl SessionOptions {
         self: &Arc<Self>,
         expected_version: Option<u64>,
     ) -> Result<SessionOptionsReservation, SessionOptionError> {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         if expected_version.is_some_and(|version| version != state.version) {
             return Err(SessionOptionError::StaleHandle(Arc::from(
                 "session option snapshot changed during validation",
@@ -393,7 +390,7 @@ impl SessionOptions {
         &self,
         values: &[(&str, &str)],
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         Self::prepare_set_values_from_state(&state, values)
     }
 
@@ -404,7 +401,7 @@ impl SessionOptions {
         thinking: &str,
         workflow: &str,
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         let mut candidate = state.clone();
         if candidate
             .pending_fast_model
@@ -510,7 +507,7 @@ impl SessionOptions {
             }
         }
 
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         for definition in &definitions {
             if state.definitions.iter().any(|current| {
                 current.id == definition.id
@@ -619,7 +616,7 @@ impl SessionOptions {
         }
         let mut guards = candidates
             .iter()
-            .map(|(reservation, _)| lock(&reservation.options.state))
+            .map(|(reservation, _)| reservation.options.state.lock_unpoisoned())
             .collect::<Vec<_>>();
         for (guard, (reservation, candidate)) in guards.iter().zip(&candidates) {
             if guard.version != candidate.base_version
@@ -660,7 +657,7 @@ impl SessionOptions {
             .collect::<Vec<_>>();
         let mut guards = changed
             .iter()
-            .map(|options| lock(&options.state))
+            .map(|options| options.state.lock_unpoisoned())
             .collect::<Vec<_>>();
         if guards
             .iter()
@@ -702,7 +699,7 @@ impl SessionOptions {
         definition: SessionOptionDefinition,
     ) -> Result<Option<SessionOptionsCandidate>, SessionOptionError> {
         definition.validate()?;
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         let index = state
             .definitions
             .iter()
@@ -744,7 +741,7 @@ impl SessionOptions {
     }
 
     pub(crate) fn unchanged_candidate(&self) -> SessionOptionsCandidate {
-        let state = lock(&self.state);
+        let state = self.state.lock_unpoisoned();
         SessionOptionsCandidate {
             base_version: state.version,
             state: state.clone(),
@@ -760,7 +757,7 @@ impl SessionOptions {
     pub(crate) async fn wait_unreserved(&self) {
         loop {
             let listener: EventListener = self.changed.listen();
-            if !lock(&self.state).reserved {
+            if !self.state.lock_unpoisoned().reserved {
                 return;
             }
             listener.await;

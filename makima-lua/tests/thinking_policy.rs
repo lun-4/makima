@@ -50,7 +50,7 @@ fn load_thinking_host(ctx: &mut ToolContext) -> (PluginHost, TrustedTarget) {
             Some(common::effective_config(ctx)),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
         )
         .unwrap();
     ctx.execution_agent_id = Some(root.id());

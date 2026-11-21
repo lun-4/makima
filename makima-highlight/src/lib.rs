@@ -1,3 +1,4 @@
+use makima_domain::RwLockExt;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -42,12 +43,9 @@ pub fn is_ready() -> bool {
 }
 
 pub fn set_theme(theme: Theme) {
-    *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    *theme_lock().write_unpoisoned() = Arc::new(theme);
     THEME_GEN.fetch_add(1, Ordering::Release);
-    block_cache_lock()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    block_cache_lock().write_unpoisoned().clear();
 }
 
 /// Bumped by every [`set_theme`]. Anything derived from the theme, like an
@@ -143,10 +141,7 @@ impl BlockCache {
 }
 
 pub fn theme() -> Arc<Theme> {
-    theme_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    theme_lock().read_unpoisoned().clone()
 }
 
 fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
@@ -154,15 +149,11 @@ fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
 }
 
 pub fn set_ui_colors(colors: HashMap<String, Rgb>) {
-    *ui_colors_lock().write().unwrap_or_else(|e| e.into_inner()) = colors;
+    *ui_colors_lock().write_unpoisoned() = colors;
 }
 
 pub fn theme_color(name: &str) -> Option<Rgb> {
-    if let Some(&c) = ui_colors_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-    {
+    if let Some(&c) = ui_colors_lock().read_unpoisoned().get(name) {
         return Some(c);
     }
     let settings = &theme().settings;
@@ -329,17 +320,12 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
 /// it is incremental, and would miss this cache on every token.
 pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
     let key = BlockKey::new(lang, code);
-    if let Some(hit) = block_cache_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-    {
+    if let Some(hit) = block_cache_lock().read_unpoisoned().get(key) {
         return hit;
     }
     let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
     block_cache_lock()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
+        .write_unpoisoned()
         .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
     segments
 }

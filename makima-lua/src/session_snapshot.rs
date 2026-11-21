@@ -2,8 +2,9 @@
 //! drivers all serialize this struct, so a plugin sees the same keys wherever
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::{AgentEvent, AgentRef, Envelope};
@@ -88,10 +89,6 @@ struct Totals {
 /// A poisoned lock only means some other run panicked mid-update. The
 /// numbers are still whole, so read them instead of losing the session's
 /// whole accounting over it.
-fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
-    totals.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// What a headless driver (print, SDK, ACP) feeds every envelope of its one
 /// session to: the totals `makima.session.read` answers from and the Lua turn
 /// autocmds, so plugins see the same events and numbers as under the TUI. The
@@ -129,10 +126,7 @@ impl HeadlessObserver {
         usage: TokenUsage,
         models: HashMap<String, StoredTokenUsage>,
     ) {
-        *self
-            .persistence
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(UsagePersistence {
+        *self.persistence.lock_unpoisoned() = Some(UsagePersistence {
             writer,
             usage,
             models,
@@ -143,11 +137,7 @@ impl HeadlessObserver {
     pub fn observe(&self, envelope: &Envelope) {
         self.fold(envelope);
         if let AgentEvent::TurnComplete(turn) = &envelope.event
-            && let Some(persistence) = self
-                .persistence
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_mut()
+            && let Some(persistence) = self.persistence.lock_unpoisoned().as_mut()
         {
             persistence.usage += turn.usage;
             *persistence.models.entry(turn.model.clone()).or_default() +=
@@ -164,7 +154,7 @@ impl HeadlessObserver {
 
     fn fold(&self, envelope: &Envelope) {
         let event = &envelope.event;
-        let mut totals = lock(&self.totals);
+        let mut totals = self.totals.lock_unpoisoned();
         // Envelopes only flow while a run is alive, so anything that is not
         // an ending means the agent is busy. Sdk mode runs many turns and no
         // driver has to remember to clear a flag between them.
@@ -194,7 +184,7 @@ impl HeadlessObserver {
             if want != id {
                 return Err(format!("session {want} not live"));
             }
-            let totals = lock(&totals);
+            let totals = totals.lock_unpoisoned();
             serde_json::to_value(SessionSnapshot {
                 id: id.to_string(),
                 title: None,
@@ -273,15 +263,15 @@ mod tests {
             HeadlessObserver::new(EventHandle::disconnected_for_test(), MakimaId::generate());
 
         observer.fold(&turn_complete(FIRST_TURN_INPUT));
-        assert!(lock(&observer.totals).working);
+        assert!(observer.totals.lock_unpoisoned().working);
         observer.fold(&done(FIRST_TURN_INPUT));
-        assert!(!lock(&observer.totals).working);
+        assert!(!observer.totals.lock_unpoisoned().working);
 
         observer.fold(&turn_complete(SECOND_TURN_INPUT));
-        assert!(lock(&observer.totals).working, "{WORKING_MSG}");
+        assert!(observer.totals.lock_unpoisoned().working, "{WORKING_MSG}");
         observer.fold(&done(SECOND_TURN_INPUT));
 
-        let totals = lock(&observer.totals);
+        let totals = observer.totals.lock_unpoisoned();
         assert!(!totals.working);
         assert_eq!(
             totals.usage.input,

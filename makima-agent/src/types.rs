@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::any::Any;
 #[cfg(test)]
 use std::fmt;
@@ -946,15 +947,15 @@ impl SharedBuf {
     }
 
     pub fn set_click(&self, f: Arc<dyn Any + Send + Sync>) {
-        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        *self.click.lock_unpoisoned() = Some(f);
     }
 
     pub fn click(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.click.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.click.lock_unpoisoned().clone()
     }
 
     pub fn clear_click(&self) {
-        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.click.lock_unpoisoned() = None;
     }
 
     /// Fires synchronously after every `append`/`set_lines`, on the
@@ -962,24 +963,20 @@ impl SharedBuf {
     /// notifications are silently dropped. One slot only: a second call
     /// replaces the previous watcher.
     pub fn set_on_change(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+        *self.on_change.lock_unpoisoned() = Some(Arc::new(f));
     }
 
     /// A watcher keeps everything it captured alive for as long as it is
     /// installed, so owners must clear it once the watching task retires.
     pub fn clear_on_change(&self) {
-        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.on_change.lock_unpoisoned() = None;
     }
 
     fn notify_change(&self) {
         if self.notifying.swap(true, Ordering::AcqRel) {
             return;
         }
-        let cb = self
-            .on_change
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cb = self.on_change.lock_unpoisoned().clone();
         if let Some(cb) = cb {
             cb();
         }
@@ -987,7 +984,7 @@ impl SharedBuf {
     }
 
     pub fn append(&self, line: SnapshotLine) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.committed.lock_unpoisoned();
         Arc::make_mut(&mut guard).push(line);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
@@ -995,7 +992,7 @@ impl SharedBuf {
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.committed.lock_unpoisoned();
         *guard = Arc::new(lines);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
@@ -1003,10 +1000,7 @@ impl SharedBuf {
     }
 
     pub fn len(&self) -> usize {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.committed.lock_unpoisoned().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1014,7 +1008,7 @@ impl SharedBuf {
     }
 
     pub fn read(&self) -> Arc<Vec<SnapshotLine>> {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         Arc::clone(&guard)
     }
 
@@ -1022,7 +1016,7 @@ impl SharedBuf {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return None;
         }
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         Some(Arc::clone(&guard))
     }
 
@@ -1031,7 +1025,7 @@ impl SharedBuf {
     /// events are stale), which would strand the last repaint a tool made
     /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         BufferSnapshot::from_arc(Arc::clone(&guard))
     }
 }
@@ -1180,7 +1174,7 @@ impl RunLedger {
     /// A poisoned lock only means another run panicked mid-update. The totals
     /// are still sound, and dropping a session's accounting over it is worse.
     fn locked(&self) -> MutexGuard<'_, RunTotals> {
-        self.totals.lock().unwrap_or_else(|e| e.into_inner())
+        self.totals.lock_unpoisoned()
     }
 }
 

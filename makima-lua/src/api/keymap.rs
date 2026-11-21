@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -391,8 +392,7 @@ fn set(
         let registry_key = lua.create_registry_value(rhs)?;
         if loading(lua, &plugin) {
             pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .set(key, modifiers, registry_key, Arc::clone(&plugin), desc);
         } else {
             let old = lua
@@ -436,10 +436,7 @@ fn del(
         let _ = mode;
         let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
         let old = if loading(lua, &plugin) {
-            pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .del(key, modifiers)
+            pending.lock_unpoisoned().del(key, modifiers)
         } else {
             lua.app_data_mut::<KeymapStore>()
                 .and_then(|mut store| store.del(key, modifiers))

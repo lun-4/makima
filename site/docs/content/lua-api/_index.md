@@ -643,12 +643,13 @@ Good for things like tool usage guidelines or extra context that should
 appear alongside other plugins' hints. If you need to own the whole slot
 (e.g. identity or tone), use `set_prompt` instead.
 
-Throws if you pass a singleton slot name.
+Throws for singleton slots or duplicate names within the same plugin and slot.
 
 **Parameters:**
 
 - `{spec}` (`table`) Hint specification:
-  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "general").
+  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage").
+  - `name` (`string`) Optional. Stable name for recorded context. Omit it to use an ordinal. Names must not begin with `#`.
   - `content` (`string|function`) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
   - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids (e.g. "system").
 
@@ -715,7 +716,7 @@ Throws if you pass an aggregate slot name.
 
 **Parameters:**
 
-- `{spec}` (`table`) Spec fields mirror `register_prompt_hint`:
+- `{spec}` (`table`) Singleton prompt specification:
   - `slot` (`string`) Required. Singleton slot name (e.g. "identity", "tone").
   - `content` (`string|function`) Required. Static text or a `function()` returning a string. Max 1 MiB.
   - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids.

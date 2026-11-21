@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use makima_lua::orchestration::{self, CommandRunner, PinnedCommandTarget, TrustedTarget};
 use std::{
     any::Any,
@@ -62,8 +63,7 @@ impl CommandHost for UiCommandHost {
     fn admission_context(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         let target = self.target.get()?;
         self.admissions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .get(target)
             .cloned()
             .filter(|target| target.validate().is_ok())
@@ -166,10 +166,7 @@ impl CommandRuntime {
         &self,
         targets: HashMap<makima_commands::InvocationTargetId, TrustedTarget>,
     ) {
-        *self
-            .admissions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = targets
+        *self.admissions.lock_unpoisoned() = targets
             .into_iter()
             .filter_map(|(id, target)| {
                 PinnedCommandTarget::pin(target)
@@ -181,8 +178,7 @@ impl CommandRuntime {
 
     pub(crate) fn target_admission(&self, target: &TargetHandle) -> Option<PinnedCommandTarget> {
         self.admissions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .get(&target.id())
             .cloned()
             .filter(|admission| admission.validate().is_ok())

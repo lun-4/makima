@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use makima_domain::LockExt;
 use std::borrow::Cow;
 
 use std::cell::RefCell;
@@ -916,14 +917,11 @@ fn register_permission_rule(
         )));
     }
 
-    pending_rules
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(PendingRule {
-            tool,
-            scope,
-            effect,
-        });
+    pending_rules.lock_unpoisoned().push(PendingRule {
+        tool,
+        scope,
+        effect,
+    });
     Ok(())
 }
 
@@ -1203,10 +1201,11 @@ async fn run_command(
 /// appear alongside other plugins' hints. If you need to own the whole slot
 /// (e.g. identity or tone), use `set_prompt` instead.
 ///
-/// Throws if you pass a singleton slot name.
+/// Throws for singleton slots or duplicate names within the same plugin and slot.
 ///
 /// @param spec table Hint specification:
-///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
+///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage").
+///   name    (string)         Optional. Stable name for recorded context. Omit it to use an ordinal. Names must not begin with `#`.
 ///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
@@ -1235,18 +1234,46 @@ fn register_prompt_hint(
     let prompts = parse_prompt_field(&spec)?;
     validate_slot_prompt_compatibility(slot, &prompts)?;
 
+    let name = match spec.get::<LuaValue>("name")? {
+        LuaValue::Nil => None,
+        LuaValue::String(name) => {
+            let name = name.to_str()?;
+            if name.is_empty() || name.starts_with('#') {
+                return Err(mlua::Error::runtime(
+                    "'name' must be non-empty and must not start with '#'",
+                ));
+            }
+            Some(Arc::<str>::from(&*name))
+        }
+        _ => return Err(mlua::Error::runtime("'name' must be a UTF-8 string")),
+    };
     let content = parse_hint_content(lua, &spec)?;
-    let reg = PromptHintRegistration {
+    let mut pending = pending.lock_unpoisoned();
+    let registrations = pending.entry(plugin).or_default();
+    let name = name.unwrap_or_else(|| {
+        let ordinal = registrations
+            .iter()
+            .filter(|registration| registration.slot == slot && registration.name.starts_with('#'))
+            .count();
+        format!("#{ordinal}").into()
+    });
+    if registrations
+        .iter()
+        .any(|r| r.slot == slot && r.name == name)
+    {
+        if let HintContent::Callback(key) = content {
+            lua.remove_registry_value(key)?;
+        }
+        return Err(mlua::Error::runtime(format!(
+            "duplicate prompt hint name '{name}' in slot '{slot}'"
+        )));
+    }
+    registrations.push(PromptHintRegistration {
         prompts,
         slot,
+        name,
         content,
-    };
-    pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(Arc::clone(&plugin))
-        .or_default()
-        .push(reg);
+    });
     Ok(())
 }
 
@@ -1259,7 +1286,7 @@ fn register_prompt_hint(
 ///
 /// Throws if you pass an aggregate slot name.
 ///
-/// @param spec table Spec fields mirror `register_prompt_hint`:
+/// @param spec table Singleton prompt specification:
 ///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
 ///   content (string|function) Required. Static text or a `function()` returning a string. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
@@ -1292,14 +1319,19 @@ fn set_prompt(
     let reg = PromptHintRegistration {
         prompts,
         slot,
+        name: "default".into(),
         content,
     };
-    pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(Arc::clone(&plugin))
-        .or_default()
-        .push(reg);
+    let mut pending = pending.lock_unpoisoned();
+    let registrations = pending.entry(plugin).or_default();
+    if let Some(previous) = registrations.iter_mut().find(|r| r.slot == slot) {
+        let previous = std::mem::replace(previous, reg);
+        if let HintContent::Callback(key) = previous.content {
+            lua.remove_registry_value(key)?;
+        }
+    } else {
+        registrations.push(reg);
+    }
     Ok(())
 }
 
@@ -1766,28 +1798,25 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
 
     let name: Arc<str> = Arc::from(name.as_str());
 
-    pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(PendingTool {
-            name,
-            description,
-            schema: param_schema,
-            audience,
-            resumable,
-            kind,
-            handler_key,
-            header_key,
-            restore_key,
-            start_key,
-            permission_scopes,
-            permission,
-            mutable_path,
-            timeout,
-            start_annotation,
-            examples,
-            describe_key,
-        });
+    pending.lock_unpoisoned().push(PendingTool {
+        name,
+        description,
+        schema: param_schema,
+        audience,
+        resumable,
+        kind,
+        handler_key,
+        header_key,
+        restore_key,
+        start_key,
+        permission_scopes,
+        permission,
+        mutable_path,
+        timeout,
+        start_annotation,
+        examples,
+        describe_key,
+    });
 
     Ok(())
 }
@@ -2137,7 +2166,7 @@ fn register_command_from_lua(
     };
 
     if crate::runtime::loading_plugin_is(lua, &plugin) {
-        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = pending.lock_unpoisoned();
         if let Some(previous) = pending.insert(Arc::clone(&name), entry) {
             remove_command_registry_values(lua, previous);
         }
@@ -2305,7 +2334,7 @@ impl ToolCallReply {
         let mut ctx = ctx.clone();
         ctx.deadline = self.deadline.map_or(Deadline::None, Deadline::At);
         if let Some(pending) = &ctx.pending_output_limits {
-            let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+            let mut pending = pending.lock_unpoisoned();
             let metadata = pending.get_or_insert_with(|| OutputFinalization {
                 limits: None,
                 deadline: self.deadline,

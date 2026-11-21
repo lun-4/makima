@@ -1,6 +1,7 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use makima_agent::session_coordinator::{
     SessionCoordinatorError, SessionOptionCatalog, settable_builtin_definitions,
@@ -56,10 +57,6 @@ impl Drop for ValidationGuard {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 impl PendingSessionOptions {
     pub(crate) fn new(plugin: Arc<str>, generation: u64) -> Self {
         Self {
@@ -71,15 +68,15 @@ impl PendingSessionOptions {
     }
 
     pub(crate) fn definitions(&self) -> Vec<SessionOptionDefinition> {
-        lock(&self.definitions).clone()
+        self.definitions.lock_unpoisoned().clone()
     }
 
     pub(crate) fn validators(&self) -> BTreeMap<Arc<str>, Function> {
-        lock(&self.validators).clone()
+        self.validators.lock_unpoisoned().clone()
     }
 
     pub(crate) fn insert_validator(&self, id: Arc<str>, function: Function) {
-        lock(&self.validators).insert(id, function);
+        self.validators.lock_unpoisoned().insert(id, function);
     }
 }
 
@@ -305,7 +302,7 @@ fn register_session_option(
 ) -> LuaResult<()> {
     crate::runtime::require_plugin_load(lua, &pending.plugin, "register_session_option")?;
     let (definition, validator) = parse_definition(&pending, &spec)?;
-    let mut definitions = lock(&pending.definitions);
+    let mut definitions = pending.definitions.lock_unpoisoned();
     if definitions
         .iter()
         .any(|current| current.id == definition.id)

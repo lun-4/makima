@@ -1,9 +1,10 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use makima_config::ModelPolicy;
 use makima_domain::ModelSelection;
@@ -92,7 +93,7 @@ impl PublicationLifetime {
     }
 
     fn cancel(&self) {
-        drop(lock(&self.trigger).take());
+        drop(self.trigger.lock_unpoisoned().take());
     }
 }
 
@@ -291,7 +292,7 @@ impl SessionTransactionReservation {
         let coordinator = &self.coordinator;
         let binding = coordinator.actor_binding()?;
         let mut candidate = actor_options(&coordinator.read, &config)?;
-        if let Some(binding) = lock(&coordinator.read.binding).as_ref() {
+        if let Some(binding) = coordinator.read.binding.lock_unpoisoned().as_ref() {
             let journal = binding.agent.manager().journal();
             let current = journal.snapshot();
             if let Some(saved) =
@@ -315,7 +316,7 @@ impl SessionTransactionReservation {
             }
         }
         let candidate = Arc::new(Mutex::new(candidate));
-        let options = SessionOptions::candidate_snapshot(&lock(&candidate));
+        let options = SessionOptions::candidate_snapshot(&candidate.lock_unpoisoned());
         let publish_candidate = Arc::clone(&candidate);
         let publish_read = coordinator.read.clone();
         let session_id = coordinator.session_id;
@@ -346,9 +347,10 @@ impl SessionTransactionReservation {
                     });
                 }
                 if snapshot.clear_pending_fast {
-                    lock(&publish_candidate).clear_pending_fast();
+                    publish_candidate.lock_unpoisoned().clear_pending_fast();
                 }
-                let options = SessionOptions::candidate_snapshot(&lock(&publish_candidate));
+                let options =
+                    SessionOptions::candidate_snapshot(&publish_candidate.lock_unpoisoned());
                 let history = history_changed.then_some(snapshot.history);
                 let (version, history_revision) =
                     publish_read.next_version(options.version, history.is_some());
@@ -391,7 +393,7 @@ impl SessionTransactionReservation {
             finalize: Box::new(move |commit| {
                 let _registration = final_registration;
                 (binding.project_config)(commit);
-                reservation.commit(lock(&candidate).clone());
+                reservation.commit(candidate.lock_unpoisoned().clone());
             }),
         })
     }
@@ -507,10 +509,6 @@ enum Operation {
     Barrier(flume::Sender<()>),
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 pub fn publication_claim() -> CheckpointClaim {
     Arc::new(|publication| {
         if publication.try_publish() {
@@ -540,7 +538,8 @@ fn actor_options(
 impl SessionOptionCatalog {
     /// Every plugin's definitions, in plugin order.
     pub fn definitions(&self) -> Vec<SessionOptionDefinition> {
-        lock(&self.state)
+        self.state
+            .lock_unpoisoned()
             .definitions
             .values()
             .flatten()
@@ -549,7 +548,8 @@ impl SessionOptionCatalog {
     }
 
     pub fn plugin_definitions(&self, plugin: &str) -> Vec<SessionOptionDefinition> {
-        lock(&self.state)
+        self.state
+            .lock_unpoisoned()
             .definitions
             .get(plugin)
             .cloned()
@@ -557,7 +557,7 @@ impl SessionOptionCatalog {
     }
 
     fn unregister(&self, session_id: MakimaId, generation: u64) {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         if state
             .sessions
             .get(&session_id)
@@ -592,7 +592,9 @@ impl SessionOptionCatalog {
         let registration = invocation.register_publication(&publication);
         let mut prepared: Vec<PluginOptionParticipant> = Vec::new();
         let revision = loop {
-            let mut sessions = lock(&self.state)
+            let mut sessions = self
+                .state
+                .lock_unpoisoned()
                 .sessions
                 .iter()
                 .map(|(session_id, session)| (*session_id, session.generation, session.tx.clone()))
@@ -673,8 +675,8 @@ impl SessionOptionCatalog {
             }
             prepared.sort_by_key(|(staged, _)| (staged.session_id.to_string(), staged.generation));
             let commit = {
-                let directory = lock(&DIRECTORY);
-                let state = lock(&self.state);
+                let directory = DIRECTORY.lock_unpoisoned();
+                let state = self.state.lock_unpoisoned();
                 let participants = prepared
                     .iter()
                     .map(|(staged, _)| (staged.session_id, staged.generation))
@@ -747,7 +749,8 @@ impl SessionCoordinatorHandle {
     }
 
     pub fn resolve(session_id: MakimaId) -> Result<Self, SessionCoordinatorError> {
-        lock(&DIRECTORY)
+        DIRECTORY
+            .lock_unpoisoned()
             .get(&session_id)
             .map(|entry| entry.handle.clone())
             .ok_or(SessionCoordinatorError::StaleSession(session_id))
@@ -758,7 +761,7 @@ impl SessionCoordinatorHandle {
         checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
     ) -> Result<(), SessionCoordinatorError> {
         self.ensure_live()?;
-        *lock(&self.read.checkpoint) = checkpoint;
+        *self.read.checkpoint.lock_unpoisoned() = checkpoint;
         Ok(())
     }
 
@@ -776,7 +779,7 @@ impl SessionCoordinatorHandle {
         &self,
         publication: &CheckpointPublication,
     ) -> Result<PublicationRegistration, SessionCoordinatorError> {
-        let directory = lock(&DIRECTORY);
+        let directory = DIRECTORY.lock_unpoisoned();
         let entry = directory
             .get(&self.session_id)
             .filter(|entry| entry.handle.generation == self.generation)
@@ -789,7 +792,8 @@ impl SessionCoordinatorHandle {
     }
 
     pub fn mailbox(&self) -> Result<SessionMailbox, SessionCoordinatorError> {
-        lock(&DIRECTORY)
+        DIRECTORY
+            .lock_unpoisoned()
             .get(&self.session_id)
             .filter(|entry| entry.handle.generation == self.generation)
             .map(|entry| entry.mailbox.clone())
@@ -801,7 +805,7 @@ impl SessionCoordinatorHandle {
         permissions: Arc<PermissionManager>,
     ) -> Result<(), SessionCoordinatorError> {
         self.ensure_bindable()?;
-        let mut bound = lock(&self.read.permissions);
+        let mut bound = self.read.permissions.lock_unpoisoned();
         if let Some(current) = &*bound {
             if !Arc::ptr_eq(current, &permissions) {
                 return Err(SessionCoordinatorError::SessionBusy(self.session_id));
@@ -814,12 +818,16 @@ impl SessionCoordinatorHandle {
 
     pub fn permissions(&self) -> Result<Arc<PermissionManager>, SessionCoordinatorError> {
         self.ensure_live()?;
-        lock(&self.read.permissions).clone().ok_or_else(|| {
-            SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                session_id: self.session_id,
-                message: Arc::from("session permissions are not bound"),
+        self.read
+            .permissions
+            .lock_unpoisoned()
+            .clone()
+            .ok_or_else(|| {
+                SessionCoordinatorError::Checkpoint(CheckpointError::Save {
+                    session_id: self.session_id,
+                    message: Arc::from("session permissions are not bound"),
+                })
             })
-        })
     }
 
     pub fn bind_actor(
@@ -853,7 +861,7 @@ impl SessionCoordinatorHandle {
     ) -> Result<(), ConfigChangeError> {
         let reservation = self.reserve_options()?;
         let candidate = actor_options(&self.read, &config)?;
-        let mut binding = lock(&self.read.binding);
+        let mut binding = self.read.binding.lock_unpoisoned();
         if binding.is_some() {
             return Err(SessionCoordinatorError::SessionBusy(self.session_id).into());
         }
@@ -869,7 +877,9 @@ impl SessionCoordinatorHandle {
 
     fn actor_binding(&self) -> Result<ActorBinding, SessionCoordinatorError> {
         self.ensure_live()?;
-        lock(&self.read.binding)
+        self.read
+            .binding
+            .lock_unpoisoned()
             .clone()
             .ok_or(SessionCoordinatorError::ActorUnbound(self.session_id))
     }
@@ -904,7 +914,7 @@ impl SessionCoordinatorHandle {
         history: HistorySnapshot<Message>,
     ) -> Result<(), SessionCoordinatorError> {
         self.ensure_live()?;
-        let binding = lock(&self.read.binding).clone();
+        let binding = self.read.binding.lock_unpoisoned().clone();
         let actor = binding
             .as_ref()
             .and_then(|binding| binding.agent.actor().ok());
@@ -975,7 +985,10 @@ impl SessionCoordinatorHandle {
     async fn reserve_options_in_turn(
         &self,
     ) -> Result<SessionOptionsReservation, ConfigChangeError> {
-        let binding = lock(&self.read.binding)
+        let binding = self
+            .read
+            .binding
+            .lock_unpoisoned()
             .clone()
             .filter(|binding| binding.agent.actor().is_ok());
         Ok(match binding {
@@ -995,7 +1008,10 @@ impl SessionCoordinatorHandle {
         claim: CheckpointClaim,
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
         let _caller = PublicationGuard::new(publication.clone());
-        let actor = lock(&self.read.binding)
+        let actor = self
+            .read
+            .binding
+            .lock_unpoisoned()
             .as_ref()
             .map(|binding| binding.agent.actor())
             .transpose()?;
@@ -1073,7 +1089,10 @@ impl SessionCoordinatorHandle {
     ) -> Result<SessionOptionsSnapshot, ConfigChangeError> {
         let _caller = PublicationGuard::new(publication.clone());
         self.ensure_live()?;
-        let _registrations = lock(&self.read.binding)
+        let _registrations = self
+            .read
+            .binding
+            .lock_unpoisoned()
             .as_ref()
             .map(|binding| {
                 binding
@@ -1369,7 +1388,7 @@ impl SessionCoordinatorHandle {
     }
 
     fn request_close(&self) -> Result<flume::Receiver<()>, SessionCoordinatorError> {
-        let directory = lock(&DIRECTORY);
+        let directory = DIRECTORY.lock_unpoisoned();
         let entry = directory
             .get(&self.session_id)
             .filter(|entry| entry.handle.generation == self.generation)
@@ -1402,7 +1421,8 @@ impl SessionCoordinatorHandle {
     }
 
     fn ensure_bindable(&self) -> Result<(), SessionCoordinatorError> {
-        if lock(&DIRECTORY)
+        if DIRECTORY
+            .lock_unpoisoned()
             .get(&self.session_id)
             .is_some_and(|entry| entry.handle.generation == self.generation)
         {
@@ -1413,7 +1433,8 @@ impl SessionCoordinatorHandle {
     }
 
     fn ensure_live(&self) -> Result<(), SessionCoordinatorError> {
-        if lock(&DIRECTORY)
+        if DIRECTORY
+            .lock_unpoisoned()
             .get(&self.session_id)
             .is_some_and(|entry| entry.handle.generation == self.generation)
         {
@@ -1436,7 +1457,7 @@ impl PreparedSessionCoordinator {
             mailbox,
         } = params;
         let catalog_revision = {
-            let state = lock(&catalog.state);
+            let state = catalog.state.lock_unpoisoned();
             definitions.extend(
                 state
                     .definitions
@@ -1498,7 +1519,7 @@ impl PreparedSessionCoordinator {
             mailbox,
             rx,
         } = self;
-        let mut directory = lock(&DIRECTORY);
+        let mut directory = DIRECTORY.lock_unpoisoned();
         let retired = match (directory.get(&handle.session_id), replaced_generation) {
             (None, None) => None,
             (Some(entry), Some(generation)) if entry.handle.generation == generation => {
@@ -1509,7 +1530,7 @@ impl PreparedSessionCoordinator {
             }
             _ => return Err(SessionCoordinatorError::StaleSession(handle.session_id)),
         };
-        let mut catalog_state = lock(&handle.catalog.state);
+        let mut catalog_state = handle.catalog.state.lock_unpoisoned();
         if catalog_revision != catalog_state.revision {
             reconcile_options(&handle.read.options, &catalog_state.definitions)?;
         }
@@ -1543,14 +1564,14 @@ impl PreparedSessionCoordinator {
 
 impl SessionReadHandle {
     fn checkpoint_writer(&self) -> Arc<dyn CheckpointWriter<SessionCheckpoint>> {
-        Arc::clone(&lock(&self.checkpoint))
+        Arc::clone(&self.checkpoint.lock_unpoisoned())
     }
     pub fn session_id(&self) -> MakimaId {
         self.session_id
     }
     pub fn options(&self) -> SessionOptionsSnapshot {
         let mut snapshot = self.options.snapshot();
-        let binding = lock(&self.binding).clone();
+        let binding = self.binding.lock_unpoisoned().clone();
         if let Some(binding) = binding {
             let journal = binding.agent.manager().journal();
             let current = journal.snapshot();
@@ -1574,14 +1595,14 @@ impl SessionReadHandle {
                 );
             }
         }
-        if let Some(permissions) = lock(&self.permissions).clone() {
+        if let Some(permissions) = self.permissions.lock_unpoisoned().clone() {
             snapshot.set_yolo(permissions.is_yolo());
         }
         snapshot
     }
 
     fn config(&self) -> Option<Arc<EffectiveAgentConfig>> {
-        let binding = lock(&self.binding).clone()?;
+        let binding = self.binding.lock_unpoisoned().clone()?;
         binding.agent.effective_config().ok().flatten()
     }
 
@@ -1612,7 +1633,7 @@ impl SessionReadHandle {
     }
 
     fn next_version(&self, option_version: u64, history: bool) -> (CheckpointVersion, Option<u64>) {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         state.checkpoint_revision += 1;
         let revision = history.then(|| {
             state.history_revision += 1;
@@ -1689,11 +1710,11 @@ async fn handle_operation(
                 let candidate = ctx.read.options.prepare_set(&id, &value)?;
                 let candidate = candidate.or_else(|| {
                     (id.as_ref() == YOLO_OPTION_ID
-                        && lock(&ctx.read.permissions)
-                            .as_ref()
-                            .is_none_or(|permissions| {
+                        && ctx.read.permissions.lock_unpoisoned().as_ref().is_none_or(
+                            |permissions| {
                                 permissions.snapshot().yolo != Some(value.as_ref() == ENABLED_VALUE)
-                            }))
+                            },
+                        ))
                     .then(|| ctx.read.options.unchanged_candidate())
                 });
                 let Some(candidate) = candidate else {
@@ -1830,7 +1851,7 @@ async fn handle_operation(
                     Either::Left(Ok(
                         PluginOptionDecision::Complete(reply) | PluginOptionDecision::Abort(reply),
                     )) => {
-                        drop(lock(&operation).take());
+                        drop(operation.lock_unpoisoned().take());
                         drop(reservation);
                         let _ = reply.send(Ok(()));
                         break;
@@ -1985,8 +2006,8 @@ async fn finish_plugin_options(
             return Err(SessionOptionError::CallbackFailed(Arc::from(CHECKPOINT_CANCELLED)).into());
         }
         let snapshots = {
-            let directory = lock(&DIRECTORY);
-            let mut state = lock(&catalog.state);
+            let directory = DIRECTORY.lock_unpoisoned();
+            let mut state = catalog.state.lock_unpoisoned();
             if revision != state.revision
                 || prepared.len() != state.sessions.len()
                 || prepared.iter().any(|(staged, decision)| {
@@ -2074,7 +2095,7 @@ async fn prepare_catalog_publications(
 ) -> Result<Vec<CatalogPublication>, SessionCoordinatorError> {
     let mut groups: BTreeMap<usize, (Arc<SessionJournal>, Vec<usize>)> = BTreeMap::new();
     for (index, (staged, _)) in participants.iter().enumerate() {
-        let binding = lock(&staged.read.binding).clone();
+        let binding = staged.read.binding.lock_unpoisoned().clone();
         let Some(binding) = binding else { continue };
         let actor = binding.agent.actor().map_err(|error| match error {
             ManagerError::NonLiveAgent(_) => {
@@ -2091,7 +2112,7 @@ async fn prepare_catalog_publications(
                 ActorError::Busy => SessionCoordinatorError::SessionBusy(staged.session_id),
                 error => SessionOptionError::CallbackFailed(Arc::from(error.to_string())).into(),
             })?;
-        *lock(&staged.operation) = Some(operation);
+        *staged.operation.lock_unpoisoned() = Some(operation);
         groups
             .entry(Arc::as_ptr(journal) as usize)
             .or_insert_with(|| (Arc::clone(journal), Vec::new()))
@@ -2103,7 +2124,10 @@ async fn prepare_catalog_publications(
         let mut configs = Vec::with_capacity(indexes.len());
         for &index in &indexes {
             let staged = &participants[index].0;
-            let binding = lock(&staged.read.binding)
+            let binding = staged
+                .read
+                .binding
+                .lock_unpoisoned()
                 .clone()
                 .ok_or(SessionCoordinatorError::ActorUnbound(staged.session_id))?;
             let actor = binding.agent.actor().map_err(|error| {
@@ -2267,7 +2291,7 @@ async fn checkpoint_options_for_actor(
     commit: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<(), CheckpointError> {
     let yolo = options.enabled(YOLO_OPTION_ID);
-    let permissions = lock(&read.permissions).clone();
+    let permissions = read.permissions.lock_unpoisoned().clone();
     if explicit_yolo && permissions.is_none() {
         return Err(CheckpointError::Save {
             session_id: read.session_id,
@@ -2280,12 +2304,14 @@ async fn checkpoint_options_for_actor(
             message: Arc::from(error.to_string()),
         })?;
         admission.actor.clone().or_else(|| {
-            lock(&read.binding)
+            read.binding
+                .lock_unpoisoned()
                 .as_ref()
                 .and_then(|binding| binding.agent.actor().ok())
         })
     } else {
-        lock(&read.binding)
+        read.binding
+            .lock_unpoisoned()
             .clone()
             .map(|binding| binding.agent.actor())
             .transpose()
@@ -2479,7 +2505,7 @@ async fn checkpoint_options_for_actor(
         } else if !publication.try_publish() {
             return Err(Arc::from(CHECKPOINT_CANCELLED));
         }
-        let mut staged = lock(&install);
+        let mut staged = install.lock_unpoisoned();
         install_options_publication(&mut staged.0, session_id)
             .map_err(|error| Arc::from(error.to_string()))?;
         if let Some(commit) = staged.1.take() {
@@ -2549,7 +2575,7 @@ async fn update_model_values(
 }
 
 fn unregister(session_id: MakimaId, generation: u64) {
-    let mut directory = lock(&DIRECTORY);
+    let mut directory = DIRECTORY.lock_unpoisoned();
     if directory
         .get(&session_id)
         .is_some_and(|entry| entry.handle.generation == generation)
@@ -2705,7 +2731,7 @@ pub(crate) mod tests {
     use crate::context::root_context;
     use crate::manager::{AgentLimits, AgentManagerHandle, ResidentInitialization};
     use crate::modes::{ModeDef, ModeId};
-    use crate::test_util::StubBackend;
+    use crate::test_util::MockBackend;
     use crate::tools::{LocalTools, NullProvider, ToolRegistry};
     use crate::{AgentInput, AgentMode, ModeRegistry, RunSettings, TurnContext};
     use makima_providers::Effort;
@@ -2862,7 +2888,7 @@ pub(crate) mod tests {
             publication: CheckpointPublication,
             claim: CheckpointClaim,
         ) -> CheckpointFuture {
-            let gate = lock(&self.gate).take();
+            let gate = self.gate.lock_unpoisoned().take();
             let session_id = request.session_id;
             let save = self.writer.checkpoint(request);
             Box::pin(async move {
@@ -2920,7 +2946,7 @@ pub(crate) mod tests {
                     message,
                 })?;
                 let ack = CheckpointAck::for_request(&request);
-                lock(&saved).push(request.snapshot);
+                saved.lock_unpoisoned().push(request.snapshot);
                 Ok(ack)
             })
         }
@@ -2985,7 +3011,7 @@ pub(crate) mod tests {
     ) -> AgentRef {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let agent = manager
-            .create_root(Vec::new(), None, Box::new(StubBackend))
+            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
             .unwrap();
         agent.actor().unwrap().initialize_config(config).unwrap();
         bind_test_permissions(coordinator, &agent);
@@ -3000,7 +3026,9 @@ pub(crate) mod tests {
                         })
                     })
                 }),
-                Arc::new(move |commit| lock(&installed).push(commit.config.model.spec())),
+                Arc::new(move |commit| {
+                    installed.lock_unpoisoned().push(commit.config.model.spec())
+                }),
             )
             .unwrap();
         agent
@@ -3103,7 +3131,10 @@ pub(crate) mod tests {
             const OPTION: &str = "test.choice";
             let catalog = SessionOptionCatalog::default();
             let coordinator = register_with_catalog(MakimaId::generate(), writer(false), &catalog);
-            let agent = lock(&coordinator.read.binding)
+            let agent = coordinator
+                .read
+                .binding
+                .lock_unpoisoned()
                 .as_ref()
                 .unwrap()
                 .agent
@@ -3175,7 +3206,10 @@ pub(crate) mod tests {
         smol::block_on(futures_lite::future::or(
             async {
                 let coordinator = register(MakimaId::generate());
-                let agent = lock(&coordinator.read.binding)
+                let agent = coordinator
+                    .read
+                    .binding
+                    .lock_unpoisoned()
                     .as_ref()
                     .unwrap()
                     .agent
@@ -3233,7 +3267,7 @@ pub(crate) mod tests {
                 .replace_plugin_options("test", vec![plugin_option(1, &["a", "b"], "a")])
                 .await
                 .unwrap();
-            *lock(&gate) = Some(PublicationGate {
+            *gate.lock_unpoisoned() = Some(PublicationGate {
                 claimed: true,
                 reached,
                 release: proceed,
@@ -3336,7 +3370,10 @@ pub(crate) mod tests {
             first.set_option("test.choice", "b").await.unwrap();
             let before_first = first.read().options();
             let before_second = second.read().options();
-            let predecessor = lock(&second.read.binding)
+            let predecessor = second
+                .read
+                .binding
+                .lock_unpoisoned()
                 .as_ref()
                 .unwrap()
                 .agent
@@ -3412,7 +3449,12 @@ pub(crate) mod tests {
                     let closed = first.request_close().unwrap();
                     assert!(closed.is_empty());
                     assert_eq!(
-                        lock(&DIRECTORY).get(&ids[0]).unwrap().handle.generation,
+                        DIRECTORY
+                            .lock_unpoisoned()
+                            .get(&ids[0])
+                            .unwrap()
+                            .handle
+                            .generation,
                         first.generation
                     );
                     release_tx.send(()).unwrap();
@@ -3427,10 +3469,16 @@ pub(crate) mod tests {
                         .unwrap();
                 }
                 assert_eq!(catalog.plugin_definitions("test"), previous_definitions);
-                assert_eq!(lock(&first_saved).last().unwrap().options, before_first);
+                assert_eq!(
+                    first_saved.lock_unpoisoned().last().unwrap().options,
+                    before_first
+                );
                 drop(first.read.options.try_reserve(None).unwrap());
                 second.barrier().await;
-                assert_eq!(lock(&second_saved).last().unwrap().options, before_second);
+                assert_eq!(
+                    second_saved.lock_unpoisoned().last().unwrap().options,
+                    before_second
+                );
                 drop(second.read.options.try_reserve(None).unwrap());
                 second
                     .set_option(YOLO_OPTION_ID, DISABLED_VALUE)
@@ -3462,7 +3510,13 @@ pub(crate) mod tests {
             let second = register_with_catalog(ids[1], checkpoint, &catalog);
             let before = first.read().options();
             let (gate_tx, gate_rx) = flume::unbounded();
-            lock(&catalog.state).sessions.get_mut(&ids[1]).unwrap().tx = gate_tx;
+            catalog
+                .state
+                .lock_unpoisoned()
+                .sessions
+                .get_mut(&ids[1])
+                .unwrap()
+                .tx = gate_tx;
             let replacement = smol::spawn({
                 let catalog = catalog.clone();
                 async move {
@@ -3498,7 +3552,7 @@ pub(crate) mod tests {
             let (ack, acknowledged) = flume::bounded(1);
             forward.send(PluginOptionDecision::Commit(ack)).unwrap();
             acknowledged.recv_async().await.unwrap().unwrap();
-            assert_eq!(lock(&saved).len(), 0);
+            assert_eq!(saved.lock_unpoisoned().len(), 0);
             for coordinator in [&first, &second] {
                 for value in [ENABLED_VALUE, DISABLED_VALUE] {
                     assert!(matches!(
@@ -3514,7 +3568,7 @@ pub(crate) mod tests {
                     );
                 }
             }
-            assert_eq!(lock(&saved).len(), 0);
+            assert_eq!(saved.lock_unpoisoned().len(), 0);
             assert!(replacement.cancel().await.is_none());
             reply
                 .send(if abort {
@@ -3540,12 +3594,12 @@ pub(crate) mod tests {
             assert!(catalog.plugin_definitions("test").is_empty());
             assert_eq!(first.read().options(), before);
             assert_eq!(second.read().options(), before);
-            assert_eq!(lock(&saved).len(), 0);
+            assert_eq!(saved.lock_unpoisoned().len(), 0);
             first
                 .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
                 .await
                 .unwrap();
-            assert_eq!(lock(&saved).len(), 1);
+            assert_eq!(saved.lock_unpoisoned().len(), 1);
             first.close().await.unwrap();
             second.close().await.unwrap();
         });
@@ -3662,7 +3716,7 @@ pub(crate) mod tests {
                         let fail = Arc::clone(&fail);
                         let saved = Arc::clone(&saved);
                         move |request: CheckpointRequest<SessionCheckpoint>| {
-                            let rejected = *lock(&fail);
+                            let rejected = *fail.lock_unpoisoned();
                             let saved = Arc::clone(&saved);
                             Box::pin(async move {
                                 if rejected {
@@ -3672,7 +3726,7 @@ pub(crate) mod tests {
                                     });
                                 }
                                 let ack = CheckpointAck::for_request(&request);
-                                lock(&saved).push(request.snapshot);
+                                saved.lock_unpoisoned().push(request.snapshot);
                                 Ok(ack)
                             }) as CheckpointFuture
                         }
@@ -3682,7 +3736,14 @@ pub(crate) mod tests {
                 params
             })
             .unwrap();
-            let root = lock(&first.read.binding).as_ref().unwrap().agent.clone();
+            let root = first
+                .read
+                .binding
+                .lock_unpoisoned()
+                .as_ref()
+                .unwrap()
+                .agent
+                .clone();
             let child = if independent {
                 bind(&second, Arc::default())
             } else {
@@ -3694,7 +3755,7 @@ pub(crate) mod tests {
                         Default::default(),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
                     .unwrap();
                 second
@@ -3712,7 +3773,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             if !independent {
-                let saved = lock(&saved);
+                let saved = saved.lock_unpoisoned();
                 let first = saved[0].journal.as_ref().unwrap();
                 let second = saved[1].journal.as_ref().unwrap();
                 assert_eq!(first.state, second.state);
@@ -3721,7 +3782,7 @@ pub(crate) mod tests {
                     assert!(first.state.iter().any(|record| record.agent == Some(id) && matches!(&record.change, StateChange::Config(config) if config.options.get("test.choice").is_some_and(|value| value == "a"))));
                 }
             }
-            *lock(&fail) = true;
+            *fail.lock_unpoisoned() = true;
             let updated = vec![plugin_option(2, &["b"], "b")];
             assert!(matches!(
                 catalog.replace_plugin_options("test", updated.clone()).await,
@@ -3729,7 +3790,10 @@ pub(crate) mod tests {
                     if session_id == ids[1]
             ));
             assert_eq!(catalog.plugin_definitions("test"), updated);
-            assert_eq!(lock(&saved).last().unwrap().options, first.read().options());
+            assert_eq!(
+                saved.lock_unpoisoned().last().unwrap().options,
+                first.read().options()
+            );
             for (coordinator, agent) in [(&first, &root), (&second, &child)] {
                 let snapshot = agent.manager().journal().snapshot();
                 let config = snapshot
@@ -3805,7 +3869,7 @@ pub(crate) mod tests {
                             reached.send_async(()).await.unwrap();
                             proceed.recv_async().await.unwrap();
                             let ack = CheckpointAck::for_request(&request);
-                            lock(&saved).push(request.snapshot);
+                            saved.lock_unpoisoned().push(request.snapshot);
                             Ok(ack)
                         }) as CheckpointFuture
                     }
@@ -3826,7 +3890,7 @@ pub(crate) mod tests {
                 catalog.plugin_definitions("test"),
                 vec![plugin_option(1, &["a"], "a")]
             );
-            assert!(lock(&saved).is_empty());
+            assert!(saved.lock_unpoisoned().is_empty());
             assert!(replacement.cancel().await.is_none());
             release.send_async(()).await.unwrap();
             coordinator.read().wait_unreserved().await;
@@ -3835,7 +3899,7 @@ pub(crate) mod tests {
                 catalog.plugin_definitions("test"),
                 vec![plugin_option(1, &["a"], "a")]
             );
-            assert_eq!(lock(&saved).len(), 1);
+            assert_eq!(saved.lock_unpoisoned().len(), 1);
             coordinator.close().await.unwrap();
         });
     }
@@ -3846,13 +3910,22 @@ pub(crate) mod tests {
             let catalog = SessionOptionCatalog::default();
             let id = MakimaId::generate();
             let coordinator = register_with_catalog(id, writer(false), &catalog);
-            let agent = lock(&coordinator.read.binding)
+            let agent = coordinator
+                .read
+                .binding
+                .lock_unpoisoned()
                 .as_ref()
                 .unwrap()
                 .agent
                 .clone();
             let (gate, requests) = flume::unbounded();
-            lock(&catalog.state).sessions.get_mut(&id).unwrap().tx = gate;
+            catalog
+                .state
+                .lock_unpoisoned()
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .tx = gate;
             let replacement = smol::spawn({
                 let catalog = catalog.clone();
                 async move {
@@ -3958,15 +4031,15 @@ pub(crate) mod tests {
                 assert!(result.is_err());
                 assert_eq!(coordinator.read().options(), before);
                 assert_eq!(agent.effective_config().unwrap().unwrap().model.spec(), OLD);
-                assert!(lock(&installed).is_empty());
-                assert!(lock(&saved).is_empty());
+                assert!(installed.lock_unpoisoned().is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
                 assert_eq!(journal.snapshot().state, before_journal);
             } else {
                 let options = result.unwrap();
                 assert_eq!(coordinator.read().model().unwrap().as_ref(), NEW);
                 assert_eq!(agent.effective_config().unwrap().unwrap().model.spec(), NEW);
-                assert_eq!(lock(&installed).as_slice(), &[NEW]);
-                let saved = lock(&saved);
+                assert_eq!(installed.lock_unpoisoned().as_slice(), &[NEW]);
+                let saved = saved.lock_unpoisoned();
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved[0].options, options);
                 assert!(saved[0].history.is_none());
@@ -4011,7 +4084,7 @@ pub(crate) mod tests {
             history.compacted = true;
             coordinator.persist_history(history.clone()).await.unwrap();
             {
-                let saved = lock(&saved);
+                let saved = saved.lock_unpoisoned();
                 assert_eq!(saved[0].kind, SessionCheckpointKind::History);
                 let saved_history = saved[0].history.as_ref().unwrap();
                 assert_eq!(saved_history.epoch, history.epoch);
@@ -4050,7 +4123,7 @@ pub(crate) mod tests {
             let authority = Arc::new(Mutex::new(true));
             let captured_authority = Arc::clone(&authority);
             let claim: CheckpointClaim = Arc::new(move |publication| {
-                let live = lock(&captured_authority);
+                let live = captured_authority.lock_unpoisoned();
                 if !*live {
                     publication.cancel();
                     return Err(Arc::from(FAILED));
@@ -4090,7 +4163,7 @@ pub(crate) mod tests {
                     }),
                 claimed
             );
-            *lock(&authority) = false;
+            *authority.lock_unpoisoned() = false;
             release_tx.send_async(()).await.unwrap();
             assert_eq!(operation.await.is_ok(), claimed);
             assert_eq!(
@@ -4104,15 +4177,15 @@ pub(crate) mod tests {
             if claimed {
                 let options = coordinator.read().options();
                 assert!(options.version > before.version);
-                let saved = lock(&saved);
+                let saved = saved.lock_unpoisoned();
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved[0].options, options);
                 assert_eq!(saved[0].config.as_ref().unwrap().config.model.spec(), NEW);
-                assert_eq!(lock(&installed).as_slice(), &[NEW]);
+                assert_eq!(installed.lock_unpoisoned().as_slice(), &[NEW]);
             } else {
                 assert_eq!(coordinator.read().options(), before);
-                assert!(lock(&saved).is_empty());
-                assert!(lock(&installed).is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
+                assert!(installed.lock_unpoisoned().is_empty());
             }
             drop(coordinator.read.options.try_reserve(None).unwrap());
             coordinator.close().await.unwrap();
@@ -4162,7 +4235,10 @@ pub(crate) mod tests {
             let publication = CheckpointPublication::default();
             let (started_tx, started_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            lock(&coordinator.read.binding)
+            coordinator
+                .read
+                .binding
+                .lock_unpoisoned()
                 .as_mut()
                 .unwrap()
                 .prepare_model = Arc::new(move |spec| {
@@ -4207,8 +4283,8 @@ pub(crate) mod tests {
             assert!(operation.await.is_err());
             assert_eq!(coordinator.read().options(), before);
             assert_eq!(agent.effective_config().unwrap().unwrap().model.spec(), OLD);
-            assert!(lock(&saved).is_empty());
-            assert!(lock(&installed).is_empty());
+            assert!(saved.lock_unpoisoned().is_empty());
+            assert!(installed.lock_unpoisoned().is_empty());
             coordinator
                 .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
                 .await
@@ -4295,14 +4371,14 @@ pub(crate) mod tests {
                 assert_eq!(journal.snapshot().state, before.state);
                 assert_eq!(coordinator.read().options(), options);
                 assert!(root_context(&access).unwrap().is_none());
-                assert!(lock(&saved).is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
             } else if fail {
                 assert!(root_context(&access).unwrap().is_some());
                 assert!(journal.snapshot().revision > before.revision);
-                assert!(lock(&saved).is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
             } else {
                 assert!(root_context(&access).unwrap().is_some());
-                let saved = lock(&saved);
+                let saved = saved.lock_unpoisoned();
                 assert_eq!(saved.len(), 1);
                 assert!(
                     saved[0]
@@ -4411,7 +4487,7 @@ pub(crate) mod tests {
             assert_eq!(fixture.coordinator.read().options(), options);
             assert_eq!(actor.config_snapshot().unwrap().generation, generation);
             assert!(root_context(&access).unwrap().is_none());
-            assert!(lock(&fixture.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
             let barrier = actor.reserve_prepared_operation(None).unwrap();
             barrier.wait_predecessor().await.unwrap();
             drop(barrier);
@@ -4461,7 +4537,7 @@ pub(crate) mod tests {
             assert!(commit.await.is_err());
             assert!(publication.is_cancelled());
             assert_eq!(journal.snapshot().state, before.state);
-            assert!(lock(&fixture.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
             actor.shutdown();
             fixture.coordinator.close().await.unwrap();
         });
@@ -4501,7 +4577,7 @@ pub(crate) mod tests {
             assert!(claimed.load(Ordering::SeqCst));
             assert!(!publication.is_cancelled());
             assert!(!publication.cancel());
-            assert_eq!(lock(&fixture.saved).len(), 1);
+            assert_eq!(fixture.saved.lock_unpoisoned().len(), 1);
             let access = fixture
                 .agent
                 .manager()
@@ -4530,7 +4606,7 @@ pub(crate) mod tests {
             let other_journal = other.agent.manager().journal();
             let before = journal.snapshot();
             let other_before = other_journal.snapshot();
-            let checkpoints = lock(&fixture.saved).len();
+            let checkpoints = fixture.saved.lock_unpoisoned().len();
             let result = fixture
                 .coordinator
                 .ensure_root_context_for_actor(&other.agent.actor().unwrap())
@@ -4541,8 +4617,8 @@ pub(crate) mod tests {
             ));
             assert_eq!(journal.snapshot().state, before.state);
             assert_eq!(other_journal.snapshot().state, other_before.state);
-            assert_eq!(lock(&fixture.saved).len(), checkpoints);
-            assert!(lock(&other.saved).is_empty());
+            assert_eq!(fixture.saved.lock_unpoisoned().len(), checkpoints);
+            assert!(other.saved.lock_unpoisoned().is_empty());
             fixture.agent.actor().unwrap().shutdown();
             other.agent.actor().unwrap().shutdown();
             fixture.coordinator.close().await.unwrap();
@@ -4570,8 +4646,8 @@ pub(crate) mod tests {
             assert!(publication.is_cancelled());
             assert_eq!(journal.snapshot().state, before.state);
             assert_eq!(other_journal.snapshot().state, other_before.state);
-            assert!(lock(&fixture.saved).is_empty());
-            assert!(lock(&other.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
+            assert!(other.saved.lock_unpoisoned().is_empty());
             fixture.agent.actor().unwrap().shutdown();
             other.agent.actor().unwrap().shutdown();
             fixture.coordinator.close().await.unwrap();
@@ -4604,7 +4680,7 @@ pub(crate) mod tests {
             );
             let recorded = journal.snapshot();
             {
-                let saved = lock(&fixture.saved);
+                let saved = fixture.saved.lock_unpoisoned();
                 assert_eq!(saved.len(), 1);
                 assert_eq!(saved[0].journal.as_ref().unwrap().state, recorded.state);
             }
@@ -4626,7 +4702,7 @@ pub(crate) mod tests {
             assert!(!reused.instructions.text.contains(CHANGED_INSTRUCTIONS));
             assert_eq!(journal.snapshot().state, recorded.state);
             assert_eq!(journal.snapshot().revision, recorded.revision);
-            assert_eq!(lock(&fixture.saved).len(), 1);
+            assert_eq!(fixture.saved.lock_unpoisoned().len(), 1);
             let snapshot = actor.snapshot();
             assert_eq!(snapshot.status, ActorStatus::Idle);
             assert!(snapshot.active_turn.is_none());
@@ -4676,7 +4752,7 @@ pub(crate) mod tests {
                     .await
                     .is_none()
             );
-            assert!(!lock(&actor.inner.config_waiters).is_empty());
+            assert!(!actor.inner.config_waiters.lock_unpoisoned().is_empty());
             smol::fs::write(
                 fixture.directory.path().join(LOCAL_INSTRUCTIONS_FILE),
                 LOCAL_INSTRUCTIONS,
@@ -4698,9 +4774,9 @@ pub(crate) mod tests {
             }));
             assert_eq!(journal.snapshot().state, recorded.state);
             assert_eq!(journal.snapshot().revision, recorded.revision);
-            assert_eq!(lock(&fixture.saved).len(), 1);
+            assert_eq!(fixture.saved.lock_unpoisoned().len(), 1);
             assert!(actor.latest_ticket().is_none());
-            assert!(lock(&actor.inner.config_waiters).is_empty());
+            assert!(actor.inner.config_waiters.lock_unpoisoned().is_empty());
             actor.shutdown();
             fixture.coordinator.close().await.unwrap();
         });
@@ -4742,7 +4818,7 @@ pub(crate) mod tests {
             waiting.recv_async().await.unwrap();
             assert!(root_context(&access).unwrap().is_none());
             assert_eq!(journal.snapshot().state, before.state);
-            assert!(lock(&fixture.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
             assert_eq!(actor.snapshot().status, ActorStatus::Idle);
             assert!(actor.latest_ticket().is_none());
             release.send_async(()).await.unwrap();
@@ -4750,7 +4826,7 @@ pub(crate) mod tests {
             assert!(root_context(&access).unwrap().is_some());
             assert!(journal.snapshot().revision > before.revision);
             assert_eq!(fixture.coordinator.read().options(), options);
-            assert!(lock(&fixture.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
             assert_eq!(actor.snapshot().status, ActorStatus::Idle);
             assert!(actor.latest_ticket().is_none());
             assert_eq!(actor.config_snapshot().unwrap().generation, generation);
@@ -4768,7 +4844,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert!(initialized.instructions.text.contains(RELOAD_INSTRUCTIONS));
             assert!(root_context(&access).unwrap().is_some());
-            assert!(lock(&fixture.saved).is_empty());
+            assert!(fixture.saved.lock_unpoisoned().is_empty());
             assert!(actor.latest_ticket().is_none());
             actor.shutdown();
             fixture.coordinator.close().await.unwrap();
@@ -4805,8 +4881,8 @@ pub(crate) mod tests {
                     before
                 );
                 assert_eq!(coordinator.read().options(), before_options);
-                assert!(lock(&installed).is_empty());
-                assert!(lock(&saved).is_empty());
+                assert!(installed.lock_unpoisoned().is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
             } else {
                 assert_eq!(result.unwrap(), canonical);
                 assert_eq!(coordinator.read().cwd().unwrap(), canonical);
@@ -4815,7 +4891,7 @@ pub(crate) mod tests {
                     canonical
                 );
                 assert_eq!(
-                    lock(&saved)[0]
+                    saved.lock_unpoisoned()[0]
                         .config
                         .as_ref()
                         .unwrap()
@@ -4824,7 +4900,7 @@ pub(crate) mod tests {
                         .cwd(),
                     canonical
                 );
-                assert_eq!(lock(&installed).len(), 1);
+                assert_eq!(installed.lock_unpoisoned().len(), 1);
                 coordinator
                     .change_directory(PathBuf::from("."))
                     .await
@@ -4913,7 +4989,7 @@ pub(crate) mod tests {
                         before.iter().len() + 1
                     );
                     assert!(!agent.effective_config().unwrap().unwrap().fast);
-                    assert!(lock(&saved).is_empty());
+                    assert!(saved.lock_unpoisoned().is_empty());
                 } else {
                     let (enabled, snapshot) = result.unwrap();
                     assert!(!enabled);
@@ -4929,7 +5005,7 @@ pub(crate) mod tests {
                     assert!(!config.fast);
                     assert!(!config.options.contains_key(FAST_PENDING_MODEL_OPTION_ID));
                     assert!(
-                        !lock(&saved)[0]
+                        !saved.lock_unpoisoned()[0]
                             .options
                             .values()
                             .contains_key(FAST_PENDING_MODEL_OPTION_ID)
@@ -4988,7 +5064,7 @@ pub(crate) mod tests {
                     Some(MODEL)
                 );
                 assert_eq!(journal.snapshot().state, before.state);
-                assert!(lock(&saved).is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
             } else {
                 assert!(
                     !result
@@ -5010,7 +5086,7 @@ pub(crate) mod tests {
                 );
                 assert_eq!(snapshot.state.iter().len(), before.state.iter().len() + 1);
                 assert!(
-                    !lock(&saved)[0]
+                    !saved.lock_unpoisoned()[0]
                         .options
                         .values()
                         .contains_key(FAST_PENDING_MODEL_OPTION_ID)
@@ -5092,7 +5168,7 @@ pub(crate) mod tests {
                 coordinator.read().options().enabled(YOLO_OPTION_ID),
                 claimed
             );
-            assert_eq!(lock(&saved).len(), usize::from(claimed));
+            assert_eq!(saved.lock_unpoisoned().len(), usize::from(claimed));
             if claimed {
                 assert!(journal.snapshot().state.iter().any(|record| matches!(
                     record.change,
@@ -5159,7 +5235,7 @@ pub(crate) mod tests {
                 coordinator.read().options().enabled(WORKFLOW_OPTION_ID),
                 publish
             );
-            assert_eq!(lock(&saved).len(), usize::from(publish));
+            assert_eq!(saved.lock_unpoisoned().len(), usize::from(publish));
             coordinator.close().await.unwrap();
             agent.close_subtree().unwrap();
         });
@@ -5225,7 +5301,7 @@ pub(crate) mod tests {
             release.send_async(()).await.unwrap();
             assert_eq!(operation.await.is_ok(), claimed);
             assert_eq!(coordinator.read().options().enabled(id), claimed);
-            assert_eq!(lock(&saved).len(), usize::from(claimed));
+            assert_eq!(saved.lock_unpoisoned().len(), usize::from(claimed));
             assert_eq!(
                 agent.effective_config().unwrap().unwrap().workflow,
                 claimed && id == WORKFLOW_OPTION_ID
@@ -5299,7 +5375,7 @@ pub(crate) mod tests {
             assert_eq!(operation.await.is_ok(), claimed);
             coordinator.barrier().await;
             assert_eq!(permissions.is_yolo(), claimed);
-            assert_eq!(lock(&saved).len(), usize::from(claimed));
+            assert_eq!(saved.lock_unpoisoned().len(), usize::from(claimed));
             assert_eq!(
                 coordinator.read().options().enabled(YOLO_OPTION_ID),
                 claimed
@@ -5331,7 +5407,7 @@ pub(crate) mod tests {
                         Some((*projection_config(false)).clone()),
                         Vec::new(),
                         None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
                     .unwrap();
                 assert!(root.actor().unwrap().inner.journal.is_none());
@@ -5372,7 +5448,7 @@ pub(crate) mod tests {
                     assert!(result.is_err());
                     assert!(permissions.is_yolo());
                     assert_eq!(permissions.snapshot().yolo, None);
-                    assert!(lock(&saved).is_empty());
+                    assert!(saved.lock_unpoisoned().is_empty());
                 } else {
                     let (enabled, snapshot) = result.unwrap();
                     assert!(!enabled);
@@ -5423,7 +5499,7 @@ pub(crate) mod tests {
                     Some((*projection_config(false)).clone()),
                     Vec::new(),
                     None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(StubBackend)),
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                 )
                 .unwrap();
             let cwd = PathBuf::from("/project");
@@ -5457,7 +5533,13 @@ pub(crate) mod tests {
             let value = if seed { ENABLED_VALUE } else { DISABLED_VALUE };
             coordinator.set_option(YOLO_OPTION_ID, value).await.unwrap();
             assert_eq!(permissions.snapshot().yolo, Some(seed));
-            let published = lock(&saved).last().unwrap().journal.clone().unwrap();
+            let published = saved
+                .lock_unpoisoned()
+                .last()
+                .unwrap()
+                .journal
+                .clone()
+                .unwrap();
             let folded = published.fold().unwrap();
             let rules = &folded.scopes[&None];
             assert_eq!(rules.yolo, Some(seed));
@@ -5474,7 +5556,7 @@ pub(crate) mod tests {
             let before = manager.journal().snapshot().state;
             coordinator.set_option(YOLO_OPTION_ID, value).await.unwrap();
             assert_eq!(manager.journal().snapshot().state, before);
-            assert_eq!(lock(&saved).len(), 1);
+            assert_eq!(saved.lock_unpoisoned().len(), 1);
             coordinator.close().await.unwrap();
             manager
                 .lookup(manager.root_id().unwrap())
@@ -5498,7 +5580,12 @@ pub(crate) mod tests {
             ))
             .unwrap();
             let agent = bind(&coordinator, Arc::default());
-            let permissions = lock(&coordinator.read.permissions).clone().unwrap();
+            let permissions = coordinator
+                .read
+                .permissions
+                .lock_unpoisoned()
+                .clone()
+                .unwrap();
             let rule = makima_config::PermissionRule {
                 tool: makima_config::ToolKey::parse("read").unwrap(),
                 scope: Some("/allowed".into()),
@@ -5519,7 +5606,7 @@ pub(crate) mod tests {
                 assert!(result.is_err());
                 assert!(!permissions.is_yolo());
                 assert_eq!(journal.snapshot().state, before.state);
-                assert!(lock(&saved).is_empty());
+                assert!(saved.lock_unpoisoned().is_empty());
             } else {
                 result.unwrap();
                 assert!(permissions.is_yolo());
@@ -5533,7 +5620,10 @@ pub(crate) mod tests {
                 assert_eq!(*yolo, Some(true));
                 assert_eq!(rules.len(), 1);
                 assert_eq!(rules[0].scope.as_deref(), Some("/allowed"));
-                assert_eq!(lock(&saved)[0].journal.as_ref().unwrap().state, after.state);
+                assert_eq!(
+                    saved.lock_unpoisoned()[0].journal.as_ref().unwrap().state,
+                    after.state
+                );
                 coordinator
                     .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
                     .await
@@ -5618,7 +5708,10 @@ pub(crate) mod tests {
                 DISABLED_VALUE
             );
             assert!(
-                lock(&first.read.binding)
+                first
+                    .read
+                    .binding
+                    .lock_unpoisoned()
                     .as_ref()
                     .unwrap()
                     .agent
@@ -5628,7 +5721,10 @@ pub(crate) mod tests {
                     .workflow
             );
             assert!(
-                !lock(&second.read.binding)
+                !second
+                    .read
+                    .binding
+                    .lock_unpoisoned()
                     .as_ref()
                     .unwrap()
                     .agent
@@ -5768,7 +5864,7 @@ pub(crate) mod tests {
             let (first, second) = futures_lite::future::zip(first, second).await;
             first.unwrap();
             second.unwrap();
-            assert_eq!(lock(&installed).as_slice(), &[NEW, OLD]);
+            assert_eq!(installed.lock_unpoisoned().as_slice(), &[NEW, OLD]);
             assert_eq!(coordinator.read().model().unwrap().as_ref(), OLD);
             coordinator.close().await.unwrap();
         });
@@ -5864,7 +5960,7 @@ pub(crate) mod tests {
             assert!(futures_lite::future::poll_once(&mut change).await.is_none());
             agent.close_subtree().unwrap();
             assert!(change.await.is_err());
-            assert!(lock(&installed).is_empty());
+            assert!(installed.lock_unpoisoned().is_empty());
         });
     }
 

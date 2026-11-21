@@ -225,7 +225,7 @@ mod tests {
         AgentLimits, AgentManagerHandle, HistorySnapshot,
         journal::{JournalChange, JournalCommit, SessionJournal},
         session_writer::StoredSession,
-        test_util::StubBackend,
+        test_util::MockBackend,
     };
     use makima_providers::Message;
     use makima_storage::{
@@ -244,7 +244,7 @@ mod tests {
         let manager =
             AgentManagerHandle::new_with_journal(AgentLimits::default(), journal).unwrap();
         let root = manager
-            .create_root(Vec::new(), None, Box::new(StubBackend))
+            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
             .unwrap();
         let mut session = StoredSession::new("test", "/");
         session.bind_root_id(root.id()).unwrap();

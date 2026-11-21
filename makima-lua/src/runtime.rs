@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_int;
@@ -177,6 +178,7 @@ pub(crate) enum HintContent {
 pub(crate) struct PromptHintRegistration {
     pub(crate) prompts: Option<Vec<PromptId>>,
     pub(crate) slot: Slot,
+    pub(crate) name: Arc<str>,
     pub(crate) content: HintContent,
 }
 
@@ -852,7 +854,7 @@ struct WarmTool {
 }
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
-    handle.lock().unwrap_or_else(|e| e.into_inner())
+    handle.lock_unpoisoned()
 }
 
 /// Backs `makima.async.on_cancel`. An already cancelled task has no
@@ -2167,7 +2169,7 @@ impl DeferQueue {
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(Arc<str>, Arc<AtomicBool>)>> {
-        self.timers.lock().unwrap_or_else(|e| e.into_inner())
+        self.timers.lock_unpoisoned()
     }
 
     /// Hands the callback to the dispatcher and remembers it as pending, so
@@ -2521,10 +2523,7 @@ impl LuaCommandCompletion {
         trigger: makima_agent::CancelTrigger,
         terminal: bool,
     ) -> (CommandArgumentContext, Option<makima_agent::CancelTrigger>) {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut sessions = self.sessions.lock_unpoisoned();
         let id = sessions
             .get(&context.session_id)
             .map(|session| session.id)
@@ -2680,10 +2679,7 @@ pub(crate) fn publish_registered_commands(lua: &Lua, plugin: &Arc<str>) -> mlua:
     )
     .map_err(|error| mlua::Error::runtime(format!("invalid command registration: {error}")))?;
     if let Some(plugin_commands) = commands.get(plugin) {
-        let mut generations = publisher
-            .command_generations
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut generations = publisher.command_generations.lock_unpoisoned();
         generations.retain(|(owner, _), _| owner != plugin);
         generations.extend(
             plugin_commands
@@ -2816,7 +2812,7 @@ fn replace_command_producer(
     plugin: &Arc<str>,
     registrations: Vec<Registration>,
 ) -> Result<(), RegistrationError> {
-    let mut producers = producers.lock().unwrap_or_else(|error| error.into_inner());
+    let mut producers = producers.lock_unpoisoned();
     producers
         .entry(Arc::clone(plugin))
         .or_insert_with(|| registry.create_producer(ProducerPrecedence::Plugin))
@@ -2887,7 +2883,7 @@ struct LuaRuntime {
 }
 
 fn discard_pending_prompt_callbacks(lua: &Lua, pending: PendingPromptHintCallbacks) {
-    let map = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    let map = std::mem::take(&mut *pending.lock_unpoisoned());
     for regs in map.into_values() {
         for reg in regs {
             if let HintContent::Callback(key) = reg.content {
@@ -3096,12 +3092,7 @@ impl LuaRuntime {
     fn drop_plugin_keys(&mut self, name: &str) {
         crate::orchestration::revoke_plugin(&self.lua, name);
         crate::api::state::unload(&self.lua, name);
-        if let Some(producer) = self
-            .command_producers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(name)
-        {
+        if let Some(producer) = self.command_producers.lock_unpoisoned().remove(name) {
             producer.remove();
         }
         let retired = self
@@ -3116,9 +3107,7 @@ impl LuaRuntime {
                 retired.push((Arc::from(name), entries));
             }
             if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
-                let mut generations = generations
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let mut generations = generations.lock_unpoisoned();
                 generations.retain(|(plugin, _), _| plugin.as_ref() != name);
             }
             let _ = self.tx.send(Request::DropCommandKeys {
@@ -3252,11 +3241,7 @@ impl LuaRuntime {
             };
             map.iter()
                 .flat_map(|(plugin, regs)| {
-                    let mut ordinals = HashMap::<Slot, usize>::new();
                     regs.iter().map(move |r| {
-                        let next = ordinals.entry(r.slot).or_default();
-                        let ordinal = *next;
-                        *next += 1;
                         let mut prompts = Vec::new();
                         let observations = r
                             .prompts
@@ -3273,7 +3258,7 @@ impl LuaRuntime {
                             })
                             .map(|prompt| PromptSource {
                                 plugin: Arc::clone(plugin),
-                                registration: ordinal,
+                                name: Arc::clone(&r.name),
                                 prompt,
                                 slot: r.slot,
                                 content: None,
@@ -3316,22 +3301,18 @@ impl LuaRuntime {
     }
 
     fn drain_pending(&self) -> Vec<PendingTool> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect()
+        self.pending.lock_unpoisoned().drain(..).collect()
     }
 
     fn discard_pending_commands(&mut self, pending: crate::api::util::command::PendingCommandMap) {
-        let entries = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+        let entries = std::mem::take(&mut *pending.lock_unpoisoned());
         for entry in entries.into_values() {
             crate::api::util::command::remove_command_entry(&self.lua, entry);
         }
     }
 
     fn discard_pending_keymaps(&mut self, pending: crate::api::keymap::PendingKeymapStore) {
-        let (bindings, _) = pending.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        let (bindings, _) = pending.lock_unpoisoned().drain();
         for binding in bindings {
             let _ = self.lua.remove_registry_value(binding.callback);
         }
@@ -3342,7 +3323,7 @@ impl LuaRuntime {
         plugin: &Arc<str>,
         pending: &crate::api::util::command::PendingCommandMap,
     ) -> Result<Vec<Registration>, PluginError> {
-        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let pending = pending.lock_unpoisoned();
         let registrations = command_registrations(
             &self.lua,
             Some(&pending),
@@ -3386,9 +3367,7 @@ impl LuaRuntime {
         pending_commands: crate::api::util::command::PendingCommandMap,
         pending_keymaps: crate::api::keymap::PendingKeymapStore,
     ) {
-        let mut pending_commands = pending_commands
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut pending_commands = pending_commands.lock_unpoisoned();
         let candidate = std::mem::take(&mut *pending_commands);
         drop(pending_commands);
         let old = {
@@ -3401,9 +3380,7 @@ impl LuaRuntime {
                 .lua
                 .app_data_ref::<Arc<Mutex<CommandGenerationMap>>>()
                 .expect("command generation map initialized");
-            let mut generations = generations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut generations = generations.lock_unpoisoned();
             generations.retain(|(owner, _), _| owner != plugin);
             if let Some(commands) = commands.get(plugin) {
                 generations.extend(commands.iter().map(|(name, entry)| {
@@ -3422,10 +3399,7 @@ impl LuaRuntime {
                 plugin: Arc::clone(plugin),
             });
         }
-        let (candidate, deletions) = pending_keymaps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain();
+        let (candidate, deletions) = pending_keymaps.lock_unpoisoned().drain();
         let mut old_callbacks = Vec::new();
         if let Some(mut live) = self.lua.app_data_mut::<KeymapStore>() {
             old_callbacks.extend(live.clear_plugin(plugin));
@@ -3454,8 +3428,8 @@ impl LuaRuntime {
         sources: Arc<Mutex<completion::PendingCompletionStore>>,
         expanders: Arc<Mutex<completion::PendingExpanderStore>>,
     ) {
-        let sources = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
-        let expanders = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let sources = std::mem::take(&mut sources.lock_unpoisoned().0);
+        let expanders = std::mem::take(&mut expanders.lock_unpoisoned().0);
         if let Some(mut store) = self.lua.app_data_mut::<completion::CompletionStore>() {
             store.0.insert(Arc::clone(plugin), sources);
         }
@@ -3469,7 +3443,7 @@ impl LuaRuntime {
         plugin: &Arc<str>,
         pending: crate::api::options::PendingPluginOptionSpecs,
     ) {
-        if let Some(specs) = pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+        if let Some(specs) = pending.lock_unpoisoned().take()
             && let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>()
         {
             store.insert(Arc::clone(plugin), specs);
@@ -3479,14 +3453,11 @@ impl LuaRuntime {
     }
 
     fn discard_pending_autocmds(&mut self, pending: crate::api::autocmd::PendingAutocmdStore) {
-        drop(pending.lock().unwrap_or_else(|error| error.into_inner()));
+        drop(pending.lock_unpoisoned());
     }
 
     fn discard_pending_timers(&mut self, pending: crate::api::timer::PendingTimerStore) {
-        let keys = pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .discard_candidate();
+        let keys = pending.lock_unpoisoned().discard_candidate();
         for key in keys {
             let _ = self.lua.remove_registry_value(key);
         }
@@ -3497,8 +3468,7 @@ impl LuaRuntime {
         plugin: &str,
         pending: crate::api::autocmd::PendingAutocmdStore,
     ) {
-        let candidate =
-            std::mem::take(&mut *pending.lock().unwrap_or_else(|error| error.into_inner()));
+        let candidate = std::mem::take(&mut *pending.lock_unpoisoned());
         if let Some(mut live) = self.lua.app_data_mut::<AutocmdStore>() {
             live.replace_plugin(plugin, candidate);
         }
@@ -3509,10 +3479,7 @@ impl LuaRuntime {
         plugin: &str,
         pending: crate::api::timer::PendingTimerStore,
     ) {
-        let candidate = std::mem::replace(
-            &mut *pending.lock().unwrap_or_else(|error| error.into_inner()),
-            TimerStore::new(),
-        );
+        let candidate = std::mem::replace(&mut *pending.lock_unpoisoned(), TimerStore::new());
         let old = self
             .lua
             .app_data_mut::<TimerStore>()
@@ -3532,15 +3499,12 @@ impl LuaRuntime {
         sources: Arc<Mutex<completion::PendingCompletionStore>>,
         expanders: Arc<Mutex<completion::PendingExpanderStore>>,
     ) {
-        let _ = std::mem::take(&mut sources.lock().unwrap_or_else(|e| e.into_inner()).0);
-        let _ = std::mem::take(&mut expanders.lock().unwrap_or_else(|e| e.into_inner()).0);
+        let _ = std::mem::take(&mut sources.lock_unpoisoned().0);
+        let _ = std::mem::take(&mut expanders.lock_unpoisoned().0);
     }
 
     fn commit_pending_store(&mut self, plugin: &str, pending: crate::api::store::PendingStore) {
-        let candidate = pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .drain();
+        let candidate = pending.lock_unpoisoned().drain();
         let candidate_events: Vec<(String, String)> = candidate
             .iter()
             .map(|(registry, key, _, _)| (registry.clone(), key.clone()))
@@ -3670,12 +3634,7 @@ impl LuaRuntime {
         opts: &PluginOpts,
         pending: &crate::api::options::PendingPluginOptionSpecs,
     ) -> Result<(), mlua::Error> {
-        if opts.is_empty()
-            || pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_some()
-        {
+        if opts.is_empty() || pending.lock_unpoisoned().is_some() {
             return Ok(());
         }
         let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
@@ -4041,10 +4000,7 @@ impl LuaRuntime {
             .lua
             .remove_app_data::<crate::api::slot::PendingSlotStore>()
         {
-            let candidate = candidate
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
+            let candidate = candidate.lock_unpoisoned().clone();
             if let Some(mut live) = self.lua.app_data_mut::<SlotStore>() {
                 live.replace_plugin(&name, candidate);
             }
@@ -4054,8 +4010,7 @@ impl LuaRuntime {
             && let Some(old) = live.insert(
                 Arc::clone(&name),
                 candidate
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .lock_unpoisoned()
                     .remove(&name)
                     .unwrap_or_default(),
             )
@@ -4070,7 +4025,7 @@ impl LuaRuntime {
             .lua
             .remove_app_data::<crate::api::ui::PendingHintStore>()
         {
-            let value = candidate.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let value = candidate.lock_unpoisoned().take();
             if let Some(mut live) = self.lua.app_data_mut::<HintStore>() {
                 live.clear_plugin(&name);
                 if let Some(spans) = value {
@@ -4118,8 +4073,7 @@ impl LuaRuntime {
             })
             .collect();
 
-        let declared =
-            std::mem::take(&mut *pending_rules.lock().unwrap_or_else(|e| e.into_inner()));
+        let declared = std::mem::take(&mut *pending_rules.lock_unpoisoned());
         let rules = resolve_rules(&self.registry, &name, permissions, declared);
         self.plugin_rules.replace(&name, rules);
         self.plugins.borrow_mut().insert(
@@ -4147,8 +4101,7 @@ impl LuaRuntime {
         self.registry.clear_plugin(plugin);
         if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
             generations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .retain(|(owner, _), _| owner.as_ref() != plugin);
         }
         self.plugin_rules.remove(plugin);
@@ -6092,8 +6045,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             crate::api::agent::detach_all_agents(&rt.lua);
             for (_, producer) in rt
                 .command_producers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .drain()
             {
                 producer.remove();
@@ -6739,10 +6691,7 @@ mod tests {
             context: CompletionContext,
             _cancellation: makima_commands::CancellationToken,
         ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
-            self.0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(context);
+            self.0.lock_unpoisoned().push(context);
             Box::pin(async { Ok(Vec::new()) })
         }
     }
@@ -6843,6 +6792,7 @@ mod tests {
             vec![PromptHintRegistration {
                 prompts: None,
                 slot: Slot::ToolUsage,
+                name: "default".into(),
                 content: HintContent::Callback(key),
             }],
         );
@@ -7233,11 +7183,7 @@ mod tests {
                 makima_commands::CompletionResult::Items(_)
             ));
         }
-        let contexts = probe
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+        let contexts = probe.0.lock_unpoisoned().clone();
         let adapter = LuaCommandCompletion {
             plugin: Arc::from("test-plugin"),
             command: Arc::from("/complete"),

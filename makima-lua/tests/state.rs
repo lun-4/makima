@@ -28,12 +28,16 @@ makima.api.register_tool({
         end
         assert(type(revision) == "number", tostring(revision))
         if input.action == "write" then
-            local candidate = { count = input.count, null = makima.state.null }
+            local candidate = { count = input.count, null = makima.state.null, nested = { makima.state.null, 1.5, {} } }
             local committed, err = slot:set(ctx, candidate, { expect = revision })
             assert(committed, err)
             candidate.count = -1
             local copy, read_revision = slot:get(ctx)
             assert(copy.count == input.count and copy.null == makima.state.null and read_revision == committed)
+            assert(#copy.nested == 3 and copy.nested[1] == makima.state.null and copy.nested[2] == 1.5)
+            assert(next(copy.nested[3]) == nil)
+            copy.nested[2] = 0
+            assert(slot:get(ctx).nested[2] == 1.5)
             copy.count = -2
             assert(slot:get(ctx).count == input.count)
             local agent = assert(ctx:agent())
@@ -308,7 +312,7 @@ fn trusted_dormant_state_and_nonveto_install_notifications() {
             Some(common::effective_config(&template)),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
         )
         .unwrap();
     let target = common::install_root(&host, root.clone(), template);
@@ -437,7 +441,7 @@ fn start_and_restore_read_only_migrate_copies_of_captured_target() {
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let focused = other
         .create_root_with_config(Some(config), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>)
+            Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>)
         })
         .unwrap();
     common::install_root(&host, focused, ctx.clone());
@@ -603,7 +607,7 @@ fn retained_fixture() -> (PluginHost, ToolContext, CancelTrigger, AgentRef, Agen
             AgentMetadata::default(),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
         )
         .unwrap();
     let slot = manager
@@ -675,43 +679,7 @@ fn retained_reads_reject_session_unknown_and_malformed_slots() {
 
 #[test]
 fn retained_reads_reject_unrelated_agent_topology() {
-    use makima_agent::{
-        AgentInput, AgentMetadata, BackendResult, ControlWork, CurrentManagedTurn, TurnContext,
-        WorkKind, actor::ActorHistory,
-    };
-    use makima_providers::provider::BoxFuture;
-
-    struct Caller(flume::Sender<CurrentManagedTurn>);
-    impl ActorBackend for Caller {
-        fn run_turn<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            context: TurnContext,
-            _: AgentInput,
-            _: WorkKind,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async move {
-                self.0.send(context.managed_turn.unwrap()).unwrap();
-                std::future::pending().await
-            })
-        }
-        fn run_control<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: &'a ControlWork,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async { unreachable!() })
-        }
-        fn run_compact<'a>(
-            &'a mut self,
-            _: ActorHistory<'a>,
-            _: TurnContext,
-            _: Option<&'a str>,
-        ) -> BoxFuture<'a, BackendResult> {
-            Box::pin(async { unreachable!() })
-        }
-    }
+    use makima_agent::{AgentInput, AgentMetadata};
 
     let (host, mut ctx, _cancel, parent, sibling) = retained_fixture();
     let manager = parent.manager();
@@ -738,7 +706,13 @@ fn retained_reads_reject_unrelated_agent_topology() {
             AgentMetadata::default(),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(Caller(entered)) as Box<dyn ActorBackend>),
+            |_| {
+                let backend = common::MockBackend::STRICT.with_turn(move |_, context, _, _| {
+                    entered.send(context.managed_turn.unwrap()).unwrap();
+                    Box::pin(std::future::pending())
+                });
+                Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
+            },
         )
         .unwrap();
     caller
@@ -801,7 +775,7 @@ fn retained_reads_after_restart_leave_child_dormant() {
             AgentMetadata::default(),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
         )
         .unwrap();
     host.manager
@@ -1005,7 +979,7 @@ fn resume_callback_keeps_replayed_revision_and_host_notices_keep_commit_order() 
             Some(common::effective_config(&template)),
             Vec::new(),
             None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
         )
         .unwrap();
     let journal = manager.journal();

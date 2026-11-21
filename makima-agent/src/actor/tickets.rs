@@ -5,6 +5,7 @@
 //! turn's outcome, whether the turn completed, failed, was cancelled, was
 //! removed, or was terminalized by a close/clear.
 
+use makima_domain::LockExt;
 use std::mem::take;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -56,22 +57,15 @@ pub struct TurnOutput(Arc<Mutex<OutputState>>);
 impl TurnOutput {
     /// Registers the presentation sink used only after the actor seals its result.
     pub fn set_terminal_sender(&self, sender: crate::EventSender) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .terminal_sender = Some(sender.without_output());
+        self.0.lock_unpoisoned().terminal_sender = Some(sender.without_output());
     }
 
     pub(super) fn take_terminal_sender(&self) -> Option<crate::EventSender> {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .terminal_sender
-            .take()
+        self.0.lock_unpoisoned().terminal_sender.take()
     }
 
     pub fn begin_text_attempt(&self) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.clear();
         }
@@ -82,7 +76,7 @@ impl TurnOutput {
     }
 
     pub fn reconcile_text_attempt(&self, text: &str) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.clear();
             state.text.push_str(text);
@@ -90,14 +84,14 @@ impl TurnOutput {
     }
 
     pub fn append_text(&self, text: &str) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.push_str(text);
         }
     }
 
     pub fn append_output(&self, output: serde_json::Value) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.output.push(output);
         }
@@ -167,12 +161,7 @@ impl TurnTicket {
     }
 
     pub fn peek_result(&self) -> Option<TurnResult> {
-        self.output
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .result
-            .clone()
+        self.output.0.lock_unpoisoned().result.clone()
     }
 
     pub async fn wait_result(&self) -> TurnResult {
@@ -190,7 +179,7 @@ impl TurnTicket {
     }
 
     pub(crate) fn mark_started(&self) {
-        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.output.0.lock_unpoisoned();
         if state.result.is_none() && state.started.is_none() {
             state.started = Some(Instant::now());
         }
@@ -198,7 +187,7 @@ impl TurnTicket {
 
     /// Freezes the result for [`Self::peek_result`] without waking waiters.
     pub(crate) fn seal(&self, outcome: &TurnOutcome) {
-        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.output.0.lock_unpoisoned();
         if state.result.is_none() {
             state.result = Some(TurnResult {
                 outcome: outcome.clone(),
@@ -213,22 +202,14 @@ impl TurnTicket {
     }
 
     pub(crate) fn replace_sealed_outcome(&self, outcome: &TurnOutcome) {
-        let mut state = self
-            .output
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.output.0.lock_unpoisoned();
         if let Some(result) = &mut state.result {
             result.outcome = outcome.clone();
         }
     }
 
     pub(crate) fn resolve(&self, outcome: TurnOutcome) {
-        let mut outcome_slot = self
-            .shared
-            .outcome
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut outcome_slot = self.shared.outcome.lock_unpoisoned();
         if outcome_slot.is_none() {
             self.seal(&outcome);
             *outcome_slot = Some(outcome);
@@ -252,11 +233,7 @@ impl TurnTicket {
     }
 
     pub fn peek(&self) -> Option<TurnOutcome> {
-        self.shared
-            .outcome
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.shared.outcome.lock_unpoisoned().clone()
     }
 }
 

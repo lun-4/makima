@@ -9,10 +9,11 @@ use makima_agent::{
     tools::{Deadline, ToolContext, TurnToolBindings},
 };
 use makima_commands::CommandInvocation;
+use makima_domain::LockExt;
 use makima_providers::Message;
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::sessions::HistorySnapshot;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use super::{
     CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
@@ -74,18 +75,12 @@ impl AgentOrchestration {
         self
     }
 
-    fn lock(&self) -> MutexGuard<'_, Targets> {
-        self.targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
     pub fn register_root(
         &self,
         target: TrustedTarget,
         config_mutations: Option<ConfigMutationReserver>,
     ) {
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         targets.roots.retain(|entry| {
             entry.target.target.validate_live().is_ok()
                 && !entry.target.target.same_manager(&target.target)
@@ -101,7 +96,8 @@ impl AgentOrchestration {
     /// the frontend's own command target.
     pub fn bind_commands(&self, root: &AgentRef, runner: CommandRunner) {
         if let Some(entry) = self
-            .lock()
+            .targets
+            .lock_unpoisoned()
             .roots
             .iter_mut()
             .find(|entry| same_agent(&entry.target.target, root))
@@ -113,7 +109,8 @@ impl AgentOrchestration {
     pub fn history_key(&self, target: &AgentRef) -> Result<String, String> {
         self.validate_target(target)?;
         let registered = self
-            .lock()
+            .targets
+            .lock_unpoisoned()
             .children
             .iter()
             .find(|entry| same_agent(&entry.target.target, target))
@@ -130,7 +127,8 @@ impl AgentOrchestration {
     }
 
     pub(super) fn roots(&self) -> Vec<TrustedTarget> {
-        self.lock()
+        self.targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .map(|entry| entry.target.clone())
@@ -138,7 +136,7 @@ impl AgentOrchestration {
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         targets.selected = selected;
         targets
             .roots
@@ -179,7 +177,7 @@ impl OrchestrationServices for AgentOrchestration {
             self.validate_target(&pinned.target)?;
             return Ok(Some(pinned.clone()));
         }
-        let target = self.lock().selected.clone();
+        let target = self.targets.lock_unpoisoned().selected.clone();
         target
             .map(|target| {
                 self.template(&target)
@@ -199,7 +197,7 @@ impl OrchestrationServices for AgentOrchestration {
         if actor.agent_id() != target.target.id() {
             return Err("child activation actor identity does not match target".into());
         }
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         target
             .target
             .manager()
@@ -224,7 +222,7 @@ impl OrchestrationServices for AgentOrchestration {
     }
 
     fn unregister_child_target(&self, target: &AgentRef, identity: &Arc<()>) {
-        self.lock().children.retain(|entry| {
+        self.targets.lock_unpoisoned().children.retain(|entry| {
             !same_agent(&entry.target.target, target)
                 || !Arc::ptr_eq(&entry.actor_identity, identity)
         });
@@ -236,7 +234,7 @@ impl OrchestrationServices for AgentOrchestration {
         history_key: String,
     ) -> Result<(), String> {
         self.validate_target(&target.target)?;
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         if targets
             .roots
             .iter()
@@ -263,7 +261,7 @@ impl OrchestrationServices for AgentOrchestration {
 
     fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
         target.validate_live().map_err(|error| error.to_string())?;
-        let targets = self.lock();
+        let targets = self.targets.lock_unpoisoned();
         let root = targets
             .roots
             .iter()
@@ -302,7 +300,7 @@ impl OrchestrationServices for AgentOrchestration {
 
     fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
         target.snapshot().map_err(|error| error.to_string())?;
-        if self.lock().roots.iter().any(|entry| {
+        if self.targets.lock_unpoisoned().roots.iter().any(|entry| {
             entry.target.target.same_manager(target) && entry.target.target.validate_live().is_ok()
         }) {
             Ok(())
@@ -318,7 +316,8 @@ impl OrchestrationServices for AgentOrchestration {
     ) -> Result<ConfigMutation, ConfigChangeError> {
         self.validate_target(target)?;
         let reserve = self
-            .lock()
+            .targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .find(|root| root.target.target.same_manager(target))
@@ -345,7 +344,8 @@ impl OrchestrationServices for AgentOrchestration {
 
     fn command_runner(&self, target: &AgentRef) -> Result<CommandRunner, String> {
         self.validate_target(target)?;
-        self.lock()
+        self.targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .find(|root| root.target.target.same_manager(target))

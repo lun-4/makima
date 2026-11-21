@@ -23,6 +23,9 @@ pub mod test_util;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod windows_offload;
 
 use std::fs;
 use std::io::Write;

@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -209,17 +210,11 @@ impl PreparedTransaction {
         let install_prepared = Arc::clone(&prepared);
         let install_flag = Arc::clone(&installed);
         snapshot.install = Some(Arc::new(move || {
-            if let Some(prepared) = install_prepared
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_mut()
-            {
+            if let Some(prepared) = install_prepared.lock_unpoisoned().as_mut() {
                 prepared.install().map_err(|error| error.to_string())?;
             }
 
-            *install_flag
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = true;
+            *install_flag.lock_unpoisoned() = true;
             Ok(())
         }));
         let future = catch_unwind(AssertUnwindSafe(|| {
@@ -232,7 +227,7 @@ impl PreparedTransaction {
             .map_err(|_| ActorError::HistoryCheckpoint(PUBLICATION_FUTURE_PANICKED.into()))?
             .map_err(ActorError::HistoryCheckpoint);
 
-        let installed = *installed.lock().unwrap_or_else(|error| error.into_inner());
+        let installed = *installed.lock_unpoisoned();
         if !installed {
             result.as_ref().map_err(Clone::clone)?;
             if self.publication.is_cancelled() {
@@ -243,11 +238,7 @@ impl PreparedTransaction {
                     "publication callback succeeded without claiming durable publication".into(),
                 ));
             }
-            if let Some(prepared) = prepared
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_mut()
-            {
+            if let Some(prepared) = prepared.lock_unpoisoned().as_mut() {
                 prepared
                     .install()
                     .map_err(|error| ActorError::HistoryCheckpoint(error.to_string()))?;
@@ -301,11 +292,7 @@ pub(crate) struct ConfigPublicationGuard {
 
 impl Drop for ConfigPublicationGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state
             .config_publication
             .as_ref()
@@ -326,11 +313,7 @@ impl AgentActorHandle {
         &self,
         publication: &CheckpointPublication,
     ) -> Result<Vec<Arc<PublicationGuard>>, ActorError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             publication.cancel();
             return Err(lifecycle_error(state.lifecycle));
@@ -352,11 +335,7 @@ impl AgentActorHandle {
     }
 
     pub(crate) fn reserve_config_publication(&self) -> Result<ConfigPublicationGuard, ActorError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -390,7 +369,7 @@ impl AgentActorHandle {
         turn: Option<PreparedTurn>,
         idle_owner: Option<&Arc<()>>,
     ) -> Result<PreparedOperationTicket, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -459,7 +438,7 @@ impl PreparedOperationTicket {
         &self,
         publication: &CheckpointPublication,
     ) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if let Some(error) = self.failure() {
             publication.cancel();
             return Err(error);
@@ -484,7 +463,7 @@ impl PreparedOperationTicket {
     /// [`ActorError::PolicyPending`] once a change was already resolved and
     /// preparation is under way.
     pub fn replace_turn_input(&self, input: AgentInput) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         let pending = self.unresolved(&mut state)?;
         let turn = pending.turn.as_mut().ok_or(ActorError::PolicyCancelled)?;
         turn.input = input;
@@ -494,7 +473,7 @@ impl PreparedOperationTicket {
     /// Sets whether the caller already displayed this turn, including after readiness.
     /// Must be set before commit; config-only or cancelled operations reject it.
     pub fn set_turn_displayed(&self, displayed: bool) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -515,7 +494,7 @@ impl PreparedOperationTicket {
                 "context preparation is unavailable".into(),
             ));
         }
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         let pending = self.unresolved(&mut state)?;
         if pending.turn.is_some() {
             return Err(ActorError::Busy);
@@ -525,7 +504,7 @@ impl PreparedOperationTicket {
     }
 
     pub fn resolve(&self, change: Option<ConfigChange>) -> Result<(), ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         self.unresolved(&mut state)?.change = Some(change);
         drive_operations(&self.inner, &mut state);
         Ok(())
@@ -537,7 +516,7 @@ impl PreparedOperationTicket {
         loop {
             let listener = self.inner.policy_changed.listen();
             {
-                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.inner.state.lock_unpoisoned();
                 if let Some(error) = self.failure() {
                     return Err(error);
                 }
@@ -564,7 +543,7 @@ impl PreparedOperationTicket {
         loop {
             let listener = self.inner.policy_changed.listen();
             {
-                let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.inner.state.lock_unpoisoned();
                 if let Some(error) = self.failure() {
                     return Err(error);
                 }
@@ -581,7 +560,7 @@ impl PreparedOperationTicket {
     }
 
     pub fn ready_config(&self) -> Result<Arc<EffectiveAgentConfig>, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -598,7 +577,7 @@ impl PreparedOperationTicket {
     /// The only production cancel path is `Drop`; `pub(crate)` exists for
     /// same-crate tests that need to cancel without dropping.
     pub(crate) fn cancel(&self) {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if let Some(publication) = &state.prepared_publication
             && publication.id == self.id
             && publication.publication.cancel()
@@ -647,7 +626,7 @@ impl PreparedOperationTicket {
     }
 
     pub fn commit(self) -> Result<PreparedCommit, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -694,7 +673,7 @@ impl PreparedOperationTicket {
         let _cancellation = CancelPublication(transaction.publication.clone());
         let (completion, response) = flume::bounded(1);
         {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open {
                 return Err(lifecycle_error(state.lifecycle));
             }
@@ -714,7 +693,7 @@ impl PreparedOperationTicket {
             let inner = Arc::clone(&self.inner);
             smol::spawn(async move {
                 let result = transaction.publish(snapshot).await;
-                let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = inner.state.lock_unpoisoned();
                 let id = operation.id;
                 let result = match result {
                     Ok((finalize, error)) => operation
@@ -942,10 +921,7 @@ impl PreparedOperation {
 
 impl PreparedOperationTicket {
     fn failure(&self) -> Option<ActorError> {
-        self.failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.failure.lock_unpoisoned().clone()
     }
 
     /// The pending operation, while it still accepts its turn input or change.
@@ -1035,10 +1011,7 @@ impl Drop for PreparedOperationTicket {
 
 impl PreparedOperation {
     pub(super) fn fail(self, error: ActorError) {
-        self.failure
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(error);
+        self.failure.lock_unpoisoned().get_or_insert(error);
     }
 }
 
@@ -1208,7 +1181,7 @@ pub(super) fn drive(inner: &Arc<ActorInner>, state: &mut ActorState) {
             })
             .await
             .unwrap_or(Err(ActorError::PolicyCancelled));
-        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open
             || state.preparing != Some(id)
             || state

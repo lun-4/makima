@@ -1,6 +1,7 @@
+use makima_domain::LockExt;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Mutex, Weak},
 };
 
 use crate::{AgentId, cancel::PublicationGuard};
@@ -80,7 +81,7 @@ impl WorkLedger {
         incarnation: u64,
         open: bool,
     ) -> WorkAdmission {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state.agents.entry(agent_id).or_insert(WorkAgent {
             parent_id,
             incarnation,
@@ -106,7 +107,7 @@ impl WorkLedger {
     }
 
     pub(crate) fn set_open(&self, agent_id: AgentId, open: bool) -> Result<(), ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -127,7 +128,7 @@ impl WorkLedger {
         incarnation: u64,
         open: bool,
     ) -> Result<(), ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -146,7 +147,8 @@ impl WorkLedger {
     }
 
     pub(crate) fn is_busy(&self, agent_id: AgentId) -> bool {
-        self.lock()
+        self.state
+            .lock_unpoisoned()
             .agents
             .get(&agent_id)
             .is_some_and(|agent| agent.references != 0)
@@ -156,7 +158,7 @@ impl WorkLedger {
         self: &Arc<Self>,
         agent_id: AgentId,
     ) -> Result<WorkIdleGuard, ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -204,7 +206,7 @@ impl WorkLedger {
         incarnation: u64,
         open: Option<bool>,
     ) -> Result<WorkAdmission, ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -229,7 +231,7 @@ impl WorkLedger {
         agent_id: AgentId,
         reporting: bool,
     ) -> Result<(), ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -240,7 +242,7 @@ impl WorkLedger {
     }
 
     pub(crate) fn remove(&self, agent_id: AgentId) -> Result<(), ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&agent_id)
@@ -266,12 +268,13 @@ impl WorkLedger {
 
     #[cfg(test)]
     pub(crate) fn active_agents(&self) -> usize {
-        self.lock().active_agents
+        self.state.lock_unpoisoned().active_agents
     }
 
     #[cfg(test)]
     pub(crate) fn active_children(&self, parent_id: AgentId) -> usize {
-        self.lock()
+        self.state
+            .lock_unpoisoned()
             .active_children
             .get(&parent_id)
             .copied()
@@ -285,7 +288,7 @@ impl WorkLedger {
         reporting: bool,
         restored: bool,
     ) -> Result<WorkReservation, ManagerError> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let mut chain = Vec::new();
         let mut next = Some(agent_id);
         while let Some(id) = next {
@@ -370,7 +373,7 @@ impl WorkLedger {
     }
 
     fn release(&self, agent_id: AgentId) {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         let Some(agent) = state.agents.get_mut(&agent_id) else {
             return;
         };
@@ -393,10 +396,6 @@ impl WorkLedger {
             state.agents.remove(&agent_id);
         }
     }
-
-    fn lock(&self) -> MutexGuard<'_, WorkState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
 }
 
 impl WorkIdleGuard {
@@ -410,7 +409,7 @@ impl Drop for WorkIdleGuard {
         if self.committed {
             return;
         }
-        let mut state = self.ledger.lock();
+        let mut state = self.ledger.state.lock_unpoisoned();
         if let Some(agent) = state.agents.get_mut(&self.agent_id)
             && agent.revision == self.revision
             && !agent.removed
@@ -427,7 +426,7 @@ impl WorkAdmission {
         &self,
         publication: &CheckpointPublication,
     ) -> Result<Arc<PublicationGuard>, ManagerError> {
-        let mut state = self.ledger.lock();
+        let mut state = self.ledger.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&self.agent_id)
@@ -446,7 +445,7 @@ impl WorkAdmission {
     }
 
     pub(crate) fn validate_open(&self) -> Result<(), ManagerError> {
-        let state = self.ledger.lock();
+        let state = self.ledger.state.lock_unpoisoned();
         let agent = state
             .agents
             .get(&self.agent_id)
@@ -467,7 +466,7 @@ impl WorkAdmission {
     }
 
     pub(crate) fn set_reporting(&self, reporting: bool) -> Result<(), ManagerError> {
-        let mut state = self.ledger.lock();
+        let mut state = self.ledger.state.lock_unpoisoned();
         let agent = state
             .agents
             .get_mut(&self.agent_id)
@@ -528,6 +527,7 @@ impl Drop for WorkHold {
 
 #[cfg(test)]
 mod tests {
+    use makima_domain::LockExt;
     use std::{
         sync::{Arc, Barrier, mpsc},
         thread,
@@ -698,7 +698,10 @@ mod tests {
             drop(reservation);
             assert_eq!(ledger.active_agents(), 1);
         }
-        assert_eq!(ledger.lock().agents.len(), SEQUENTIAL_CHILDREN + 1);
+        assert_eq!(
+            ledger.state.lock_unpoisoned().agents.len(),
+            SEQUENTIAL_CHILDREN + 1
+        );
         drop(root_hold);
         assert_eq!(ledger.active_agents(), 0);
     }

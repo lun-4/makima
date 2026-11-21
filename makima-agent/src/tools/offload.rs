@@ -1,5 +1,6 @@
 //! Saves oversized tool output with a bounded preview and an inspection path.
 
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::fs::File;
 #[cfg(unix)]
@@ -142,7 +143,7 @@ impl OffloadStore {
 
     pub fn read(&self, name: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
         DiskBackend::validate_name(name)?;
-        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        let _operation = self.operation.lock_unpoisoned();
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(ErrorKind::NotConnected, READ_CLOSED));
         }
@@ -150,7 +151,7 @@ impl OffloadStore {
     }
 
     fn put_serialized(&self, body: &str, saved_bytes: usize) -> Result<Saved, OffloadError> {
-        let mut usage = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        let mut usage = self.operation.lock_unpoisoned();
         if self.closed.load(Ordering::Acquire) {
             return Err(OffloadError::Closed);
         }
@@ -195,11 +196,11 @@ impl OffloadStore {
 
     pub fn close_and_drain(&self) {
         self.request_close();
-        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        let _operation = self.operation.lock_unpoisoned();
     }
 
     fn remove_after_close(&self) -> io::Result<()> {
-        let _operation = self.operation.lock().unwrap_or_else(|e| e.into_inner());
+        let _operation = self.operation.lock_unpoisoned();
         self.backend.remove_all()
     }
 }
@@ -240,7 +241,7 @@ impl OffloadCleanup {
                 if let Err(error) = &result {
                     warn!(%error, dir = %shared.store.dir().display(), "offload cleanup failed");
                 }
-                *shared.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                *shared.result.lock_unpoisoned() = Some(result);
                 shared.completed.notify(usize::MAX);
             })
             .await;
@@ -252,13 +253,7 @@ impl OffloadCleanup {
         self.request();
         loop {
             let listener = self.shared.completed.listen();
-            if let Some(result) = self
-                .shared
-                .result
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
+            if let Some(result) = self.shared.result.lock_unpoisoned().clone() {
                 return result;
             }
             listener.await;

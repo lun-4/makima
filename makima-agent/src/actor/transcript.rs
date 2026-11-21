@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 
 use makima_providers::{ContentBlock, Message};
@@ -91,22 +92,14 @@ impl AgentActorHandle {
         let (history, through_turn, end) = {
             // Settlement takes outcomes before state, then coverage. Keep that order
             // so a boundary and its history are captured in the same observation.
-            let _outcomes = self
-                .inner
-                .outcomes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let _outcomes = self.inner.outcomes.lock_unpoisoned();
+            let state = self.inner.state.lock_unpoisoned();
             let history = self.inner.history.load_full();
             let through_turn = request
                 .through_turn
                 .or(state.latest_history_turn.map(|(id, _, _)| id));
             let end = if let Some(turn_id) = through_turn {
-                let coverage = self
-                    .inner
-                    .coverage
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let coverage = self.inner.coverage.lock_unpoisoned();
                 let latest_boundary = state
                     .latest_history_turn
                     .filter(|(id, _, _)| *id == turn_id)
@@ -119,13 +112,7 @@ impl AgentActorHandle {
                     }
                     Some(None) => return Err(ActorError::UnavailableTurnHistory(turn_id)),
                     Some(Some(_)) => return Err(ActorError::CompactedTurn(turn_id)),
-                    None if self
-                        .inner
-                        .tickets
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains_key(&turn_id) =>
-                    {
+                    None if self.inner.tickets.lock_unpoisoned().contains_key(&turn_id) => {
                         return Err(ActorError::PendingTurn(turn_id));
                     }
                     None => return Err(ActorError::UnknownTurn(turn_id)),

@@ -996,13 +996,14 @@ async fn close_session(srv: &mut Server) {
     {
         warn!(%error, "failed to drain session coordinator");
     }
+    state.command_projection_task.cancel().await;
+    // Forwarding the last turn events can enqueue usage records.
+    state.event_pump.finish().await;
     if let Some(checkpoint) = state.checkpoint
         && let Err(error) = checkpoint.drain().await
     {
         warn!(%error, "failed to drain session checkpoint");
     }
-    state.command_projection_task.cancel().await;
-    state.event_pump.finish().await;
     state.option_projection_task.cancel().await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
@@ -2655,6 +2656,7 @@ mod tests {
     };
     use makima_storage::sessions::{Effort, Session, StoredThinking};
     use smol::future::poll_once;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3492,9 +3494,21 @@ mod tests {
         .unwrap()
     }
 
-    struct ResumeProviderBackend(Arc<dyn Provider>);
+    fn spawn_test_providers(provider: Arc<dyn Provider>) -> Arc<ProviderRegistry> {
+        let (provider_id, model_id) = Model::parse_spec(SPAWN_TEST_SPEC).unwrap();
+        Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+            id: provider_id.into(),
+            display_name: provider_id.into(),
+            models: vec![ModelInfo::id_only(model_id.into())],
+            backend: Arc::new(FixedProviderBackend(provider)),
+            auth: AuthSpec::default(),
+            docs: None,
+        }]))
+    }
 
-    impl ProviderBackend for ResumeProviderBackend {
+    struct FixedProviderBackend(Arc<dyn Provider>);
+
+    impl ProviderBackend for FixedProviderBackend {
         fn prepare(
             &self,
             model: Model,
@@ -3536,16 +3550,7 @@ mod tests {
             let storage = StateDir::from_path(directory.path().to_path_buf());
             let (requests, received) = flume::unbounded();
             let (_release, release) = flume::unbounded();
-            let provider: Arc<dyn Provider> = Arc::new(ParkedProvider { requests, release });
-            let (provider_id, model_id) = Model::parse_spec(SPAWN_TEST_SPEC).unwrap();
-            let providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
-                id: provider_id.into(),
-                display_name: provider_id.into(),
-                models: vec![ModelInfo::id_only(model_id.into())],
-                backend: Arc::new(ResumeProviderBackend(provider)),
-                auth: AuthSpec::default(),
-                docs: None,
-            }]));
+            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
             let mut params = test_params(
                 providers.model(SPAWN_TEST_SPEC).unwrap(),
                 directory.path().to_path_buf(),
@@ -3617,16 +3622,7 @@ mod tests {
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             let (requests, received) = flume::unbounded();
             let (_release, release) = flume::unbounded();
-            let provider: Arc<dyn Provider> = Arc::new(ParkedProvider { requests, release });
-            let (provider_id, model_id) = Model::parse_spec(SPAWN_TEST_SPEC).unwrap();
-            let providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
-                id: provider_id.into(),
-                display_name: provider_id.into(),
-                models: vec![ModelInfo::id_only(model_id.into())],
-                backend: Arc::new(ResumeProviderBackend(provider)),
-                auth: AuthSpec::default(),
-                docs: None,
-            }]));
+            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
             let mut session = StoredSession::new(SPAWN_TEST_SPEC, &tmp.path().to_string_lossy());
             let root_id = AgentId::generate();
             let child_id = AgentId::generate();
@@ -3856,6 +3852,16 @@ mod tests {
             drop(out_rx.drain());
             let mut loading = Box::pin(load_session(&mut server, &raw, &params));
             assert!(poll_once(loading.as_mut()).await.is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    StoredSession::load(seed.id, &params.storage)
+                        .unwrap()
+                        .messages()
+                )
+                .unwrap(),
+                serde_json::to_value(before.messages()).unwrap()
+            );
+            // The publication guard stalls shutdown, not an ordinary journal commit's append.
             journal
                 .commit(JournalCommit {
                     changes: vec![
@@ -3878,15 +3884,6 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            assert_eq!(
-                serde_json::to_value(
-                    StoredSession::load(seed.id, &params.storage)
-                        .unwrap()
-                        .messages()
-                )
-                .unwrap(),
-                serde_json::to_value(before.messages()).unwrap()
-            );
             drop(publication);
             within(loading, EVENT_STREAM_ENDED).await.unwrap();
             let saved = StoredSession::load(seed.id, &params.storage).unwrap();
@@ -4363,6 +4360,64 @@ mod tests {
     }
 
     #[test]
+    fn close_persists_usage_from_queued_turn_events() {
+        smol::block_on(async {
+            let (mut srv, ..) = server_awaiting_answer();
+            let directory = TempDir::new().unwrap();
+            let storage = StateDir::from_path(directory.path().to_path_buf());
+            let state = srv.session.as_mut().unwrap();
+            let session_id = state.handle.session_id.clone();
+            let mut seed = StoredSession::new(OFFLINE_SPEC, "/project");
+            seed.id = session_id.id();
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let writer = Arc::new(SessionWriter::open_session(&sessions_dir, &seed).unwrap());
+            let observer = test_observer();
+            observer.persist_usage(
+                writer.as_ref().clone(),
+                TokenUsage::default(),
+                HashMap::new(),
+            );
+            let (events, event_rx) = flume::unbounded();
+            let usage = TokenUsage {
+                output: 17,
+                ..Default::default()
+            };
+            events
+                .send(subagent_activity(AgentEvent::TurnComplete(Box::new(
+                    makima_agent::TurnCompleteEvent {
+                        message: Message::default(),
+                        usage,
+                        model: OFFLINE_SPEC.into(),
+                        cost: None,
+                        context_size: None,
+                        context_window: 1,
+                    },
+                ))))
+                .unwrap();
+            state.checkpoint = Some(writer);
+            state.event_pump = start_event_pump(
+                event_rx,
+                session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&state.pending),
+                false,
+                state.handle.answer_tx.clone(),
+                state.coordinator.as_ref().unwrap().read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+                observer,
+            );
+
+            close_session(&mut srv).await;
+
+            let saved = StoredSession::load(session_id.id(), &storage).unwrap();
+            assert_eq!(saved.token_usage, usage);
+            assert_eq!(saved.usage_by_model()[OFFLINE_SPEC].output, usage.output);
+        });
+    }
+
+    #[test]
     fn close_denies_outstanding_permission_requests() {
         smol::block_on(async {
             let (mut srv, ..) = server_awaiting_answer();
@@ -4814,10 +4869,13 @@ mod tests {
 
     const GHOST_MODE: &str = "ghost";
 
-    fn configure_test_provider() -> TempDir {
-        let root = TempDir::new().unwrap();
-        makima_storage::paths::init_at(root.path().to_path_buf()).unwrap();
-        root
+    fn configure_test_paths() {
+        static ROOT: OnceLock<TempDir> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = TempDir::new().unwrap();
+            makima_storage::paths::init_at(root.path().to_path_buf()).unwrap();
+            root
+        });
     }
 
     fn test_providers(models: Arc<Mutex<Vec<ModelInfo>>>) -> Arc<ProviderRegistry> {
@@ -4830,7 +4888,7 @@ mod tests {
 
     #[test]
     fn closing_a_session_releases_its_orchestration() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let host =
@@ -4872,7 +4930,7 @@ mod tests {
     #[test_case(StateScope::Session; "session_slot")]
     #[test_case(StateScope::Agent; "root_slot")]
     fn new_session_replaces_state_scope_and_preserves_previous_values(scope: StateScope) {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
@@ -4945,7 +5003,7 @@ mod tests {
     /// session is closed, so the client keeps the session it had.
     #[test]
     fn broken_permissions_keep_the_live_session() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let (mut srv, _, _, turns) = server_awaiting_answer();
             let live = srv.session.as_ref().unwrap().handle.session_id.to_string();
@@ -4973,7 +5031,7 @@ mod tests {
     #[test_case("plan", false ; "plan_lands_in_the_state_dir")]
     #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
     fn set_mode_commits_through_the_shared_setter(mode: &str, invalid: bool) {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
@@ -5034,7 +5092,7 @@ mod tests {
 
     #[test]
     fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         let (mut srv, answer_rx, _, turns) = server_awaiting_answer();
         let stale = MakimaId::generate().to_string();
         let prompt_error = smol::block_on(handle_prompt(
@@ -6854,32 +6912,16 @@ mod tests {
     #[test]
     fn spawned_primary_turn_end_turn_releases_pending_operation() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
+            let storage = TempDir::new().unwrap();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
-            let model = test_model(SPAWN_TEST_SPEC);
+            let providers = spawn_test_providers(Arc::new(EndTurnProvider));
+            let model = providers.model(SPAWN_TEST_SPEC).unwrap();
+            let mut params = test_params(model.clone(), storage.path().to_path_buf());
+            params.providers = providers;
             let (handle, root_target) = spawn_session(
-                &AcpParams {
-                    model: model.clone(),
-                    model_explicit: false,
-                    config: Default::default(),
-                    permissions_config: Default::default(),
-                    timeouts: Default::default(),
-                    initial_wd: PathBuf::from("/project"),
-                    storage: StateDir::from_path(PathBuf::from("/tmp/makima-acp-test")),
-                    prompt_slots: Default::default(),
-                    yolo: false,
-                    defaults: SessionDefaults::default(),
-                    system_prompt_override: Some(String::new()),
-                    append_system_prompt: None,
-                    model_policy: Arc::default(),
-                    providers: test_providers(Arc::default()),
-                    plugin_rules: Arc::default(),
-                    lua_event_handle: makima_lua::EventHandle::disconnected_for_test(),
-                    command_registry: test_registry(&[]),
-                    trust_mode: TrustMode::Consult,
-                    trust_policy: Arc::default(),
-                },
+                &params,
                 SpawnSession {
                     model,
                     cwd: PathBuf::from("/project"),
@@ -6895,39 +6937,12 @@ mod tests {
                     permissions: PermissionsConfig::default(),
                 },
             );
-            let provider_ready = smol::future::or(
-                async {
-                    while makima_agent::ModelSource::current(&handle.model).is_none() {
-                        smol::future::yield_now().await;
-                    }
-                    true
-                },
-                async {
-                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
-                    false
-                },
-            )
-            .await;
-            assert!(
-                provider_ready,
-                "spawned session provider did not initialize"
-            );
-            let actor = handle.initialized_root().await.unwrap().actor().unwrap();
-            actor
-                .reserve_prepared_operation(None)
-                .unwrap()
-                .commit_when_ready(Some(makima_agent::actor::ConfigChange::Patch(
-                    makima_agent::actor::ConfigPatch {
-                        model: Some(makima_agent::actor::PreparedModel {
-                            provider: Arc::new(EndTurnProvider),
-                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
-                        }),
-                        ..Default::default()
-                    },
-                )))
+            within(handle.initialized_root(), "spawned root did not initialize")
                 .await
                 .unwrap();
-            let command_root = root_target.recv_async().await.unwrap();
+            let command_root = within(root_target.recv_async(), "root target was not bound")
+                .await
+                .unwrap();
             let session = srv.session.as_mut().unwrap();
             let previous_handle = std::mem::replace(&mut session.handle, handle);
             session.command_root = command_root;
@@ -7240,12 +7255,15 @@ mod tests {
     #[test]
     fn prompt_immediately_after_new_session_is_queued() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let model = test_model(SPAWN_TEST_SPEC);
-            let params = test_params(model, cwd.clone());
+            let (requests, received) = flume::unbounded();
+            let (_release, release) = flume::unbounded();
+            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
+            let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
+            params.providers = providers;
             let request = serde_json::json!({
                 "params": { "cwd": cwd, "mcpServers": [] }
             });
@@ -7293,15 +7311,18 @@ mod tests {
                 session.handle.permissions.check(&write, &next_scope, None),
                 makima_agent::permissions::PermissionCheck::Allowed
             ));
-            handle_request(
+            handle_prompt(
                 &mut srv,
-                "session/prompt",
-                RequestId::Number(83),
                 &prompt_request(&session_id, "immediate prompt", false),
-                &params,
+                &RequestId::Number(83),
             )
-            .await;
+            .await
+            .unwrap();
 
+            let request = within(received.recv_async(), "prompt never reached the provider")
+                .await
+                .unwrap();
+            assert_eq!(text_of(&request), "immediate prompt");
             let pending = srv
                 .session
                 .as_ref()
@@ -7323,7 +7344,7 @@ mod tests {
     #[test]
     fn discovery_reaches_the_root_its_catalog_and_the_client() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -7412,7 +7433,7 @@ mod tests {
     #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
@@ -7467,7 +7488,9 @@ mod tests {
                 &serde_json::json!({ "params": { "sessionId": old_id } }),
             );
 
-            let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.clone());
+            let providers = spawn_test_providers(Arc::new(EndTurnProvider));
+            let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
+            params.providers = providers;
             new_session(
                 &mut srv,
                 &serde_json::json!({
@@ -7492,53 +7515,6 @@ mod tests {
                 lifecycle_state(&srv)
             );
             while out_rx.try_recv().is_ok() {}
-            let provider_ready = smol::future::or(
-                async {
-                    while makima_agent::ModelSource::current(
-                        &srv.session.as_ref().unwrap().handle.model,
-                    )
-                    .is_none()
-                    {
-                        smol::future::yield_now().await;
-                    }
-                    true
-                },
-                async {
-                    smol::Timer::after(PRIMARY_TURN_TIMEOUT).await;
-                    false
-                },
-            )
-            .await;
-            assert!(
-                provider_ready,
-                "new session provider did not initialize; {}",
-                lifecycle_state(&srv)
-            );
-            let actor = srv
-                .session
-                .as_ref()
-                .unwrap()
-                .handle
-                .initialized_root()
-                .await
-                .unwrap()
-                .actor()
-                .unwrap();
-            actor
-                .reserve_prepared_operation(None)
-                .unwrap()
-                .commit_when_ready(Some(makima_agent::actor::ConfigChange::Patch(
-                    makima_agent::actor::ConfigPatch {
-                        model: Some(makima_agent::actor::PreparedModel {
-                            provider: Arc::new(EndTurnProvider),
-                            model: spec_providers().model(OFFLINE_SPEC).unwrap(),
-                        }),
-                        ..Default::default()
-                    },
-                )))
-                .await
-                .unwrap();
-
             let prompt_result = handle_prompt(
                 &mut srv,
                 &prompt_request(&new_id, "new primary", false),
@@ -8035,7 +8011,7 @@ mod tests {
     fn load_restores_saved_mode_and_thinking_over_config(legacy: bool) {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
-            makima_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
+            configure_test_paths();
             let plan = tmp.path().join(SAVED_PLAN_FILE);
             std::fs::write(&plan, SAVED_PLAN_CONTENT).unwrap();
             let providers = test_providers(Arc::new(Mutex::new(vec![ModelInfo {

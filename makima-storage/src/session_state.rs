@@ -42,9 +42,13 @@ pub enum StateChange {
         rules: Vec<StoredRule>,
         yolo: Option<bool>,
     },
+    #[serde(rename = "context")]
     Context {
+        #[serde(rename = "source")]
         source: String,
+        #[serde(rename = "hash")]
         hash: String,
+        #[serde(rename = "content")]
         content: String,
     },
     Plugin {
@@ -648,7 +652,7 @@ fn validate_sequence(
     Ok(())
 }
 
-fn validate_plugin_value(value: &Value, seq: u64) -> Result<(), StateFoldError> {
+pub fn validate_plugin_value(value: &Value, seq: u64) -> Result<(), StateFoldError> {
     let mut pending = vec![(value, 0)];
     while let Some((value, depth)) = pending.pop() {
         if depth > MAX_PLUGIN_VALUE_DEPTH {

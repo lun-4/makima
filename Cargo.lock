@@ -2751,6 +2751,7 @@ dependencies = [
  "makima-agent",
  "makima-commands",
  "makima-config",
+ "makima-domain",
  "makima-lua",
  "makima-providers",
  "makima-storage",
@@ -2836,7 +2837,6 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "url",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2912,6 +2912,7 @@ name = "makima-highlight"
 version = "0.5.0"
 dependencies = [
  "flume 0.11.1",
+ "makima-domain",
  "serde_json",
  "syntect",
  "test-case",

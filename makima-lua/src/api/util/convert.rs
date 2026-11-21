@@ -1,5 +1,5 @@
 use makima_storage::session_state::{
-    MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, StateChange, StoredStateRecord,
+    MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, StateFoldError, validate_plugin_value,
 };
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
@@ -172,22 +172,10 @@ fn state_value_table_to_json(
 
 pub(crate) fn state_value_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     validate_state_value(value)?;
-    let converted = state_value_to_lua_inner(lua, value, 0)?;
-    if state_value_from_lua(lua, &converted)? != *value {
-        return Err(mlua::Error::runtime(
-            "state value cannot be represented losslessly in Lua",
-        ));
-    }
-    Ok(converted)
+    state_value_to_lua_inner(lua, value, false)
 }
 
-fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaResult<Value> {
-    if depth > MAX_PLUGIN_VALUE_DEPTH {
-        return Err(mlua::Error::runtime(
-            "state value exceeds maximum nesting depth",
-        ));
-    }
-
+fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, in_table: bool) -> LuaResult<Value> {
     Ok(match value {
         JsonValue::Null => Value::NULL,
         JsonValue::Bool(value) => Value::Boolean(*value),
@@ -206,7 +194,11 @@ fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaRe
                 let roundtrip = serde_json::Number::from_f64(number).ok_or_else(|| {
                     mlua::Error::runtime("state value number cannot be represented in Lua")
                 })?;
-                if roundtrip != *json_number {
+                // Luau returns table numbers that fit in i64 as Lua integers.
+                let becomes_integer = in_table
+                    && ((number as i64) as f64).to_bits() == number.to_bits()
+                    && number < -(i64::MIN as f64);
+                if roundtrip != *json_number || becomes_integer {
                     return Err(mlua::Error::runtime(
                         "state value number cannot be represented losslessly in Lua",
                     ));
@@ -218,7 +210,7 @@ fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaRe
         JsonValue::Array(items) => {
             let table = lua.create_table_with_capacity(items.len(), 0)?;
             for (index, item) in items.iter().enumerate() {
-                table.set(index + 1, state_value_to_lua_inner(lua, item, depth + 1)?)?;
+                table.set(index + 1, state_value_to_lua_inner(lua, item, true)?)?;
             }
             table.set_metatable(Some(lua.array_metatable()))?;
             Value::Table(table)
@@ -226,10 +218,7 @@ fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaRe
         JsonValue::Object(items) => {
             let table = lua.create_table_with_capacity(0, items.len())?;
             for (key, item) in items {
-                table.set(
-                    key.as_str(),
-                    state_value_to_lua_inner(lua, item, depth + 1)?,
-                )?;
+                table.set(key.as_str(), state_value_to_lua_inner(lua, item, true)?)?;
             }
             Value::Table(table)
         }
@@ -237,51 +226,15 @@ fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, depth: usize) -> LuaRe
 }
 
 fn validate_state_value(value: &JsonValue) -> LuaResult<()> {
-    let mut pending = vec![(value, 0)];
-    while let Some((value, depth)) = pending.pop() {
-        if depth > MAX_PLUGIN_VALUE_DEPTH {
-            return Err(mlua::Error::runtime(
-                "state value exceeds maximum nesting depth",
-            ));
+    validate_plugin_value(value, 1).map_err(|error| match error {
+        StateFoldError::PluginDepth { .. } => {
+            mlua::Error::runtime("state value exceeds maximum nesting depth")
         }
-        match value {
-            JsonValue::Array(values) => {
-                pending.extend(values.iter().map(|value| (value, depth + 1)))
-            }
-            JsonValue::Object(values) => {
-                pending.extend(values.values().map(|value| (value, depth + 1)))
-            }
-            _ => {}
+        StateFoldError::PluginSize { .. } => {
+            mlua::Error::runtime("state value exceeds maximum encoded size")
         }
-    }
-    if serde_json::to_vec(value)
-        .map_err(mlua::Error::external)?
-        .len()
-        > MAX_PLUGIN_VALUE_BYTES
-    {
-        return Err(mlua::Error::runtime(
-            "state value exceeds maximum encoded size",
-        ));
-    }
-    let record = StoredStateRecord {
-        seq: 1,
-        agent: None,
-        generation: 0,
-        change: StateChange::Plugin {
-            key: "state/validation".into(),
-            version: 1,
-            value: Some(value.clone()),
-        },
-    };
-    let encoded = serde_json::to_vec(&record).map_err(mlua::Error::external)?;
-    let decoded: StoredStateRecord =
-        serde_json::from_slice(&encoded).map_err(mlua::Error::external)?;
-    if decoded != record {
-        return Err(mlua::Error::runtime(
-            "state value storage round trip is lossy",
-        ));
-    }
-    Ok(())
+        error => mlua::Error::external(error),
+    })
 }
 
 /// mlua reads `bool` by Lua truthiness and never fails, so `get::<bool>`
@@ -878,6 +831,21 @@ mod tests {
         let lua = Lua::new();
         let value: JsonValue = serde_json::from_str(encoded).unwrap();
         assert!(state_value_to_lua(&lua, &value).is_err());
+    }
+
+    #[test_case("[1.0]", false; "integral_float_changes_to_integer")]
+    #[test_case("[-0.0,1.5,9223372036854775808.0]", true; "float_kind_preserved")]
+    fn state_value_checks_nested_float_representation(encoded: &str, accepted: bool) {
+        let lua = Lua::new();
+        let value: JsonValue = serde_json::from_str(encoded).unwrap();
+        let converted = state_value_to_lua(&lua, &value);
+        if accepted {
+            let restored = state_value_from_lua(&lua, &converted.unwrap()).unwrap();
+            assert_eq!(restored, value);
+            assert!(restored[0].as_f64().unwrap().is_sign_negative());
+        } else {
+            assert!(converted.is_err());
+        }
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub use types::{
     TurnPermitLease,
 };
 
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::{Future, poll_fn};
 use std::io::{self, Error as IoError, ErrorKind};
@@ -71,7 +72,6 @@ static NEXT_TURN_NONCE: AtomicU64 = AtomicU64::new(1);
 struct ActivationAttempt {
     result: Mutex<Option<Result<(), ManagerError>>>,
     completed: Event,
-    finishing: AtomicBool,
 }
 
 impl ActivationAttempt {
@@ -79,15 +79,11 @@ impl ActivationAttempt {
         Self {
             result: Mutex::new(None),
             completed: Event::new(),
-            finishing: AtomicBool::new(false),
         }
     }
 
     fn complete(&self, result: Result<(), ManagerError>) {
-        let mut current = self
-            .result
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut current = self.result.lock_unpoisoned();
         if current.is_none() {
             *current = Some(result);
             self.completed.notify(usize::MAX);
@@ -97,12 +93,7 @@ impl ActivationAttempt {
     async fn wait(&self) -> Result<(), ManagerError> {
         loop {
             let listener = self.completed.listen();
-            if let Some(result) = self
-                .result
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-            {
+            if let Some(result) = self.result.lock_unpoisoned().clone() {
                 return result;
             }
             listener.await;
@@ -113,16 +104,14 @@ impl ActivationAttempt {
 struct ActivationGuard {
     manager: AgentManagerHandle,
     incarnation: AgentIncarnation,
-    attempt: Arc<ActivationAttempt>,
     committed: bool,
 }
 
 impl Drop for ActivationGuard {
     fn drop(&mut self) {
-        if !self.committed && !self.attempt.finishing.load(Ordering::Acquire) {
-            self.manager.rollback_activation(&self.incarnation);
-            self.attempt
-                .complete(Err(ReactivationError::Cancelled.into()));
+        if !self.committed {
+            self.manager
+                .rollback_activation(&self.incarnation, Some(ReactivationError::Cancelled.into()));
         }
     }
 }
@@ -237,6 +226,7 @@ struct Node {
     lifecycle: GraphLifecycle,
     residency: AgentResidency,
     activation: Option<Arc<ActivationAttempt>>,
+    activation_finishing: bool,
     actor: Option<AgentActorHandle>,
     task: Option<RunnerTask>,
     metadata: AgentMetadata,
@@ -485,6 +475,7 @@ impl AgentManagerHandle {
                     },
                     residency: AgentResidency::Dormant,
                     activation: None,
+                    activation_finishing: false,
                     actor: None,
                     task: None,
                     metadata: AgentMetadata {
@@ -540,8 +531,7 @@ impl AgentManagerHandle {
                     manager
                         .0
                         .restored_delivery_work
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
+                        .lock_unpoisoned()
                         .insert((*parent, source, turn), vec![work]);
                 }
             }
@@ -837,7 +827,6 @@ impl AgentManagerHandle {
         let mut guard = ActivationGuard {
             manager: self.clone(),
             incarnation: incarnation.clone(),
-            attempt: attempt.clone(),
             committed: false,
         };
         let result = self
@@ -847,11 +836,9 @@ impl AgentManagerHandle {
                 factory,
             )
             .await;
-        if !attempt.finishing.load(Ordering::Acquire) {
-            if result.is_err() {
-                self.rollback_activation(&incarnation);
-            }
-            attempt.complete(result.as_ref().map(|_| ()).map_err(Clone::clone));
+        match &result {
+            Ok(_) => attempt.complete(Ok(())),
+            Err(error) => self.rollback_activation(&incarnation, Some(error.clone())),
         }
         guard.committed = true;
         result
@@ -1051,9 +1038,7 @@ impl AgentManagerHandle {
                 terminal: node.terminal.clone(),
             }
         };
-        let attempt = self.lock_graph().nodes[&incarnation.agent_id]
-            .activation
-            .clone();
+
         if let Some(initialize) = resident.initialize {
             let future = catch_unwind(AssertUnwindSafe(|| {
                 initialize(ResidentInitialization {
@@ -1074,10 +1059,8 @@ impl AgentManagerHandle {
             })
             .await?;
         }
-        if let Some(attempt) = attempt.filter(|attempt| attempt.finishing.load(Ordering::Acquire)) {
+        if let Some(attempt) = self.finish_activation(incarnation, &actor, false)? {
             attempt.wait().await?;
-        } else {
-            self.finish_activation(incarnation, &actor, false)?;
         }
         let _ = start.try_send(());
         Ok(agent)
@@ -1088,7 +1071,7 @@ impl AgentManagerHandle {
         incarnation: &AgentIncarnation,
         actor: &AgentActorHandle,
         prepared: bool,
-    ) -> Result<(), ManagerError> {
+    ) -> Result<Option<Arc<ActivationAttempt>>, ManagerError> {
         {
             let mut graph = self.lock_graph();
             if !prepared && graph.shutting_down {
@@ -1098,6 +1081,17 @@ impl AgentManagerHandle {
                 .nodes
                 .get_mut(&incarnation.agent_id)
                 .ok_or(ManagerError::UnknownAgent(incarnation.agent_id))?;
+            if !prepared && node.reservation == incarnation.reservation {
+                if node.activation_finishing {
+                    return Ok(node.activation.clone());
+                }
+                if node.lifecycle == GraphLifecycle::Live
+                    && node.residency == AgentResidency::Resident
+                    && !node.detach_pending
+                {
+                    return Ok(None);
+                }
+            }
             if !prepared
                 && (node.reservation != incarnation.reservation
                     || node.detach_pending
@@ -1127,10 +1121,10 @@ impl AgentManagerHandle {
             node.residency = AgentResidency::Resident;
             node.reservation_pending = false;
             node.activation = None;
+            node.activation_finishing = false;
             self.0
                 .restored_delivery_work
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .retain(|(parent, _, _), _| *parent != incarnation.agent_id);
             graph.revision += 1;
             for (_, observer) in &graph.observers {
@@ -1138,7 +1132,7 @@ impl AgentManagerHandle {
             }
         }
         self.0.reaped.notify(usize::MAX);
-        Ok(())
+        Ok(None)
     }
 
     async fn finish_initialization(
@@ -1148,16 +1142,17 @@ impl AgentManagerHandle {
     ) -> Result<(), ReactivationError> {
         let completion = self.0.activation_completion.read_arc().await;
         let attempt = {
-            let graph = self.lock_graph();
+            let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ReactivationError::Cancelled);
             }
             let node = graph
                 .nodes
-                .get(&initialization.agent.id())
+                .get_mut(&initialization.agent.id())
                 .filter(|node| {
                     node.reservation == initialization.incarnation.reservation
                         && !node.detach_pending
+                        && !node.activation_finishing
                 })
                 .ok_or(ReactivationError::Cancelled)?;
             if node.lifecycle != GraphLifecycle::Dormant
@@ -1188,7 +1183,7 @@ impl AgentManagerHandle {
                 .activation
                 .clone()
                 .ok_or(ReactivationError::Cancelled)?;
-            attempt.finishing.store(true, Ordering::Release);
+            node.activation_finishing = true;
             attempt
         };
         let manager = self.clone();
@@ -1201,14 +1196,12 @@ impl AgentManagerHandle {
                 .map_err(|_| ManagerError::from(ReactivationError::Panicked))
                 .and_then(|result| result.map_err(ManagerError::from))
                 .and_then(|()| {
-                    manager.finish_activation(
-                        &initialization.incarnation,
-                        &initialization.actor,
-                        true,
-                    )
+                    manager
+                        .finish_activation(&initialization.incarnation, &initialization.actor, true)
+                        .map(|_| ())
                 });
             if result.is_err() {
-                manager.rollback_activation(&initialization.incarnation);
+                manager.rollback_activation(&initialization.incarnation, None);
             } else {
                 let _ = initialization.start.try_send(());
             }
@@ -1294,11 +1287,7 @@ impl AgentManagerHandle {
         if node.detach_pending || node.lifecycle != GraphLifecycle::Live {
             return Err(ManagerError::NonLiveAgent(agent));
         }
-        let mut tasks = self
-            .0
-            .tool_completions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut tasks = self.0.tool_completions.lock_unpoisoned();
         tasks.retain(|(_, task)| !task.is_finished());
         tasks.push((agent, RetainedTask::new(self, completion)));
         self.0.reaped.notify(usize::MAX);
@@ -1306,11 +1295,7 @@ impl AgentManagerHandle {
     }
 
     fn tool_completions_finished(&self, agent: Option<AgentId>) -> bool {
-        let mut tasks = self
-            .0
-            .tool_completions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut tasks = self.0.tool_completions.lock_unpoisoned();
         tasks.retain(|(_, task)| !task.is_finished());
         !tasks
             .iter()
@@ -1328,11 +1313,7 @@ impl AgentManagerHandle {
     }
 
     fn retain_cleanup_task(&self, task: RunnerTask) {
-        let mut tasks = self
-            .0
-            .cleanup_tasks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut tasks = self.0.cleanup_tasks.lock_unpoisoned();
         tasks.retain(|task| !task.is_finished());
         tasks.push(RetainedTask::new(self, task));
         self.0.reaped.notify(usize::MAX);
@@ -1343,31 +1324,38 @@ impl AgentManagerHandle {
     }
 
     fn cleanup_tasks_finished(&self) -> bool {
-        let mut tasks = self
-            .0
-            .cleanup_tasks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut tasks = self.0.cleanup_tasks.lock_unpoisoned();
         tasks.retain(|task| !task.is_finished());
         tasks.is_empty()
     }
 
-    fn rollback_activation(&self, incarnation: &AgentIncarnation) {
+    fn rollback_activation(
+        &self,
+        incarnation: &AgentIncarnation,
+        abandonment: Option<ManagerError>,
+    ) {
         let Some(_publication) = self.0.journal.try_publication_read() else {
-            let _ = self.defer_incarnation_cleanup(incarnation, true);
+            let _ = self.defer_incarnation_cleanup(incarnation, true, abandonment);
             return;
         };
-        self.rollback_activation_held(incarnation);
+        self.rollback_activation_held(incarnation, abandonment);
     }
 
-    fn rollback_activation_held(&self, incarnation: &AgentIncarnation) {
+    fn rollback_activation_held(
+        &self,
+        incarnation: &AgentIncarnation,
+        abandonment: Option<ManagerError>,
+    ) {
         let resources = {
             let mut graph = self.lock_graph();
             let replacement = Self::next_reservation(&mut graph);
             let Some(node) = graph.nodes.get_mut(&incarnation.agent_id) else {
                 return;
             };
-            if node.reservation != incarnation.reservation || !node.reservation_pending {
+            if node.reservation != incarnation.reservation
+                || !node.reservation_pending
+                || (abandonment.is_some() && (node.activation_finishing || node.detach_pending))
+            {
                 return;
             }
             if let Err(error) = self
@@ -1384,7 +1372,12 @@ impl AgentManagerHandle {
             }
             node.detach_pending = false;
             node.reservation_pending = false;
-            node.activation = None;
+            if let Some(attempt) = node.activation.take()
+                && let Some(error) = abandonment
+            {
+                attempt.complete(Err(error));
+            }
+            node.activation_finishing = false;
             node.residency = AgentResidency::Dormant;
             if node.lifecycle == GraphLifecycle::Closing
                 && node.actor.is_none()
@@ -1603,10 +1596,10 @@ impl AgentManagerHandle {
         incarnation: &AgentIncarnation,
     ) -> Result<(), ManagerError> {
         if !self.tool_completions_finished(Some(incarnation.agent_id)) {
-            return self.defer_incarnation_cleanup(incarnation, false);
+            return self.defer_incarnation_cleanup(incarnation, false, None);
         }
         let Some(_publication) = self.0.journal.try_publication_read() else {
-            return self.defer_incarnation_cleanup(incarnation, false);
+            return self.defer_incarnation_cleanup(incarnation, false, None);
         };
         self.detach_incarnation_held(incarnation)
     }
@@ -1615,6 +1608,7 @@ impl AgentManagerHandle {
         &self,
         incarnation: &AgentIncarnation,
         rollback: bool,
+        abandonment: Option<ManagerError>,
     ) -> Result<(), ManagerError> {
         if incarnation.manager_generation != self.generation() {
             return Err(ManagerError::WrongManager);
@@ -1628,7 +1622,10 @@ impl AgentManagerHandle {
             if node.reservation != incarnation.reservation {
                 return Err(ManagerError::StaleIncarnation(incarnation.agent_id));
             }
-            if rollback && !node.reservation_pending {
+            if rollback
+                && (!node.reservation_pending
+                    || (abandonment.is_some() && node.activation_finishing))
+            {
                 return Ok(());
             }
             if node.detach_pending {
@@ -1640,6 +1637,12 @@ impl AgentManagerHandle {
                 false,
             )?;
             node.detach_pending = true;
+            if let Some(error) = abandonment
+                && let Some(attempt) = &node.activation
+            {
+                attempt.complete(Err(error));
+            }
+            node.activation_finishing = false;
             self.0.journal.revoke_state_agent(incarnation.agent_id);
             let actor = node.actor.clone();
             graph.revision += 1;
@@ -1655,7 +1658,7 @@ impl AgentManagerHandle {
             let _completion = manager.0.activation_completion.write_arc().await;
             let _publication = manager.0.journal.publication_read().await;
             if rollback {
-                manager.rollback_activation_held(&incarnation);
+                manager.rollback_activation_held(&incarnation, None);
             } else if let Err(error) = manager.detach_incarnation_held(&incarnation)
                 && !matches!(error, ManagerError::StaleIncarnation(_))
             {
@@ -1672,7 +1675,7 @@ impl AgentManagerHandle {
             let mut graph = self.lock_graph();
             if !self.tool_completions_finished(Some(incarnation.agent_id)) {
                 drop(graph);
-                return self.defer_incarnation_cleanup(incarnation, false);
+                return self.defer_incarnation_cleanup(incarnation, false, None);
             }
             let replacement = Self::next_reservation(&mut graph);
             let node = graph
@@ -1700,6 +1703,7 @@ impl AgentManagerHandle {
             ) {
                 node.lifecycle = GraphLifecycle::Dormant;
             }
+            node.activation_finishing = false;
             if let Some(attempt) = node.activation.take() {
                 attempt.complete(Err(ReactivationError::Cancelled.into()));
             }
@@ -1751,8 +1755,7 @@ impl AgentManagerHandle {
     ) -> Vec<WorkReservation> {
         self.0
             .restored_delivery_work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .get(&(parent, source, turn))
             .cloned()
             .unwrap_or_default()
@@ -1815,10 +1818,7 @@ impl AgentManagerHandle {
                 return Err(DeliveryRejection::ParentClosed);
             }
             ((node.lifecycle == GraphLifecycle::Live && node.residency == AgentResidency::Resident
-                || node
-                    .activation
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire)))
+                || node.activation_finishing)
                 && !node.detach_pending)
                 .then(|| node.actor.clone())
                 .flatten()
@@ -1873,8 +1873,7 @@ impl AgentManagerHandle {
         if !work.is_empty() {
             self.0
                 .restored_delivery_work
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .entry((parent, source, turn))
                 .or_default()
                 .extend(work);
@@ -1901,6 +1900,7 @@ impl AgentManagerHandle {
             lifecycle: GraphLifecycle::Live,
             residency: AgentResidency::Resident,
             activation: None,
+            activation_finishing: false,
             actor: Some(actor.clone()),
             task: None,
             metadata: AgentMetadata::default(),
@@ -1958,18 +1958,11 @@ impl AgentManagerHandle {
             return Err(ManagerError::GraphShutdown);
         }
         let Some(node) = graph.nodes.get(&agent.agent_id) else {
-            return Err(
-                if agent
-                    .terminal
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some()
-                {
-                    ManagerError::NonLiveAgent(agent.agent_id)
-                } else {
-                    ManagerError::UnknownAgent(agent.agent_id)
-                },
-            );
+            return Err(if agent.terminal.lock_unpoisoned().is_some() {
+                ManagerError::NonLiveAgent(agent.agent_id)
+            } else {
+                ManagerError::UnknownAgent(agent.agent_id)
+            });
         };
         if node.lifecycle != GraphLifecycle::Live
             || node.detach_pending
@@ -2036,11 +2029,7 @@ impl AgentManagerHandle {
     }
 
     pub fn bind_result_store(&self, store: Arc<OffloadStore>) -> Result<(), ManagerError> {
-        let mut current = self
-            .0
-            .result_store
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut current = self.0.result_store.lock_unpoisoned();
         if current
             .as_ref()
             .is_some_and(|bound| !Arc::ptr_eq(bound, &store))
@@ -2063,8 +2052,7 @@ impl AgentManagerHandle {
         let store = self
             .0
             .result_store
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .clone()
             .ok_or_else(|| {
                 IoError::new(
@@ -2472,6 +2460,7 @@ impl AgentManagerHandle {
                     lifecycle: GraphLifecycle::Reserved,
                     residency: AgentResidency::Activating,
                     activation: None,
+                    activation_finishing: false,
                     actor: None,
                     task: None,
                     metadata: AgentMetadata::default(),
@@ -2769,6 +2758,7 @@ impl AgentManagerHandle {
                     lifecycle: GraphLifecycle::Reserved,
                     residency: AgentResidency::Activating,
                     activation: None,
+                    activation_finishing: false,
                     actor: None,
                     task: None,
                     metadata,
@@ -2965,11 +2955,7 @@ impl AgentManagerHandle {
             watcher_wait.mark_reapable();
         });
         let task = {
-            let mut watchers = self
-                .0
-                .watchers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut watchers = self.0.watchers.lock_unpoisoned();
             if watchers.reapable.remove(&watcher_id) {
                 Some(task)
             } else {
@@ -3026,10 +3012,7 @@ impl AgentManagerHandle {
             let Some(manager) = manager.upgrade() else {
                 return;
             };
-            let mut graph = manager
-                .graph
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut graph = manager.graph.lock_unpoisoned();
             let closed = actor.lifecycle() == ActorLifecycle::Closed;
             if let Some(node) = graph.nodes.get_mut(&agent_id)
                 && node.reservation == reservation
@@ -3598,11 +3581,7 @@ impl AgentManagerHandle {
                 .actor
                 .clone()
                 .ok_or(ManagerError::NonLiveAgent(agent_id))?;
-            let mut state = actor
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = actor.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open {
                 return Err(ManagerError::NonLiveAgent(agent_id));
             }
@@ -3693,8 +3672,7 @@ impl AgentManagerHandle {
                 graph
                     .nodes
                     .get(id)
-                    .and_then(|node| node.activation.as_ref())
-                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+                    .is_some_and(|node| node.activation_finishing)
             }) {
                 return Err(ManagerError::BusySubtree(agent_id));
             }
@@ -3709,11 +3687,7 @@ impl AgentManagerHandle {
                 .actor
                 .clone()
                 .ok_or(ManagerError::NonLiveAgent(agent_id))?;
-            let mut state = actor
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = actor.inner.state.lock_unpoisoned();
             let cut = match actor.capture_turn_cancel(&mut state, turn_id, reason) {
                 Ok(cut) => cut,
                 Err(ActorError::Closed | ActorError::Shutdown) => {
@@ -3774,8 +3748,7 @@ impl AgentManagerHandle {
                 graph
                     .nodes
                     .get(id)
-                    .and_then(|node| node.activation.as_ref())
-                    .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+                    .is_some_and(|node| node.activation_finishing)
             }) {
                 return Err(ManagerError::BusySubtree(agent_id));
             }
@@ -3790,11 +3763,7 @@ impl AgentManagerHandle {
                 .actor
                 .clone()
                 .ok_or(ManagerError::NonLiveAgent(agent_id))?;
-            let mut state = actor
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = actor.inner.state.lock_unpoisoned();
             let cut = actor.capture_correlation_cancel(&mut state, correlation, reason);
             let descendants = Self::capture_turn_children(
                 &self.0.journal,
@@ -3879,7 +3848,7 @@ impl AgentManagerHandle {
             drop(completion);
             for &id in &timed_out {
                 if let Ok(incarnation) = self.incarnation(id) {
-                    let _ = self.defer_incarnation_cleanup(&incarnation, false);
+                    let _ = self.defer_incarnation_cleanup(&incarnation, false, None);
                 }
             }
             timed_out.sort_by_key(ToString::to_string);
@@ -3923,6 +3892,7 @@ impl AgentManagerHandle {
                 let replacement = Self::next_reservation(&mut graph);
                 if let Some(node) = graph.nodes.get_mut(id) {
                     let _ = self.0.work.set_open(*id, false);
+                    node.activation_finishing = false;
                     if let Some(attempt) = node.activation.take() {
                         attempt.complete(Err(ManagerError::GraphShutdown));
                         node.reservation_pending = false;
@@ -4011,11 +3981,7 @@ impl AgentManagerHandle {
 
     async fn take_watcher_tasks(&self) {
         let tasks = {
-            let mut watchers = self
-                .0
-                .watchers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut watchers = self.0.watchers.lock_unpoisoned();
             watchers.reapable.clear();
             watchers
                 .tasks
@@ -4234,8 +4200,7 @@ impl AgentManagerHandle {
             graph
                 .nodes
                 .get(id)
-                .and_then(|node| node.activation.as_ref())
-                .is_some_and(|attempt| attempt.finishing.load(Ordering::Acquire))
+                .is_some_and(|node| node.activation_finishing)
         }) {
             return Err(ManagerError::BusySubtree(agent_id));
         }
@@ -4292,8 +4257,7 @@ impl AgentManagerHandle {
             })
             .map_err(|error| ManagerError::Policy(error.to_string()))?;
         delivery_work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .retain(|(target, _, _), _| !ids.contains(target));
         let mut transitioned = false;
         let actors = ids
@@ -4405,11 +4369,7 @@ impl AgentManagerHandle {
 
     #[cfg(test)]
     fn set_commit_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
-        *self
-            .0
-            .commit_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+        *self.0.commit_gate.lock_unpoisoned() = Some(TestGate { entered, release });
     }
 
     #[cfg(test)]
@@ -4419,11 +4379,7 @@ impl AgentManagerHandle {
 
     #[cfg(test)]
     fn set_descendant_cut_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
-        *self
-            .0
-            .descendant_cut_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+        *self.0.descendant_cut_gate.lock_unpoisoned() = Some(TestGate { entered, release });
     }
 
     #[cfg(test)]
@@ -4433,11 +4389,7 @@ impl AgentManagerHandle {
 
     #[cfg(test)]
     fn set_managed_acquire_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
-        *self
-            .0
-            .managed_acquire_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+        *self.0.managed_acquire_gate.lock_unpoisoned() = Some(TestGate { entered, release });
     }
 
     #[cfg(test)]
@@ -4451,11 +4403,8 @@ impl AgentManagerHandle {
         entered: flume::Sender<()>,
         release: flume::Receiver<()>,
     ) {
-        *self
-            .0
-            .prompt_wait_registration_gate
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+        *self.0.prompt_wait_registration_gate.lock_unpoisoned() =
+            Some(TestGate { entered, release });
     }
 
     #[cfg(test)]
@@ -4465,10 +4414,7 @@ impl AgentManagerHandle {
 
     #[cfg(test)]
     fn wait_at_test_gate(&self, slot: &Mutex<Option<TestGate>>) {
-        let gate = slot
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let gate = slot.lock_unpoisoned().take();
         if let Some(gate) = gate {
             gate.entered.send(()).unwrap();
             gate.release.recv().unwrap();
@@ -4476,10 +4422,7 @@ impl AgentManagerHandle {
     }
 
     fn lock_graph(&self) -> std::sync::MutexGuard<'_, GraphState> {
-        self.0
-            .graph
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.0.graph.lock_unpoisoned()
     }
 }
 
@@ -4507,7 +4450,7 @@ impl LeaseInner {
         watcher_id: u64,
         cancel: crate::cancel::ReasonedCancelTrigger,
     ) -> Result<(), ManagerError> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         if state.closing || state.suspensions_sealed {
             return Err(ManagerError::InactiveTurn {
                 agent_id: self.agent_id,
@@ -4527,7 +4470,7 @@ impl LeaseInner {
     }
 
     fn retire(&self, watcher_id: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         if state.watcher_cancels.remove(&watcher_id).is_none() {
             return;
         }
@@ -4541,7 +4484,7 @@ impl LeaseInner {
 
     fn cancel_waiters(&self) {
         let cancels = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state.lock_unpoisoned();
             state.suspensions_sealed = true;
             state
                 .watcher_cancels
@@ -4554,7 +4497,7 @@ impl LeaseInner {
 
     fn close(&self) {
         let cancels = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state.lock_unpoisoned();
             state.closing = true;
             state.permit.take();
             state.owns_permit = false;
@@ -4575,7 +4518,7 @@ impl LeaseInner {
         loop {
             let listener = self.owned.listen();
             let ready = {
-                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                let state = self.state.lock_unpoisoned();
                 state.closing || (state.suspensions == 0 && state.owns_permit)
             };
             if ready {
@@ -4597,10 +4540,7 @@ pub(crate) struct PromptWaitInner {
 
 impl PromptWaitInner {
     fn complete(&self, result: Result<crate::TurnOutcome, PromptWaitError>) {
-        let mut slot = self
-            .result
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut slot = self.result.lock_unpoisoned();
         if slot.is_none() {
             *slot = Some(result);
             self.completed.notify(usize::MAX);
@@ -4608,29 +4548,16 @@ impl PromptWaitInner {
     }
 
     fn cancel(&self) {
-        self.cancel
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        self.cancel.lock_unpoisoned().take();
     }
 
     async fn wait_result(&self) -> Result<crate::TurnOutcome, PromptWaitError> {
         loop {
-            if let Some(result) = self
-                .result
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-            {
+            if let Some(result) = self.result.lock_unpoisoned().clone() {
                 return result;
             }
             let listener = self.completed.listen();
-            if let Some(result) = self
-                .result
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-            {
+            if let Some(result) = self.result.lock_unpoisoned().clone() {
                 return result;
             }
             listener.await;
@@ -4642,10 +4569,7 @@ impl PromptWaitInner {
             return;
         };
         let task = {
-            let mut watchers = manager
-                .watchers
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut watchers = manager.watchers.lock_unpoisoned();
             if let Some(task) = watchers.tasks.remove(&self.watcher_id) {
                 Some(task)
             } else {
@@ -4684,10 +4608,7 @@ pub(crate) struct ManagedTurnGuard {
 impl Drop for ManagedTurnGuard {
     fn drop(&mut self) {
         if let Some(manager) = self.manager.upgrade() {
-            let mut graph = manager
-                .graph
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut graph = manager.graph.lock_unpoisoned();
             if graph.active_turns.get(&(self.agent_id, self.turn_id)) == Some(&self.nonce) {
                 graph.active_turns.remove(&(self.agent_id, self.turn_id));
                 manager
@@ -4727,10 +4648,7 @@ impl Future for ManagedExecutionFuture<'_> {
                         .guard
                         .as_ref()
                         .expect("guard exists while execution is active");
-                    let mut graph = manager
-                        .graph
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let mut graph = manager.graph.lock_unpoisoned();
                     if graph.active_turns.get(&(guard.agent_id, guard.turn_id))
                         == Some(&guard.nonce)
                     {
@@ -4741,11 +4659,7 @@ impl Future for ManagedExecutionFuture<'_> {
                     }
                 }
             }
-            let mut state = self
-                .lease
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.lease.state.lock_unpoisoned();
             if state.suspensions > 0 {
                 state.wake = Some(context.waker().clone());
                 drop(state);
@@ -4756,11 +4670,7 @@ impl Future for ManagedExecutionFuture<'_> {
                 state.wake = Some(context.waker().clone());
                 drop(state);
                 let result = self.backend.as_mut().poll(context);
-                let mut state = self
-                    .lease
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let mut state = self.lease.state.lock_unpoisoned();
                 let restored_ownership =
                     result.is_pending() && state.suspensions == 0 && !state.closing;
                 if restored_ownership {
@@ -4791,11 +4701,7 @@ impl Future for ManagedExecutionFuture<'_> {
                 return Poll::Pending;
             };
             self.acquire = None;
-            let mut state = self
-                .lease
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.lease.state.lock_unpoisoned();
             if state.suspensions == 0 && !state.closing {
                 state.permit = Some(permit);
                 state.owns_permit = true;
@@ -4849,10 +4755,7 @@ pub(crate) async fn enter_managed_turn(
     }
     let nonce = NEXT_TURN_NONCE.fetch_add(1, Ordering::Relaxed);
     let registered = {
-        let mut graph = inner
-            .graph
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut graph = inner.graph.lock_unpoisoned();
         if graph.shutting_down {
             return Err(crate::TurnCancellationReason::Shutdown);
         }
@@ -4867,11 +4770,7 @@ pub(crate) async fn enter_managed_turn(
             .actor
             .as_ref()
             .ok_or(crate::TurnCancellationReason::Closed)?;
-        let state = actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = actor.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(match state.lifecycle {
                 ActorLifecycle::Shutdown => crate::TurnCancellationReason::Shutdown,
@@ -4891,12 +4790,7 @@ pub(crate) async fn enter_managed_turn(
     if !registered {
         drop(permit);
         #[cfg(test)]
-        if let Some(rejected) = inner
-            .managed_registration_rejected
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+        if let Some(rejected) = inner.managed_registration_rejected.lock_unpoisoned().take() {
             rejected.send(()).unwrap();
         }
         return Err(cancel.cancelled().await);

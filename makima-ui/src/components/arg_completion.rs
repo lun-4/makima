@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
@@ -201,8 +202,7 @@ impl CommandCompletion for ModelArgSource {
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         let target = self.targets.as_ref().and_then(|targets| {
             targets
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .get(&context.target_id)
                 .filter(|target| target.validate().is_ok())
                 .cloned()
@@ -349,10 +349,7 @@ impl ThemeArgSource {
     }
 
     pub(crate) fn finish(&self, target: InvocationTargetId, commit: bool) {
-        let mut previews = self
-            .previews
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut previews = self.previews.lock_unpoisoned();
         let Some(index) = previews
             .iter()
             .rposition(|preview| preview.target == target && preview.accepted)
@@ -412,10 +409,7 @@ impl CommandCompletion for ThemeArgSource {
         event: &CompletionLifecycleEvent,
         _cancellation: &CancellationToken,
     ) -> Result<(), CompletionError> {
-        let mut previews = self
-            .previews
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut previews = self.previews.lock_unpoisoned();
         match event {
             CompletionLifecycleEvent::Highlight(item) => {
                 let index = previews

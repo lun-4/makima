@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -255,8 +256,7 @@ fn set(
     let interval = Duration::from_secs_f64(seconds);
     if crate::runtime::loading_plugin_is(lua, &plugin) {
         let id = pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .add(plugin, key, callback, interval);
         Ok((Some(id), None))
     } else {
@@ -288,10 +288,7 @@ fn del(
     id: u64,
 ) -> LuaResult<()> {
     let key = if crate::runtime::loading_plugin_is(lua, &plugin) {
-        pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .del(id)
+        pending.lock_unpoisoned().del(id)
     } else {
         lua.app_data_mut::<TimerStore>()
             .and_then(|mut store| store.del(id))

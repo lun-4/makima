@@ -1,4 +1,5 @@
 use crate::StateDir;
+use makima_domain::LockExt;
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -46,10 +47,7 @@ impl StateDir {
     pub fn resource<T: Default + Send + Sync + 'static>(&self) -> io::Result<RootResource<T>> {
         let path = fs::canonicalize(self.path())?;
         let root = {
-            let mut roots = ROOTS
-                .get_or_init(Mutex::default)
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut roots = ROOTS.get_or_init(Mutex::default).lock_unpoisoned();
             roots.retain(|_, root| root.strong_count() > 0);
             match roots.get(&path).and_then(Weak::upgrade) {
                 Some(root) => root,
@@ -61,10 +59,7 @@ impl StateDir {
             }
         };
         let existing = {
-            let values = root
-                .values
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let values = root.values.lock_unpoisoned();
             values.get(&TypeId::of::<T>()).cloned()
         };
         let value = if let Some(existing) = existing {
@@ -72,10 +67,7 @@ impl StateDir {
         } else {
             let candidate = Arc::new(T::default());
             let value = {
-                let mut values = root
-                    .values
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let mut values = root.values.lock_unpoisoned();
                 Arc::clone(
                     values
                         .entry(TypeId::of::<T>())

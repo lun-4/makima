@@ -5,6 +5,7 @@
 #[path = "config_tests.rs"]
 mod config_tests;
 
+use makima_domain::LockExt;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use super::{
     CompactionStatus, DeliveryStatus, TurnOrigin, TurnProvenance,
 };
 use crate::journal::SessionJournal;
+use crate::test_util::poll_until;
 use crate::tools::DescriptionContext;
 use crate::tools::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience, ToolInvocation,
@@ -2037,18 +2039,9 @@ fn spawn(backend: impl ActorBackend + 'static) -> (AgentActorHandle, smol::Task<
 }
 
 async fn until(cond: impl Fn() -> bool) {
-    futures_lite::future::or(
-        async {
-            while !cond() {
-                smol::future::yield_now().await;
-            }
-        },
-        async {
-            smol::Timer::after(COMPLETION_TIMEOUT).await;
-            panic!("{CONDITION_TIMEOUT}");
-        },
-    )
-    .await;
+    poll_until(COMPLETION_TIMEOUT, || cond().then_some(()))
+        .await
+        .expect(CONDITION_TIMEOUT);
 }
 
 #[test]
@@ -2787,8 +2780,7 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
         let settled = handle
             .inner
             .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .settled
             .expect("the cancelled turn settled as work");
         assert_eq!(
@@ -3681,8 +3673,7 @@ fn duplicate_finalize_keeps_the_first_settled_identity() {
         actor
             .inner
             .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .settled
             .map(|settled| settled.presentation_id),
         Some(1),

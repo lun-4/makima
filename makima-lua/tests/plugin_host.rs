@@ -961,7 +961,7 @@ fn system_prompt_uses_admitted_instructions(
             Slot::ToolUsage,
             SlotEntry {
                 plugin: TOOL.into(),
-                registration: 0,
+                name: "default".into(),
                 content: content.into(),
             },
         );

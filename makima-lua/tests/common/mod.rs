@@ -14,14 +14,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use makima_agent::actor::{
-    ActorHistory, AdmissionPreparation, AgentContextSnapshot, EffectiveAgentConfig, PreparedModel,
-    PreparedReadiness,
-};
+use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig, PreparedModel};
 use makima_agent::agent::{RunSettings, TurnSetup};
 use makima_agent::cancel::{CancelMap, CancelToken, CancelTrigger};
 use makima_agent::config_change::unresolved_model;
@@ -34,14 +30,14 @@ use makima_agent::session_coordinator::{
 };
 use makima_agent::session_writer::{SessionWriter, forget};
 use makima_agent::template::Vars;
+pub use makima_agent::test_util::MockBackend;
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::tools::test_support::stub_ctx;
 use makima_agent::tools::{DescriptionContext, RequestTools, ToolContext, ToolRegistry};
 use makima_agent::{
     ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, AgentRef,
-    BackendResult, ControlWork, CurrentManagedTurn, Envelope, EventSender, McpSession,
-    SessionMailbox, SharedMessages, ToolOutput, TurnCancellationReason, TurnContext, TurnOutcome,
-    WorkKind, modes,
+    BackendResult, Envelope, EventSender, McpSession, SessionMailbox, SharedMessages, ToolOutput,
+    TurnCancellationReason, TurnOutcome, modes,
 };
 use makima_lua::PluginHost;
 use makima_lua::orchestration::{
@@ -338,7 +334,11 @@ pub fn effective_config(ctx: &ToolContext) -> EffectiveAgentConfig {
 }
 
 /// A root whose turns never finish.
-pub struct IdleRoot;
+pub fn idle_root() -> MockBackend {
+    MockBackend::STRICT
+        .with_noop_controls()
+        .with_turn(|_, _, _, _| Box::pin(std::future::pending()))
+}
 
 pub type TestSession = Session<Message, TokenUsage, ToolOutput>;
 
@@ -425,7 +425,7 @@ impl RestartHost {
                 ),
                 session.messages().to_vec(),
                 Some(Arc::clone(&history)),
-                |_| Ok::<_, String>(Box::new(IdleRoot) as Box<dyn ActorBackend>),
+                |_| Ok::<_, String>(Box::new(idle_root()) as Box<dyn ActorBackend>),
             )
             .unwrap();
         context.execution_agent_id = Some(root.id());
@@ -617,7 +617,7 @@ impl RestartHost {
                     config = config.with_mode_authority(spec.mode_ceiling.into());
                 }
                 Ok(ResidentAgent {
-                    backend: Box::new(ContextRoot(setup)),
+                    backend: Box::new(idle_root().with_setup(setup)),
                     config,
                     shared_messages: Some(shared),
                     start: None,
@@ -826,122 +826,6 @@ impl RestartHost {
     }
 }
 
-struct ContextRoot(TurnSetup);
-
-impl ActorBackend for ContextRoot {
-    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
-        Some(self.0.clone().preparation())
-    }
-
-    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
-        Some(TurnSetup::readiness())
-    }
-
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(std::future::pending())
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-}
-
-impl ActorBackend for IdleRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(std::future::pending())
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
-/// A root that hands out its managed turn and parks it until {cancel} fires.
-struct ParkedRoot {
-    turn: flume::Sender<CurrentManagedTurn>,
-    cancel: CancelToken,
-}
-
-impl ActorBackend for ParkedRoot {
-    fn run_turn<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        ctx: TurnContext,
-        _: AgentInput,
-        _: WorkKind,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async move {
-            self.turn.send(ctx.managed_turn.unwrap()).unwrap();
-            self.cancel.cancelled().await;
-            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                ctx.agent_id,
-                ctx.turn_id.unwrap(),
-                TokenUsage::default(),
-                0,
-                TurnCancellationReason::User,
-            ))
-        })
-    }
-
-    fn run_control<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: &'a ControlWork,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::ControlDone })
-    }
-
-    fn run_compact<'a>(
-        &'a mut self,
-        _: ActorHistory<'a>,
-        _: TurnContext,
-        _: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
-        Box::pin(async { BackendResult::CompactDone })
-    }
-}
-
 /// Installs a root on {host} running {config}, parked inside one managed
 /// turn until `ctx.cancel` fires, and points {ctx} at that turn.
 pub fn bind_parked_root(
@@ -956,10 +840,25 @@ pub fn bind_parked_root(
     let cancel = ctx.cancel.clone();
     let root = manager
         .create_root_with_config(Some(config), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(ParkedRoot {
-                turn: turn_tx,
-                cancel,
-            }) as Box<dyn ActorBackend>)
+            let backend =
+                MockBackend::STRICT
+                    .with_noop_controls()
+                    .with_turn(move |_, ctx, _, _| {
+                        let turn_tx = turn_tx.clone();
+                        let cancel = cancel.clone();
+                        Box::pin(async move {
+                            turn_tx.send(ctx.managed_turn.unwrap()).unwrap();
+                            cancel.cancelled().await;
+                            BackendResult::EnteredRun(TurnOutcome::cancelled(
+                                ctx.agent_id,
+                                ctx.turn_id.unwrap(),
+                                TokenUsage::default(),
+                                0,
+                                TurnCancellationReason::User,
+                            ))
+                        })
+                    });
+            Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
         })
         .unwrap();
     ctx.execution_agent_id = Some(root.id());
@@ -1003,7 +902,7 @@ pub fn install_command_root(host: &PluginHost, runner: CommandRunner) -> AgentMa
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let root = manager
         .create_root_with_config(Some(effective_config(&template)), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(IdleRoot) as Box<dyn ActorBackend>)
+            Ok::<_, String>(Box::new(idle_root()) as Box<dyn ActorBackend>)
         })
         .unwrap();
     let services = AgentOrchestration::bind_root(

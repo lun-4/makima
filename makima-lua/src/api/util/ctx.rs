@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -650,7 +651,7 @@ impl UserData for LuaCtx {
                     }
                 };
                 let handle = active_task(lua);
-                let mut cell = handle.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cell = handle.lock_unpoisoned();
                 if cell.deadline_secs.get().is_some() {
                     return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
                 }

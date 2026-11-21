@@ -493,7 +493,7 @@ mod tests {
                 Slot::Identity,
                 SlotEntry {
                     plugin: CONTEXT_PLUGIN.into(),
-                    registration: 0,
+                    name: "default".into(),
                     content: content.into(),
                 },
             );
@@ -502,7 +502,7 @@ mod tests {
                 prompt: PromptId::System,
                 slot: Slot::Identity,
                 plugin: CONTEXT_PLUGIN.into(),
-                registration: 0,
+                name: "default".into(),
                 content: None,
             });
         }
@@ -534,7 +534,7 @@ mod tests {
         let slots = context.slots.get(PromptId::System, Slot::Identity);
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].plugin.as_ref(), CONTEXT_PLUGIN);
-        assert_eq!(slots[0].registration, 0);
+        assert_eq!(slots[0].name.as_ref(), "default");
         assert_eq!(slots[0].content, RECORDED_SLOT);
     }
 

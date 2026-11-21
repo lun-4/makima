@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -106,8 +107,7 @@ fn register(
             )));
         }
         pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .register(registry, key, plugin, value)?;
         return Ok(());
     }
@@ -147,13 +147,7 @@ fn collect(
             }
         }
     }
-    if loading
-        && let Some(entries) = pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entries
-            .get(&registry)
-    {
+    if loading && let Some(entries) = pending.lock_unpoisoned().entries.get(&registry) {
         for (key, entry) in entries {
             result.set(key.as_str(), entry.value.clone())?;
         }

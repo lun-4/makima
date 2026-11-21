@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
+use makima_domain::LockExt;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -741,7 +742,7 @@ impl McpSession {
     }
 
     fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
-        self.loaded.lock().unwrap_or_else(|e| e.into_inner())
+        self.loaded.lock_unpoisoned()
     }
 }
 
@@ -1785,8 +1786,7 @@ fn intern(name: String) -> Arc<str> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
     let mut map = CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock_unpoisoned();
     if let Some(existing) = map.get(&name) {
         return Arc::clone(existing);
     }

@@ -1,6 +1,7 @@
 //! Ordered, retrying durability queue for one session log.
 
 use crate::{ToolOutput, journal::SessionJournal};
+use makima_domain::LockExt;
 use makima_providers::{Message, TokenUsage};
 use makima_storage::{
     StorageError,
@@ -29,21 +30,11 @@ const CLOSED: &str = "session writer closed";
 type WriterSlot = Arc<OnceLock<Result<Arc<WriterHandle>, WriterError>>>;
 static WRITERS: OnceLock<Mutex<HashMap<PathBuf, WriterSlot>>> = OnceLock::new();
 
-pub type OpenedSessionIo = (Box<dyn SessionIo>, u64);
+pub(crate) type OpenedSessionIo = (Box<dyn SessionIo>, u64);
 
 pub trait SessionIo: Send + 'static {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
     fn sync(&mut self) -> io::Result<()>;
-}
-
-impl SessionIo for File {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        Write::write(self, bytes)
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        self.sync_all()
-    }
 }
 
 struct SessionFile {
@@ -147,10 +138,7 @@ impl SessionWriter {
     ) -> Result<Self, WriterError> {
         let path = absolute(path).map_err(|error| writer_error(session_id, error))?;
         let slot = {
-            let mut writers = WRITERS
-                .get_or_init(Mutex::default)
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
             Arc::clone(writers.entry(path.clone()).or_default())
         };
         let session = session.cloned();
@@ -178,14 +166,7 @@ impl SessionWriter {
         .map(Self)
     }
 
-    pub fn with_io(session_id: MakimaId, io: impl SessionIo, next_seq: u64) -> Self {
-        let mut opened = Some((Box::new(io) as Box<dyn SessionIo>, next_seq));
-        Self::with_factory(session_id, move || {
-            opened.take().ok_or_else(|| io::Error::other(CLOSED))
-        })
-    }
-
-    pub fn with_factory(
+    pub(crate) fn with_factory(
         session_id: MakimaId,
         factory: impl FnMut() -> io::Result<OpenedSessionIo> + Send + 'static,
     ) -> Self {
@@ -213,11 +194,7 @@ impl SessionWriter {
     }
 
     pub fn bind_publication_guard(&self, guard: Option<SessionPublicationGuard>) {
-        *self
-            .0
-            .publication_guard
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = guard;
+        *self.0.publication_guard.lock_unpoisoned() = guard;
     }
 
     /// Enqueues immediately, even when the returned receipt is not polled.
@@ -235,23 +212,13 @@ impl SessionWriter {
     }
 
     fn enqueue(&self, payload: Payload, guard: Option<SessionPublicationGuard>) -> Receipt {
-        let guard = guard.or_else(|| {
-            self.0
-                .publication_guard
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-        });
+        let guard = guard.or_else(|| self.0.publication_guard.lock_unpoisoned().clone());
         let (reply, response) = flume::bounded(1);
         let count = match &payload {
             Payload::Records(records) => records.len(),
             Payload::Close => 0,
         };
-        let mut status = self
-            .0
-            .status
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut status = self.0.status.lock_unpoisoned();
         status.unsaved_records += count;
         let sent = self.0.tx.send(Request {
             payload,
@@ -273,11 +240,7 @@ impl SessionWriter {
     }
 
     pub fn attach_journal(&self, journal: &Arc<SessionJournal>) {
-        let mut journals = self
-            .0
-            .journals
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut journals = self.0.journals.lock_unpoisoned();
         journals.clear();
         journals.push(Arc::downgrade(journal));
         drop(journals);
@@ -287,19 +250,14 @@ impl SessionWriter {
     pub(crate) fn journals(&self) -> Vec<Arc<SessionJournal>> {
         self.0
             .journals
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .iter()
             .filter_map(Weak::upgrade)
             .collect()
     }
 
     pub fn status(&self) -> WriterStatus {
-        self.0
-            .status
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+        self.0.status.lock_unpoisoned().clone()
     }
 }
 
@@ -383,10 +341,7 @@ async fn initialize(
             }
             Err(error) => {
                 let error = writer_error(session_id, error);
-                status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .error = Some(error.clone());
+                status.lock_unpoisoned().error = Some(error.clone());
                 update_journals(&journals, Some(error.to_string()));
                 for request in &mut pending {
                     let _ = request.reply.try_send(Err(error.clone()));
@@ -459,10 +414,7 @@ async fn run(
                 Ok::<_, io::Error>(())
             });
             if let Err(error) = result {
-                status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .unsaved_records -= records.len();
+                status.lock_unpoisoned().unsaved_records -= records.len();
                 let _ = request.reply.send(Err(writer_error(session_id, error)));
                 continue;
             }
@@ -497,7 +449,7 @@ async fn run(
         match result.4 {
             Ok(()) => {
                 {
-                    let mut status = status.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut status = status.lock_unpoisoned();
                     status.unsaved_records -= retained;
                     status.error = None;
                 }
@@ -514,10 +466,7 @@ async fn run(
             }
             Err(error) => {
                 let error = writer_error(session_id, error);
-                status
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .error = Some(error.clone());
+                status.lock_unpoisoned().error = Some(error.clone());
                 update_journals(&journals, Some(error.to_string()));
                 warn!(%session_id, %error, retained, "session has unsaved records; retrying");
                 for reply in replies.drain(..) {
@@ -531,15 +480,22 @@ async fn run(
 }
 
 fn update_journals(journals: &Mutex<Vec<Weak<SessionJournal>>>, error: Option<String>) {
-    let mut journals = journals.lock().unwrap_or_else(|error| error.into_inner());
-    journals.retain(|journal| {
-        if let Some(journal) = journal.upgrade() {
-            journal.set_writer_error(error.clone());
-            true
-        } else {
-            false
-        }
-    });
+    let attached = {
+        let mut journals = journals.lock_unpoisoned();
+        let mut attached = Vec::new();
+        journals.retain(|journal| {
+            if let Some(journal) = journal.upgrade() {
+                attached.push(journal);
+                true
+            } else {
+                false
+            }
+        });
+        attached
+    };
+    for journal in attached {
+        journal.set_writer_error(error.clone());
+    }
 }
 
 pub fn delete(directory: &Path, session_id: MakimaId) -> Result<(), SessionError> {
@@ -552,8 +508,7 @@ pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError
         absolute(directory.join(format!("{session_id}.jsonl"))).map_err(StorageError::from)?;
     let slot = WRITERS
         .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .lock_unpoisoned()
         .get(&path)
         .cloned();
     if let Some(slot) = slot {
@@ -561,10 +516,7 @@ pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError
             smol::block_on(SessionWriter(Arc::clone(handle)).enqueue(Payload::Close, None))
                 .map_err(|error| StorageError::from(io::Error::other(error)))?;
         }
-        let mut writers = WRITERS
-            .get_or_init(Mutex::default)
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
         if writers
             .get(&path)
             .is_some_and(|current| Arc::ptr_eq(current, &slot))

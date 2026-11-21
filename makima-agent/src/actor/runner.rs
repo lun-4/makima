@@ -1,6 +1,7 @@
 //! The actor's scheduler loop: drains the FIFO queue, executes work through
 //! the backend, and wakes on pushes and lifecycle changes.
 
+use makima_domain::LockExt;
 use std::sync::Arc;
 
 use futures_lite::future::{self};
@@ -18,11 +19,7 @@ use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
 
 #[cfg(test)]
 fn take_after_pop_hook(inner: &ActorInner) -> Option<(flume::Sender<()>, flume::Receiver<()>)> {
-    inner
-        .after_pop
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
+    inner.after_pop.lock_unpoisoned().take()
 }
 
 enum Step {
@@ -116,11 +113,7 @@ impl Runner {
     async fn step(&mut self) -> Step {
         loop {
             let popped = {
-                let mut state = self
-                    .inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let mut state = self.inner.state.lock_unpoisoned();
                 super::delivery::schedule(&self.inner, &mut state);
                 let guarded = state.idle.is_some();
                 let work = if self.inner.terminal_checkpoint.is_some()
@@ -172,11 +165,7 @@ impl Runner {
                     let _ = release.recv_async().await;
                 }
             }
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             state.processing = None;
             if let Some(identity) = settles {
                 state.settled = Some(identity);
@@ -190,11 +179,7 @@ impl Runner {
         }
         #[cfg(any(test, feature = "test-util"))]
         {
-            let state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let state = self.inner.state.lock_unpoisoned();
             let probe = super::ActorRuntimeProbe {
                 operations: state.operations.len(),
                 queued: self.queue.len(),
@@ -205,19 +190,13 @@ impl Runner {
                     || state.active.is_some()
                     || state.preparing.is_some(),
             };
-            for observer in self
-                .inner
-                .runtime_probes
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .drain(..)
-            {
+            for observer in self.inner.runtime_probes.lock_unpoisoned().drain(..) {
                 let _ = observer.send(probe.clone());
             }
         }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
         let can_exit = {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             state.runner_busy = false;
             state.lifecycle != ActorLifecycle::Open && state.pending_publications == 0
         };
@@ -234,11 +213,7 @@ impl Runner {
         )
         .await;
 
-        let state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open && state.pending_publications == 0 {
             Step::Exit
         } else {
@@ -286,7 +261,7 @@ impl Runner {
         let correlation = admission.correlation.clone();
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             if state
                 .delivery_runs
                 .get(&turn_id)
@@ -387,7 +362,7 @@ impl Runner {
             None => (None, None),
         };
         {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open || plain.is_cancelled() {
                 drop(state);
                 let reason = reasoned.reason().unwrap_or(TurnCancellationReason::Closed);
@@ -498,11 +473,7 @@ impl Runner {
         let correlation = control.correlation.clone();
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         let policy = {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open
                 || self.inner.validate_effect_admission().is_err()
                 || state
@@ -516,7 +487,7 @@ impl Runner {
             state.policy.clone()
         };
         if plain.is_cancelled() {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             state.active = None;
             return;
         }
@@ -543,7 +514,7 @@ impl Runner {
             )
             .await;
         {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             state.active = None;
             if let BackendResult::ControlCompacted(status) = result {
                 state.emit(ActorEvent::CompactionEnd(status));
@@ -570,7 +541,7 @@ impl Runner {
         let correlation = super::run_correlation(run_id);
         let (active, plain, reasoned) = ActiveCancel::new(Some(correlation.clone()));
         {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open {
                 return;
             }
@@ -589,7 +560,7 @@ impl Runner {
             state.active = Some(active);
         }
         if plain.is_cancelled() {
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.inner.state.lock_unpoisoned();
             state.active = None;
             state.emit(ActorEvent::CompactionEnd(CompactionStatus::Cancelled));
             return;
@@ -626,7 +597,7 @@ impl Runner {
                 CompactionStatus::Failed
             }
         };
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         state.active = None;
         state.emit(ActorEvent::CompactionEnd(status));
     }

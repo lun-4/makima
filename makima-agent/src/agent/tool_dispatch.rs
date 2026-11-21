@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -144,11 +145,7 @@ pub async fn run(
     let finalization = execution_ctx
         .pending_output_limits
         .as_ref()
-        .and_then(|slot| {
-            slot.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        });
+        .and_then(|slot| slot.lock_unpoisoned().take());
     let output_deadline = finalization.as_ref().map_or(ctx.deadline, |metadata| {
         let deadline = metadata.deadline.map_or(Deadline::None, Deadline::At);
         if metadata.terminal_cleanup {

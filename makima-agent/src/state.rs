@@ -4,7 +4,7 @@ use crate::{
 };
 use makima_storage::{
     id::MakimaId,
-    session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord, StoredStateRecord},
+    session_state::{StateChange, StoredAgentLifecycle, StoredAgentRecord, validate_plugin_value},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -248,21 +248,31 @@ impl<T> StateSlot<T> {
         if !Arc::ptr_eq(&self.journal, &access.journal) {
             return Err(StateError::StaleAccess);
         }
-        let edit = StateEdit {
+        if let Some(value) = &value {
+            validate_plugin_value(value, 1)
+                .map_err(|error| StateError::InvalidValue(error.to_string()))?;
+        }
+        Ok(StateEdit {
             access: access.clone(),
             spec: self.spec.clone(),
             value,
             expect,
-        };
-        validate_record(&edit.change(), 1)?;
-        Ok(edit)
+        })
     }
     pub fn delete(
         &self,
         access: &StateAccess,
         expect: Option<StateRevision>,
     ) -> Result<StateRevision, StateError> {
-        self.commit(self.edit_json(access, None, expect)?)
+        self.set_json(access, None, expect)
+    }
+    pub fn set_json(
+        &self,
+        access: &StateAccess,
+        value: Option<Value>,
+        expect: Option<StateRevision>,
+    ) -> Result<StateRevision, StateError> {
+        self.commit(self.edit_json(access, value, expect)?)
     }
     fn commit(&self, edit: StateEdit) -> Result<StateRevision, StateError> {
         self.journal
@@ -383,23 +393,13 @@ pub(crate) fn read_slot(
 }
 
 pub(crate) fn validate_record(change: &JournalChange, seq: u64) -> Result<(), StateError> {
-    let record = StoredStateRecord {
-        seq,
-        agent: change.agent,
-        generation: change.generation,
-        change: change.change.clone(),
-    };
-    let bytes =
-        serde_json::to_vec(&record).map_err(|error| StateError::InvalidValue(error.to_string()))?;
-    let decoded: StoredStateRecord = serde_json::from_slice(&bytes)
-        .map_err(|error| StateError::InvalidValue(error.to_string()))?;
-    if decoded != record {
-        return Err(StateError::InvalidValue(
-            "stored record does not round trip".into(),
-        ));
+    if let StateChange::Plugin {
+        value: Some(value), ..
+    } = &change.change
+    {
+        validate_plugin_value(value, seq)
+            .map_err(|error| StateError::InvalidValue(error.to_string()))?;
     }
-    makima_storage::session_state::validate_record(&decoded)
-        .map_err(|error| StateError::InvalidValue(error.to_string()))?;
     Ok(())
 }
 

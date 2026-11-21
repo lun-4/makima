@@ -10,6 +10,8 @@
 //! Only write paths (`claim`, `heartbeat`) mutate lock state. Readers (`open_elsewhere`)
 //! never reclaim: a stale lock is cleaned up by the next claim.
 
+#[cfg(test)]
+use makima_domain::LockExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -160,9 +162,7 @@ fn sidecar_read_error() -> &'static Mutex<Option<(PathBuf, io::ErrorKind)>> {
 
 #[cfg(test)]
 fn take_sidecar_read_error(path: &Path) -> Option<io::Error> {
-    let mut error = sidecar_read_error()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut error = sidecar_read_error().lock_unpoisoned();
     if error.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, kind) = error.take().expect("matching sidecar read error");
         return Some(io::Error::new(kind, "injected sidecar read failure"));
@@ -184,9 +184,7 @@ fn publish_before_lock_hook() -> &'static Mutex<Option<PublishHook>> {
 
 #[cfg(test)]
 fn run_publish_before_lock_hook(path: &Path) {
-    let mut hook = publish_before_lock_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut hook = publish_before_lock_hook().lock_unpoisoned();
     if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, callback) = hook.take().expect("matching publish hook");
         drop(hook);
@@ -196,9 +194,7 @@ fn run_publish_before_lock_hook(path: &Path) {
 
 #[cfg(test)]
 fn run_release_before_write_hook(path: &Path) {
-    let mut hook = release_before_write_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut hook = release_before_write_hook().lock_unpoisoned();
     if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, callback) = hook.take().expect("matching release hook");
         drop(hook);

@@ -2686,7 +2686,7 @@ mod tests {
             makima_agent::prompt::Slot::Identity,
             makima_agent::prompt::SlotEntry {
                 plugin: "admission".into(),
-                registration: 0,
+                name: "default".into(),
                 content: "admitted identity".into(),
             },
         );

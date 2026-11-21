@@ -1,5 +1,6 @@
+use makima_domain::LockExt;
 use std::io::{self, Write};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
@@ -133,7 +134,7 @@ impl<'a> MakeWriter<'a> for SharedWriter {
     type Writer = SharedGuard<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard(self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        SharedGuard(self.0.lock_unpoisoned())
     }
 }
 

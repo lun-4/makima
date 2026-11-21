@@ -7,6 +7,7 @@ use makima_agent::session_coordinator::{
     SessionOptionCatalog, builtin_option_definitions,
 };
 use makima_agent::session_options::SessionOptionError;
+use makima_agent::test_util::poll_until;
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
     ControlWork, DoneReason, GraphLifecycle, ManagerError, ModeId, RunSettings,
@@ -117,15 +118,15 @@ async fn request_with_command_diagnostics(
 }
 
 async fn wait_for_gate_drop(request: &CapturedRequest, operation: &str) {
-    bounded(
-        async {
-            while !request.reply.is_disconnected() {
-                smol::future::yield_now().await;
-            }
-        },
-        operation,
-    )
-    .await;
+    assert!(
+        poll_until(TEST_TIMEOUT, || request
+            .reply
+            .is_disconnected()
+            .then_some(()))
+        .await
+        .is_some(),
+        "{operation} did not complete within {TEST_TIMEOUT:?}"
+    );
 }
 
 struct ScriptedProvider {
@@ -595,22 +596,20 @@ async fn wait_for_retained_children(
     stored_lifecycle: StoredAgentLifecycle,
     operation: &str,
 ) {
-    let wait = async {
-        loop {
-            if children.iter().all(|&id| {
+    let settled = poll_until(TEST_TIMEOUT, || {
+        children
+            .iter()
+            .all(|&id| {
                 manager.node(id).is_ok_and(|node| {
                     node.graph_lifecycle == lifecycle
                         && node.residency == AgentResidency::Dormant
                         && node.actor.is_none()
                 }) && manager.runner_finished(id).unwrap()
-            }) {
-                return;
-            }
-            smol::future::yield_now().await;
-        }
-    };
-    let watchdog = async {
-        smol::Timer::after(TEST_TIMEOUT).await;
+            })
+            .then_some(())
+    })
+    .await;
+    if settled.is_none() {
         let nodes: Vec<String> = manager
             .snapshot()
             .iter()
@@ -629,8 +628,7 @@ async fn wait_for_retained_children(
             })
             .collect();
         panic!("{operation} did not complete: {nodes:?}");
-    };
-    futures_lite::future::race(wait, watchdog).await;
+    }
     assert_eq!(
         manager
             .snapshot()
@@ -2534,15 +2532,11 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
                 .unwrap()
                 .thinking
         };
-        bounded(
-            async {
-                while thinking(&pinned) != ThinkingConfig::Effort(Effort::Low) {
-                    smol::future::yield_now().await;
-                }
-            },
-            "pinned keybind target update",
-        )
-        .await;
+        poll_until(TEST_TIMEOUT, || {
+            (thinking(&pinned) == ThinkingConfig::Effort(Effort::Low)).then_some(())
+        })
+        .await
+        .expect("pinned keybind target did not update");
         assert_eq!(thinking(&focused), ThinkingConfig::Off);
         shutdown_manager(&focused.manager).await;
         shutdown_manager(&pinned.manager).await;
@@ -2652,15 +2646,11 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
                     let unloaded = host.unload(TOOL);
                     finished.send((host, unloaded)).unwrap();
                 });
-                bounded(
-                    async {
-                        while fixture.manager.is_live(child.agent_id) {
-                            smol::future::yield_now().await;
-                        }
-                    },
-                    "plugin revocation child authority detachment",
-                )
-                .await;
+                poll_until(TEST_TIMEOUT, || {
+                    (!fixture.manager.is_live(child.agent_id)).then_some(())
+                })
+                .await
+                .expect("plugin revocation did not detach child authority");
                 Some((result, child.agent_id))
             } else {
                 cancel.cancel();

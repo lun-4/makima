@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::any::Any;
 use std::fmt;
 use std::path::PathBuf;
@@ -161,11 +162,7 @@ impl CommandRegistry {
     ) -> CommandFuture<CommandOutcome> {
         let admission = admission.unwrap_or_else(|| {
             {
-                let state = self
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let state = self.0.state.lock_unpoisoned();
                 target_record(&state, self.0.id, &target).map(|record| Arc::clone(&record.host))
             }
             .and_then(|host| host.admission_context())
@@ -176,11 +173,7 @@ impl CommandRegistry {
                 return CommandOutcome::Failed(CommandError::MaximumDepth);
             }
             let (capabilities, host) = {
-                let state = registry
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let state = registry.0.state.lock_unpoisoned();
                 let Some(record) = target_record(&state, registry.0.id, &target) else {
                     return CommandOutcome::Failed(CommandError::StaleTarget);
                 };
@@ -190,11 +183,7 @@ impl CommandRegistry {
                 return CommandOutcome::Failed(CommandError::StaleCommand);
             }
             {
-                let state = registry
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let state = registry.0.state.lock_unpoisoned();
                 let Some(winner) = state.winners.get(&normalize(command.invoked_name())) else {
                     return CommandOutcome::Failed(CommandError::StaleCommand);
                 };

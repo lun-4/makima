@@ -57,7 +57,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 37. Root depth is zero. Parent, root, and depth relationships are immutable after reservation.
 38. Work admission reserves active-agent and direct-child capacity atomically. Queued, executing, delivery, and cleanup work retain capacity until settlement. Idle resident and dormant actors consume neither active-work limit; non-retired identities consume retained capacity except imported legacy records.
 39. Actor/backend factories run outside the graph lock. Returned errors, panics, concurrent closure, and failed commit all roll reservations back exactly once.
-40. Never hold the graph lock across an await, actor call, backend call, factory invocation, task join, or any path that can re-enter tool dispatch.
+40. The graph lock may enclose synchronous actor state operations such as cut capture. Drop it before applying a cut, awaiting, invoking a factory or backend, joining a task, or re-entering tool dispatch.
 41. Durable agent records retain topology, spawn specification, lifecycle, usage, and identity across restart. Runtime residency and incarnation reservations are separate. Reactivation installs at most one resident actor and must reject a stale reservation or closed, retired, or unrestorable record.
     - `ResidentInitialization::finish_with` acquires the activation-completion read guard before graph validation. Once the attempt is marked finishing, manager-owned work retains that guard through publication and activation commit or rollback, even if the initiating waiter is dropped. Fallible host registration precedes this work.
     - Shutdown and detach acquire activation completion before journal publication. When these guards overlap the graph lock, the order is activation completion, journal publication, graph. No path may await activation completion or journal publication while holding the graph lock. The journal publication lock is distinct from its state mutex.
@@ -109,6 +109,17 @@ These invariants cover the actor, manager and agent frontends as they are curren
 74. Plugin state uses registered, versioned JSON slots in explicit agent or session scope. Mutations validate authority and expected revision. Migration changes publish with the same journal transaction before observers run.
 75. Session saves write v3; v2 import has no downgrade path. The first v3 release writes an empty header feature set. Unknown versions, unsupported feature names, and complete unsupported record schemas fail closed.
 76. History epochs are opaque ordered identities within one namespace. Import remints distinct saved epochs while preserving order, equality, and all retained references. Independent imported namespaces must never be merged by equal raw epoch numbers.
+
+## Lock order
+
+The order applies to locks held at the same time. A synchronous state mutex must not be held across an await.
+
+- Acquire activation completion before journal publication, and publication before the journal boundary when both are required. Acquire these guards before taking graph, actor, or journal state. History mutations that only need the boundary do not acquire publication while holding the boundary.
+- Acquire manager graph state before actor state. Either may acquire journal state. Capture a close cut under the graph lock and apply it after releasing the graph lock. Terminal delivery releases source actor state before looking up the target in the graph. A journal commit builder runs under journal state and must not acquire graph, actor, or session coordinator state.
+- Catalog publication reserves its journal publication and boundary guards before taking `DIRECTORY`. When both directory and catalog state are needed, acquire `DIRECTORY` first. Catalog decisions then acquire participant option state and journal state in that order. Batch publication acquires journal guards in journal address order. An operation must release the directory and catalog mutexes before awaiting a participant or publication guard.
+- Journal state may enqueue writer work. The writer releases its status and attached-journal mutexes before changing journal state. It does not hold either mutex during writes, fsync, or receipt waits. The writer registry lock only protects the registry and is released before opening or closing a writer.
+
+A terminal guard keeps the corresponding journal entry staged until delivery has been attempted. Dropping the guard releases it for conversion without acquiring publication or boundary guards, so a preparation waiting on that entry can proceed.
 
 ## Verification expectations
 

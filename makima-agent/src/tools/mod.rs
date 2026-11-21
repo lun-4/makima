@@ -23,6 +23,7 @@ pub use registry::{
     ToolRegistry, ToolSource,
 };
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -549,7 +550,7 @@ impl ToolContext {
             (None, Deadline::At(deadline)) => Some(deadline),
             (current, Deadline::None) => current,
         };
-        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = pending.lock_unpoisoned();
         let metadata = pending.get_or_insert_with(|| OutputFinalization {
             limits: None,
             deadline: opts.deadline,

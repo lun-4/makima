@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -242,10 +243,7 @@ impl InteractiveControlSender {
                         cancel.cancelled().await;
                         actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
                         if let Some(pending) = queued.upgrade() {
-                            pending
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .cancel();
+                            pending.lock_unpoisoned().cancel();
                         }
                     },
                     async {
@@ -915,13 +913,9 @@ impl ActorBackend for HeadlessBackend {
                 .payload
                 .clone()
                 .and_then(|payload| payload.downcast::<StdMutex<PendingControl>>().ok());
-            let control = pending.as_ref().and_then(|pending| {
-                pending
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .control
-                    .take()
-            });
+            let control = pending
+                .as_ref()
+                .and_then(|pending| pending.lock_unpoisoned().control.take());
             match control {
                 Some(InteractiveControl::Compact(reply)) => {
                     let result = self.compact(history, &context, None, &context.cancel).await;
@@ -1638,7 +1632,7 @@ pub(crate) mod tests {
     use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
     use crate::session_coordinator::tests::bind_initializing_actor;
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
-    use crate::test_util::StubBackend;
+    use crate::test_util::MockBackend;
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
     use makima_providers::provider::Provider;
@@ -1849,7 +1843,7 @@ pub(crate) mod tests {
                         Slot::Conventions,
                         SlotEntry {
                             plugin: Arc::from(SLOT_PLUGIN),
-                            registration: 0,
+                            name: "default".into(),
                             content: slot_content.lock().unwrap().clone(),
                         },
                     );
@@ -2777,7 +2771,7 @@ pub(crate) mod tests {
             );
             let child = bounded(manager.ensure_resident_with(child_id, |_| async {
                 Ok(ResidentAgent {
-                    backend: Box::new(StubBackend),
+                    backend: Box::new(MockBackend::STRICT),
                     config: (*config).clone(),
                     shared_messages: None,
                     start: None,

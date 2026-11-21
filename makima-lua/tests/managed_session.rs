@@ -1,3 +1,4 @@
+use makima_agent::test_util::poll_until;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1087,20 +1088,14 @@ async fn assert_closed_child(manager: &AgentManagerHandle, agent_id: AgentId, pa
 }
 
 async fn wait_for_runner_finished(manager: &AgentManagerHandle, agent_id: AgentId) {
-    let finished = futures_lite::future::race(
-        async {
-            while !manager.runner_finished(agent_id).unwrap() {
-                smol::future::yield_now().await;
-            }
-            true
-        },
-        async {
-            smol::Timer::after(SETTLE_TIMEOUT).await;
-            false
-        },
-    )
-    .await;
-    assert!(finished, "managed agent {agent_id} runner did not finish");
+    assert!(
+        poll_until(SETTLE_TIMEOUT, || {
+            manager.runner_finished(agent_id).unwrap().then_some(())
+        })
+        .await
+        .is_some(),
+        "managed agent {agent_id} runner did not finish"
+    );
 }
 
 #[test]
@@ -2002,23 +1997,16 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
             .find(|node| node.parent_id == Some(root.id()))
             .unwrap()
             .agent_id;
-        let child_before = futures_lite::future::race(
-            async {
-                loop {
-                    let child = manager.node(child_id).unwrap();
-                    if child.actor.as_ref().is_some_and(|actor| {
-                        actor.latest.is_some() && actor.active_turn.is_none() && actor.queued == 0
-                    }) {
-                        break Some(child);
-                    }
-                    smol::future::yield_now().await;
-                }
-            },
-            async {
-                smol::Timer::after(SETTLE_TIMEOUT).await;
-                None
-            },
-        )
+        let child_before = poll_until(SETTLE_TIMEOUT, || {
+            let child = manager.node(child_id).unwrap();
+            child
+                .actor
+                .as_ref()
+                .is_some_and(|actor| {
+                    actor.latest.is_some() && actor.active_turn.is_none() && actor.queued == 0
+                })
+                .then_some(child)
+        })
         .await
         .expect("managed task child did not settle");
 

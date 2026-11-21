@@ -51,13 +51,24 @@ pub enum SlotKind {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter, Serialize, Deserialize,
 )]
-#[strum(serialize_all = "snake_case")]
 pub enum Slot {
+    #[serde(rename = "identity")]
+    #[strum(serialize = "identity")]
     Identity,
+    #[serde(rename = "tone")]
+    #[strum(serialize = "tone")]
     Tone,
+    #[serde(rename = "tool_usage")]
+    #[strum(serialize = "tool_usage")]
     ToolUsage,
+    #[serde(rename = "efficient_tools")]
+    #[strum(serialize = "efficient_tools")]
     EfficientTools,
+    #[serde(rename = "conventions")]
+    #[strum(serialize = "conventions")]
     Conventions,
+    #[serde(rename = "after_instructions")]
+    #[strum(serialize = "after_instructions")]
     AfterInstructions,
 }
 
@@ -107,10 +118,15 @@ impl Slot {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter, Serialize, Deserialize,
 )]
-#[strum(serialize_all = "snake_case")]
 pub enum PromptId {
+    #[serde(rename = "system")]
+    #[strum(serialize = "system")]
     System,
+    #[serde(rename = "research")]
+    #[strum(serialize = "research")]
     Research,
+    #[serde(rename = "general")]
+    #[strum(serialize = "general")]
     General,
 }
 
@@ -124,7 +140,7 @@ impl ValidNames for PromptId {}
 #[derive(Clone)]
 pub struct SlotEntry {
     pub plugin: Arc<str>,
-    pub registration: usize,
+    pub name: Arc<str>,
     pub content: String,
 }
 
@@ -133,14 +149,14 @@ pub struct PromptSource {
     pub prompt: PromptId,
     pub slot: Slot,
     pub plugin: Arc<str>,
-    pub registration: usize,
+    pub name: Arc<str>,
     pub content: Option<String>,
 }
 
 #[derive(Clone, Default)]
 pub struct ResolvedSlots {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
-    observations: HashMap<(PromptId, Slot), Vec<PromptSource>>,
+    observations: Vec<PromptSource>,
 }
 
 impl ResolvedSlots {
@@ -156,7 +172,7 @@ impl ResolvedSlots {
             prompt,
             slot,
             plugin: entry.plugin,
-            registration: entry.registration,
+            name: entry.name,
             content: Some(entry.content),
         });
     }
@@ -166,23 +182,15 @@ impl ResolvedSlots {
         if let Some(content) = &source.content {
             self.entries.entry(address).or_default().push(SlotEntry {
                 plugin: source.plugin.clone(),
-                registration: source.registration,
+                name: source.name.clone(),
                 content: content.clone(),
             });
         }
-        self.observations.entry(address).or_default().push(source);
+        self.observations.push(source);
     }
 
-    pub fn sources(&self) -> Vec<PromptSource> {
-        let mut sources = Vec::new();
-        for &prompt in PromptId::ALL {
-            for slot in Slot::iter() {
-                if let Some(observations) = self.observations.get(&(prompt, slot)) {
-                    sources.extend(observations.iter().cloned());
-                }
-            }
-        }
-        sources
+    pub fn sources(&self) -> &[PromptSource] {
+        &self.observations
     }
 }
 
@@ -287,7 +295,7 @@ mod tests {
                 slot,
                 SlotEntry {
                     plugin: Arc::from("p"),
-                    registration: 0,
+                    name: "default".into(),
                     content: content.into(),
                 },
             );
@@ -365,26 +373,68 @@ mod tests {
     }
 
     #[test]
-    fn sources_preserve_registration_and_bucket_order_for_reconstruction() {
+    fn sources_preserve_registration_order_for_reconstruction() {
         let entries = [
-            (PromptId::General, Slot::ToolUsage, "z", 4, "general"),
-            (PromptId::System, Slot::ToolUsage, "z", 3, "first hint"),
-            (PromptId::System, Slot::Identity, "z", 1, "first identity"),
-            (PromptId::Research, Slot::ToolUsage, "a", 2, "research"),
-            (PromptId::System, Slot::Identity, "a", 0, "second identity"),
-            (PromptId::System, Slot::ToolUsage, "a", 5, "second hint"),
-            (PromptId::System, Slot::Identity, "z", 7, "last identity"),
-            (PromptId::System, Slot::ToolUsage, "z", 8, "last hint"),
-            (PromptId::System, Slot::Tone, "a", 6, "tone"),
+            (PromptId::General, Slot::ToolUsage, "z", "hint_4", "general"),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "z",
+                "hint_3",
+                "first hint",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "z",
+                "hint_1",
+                "first identity",
+            ),
+            (
+                PromptId::Research,
+                Slot::ToolUsage,
+                "a",
+                "hint_2",
+                "research",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "a",
+                "hint_0",
+                "second identity",
+            ),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "a",
+                "hint_5",
+                "second hint",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "z",
+                "hint_7",
+                "last identity",
+            ),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "z",
+                "hint_8",
+                "last hint",
+            ),
+            (PromptId::System, Slot::Tone, "a", "hint_6", "tone"),
         ];
         let mut slots = ResolvedSlots::default();
-        for (prompt, slot, plugin, registration, content) in entries {
+        for (prompt, slot, plugin, name, content) in entries {
             slots.insert(
                 prompt,
                 slot,
                 SlotEntry {
                     plugin: Arc::from(plugin),
-                    registration,
+                    name: name.into(),
                     content: content.into(),
                 },
             );
@@ -397,16 +447,16 @@ mod tests {
                     source.prompt,
                     source.slot,
                     source.plugin.as_ref(),
-                    source.registration,
+                    source.name.as_ref(),
                     source.content.as_deref().unwrap(),
                 )
             })
             .collect();
-        assert_eq!(projected, [2, 4, 6, 8, 1, 5, 7, 3, 0].map(|i| entries[i]));
+        assert_eq!(projected, entries);
 
         let mut restored = ResolvedSlots::default();
         for source in sources {
-            restored.observe(source);
+            restored.observe(source.clone());
         }
         for &prompt in PromptId::ALL {
             assert_eq!(
@@ -432,15 +482,15 @@ mod tests {
             prompt: PromptId::General,
             slot: Slot::ToolUsage,
             plugin: Arc::from("missing"),
-            registration: 0,
+            name: "default".into(),
             content: None,
         });
-        for (registration, content) in [(1, None), (2, Some(identity)), (3, None)] {
+        for (name, content) in [("first", None), ("second", Some(identity)), ("third", None)] {
             slots.observe(PromptSource {
                 prompt: PromptId::System,
                 slot: Slot::Identity,
                 plugin: Arc::from("plugin"),
-                registration,
+                name: name.into(),
                 content: content.map(String::from),
             });
         }
@@ -448,16 +498,16 @@ mod tests {
         assert_eq!(
             sources
                 .iter()
-                .map(|source| source.registration)
+                .map(|source| source.name.as_ref())
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 0]
+            ["default", "first", "second", "third"]
         );
         assert_eq!(
             sources
                 .iter()
                 .map(|source| source.content.as_deref())
                 .collect::<Vec<_>>(),
-            [None, Some(identity), None, None]
+            [None, None, Some(identity), None]
         );
         assert_eq!(slots.get(PromptId::System, Slot::Identity).len(), 1);
         assert!(slots.get(PromptId::General, Slot::ToolUsage).is_empty());
@@ -467,7 +517,7 @@ mod tests {
         );
         let mut restored = ResolvedSlots::default();
         for source in sources {
-            restored.observe(source);
+            restored.observe(source.clone());
         }
         assert_eq!(restored.sources().len(), 4);
         for &prompt in PromptId::ALL {
@@ -511,7 +561,7 @@ mod tests {
                 Slot::AfterInstructions,
                 SlotEntry {
                     plugin: Arc::from("p"),
-                    registration: 0,
+                    name: "default".into(),
                     content: "AFTER".into(),
                 },
             );
@@ -590,7 +640,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("user"),
-                registration: 0,
+                name: "default".into(),
                 content: "Custom identity".into(),
             },
         );
@@ -607,7 +657,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("first"),
-                registration: 0,
+                name: "default".into(),
                 content: "FIRST".into(),
             },
         );
@@ -616,7 +666,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("second"),
-                registration: 0,
+                name: "default".into(),
                 content: "SECOND".into(),
             },
         );
@@ -648,7 +698,7 @@ mod tests {
             Slot::Conventions,
             SlotEntry {
                 plugin: Arc::from("plugin"),
-                registration: 0,
+                name: "default".into(),
                 content: "- Extra rule".into(),
             },
         );

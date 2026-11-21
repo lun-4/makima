@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::Arc;
 
 use makima_providers::{ConversationEnd, Message};
@@ -50,7 +51,7 @@ impl ActorIdleGuard {
         let (completion, response) = flume::bounded(1);
         let actor = self.actor.clone();
         {
-            let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = actor.inner.state.lock_unpoisoned();
             if state.lifecycle != ActorLifecycle::Open {
                 return Err(super::lifecycle_error(state.lifecycle));
             }
@@ -80,7 +81,7 @@ impl ActorIdleGuard {
                 async {
                     publication.cancelled().await;
                     let edit = {
-                        let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut state = actor.inner.state.lock_unpoisoned();
                         let edit = state
                             .owned_idle(&self.owner)
                             .and_then(|idle| idle.edit.take());
@@ -145,7 +146,7 @@ impl HistoryEditWork {
             .clone()
             .unwrap_or_else(|| (*actor.inner.history.load_full()).clone());
         let snapshot = {
-            let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = actor.inner.state.lock_unpoisoned();
             operation.transaction_snapshot(&actor.inner, &state, snapshot)
         };
         let result = transaction.publish(snapshot).await;
@@ -153,13 +154,13 @@ impl HistoryEditWork {
         let result = match result {
             Err(error) => {
                 (*operation).fail(error.clone());
-                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = actor.inner.state.lock_unpoisoned();
                 state.end_prepared_publication(id);
                 super::drive_operations(&actor.inner, &mut state);
                 Err(error)
             }
             Ok((finalize, publication_error)) => {
-                let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = actor.inner.state.lock_unpoisoned();
                 let change = replacement.map(|snapshot| {
                     history.adopt_prepared_snapshot(snapshot.clone());
                     // Nothing kept is a fresh start, not a rewind to build on.
@@ -197,7 +198,7 @@ impl HistoryEditWork {
             && let Some(ticket) = &committed.ticket
         {
             let cancelled = {
-                let state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = actor.inner.state.lock_unpoisoned();
                 let reason = match state.lifecycle {
                     ActorLifecycle::Open => None,
                     ActorLifecycle::Closed => Some(crate::TurnCancellationReason::Closed),
