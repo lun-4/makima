@@ -1100,6 +1100,49 @@ fn ctrl_c_clears_nonempty_input(setup: fn(&mut App)) {
     assert!(app.input_box.is_empty());
 }
 
+/// Shift+Home to Shift+End over whatever the input holds.
+fn select_input(app: &mut App) {
+    app.update(Msg::Key(key(KeyCode::Home)));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT)));
+}
+
+#[test]
+fn ctrl_c_copies_the_input_selection_before_clearing() {
+    let mut app = test_app();
+    with_text(&mut app);
+    select_input(&mut app);
+    assert_eq!(app.input_box.buffer.selected_text().as_deref(), Some("hi"));
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "hi",
+        "a copy leaves the text alone"
+    );
+    assert!(!app.input_box.buffer.has_selection());
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(app.input_box.is_empty(), "the next press clears");
+}
+
+#[test]
+fn ctrl_c_copies_only_once_in_a_row() {
+    let mut app = test_app();
+    with_text(&mut app);
+    select_input(&mut app);
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+
+    app.update(Msg::Key(key(KeyCode::Char('!'))));
+    select_input(&mut app);
+    let _ = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "hi!",
+        "a key in between makes the next press copy again"
+    );
+}
+
 #[test]
 fn ctrl_c_quits_when_input_empty() {
     let mut app = test_app();

@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::click::{ClickTarget, ScrollOwner, Surface};
-use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -643,11 +642,7 @@ impl App {
             }
         };
 
-        match self.clipboard.copy_text(&text) {
-            Ok(CopyResult::Noop) => {}
-            Ok(CopyResult::Copied) => self.status_bar.flash("Copied selection".into()),
-            Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
-        }
+        self.copy(&text);
         self.selection_state = None;
     }
 
