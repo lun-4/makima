@@ -35,7 +35,10 @@ const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
 const FILE_KIND: &str = "file";
 const DIRECTORY_KIND: &str = "directory";
-const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
+/// The separator completion inserts into a prompt, not the one the filesystem
+/// uses: the same text then means the same path wherever the agent runs, and
+/// every platform accepts `/`.
+pub(crate) const DIRECTORY_SUFFIX: char = '/';
 
 fn ends_with_path_separator(value: &str) -> bool {
     value.ends_with(std::path::is_separator)
@@ -224,7 +227,7 @@ impl CompletionItem {
     }
 
     fn path(mut path: String, directory: bool) -> Self {
-        if directory && !path.ends_with(DIRECTORY_SUFFIX) {
+        if directory && !ends_with_path_separator(&path) {
             path.push(DIRECTORY_SUFFIX);
         }
         let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
@@ -639,7 +642,7 @@ impl FileCompletionMenu {
     ) {
         self.close();
         let root = PathBuf::from(cwd);
-        let explicit = query.starts_with(['~', '/', '.']);
+        let explicit = is_explicit_path(query);
         let (discovery, walking) = if explicit {
             (
                 Discovery::Explicit {
@@ -755,7 +758,7 @@ impl FileCompletionMenu {
         let Some(session) = &mut self.session else {
             return;
         };
-        let explicit = query.starts_with(['~', '/', '.']);
+        let explicit = is_explicit_path(query);
         session.intent = parse_query(query);
         let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
         if explicit {
@@ -1012,6 +1015,21 @@ impl FileCompletionMenu {
 
 /// Character indices of `query` fuzzy-matched within `label`, for
 /// highlighting. `None` when the query does not match.
+/// Whether the query names a path rather than a fuzzy fragment: `~`, `/`,
+/// `.`, a drive letter or a UNC share. Without the Windows spellings an
+/// absolute path is searched for as if it were part of the project.
+fn is_explicit_path(query: &str) -> bool {
+    if query.starts_with(['~', '/', '.']) {
+        return true;
+    }
+    let bytes = query.as_bytes();
+    bytes.starts_with(b"\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
 fn parse_query(query: &str) -> QueryIntent {
     let lowered = query.to_lowercase();
     for (aliases, kind) in [
@@ -1140,7 +1158,7 @@ fn refresh_file_matches(s: &mut Session) {
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        let directory = path.ends_with(DIRECTORY_SUFFIX);
+        let directory = ends_with_path_separator(&path);
         let item = if directory {
             CompletionItem::directory(path)
         } else {
@@ -1404,6 +1422,19 @@ mod tests {
     use test_case::test_case;
 
     const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test_case(r"C:\Users\me\notes.md", true; "drive_backslash")]
+    #[test_case("C:/Users/me/notes.md", true; "drive_slash")]
+    #[test_case(r"\\server\share\notes.md", true; "unc")]
+    #[test_case("~/notes.md", true; "home")]
+    #[test_case("./notes.md", true; "relative")]
+    #[test_case("/notes.md", true; "rooted")]
+    #[test_case("notes.md", false; "fragment")]
+    #[test_case("C", false; "drive_letter_alone")]
+    #[test_case("a: b", false; "colon_without_slash")]
+    fn explicit_path_recognises_platform_spellings(query: &str, explicit: bool) {
+        assert_eq!(is_explicit_path(query), explicit, "{query}");
+    }
 
     fn wait_for_matcher(
         menu: &mut FileCompletionMenu,

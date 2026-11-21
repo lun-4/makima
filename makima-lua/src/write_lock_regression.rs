@@ -79,10 +79,18 @@ fn dispatch(ctx: &ToolContext, id: &str, name: &str, input: Value) -> ToolDoneEv
     ))
 }
 
+/// The fs API makes a rooted path absolute against the cwd, and on Windows a
+/// rooted path without a drive is not absolute, so seeds must use the same
+/// spelling the tools resolve to.
+fn resolve(path: &str) -> PathBuf {
+    std::env::current_dir().unwrap().join(path)
+}
+
 fn file_content(fs: &InMemoryFs, path: &str) -> String {
+    let path = resolve(path);
     fs.files()
         .into_iter()
-        .find(|(p, _)| p.to_string_lossy() == path)
+        .find(|(p, _)| *p == path)
         .map(|(_, bytes)| String::from_utf8(bytes).expect("utf8 content"))
         .expect("file exists on the backend")
 }
@@ -100,7 +108,7 @@ fn edit_opts() -> HashMap<String, Map<String, Value>> {
 #[test]
 fn batch_edits_same_file_preserve_all_replacements() {
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
+    fs.seed(&resolve(FILE), b"alpha\nbeta\ngamma\n".to_vec());
     let (registry, _host) = boot(Arc::clone(&fs), &["batch", "edit", "write"]);
     let ctx = shared_ctx(&registry);
 
@@ -140,7 +148,7 @@ fn edit_handlers_bypassing_lock_lose_updates() {
     let barrier = ReadBarrierFs::new();
     barrier
         .fs
-        .seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
+        .seed(&resolve(FILE), b"alpha\nbeta\ngamma\n".to_vec());
     let (registry, _host) = boot_with_backend(&["edit"], Arc::clone(&barrier) as _, HashMap::new());
     let ctx = shared_ctx(&registry);
 
@@ -181,7 +189,7 @@ fn edit_handlers_bypassing_lock_lose_updates() {
 fn mutable_tools_share_path_lock() {
     // edit + multiedit over disjoint regions of one file.
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(FILE), b"aaa\nbbb\nccc\nddd\n".to_vec());
+    fs.seed(&resolve(FILE), b"aaa\nbbb\nccc\nddd\n".to_vec());
     let (registry, _host) =
         boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
     let ctx = shared_ctx(&registry);
@@ -206,7 +214,7 @@ fn mutable_tools_share_path_lock() {
 
     // edit + edit_lines: the line tool shares the same key.
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(FILE), b"one\ntwo\nthree\n".to_vec());
+    fs.seed(&resolve(FILE), b"one\ntwo\nthree\n".to_vec());
     let (registry, _host) =
         boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
     let ctx = shared_ctx(&registry);
@@ -229,7 +237,7 @@ fn mutable_tools_share_path_lock() {
     // edit + write overlap: a serialized outcome is entirely one handler's
     // result; a raced one would be a torn mix.
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(FILE), b"old\n".to_vec());
+    fs.seed(&resolve(FILE), b"old\n".to_vec());
     let (registry, _host) =
         boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
     let ctx = shared_ctx(&registry);
@@ -255,7 +263,7 @@ fn mutable_tools_share_path_lock() {
 
     // insert_lines joins the same namespace.
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(FILE), b"a\nc\n".to_vec());
+    fs.seed(&resolve(FILE), b"a\nc\n".to_vec());
     let (registry, _host) =
         boot_with_backend(&["edit", "write"], Arc::clone(&fs) as _, edit_opts());
     let ctx = shared_ctx(&registry);
@@ -281,9 +289,7 @@ fn mutable_tools_share_path_lock() {
 #[test]
 fn edit_and_write_handlers_use_atomic_write() {
     let watch = Watch::new();
-    watch
-        .fs
-        .seed(std::path::Path::new(FILE), b"before\n".to_vec());
+    watch.fs.seed(&resolve(FILE), b"before\n".to_vec());
     let (registry, _host) = boot_with_watch(&watch, &["edit", "write"]);
     let ctx = shared_ctx(&registry);
 
@@ -820,7 +826,7 @@ fn dispatched_handlers_serialize_on_the_lock() {
         let probe = ProbeFs::new();
         probe
             .fs
-            .seed(std::path::Path::new(FILE), b"alpha\nbeta\ngamma\n".to_vec());
+            .seed(&resolve(FILE), b"alpha\nbeta\ngamma\n".to_vec());
         let (registry, _host) = boot_with_backend(&["edit"], Arc::clone(&probe) as _, edit_opts());
         let ctx = shared_ctx(&registry);
         probe.arm_read_gate();
@@ -909,7 +915,7 @@ fn memory_write_and_delete_serialize_on_shared_lock() {
             .files()
             .into_iter()
             .map(|(p, _)| p)
-            .find(|p| p.to_string_lossy().ends_with("memories/notes.md"))
+            .find(|p| p.ends_with("memories/notes.md"))
             .expect("seeded note exists")
             .to_path_buf();
         probe.clear_events();
@@ -1016,9 +1022,7 @@ fn memory_computed_mutable_path_locks_the_real_note() {
         "lock key must be absolute: {first_target:?}"
     );
     assert!(
-        first_target
-            .to_string_lossy()
-            .ends_with("memories/notes.md"),
+        first_target.ends_with("memories/notes.md"),
         "lock key must be the note's real location: {first_target:?}"
     );
     assert_ne!(
@@ -1280,7 +1284,7 @@ fn guarded_content() -> Vec<u8> {
 #[test]
 fn guard_holds_through_dispatcher_with_stale_check_off() {
     let fs = Arc::new(InMemoryFs::new());
-    fs.seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    fs.seed(&resolve(GUARDED_FILE), guarded_content());
     let (registry, _host) = boot(Arc::clone(&fs), &["write"]);
     let mut ctx = shared_ctx(&registry);
     ctx.config.stale_read_check = false;
@@ -1400,9 +1404,7 @@ fn write_target_errors_fail_closed(fail_stat: bool, fail_read_bytes: bool) {
         fail_stat,
         fail_read_bytes,
     });
-    failing
-        .fs
-        .seed(std::path::Path::new(GUARDED_FILE), guarded_content());
+    failing.fs.seed(&resolve(GUARDED_FILE), guarded_content());
     let (registry, _host) =
         boot_with_backend(&["write"], Arc::clone(&failing) as _, HashMap::new());
     let ctx = shared_ctx(&registry);
@@ -1447,7 +1449,7 @@ fn mcp_offload_readable_by_lua_read() {
     ctx.offload = Some(Arc::new(OffloadStore::new(Box::new(
         InMemoryOffloadBackend::new(
             Arc::clone(&fs),
-            PathBuf::from(STATE_DIR).join("sessions/offload/s"),
+            resolve(STATE_DIR).join("sessions/offload/s"),
         ),
     ))));
     ctx.mcp = Some(stub_session_with_result(&[(MCP_TOOL_QUALIFIED, "")], &text));

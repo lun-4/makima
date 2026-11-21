@@ -2859,6 +2859,32 @@ if not makima.env.no_project() then
 end
 ```
 
+---
+
+### `makima.env.shell()` {#makima-env-shell}
+
+```lua
+makima.env.shell()
+```
+
+Which shell `makima.fn.jobstart` and the `bash` tool run on Windows:
+`"bash"`, `"cmd"` or `"powershell"`. Always `"bash"` elsewhere.
+
+A plugin that builds command text should match this: quoting, syntax
+highlighting and command parsing all follow the shell that will run it.
+
+Requires the `env` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string`) The shell name.
+
+**Example:**
+
+```lua
+if makima.env.shell() ~= "bash" then
+  return { llm_output = "this tool needs bash", is_error = true }
+end
+```
+
 
 ## makima.fn {#makima-fn}
 
@@ -2881,8 +2907,9 @@ makima.fn.jobstart({cmd}, {opts?})
 ```
 
 Run a shell command in the background. The command runs through
-`bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-that you can pass to `jobstop` or `jobwait` to control the process.
+`bash -c` on Unix, and on Windows through whatever `agent.shell` selects
+(Git Bash by default). You get back a job id that you can pass to
+`jobstop` or `jobwait` to control the process.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -8030,6 +8057,10 @@ function Spans.match_spans(text, indices, base_style, match_style)
 function M.case(name, fn)
 function M.eq(actual, expected, msg)
 function M.has(s, substr, msg)
+
+-- Absolute so a caller that resolves it again (a tool's ctx:resolve_path)
+-- gets the same spelling: a rooted path without a drive is not absolute on
+-- Windows and resolves against the cwd's drive.
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 

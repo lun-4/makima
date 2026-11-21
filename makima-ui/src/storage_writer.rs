@@ -2553,21 +2553,15 @@ mod tests {
             logs: HashMap::new(),
             failing: HashSet::new(),
         };
-        let sessions_path = dir.path().join(SESSIONS_DIR);
-        let saved_path = dir.path().join(TITLE);
-        if failures > 0 {
-            std::fs::rename(&sessions_path, &saved_path).unwrap();
-            block_sessions_dir(&dir);
-        }
+        let blocked = (failures > 0).then(|| BlockedSession::new(&dir, id));
         for _ in 0..failures {
             if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
                 save.retry_at = None;
             }
             disk.flush(&writer.pending);
         }
-        if failures > 0 {
-            std::fs::remove_file(&sessions_path).unwrap();
-            std::fs::rename(&saved_path, &sessions_path).unwrap();
+        if let Some(blocked) = blocked {
+            blocked.restore();
         }
         if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
             save.retry_at = None;
@@ -2953,10 +2947,32 @@ mod tests {
         Message::user(msg_text(n))
     }
 
-    /// A plain file where the sessions dir should be. `create_dir_all` cannot
-    /// turn that into a directory, so every flush fails until it is removed.
-    fn block_sessions_dir(dir: &StateDir) {
-        std::fs::write(dir.path().join(SESSIONS_DIR), "").unwrap();
+    /// Makes one session's log unwritable by putting a directory where its
+    /// file belongs. Blocking the whole sessions dir means renaming it, which
+    /// Windows refuses while a writer still holds a file inside.
+    struct BlockedSession {
+        path: PathBuf,
+        backup: Option<PathBuf>,
+    }
+
+    impl BlockedSession {
+        fn new(dir: &StateDir, id: MakimaId) -> Self {
+            let path = dir.path().join(SESSIONS_DIR).join(format!("{id}.jsonl"));
+            let backup = path.exists().then(|| {
+                let backup = path.with_extension("jsonl.saved");
+                std::fs::rename(&path, &backup).unwrap();
+                backup
+            });
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path, backup }
+        }
+
+        fn restore(self) {
+            std::fs::remove_dir_all(&self.path).unwrap();
+            if let Some(backup) = self.backup {
+                std::fs::rename(backup, &self.path).unwrap();
+            }
+        }
     }
 
     /// Snapshots must coalesce per session id, not into one `latest` slot:
@@ -3022,16 +3038,12 @@ mod tests {
         commit_save(&writer.pending, id, &in_flight);
         acknowledge_waiters(&writer.pending, &in_flight.session, in_flight.waiters);
         assert!(smol::block_on(ack).is_ok());
-        let sessions_path = dir.path().join(SESSIONS_DIR);
-        let saved_path = dir.path().join(TITLE);
-        std::fs::rename(&sessions_path, &saved_path).unwrap();
-        block_sessions_dir(&dir);
+        let blocked = BlockedSession::new(&dir, id);
         disk.logs.clear();
         disk.flush(&writer.pending);
         assert!(disk.failing.contains(&id));
         assert!(lock(&writer.pending).entries.contains_key(&id));
-        std::fs::remove_file(&sessions_path).unwrap();
-        std::fs::rename(&saved_path, &sessions_path).unwrap();
+        blocked.restore();
         let latest = writer.latest_snapshot(id).unwrap();
         let messages = latest.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
@@ -3196,18 +3208,14 @@ mod tests {
             }
             return;
         }
-        let sessions_path = dir.path().join(SESSIONS_DIR);
-        let saved_path = dir.path().join(TITLE);
-        std::fs::rename(&sessions_path, &saved_path).unwrap();
-        block_sessions_dir(&dir);
+        let blocked = BlockedSession::new(&dir, id);
         disk.logs.clear();
         if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
             save.retry_attempt = CHECKPOINT_RETRY_BACKOFFS.len();
         }
         disk.flush(&writer.pending);
         assert!(smol::block_on(newer_ack).is_err());
-        std::fs::remove_file(&sessions_path).unwrap();
-        std::fs::rename(&saved_path, &sessions_path).unwrap();
+        blocked.restore();
         let latest = writer.latest_snapshot(id).unwrap();
         let messages = latest.messages();
         assert_eq!(messages[0].first_text_content(), Some(COORDINATOR_MSG));
@@ -3660,15 +3668,11 @@ mod tests {
         disk.flush(&writer.pending);
         smol::block_on(accepted).unwrap();
         let newer = checkpoint(RESUMED_MSG, 2);
-        let sessions_path = dir.path().join(SESSIONS_DIR);
-        let saved_path = dir.path().join(TITLE);
-        std::fs::rename(&sessions_path, &saved_path).unwrap();
-        block_sessions_dir(&dir);
+        let blocked = BlockedSession::new(&dir, id);
         disk.logs.clear();
         disk.flush(&writer.pending);
         assert!(disk.failing.contains(&id));
-        std::fs::remove_file(&sessions_path).unwrap();
-        std::fs::rename(&saved_path, &sessions_path).unwrap();
+        blocked.restore();
         if let Some(Entry::Save(save)) = lock(&writer.pending).entries.get_mut(&id) {
             save.retry_at = Some(Instant::now() + DRAIN_TIMEOUT);
         }
@@ -3918,12 +3922,12 @@ mod tests {
     #[test_case(true; "with_interleaved_save")]
     fn failed_replacement_keeps_committed_history(interleaved: bool) {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
         let (writer, _wake_rx) = manual_writer();
         let mut session = AppSession::new(MODEL, CWD);
         session.push_message(Message::user(BASE_MSG.into()));
         session.set_subagent_messages(TOOL_ID.into(), vec![Message::user(BASE_MSG.into())]);
         let id = session.id;
+        let blocked = BlockedSession::new(&dir, id);
         writer.seed(Arc::new(session.clone()));
         let history = HistorySnapshot::new(vec![Message::user(REWOUND_MSG.into())]);
         let checkpoint = {
@@ -3969,7 +3973,7 @@ mod tests {
                 serde_json::to_value(vec![Message::user(BASE_MSG.into())]).unwrap()
             );
         }
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        blocked.restore();
         let mut retry = latest.as_ref().clone();
         retry.set_title(TITLE.into());
         writer.send(Arc::new(retry));
@@ -4330,10 +4334,10 @@ mod tests {
     fn failed_coordinator_checkpoint_is_not_a_later_tui_merge_base() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
-            block_sessions_dir(&dir);
-            let (writer, warn_rx) = writer(&dir);
             let session = AppSession::new(MODEL, CWD);
             let id = session.id;
+            let blocked = BlockedSession::new(&dir, id);
+            let (writer, warn_rx) = writer(&dir);
             writer.send(Arc::new(session.clone()));
             let warning = warn_rx.recv_async().await.unwrap();
             assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
@@ -4370,7 +4374,7 @@ mod tests {
                 .await;
             assert!(matches!(result, Err(CheckpointError::Save { .. })));
 
-            std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+            blocked.restore();
             writer.send(Arc::new(session));
             writer.shutdown(DRAIN_TIMEOUT);
 
@@ -4387,10 +4391,10 @@ mod tests {
     fn failed_checkpoint_retries_without_another_wake() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
-            block_sessions_dir(&dir);
-            let (writer, warn_rx) = writer(&dir);
             let session = AppSession::new(MODEL, CWD);
             let id = session.id;
+            let blocked = BlockedSession::new(&dir, id);
+            let (writer, warn_rx) = writer(&dir);
             let version = CheckpointVersion {
                 revision: session.revision(),
                 epoch: 1,
@@ -4403,7 +4407,7 @@ mod tests {
 
             let warning = warn_rx.recv_async().await.unwrap();
             assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
-            std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+            blocked.restore();
 
             assert_eq!(ack.await.unwrap().version, version);
             assert_eq!(warn_rx.recv_async().await.unwrap(), SAVE_RECOVERED);
@@ -4489,10 +4493,10 @@ mod tests {
     fn failed_checkpoint_exhausts_retries_without_false_ack() {
         smol::block_on(async {
             let (_tmp, dir) = state_dir();
-            block_sessions_dir(&dir);
-            let (writer, warn_rx) = writer(&dir);
             let session = AppSession::new(MODEL, CWD);
             let id = session.id;
+            let _blocked = BlockedSession::new(&dir, id);
+            let (writer, warn_rx) = writer(&dir);
             let result = writer
                 .checkpoint(CheckpointRequest {
                     session_id: id,
@@ -4577,10 +4581,12 @@ mod tests {
     #[test]
     fn failing_flush_warns_once_and_reports_recovery() {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
-        let (writer, warn_rx) = writer(&dir);
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
+        let blocked = BlockedSession::new(&dir, id);
+        let undelatable = MakimaId::generate();
+        let blocked_other = BlockedSession::new(&dir, undelatable);
+        let (writer, warn_rx) = writer(&dir);
 
         writer.send(Arc::clone(&session));
         let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
@@ -4590,13 +4596,14 @@ mod tests {
         // delete has already drained it; a repeat failure must stay silent.
         writer.send(Arc::clone(&session));
         let (done_tx, done_rx) = flume::bounded(1);
-        writer.delete(MakimaId::generate(), move |res| {
+        writer.delete(undelatable, move |res| {
             let _ = done_tx.send(res);
         });
         assert!(done_rx.recv_timeout(DRAIN_TIMEOUT).unwrap().is_err());
         assert!(warn_rx.is_empty(), "second failure warned again");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        blocked.restore();
+        blocked_other.restore();
         writer.send(session);
         let recovered = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert_eq!(recovered, SAVE_RECOVERED);
@@ -4633,16 +4640,16 @@ mod tests {
     #[test]
     fn failed_write_is_retried_without_an_external_wake() {
         let (_tmp, dir) = state_dir();
-        block_sessions_dir(&dir);
-        let (writer, warn_rx) = writer(&dir);
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
+        let blocked = BlockedSession::new(&dir, id);
+        let (writer, warn_rx) = writer(&dir);
 
         writer.send(session);
         let warning = warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap();
         assert!(warning.starts_with(SAVE_FAILED_PREFIX), "{warning}");
 
-        std::fs::remove_file(dir.path().join(SESSIONS_DIR)).unwrap();
+        blocked.restore();
         assert_eq!(warn_rx.recv_timeout(DRAIN_TIMEOUT).unwrap(), SAVE_RECOVERED);
         assert!(AppSession::load(id, &dir).is_ok());
         writer.shutdown(DRAIN_TIMEOUT);

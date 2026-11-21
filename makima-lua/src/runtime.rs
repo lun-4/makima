@@ -216,6 +216,7 @@ pub enum Request {
     /// Print saves nothing, saved preferences included.
     SaveNoPreferences,
     SetClockFormat(makima_config::ClockFormat),
+    SetShell(makima_config::Shell),
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -5425,6 +5426,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::SetClockFormat(format) => {
                             rt.lua.set_app_data(format);
                         }
+                        Request::SetShell(shell) => {
+                            rt.lua.set_app_data(shell);
+                        }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
@@ -6095,10 +6099,28 @@ mod tests {
         let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
         with_jobs(&lua, |store| {
             store
-                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    task_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    makima_config::Shell::default(),
+                )
                 .unwrap();
             store
-                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    plugin_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    makima_config::Shell::default(),
+                )
                 .unwrap();
         });
 
@@ -7254,7 +7276,16 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
             with_jobs(&lua, |store| {
-                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+                store.start(
+                    owner,
+                    DISPATCH_TEST_JOB,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    makima_config::Shell::default(),
+                )
             })
             .unwrap();
             let (finish_tx, finish_rx) = flume::bounded(1);

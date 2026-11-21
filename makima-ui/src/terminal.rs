@@ -10,10 +10,12 @@ use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 #[cfg(not(windows))]
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::event::{
+    DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use makima_config::NotificationMethod;
 
@@ -320,7 +322,7 @@ fn teardown() {
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     stdout().execute(crossterm::cursor::Show).ok();
-    stdout().execute(PopKeyboardEnhancementFlags).ok();
+    pop_keyboard_enhancement();
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();
     stdout().execute(DisableBracketedPaste).ok();
@@ -354,12 +356,41 @@ fn disable_focus_change() {
 #[cfg(windows)]
 fn disable_focus_change() {}
 
+/// crossterm refuses the kitty command on Windows, but conhost under ConPTY
+/// implements it and Windows Terminal forwards it. Without it ConPTY encodes
+/// Ctrl+Backspace as BS (0x08), which the VT parser reads as Ctrl+H.
+#[cfg(windows)]
+const PUSH_KEYBOARD_ENHANCEMENT_SEQUENCE: &str = "\u{1b}[>1u";
+#[cfg(windows)]
+const POP_KEYBOARD_ENHANCEMENT_SEQUENCE: &str = "\u{1b}[<1u";
+
+#[cfg(windows)]
+fn push_keyboard_enhancement() {
+    let mut out = stdout();
+    if let Err(e) = write!(out, "{PUSH_KEYBOARD_ENHANCEMENT_SEQUENCE}").and_then(|()| out.flush()) {
+        tracing::warn!(error = %e, "failed to enable keyboard enhancement (Kitty protocol)");
+    }
+}
+
+#[cfg(not(windows))]
 fn push_keyboard_enhancement() {
     if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
     )) {
         tracing::warn!(error = %e, "failed to enable keyboard enhancement (Kitty protocol)");
     }
+}
+#[cfg(windows)]
+fn pop_keyboard_enhancement() {
+    let mut out = stdout();
+    if let Err(e) = write!(out, "{POP_KEYBOARD_ENHANCEMENT_SEQUENCE}").and_then(|()| out.flush()) {
+        tracing::warn!(error = %e, "failed to disable keyboard enhancement (Kitty protocol)");
+    }
+}
+
+#[cfg(not(windows))]
+fn pop_keyboard_enhancement() {
+    stdout().execute(PopKeyboardEnhancementFlags).ok();
 }
 
 pub(crate) fn edit_temp_content(

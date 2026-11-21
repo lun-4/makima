@@ -1,8 +1,9 @@
 use std::fs;
 use std::future::Future;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use makima_storage::auth::{load_credentials, save_credentials};
 use serde_json::json;
 use tempfile::TempDir;
 
+const PROVIDERS_FILE: &str = "providers.toml";
 const PLUGIN: &str = "fake_plugin";
 const PROVIDER: &str = "fake";
 const DISPLAY_NAME: &str = "Fake";
@@ -128,6 +130,20 @@ struct Fixture {
     registry: Arc<ProviderRegistry>,
     storage: StateDir,
     _state: TempDir,
+    _serial: MutexGuard<'static, ()>,
+}
+
+/// `providers.toml` lives in the one config dir the process paths point at,
+/// so tests that read or write it cannot run beside each other.
+fn shared_config() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let serial = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    makima_storage::paths::init_shared_for_test();
+    serial
+}
+
+fn config_dir() -> PathBuf {
+    makima_storage::paths::config_dir().unwrap()
 }
 
 impl Fixture {
@@ -140,7 +156,12 @@ impl Fixture {
     }
 
     fn with_plugin_state(plugin: &str, source: &str, state: TempDir) -> Self {
-        makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        let serial = shared_config();
+        let providers = fs::read_to_string(state.path().join(PROVIDERS_FILE)).ok();
+        ProvidersConfig::default().save().unwrap();
+        if let Some(content) = providers {
+            fs::write(config_dir().join(PROVIDERS_FILE), content).unwrap();
+        }
         let host = PluginHost::with_session_provider_preparer(
             Arc::new(ToolRegistry::new()),
             Default::default(),
@@ -159,6 +180,7 @@ impl Fixture {
             _host: host,
             storage: StateDir::from_path(state.path().to_path_buf()),
             _state: state,
+            _serial: serial,
         }
     }
 

@@ -488,10 +488,7 @@ impl StagedCheckpoint {
         if !claim_publication() {
             return Ok(false);
         }
-        self.temporary
-            .persist(&self.path)
-            .map_err(|error| StorageError::from(error.error))?;
-        crate::sync_parent_dir(&self.path);
+        crate::persist(self.temporary, &self.path)?;
         Ok(true)
     }
 }
@@ -2129,6 +2126,28 @@ mod tests {
         let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
         assert!(loaded.subagents()[0].ambiguous);
         assert!(loaded.subagents()[0].agent_id.is_none());
+    }
+
+    /// The live writer keeps an append cursor on the log while a checkpoint
+    /// stages its replacement. Windows rejects a raw replace rename over that
+    /// open handle, so the staged publish must not depend on the destination
+    /// being closed.
+    #[test]
+    fn staged_checkpoint_publishes_over_an_open_log_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        session.save_to(dir).unwrap();
+        let cursor = OpenOptions::new()
+            .append(true)
+            .open(jsonl_path(dir, session.id))
+            .unwrap();
+
+        let staged = SessionLog::stage_checkpoint(dir, &session).unwrap();
+        assert!(staged.publish_unowned(|| true).unwrap());
+
+        drop(cursor);
+        TestSession::load_from(session.id, dir).unwrap();
     }
 
     #[test]

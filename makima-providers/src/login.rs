@@ -444,7 +444,7 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     use makima_config::providers::ProviderDef;
     use makima_storage::model::read_model;
@@ -606,17 +606,31 @@ mod tests {
         }
     }
 
+    /// `providers.toml` lives in the process paths every test shares, so the
+    /// tests that read and write it cannot run beside each other.
+    fn shared_config() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     struct Fixture {
         _dir: TempDir,
+        _serial: MutexGuard<'static, ()>,
         storage: StateDir,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let serial = shared_config();
             let dir = TempDir::new().unwrap();
-            makima_storage::paths::init_at(dir.path().to_path_buf()).unwrap();
+            makima_storage::paths::init_shared_for_test();
+            ProvidersConfig::default().save().unwrap();
             let storage = StateDir::from_path(dir.path().to_path_buf());
-            Self { _dir: dir, storage }
+            Self {
+                _dir: dir,
+                _serial: serial,
+                storage,
+            }
         }
 
         fn registry(&self, backend: FakeAuthBackend, methods: &[&str]) -> ProviderRegistry {

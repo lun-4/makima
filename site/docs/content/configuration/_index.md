@@ -158,6 +158,7 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `shell` | string | `auto` | - | Windows shell for the bash tool: auto (Git Bash from GIT_INSTALL_ROOT, else cmd), cmd, or powershell; Unix ignores it |
 
 ### `provider`
 
