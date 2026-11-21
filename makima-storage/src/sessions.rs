@@ -9,6 +9,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+#[cfg(windows)]
+use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +18,11 @@ use std::time::UNIX_EPOCH;
 
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FileBasicInfo,
+    SetFileInformationByHandle,
+};
 
 use crate::conversation::ConversationState;
 use crate::id::MakimaId;
@@ -683,6 +690,8 @@ impl SessionLog {
         let path = jsonl_path(dir, session.id);
         let mut temporary = NamedTempFile::new_in(dir).map_err(StorageError::from)?;
         write_full_session(temporary.as_file_mut(), session)?;
+        #[cfg(windows)]
+        clear_temporary_attribute(temporary.as_file()).map_err(StorageError::from)?;
         temporary
             .as_file()
             .sync_data()
@@ -845,6 +854,35 @@ impl SessionLog {
                     .is_none_or(|msgs| count > msgs.len())
             })
     }
+}
+
+#[cfg(windows)]
+fn clear_temporary_attribute(file: &File) -> io::Result<()> {
+    let attributes = file.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_TEMPORARY == 0 {
+        return Ok(());
+    }
+    let remaining = attributes & !FILE_ATTRIBUTE_TEMPORARY;
+    let info = FILE_BASIC_INFO {
+        FileAttributes: if remaining == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            remaining
+        },
+        ..Default::default()
+    };
+    let success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
@@ -1908,11 +1946,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink as symlink_dir;
     #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
+    use std::os::windows::fs::{MetadataExt, symlink_dir};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
 
     type TestSession = Session<Value, Value, Value>;
 
@@ -1924,6 +1964,7 @@ mod tests {
     const SONNET_COST: f64 = 0.42;
     const HAIKU_COST: f64 = 0.08;
     const TAMPERED_TITLE: &str = "tampered cached title";
+    const CHECKPOINT_MESSAGE: &str = "new checkpoint message";
     const PENDING_DRAFT: &str = "half typed thought";
     const POST_TEXT: &str = "reviewer has findings";
     const POST_AGENT: &str = "session-reviewer";
@@ -2143,11 +2184,32 @@ mod tests {
             .open(jsonl_path(dir, session.id))
             .unwrap();
 
+        session.push_message(Value::from(CHECKPOINT_MESSAGE));
         let staged = SessionLog::stage_checkpoint(dir, &session).unwrap();
+        #[cfg(windows)]
+        assert_eq!(
+            staged
+                .temporary
+                .as_file()
+                .metadata()
+                .unwrap()
+                .file_attributes()
+                & FILE_ATTRIBUTE_TEMPORARY,
+            0
+        );
         assert!(staged.publish_unowned(|| true).unwrap());
 
         drop(cursor);
-        TestSession::load_from(session.id, dir).unwrap();
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        #[cfg(windows)]
+        assert_eq!(
+            fs::metadata(jsonl_path(dir, session.id))
+                .unwrap()
+                .file_attributes()
+                & FILE_ATTRIBUTE_TEMPORARY,
+            0
+        );
     }
 
     #[test]
