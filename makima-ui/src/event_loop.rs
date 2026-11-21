@@ -4823,6 +4823,7 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
         percentage: limit.percentage,
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
+        ui_shortname_hint: limit.ui_shortname_hint,
     }
 }
 

@@ -1,7 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{ActorSnapshot, AgentActorHandle, AgentId, TurnId, TurnTicket};
+use futures_lite::future::or;
+
+use crate::{
+    ActorSnapshot, AgentActorHandle, AgentId, CallScope, ReasonedCancelTrigger, TurnId,
+    TurnOutcome, TurnTicket,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
@@ -138,6 +143,7 @@ pub struct ShutdownReport {
 #[derive(Clone)]
 pub struct CurrentManagedTurn {
     pub(crate) token: ManagedTurnToken,
+    pub(crate) tool_call: Option<Arc<CallScope>>,
     pub(crate) lease: TurnPermitLease,
     pub(crate) policy: Option<Arc<crate::RunSettings>>,
     pub(crate) mode: Option<crate::AgentMode>,
@@ -204,6 +210,10 @@ impl CurrentManagedTurn {
         )
     }
 
+    pub fn tool_call(&self) -> Option<&CallScope> {
+        self.tool_call.as_deref()
+    }
+
     pub fn lease(&self) -> TurnPermitLease {
         self.lease.clone()
     }
@@ -264,26 +274,49 @@ impl TurnPermitLease {
 pub struct ManagedPromptWait {
     pub(crate) inner: Arc<super::PromptWaitInner>,
     pub(crate) ticket: TurnTicket,
+    pub(crate) _cancel: ReasonedCancelTrigger,
 }
 
 impl ManagedPromptWait {
     pub async fn wait_result(self) -> Result<crate::TurnResult, PromptWaitError> {
-        let result = self.inner.wait_result().await;
-        self.inner.lease.wait_until_owned().await;
-        result?;
+        self.wait_owned().await?;
         Ok(self.ticket.wait_result().await)
     }
 
-    pub async fn wait(self) -> Result<crate::TurnOutcome, PromptWaitError> {
+    pub async fn wait(self) -> Result<TurnOutcome, PromptWaitError> {
+        self.wait_owned().await
+    }
+
+    async fn wait_owned(&self) -> Result<TurnOutcome, PromptWaitError> {
         let result = self.inner.wait_result().await;
         self.inner.lease.wait_until_owned().await;
         result
     }
-}
 
-impl Drop for ManagedPromptWait {
-    fn drop(&mut self) {
-        self.inner.cancel();
+    /// Waits with the parent lease until the call moves. A moved call keeps the
+    /// original watcher and timeout, but no longer waits for the parent permit.
+    pub async fn wait_for_call(self, call: &CallScope) -> Result<TurnOutcome, PromptWaitError> {
+        if let Some(result) = or(
+            async {
+                call.moved().await;
+                None
+            },
+            async { Some(self.wait_owned().await) },
+        )
+        .await
+        {
+            return result;
+        }
+        // Dropping the parent's trigger here would cancel the watcher on handoff.
+        let _parent_cancel = self.inner.lease.retire(self.inner.watcher_id);
+        or(
+            async {
+                call.cancel().cancelled().await;
+                Err(PromptWaitError::Cancelled)
+            },
+            self.inner.wait_result(),
+        )
+        .await
     }
 }
 

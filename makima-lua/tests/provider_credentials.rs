@@ -127,6 +127,15 @@ const SCRIPTS: &str = r#"
                 return ctx.credentials:read().access
             end)
         end,
+        concurrent_store_reads = function(ctx)
+            local store = makima.credentials.open(ctx, STORE_KEY)
+            assert(store:write({ api_key = API_KEY }))
+            local function read()
+                return assert(store:read()).api_key
+            end
+            local results = makima.async.gather({ read, read })
+            return results[1].value .. "," .. results[2].value
+        end,
         plugin_store = function(ctx)
             local store = makima.credentials.open(ctx, STORE_KEY)
             store:write({ api_key = API_KEY })
@@ -455,6 +464,56 @@ fn refresh_error_table_reaches_the_caller_intact() {
         fixture.run("fail_table"),
         format!("{REFRESH_STATUS},{REFRESH_ERR},{RETRY_AFTER_SECS}")
     );
+}
+
+#[test]
+fn concurrent_reads_of_one_store_succeed() {
+    let fixture = Fixture::new("");
+    assert_eq!(
+        fixture.run("concurrent_store_reads"),
+        format!("{API_KEY},{API_KEY}")
+    );
+}
+
+#[test]
+fn concurrent_provider_prepares_read_one_cached_store() {
+    const PREPARES: usize = 10;
+    let state = TempDir::new().unwrap();
+    let host = new_host(state.path());
+    let source = format!(
+        r#"
+        local root = ...
+        local store
+        makima.api.register_provider(root:with_name("{NAMESPACE}"), {{
+            id = "{PROVIDER}",
+            display_name = "Fake",
+            models = {{ {{ id = "fake-1", tier = "strong" }} }},
+            prepare = function(ctx, model)
+                store = store or makima.credentials.open(ctx, "{STORE_KEY}")
+                local saved = assert(store:read())
+                assert(saved.api_key == "{API_KEY}")
+                return {{ stream = function() end }}
+            end,
+        }})
+        "#
+    );
+    save_credentials(
+        &StateDir::from_path(state.path().to_path_buf()),
+        NAMESPACED_STORE,
+        &json!({ "api_key": API_KEY }),
+    )
+    .unwrap();
+    host.load_source(PLUGIN, &source).unwrap();
+    let providers = host
+        .provider_registry(makima_providers::Timeouts::default())
+        .unwrap();
+    let model = providers.model(SPEC).unwrap();
+    let results = smol::block_on(bounded(futures::future::join_all(
+        (0..PREPARES).map(|_| providers.prepare(model.clone())),
+    )));
+    for result in results {
+        result.unwrap();
+    }
 }
 
 #[test]
