@@ -121,18 +121,17 @@ lua_table! {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::shell;
+    use makima_config::Shell;
+    use mlua::Lua;
+    use test_case::test_case;
 
-    #[test]
-    fn shell_reflects_the_configured_value() {
+    #[test_case(Shell::Cmd, "cmd"; "cmd")]
+    #[test_case(Shell::Powershell, "powershell"; "powershell")]
+    fn shell_reflects_platform_and_config(configured: Shell, windows_shell: &str) {
         let lua = Lua::new();
-        assert_eq!(shell(&lua).unwrap(), "bash");
-        #[cfg(windows)]
-        {
-            lua.set_app_data(makima_config::Shell::Cmd);
-            assert_eq!(shell(&lua).unwrap(), "cmd");
-            lua.set_app_data(makima_config::Shell::Powershell);
-            assert_eq!(shell(&lua).unwrap(), "powershell");
-        }
+        lua.set_app_data(configured);
+        let expected = if cfg!(windows) { windows_shell } else { "bash" };
+        assert_eq!(shell(&lua).unwrap(), expected);
     }
 }
