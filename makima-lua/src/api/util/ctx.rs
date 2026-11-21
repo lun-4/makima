@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use makima_agent::agent::LoadedInstructions;
 use makima_agent::cancel::CancelToken;
-use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
+use makima_agent::tools::{
+    FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
+};
 use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
@@ -111,6 +113,7 @@ enum Caps {
         config: AgentConfig,
         workflow: bool,
         audience: ToolAudience,
+        output_mode: ToolOutputMode,
         session_id: Option<SessionRef>,
     },
     Restore {
@@ -163,6 +166,7 @@ impl LuaCtx {
                 config: ctx.config.clone(),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
+                output_mode: ctx.output_mode,
                 session_id: ctx.session_id.clone(),
             },
         )
@@ -321,6 +325,15 @@ impl LuaCtx {
         }
     }
 
+    /// Trusted orchestration runs a model, so its tools are model-facing.
+    fn output_mode(&self) -> ToolOutputMode {
+        match &self.caps {
+            Caps::Handler { agent, .. } => agent.output_mode,
+            Caps::Start { output_mode, .. } => *output_mode,
+            Caps::Trusted { .. } | Caps::Restore { .. } => ToolOutputMode::Compact,
+        }
+    }
+
     fn audience(&self) -> Option<ToolAudience> {
         match &self.caps {
             Caps::Handler { agent, .. } | Caps::Trusted { agent, .. } => Some(agent.audience),
@@ -401,6 +414,8 @@ impl UserData for LuaCtx {
             Ok((Some(agent.mode.id().key().to_string()), None))
         });
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
+
+        methods.add_method("output_mode", |_, this, ()| Ok(this.output_mode().as_str()));
 
         methods.add_method("workflow", |lua, this, ()| {
             let Some(workflow) = this.workflow() else {

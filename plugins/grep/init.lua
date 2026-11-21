@@ -11,7 +11,7 @@ local opts = makima.api.register_options(output_limits.extend({
   search_result_limit = {
     default = 100,
     min = 10,
-    desc = "Max match groups per search. A call's `limit` param overrides it.",
+    desc = "Max match groups per search in compact mode. A call's `limit` param overrides it.",
   },
 }))
 
@@ -262,9 +262,12 @@ makima.api.register_tool({
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
+    local limit = input.limit
+    if ctx:output_mode() == "compact" then
+      limit = math.min(limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
+    end
 
-    local max_line_bytes = output_limits.line_bytes(ctx)
+    local max_line_bytes = output_limits.line_bytes(ctx) or 0
     local path, path_err = ctx:resolve_path(input.path or ".")
     if not path then
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
@@ -276,6 +279,7 @@ makima.api.register_tool({
       context_before = input.context_before or 0,
       context_after = input.context_after or 0,
       limit = limit,
+      unlimited = ctx:output_mode() == "full",
       max_line_bytes = max_line_bytes,
     })
 

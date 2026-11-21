@@ -121,7 +121,7 @@ local description = [[Execute Python in a sandbox where every tool is an async f
 
 Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** cheaper than sequential tool calls!
 
-- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
+- All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Tool results are complete; only what you print or return is capped. Parse output yourself.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
 - Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
 - Fresh sandbox each run: no state persists between executions.

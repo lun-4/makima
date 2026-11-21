@@ -106,6 +106,9 @@ local function rtk_find_unsupported(cmd)
 end
 
 local function rtk_rewrite(command, ctx)
+  if ctx:output_mode() == "full" then
+    return nil
+  end
   local config = ctx:config()
   if config and not config.rtk then
     return nil
@@ -262,7 +265,7 @@ Commands run in ]] .. cwd .. [[ by default.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
+- Output sent to the model beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
 - Use `background = true` for long builds, tests, or servers; the call returns at once and the result arrives as a message.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 

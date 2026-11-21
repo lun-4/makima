@@ -10,7 +10,7 @@ use makima_agent::mcp::test_support::stub_session_with_result;
 use makima_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use makima_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
 use makima_agent::tools::test_support::stub_ctx;
-use makima_agent::tools::{CallOrigin, Deadline, ToolRegistry, TurnToolBindings};
+use makima_agent::tools::{CallOrigin, Deadline, ToolOutputMode, ToolRegistry, TurnToolBindings};
 use makima_lua::{Permission, PluginHost, PluginPermissions, UiAction};
 use test_case::test_case;
 
@@ -374,6 +374,7 @@ fn call_of<'a>(
         tool_id: TOOL_ID,
         session_id: None,
         origin,
+        output_mode: ToolOutputMode::Compact,
         authority,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,
