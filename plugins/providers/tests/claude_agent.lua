@@ -195,6 +195,21 @@ t.case("discovery_lists_each_model_once", function()
   t.eq(models[2].tier, "weak")
 end)
 
+t.case("subscription_metadata_requires_a_known_first_party_plan", function()
+  local cases = {
+    { { subscription = "pro", api_provider = "firstParty" }, "Claude Pro" },
+    { { subscription = "max", api_provider = "firstParty" }, "Claude Max" },
+    { { subscription = "pro", api_provider = "bedrock" } },
+    { { subscription = "console", api_provider = "firstParty" } },
+    { { api_provider = "firstParty" } },
+    { { subscription = "pro" } },
+  }
+  for _, case in ipairs(cases) do
+    local ctx = t.provider_ctx({ json({ account = case[1], models = { { value = "sonnet" } } }) })
+    t.eq(spec.discover(ctx, CONFIG)[1].subsidised_by, case[2])
+  end
+end)
+
 t.case("discovery_is_cached_for_the_next_start", function()
   local dir = t.mktmpdir("claude-agent")
   local cache = makima.fs.joinpath(dir, claude_agent.CACHE_FILE)

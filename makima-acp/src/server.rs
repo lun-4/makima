@@ -5505,6 +5505,8 @@ mod tests {
                 usage: TokenUsage::default(),
                 model: OFFLINE_SPEC.to_owned(),
                 cost: Some(cost),
+                list_cost: None,
+                subsidy_source: None,
                 context_size: Some(0),
                 context_window: 1,
             }))

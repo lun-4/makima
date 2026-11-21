@@ -1034,6 +1034,8 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         usage,
         model: model.into(),
         cost,
+        list_cost: None,
+        subsidy_source: None,
         context_size: None,
         context_window: 0,
     }))
@@ -12747,9 +12749,90 @@ fn final_history_after_subagent_closed_only_persists_messages() {
 }
 
 #[test]
+fn chat_costs_survive_session_roundtrip() {
+    let mut app = app_with_subagent();
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    app.update(sub_turn_complete());
+    app.sync_subagents();
+
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    app.state.session = Arc::new(AppSession::load(id, &dir).unwrap());
+    app.reset_ui_chrome();
+    app.restore_display();
+
+    assert_eq!(app.chats[0].cost, MAIN_COST);
+    assert_eq!(app.chats[1].cost, SUB_COST);
+    assert_eq!(app.state.cost, Some(MAIN_COST.unwrap() + SUB_COST.unwrap()));
+    app.update(agent_msg(turn_complete(
+        MAIN_TOKENS,
+        "main-model",
+        MAIN_COST,
+    )));
+    assert_eq!(app.chats[0].cost, Some(MAIN_COST.unwrap() * 2.0));
+    assert_eq!(app.chats[1].cost, SUB_COST);
+}
+
+#[test]
+fn subsidy_sources_survive_model_switch_and_resume() {
+    const FIRST: &str = "first plan";
+    const SECOND: &str = "second plan";
+    const FIRST_COST: f64 = 0.25;
+    const SECOND_COST: f64 = 0.5;
+    const LEGACY_COST: f64 = 0.125;
+    let mut app = app_with_subagent();
+    for (source, list) in [
+        (Some(FIRST), FIRST_COST),
+        (Some(SECOND), SECOND_COST),
+        (None, LEGACY_COST),
+    ] {
+        let mut event = turn_complete(MAIN_TOKENS, "same-model-id", Some(0.0));
+        if let AgentEvent::TurnComplete(turn) = &mut event {
+            turn.list_cost = Some(list);
+            turn.subsidy_source = source.map(Arc::from);
+        }
+        app.update(agent_msg(event));
+    }
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    app.state.session = Arc::new(AppSession::load(id, &dir).unwrap());
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_eq!(app.chats[0].list_cost, Some(LEGACY_COST));
+    assert_eq!(
+        app.chats[0].list_cost_by_source.get(FIRST),
+        Some(&FIRST_COST)
+    );
+    assert_eq!(
+        app.chats[0].list_cost_by_source.get(SECOND),
+        Some(&SECOND_COST)
+    );
+}
+
+#[test]
+fn legacy_session_does_not_attribute_aggregate_cost_to_main_chat() {
+    let mut app = test_app();
+    app.state.cost = MAIN_COST;
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert_eq!(app.state.cost, MAIN_COST);
+    assert_eq!(app.chats[0].cost, None);
+}
+
+#[test]
 fn turn_complete_after_subagent_closed_only_accounts_usage() {
     const MODEL: &str = "delayed-model";
     const COST: f64 = 0.125;
+    const LIST: f64 = 0.75;
+    const SOURCE: &str = "subscription";
 
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
@@ -12769,14 +12852,20 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
         subagent: Some(info.clone()),
         identity: Some(work_identity(1)),
     })));
+    app.live_chat_index.remove(&agent_id);
+    let mut late = turn_complete(usage, MODEL, Some(COST));
+    if let AgentEvent::TurnComplete(turn) = &mut late {
+        turn.list_cost = Some(LIST);
+        turn.subsidy_source = Some(SOURCE.into());
+    }
     app.update(Msg::Agent(Box::new(Envelope {
-        event: turn_complete(usage, MODEL, Some(COST)),
+        event: late,
         subagent: Some(info),
         identity: Some(work_identity(1)),
     })));
 
     assert_eq!(app.state.token_usage, usage);
-    assert_eq!(app.chats[chat_idx].cost, Some(COST));
+    assert_eq!(app.chats[chat_idx].cost, None);
     assert_eq!(app.chats.len(), chat_count);
     assert!(app.chats[chat_idx].is_finished());
     assert!(app.active_subagent_closed());
@@ -12788,7 +12877,22 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
     app.state.session_mut().save(&dir).unwrap();
     let persisted = AppSession::load(session_id, &dir).unwrap();
     assert_eq!(persisted.usage_by_model().len(), 1);
-    assert_eq!(persisted.usage_by_model()[MODEL], usage.billed(Some(COST)));
+    assert_eq!(
+        persisted.usage_by_model()[MODEL],
+        usage.billed_with_list_cost(Some(COST), Some(LIST))
+    );
+    assert_eq!(
+        persisted.chat_usage(Some(TASK_ID)),
+        Some(&usage.billed(Some(COST)))
+    );
+    assert_eq!(persisted.chat_usage(None), None);
+    assert_eq!(
+        persisted
+            .chat_list_cost_by_source(Some(TASK_ID))
+            .unwrap()
+            .get(SOURCE),
+        Some(&LIST)
+    );
 }
 
 #[test]

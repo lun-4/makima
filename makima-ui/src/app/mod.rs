@@ -2859,7 +2859,11 @@ impl App {
                     }
                     AgentEvent::TurnComplete(turn) => {
                         let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
-                        self.account_turn_complete(chat_idx, &turn);
+                        self.account_turn_complete(
+                            chat_idx,
+                            Some(&subagent.parent_tool_use_id),
+                            &turn,
+                        );
                     }
                     _ => {}
                 }
@@ -3046,7 +3050,7 @@ impl App {
         self.chats[chat_idx].retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.account_turn_complete(Some(chat_idx), tc);
+            self.account_turn_complete(Some(chat_idx), subagent_id.as_deref(), tc);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -3165,14 +3169,38 @@ impl App {
         actions
     }
 
-    fn account_turn_complete(&mut self, chat_idx: Option<usize>, turn: &TurnCompleteEvent) {
+    fn account_turn_complete(
+        &mut self,
+        chat_idx: Option<usize>,
+        child: Option<&str>,
+        turn: &TurnCompleteEvent,
+    ) {
         self.state.token_usage += turn.usage;
+        add_cost(&mut self.state.cost, turn.cost);
+        add_cost(&mut self.state.list_cost, turn.list_cost);
         if let Some(chat_idx) = chat_idx {
             add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+            if let (Some(cost), Some(source)) = (turn.list_cost, &turn.subsidy_source) {
+                *self.chats[chat_idx]
+                    .list_cost_by_source
+                    .entry(source.to_string())
+                    .or_default() += cost;
+            } else {
+                add_cost(&mut self.chats[chat_idx].list_cost, turn.list_cost);
+            }
         }
-        self.state
-            .session_mut()
-            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
+        let usage = turn.usage.billed_with_list_cost(turn.cost, turn.list_cost);
+        let mut chat_usage = usage;
+        if turn.subsidy_source.is_some() {
+            chat_usage.list_cost = None;
+        }
+        self.state.session_mut().add_chat_usage(child, chat_usage);
+        if let (Some(cost), Some(source)) = (turn.list_cost, &turn.subsidy_source) {
+            self.state
+                .session_mut()
+                .add_chat_list_cost_source(child, source, cost);
+        }
+        self.state.session_mut().add_model_usage(&turn.model, usage);
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went

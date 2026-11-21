@@ -879,6 +879,8 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
+                list_cost: self.model.subsidised_list_cost(&response.usage, fast),
+                subsidy_source: self.model.subsidised_by.clone(),
                 context_size: Some(self.context_size),
                 context_window: self.model.context_window,
             })))
@@ -2675,6 +2677,29 @@ mod tests {
             ));
             let events = drain_events(&event_rx);
             assert_eq!(terminal_outcomes(&events), [&failed, &completed]);
+        });
+    }
+
+    #[test_case(Some("Plan A"); "subsidised")]
+    #[test_case(None; "metered")]
+    fn turn_event_captures_model_subsidy_source(source: Option<&str>) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            Arc::make_mut(&mut agent.model).subsidised_by = source.map(Arc::from);
+            run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            Arc::make_mut(&mut agent.model).subsidised_by = Some(Arc::from("Changed"));
+            let event = events
+                .drain()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::TurnComplete(event) => Some(event),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(event.subsidy_source.as_deref(), source);
         });
     }
 

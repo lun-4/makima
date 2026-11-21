@@ -907,6 +907,8 @@ mod tests {
             },
             model: "test-model".into(),
             cost,
+            list_cost: None,
+            subsidy_source: None,
             context_size,
             context_window,
         }

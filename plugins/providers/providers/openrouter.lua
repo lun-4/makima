@@ -15,9 +15,11 @@ for rank, level in ipairs(thinking.LEVELS) do
   RANK[level] = rank
 end
 
+-- Routers like `openrouter/auto` report `-1` because the real price depends
+-- on the pick, so a negative rate stays unknown rather than a negative price.
 local function per_million(value)
   local number = type(value) == "string" and tonumber(value)
-  return number and number * compat.PER_MILLION
+  return number and number >= 0 and number * compat.PER_MILLION or nil
 end
 
 local function has(list, value)

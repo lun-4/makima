@@ -27,9 +27,10 @@ function fetchUsage(): Promise<PlanUsage | undefined> {
 before(async () => {
   dir = await mkdtemp(join(tmpdir(), "bridge-"))
   socket = join(dir, "state", "bridge.sock")
+  const probe = { ...LOGGED_IN, account: { ...LOGGED_IN.account, subscriptionType: "max", apiProvider: "firstParty" as const } }
   server = await listen(
     socket,
-    handler(h.conversations, async () => LOGGED_IN, fetchUsage),
+    handler(h.conversations, async () => probe, fetchUsage),
   )
 })
 
@@ -87,9 +88,14 @@ test("status reports the login", async () => {
     protocol_version: 1,
     claude_code_version: "2.1.318",
     logged_in: true,
-    account: { email: "a@example.com" },
+    account: { email: "a@example.com", subscription: "max", api_provider: "firstParty" },
     ready: true,
   })
+})
+
+test("models include the account used for discovery", async () => {
+  const response = await call("GET", "/v1/models")
+  assert.deepEqual(JSON.parse(response.text).account, { subscription: "max", api_provider: "firstParty" })
 })
 
 test("ending a conversation takes a known reason only", async () => {

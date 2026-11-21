@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 
 use makima_providers::model_registry;
 use makima_providers::{
-    CompleteModelSelection, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
+    CompleteModelSelection, Model, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
     ProviderRegistry,
 };
 
@@ -23,7 +23,11 @@ use crate::theme;
 
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
+const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
+/// Room for `$999.99` on either side of the slash.
+const PRICE_SEPARATOR: &str = " · ";
+const PRICE_WIDTH: usize = 7;
 const USE_CURRENT: &str = "Use current";
 const LOADING_OPTIONS: &str = "   Loading model options…";
 const OPTION_HINT: &str = "   ↑/↓ or Space/←/→ cycle values, empty uses current";
@@ -80,7 +84,7 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    tier: String,
+    detail: String,
     override_tiers: Vec<ModelTier>,
 }
 
@@ -94,7 +98,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn detail(&self) -> Option<&str> {
-        Some(&self.tier)
+        Some(&self.detail)
     }
 
     fn section(&self) -> Option<&str> {
@@ -670,7 +674,7 @@ fn fallback_model_entry(spec: &str) -> ModelEntry {
         id: id.to_owned(),
         provider_display: provider.to_owned(),
         suffix: None,
-        tier: format_tier_label("", &override_tiers, false),
+        detail: format_tier_label("", &override_tiers, false),
         override_tiers,
     }
 }
@@ -685,11 +689,24 @@ fn format_tier_label(tier: &str, override_tiers: &[ModelTier], free: bool) -> St
             .collect::<Vec<_>>()
             .join("/")
     };
-    if free {
-        format!("{FREE_PREFIX}{tier}")
-    } else {
-        tier
+    match (free, tier.is_empty()) {
+        (true, true) => FREE_LABEL.to_owned(),
+        (true, false) => format!("{FREE_PREFIX}{tier}"),
+        (false, _) => tier,
     }
+}
+
+/// Input and output rates per million tokens. A subsidised model shows its
+/// `$0` bill instead, so its shelf price would only mislead here.
+fn format_pricing(model: &Model) -> Option<String> {
+    let pricing = &model.pricing;
+    (model.subsidy_source().is_none() && !pricing.is_zero()).then(|| {
+        format!(
+            "{:>PRICE_WIDTH$}/{:<PRICE_WIDTH$}",
+            format!("${:.2}", pricing.input),
+            format!("${:.2}", pricing.output),
+        )
+    })
 }
 
 fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEntry> {
@@ -697,18 +714,23 @@ fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEn
     let provider_display = providers.display_name(provider_str)?.to_string();
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match providers.model(spec) {
-        Ok(m) => (m.tier.to_string(), m.free),
-        Err(_) => (String::new(), false),
+    let (tier, free, price) = match providers.model(spec) {
+        Ok(m) => (m.tier.to_string(), m.free, format_pricing(&m)),
+        Err(_) => (String::new(), false, None),
     };
     let tier = format_tier_label(&tier, &override_tiers, free);
+    let detail = match price {
+        Some(price) if !tier.is_empty() => format!("{tier}{PRICE_SEPARATOR}{price}"),
+        Some(price) => price,
+        None => tier,
+    };
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
         provider_display,
         suffix: None,
-        tier,
+        detail,
         override_tiers,
     })
 }
@@ -716,7 +738,7 @@ fn parse_model_entry(spec: &str, providers: &ProviderRegistry) -> Option<ModelEn
 #[cfg(test)]
 mod tests {
     use super::{
-        FREE_PREFIX, LOADING_OPTIONS, ModelPicker, ModelPickerAction, RECENT_SECTION,
+        FREE_LABEL, FREE_PREFIX, LOADING_OPTIONS, ModelPicker, ModelPickerAction, RECENT_SECTION,
         parse_model_entry,
     };
     use crate::click::ClickTarget;
@@ -727,10 +749,11 @@ mod tests {
     use crate::repaint::Dirty;
     use arc_swap::ArcSwapOption;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use makima_providers::test_util::offline_ids;
+    use makima_providers::test_util::{offline_ids, offline_registry};
     use makima_providers::{
-        CompleteModelSelection, Effort, ModelCapabilities, ModelOption, ModelSelection, ModelTier,
-        ProviderRegistry, ThinkingConfig, ThinkingSupport, model_registry,
+        CompleteModelSelection, Effort, ModelCapabilities, ModelInfo, ModelOption, ModelPricing,
+        ModelSelection, ModelTier, ProviderRegistry, ThinkingConfig, ThinkingSupport,
+        model_registry,
     };
     use makima_storage::StateDir;
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
@@ -746,6 +769,21 @@ mod tests {
     const UNRESOLVED: &str = "openai/gpt-5";
     const FALLBACK: &str = "llama-cpp/default";
     const INVALID: &str = "not-a-value";
+    const PAID_ID: &str = "paid-model";
+    const FREE_ID: &str = "free-model";
+    const SUBSIDISED_ID: &str = "subsidised-model";
+    const PAID_SPEC: &str = "anthropic/paid-model";
+    const FREE_SPEC: &str = "anthropic/free-model";
+    const SUBSIDISED_SPEC: &str = "anthropic/subsidised-model";
+    const PAID_PRICING: ModelPricing = ModelPricing {
+        input: 3.0,
+        output: 15.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+        fast: None,
+    };
+    const PAID_PRICE_LABEL: &str = "  $3.00/$15.00 ";
+    const SUBSIDY_SOURCE: &str = "Max";
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
     const ALL_OPTIONS: ModelCapabilities = ModelCapabilities {
         thinking: ThinkingSupport::Yes,
@@ -1359,9 +1397,52 @@ mod tests {
         let entry = parse_model_entry(CURRENT, &test_providers()).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, ANTHROPIC);
-        assert!(!entry.tier.is_empty());
-        assert!(!entry.tier.starts_with(FREE_PREFIX));
+        assert!(!entry.detail.is_empty());
+        assert!(!entry.detail.starts_with(FREE_PREFIX));
         assert!(parse_model_entry("no-slash", &ProviderRegistry::default()).is_none());
+    }
+
+    fn priced_providers() -> Arc<ProviderRegistry> {
+        Arc::new(offline_registry(vec![(
+            ANTHROPIC,
+            vec![
+                priced_info(PAID_ID, Some(PAID_PRICING), false),
+                priced_info(FREE_ID, None, true),
+                priced_info(SUBSIDISED_ID, Some(PAID_PRICING), false),
+            ],
+        )]))
+    }
+
+    fn priced_info(id: &str, pricing: Option<ModelPricing>, free: bool) -> ModelInfo {
+        ModelInfo {
+            pricing,
+            free: Some(free),
+            subsidised_by: (id == SUBSIDISED_ID).then(|| SUBSIDY_SOURCE.into()),
+            ..ModelInfo::id_only(id.to_owned())
+        }
+    }
+
+    fn priced_picker() -> ModelPicker {
+        let models = models(&[PAID_SPEC, FREE_SPEC, SUBSIDISED_SPEC]);
+        ModelPicker::new(models, priced_providers(), cache())
+    }
+
+    /// A row with known rates shows them beside its tier, a free row says so,
+    /// and a subsidised one shows no shelf price because it bills `$0`.
+    #[test]
+    fn renders_prices_for_paid_models_and_marks_free_ones() {
+        let mut picker = priced_picker();
+        open(&mut picker, PAID_SPEC);
+        let text = render(&mut picker, 200, 24);
+        assert!(text.contains(PAID_PRICE_LABEL), "no price in:\n{text}");
+        assert!(text.contains(FREE_LABEL), "no free marker in:\n{text}");
+
+        let subsidised = parse_model_entry(SUBSIDISED_SPEC, &priced_providers()).unwrap();
+        assert!(
+            !subsidised.detail.contains('$'),
+            "a subsidised model must not show a shelf price: {}",
+            subsidised.detail
+        );
     }
 
     #[test_case(120, 24; "wide")]

@@ -609,7 +609,11 @@ function M.provider()
       end)
       discovered = true
       -- A failed listing falls back to the curated plan models.
-      return compat.merge(M.def, rows or {})
+      local models = compat.merge(M.def, rows or {})
+      for _, model in ipairs(models) do
+        model.subsidised_by = "ChatGPT"
+      end
+      return models
     end
     local body, err = authorized(ctx, config, state, function()
       return get_json(ctx, state.base .. compat.MODELS_PATH, headers(state))
@@ -626,6 +630,7 @@ function M.provider()
       return nil, err
     end
     local model = compat.describe(M.def, info)
+    model.subsidised_by = state.tokens and "ChatGPT" or nil
     -- API-key users get no opinion on fast; the host's pricing gate decides.
     if state.tokens then
       local listed = type(model.provider_data) == "table" and model.provider_data.fast ~= nil
