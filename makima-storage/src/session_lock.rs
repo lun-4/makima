@@ -293,20 +293,20 @@ impl Drop for ClaimedSessionLock {
 /// `fs4` reports `LockFileEx` failures as raw Windows errors, so a lock that
 /// simply belongs to someone else is not `WouldBlock` there.
 fn is_contended(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return true;
-    }
     #[cfg(windows)]
     {
-        matches!(
-            error.raw_os_error(),
-            Some(code)
-                if code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
-                    || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
-        )
+        error.kind() == io::ErrorKind::WouldBlock
+            || matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+                        || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+            )
     }
     #[cfg(not(windows))]
-    false
+    {
+        error.kind() == io::ErrorKind::WouldBlock
+    }
 }
 
 fn open_existing_locked(path: &Path) -> io::Result<Option<File>> {

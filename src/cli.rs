@@ -391,8 +391,7 @@ mod tests {
 
     const PROMPT: &str = "hello";
     const PROMPT_EQUALS_ARG: &str = "--prompt=hello";
-    const MODEL_HELP: &str =
-        "Defaults to last used model, then configured default_model, then auto-detected";
+    const MODEL_HELP: &str = "Defaults to the saved, configured, or auto-detected model";
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
