@@ -1770,7 +1770,6 @@ impl<'t> EventLoop<'t> {
         } = params;
 
         lua_event_handle.set_clock_format(crate::clock::resolved(ui_config.clock_format));
-        lua_event_handle.set_shell(config.shell);
 
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the

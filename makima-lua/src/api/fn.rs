@@ -7,10 +7,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use makima_agent::shell::{ResolvedShell, command};
+#[cfg(test)]
 use makima_config::Shell;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::api::env::resolved_shell;
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
@@ -66,9 +69,9 @@ pub(crate) enum JobCommand {
 }
 
 impl JobCommand {
-    fn build(&self, shell: Shell) -> Command {
+    fn build(&self, shell: impl Into<ResolvedShell>) -> Command {
         match self {
-            Self::Shell(cmd) => shell_command(cmd, shell),
+            Self::Shell(cmd) => command(shell, cmd),
             Self::Argv(argv) => {
                 let mut command = Command::new(&argv[0]);
                 command.args(&argv[1..]);
@@ -127,7 +130,7 @@ impl JobStore {
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
-        shell: Shell,
+        shell: impl Into<ResolvedShell>,
     ) -> Result<u32, String> {
         let cmd = cmd.into();
         let mut command = cmd.build(shell);
@@ -404,10 +407,6 @@ impl JobMeta {
     }
 }
 
-fn shell_command(cmd: &str, shell: Shell) -> Command {
-    makima_agent::shell::command(shell, cmd)
-}
-
 fn kill_job(meta: &mut JobMeta) {
     let pid = meta.pid;
     #[cfg(unix)]
@@ -522,19 +521,11 @@ fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>)
         None => (None, None, None, None, None),
     };
 
-    let shell = shell_setting(lua);
+    let shell = resolved_shell(lua);
     with_jobs(lua, |store| {
         store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit, shell)
     })
     .map_err(mlua::Error::runtime)
-}
-
-/// `jobstart` runs shell strings through `agent.shell`, the same choice the
-/// bash tool uses, so a plugin's `rtk --version` probe runs where its tool does.
-fn shell_setting(lua: &Lua) -> Shell {
-    lua.app_data_ref::<Shell>()
-        .map(|shell| *shell)
-        .unwrap_or_default()
 }
 
 /// Kill a running job immediately (SIGKILL on Unix). Safe to call on

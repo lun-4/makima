@@ -18,6 +18,7 @@ use include_dir::Dir;
 use makima_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use makima_agent::permissions::PluginRuleStore;
 use makima_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use makima_agent::shell::ResolvedShell;
 use makima_agent::tools::hook::{Authority, Verdict};
 use makima_agent::tools::offload::OutputLimits;
 use makima_agent::tools::{
@@ -44,7 +45,7 @@ use makima_commands::{
     Producer, ProducerPrecedence, Registration, RegistrationError, TargetCapabilities,
     TargetCapability,
 };
-use makima_config::RawConfig;
+use makima_config::{RawConfig, Shell};
 use makima_storage::id::{MakimaId, SessionRef};
 
 use crate::api::autocmd::{self, AutocmdStore};
@@ -216,7 +217,7 @@ pub enum Request {
     /// Print saves nothing, saved preferences included.
     SaveNoPreferences,
     SetClockFormat(makima_config::ClockFormat),
-    SetShell(makima_config::Shell),
+    SetShell(ResolvedShell),
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -2827,6 +2828,7 @@ impl LuaRuntime {
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(crate::api::usage::UsageMirror::default());
         lua.set_app_data(makima_config::ClockFormat::default());
+        lua.set_app_data(ResolvedShell::from(Shell::default()));
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
         lua.set_app_data(ProviderStore::default());
@@ -6107,7 +6109,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    makima_config::Shell::default(),
+                    Shell::default(),
                 )
                 .unwrap();
             store
@@ -6119,7 +6121,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    makima_config::Shell::default(),
+                    Shell::default(),
                 )
                 .unwrap();
         });
@@ -7284,7 +7286,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    makima_config::Shell::default(),
+                    Shell::default(),
                 )
             })
             .unwrap();

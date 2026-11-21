@@ -18,8 +18,9 @@ const GIT_BASH: &str = "bin/bash.exe";
 
 /// Builds the command that runs `script` under the configured shell. Unix
 /// always gets `bash -c`.
-pub fn command(shell: Shell, script: &str) -> Command {
-    let (program, flag) = program_and_flag(shell, git_bash().as_deref());
+pub fn command(shell: impl Into<ResolvedShell>, script: &str) -> Command {
+    let shell = shell.into();
+    let (program, flag) = program_and_flag(shell.shell, shell.git_bash.as_deref());
     let mut command = Command::new(program);
     #[cfg(windows)]
     if flag == CMD_SCRIPT_FLAG {
@@ -32,10 +33,30 @@ pub fn command(shell: Shell, script: &str) -> Command {
     command
 }
 
-/// The shell a plugin should assume when it builds command text. `auto` only
-/// claims bash when Git for Windows is actually present.
-pub fn name(shell: Shell) -> &'static str {
-    name_of(resolved(shell, git_bash().as_deref()))
+#[derive(Clone)]
+pub struct ResolvedShell {
+    shell: Shell,
+    git_bash: Option<PathBuf>,
+}
+
+impl From<Shell> for ResolvedShell {
+    fn from(shell: Shell) -> Self {
+        let git_bash = if shell == Shell::Auto {
+            git_bash()
+        } else {
+            None
+        };
+        Self {
+            shell: resolved(shell, git_bash.as_deref()),
+            git_bash,
+        }
+    }
+}
+
+impl ResolvedShell {
+    pub fn name(&self) -> &'static str {
+        name_of(self.shell)
+    }
 }
 
 fn name_of(shell: Shell) -> &'static str {

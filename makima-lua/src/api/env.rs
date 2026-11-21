@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use makima_agent::shell::ResolvedShell;
+use makima_config::Shell;
 use makima_lua_macro::{lua_fn, lua_table};
 use makima_storage::StateDir;
 use mlua::Lua;
@@ -97,11 +99,18 @@ fn no_project(lua: &Lua) -> mlua::Result<bool> {
 /// end
 #[lua_fn(guard = Env)]
 fn shell(lua: &Lua) -> mlua::Result<&'static str> {
-    let shell = lua
-        .app_data_ref::<makima_config::Shell>()
-        .map(|shell| *shell)
-        .unwrap_or_default();
-    Ok(makima_agent::shell::name(shell))
+    Ok(resolved_shell(lua).name())
+}
+
+pub(crate) fn resolved_shell(lua: &Lua) -> ResolvedShell {
+    lua.app_data_ref::<ResolvedShell>()
+        .map(|shell| shell.clone())
+        .unwrap_or_else(|| {
+            lua.app_data_ref::<Shell>()
+                .map(|shell| *shell)
+                .unwrap_or_default()
+                .into()
+        })
 }
 
 lua_table! {

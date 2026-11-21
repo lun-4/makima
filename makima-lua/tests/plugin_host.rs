@@ -57,6 +57,8 @@ const REPLACEMENT_DESC: &str = "took the builtin name over";
 const ZERO_LINES_OPTION: &str = "max_output_lines";
 const BASH_PROBE_COMMAND: &str = "printf '%s%s\\n' X Y";
 const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
+#[cfg(windows)]
+const WINDOWS_SHELL_PROBE_OUTPUT: &str = "42";
 
 struct FakeCommandHost;
 
@@ -4565,6 +4567,42 @@ fn restore_rebuilds_body_from_input_content(
         !text.contains(summary),
         "restored body should show content, not the summary: {text}"
     );
+}
+
+#[cfg(windows)]
+#[test_case::test_case("cmd", "if 1==1 echo 42"; "cmd")]
+#[test_case::test_case("powershell", "Write-Output 42; exit 0"; "powershell")]
+fn configured_shell_is_used_when_builtins_load(shell: &str, command: &str) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("makima.setup({{ agent = {{ shell = '{shell}' }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config().unwrap();
+    host.load_configured_builtins(&config).unwrap();
+
+    let description = tool_description(&reg, &config.agent, "bash");
+    assert!(
+        description.starts_with(&format!("Execute a {shell} command.")),
+        "{description}"
+    );
+
+    let input = json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes(None)).expect("permission scopes");
+    assert!(scopes.force_prompt);
+    assert_eq!(scopes.scopes, [command]);
+
+    let mut ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    let output = exec_with_ctx(&reg, "bash", input, &ctx).unwrap();
+    assert_eq!(output.trim(), WINDOWS_SHELL_PROBE_OUTPUT);
 }
 
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must call
