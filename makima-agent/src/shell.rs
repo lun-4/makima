@@ -1,12 +1,15 @@
+#[cfg(windows)]
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use makima_config::Shell;
 
+#[cfg(windows)]
 const GIT_INSTALL_ROOT: &str = "GIT_INSTALL_ROOT";
 /// Relative to `GIT_INSTALL_ROOT`. `bin/bash.exe` is the shim Git for Windows
 /// ships so a plain spawn gets the same MSYS environment as its own terminal.
+#[cfg(windows)]
 const GIT_BASH: &str = "bin/bash.exe";
 
 /// Builds the command that runs `script` under the configured shell. Unix
@@ -38,10 +41,10 @@ fn name_of(shell: Shell) -> &'static str {
 /// otherwise, so a machine without Git for Windows keeps working instead of
 /// spawning a bash that is not there.
 fn resolved(shell: Shell, git_bash: Option<&Path>) -> Shell {
-    match shell {
+    match (shell, git_bash) {
         #[cfg(windows)]
-        Shell::Auto if git_bash.is_none() => Shell::Cmd,
-        _ => shell,
+        (Shell::Auto, None) => Shell::Cmd,
+        (shell, _) => shell,
     }
 }
 
@@ -76,6 +79,7 @@ fn git_bash() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     const FAKE_GIT: &str = "/Program Files/Git/bin/bash.exe";
 
     #[cfg(not(windows))]
