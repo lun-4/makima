@@ -278,13 +278,14 @@ impl TerminalMux {
 impl TerminalGuard {
     pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
         let terminal = ratatui::init();
+        let guard = Self;
         write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
         crate::terminal_image::init_graphics_detection();
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
         push_keyboard_enhancement();
-        Ok((Self, terminal))
+        Ok((guard, terminal))
     }
 }
 
