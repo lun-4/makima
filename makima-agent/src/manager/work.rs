@@ -187,6 +187,23 @@ impl WorkLedger {
         agent_id: AgentId,
         incarnation: u64,
     ) -> Result<WorkAdmission, ManagerError> {
+        self.rebind(agent_id, incarnation, None)
+    }
+
+    pub(crate) fn bind_closed_incarnation(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        incarnation: u64,
+    ) -> Result<(), ManagerError> {
+        self.rebind(agent_id, incarnation, Some(false)).map(drop)
+    }
+
+    fn rebind(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        incarnation: u64,
+        open: Option<bool>,
+    ) -> Result<WorkAdmission, ManagerError> {
         let mut state = self.lock();
         let agent = state
             .agents
@@ -195,6 +212,10 @@ impl WorkLedger {
             .ok_or(ManagerError::UnknownAgent(agent_id))?;
         PublicationGuard::cancel_all(&mut agent.publications);
         agent.incarnation = incarnation;
+        if let Some(open) = open {
+            agent.open = open;
+            agent.frozen = false;
+        }
         agent.revision += 1;
         Ok(WorkAdmission {
             ledger: Arc::clone(self),

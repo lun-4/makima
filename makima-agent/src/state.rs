@@ -302,8 +302,10 @@ impl<T: Serialize + DeserializeOwned> StateSlot<T> {
                     let value = migrate(raw.version, value)?;
                     let decoded = serde_json::from_value(value.clone())
                         .map_err(|error| StateError::InvalidValue(error.to_string()))?;
-                    revision =
-                        self.commit(self.edit_json(access, Some(value), Some(revision))?)?;
+                    let edit = self.edit_json(access, Some(value), Some(revision))?;
+                    if !access.is_read_only() {
+                        revision = self.commit(edit)?;
+                    }
                     Some(decoded)
                 }
                 None => None,
@@ -751,6 +753,36 @@ mod tests {
             })
         ));
         assert_eq!(new.get(&access).unwrap(), migrated);
+    }
+
+    #[test]
+    fn read_only_migration_returns_a_copy_without_committing() {
+        let (journal, agent) = fixture();
+        let access = journal.state_access(agent, None);
+        let old = slot(&journal, StateScope::Agent, 1);
+        let revision = old.set(&access, json!(1), None).unwrap();
+        let new = slot(&journal, StateScope::Agent, 2);
+        let notices = journal.subscribe_state_changes();
+        let migrate = |version, value| {
+            assert_eq!(version, 1);
+            assert_eq!(value, json!(1));
+            Ok(json!(2))
+        };
+        let before = journal.snapshot();
+        let migrated = new
+            .get_migrated(&access.clone().read_only(), migrate)
+            .unwrap();
+        assert_eq!(migrated.value, Some(json!(2)));
+        assert_eq!(migrated.revision, revision);
+        assert_eq!(old.get_raw(&access).unwrap().version, 1);
+        assert_eq!(journal.snapshot().state, before.state);
+        assert_eq!(journal.snapshot().revision, before.revision);
+        assert!(notices.try_recv().is_err());
+
+        let committed = new.get_migrated(&access, migrate).unwrap();
+        assert_eq!(committed.value, migrated.value);
+        assert!(committed.revision.0 > revision.0);
+        assert_eq!(notices.try_recv().unwrap().revision, committed.revision);
     }
 
     #[test]

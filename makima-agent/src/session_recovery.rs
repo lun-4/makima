@@ -1,31 +1,223 @@
 use crate::{
-    AgentMode, ModeId, ModeRegistry, ToolOutput,
+    AgentId, AgentMode, ModeId, ModeRegistry, ToolOutput,
     agent::UNAVAILABLE_RESULT,
     journal::{SessionJournal, SessionJournalSnapshot},
     modes, plan_state,
-    session_writer::SessionWriter,
+    session_coordinator::SessionCoordinatorHandle,
+    session_writer::{SessionWriter, WriterError},
 };
-use makima_providers::{ContentBlock, Message, Role, TokenUsage};
+use makima_config::ModelPolicy;
+use makima_providers::{ContentBlock, Message, Model, ProviderRegistry, Role, TokenUsage};
 use makima_storage::{
-    StateDir,
+    StateDir, StorageError,
     checkpoint::{CheckpointClaim, CheckpointError, CheckpointPublication},
     id::MakimaId,
+    session_lock::{
+        self, ClaimedSessionLock, LockHeartbeat, OPEN_ELSEWHERE_MSG, ResumeBlock,
+        SessionPublicationGuard,
+    },
     session_state::{
         StateChange, StoredCancellationReason, StoredDelivery, StoredDeliveryOp, StoredPayload,
         StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
         StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
     },
-    sessions::{HistorySnapshot, Session, SessionRecord, next_epoch},
+    sessions::{HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionRecord, next_epoch},
 };
-use std::{collections::BTreeSet, env, mem::take, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    env, io,
+    mem::take,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const CONTINUATION_DISABLED: &str = "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
 const CONTINUE_ALL_AGENTS_ENV: &str = "MAKIMA_CONTINUE_ALL_AGENTS";
 const SEQUENCE_EXHAUSTED: &str = "session recovery exhausted the state sequence";
 const DRAFT_SEPARATOR: &str = "\n\n";
+const RECOVERY_CANCELLED: &str = "session recovery publication cancelled";
 const WRONG_WRITER: &str = "recovery writer belongs to another session";
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+
+pub enum SessionSource {
+    Resume(MakimaId),
+    Create(StoredSession),
+    ResumeOrCreate(StoredSession),
+}
+
+pub struct OpenModel<'a> {
+    pub startup: &'a Model,
+    pub explicit: bool,
+    pub providers: &'a ProviderRegistry,
+    pub policy: &'a ModelPolicy,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenSessionError {
+    #[error("session {0}: {OPEN_ELSEWHERE_MSG}")]
+    Busy(MakimaId),
+    #[error("session {0} already exists")]
+    Exists(MakimaId),
+    #[error("session {0}: lock ownership was lost")]
+    LockLost(MakimaId),
+    #[error(transparent)]
+    ResumeBlocked(#[from] ResumeBlock),
+    #[error(transparent)]
+    Load(#[from] SessionError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Lock(#[from] io::Error),
+    #[error(transparent)]
+    Writer(#[from] WriterError),
+    #[error(transparent)]
+    Recovery(#[from] CheckpointError),
+}
+
+pub struct SessionOpening {
+    pub session: StoredSession,
+    pub model: Model,
+    pub resumed: bool,
+    pub warning: Option<String>,
+    lease: ClaimedSessionLock,
+    directory: PathBuf,
+}
+
+pub fn open_session(
+    storage: &StateDir,
+    source: SessionSource,
+    model: OpenModel<'_>,
+    resume_cwd: Option<&str>,
+) -> Result<SessionOpening, OpenSessionError> {
+    let id = match &source {
+        SessionSource::Resume(id) => *id,
+        SessionSource::Create(seed) | SessionSource::ResumeOrCreate(seed) => seed.id,
+    };
+    let directory = storage.ensure_subdir(SESSIONS_DIR)?;
+    let lease = session_lock::claim(&directory, &id)?.ok_or(OpenSessionError::Busy(id))?;
+    let loaded = lease
+        .publication_guard()
+        .publish(|| StoredSession::load_from(id, &directory))?
+        .ok_or(OpenSessionError::LockLost(id))?;
+    let (session, resumed) = match (source, loaded) {
+        (SessionSource::Create(_), Ok(_)) => return Err(OpenSessionError::Exists(id)),
+        (_, Ok(session)) => {
+            if let Some(cwd) = resume_cwd
+                && let Some(block) = session_lock::resume_block(&session.cwd, cwd, false)
+            {
+                return Err(block.into());
+            }
+            (session, true)
+        }
+        (
+            SessionSource::Create(seed) | SessionSource::ResumeOrCreate(seed),
+            Err(SessionError::Storage(StorageError::NotFound(_))),
+        ) => (seed, false),
+        (_, Err(error)) => return Err(error.into()),
+    };
+    let (model, warning) = model.select(&session)?;
+    Ok(SessionOpening {
+        session,
+        model,
+        resumed,
+        warning,
+        lease,
+        directory,
+    })
+}
+
+impl OpenModel<'_> {
+    pub fn select(&self, session: &StoredSession) -> Result<(Model, Option<String>), SessionError> {
+        let view = session.latest_state()?;
+        if self.explicit {
+            return Ok((self.startup.clone(), None));
+        }
+        let recorded = view
+            .scopes
+            .get(&session.root_agent_id())
+            .and_then(|scope| scope.config.as_ref())
+            .map_or(session.model.as_str(), |config| config.model.as_str());
+        if recorded == self.startup.spec() && self.policy.allows(recorded) {
+            return Ok((self.startup.clone(), None));
+        }
+        let reason = match self.providers.model(recorded) {
+            Ok(model) if self.policy.allows(&model.spec()) => return Ok((model, None)),
+            Ok(_) => "rejected by model policy".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        Ok((
+            self.startup.clone(),
+            Some(format!(
+                "failed to restore model {recorded}: {reason}; using {}",
+                self.startup.spec()
+            )),
+        ))
+    }
+}
+
+impl SessionOpening {
+    pub fn into_claimed(self) -> (StoredSession, ClaimedSessionLock) {
+        (self.session, self.lease)
+    }
+
+    pub async fn recover(
+        mut self,
+        storage: &StateDir,
+        modes: &ModeRegistry,
+    ) -> Result<(Arc<SessionWriter>, Arc<LockHeartbeat>, RecoveredSession), OpenSessionError> {
+        let id = self.session.id;
+        let root = self
+            .session
+            .root_agent_id()
+            .unwrap_or_else(AgentId::generate);
+        self.session.bind_root_id(root)?;
+        if self.resumed
+            && let Some(warning) = resolve_legacy_mode(&mut self.session, modes, storage)?
+        {
+            tracing::warn!(%warning, "legacy mode restoration fell back to read-only");
+        }
+        let lock = Arc::new(LockHeartbeat::spawn(self.lease, move || {
+            if let Ok(coordinator) = SessionCoordinatorHandle::resolve(id) {
+                coordinator.retire();
+            }
+        }));
+        let (writer, candidate) = prepare_session_recovery(
+            &self.directory,
+            self.session,
+            lock.publication_guard(),
+            None,
+        )?;
+        let recovered = candidate
+            .publish(
+                &writer,
+                CheckpointPublication::default(),
+                Arc::new(|publication| {
+                    publication
+                        .try_publish()
+                        .then_some(())
+                        .ok_or_else(|| Arc::from(RECOVERY_CANCELLED))
+                }),
+            )
+            .await?;
+        Ok((writer, lock, recovered))
+    }
+}
+
+pub fn prepare_session_recovery(
+    directory: &Path,
+    session: StoredSession,
+    guard: SessionPublicationGuard,
+    exact: Option<SessionJournalSnapshot>,
+) -> Result<(Arc<SessionWriter>, RecoveryCandidate), OpenSessionError> {
+    let candidate = match exact {
+        Some(snapshot) => RecoveryCandidate::from_exact(session.clone(), snapshot)?,
+        None => RecoveryCandidate::prepare(session.clone())?,
+    };
+    let writer = Arc::new(SessionWriter::open_session(directory, &session)?);
+    writer.bind_publication_guard(Some(guard));
+    Ok((writer, candidate))
+}
 
 pub fn continuation_notice(count: usize) -> Option<String> {
     (count != 0).then(|| {
@@ -362,6 +554,12 @@ impl RecoveryCandidate {
             session_id,
             message,
         })?;
+        self.journal
+            .bind_writer(writer.clone())
+            .map_err(|error| CheckpointError::Save {
+                session_id,
+                message: error.to_string().into(),
+            })?;
         writer
             .append(self.records)
             .await
@@ -369,7 +567,7 @@ impl RecoveryCandidate {
                 session_id,
                 message: Arc::from(error.to_string()),
             })?;
-        writer.bind_journal(Arc::clone(&self.journal)).await?;
+        writer.attach_journal(&self.journal);
         Ok(RecoveredSession {
             session: self.session,
             journal: self.journal,
@@ -517,6 +715,84 @@ mod tests {
     const ORPHAN: &str = "orphan";
     const CLAIM_REJECTED: &str = "recovery claim rejected";
     const DRAFT: &str = "inactive draft";
+
+    const STARTUP_MODEL: &str = "startup/default";
+    const UNAVAILABLE_MODEL: &str = "unavailable/model";
+    const POLICY_REJECTION: &str = "rejected by model policy";
+
+    #[test_case(MODEL, false, false, MODEL, None; "recorded")]
+    #[test_case(MODEL, true, false, STARTUP_MODEL, None; "explicit")]
+    #[test_case(MODEL, false, true, STARTUP_MODEL, Some(POLICY_REJECTION); "policy_fallback")]
+    #[test_case(UNAVAILABLE_MODEL, false, false, STARTUP_MODEL, Some(UNAVAILABLE_MODEL); "unavailable_fallback")]
+    fn open_session_selects_authoritative_model(
+        recorded: &str,
+        explicit: bool,
+        excluded: bool,
+        expected: &str,
+        warning: Option<&str>,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let startup = Model::from_spec(STARTUP_MODEL).unwrap();
+        let providers = makima_providers::test_util::offline_ids(&["test", "startup"]);
+        let excluded = if excluded {
+            vec![recorded.to_owned()]
+        } else {
+            Vec::new()
+        };
+        let policy = ModelPolicy::new(&[], &excluded).unwrap();
+        let mut session = StoredSession::new(STARTUP_MODEL, CWD);
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        session
+            .resolve_legacy_config(
+                crate::session_checkpoint::stored_agent_config(
+                    &crate::EffectiveAgentConfig::new(
+                        crate::RunSettings {
+                            provider: makima_providers::provider::unconfigured(),
+                            model: Model::from_spec(recorded).unwrap(),
+                            thinking: Default::default(),
+                            fast: false,
+                            workflow: false,
+                        },
+                        AgentMode::Build,
+                    )
+                    .with_mode_def(Some(ModeRegistry::builtin().current(&AgentMode::Build)))
+                    .with_context(crate::AgentContextSnapshot::new(CWD.into())),
+                    Default::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        session.save(&storage).unwrap();
+        let id = session.id;
+        let open = || {
+            open_session(
+                &storage,
+                SessionSource::Resume(id),
+                OpenModel {
+                    startup: &startup,
+                    explicit,
+                    providers: &providers,
+                    policy: &policy,
+                },
+                Some(CWD),
+            )
+        };
+        let opening = open().unwrap();
+        assert_eq!(opening.model.spec(), expected);
+        assert_eq!(opening.warning.is_some(), warning.is_some());
+        if let Some(warning) = warning {
+            assert!(opening.warning.as_deref().unwrap().contains(warning));
+        }
+        assert!(matches!(open(), Err(OpenSessionError::Busy(busy)) if busy == id));
+        let (_writer, lease, recovered) =
+            smol::block_on(opening.recover(&storage, &ModeRegistry::builtin())).unwrap();
+        assert_eq!(recovered.session().root_agent_id(), Some(root));
+        assert!(recovered.journal().has_writer());
+        drop(lease);
+        assert!(open().is_ok());
+    }
 
     #[test_case(false; "exact_candidate_preserves_history_coordinates")]
     #[test_case(true; "mismatched_candidate_is_rejected")]

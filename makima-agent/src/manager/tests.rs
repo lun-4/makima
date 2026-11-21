@@ -101,6 +101,47 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
     smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
 }
 
+#[test]
+fn blocked_spawn_leaves_no_agent_to_publish_later() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let journal = manager.journal();
+    let directory = tempfile::tempdir().unwrap();
+    let session = crate::session_writer::StoredSession::new("spawn-test", "/");
+    journal
+        .bind_writer(SessionWriter::open_session(directory.path(), &session).unwrap())
+        .unwrap();
+    let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
+    let error = manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap_err();
+    assert!(matches!(error, ManagerError::Persistence(_)));
+    assert!(manager.root_id().is_err());
+    journal
+        .complete(
+            barrier,
+            vec![JournalChange {
+                agent: None,
+                generation: 0,
+                change: StateChange::Rules {
+                    rules: Vec::new(),
+                    yolo: None,
+                },
+            }],
+        )
+        .unwrap();
+    assert!(journal.snapshot().agent_revisions.iter().next().is_none());
+    let root = manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+    let reloaded =
+        crate::session_writer::StoredSession::load_from(session.id, directory.path()).unwrap();
+    assert_eq!(
+        reloaded.agents().keys().copied().collect::<Vec<_>>(),
+        [root.id()]
+    );
+}
+
 #[test_case(false; "restorable")]
 #[test_case(true; "private_tools")]
 fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_tools: bool) {

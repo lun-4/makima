@@ -960,12 +960,15 @@ local slot = makima.state.register("resume", {
     end,
 })
 slot:on_change(function(ctx, event)
-    local current, revision = slot:get(ctx)
-    assert(type(revision) == "number" and revision >= event.revision)
     assert(event.agent ~= nil and ctx:mode() == nil)
     if event.reason == "resume" then
-        assert(current.count == 5 and migrations == 1 and revision == event.revision)
-        makima.ui.flash("resume migrated")
+        assert(migrations == 0)
+        local notified_revision = event.revision
+        assert(type(notified_revision) == "number")
+        local current, revision = slot:get(ctx)
+        assert(current.count == 5 and migrations == 1 and revision > notified_revision)
+        assert(event.revision == notified_revision)
+        makima.ui.flash("resume revision:" .. tostring(notified_revision))
         error("notification cannot veto")
     end
     assert(event.reason == "commit" and event.revision > last)
@@ -973,10 +976,10 @@ slot:on_change(function(ctx, event)
     makima.ui.flash("host commit:" .. tostring(event.revision))
 end)
 "#;
-const RESUME_OK: &str = "resume migrated";
+const RESUME_PREFIX: &str = "resume revision:";
 const COMMIT_PREFIX: &str = "host commit:";
 #[test]
-fn resume_migrates_before_callback_and_host_write_notices_keep_commit_order() {
+fn resume_callback_keeps_replayed_revision_and_host_notices_keep_commit_order() {
     use makima_agent::{
         ActorBackend, AgentManagerHandle,
         state::{StateScope, StateSlotSpec},
@@ -1013,7 +1016,8 @@ fn resume_migrates_before_callback_and_host_write_notices_keep_commit_order() {
             version: 1,
         })
         .unwrap();
-    old.set(&root.state_access(), json!({ "count": 4 }), None)
+    let replayed = old
+        .set(&root.state_access(), json!({ "count": 4 }), None)
         .unwrap();
     common::install_root(&host, root.clone(), template);
     host.event_handle().notify_state_restored(root.clone());
@@ -1022,7 +1026,7 @@ fn resume_migrates_before_callback_and_host_write_notices_keep_commit_order() {
         UiAction::Flash(text) => text,
         _ => panic!("unexpected notification"),
     };
-    assert_eq!(receive(), RESUME_OK);
+    assert_eq!(receive(), format!("{RESUME_PREFIX}{}", replayed.0));
     let migrated = old.get_raw(&root.state_access()).unwrap();
     assert_eq!(migrated.version, 2);
     assert_eq!(migrated.value, Some(json!({ "count": 5 })));

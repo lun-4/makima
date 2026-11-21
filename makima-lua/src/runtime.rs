@@ -4143,8 +4143,6 @@ impl LuaRuntime {
             unload_session_options(&self.lua, &session_options, plugin).await;
         if let Err(error) = &session_option_error {
             tracing::warn!(plugin, %error, "failed to unload plugin session options");
-        } else if let Some(mut store) = self.lua.app_data_mut::<SessionOptionStore>() {
-            store.invalidate(plugin);
         }
         self.registry.clear_plugin(plugin);
         if let Some(generations) = self.lua.app_data_ref::<Arc<Mutex<CommandGenerationMap>>>() {
@@ -4194,7 +4192,7 @@ impl LuaRuntime {
         completion::clear_plugin(&self.lua, plugin);
         session_option_error.map_err(|error| PluginError::Unload {
             plugin: plugin.to_owned(),
-            error,
+            error: error.to_string(),
         })
     }
 

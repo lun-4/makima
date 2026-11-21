@@ -24,7 +24,8 @@ use crate::{
 };
 
 const MAX_LUA_REVISION: f64 = 9_007_199_254_740_991.0;
-const CALLBACK_WRAPPER: &str = "local callback, event, slot = ...; return function(ctx) if event.reason ~= 'commit' then local _, revision = slot:get(ctx); assert(type(revision) == 'number', revision); event.revision = revision end; return callback(ctx, event) end";
+const CALLBACK_WRAPPER: &str =
+    "local callback, event = ...; return function(ctx) return callback(ctx, event) end";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -442,32 +443,33 @@ pub(crate) fn dispatch(lua: &Lua, target: AgentRef, event: StateChangeEvent) -> 
         target: agent.clone(),
         template,
     };
-    let data = lua.create_table()?;
-    if event.agent.is_some() {
-        data.set(
-            "agent",
-            crate::api::agent::lookup_agent(manager, agent.id(), lua)
-                .map_err(mlua::Error::runtime)?,
-        )?;
-    }
-    data.set("revision", event.revision.0)?;
-    data.set(
-        "reason",
-        match event.reason {
-            StateChangeReason::Commit => "commit",
-            StateChangeReason::Resume => "resume",
-        },
-    )?;
+    let event_agent = event
+        .agent
+        .map(|id| crate::api::agent::lookup_agent(manager, id, lua))
+        .transpose()
+        .map_err(mlua::Error::runtime)?;
     let callbacks = definition
         .callbacks
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
     for callback in callbacks {
+        let data = lua.create_table()?;
+        if let Some(agent) = &event_agent {
+            data.set("agent", agent.clone())?;
+        }
+        data.set("revision", event.revision.0)?;
+        data.set(
+            "reason",
+            match event.reason {
+                StateChangeReason::Commit => "commit",
+                StateChangeReason::Resume => "resume",
+            },
+        )?;
         let work = lua
             .load(CALLBACK_WRAPPER)
             .set_name("=state_on_change")
-            .call::<Function>((callback, data.clone(), LuaStateSlot(definition.clone())))?;
+            .call::<Function>((callback, data))?;
         crate::runtime::enqueue_callback(
             lua,
             work,

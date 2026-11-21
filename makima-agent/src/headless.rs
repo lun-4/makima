@@ -98,12 +98,12 @@ impl RootReadiness {
 
 /// Called after provider preparation and root creation, before admissions can run.
 pub type RootBinding = Box<
-    dyn FnOnce(
+    dyn for<'a> FnOnce(
             AgentManagerHandle,
             AgentRef,
             ToolContext,
-            Option<ResidentInitialization>,
-        ) -> BoxFuture<'static, Result<(), String>>
+            Option<&'a ResidentInitialization>,
+        ) -> BoxFuture<'a, Result<(), String>>
         + Send,
 >;
 
@@ -744,6 +744,11 @@ impl HeadlessBackend {
             Err(error) => return ManualCompactionEvent::Failed(error),
         };
         let previous = history.snapshot().clone();
+        let session = self
+            .params
+            .session_id
+            .as_ref()
+            .filter(|_| self.persist_turn_results);
         let result = agent::compact(
             &config.provider,
             &config.provider,
@@ -753,13 +758,15 @@ impl HeadlessBackend {
             cancel,
             &self.params.config,
             instructions,
-            self.params.session_id.as_ref(),
+            session,
         )
         .await
         .map_err(|error| error.to_string());
-        let snapshot = history.snapshot().clone();
-        settle_manual_compaction(result, history, previous, cancel, |_| {
-            persist_history(self.params.session_id.as_ref().unwrap().id(), snapshot)
+        settle_manual_compaction(result, history, previous, cancel, |snapshot| async move {
+            match session {
+                Some(session) => persist_history(session.id(), snapshot).await,
+                None => Ok(()),
+            }
         })
         .await
     }
@@ -1045,11 +1052,11 @@ async fn settle_manual_compaction<P, F>(
     persist: P,
 ) -> ManualCompactionEvent
 where
-    P: FnOnce(Vec<Message>) -> F,
+    P: FnOnce(crate::agent::HistorySnapshot) -> F,
     F: Future<Output = Result<(), String>>,
 {
     let result = match compacted {
-        Ok(()) => persist(history.as_slice().to_vec()).await,
+        Ok(()) => persist(history.snapshot().clone()).await,
         Err(error) => Err(error),
     };
     match result {
@@ -1200,17 +1207,21 @@ fn spawn_interactive(
                     .scopes
                     .get(&Some(root_id))
                     .and_then(|scope| scope.config.clone());
-                if let Some(stored) = &restored_config {
-                    if !params.model_policy.allows(&stored.model) {
-                        return Err(SessionOptionError::PolicyRejected(
-                            stored.model.clone().into(),
-                        )
-                        .to_string());
+                if let Some(stored) = &mut restored_config {
+                    if checkpoint.is_some() {
+                        stored.model = params.model.spec();
+                    } else {
+                        if !params.model_policy.allows(&stored.model) {
+                            return Err(SessionOptionError::PolicyRejected(
+                                stored.model.clone().into(),
+                            )
+                            .to_string());
+                        }
+                        params.model = params
+                            .providers
+                            .model(&stored.model)
+                            .map_err(|error| error.to_string())?;
                     }
-                    params.model = params
-                        .providers
-                        .model(&stored.model)
-                        .map_err(|error| error.to_string())?;
                     params.initial_wd = PathBuf::from(&stored.cwd);
                     params.defaults = SessionDefaults {
                         fast: stored.fast,
@@ -1419,84 +1430,97 @@ fn spawn_interactive(
                                     .map_err(|error| {
                                         ReactivationError::Initialization(error.to_string())
                                     })?;
-                                if mode_fallback {
-                                    let checkpoint = checkpoint.ok_or_else(|| {
-                                        ReactivationError::Initialization(
-                                            FALLBACK_CHECKPOINT_UNAVAILABLE.into(),
-                                        )
-                                    })?;
-                                    let commit =
-                                        installed.actor.config_snapshot().ok_or_else(|| {
-                                            ReactivationError::Initialization(
-                                                HEADLESS_CONFIG_UNAVAILABLE.into(),
-                                            )
-                                        })?;
-                                    let stored =
-                                        stored_agent_config(&commit.config, Default::default())
-                                            .map_err(|error| {
-                                                ReactivationError::Initialization(error.to_string())
-                                            })?;
-                                    let incarnation = JournalIncarnation {
-                                        agent: installed.incarnation.agent_id,
-                                        reservation: installed.incarnation.reservation,
-                                    };
-                                    let (_startup_trigger, startup_cancel) = CancelToken::new();
-                                    let expected_incarnation = incarnation.clone();
-                                    let prepared = journal
-                                        .prepare_with(move |current| {
-                                            let mut stored = stored;
-                                            if let Some(latest) =
-                                                current.state.iter().rev().find_map(|record| {
-                                                    match &record.change {
-                                                        StateChange::Config(config)
-                                                            if record.agent
-                                                                == Some(incarnation.agent) =>
-                                                        {
-                                                            Some(config)
-                                                        }
-                                                        _ => None,
-                                                    }
-                                                })
-                                            {
-                                                stored.options = latest.options.clone();
-                                            }
-                                            JournalCommit {
-                                                incarnations: vec![incarnation.clone()],
-                                                changes: vec![JournalChange {
-                                                    agent: Some(incarnation.agent),
-                                                    generation: commit.generation,
-                                                    change: StateChange::Config(stored),
-                                                }],
-                                                ..Default::default()
-                                            }
-                                        })
-                                        .await
-                                        .map_err(|error| {
-                                            ReactivationError::Initialization(error.to_string())
-                                        })?;
-                                    checkpoint
-                                        .publish_prepared(
-                                            prepared,
-                                            startup_cancel,
-                                            expected_incarnation,
-                                            Arc::clone(&journal),
-                                        )
-                                        .await
-                                        .map_err(|error| {
-                                            ReactivationError::Initialization(error.to_string())
-                                        })?;
-                                }
+                                let incarnation = JournalIncarnation {
+                                    agent: installed.incarnation.agent_id,
+                                    reservation: installed.incarnation.reservation,
+                                };
                                 if let Some(binding) = binding {
                                     binding(
                                         manager_for_binding,
                                         installed.agent.clone(),
                                         template,
-                                        Some(installed),
+                                        Some(&installed),
                                     )
                                     .await
                                     .map_err(ReactivationError::Initialization)?;
                                 }
-                                Ok(())
+                                let actor = installed.actor.clone();
+                                installed
+                                    .finish_with(async move {
+                                        if mode_fallback {
+                                            let checkpoint = checkpoint.ok_or_else(|| {
+                                                ReactivationError::Initialization(
+                                                    FALLBACK_CHECKPOINT_UNAVAILABLE.into(),
+                                                )
+                                            })?;
+                                            let commit =
+                                                actor.config_snapshot().ok_or_else(|| {
+                                                    ReactivationError::Initialization(
+                                                        HEADLESS_CONFIG_UNAVAILABLE.into(),
+                                                    )
+                                                })?;
+                                            let stored = stored_agent_config(
+                                                &commit.config,
+                                                Default::default(),
+                                            )
+                                            .map_err(|error| {
+                                                ReactivationError::Initialization(error.to_string())
+                                            })?;
+                                            let (_startup_trigger, startup_cancel) =
+                                                CancelToken::new();
+                                            let expected_incarnation = incarnation.clone();
+                                            let prepared = journal
+                                                .prepare_with(move |current| {
+                                                    let mut stored = stored;
+                                                    if let Some(latest) = current
+                                                        .state
+                                                        .iter()
+                                                        .rev()
+                                                        .find_map(|record| match &record.change {
+                                                            StateChange::Config(config)
+                                                                if record.agent
+                                                                    == Some(incarnation.agent) =>
+                                                            {
+                                                                Some(config)
+                                                            }
+                                                            _ => None,
+                                                        })
+                                                    {
+                                                        stored.options = latest.options.clone();
+                                                    }
+                                                    JournalCommit {
+                                                        incarnations: vec![incarnation.clone()],
+                                                        changes: vec![JournalChange {
+                                                            agent: Some(incarnation.agent),
+                                                            generation: commit.generation,
+                                                            change: StateChange::Config(stored),
+                                                        }],
+                                                        ..Default::default()
+                                                    }
+                                                })
+                                                .await
+                                                .map_err(|error| {
+                                                    ReactivationError::Initialization(
+                                                        error.to_string(),
+                                                    )
+                                                })?;
+                                            checkpoint
+                                                .publish_prepared(
+                                                    prepared,
+                                                    startup_cancel,
+                                                    expected_incarnation,
+                                                    Arc::clone(&journal),
+                                                )
+                                                .await
+                                                .map_err(|error| {
+                                                    ReactivationError::Initialization(
+                                                        error.to_string(),
+                                                    )
+                                                })?;
+                                        }
+                                        Ok(())
+                                    })
+                                    .await
                             })
                         });
                     let reference = manager
@@ -2146,8 +2170,14 @@ pub(crate) mod tests {
         )
     }
 
-    #[test]
-    fn restored_plan_fallback_is_published_before_admission() {
+    #[test_case(false; "fallback_checkpoint_precedes_admission")]
+    #[test_case(true; "binding_failure_leaves_saved_config_unchanged")]
+    fn restored_plan_fallback_publication(reject_binding: bool) {
+        use crate::session_recovery::{OpenModel, SessionSource, open_session};
+
+        const STARTUP_MODEL: &str = "openai/gpt-5";
+        const BINDING_ERROR: &str = "root binding failed";
+
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -2172,32 +2202,36 @@ pub(crate) mod tests {
                 .unwrap();
             session.save(&storage).unwrap();
             let id = session.id;
-            let checkpoint = Arc::new(
-                SessionWriter::open_session(
-                    &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
-                    &session,
-                )
-                .unwrap(),
-            );
-            let recovered = checkpoint
-                .recover(
-                    session,
-                    CheckpointPublication::default(),
-                    Arc::new(|publication| {
-                        assert!(publication.try_publish());
-                        Ok(())
-                    }),
-                )
-                .await
-                .unwrap();
             let mut params = interactive_params(id, Vec::new());
-            params.providers = Arc::new(makima_providers::test_util::offline_ids(&["anthropic"]));
+            params.model = Model::from_spec(STARTUP_MODEL).unwrap();
+            let opening = open_session(
+                &storage,
+                SessionSource::Resume(id),
+                OpenModel {
+                    startup: &params.model,
+                    explicit: false,
+                    providers: &params.providers,
+                    policy: &params.model_policy,
+                },
+                None,
+            )
+            .unwrap();
+            assert!(opening.warning.is_some());
+            assert_eq!(opening.model.spec(), STARTUP_MODEL);
+            params.model = opening.model.clone();
+            let (checkpoint, _lock, recovered) =
+                opening.recover(&storage, &params.modes).await.unwrap();
+            let recovered_config = recovered.session().latest_state().unwrap().scopes
+                [&Some(root_id)]
+                .config
+                .clone()
+                .unwrap();
             params.root_id = Some(root_id);
             params.journal = Some(recovered.journal());
             let (provider, requests) = recording();
             let (entered, entering) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
-            let saved_storage = storage.clone();
+            let expected_config = recovered_config.clone();
             let handle = spawn_interactive_with_checkpoint(
                 params,
                 Box::new(move |model| {
@@ -2207,35 +2241,18 @@ pub(crate) mod tests {
                 Some(Box::new(move |manager, root, _, initialization| {
                     Box::pin(async move {
                         assert!(root.actor().is_err());
-                        assert!(crate::modes::is_read_only_fallback(
-                            &initialization
-                                .unwrap()
-                                .actor
-                                .config_snapshot()
-                                .unwrap()
-                                .config
-                                .mode
-                        ));
-                        let snapshot = manager.journal().snapshot();
-                        let view = snapshot.fold().unwrap();
-                        assert_eq!(
-                            view.scopes[&Some(root_id)].config.as_ref().unwrap().mode.id,
-                            "recovery_read_only"
-                        );
-                        let saved =
-                            Session::<Message, TokenUsage, ToolOutput>::load(id, &saved_storage)
-                                .unwrap();
-                        assert_eq!(
-                            saved.latest_state().unwrap().scopes[&Some(root_id)]
-                                .config
-                                .as_ref()
-                                .unwrap()
-                                .mode
-                                .id,
-                            "recovery_read_only"
-                        );
+                        let config = initialization.unwrap().actor.config_snapshot().unwrap();
+                        assert!(crate::modes::is_read_only_fallback(&config.config.mode));
+                        assert_eq!(config.config.model.spec(), STARTUP_MODEL);
+                        let view = manager.journal().snapshot().fold().unwrap();
+                        let stored = view.scopes[&Some(root_id)].config.as_ref().unwrap();
+                        assert_eq!(stored.model, expected_config.model);
+                        assert_eq!(stored.mode.id, expected_config.mode.id);
                         entered.send_async(()).await.unwrap();
                         released.recv_async().await.unwrap();
+                        if reject_binding {
+                            return Err(BINDING_ERROR.into());
+                        }
                         Ok(())
                     })
                 })),
@@ -2247,10 +2264,21 @@ pub(crate) mod tests {
             assert!(future::poll_once(admission.as_mut()).await.is_none());
             drop(admission);
             release.send(()).unwrap();
-            let root = bounded(handle.initialized_root()).await.unwrap();
-            assert!(crate::modes::is_read_only_fallback(
-                &root.effective_config().unwrap().unwrap().mode
-            ));
+            let initialized = bounded(handle.initialized_root()).await;
+            let saved = Session::<Message, TokenUsage, ToolOutput>::load(id, &storage).unwrap();
+            let view = saved.latest_state().unwrap();
+            let config = view.scopes[&Some(root_id)].config.as_ref().unwrap();
+            if reject_binding {
+                assert!(initialized.unwrap_err().contains(BINDING_ERROR));
+                assert_eq!(config.mode.id, recovered_config.mode.id);
+                assert_eq!(config.model, TEST_MODEL);
+            } else {
+                let effective = initialized.unwrap().effective_config().unwrap().unwrap();
+                assert!(crate::modes::is_read_only_fallback(&effective.mode));
+                assert_eq!(effective.model.spec(), STARTUP_MODEL);
+                assert_eq!(config.mode.id, effective.mode.id().key());
+                assert_eq!(config.model, STARTUP_MODEL);
+            }
             assert!(requests.is_empty());
             bounded(handle.task.cancel()).await;
         });
@@ -3427,6 +3455,46 @@ pub(crate) mod tests {
             );
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn print_manual_compaction_without_session_id() {
+        smol::block_on(async {
+            let (provider, requests) = recording();
+            let mut params =
+                interactive_params(MakimaId::generate(), vec![Message::user(SECOND.into())]);
+            params.session_id = None;
+            let handle = spawn_nonpersistent_with_binding(
+                params,
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
+                None,
+            );
+            let root = bounded(handle.initialized_root()).await.unwrap();
+            let actor = root.actor().unwrap();
+            bounded(
+                handle
+                    .control_tx
+                    .compact_to(actor.clone(), None, CancelToken::none()),
+            )
+            .await
+            .unwrap();
+            bounded(actor.runtime_barrier()).await.unwrap();
+            assert!(requests.try_recv().is_ok());
+            let history = actor.committed_history();
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(FIRST))
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(SECOND))
+            );
+            bounded(handle.task.cancel()).await;
         });
     }
 

@@ -32,7 +32,7 @@ use crate::journal::{
     JournalChange, JournalCommit, JournalPrepared, JournalPublication, SessionJournal,
     SessionJournalSnapshot,
 };
-use crate::manager::AgentRef;
+use crate::manager::{AgentRef, ManagerError};
 use crate::permissions::{PermissionManager, PermissionSnapshot};
 use crate::session_checkpoint::stored_agent_config;
 use crate::session_options::{
@@ -131,6 +131,8 @@ pub enum SessionCoordinatorError {
     Option(#[from] SessionOptionError),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
+    #[error("session options were installed but could not be saved: {0}")]
+    OptionsInstalled(CheckpointError),
     #[error("session actor is not bound: {0}")]
     ActorUnbound(MakimaId),
 }
@@ -459,9 +461,7 @@ struct PreparedPluginOptions {
 
 struct CatalogPublication {
     participants: Vec<usize>,
-    journal: Arc<SessionJournal>,
     prepared: JournalPrepared,
-    previous: SessionJournalSnapshot,
 }
 
 enum PluginOptionDecision {
@@ -1701,7 +1701,7 @@ async fn handle_operation(
                 };
                 let reservation = Arc::new(reservation);
                 let commit_reservation = Arc::clone(&reservation);
-                let mut publication = checkpoint_options_for_actor(
+                checkpoint_options_for_actor(
                     &ctx.read,
                     SessionOptions::candidate_snapshot(&candidate),
                     Some(OptionsAdmission {
@@ -1716,7 +1716,6 @@ async fn handle_operation(
                     })),
                 )
                 .await?;
-                install_options_publication(&mut publication, ctx.session_id)?;
                 Ok(ctx.read.options())
             }
             .await;
@@ -1753,7 +1752,7 @@ async fn handle_operation(
                 let _registration = ctx.register_publication(&publication)?;
                 let reservation = Arc::new(reservation);
                 let commit_reservation = Arc::clone(&reservation);
-                let mut prepared = checkpoint_options_for_actor(
+                checkpoint_options_for_actor(
                     &ctx.read,
                     SessionOptions::candidate_snapshot(&candidate),
                     Some(OptionsAdmission {
@@ -1769,8 +1768,6 @@ async fn handle_operation(
                 )
                 .await
                 .map_err(SessionCoordinatorError::from)?;
-                install_options_publication(&mut prepared, ctx.session_id)
-                    .map_err(SessionCoordinatorError::from)?;
                 Ok((enabled, ctx.read.options()))
             }
             .await;
@@ -1966,8 +1963,6 @@ async fn finish_plugin_options(
                 .register_publication(&publication)
         })
         .collect::<Vec<_>>();
-    let mut publications = Vec::new();
-    let mut published = Vec::new();
     let mut installed = false;
     let result = async {
         for (staged, decision) in &prepared {
@@ -1982,16 +1977,16 @@ async fn finish_plugin_options(
                     SessionOptionError::CallbackFailed(Arc::from(CHECKPOINT_CANCELLED))
                 })??;
         }
-        publications = invocation
+        let mut publications = invocation
             .race(prepare_catalog_publications(&prepared))
             .await
             .map_err(|_| SessionOptionError::CallbackFailed(Arc::from(CHECKPOINT_CANCELLED)))??;
         if !invocation.claim_publication(&publication) {
             return Err(SessionOptionError::CallbackFailed(Arc::from(CHECKPOINT_CANCELLED)).into());
         }
-        {
+        let snapshots = {
             let directory = lock(&DIRECTORY);
-            let state = lock(&catalog.state);
+            let mut state = lock(&catalog.state);
             if revision != state.revision
                 || prepared.len() != state.sessions.len()
                 || prepared.iter().any(|(staged, decision)| {
@@ -2010,130 +2005,56 @@ async fn finish_plugin_options(
                     SessionOptionError::StaleHandle(Arc::from(PARTICIPANT_CLOSED_MESSAGE)).into(),
                 );
             }
-            let mut tokens = publications
-                .iter_mut()
-                .map(|group| &mut group.prepared)
-                .collect::<Vec<_>>();
-            JournalPrepared::install_batch(&mut tokens).map_err(|error| {
-                SessionOptionError::CallbackFailed(Arc::from(error.to_string()))
-            })?;
-            installed = !publications.is_empty();
-        }
-        for (index, (staged, _)) in prepared.iter().enumerate() {
-            let journal = publications
+            let candidates = prepared
                 .iter()
-                .find(|group| group.participants.contains(&index))
-                .map(|group| group.prepared.snapshot().clone());
-            publish_catalog_options(
-                staged,
-                SessionOptions::candidate_snapshot(&staged.candidate),
-                journal,
-            )
-            .await?;
-            published.push(index);
-        }
-        let directory = lock(&DIRECTORY);
-        let mut state = lock(&catalog.state);
-        if revision != state.revision
-            || prepared.len() != state.sessions.len()
-            || prepared.iter().any(|(staged, decision)| {
-                staged.publication_lifetime.token.is_cancelled()
-                    || decision.is_disconnected()
-                    || state
-                        .sessions
-                        .get(&staged.session_id)
-                        .is_none_or(|session| session.generation != staged.generation)
-                    || directory
-                        .get(&staged.session_id)
-                        .is_none_or(|entry| entry.handle.generation != staged.generation)
-            })
-        {
-            return Err(
-                SessionOptionError::StaleHandle(Arc::from(PARTICIPANT_CLOSED_MESSAGE)).into(),
-            );
-        }
-        let candidates = prepared
-            .iter()
-            .map(|(staged, _)| (staged.reservation.as_ref(), staged.candidate.clone()))
-            .collect();
-        let snapshots = SessionOptions::commit_batch_unpublished(candidates, || {
-            if definitions.is_empty() {
-                state.definitions.remove(plugin.as_ref());
-            } else {
-                state.definitions.insert(Arc::clone(&plugin), definitions);
-            }
-            state.revision += 1;
-            Ok(())
-        })?;
-        drop(state);
-        drop(directory);
+                .map(|(staged, _)| (staged.reservation.as_ref(), staged.candidate.clone()))
+                .collect();
+            SessionOptions::commit_batch_unpublished(candidates, || {
+                let mut tokens = publications
+                    .iter_mut()
+                    .map(|group| &mut group.prepared)
+                    .collect::<Vec<_>>();
+                JournalPrepared::install_batch(&mut tokens).map_err(|error| {
+                    SessionOptionError::CallbackFailed(Arc::from(error.to_string()))
+                })?;
+                if definitions.is_empty() {
+                    state.definitions.remove(plugin.as_ref());
+                } else {
+                    state.definitions.insert(Arc::clone(&plugin), definitions);
+                }
+                state.revision += 1;
+                Ok(())
+            })?
+        };
         SessionOptions::publish_batch(
             prepared
                 .iter()
                 .zip(&snapshots)
                 .map(|((staged, _), snapshot)| (staged.reservation.as_ref(), snapshot)),
         );
-        Ok(snapshots)
+        installed = true;
+        let mut save_error = None;
+        for (index, ((staged, _), snapshot)) in prepared.iter().zip(&snapshots).enumerate() {
+            let journal = publications
+                .iter()
+                .find(|group| group.participants.contains(&index))
+                .map(|group| group.prepared.snapshot().clone());
+            if let Err(error) = publish_catalog_options(staged, snapshot.clone(), journal).await {
+                save_error.get_or_insert(error);
+            }
+        }
+        match save_error {
+            Some(error) => Err(SessionCoordinatorError::OptionsInstalled(error)),
+            None => Ok(prepared
+                .iter()
+                .zip(snapshots)
+                .map(|((staged, _), snapshot)| (staged.session_id, snapshot))
+                .collect()),
+        }
     }
     .await;
-    let result = match result {
-        Ok(snapshots) => Ok(prepared
-            .iter()
-            .zip(snapshots)
-            .map(|((staged, _), snapshot)| (staged.session_id, snapshot))
-            .collect()),
-        Err(error) => {
-            let mut rollback_error = None;
-            if installed {
-                for group in &publications {
-                    let mut changes = BTreeMap::new();
-                    for record in group.previous.state.iter() {
-                        if let StateChange::Config(config) = &record.change {
-                            changes.insert(
-                                record.agent,
-                                JournalChange {
-                                    agent: record.agent,
-                                    generation: record.generation,
-                                    change: StateChange::Config(config.clone()),
-                                },
-                            );
-                        }
-                    }
-                    if let Err(error) = group.journal.commit(JournalCommit {
-                        changes: changes.into_values().collect(),
-                        ..Default::default()
-                    }) {
-                        rollback_error.get_or_insert_with(|| {
-                            SessionCoordinatorError::Checkpoint(CheckpointError::Save {
-                                session_id: prepared[group.participants[0]].0.session_id,
-                                message: error.to_string().into(),
-                            })
-                        });
-                    }
-                }
-            }
-            for (index, (staged, _)) in prepared
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| installed || published.contains(index))
-            {
-                let previous = publications
-                    .iter()
-                    .find(|group| group.participants.contains(&index))
-                    .map(|group| group.previous.clone());
-                if let Err(rollback) =
-                    publish_catalog_options(staged, staged.previous.clone(), previous).await
-                {
-                    tracing::error!(%rollback, session_id = %staged.session_id, "catalog checkpoint rollback remains unsaved");
-                    rollback_error.get_or_insert(rollback);
-                }
-            }
-            Err(rollback_error.unwrap_or(error))
-        }
-    };
-    drop(publications);
     let decision: fn(flume::Sender<Result<(), SessionCoordinatorError>>) -> PluginOptionDecision =
-        if result.is_ok() {
+        if installed {
             PluginOptionDecision::Complete
         } else {
             PluginOptionDecision::Abort
@@ -2155,17 +2076,21 @@ async fn prepare_catalog_publications(
     for (index, (staged, _)) in participants.iter().enumerate() {
         let binding = lock(&staged.read.binding).clone();
         let Some(binding) = binding else { continue };
-        let actor = binding
-            .agent
-            .actor()
-            .map_err(ConfigChangeError::from)
-            .map_err(|error| SessionOptionError::CallbackFailed(Arc::from(error.to_string())))?;
+        let actor = binding.agent.actor().map_err(|error| match error {
+            ManagerError::NonLiveAgent(_) => {
+                SessionCoordinatorError::SessionBusy(staged.session_id)
+            }
+            error => SessionOptionError::CallbackFailed(Arc::from(error.to_string())).into(),
+        })?;
         let Some(journal) = &actor.inner.journal else {
             continue;
         };
         let operation = actor
             .reserve_config_publication()
-            .map_err(|error| SessionOptionError::CallbackFailed(Arc::from(error.to_string())))?;
+            .map_err(|error| match error {
+                ActorError::Busy => SessionCoordinatorError::SessionBusy(staged.session_id),
+                error => SessionOptionError::CallbackFailed(Arc::from(error.to_string())).into(),
+            })?;
         *lock(&staged.operation) = Some(operation);
         groups
             .entry(Arc::as_ptr(journal) as usize)
@@ -2199,10 +2124,8 @@ async fn prepare_catalog_publications(
                 stored,
             ));
         }
-        let mut previous = None;
         let token = journal
             .prepare_with(|current| {
-                previous = Some(current.clone());
                 let mut commit = JournalCommit::default();
                 for (agent, incarnation, generation, mut stored) in configs {
                     commit.incarnations.extend(incarnation);
@@ -2243,13 +2166,7 @@ async fn prepare_catalog_publications(
             .map_err(|error| SessionOptionError::CallbackFailed(Arc::from(error.to_string())))?;
         publications.push(CatalogPublication {
             participants: indexes,
-            journal,
             prepared: token,
-            previous: previous.ok_or_else(|| {
-                SessionOptionError::CallbackFailed(Arc::from(
-                    "journal preparation did not capture its base",
-                ))
-            })?,
         });
     }
     Ok(publications)
@@ -2259,7 +2176,7 @@ async fn publish_catalog_options(
     staged: &PreparedPluginOptions,
     options: SessionOptionsSnapshot,
     journal: Option<SessionJournalSnapshot>,
-) -> Result<(), SessionCoordinatorError> {
+) -> Result<(), CheckpointError> {
     let (version, _) = staged.read.next_version(options.version, false);
     let checkpoint = staged
         .read
@@ -2276,7 +2193,7 @@ async fn publish_catalog_options(
                 journal,
             }),
         });
-    Ok(verify_ack(staged.session_id, version, checkpoint).await?)
+    verify_ack(staged.session_id, version, checkpoint).await
 }
 
 async fn abort_plugin_options(
@@ -2348,7 +2265,7 @@ async fn checkpoint_options_for_actor(
     admission: Option<OptionsAdmission>,
     explicit_yolo: bool,
     commit: Option<Box<dyn FnOnce() + Send>>,
-) -> Result<Option<OptionsPublication>, CheckpointError> {
+) -> Result<(), CheckpointError> {
     let yolo = options.enabled(YOLO_OPTION_ID);
     let permissions = lock(&read.permissions).clone();
     if explicit_yolo && permissions.is_none() {
@@ -2578,8 +2495,7 @@ async fn checkpoint_options_for_actor(
             .unwrap_or_default(),
         claim,
     );
-    verify_ack(read.session_id, version, checkpoint).await?;
-    Ok(None)
+    verify_ack(read.session_id, version, checkpoint).await
 }
 
 async fn update_model_values(
@@ -2796,7 +2712,6 @@ pub(crate) mod tests {
     use makima_providers::model::FastSupport;
     use makima_providers::{Model, ThinkingSupport};
     use makima_storage::checkpoint::CheckpointAck;
-    use makima_storage::session_state::SessionStateView;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use test_case::test_case;
@@ -2840,7 +2755,7 @@ pub(crate) mod tests {
 
     pub(crate) fn bind_initializing_actor(
         coordinator: &SessionCoordinatorHandle,
-        initialization: ResidentInitialization,
+        initialization: &ResidentInitialization,
         prepare_model: ModelPreparer,
         project_config: ConfigProjector,
     ) -> Result<(), ConfigChangeError> {
@@ -2867,7 +2782,7 @@ pub(crate) mod tests {
             ActorError::InvalidConfig("actor configuration is not initialized".into())
         })?;
         coordinator.bind_actor_config(
-            initialization.agent,
+            initialization.agent.clone(),
             config.config,
             prepare_model,
             project_config,
@@ -3353,6 +3268,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn catalog_reports_busy_actor_by_session_and_other_session_can_change_options() {
+        smol::block_on(async {
+            let catalog = SessionOptionCatalog::default();
+            let busy = register_with_catalog(MakimaId::generate(), writer(false), &catalog);
+            let other = register_with_catalog(MakimaId::generate(), writer(false), &catalog);
+            let binding = busy.actor_binding().unwrap();
+            let actor = binding.agent.actor().unwrap();
+            let publication = actor.reserve_config_publication().unwrap();
+            let definitions = vec![plugin_option(1, &["a", "b"], "a")];
+            assert!(matches!(
+                catalog.replace_plugin_options("test", definitions.clone()).await,
+                Err(SessionCoordinatorError::SessionBusy(id)) if id == busy.session_id()
+            ));
+            assert!(catalog.plugin_definitions("test").is_empty());
+            assert!(
+                other
+                    .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                    .await
+                    .unwrap()
+                    .enabled(YOLO_OPTION_ID)
+            );
+            assert!(!busy.read().options().enabled(YOLO_OPTION_ID));
+            drop(publication);
+            assert_eq!(
+                catalog
+                    .replace_plugin_options("test", definitions)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            busy.close().await.unwrap();
+            other.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn plugin_replacement_rejects_reserved_options_without_partial_commit() {
         smol::block_on(async {
             let catalog = SessionOptionCatalog::default();
@@ -3688,7 +3640,7 @@ pub(crate) mod tests {
 
     #[test_case(false; "shared_journal")]
     #[test_case(true; "independent_journals")]
-    fn catalog_groups_journals_and_rolls_back_every_published_candidate(independent: bool) {
+    fn catalog_installs_in_all_journals_even_when_a_receipt_fails(independent: bool) {
         smol::block_on(async {
             let catalog = SessionOptionCatalog::default();
             let saved = Arc::new(Mutex::new(Vec::new()));
@@ -3769,46 +3721,29 @@ pub(crate) mod tests {
                     assert!(first.state.iter().any(|record| record.agent == Some(id) && matches!(&record.change, StateChange::Config(config) if config.options.get("test.choice").is_some_and(|value| value == "a"))));
                 }
             }
-            let before = [first.read().options(), second.read().options()];
-            let journals = [root.manager().journal(), child.manager().journal()];
-            let records = journals
-                .iter()
-                .map(|journal| journal.snapshot().state)
-                .collect::<Vec<_>>();
             *lock(&fail) = true;
-            assert!(
-                catalog
-                    .replace_plugin_options("test", vec![plugin_option(2, &["b"], "b")])
-                    .await
-                    .is_err()
-            );
-            assert_eq!(first.read().options(), before[0]);
-            assert_eq!(second.read().options(), before[1]);
-            assert_eq!(
-                catalog.plugin_definitions("test"),
-                vec![plugin_option(1, &["a", "b"], "a")]
-            );
-            for (journal, records) in journals.iter().zip(records) {
-                let snapshot = journal.snapshot();
-                assert!(
-                    snapshot
-                        .state
-                        .iter()
-                        .take(records.iter().count())
-                        .eq(records.iter())
-                );
-                let before =
-                    SessionStateView::fold(&records.to_vec(), &snapshot.agent_revisions.to_vec())
-                        .unwrap();
-                assert_eq!(snapshot.fold().unwrap().scopes, before.scopes);
-            }
-            assert_eq!(lock(&saved).last().unwrap().options, before[0]);
-            *lock(&fail) = false;
-            catalog
-                .replace_plugin_options("test", vec![plugin_option(3, &["b"], "b")])
-                .await
-                .unwrap();
-            for coordinator in [&first, &second] {
+            let updated = vec![plugin_option(2, &["b"], "b")];
+            assert!(matches!(
+                catalog.replace_plugin_options("test", updated.clone()).await,
+                Err(SessionCoordinatorError::OptionsInstalled(CheckpointError::Save { session_id, .. }))
+                    if session_id == ids[1]
+            ));
+            assert_eq!(catalog.plugin_definitions("test"), updated);
+            assert_eq!(lock(&saved).last().unwrap().options, first.read().options());
+            for (coordinator, agent) in [(&first, &root), (&second, &child)] {
+                let snapshot = agent.manager().journal().snapshot();
+                let config = snapshot
+                    .state
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.change {
+                        StateChange::Config(config) if record.agent == Some(agent.id()) => {
+                            Some(config)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(config.options["test.choice"], "b");
                 assert_eq!(coordinator.read().options().values()["test.choice"], "b");
                 drop(coordinator.read.options.try_reserve(None).unwrap());
                 coordinator.close().await.unwrap();
@@ -3886,6 +3821,12 @@ pub(crate) mod tests {
                 }
             });
             waiting.recv_async().await.unwrap();
+            assert_eq!(coordinator.read().options().values()["test.choice"], "a");
+            assert_eq!(
+                catalog.plugin_definitions("test"),
+                vec![plugin_option(1, &["a"], "a")]
+            );
+            assert!(lock(&saved).is_empty());
             assert!(replacement.cancel().await.is_none());
             release.send_async(()).await.unwrap();
             coordinator.read().wait_unreserved().await;
@@ -3965,61 +3906,6 @@ pub(crate) mod tests {
             assert_eq!(agent.manager().journal().snapshot().state, installed);
             assert_eq!(coordinator.read().options().values()["test.choice"], "a");
             coordinator.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn plugin_prepare_checkpoint_failure_exposes_no_mixed_generation() {
-        smol::block_on(async {
-            let mut ids = [MakimaId::generate(), MakimaId::generate()];
-            ids.sort_by_key(ToString::to_string);
-            let saved = Arc::new(Mutex::new(Vec::new()));
-            let catalog = SessionOptionCatalog::default();
-            let first = register_with_catalog(
-                ids[0],
-                Arc::new(GuardedWriter {
-                    fail: false,
-                    saved: Arc::clone(&saved),
-                }),
-                &catalog,
-            );
-            let second = register_with_catalog(ids[1], writer(true), &catalog);
-            let before_first = first.read().options();
-            let before_second = second.read().options();
-            assert!(matches!(
-                catalog
-                    .replace_plugin_options("test", vec![plugin_option(1, &["a"], "a")])
-                    .await,
-                Err(SessionCoordinatorError::Checkpoint(_))
-            ));
-            assert_eq!(first.read().options(), before_first);
-            assert_eq!(second.read().options(), before_second);
-            drop(first.read.options.try_reserve(None).unwrap());
-            drop(second.read.options.try_reserve(None).unwrap());
-            {
-                let saved = lock(&saved);
-                assert_eq!(saved.len(), 2);
-                assert!(
-                    saved[0]
-                        .options
-                        .options
-                        .iter()
-                        .any(|option| option.definition.id.as_ref() == "test.choice")
-                );
-                assert!(
-                    saved[1]
-                        .options
-                        .options
-                        .iter()
-                        .all(|option| option.definition.id.as_ref() != "test.choice")
-                );
-            }
-            first
-                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
-                .await
-                .unwrap();
-            second.close().await.unwrap();
-            first.close().await.unwrap();
         });
     }
 
@@ -5424,7 +5310,7 @@ pub(crate) mod tests {
 
     #[test_case(false; "published")]
     #[test_case(true; "disk_failed")]
-    fn nonpersistent_yolo_toggle_uses_effective_permissions_and_installs_after_ack(fail: bool) {
+    fn nonpersistent_yolo_toggle_installs_only_after_publication_claim(fail: bool) {
         smol::block_on(futures_lite::future::or(
             async {
                 let saved = Arc::new(Mutex::new(Vec::new()));

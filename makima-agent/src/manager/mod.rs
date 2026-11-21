@@ -814,14 +814,10 @@ impl AgentManagerHandle {
                     record,
                 };
                 let reservation = Self::next_reservation(&mut graph);
+                self.0.work.bind_closed_incarnation(agent_id, reservation)?;
                 self.0.journal.set_incarnation(agent_id, reservation);
-                self.0.work.bind_incarnation(agent_id, reservation)?;
-                self.0.work.set_open(agent_id, false)?;
                 let attempt = Arc::new(ActivationAttempt::new());
-                let node = graph
-                    .nodes
-                    .get_mut(&agent_id)
-                    .ok_or(ManagerError::UnknownAgent(agent_id))?;
+                let node = graph.nodes.get_mut(&agent_id).unwrap();
                 node.reservation = reservation;
                 node.reservation_pending = true;
                 node.residency = AgentResidency::Activating;
@@ -1374,16 +1370,19 @@ impl AgentManagerHandle {
             if node.reservation != incarnation.reservation || !node.reservation_pending {
                 return;
             }
-            node.reservation = replacement;
-            node.detach_pending = false;
-            self.0
-                .journal
-                .set_incarnation(incarnation.agent_id, replacement);
-            let _ = self
+            if let Err(error) = self
                 .0
                 .work
-                .bind_incarnation(incarnation.agent_id, replacement);
-            let _ = self.0.work.set_open(incarnation.agent_id, false);
+                .bind_closed_incarnation(incarnation.agent_id, replacement)
+            {
+                warn!(agent_id = %incarnation.agent_id, %error, "could not rebind work during activation rollback");
+            } else {
+                self.0
+                    .journal
+                    .set_incarnation(incarnation.agent_id, replacement);
+                node.reservation = replacement;
+            }
+            node.detach_pending = false;
             node.reservation_pending = false;
             node.activation = None;
             node.residency = AgentResidency::Dormant;
@@ -1635,13 +1634,13 @@ impl AgentManagerHandle {
             if node.detach_pending {
                 return Ok(());
             }
-            node.detach_pending = true;
-            self.0.journal.revoke_state_agent(incarnation.agent_id);
             self.0.work.set_open_for_incarnation(
                 incarnation.agent_id,
                 incarnation.reservation,
                 false,
             )?;
+            node.detach_pending = true;
+            self.0.journal.revoke_state_agent(incarnation.agent_id);
             let actor = node.actor.clone();
             graph.revision += 1;
             actor
@@ -1683,15 +1682,14 @@ impl AgentManagerHandle {
             if node.reservation != incarnation.reservation {
                 return Err(ManagerError::StaleIncarnation(incarnation.agent_id));
             }
-            node.reservation = replacement;
-            node.detach_pending = false;
+            self.0
+                .work
+                .bind_closed_incarnation(incarnation.agent_id, replacement)?;
             self.0
                 .journal
                 .set_incarnation(incarnation.agent_id, replacement);
-            self.0
-                .work
-                .bind_incarnation(incarnation.agent_id, replacement)?;
-            self.0.work.set_open(incarnation.agent_id, false)?;
+            node.reservation = replacement;
+            node.detach_pending = false;
             node.reservation_pending = false;
             node.residency = AgentResidency::Dormant;
             if node.lifecycle == GraphLifecycle::Closing {
@@ -3180,16 +3178,18 @@ impl AgentManagerHandle {
                 ManagerError::NonLiveAgent(agent_id)
             });
         }
-        if let Err(error) =
-            self.journal_node(agent_id, &graph.nodes[&agent_id], &actor, restoration)
-        {
-            drop(graph);
-            actor.close();
-            self.finish_failed_commit(agent_id, reservation);
-            return Err(error);
-        }
+        let revision =
+            match self.journal_node(agent_id, &graph.nodes[&agent_id], &actor, restoration) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    drop(graph);
+                    actor.close();
+                    self.finish_failed_commit(agent_id, reservation);
+                    return Err(error);
+                }
+            };
         drop(graph);
-        if let Err(error) = self.0.journal.flush_spawn() {
+        if let Err(error) = self.0.journal.flush_spawn(revision) {
             actor.close();
             self.finish_failed_commit(agent_id, reservation);
             return Err(ManagerError::Persistence(error));
@@ -3246,7 +3246,7 @@ impl AgentManagerHandle {
         node: &Node,
         actor: &AgentActorHandle,
         restoration: Option<SpawnRestoration>,
-    ) -> Result<(), ManagerError> {
+    ) -> Result<u64, ManagerError> {
         let existing = self.0.journal.agent(agent_id);
         if existing
             .as_ref()
@@ -3340,9 +3340,13 @@ impl AgentManagerHandle {
         }
         self.0
             .journal
-            .commit(commit)
-            .map_err(|error| ManagerError::Policy(error.to_string()))?;
-        Ok(())
+            .commit_spawn(commit)
+            .map_err(|error| match error {
+                crate::journal::JournalError::SpawnPublicationPending => {
+                    ManagerError::Persistence(error.to_string())
+                }
+                _ => ManagerError::Policy(error.to_string()),
+            })
     }
 
     #[cfg(test)]
@@ -3437,6 +3441,7 @@ impl AgentManagerHandle {
             {
                 let parent = node.parent_id;
                 graph.nodes.remove(&agent_id);
+                let _ = self.0.work.remove(agent_id);
                 if let Some(parent) = parent.and_then(|id| graph.nodes.get_mut(&id)) {
                     parent.children.retain(|id| *id != agent_id);
                 }
@@ -3921,10 +3926,13 @@ impl AgentManagerHandle {
                     if let Some(attempt) = node.activation.take() {
                         attempt.complete(Err(ManagerError::GraphShutdown));
                         node.reservation_pending = false;
-                        node.reservation = replacement;
+                        if let Err(error) = self.0.work.bind_closed_incarnation(*id, replacement) {
+                            warn!(agent_id = %id, %error, "could not rebind work during shutdown");
+                        } else {
+                            self.0.journal.set_incarnation(*id, replacement);
+                            node.reservation = replacement;
+                        }
                         node.detach_pending = false;
-                        self.0.journal.set_incarnation(*id, replacement);
-                        let _ = self.0.work.bind_incarnation(*id, replacement);
                         node.residency = AgentResidency::Dormant;
                         node.lifecycle = GraphLifecycle::Dormant;
                     } else if node.lifecycle.consumes_capacity() {

@@ -45,7 +45,9 @@ use makima_agent::session_coordinator::{
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID,
 };
-use makima_agent::session_recovery::RecoveryCandidate;
+use makima_agent::session_recovery::{
+    OpenModel, RecoveryCandidate, SessionSource, open_session, prepare_session_recovery,
+};
 use makima_agent::template::env_vars_for;
 use makima_agent::tools::FileWriteLocks;
 use makima_agent::tools::offload::OffloadStore;
@@ -75,12 +77,15 @@ use makima_providers::{
     ConversationEnd, Message, Model, ModelTier, PreparedProvider, ProviderRegistry,
 };
 use makima_storage::StateDir;
+#[cfg(test)]
 use makima_storage::StorageError;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
 use makima_storage::session_state::StateChange;
-use makima_storage::sessions::{SESSIONS_DIR, SessionError, SessionRecord, normalize_title};
+#[cfg(test)]
+use makima_storage::sessions::SessionError;
+use makima_storage::sessions::{SESSIONS_DIR, SessionRecord, normalize_title};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -1467,18 +1472,13 @@ impl SpawnCtx {
         .map_err(|error| error.to_string())
     }
 
-    /// The model {session} needs prepared before its runtime can start, or
-    /// `None` when it runs on the startup provider.
-    fn replacement_spec(&self, session: &AppSession) -> Result<Option<Arc<str>>, String> {
-        let view = session.latest_state().map_err(|error| error.to_string())?;
-        let model_spec = session
-            .root_agent_id()
-            .and_then(|root| view.scopes.get(&Some(root)))
-            .and_then(|scope| scope.config.as_ref())
-            .map_or(session.model.as_str(), |config| config.model.as_str());
-        Ok((model_spec != self.model_slot.load().model.spec()
-            && self.model_policy.allows(model_spec))
-        .then(|| Arc::from(model_spec)))
+    fn open_model<'a>(&'a self, startup: &'a Model) -> OpenModel<'a> {
+        OpenModel {
+            startup,
+            explicit: self.initial_model_override,
+            providers: &self.providers,
+            policy: &self.model_policy,
+        }
     }
 
     fn prepare_runtime_with_provider(
@@ -1536,73 +1536,58 @@ impl SpawnCtx {
         offload: Option<Arc<OffloadStore>>,
         exact: Option<SessionJournalSnapshot>,
     ) -> Result<PreparedSessionRuntime> {
-        let seed_snapshot = matches!(ownership, RuntimeOwnership::Claim);
-        let (mut session_lock, guard) = match ownership {
+        let startup = self.model_slot.load().model.clone();
+        let (guard, renewing, selection) = match ownership {
             RuntimeOwnership::Claim => {
-                let lock = claim_lock(&self.sessions_dir, &session.id)?;
-                let guard = lock.publication_guard();
-                (Some(lock), guard)
+                let cwd = session.cwd.clone();
+                let source = if session.checkpoint_required() {
+                    SessionSource::Resume(session.id)
+                } else {
+                    SessionSource::ResumeOrCreate(session)
+                };
+                let opened =
+                    open_session(&self.storage, source, self.open_model(&startup), Some(&cwd))?;
+                let selection = opened
+                    .resumed
+                    .then(|| (opened.model.clone(), opened.warning.clone()));
+                let (owned, lock) = opened.into_claimed();
+                session = owned;
+                let lease = RenewingDeletionLease::new(lock);
+                (lease.publication_guard(), Some(lease), selection)
             }
-            RuntimeOwnership::Reuse(guard) => (None, guard),
+            RuntimeOwnership::Reuse(guard) => (guard, None, None),
         };
-        let resume_cwd = session.cwd.clone();
-        let (renewing, authoritative) = if seed_snapshot && exact.is_none() {
-            let lease = session_lock
-                .take()
-                .ok_or_else(|| eyre!(LOCK_UNAVAILABLE_REPLACEMENT_ERR))?;
-            let lease = RenewingDeletionLease::new(lease);
-            let loaded = guard
-                .publish(|| AppSession::load(session.id, &self.storage))?
-                .ok_or_else(|| eyre!(LOCK_LOST_REPLACEMENT_ERR))?;
-            let authoritative = match loaded {
-                Ok(loaded) => {
-                    if let Some(block) = session_lock::resume_block(&loaded.cwd, &resume_cwd, false)
-                    {
-                        return Err(eyre!(block.to_string()));
-                    }
-                    session = loaded;
-                    true
-                }
-                Err(SessionError::Storage(StorageError::NotFound(_)))
-                    if !session.checkpoint_required() =>
+        let mut model_warning = None;
+        let provider = match selection {
+            Some((selected, warning)) if effective_config.is_none() => {
+                model_warning = warning;
+                if provider
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.model.spec() == selected.spec())
                 {
-                    false
-                }
-                Err(error) => return Err(error.into()),
-            };
-            (Some(lease), authoritative)
-        } else {
-            (None, false)
-        };
-        let provider =
-            if authoritative && effective_config.is_none() && !self.initial_model_override {
-                match self
-                    .replacement_spec(&session)
-                    .map_err(|error| eyre!(error))?
-                {
-                    Some(spec)
-                        if provider
-                            .as_ref()
-                            .is_none_or(|provider| provider.model.spec() != spec.as_ref()) =>
-                    {
-                        let prepared = smol::block_on((self.prepare_provider)(spec))
-                            .map_err(|error| eyre!(error.to_string()))?;
-                        Some(PreparedProvider {
+                    provider
+                } else if selected.spec() == startup.spec() {
+                    None
+                } else {
+                    let spec = selected.spec();
+                    match smol::block_on((self.prepare_provider)(Arc::from(spec.as_str()))) {
+                        Ok(prepared) => Some(PreparedProvider {
                             model: prepared.model,
                             provider: prepared.provider,
-                        })
+                        }),
+                        Err(error) => {
+                            model_warning =
+                                Some(restore_warning(&spec, &error.to_string(), &startup));
+                            None
+                        }
                     }
-                    Some(_) => provider,
-                    None => provider.filter(|provider| {
-                        provider.model.spec() == self.model_slot.load().model.spec()
-                    }),
                 }
-            } else {
-                provider
-            };
+            }
+            _ => provider,
+        };
         let session_lock = match renewing {
             Some(lease) => Some(lease.into_claimed_lock().map_err(|error| eyre!(error))?),
-            None => session_lock,
+            None => None,
         };
         let resumed = session_has_content(&session)
             || session
@@ -1689,20 +1674,15 @@ impl SpawnCtx {
             session.meta.session_options.clone(),
         )?;
         session.resolve_legacy_config(stored)?;
-        let bootstrap = session.clone();
-        let recovery = match exact {
-            Some(snapshot) => {
-                let recovery = RecoveryCandidate::from_exact(session, snapshot.clone())?;
-                let mut session = recovery.session().clone();
-                let history = snapshot
-                    .histories
-                    .get(&root_id)
-                    .ok_or_else(|| eyre!(NOT_LIVE_ERR))?;
-                session.adopt_history(history);
-                RecoveryCandidate::from_exact(session, snapshot)?
-            }
-            None => RecoveryCandidate::prepare(session)?,
-        };
+        if let Some(snapshot) = &exact {
+            let history = snapshot
+                .histories
+                .get(&root_id)
+                .ok_or_else(|| eyre!(NOT_LIVE_ERR))?;
+            session.adopt_history(history);
+        }
+        let (checkpoint, recovery) =
+            prepare_session_recovery(&self.sessions_dir, session, guard.clone(), exact)?;
         let session = recovery.session().clone();
         let coordinator_config = config.clone();
         let mut app = App::prepare(
@@ -1731,6 +1711,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_capabilities),
         );
         app.app.state.warnings.extend(state.warnings);
+        app.app.state.warnings.extend(model_warning);
         let handles = AgentHandles::prepare_recovered(
             &model_slot,
             config,
@@ -1748,11 +1729,8 @@ impl SpawnCtx {
             self.system_prompt.clone(),
             Arc::clone(&self.file_write_locks),
         );
-        let writer = SessionWriter::open_session(&self.sessions_dir, &bootstrap)?;
-        writer.bind_publication_guard(Some(guard.clone()));
-        smol::block_on(writer.append_owned(Vec::new(), guard.clone()))?;
-        let checkpoint = Arc::new(writer.clone());
-        app.app.session_writer = Some(writer);
+        smol::block_on(checkpoint.append_owned(Vec::new(), guard.clone()))?;
+        app.app.session_writer = Some(checkpoint.as_ref().clone());
         app.app.writer_guard = Some(guard.clone());
         let deps = self.coordinator_deps(checkpoint);
         let coordinator = prepare_coordinator(
@@ -2180,28 +2158,20 @@ impl<'t> EventLoop<'t> {
         let mut prepares = Vec::new();
         let mut on_startup_provider = Vec::new();
         for session in sessions {
-            let restore = if explicit_model {
-                None
-            } else {
-                let spec = match ctx.replacement_spec(&session) {
-                    Ok(spec) => spec,
-                    Err(error) => {
-                        rollback_startup_runtimes(runtimes);
-                        return Err(eyre!(error));
-                    }
-                };
-                spec.and_then(|spec| match ctx.providers.model(&spec) {
-                    Ok(model) => Some((spec, model, Arc::new(PendingProvider::default()))),
-                    Err(error) => {
-                        startup_warnings.push(restore_warning(
-                            &spec,
-                            &error.to_string(),
-                            &ctx.model_slot.load().model,
-                        ));
-                        None
-                    }
-                })
+            let (selected, _) = match ctx.open_model(&model).select(&session) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    rollback_startup_runtimes(runtimes);
+                    return Err(error.into());
+                }
             };
+            let restore = (selected.spec() != model.spec()).then(|| {
+                (
+                    Arc::<str>::from(selected.spec()),
+                    selected,
+                    Arc::new(PendingProvider::default()),
+                )
+            });
             let provider = restore
                 .as_ref()
                 .map(|(_, model, pending)| PreparedProvider {
@@ -3776,14 +3746,16 @@ impl<'t> EventLoop<'t> {
     /// event loop when it needs one: preparing can read credentials or call
     /// into a plugin, and the loop must keep rendering meanwhile.
     fn bring_up(&mut self, target: RuntimeTarget, session: AppSession) {
-        let spec = match self.ctx.replacement_spec(&session) {
-            Ok(spec) => spec,
-            Err(error) => return self.report_placement(target, Err(error)),
+        let startup = self.ctx.model_slot.load().model.clone();
+        let (selected, _) = match self.ctx.open_model(&startup).select(&session) {
+            Ok(selection) => selection,
+            Err(error) => return self.report_placement(target, Err(error.to_string())),
         };
-        let Some(spec) = spec else {
+        if selected.spec() == startup.spec() {
             let result = self.place_runtime(&target, session, None);
             return self.report_placement(target, result);
-        };
+        }
+        let spec = Arc::<str>::from(selected.spec());
         let prepare = Arc::clone(&self.ctx.prepare_provider);
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
@@ -10150,39 +10122,28 @@ end })
         release_runtime(runtime);
     }
 
-    #[test]
-    fn failed_replacement_provider_preparation_preserves_current_runtime() {
+    #[test_case((); "unavailable")]
+    fn replacement_with_unavailable_saved_model_uses_startup(_: ()) {
         const INVALID_MODEL: &str = "unsupported-provider/test-model";
 
         with_event_loop(|event_loop| {
-            let current_id = event_loop.sessions[0].id();
-            let current_target = event_loop.sessions[0].app.command_target.id();
-            let (current_manager, current_root) = event_loop.sessions[0].handles.manager_and_root();
-            let current_provider = event_loop.ctx.model_slot.load().provider.identity();
-            let session = AppSession::new(INVALID_MODEL, &event_loop.session_cwd);
+            let startup = event_loop.ctx.model_slot.load().model.spec();
+            let mut session = AppSession::new(INVALID_MODEL, &event_loop.session_cwd);
+            session.save(&event_loop.ctx.storage).unwrap();
             let (reply_tx, reply_rx) = flume::bounded(1);
-            let target = RuntimeTarget::Replace {
-                runtime: event_loop.sessions[0].handles.identity(),
-                kind: None,
-                reply: Some(reply_tx),
-            };
-
-            event_loop.bring_up(target, session);
+            event_loop.bring_up(RuntimeTarget::Open { reply: reply_tx }, session.clone());
             pump_until(event_loop, |_| !reply_rx.is_empty());
 
-            assert!(reply_rx.try_recv().unwrap().is_err());
-            let runtime = &event_loop.sessions[0];
-            assert_eq!(runtime.id(), current_id);
-            assert_eq!(runtime.app.command_target.id(), current_target);
-            assert_eq!(
-                runtime.handles.manager_and_root().0.generation(),
-                current_manager.generation()
-            );
-            assert_eq!(runtime.handles.manager_and_root().1, current_root);
-            assert!(runtime.session_lock.is_some());
-            assert_eq!(
-                event_loop.ctx.model_slot.load().provider.identity(),
-                current_provider
+            assert!(reply_rx.try_recv().unwrap().is_ok());
+            let runtime = &event_loop.sessions[event_loop.position(session.id).unwrap()];
+            assert_eq!(runtime.config().unwrap().model.spec(), startup);
+            assert!(
+                runtime
+                    .app
+                    .state
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(INVALID_MODEL))
             );
         });
     }

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -40,14 +40,16 @@ use makima_agent::permissions::{
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_defaults;
 use makima_agent::session_options::{
-    DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, SessionOptionError, YOLO_OPTION_ID,
+    DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, YOLO_OPTION_ID,
 };
-use makima_agent::session_recovery::RecoveredSession;
+use makima_agent::session_recovery::{
+    OpenModel, OpenSessionError, SessionOpening, SessionSource, open_session,
+};
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
-    ModeRegistry, PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
+    PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
 };
 use makima_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
@@ -65,12 +67,11 @@ use makima_providers::{
     ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
 };
 use makima_storage::StateDir;
-use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::conversation::{ConversationRelation, ConversationState};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
 use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
-use makima_storage::sessions::{SESSIONS_DIR, Session, SessionMeta, StoredTokenUsage, read_prefs};
+use makima_storage::sessions::{SESSIONS_DIR, Session, StoredTokenUsage, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -78,7 +79,6 @@ use tracing::warn;
 use crate::cli::Cli;
 use crate::command_attachments;
 
-const RECOVERY_CANCELLED: &str = "session recovery publication cancelled";
 const WORK_ACTIVE: &str = "a command is already running";
 const OUTPUT_CLOSED: &str = "the SDK output is closed";
 const SESSION_ID_CONFLICT: &str =
@@ -713,8 +713,6 @@ impl SdkRuntime {
         let params = &session.params;
         let cli = &params.cli;
         let cwd = params.cwd.clone();
-        let model = params.model.clone();
-        let explicit_model = params.explicit_model && !fresh;
         let config = params.config.clone();
         let permissions_config = params.permissions_config.clone();
         let timeouts = params.timeouts;
@@ -736,40 +734,32 @@ impl SdkRuntime {
 
         let working_dir = cwd.to_string_lossy().into_owned();
         let storage = &session.storage;
-        let mut restored = if fresh {
-            ResolvedSession {
-                id: None,
-                parent: None,
-                seed: None,
-                fork_state: Vec::new(),
-                history: Default::default(),
-                model: None,
-                meta: Default::default(),
-            }
-        } else {
-            resolve_session(cli, &working_dir, storage)?
-        };
-        let resumed = restored.seed.is_some();
-        let session_id = restored
-            .id
-            .clone()
-            .unwrap_or_else(|| SessionRef::from(MakimaId::generate()));
-        let (checkpoint, lock_guard, recovered) = recover_sdk_session(
-            &mut restored,
-            storage,
-            &session_id,
-            &model.spec(),
+        let opening = open_sdk_session(
+            if fresh { None } else { Some(cli) },
             &working_dir,
-            &lua_handle.mode_registry(),
-        )
-        .await?;
+            storage,
+            OpenModel {
+                startup: &params.model,
+                explicit: params.explicit_model && !fresh,
+                providers: &providers,
+                policy: &model_policy,
+            },
+        )?;
+        let resumed = opening.resumed;
+        let session_id = SessionRef::from(opening.session.id);
+        let model = opening.model.clone();
+        if let Some(warning) = &opening.warning {
+            warn!(%warning, %session_id, "session model restoration");
+        }
+        let (checkpoint, lock_guard, recovered) = opening
+            .recover(storage, &lua_handle.mode_registry())
+            .await?;
         let root_id = recovered
             .session()
             .root_agent_id()
             .ok_or_else(|| eyre!("recovered session has no root agent"))?;
-        restored.history = recovered.session().history_snapshot();
-        restored.meta = recovered.session().meta.clone();
-        restored.model = Some(recovered.session().model.clone());
+        let initial_history = recovered.session().history_snapshot();
+        let meta = &recovered.session().meta;
         let recovered_state = recovered.session().latest_state()?;
         let mut continuation_count = recovered_state
             .scopes
@@ -797,23 +787,9 @@ impl SdkRuntime {
             .scopes
             .get(&Some(root_id))
             .and_then(|scope| scope.config.as_ref());
-        if let Some(config) = recovered_config {
-            restored.model = Some(config.model.clone());
-        }
         let cwd = recovered_config
             .map(|config| PathBuf::from(&config.cwd))
             .unwrap_or(cwd);
-        let model_override = explicit_model.then(|| model.spec());
-        let model = if let Some(config) = recovered_config {
-            if !model_policy.allows(&config.model) {
-                return Err(eyre!(SessionOptionError::PolicyRejected(
-                    config.model.clone().into()
-                )));
-            }
-            providers.model(&config.model)?
-        } else {
-            startup_model(&providers, model, &restored, explicit_model, &model_policy)
-        };
         let persisted_yolo = recovered_state
             .scopes
             .get(&None)
@@ -829,8 +805,8 @@ impl SdkRuntime {
                 session_defaults::resolve(
                     defaults,
                     &read_prefs(storage),
-                    &restored.meta,
-                    restored.history.messages.is_empty(),
+                    meta,
+                    initial_history.messages.is_empty(),
                     &model,
                 )
             },
@@ -842,9 +818,7 @@ impl SdkRuntime {
         );
         let persisted_options = recovered_config
             .map(|config| config.options.clone())
-            .unwrap_or_else(|| mem::take(&mut restored.meta.session_options));
-        let session_id = Some(session_id);
-        let initial_history = restored.history;
+            .unwrap_or_else(|| meta.session_options.clone());
 
         let (mcp_handle, mcp_config_errors) = async {
             let (handle, errors) =
@@ -874,7 +848,7 @@ impl SdkRuntime {
                 question_mode: QuestionMode::Headless,
                 mcp_handle,
                 initial_wd: cwd.clone(),
-                session_id,
+                session_id: Some(session_id),
                 root_id: Some(root_id),
                 journal: Some(recovered.journal()),
                 initial_history: Vec::new(),
@@ -994,15 +968,6 @@ impl SdkRuntime {
                 handle
                     .permissions
                     .try_set_yolo(permission_mode == PermissionMode::BypassPermissions)
-                    .map_err(|error| eyre!(error))?;
-            }
-            if recovered_config.is_some()
-                && let Some(spec) = model_override
-                && spec != startup_model.spec()
-            {
-                coordinator
-                    .set_option(MODEL_OPTION_ID, spec)
-                    .await
                     .map_err(|error| eyre!(error))?;
             }
             let committed_config = headless::checkpoint_startup_config(&root, &coordinator)
@@ -1746,254 +1711,122 @@ fn emit_command_result(
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
-struct ResolvedSession {
-    id: Option<SessionRef>,
-    parent: Option<ParentLink>,
-    seed: Option<StoredSession>,
-    fork_state: Vec<StateChange>,
-    history: makima_agent::agent::HistorySnapshot,
-    model: Option<String>,
-    meta: SessionMeta,
-}
-
-async fn recover_sdk_session(
-    restored: &mut ResolvedSession,
-    storage: &StateDir,
-    session_id: &SessionRef,
-    model: &str,
+fn open_sdk_session(
+    cli: Option<&Cli>,
     cwd: &str,
-    modes: &ModeRegistry,
-) -> Result<(
-    Arc<SessionWriter>,
-    Arc<session_lock::LockHeartbeat>,
-    RecoveredSession,
-)> {
-    let sessions_dir = storage
-        .ensure_subdir(SESSIONS_DIR)
-        .context("create sessions dir")?;
-    let claimed_lock = session_lock::claim(&sessions_dir, &session_id.id())
-        .context("claim session lock")?
-        .ok_or_else(|| eyre!("session is open in another terminal; close it there first"))?;
-    let locked_id = session_id.id();
-    let lock_guard = Arc::new(session_lock::LockHeartbeat::spawn(
-        claimed_lock,
-        move || {
-            if let Ok(coordinator) = SessionCoordinatorHandle::resolve(locked_id) {
-                coordinator.retire();
-            }
-        },
-    ));
-    let owned_seed = match StoredSession::load(session_id.id(), storage) {
-        Ok(seed) => Some(seed),
-        Err(makima_storage::sessions::SessionError::Storage(
-            makima_storage::StorageError::NotFound(_),
-        )) if restored.seed.is_none() => None,
-        Err(error) => return Err(eyre!("reload owned session {session_id}: {error}")),
-    };
-    if owned_seed.is_some() && restored.seed.is_none() && restored.parent.is_some() {
-        return Err(eyre!(FORK_DESTINATION_EXISTS));
-    }
-    let restore_legacy = owned_seed.is_some();
-    let mut seed = if let Some(seed) = owned_seed {
-        if let Some(block) = session_lock::resume_block(&seed.cwd, cwd, false) {
-            return Err(eyre!("session {session_id}: {block}"));
+    storage: &StateDir,
+    model: OpenModel<'_>,
+) -> Result<SessionOpening> {
+    let source = sdk_session_source(cli, cwd, storage, &model.startup.spec())?;
+    match open_session(storage, source, model, Some(cwd)) {
+        Err(OpenSessionError::Exists(_)) if cli.is_some_and(|cli| cli.fork_session) => {
+            Err(eyre!(FORK_DESTINATION_EXISTS))
         }
-        seed
-    } else {
-        let mut seed = StoredSession::new(restored.model.as_deref().unwrap_or(model), cwd);
-        seed.id = session_id.id();
-        seed.adopt_history(&restored.history);
-        seed.meta = restored.meta.clone();
-        seed
-    };
-    let root_id = seed.root_agent_id().unwrap_or_else(AgentId::generate);
-    seed.bind_root_id(root_id)?;
-    if !restore_legacy {
-        for mut change in mem::take(&mut restored.fork_state) {
-            let agent = if let StateChange::Config(config) = &mut change {
-                config.cwd = cwd.to_owned();
-                Some(root_id)
-            } else {
-                None
-            };
-            seed.push_state(StoredStateRecord {
-                seq: seed.next_state_seq(),
-                agent,
-                generation: if agent.is_some() {
-                    seed.history_snapshot().epoch
-                } else {
-                    0
-                },
-                change,
-            });
-        }
+        result => Ok(result?),
     }
-    if restore_legacy
-        && let Some(warning) =
-            makima_agent::session_recovery::resolve_legacy_mode(&mut seed, modes, storage)?
-    {
-        warn!(%warning, "legacy mode restoration fell back to read-only");
-    }
-    if !restore_legacy && restored.parent.is_some() {
-        seed.set_parent(restored.parent.clone());
-    }
-    let checkpoint = Arc::new(SessionWriter::open_session(&sessions_dir, &seed)?);
-    checkpoint.bind_publication_guard(Some(lock_guard.publication_guard()));
-    let claim: CheckpointClaim = Arc::new(|publication| {
-        publication
-            .try_publish()
-            .then_some(())
-            .ok_or_else(|| Arc::from(RECOVERY_CANCELLED))
-    });
-    let recovered = checkpoint
-        .recover(seed, CheckpointPublication::default(), claim)
-        .await?;
-    Ok((checkpoint, lock_guard, recovered))
 }
 
-fn startup_model(
-    providers: &ProviderRegistry,
-    startup: Model,
-    restored: &ResolvedSession,
-    explicit_model: bool,
-    model_policy: &ModelPolicy,
-) -> Model {
-    if explicit_model {
-        return startup;
-    }
-    restored
-        .model
+fn sdk_session_source(
+    cli: Option<&Cli>,
+    cwd: &str,
+    storage: &StateDir,
+    startup_model: &str,
+) -> Result<SessionSource> {
+    let Some(cli) = cli else {
+        return Ok(SessionSource::Create(StoredSession::new(
+            startup_model,
+            cwd,
+        )));
+    };
+    let pinned = cli
+        .session_id
         .as_deref()
-        .and_then(|spec| providers.model(spec).ok())
-        .filter(|candidate| model_policy.allows(&candidate.spec()))
-        .unwrap_or(startup)
+        .map(|id| {
+            id.parse::<MakimaId>()
+                .map_err(|error| eyre!("invalid session id {id:?}: {error}"))
+        })
+        .transpose()?;
+    // A bare --continue is rejected before SDK mode starts.
+    let explicit = cli
+        .continue_session
+        .as_ref()
+        .and_then(|id| id.as_deref())
+        .map(|id| {
+            id.parse::<MakimaId>()
+                .map_err(|error| eyre!("invalid session id {id}: {error}"))
+        })
+        .transpose()?;
+    let latest = if explicit.is_none() && cli.last_session {
+        StoredSession::latest(cwd, storage)?
+    } else {
+        None
+    };
+    let selected = explicit.or_else(|| latest.as_ref().map(|session| session.id));
+    if !cli.fork_session
+        && let Some(id) = selected
+    {
+        if pinned.is_some_and(|pinned| pinned != id) {
+            return Err(eyre!(SESSION_ID_CONFLICT));
+        }
+        return Ok(SessionSource::Resume(id));
+    }
+
+    let mut seed = StoredSession::new(startup_model, cwd);
+    if let Some(id) = pinned {
+        seed.id = id;
+    }
+    if cli.fork_session {
+        if let Some(id) = explicit {
+            let source = StoredSession::load(id, storage)
+                .map_err(|error| eyre!("load session {id}: {error}"))?;
+            seed_sdk_fork(&mut seed, &source, cwd)?;
+        } else if let Some(source) = latest {
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
+            if let Some(block) = session_lock::resume_block(
+                &source.cwd,
+                cwd,
+                session_lock::open_elsewhere(&sessions_dir, &source.id),
+            ) {
+                return Err(eyre!("session {}: {block}", source.id));
+            }
+            seed_sdk_fork(&mut seed, &source, cwd)?;
+        }
+    }
+    if pinned.is_some() && !cli.fork_session {
+        Ok(SessionSource::ResumeOrCreate(seed))
+    } else {
+        Ok(SessionSource::Create(seed))
+    }
 }
 
-fn resolve_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<ResolvedSession> {
-    let sessions_dir = storage
-        .ensure_subdir(SESSIONS_DIR)
-        .context("create sessions dir")?;
-    // A bare continue flag (no ID) is rejected by the TUI guard before SDK
-    // mode starts, so only a valued ID reaches this branch.
-    let mut parent = None;
-    let mut seed = None;
-    let mut fork_state = Vec::new();
-    let (resumed_id, mut history, mut restored_model, mut meta) =
-        if let Some(id) = cli.continue_session.as_ref().and_then(|o| o.as_deref()) {
-            let session_ref: SessionRef = id
-                .parse()
-                .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
-            let session = StoredSession::load(session_ref.id(), storage)
-                .map_err(|e| eyre!("load session {id}: {e}"))?;
-            // The fork source is a read-only copy: no resume-block checks on it.
-            if !cli.fork_session
-                && let Some(block) = resume_block_for(&sessions_dir, &session, cwd)
-            {
-                return Err(eyre!("session {id}: {block}"));
-            }
-            let resumed = (!cli.fork_session).then_some(session_ref);
-            if !cli.fork_session {
-                seed = Some(session.clone());
-            }
-            if cli.fork_session {
-                parent = Some(fork_parent(&session));
-                fork_state = fork_config_and_rules(&session)?;
-            }
-            let model = session.model.clone();
-            let meta = session.meta.clone();
-            let history = session.history_snapshot();
-            (resumed, history, Some(model), meta)
-        } else if cli.last_session {
-            match StoredSession::latest(cwd, storage) {
-                Ok(Some(session)) => {
-                    if let Some(block) = resume_block_for(&sessions_dir, &session, cwd) {
-                        return Err(eyre!("session {}: {block}", session.id));
-                    }
-                    if cli.fork_session {
-                        parent = Some(fork_parent(&session));
-                        fork_state = fork_config_and_rules(&session)?;
-                    } else {
-                        seed = Some(session.clone());
-                    }
-                    let model = session.model.clone();
-                    let meta = session.meta.clone();
-                    (
-                        (!cli.fork_session).then(|| SessionRef::from(session.id)),
-                        session.history_snapshot(),
-                        Some(model),
-                        meta,
-                    )
-                }
-                _ => (None, Default::default(), None, SessionMeta::default()),
-            }
+fn seed_sdk_fork(seed: &mut StoredSession, source: &StoredSession, cwd: &str) -> Result<()> {
+    let mut history = source.history_snapshot();
+    history.conversation = history.conversation.take().map(|conversation| {
+        ConversationState::fresh(
+            conversation.link(ConversationRelation::Branches, history.messages.len()),
+        )
+    });
+    seed.set_model(source.model.clone());
+    seed.meta = source.meta.clone();
+    seed.adopt_history(&history);
+    seed.set_parent(Some(fork_parent(source)));
+    let root = AgentId::generate();
+    seed.bind_root_id(root)?;
+    for mut change in fork_config_and_rules(source)? {
+        let (agent, generation) = if let StateChange::Config(config) = &mut change {
+            config.cwd = cwd.to_owned();
+            (Some(root), history.epoch)
         } else {
-            (None, Default::default(), None, SessionMeta::default())
+            (None, 0)
         };
-
-    if cli.fork_session {
-        history.conversation = history.conversation.take().map(|source| {
-            ConversationState::fresh(
-                source.link(ConversationRelation::Branches, history.messages.len()),
-            )
+        seed.push_state(StoredStateRecord {
+            seq: seed.next_state_seq(),
+            agent,
+            generation,
+            change,
         });
     }
-    let cli_session_id = cli.session_id.as_deref().map(|s| {
-        s.parse::<SessionRef>()
-            .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
-    });
-    let cli_session_id = match cli_session_id {
-        // A successful load proves the pinned ID pre-exists, so it must
-        // belong to this directory and be free of other holders; a fresh ID
-        // simply starts new.
-        Some(Ok(id)) => {
-            if resumed_id
-                .as_ref()
-                .is_some_and(|resumed| resumed.id() != id.id())
-            {
-                return Err(eyre!(SESSION_ID_CONFLICT));
-            }
-            match seed
-                .as_ref()
-                .filter(|session| session.id == id.id())
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| StoredSession::load(id.id(), storage))
-            {
-                Ok(session) => {
-                    if cli.fork_session {
-                        return Err(eyre!(FORK_DESTINATION_EXISTS));
-                    }
-                    parent = session.parent().cloned();
-                    seed = Some(session.clone());
-                    if !cli.fork_session {
-                        history = session.history_snapshot();
-                        restored_model = Some(session.model.clone());
-                        meta = session.meta.clone();
-                    }
-                    if let Some(block) = resume_block_for(&sessions_dir, &session, cwd) {
-                        return Err(eyre!("session {}: {block}", session.id));
-                    }
-                }
-                Err(makima_storage::sessions::SessionError::Storage(
-                    makima_storage::StorageError::NotFound(_),
-                )) => {}
-                Err(error) => return Err(eyre!("load session {id}: {error}")),
-            }
-            Some(id)
-        }
-        Some(Err(e)) => return Err(e),
-        None => None,
-    };
-
-    Ok(ResolvedSession {
-        id: cli_session_id.or(resumed_id),
-        parent,
-        seed,
-        fork_state,
-        history,
-        model: restored_model,
-        meta,
-    })
+    Ok(())
 }
 
 fn fork_config_and_rules(session: &StoredSession) -> Result<Vec<StateChange>> {
@@ -2021,18 +1854,6 @@ fn fork_parent(session: &StoredSession) -> ParentLink {
         session: session.id,
         message: session.last_message_id(),
     }
-}
-
-fn resume_block_for(
-    sessions_dir: &Path,
-    session: &StoredSession,
-    cwd: &str,
-) -> Option<session_lock::ResumeBlock> {
-    session_lock::resume_block(
-        &session.cwd,
-        cwd,
-        session_lock::open_elsewhere(sessions_dir, &session.id),
-    )
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -2747,7 +2568,6 @@ mod tests {
     use super::*;
     use makima_agent::actor::{ActorLifecycle, ActorStatus};
     use makima_agent::actor::{ConfigChange, ConfigPatch};
-    use makima_agent::journal::SessionJournal;
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::session_coordinator::{SessionCheckpoint, SessionCheckpointKind};
     use makima_agent::session_options::{
@@ -2755,7 +2575,9 @@ mod tests {
     };
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::tools::ToolRegistry;
-    use makima_agent::{AgentError, AgentId, AgentRef, ModeDef, ModelSource, PreparedModel};
+    use makima_agent::{
+        AgentError, AgentId, AgentRef, ModeDef, ModeRegistry, ModelSource, PreparedModel,
+    };
     use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use makima_lua::orchestration::OrchestrationServices;
     use makima_providers::model::FastSupport;
@@ -2766,7 +2588,7 @@ mod tests {
     };
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
-    use makima_storage::sessions::{Prefs, StoredEffect, StoredRule, StoredThinking};
+    use makima_storage::sessions::{Prefs, SessionMeta, StoredEffect, StoredRule, StoredThinking};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -3107,11 +2929,26 @@ mod tests {
         smol::block_on(fresh.close()).unwrap();
     }
 
+    fn open_test_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<SessionOpening> {
+        let params = idle_params();
+        open_sdk_session(
+            Some(cli),
+            cwd,
+            storage,
+            OpenModel {
+                startup: &params.model,
+                explicit: false,
+                providers: &params.providers,
+                policy: &params.model_policy,
+            },
+        )
+    }
+
     #[test_case("-c", true; "valued_continue")]
     #[test_case("--session-id", true; "pinned_existing")]
     #[test_case("-l", true; "last")]
     #[test_case("--session-id", false; "pinned_created_before_claim")]
-    fn sdk_recovery_reloads_checkpoint_published_after_resolution(flag: &str, existing: bool) {
+    fn sdk_open_loads_checkpoint_published_after_source_selection(flag: &str, existing: bool) {
         use clap::Parser;
 
         smol::block_on(async {
@@ -3132,7 +2969,7 @@ mod tests {
                 args.push(saved.id.to_string());
             }
             let cli = Cli::parse_from(args);
-            let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
+            let source = sdk_session_source(Some(&cli), &cwd, &storage, STARTUP_MODEL).unwrap();
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
                 .unwrap()
@@ -3166,16 +3003,22 @@ mod tests {
             let before_recovery = std::fs::read(&path).unwrap();
             competing_lease.release().unwrap();
 
-            let (checkpoint, lease, recovered) = recover_sdk_session(
-                &mut restored,
+            let params = idle_params();
+            let opening = open_session(
                 &storage,
-                &SessionRef::from(saved.id),
-                STARTUP_MODEL,
-                &cwd,
-                &modes,
+                source,
+                OpenModel {
+                    startup: &params.model,
+                    explicit: false,
+                    providers: &params.providers,
+                    policy: &params.model_policy,
+                },
+                Some(&cwd),
             )
-            .await
             .unwrap();
+            assert!(opening.resumed);
+            assert_eq!(opening.model.spec(), RESTORED_MODEL);
+            let (checkpoint, lease, recovered) = opening.recover(&storage, &modes).await.unwrap();
             checkpoint.drain().await.unwrap();
             assert!(std::fs::read(&path).unwrap().starts_with(&before_recovery));
             let durable = StoredSession::load(saved.id, &storage).unwrap();
@@ -3427,7 +3270,7 @@ mod tests {
             saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
             saved.save(&storage).unwrap();
             let cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
-            let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
+            let source = sdk_session_source(Some(&cli), &cwd, &storage, STARTUP_MODEL).unwrap();
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
                 .unwrap()
@@ -3436,21 +3279,26 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
             competing_lease.release().unwrap();
 
-            let result = recover_sdk_session(
-                &mut restored,
+            let params = idle_params();
+            let result = open_session(
                 &storage,
-                &SessionRef::from(saved.id),
-                STARTUP_MODEL,
-                &cwd,
-                &ModeRegistry::builtin(),
-            )
-            .await;
-            let error = result.err().expect("a missing resolved session must fail");
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("reload owned session {}:", saved.id))
+                source,
+                OpenModel {
+                    startup: &params.model,
+                    explicit: false,
+                    providers: &params.providers,
+                    policy: &params.model_policy,
+                },
+                Some(&cwd),
             );
+            assert!(matches!(
+                result,
+                Err(OpenSessionError::Load(
+                    makima_storage::sessions::SessionError::Storage(
+                        makima_storage::StorageError::NotFound(_)
+                    )
+                ))
+            ));
             assert!(!path.exists());
             assert!(
                 session_lock::claim(&sessions_dir, &saved.id)
@@ -3657,27 +3505,65 @@ mod tests {
         }
     }
 
-    #[test_case(false, RESTORED_MODEL; "restores_persisted_model_without_explicit_flag")]
-    #[test_case(true, STARTUP_MODEL; "explicit_model_overrides_persisted_model")]
-    fn sdk_startup_model_precedence(explicit_model: bool, expected: &str) {
-        let restored = ResolvedSession {
-            id: None,
-            parent: None,
-            seed: None,
-            fork_state: Vec::new(),
-            history: Default::default(),
-            model: Some(RESTORED_MODEL.into()),
-            meta: SessionMeta::default(),
-        };
-        let resolved = startup_model(
-            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
-            Model::from_spec(STARTUP_MODEL).unwrap(),
-            &restored,
-            explicit_model,
-            &ModelPolicy::default(),
-        );
+    #[test_case(false, false, RESTORED_MODEL; "restores_recorded_model")]
+    #[test_case(true, false, STARTUP_MODEL; "explicit_model_overrides_recorded_model")]
+    #[test_case(false, true, STARTUP_MODEL; "policy_rejected_recorded_model_falls_back")]
+    fn sdk_startup_model_precedence(explicit: bool, reject_recorded: bool, expected: &str) {
+        use clap::Parser;
 
-        assert_eq!(resolved.spec(), expected);
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let cwd = directory.path().to_string_lossy();
+        let mut saved = StoredSession::new(STARTUP_MODEL, &cwd);
+        let root = AgentId::generate();
+        saved.bind_root_id(root).unwrap();
+        saved.push_state(StoredStateRecord {
+            seq: saved.next_state_seq(),
+            agent: Some(root),
+            generation: 0,
+            change: StateChange::Config(StoredAgentConfig {
+                cwd: cwd.into_owned(),
+                model: RESTORED_MODEL.into(),
+                thinking: None,
+                fast: false,
+                workflow: false,
+                mode: ModeRegistry::builtin()
+                    .current(&AgentMode::Build)
+                    .stored_snapshot(&AgentMode::Build),
+                options: BTreeMap::new(),
+            }),
+        });
+        saved.save(&storage).unwrap();
+
+        let mut params = reset_sdk_params(directory.path().to_path_buf());
+        params.cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
+        params.model = sdk_model(STARTUP_MODEL);
+        params.explicit_model = explicit;
+        params.providers = Arc::new(makima_providers::test_util::offline_ids(&["anthropic"]));
+        if reject_recorded {
+            params.model_policy =
+                Arc::new(ModelPolicy::new(&[], &[RESTORED_MODEL.into()]).unwrap());
+        }
+        let (out_tx, out_rx) = flume::unbounded();
+        let session = SdkSession::new(params, storage.clone(), out_tx).unwrap();
+        let runtime = session.current();
+        let init: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
+        assert_eq!(init["model"], expected.split_once('/').unwrap().1);
+        assert_eq!(
+            runtime.coordinator.read().options().values()[MODEL_OPTION_ID],
+            expected
+        );
+        smol::block_on(runtime.checkpoint.drain()).unwrap();
+        let saved = StoredSession::load(saved.id, &storage).unwrap();
+        assert_eq!(
+            saved.latest_state().unwrap().scopes[&Some(root)]
+                .config
+                .as_ref()
+                .unwrap()
+                .model,
+            expected
+        );
+        smol::block_on(runtime.close()).unwrap();
     }
 
     struct OutcomeBehavior(CommandOutcome);
@@ -4306,7 +4192,7 @@ mod tests {
 
         let tmp = tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = StoredSession::new("test-model", OTHER_CWD);
+        let mut session = StoredSession::new(STARTUP_MODEL, OTHER_CWD);
         session.save(&storage).unwrap();
         let id = session.id.to_string();
         for flags in [vec!["-c".to_string()], vec!["--session-id".to_string()]] {
@@ -4314,7 +4200,7 @@ mod tests {
             args.extend(flags);
             args.push(id.clone());
             let cli = Cli::parse_from(args.iter().map(String::as_str));
-            let err = resolve_session(&cli, THIS_CWD, &storage)
+            let err = open_test_session(&cli, THIS_CWD, &storage)
                 .map(|_| ())
                 .expect_err("a session stored under another cwd must be rejected");
             assert!(err.to_string().contains(OTHER_CWD));
@@ -4355,7 +4241,7 @@ mod tests {
         }
         args.extend(["--session-id".to_owned(), destination.id.to_string()]);
         let cli = Cli::parse_from(args);
-        let error = resolve_session(&cli, THIS_CWD, &storage)
+        let error = open_test_session(&cli, THIS_CWD, &storage)
             .map(|_| ())
             .unwrap_err();
         assert_eq!(error.to_string(), SESSION_ID_CONFLICT);
@@ -4363,17 +4249,47 @@ mod tests {
         assert_eq!(std::fs::read(destination_path).ok(), destination_bytes);
     }
 
+    #[test]
+    fn sdk_fork_rejects_existing_destination() {
+        use clap::Parser;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut source = StoredSession::new(STARTUP_MODEL, THIS_CWD);
+        source.save(&storage).unwrap();
+        let mut destination = StoredSession::new(RESTORED_MODEL, THIS_CWD);
+        destination.save(&storage).unwrap();
+        let destination_path = storage
+            .path()
+            .join(SESSIONS_DIR)
+            .join(format!("{}.jsonl", destination.id));
+        let before = std::fs::read(&destination_path).unwrap();
+        let cli = Cli::parse_from([
+            "makima",
+            "-c",
+            &source.id.to_string(),
+            "--fork-session",
+            "--session-id",
+            &destination.id.to_string(),
+        ]);
+        let error = open_test_session(&cli, THIS_CWD, &storage)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(error.to_string(), FORK_DESTINATION_EXISTS);
+        assert_eq!(std::fs::read(destination_path).unwrap(), before);
+    }
+
     #[test_case("-c"; "valued_continue")]
     #[test_case("--session-id"; "pinned_id")]
     #[test_case("-l"; "last")]
-    fn sdk_resolve_session_rejects_session_open_elsewhere(flag: &str) {
+    fn sdk_open_rejects_session_open_elsewhere(flag: &str) {
         use clap::Parser;
         use std::fs;
         use tempfile::tempdir;
 
         let tmp = tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = StoredSession::new("test-model", THIS_CWD);
+        let mut session = StoredSession::new(STARTUP_MODEL, THIS_CWD);
         session.save(&storage).unwrap();
         let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
 
@@ -4385,15 +4301,17 @@ mod tests {
         let cli = Cli::parse_from(args.iter().map(String::as_str));
 
         let resolved =
-            resolve_session(&cli, THIS_CWD, &storage).expect("an unlocked session loads");
-        assert_eq!(resolved.id.map(|r| r.id()), Some(session.id));
+            open_test_session(&cli, THIS_CWD, &storage).expect("an unlocked session loads");
+        assert!(resolved.resumed);
+        assert_eq!(resolved.session.id, session.id);
+        drop(resolved);
 
         fs::write(
             session_lock::lock_path(&sessions_dir, &session.id),
             FAKE_PID.to_string(),
         )
         .unwrap();
-        let err = resolve_session(&cli, THIS_CWD, &storage)
+        let err = open_test_session(&cli, THIS_CWD, &storage)
             .map(|_| ())
             .expect_err("a session locked by another instance must be rejected");
         assert!(err.to_string().contains(session_lock::OPEN_ELSEWHERE_MSG));
@@ -4467,17 +4385,11 @@ mod tests {
             let mut first_state = None;
             for _ in 0..2 {
                 let cli = Cli::parse_from(["makima", "-c", &id.to_string()]);
-                let mut restored = resolve_session(&cli, &cwd, &storage).unwrap();
-                let (checkpoint, lease, recovered) = recover_sdk_session(
-                    &mut restored,
-                    &storage,
-                    &SessionRef::from(id),
-                    STARTUP_MODEL,
-                    &cwd,
-                    &ModeRegistry::builtin(),
-                )
-                .await
-                .unwrap();
+                let (checkpoint, lease, recovered) = open_test_session(&cli, &cwd, &storage)
+                    .unwrap()
+                    .recover(&storage, &ModeRegistry::builtin())
+                    .await
+                    .unwrap();
                 let state: Vec<_> = recovered
                     .session()
                     .state()
@@ -4661,9 +4573,11 @@ mod tests {
             args.push("--fork-session".to_owned());
         }
         let cli = Cli::parse_from(args);
-        let restored = resolve_session(&cli, THIS_CWD, &storage).unwrap();
-        assert!(restored.history.compacted);
-        let history = makima_agent::agent::History::restored_snapshot(restored.history.clone());
+        let opening = open_test_session(&cli, THIS_CWD, &storage).unwrap();
+        assert_eq!(opening.resumed, !fork);
+        let opened_history = opening.session.history_snapshot();
+        assert!(opened_history.compacted);
+        let history = makima_agent::agent::History::restored_snapshot(opened_history.clone());
         assert_eq!(
             history.conversation_id().as_ref() == STORED_CONVERSATION,
             !fork
@@ -4674,23 +4588,21 @@ mod tests {
             shared: STORED_SENT,
         });
         assert_eq!(history.conversation().previous, link);
-        let expected_root = restored
-            .seed
-            .as_ref()
-            .and_then(StoredSession::root_agent_id);
+        let expected_root = opening.session.root_agent_id();
         if !legacy && !fork {
             assert_eq!(expected_root, session.root_agent_id());
         }
+        let parent = opening.session.parent().cloned();
         assert_eq!(
-            restored.parent.as_ref().map(|parent| parent.session),
+            parent.as_ref().map(|parent| parent.session),
             fork.then_some(session.id)
         );
         assert_eq!(
-            restored.parent.as_ref().map(|parent| parent.message),
+            parent.as_ref().map(|parent| parent.message),
             fork.then_some(source_anchor)
         );
         assert_eq!(
-            serde_json::to_value(restored.history.messages.as_ref()).unwrap(),
+            serde_json::to_value(opened_history.messages.as_ref()).unwrap(),
             serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()
         );
         smol::block_on(async {
@@ -4702,18 +4614,19 @@ mod tests {
             });
             let mut params = idle_params();
             params.initial_wd = PathBuf::from(THIS_CWD);
-            params.session_id = restored.id;
-            params.root_id = expected_root;
-            params.journal = restored
-                .seed
-                .as_ref()
-                .map(|seed| Arc::new(SessionJournal::from_session(seed).unwrap()));
+            params.session_id = Some(SessionRef::from(opening.session.id));
+            params.model = opening.model.clone();
+            let (writer, lease, recovered) =
+                opening.recover(&storage, &params.modes).await.unwrap();
+            params.root_id = recovered.session().root_agent_id();
+            params.journal = Some(recovered.journal());
+            let recovered_history = recovered.session().history_snapshot();
             let handle = headless::spawn_interactive_with_binding(
                 params,
                 Box::new(move |model| {
                     Box::pin(async move { Ok(PreparedModel { model, provider }) })
                 }),
-                Some(restored.history.clone()),
+                Some(recovered_history.clone()),
                 None,
             );
             let root = handle.initialized_root().await.unwrap();
@@ -4723,16 +4636,6 @@ mod tests {
             } else {
                 assert_eq!(Some(root.id()), expected_root);
             }
-            let mut seed = restored.seed.unwrap_or_else(|| {
-                let mut seed = StoredSession::new(STARTUP_MODEL, THIS_CWD);
-                seed.id = handle.session_id.id();
-                seed
-            });
-            seed.set_parent(restored.parent.clone());
-            let writer = Arc::new(
-                SessionWriter::open_session(&storage.ensure_subdir(SESSIONS_DIR).unwrap(), &seed)
-                    .unwrap(),
-            );
             writer.bind_journal(handle.manager.journal()).await.unwrap();
             let coordinator = SessionCoordinatorHandle::register(
                 makima_agent::session_coordinator::SessionCoordinatorParams {
@@ -4770,10 +4673,10 @@ mod tests {
                 .unwrap()
                 .source_snapshot()
                 .unwrap();
-            assert_eq!(source.history.epoch == restored.history.epoch, !fork);
-            assert_eq!(source.history.compacted, restored.history.compacted);
-            assert_eq!(source.history.conversation, restored.history.conversation);
-            assert_eq!(source.history.messages, restored.history.messages);
+            assert_eq!(source.history.epoch, recovered_history.epoch);
+            assert_eq!(source.history.compacted, opened_history.compacted);
+            assert_eq!(source.history.conversation, opened_history.conversation);
+            assert_eq!(source.history.messages, opened_history.messages);
             headless::checkpoint_startup_config(&root, &coordinator)
                 .await
                 .unwrap();
@@ -4785,9 +4688,7 @@ mod tests {
             );
             assert_eq!(saved.root_agent_id(), Some(root.id()));
             let resumed_cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
-            let resumed = resolve_session(&resumed_cli, THIS_CWD, &storage).unwrap();
-            assert_eq!(resumed.seed.unwrap().root_agent_id(), Some(root.id()));
-            assert_eq!(saved.parent(), restored.parent.as_ref());
+            assert_eq!(saved.parent(), parent.as_ref());
             assert!(saved.history_snapshot().compacted);
             assert_eq!(saved.messages().len(), session.messages().len());
             if legacy && !fork {
@@ -4808,6 +4709,9 @@ mod tests {
             assert!(entering.is_empty());
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
+            drop(lease);
+            let resumed = open_test_session(&resumed_cli, THIS_CWD, &storage).unwrap();
+            assert_eq!(resumed.session.root_agent_id(), Some(root.id()));
         });
     }
 

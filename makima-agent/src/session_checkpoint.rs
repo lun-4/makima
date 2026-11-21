@@ -123,6 +123,7 @@ impl CheckpointWriter<SessionCheckpoint> for SessionWriter {
                 session_id: request.session_id,
                 message,
             })?;
+            // The claim installs the prepared changes before the flush captures its target.
             writer.flush_journals().await?;
             Ok(CheckpointAck::for_request(&request))
         })
@@ -287,7 +288,6 @@ mod tests {
                     CheckpointAck::for_request(&request(session.id))
                 );
             }
-            writer.drain().await.unwrap();
             let bytes = read(directory.path().join(format!("{}.jsonl", session.id))).unwrap();
             let states: Vec<StoredStateRecord> = bytes
                 .split(|byte| *byte == b'\n')

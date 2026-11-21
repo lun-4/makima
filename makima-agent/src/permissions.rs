@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::journal::{
     JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
 };
-use crate::{AgentEvent, CancelToken, EventSender};
+use crate::{AgentEvent, CancelToken, EventSender, Post, PostLevel};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -111,6 +111,20 @@ impl PermissionError {
             guidance: Some(guidance),
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum PermissionDecisionError {
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    #[error(
+        "Could not save the permission rule for {tool} ({scope}); the rule still applies in this session: {message}"
+    )]
+    Config {
+        tool: ToolKey,
+        scope: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,7 +836,7 @@ impl PermissionManager {
 
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
         if let Err(error) = self.try_apply_decision(tool, scopes, answer) {
-            warn!(%error, "failed to commit permission decision");
+            warn!(%error, "permission decision reported an error");
         }
     }
 
@@ -841,7 +855,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &[String],
         answer: &PermissionAnswer,
-    ) -> Result<(), JournalError> {
+    ) -> Result<(), PermissionDecisionError> {
         let binding = self.session().binding.clone();
         let _publication = binding
             .as_ref()
@@ -862,7 +876,7 @@ impl PermissionManager {
         scopes: &[String],
         answer: &PermissionAnswer,
         binding: Option<&PermissionJournal>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<(), PermissionDecisionError> {
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
             // This makes session and persisted rules consistent: a deny on an MCP tool
@@ -875,17 +889,21 @@ impl PermissionManager {
         match answer {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => self.update_session_bound(binding, |_| ()),
-            PermissionAnswer::AllowSession => self.update_session_bound(binding, |snapshot| {
-                insert_session_rules(
-                    snapshot,
-                    resolved.iter().map(|scope| PermissionRule {
-                        tool: tool.clone(),
-                        scope: Some(scope.clone()),
-                        effect: Effect::Allow,
-                    }),
-                );
-            }),
+            | PermissionAnswer::DenyWithGuidance(_) => {
+                self.update_session_bound(binding, |_| ())?;
+            }
+            PermissionAnswer::AllowSession => {
+                self.update_session_bound(binding, |snapshot| {
+                    insert_session_rules(
+                        snapshot,
+                        resolved.iter().map(|scope| PermissionRule {
+                            tool: tool.clone(),
+                            scope: Some(scope.clone()),
+                            effect: Effect::Allow,
+                        }),
+                    );
+                })?;
+            }
             PermissionAnswer::AllowAlwaysProject
             | PermissionAnswer::AllowAlwaysLocal
             | PermissionAnswer::AllowAlwaysGlobal
@@ -914,16 +932,26 @@ impl PermissionManager {
                         }),
                     );
                 })?;
-                for s in &resolved {
-                    if let Some(target) = &target
-                        && let Err(e) = append_permission_rule(tool, Some(s), effect, target)
-                    {
-                        tracing::warn!(error = %e, "failed to persist permission rule");
+                if let Some(target) = &target {
+                    let mut failure = None;
+                    for scope in resolved {
+                        if let Err(message) =
+                            append_permission_rule(tool, Some(&scope), effect, target)
+                        {
+                            failure.get_or_insert(PermissionDecisionError::Config {
+                                tool: tool.clone(),
+                                scope,
+                                message,
+                            });
+                        }
+                    }
+                    if let Some(error) = failure {
+                        return Err(error);
                     }
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1030,12 +1058,20 @@ impl PermissionManager {
                 return Err(deny(None));
             }
         }
-        if !cancel.claim_publication(&CheckpointPublication::default())
-            || self
-                .apply_decision_bound(&t2, &s2, &answer, prompt_binding.as_ref())
-                .is_err()
-        {
+        if !cancel.claim_publication(&CheckpointPublication::default()) {
             return Err(deny(None));
+        }
+        match self.apply_decision_bound(&t2, &s2, &answer, prompt_binding.as_ref()) {
+            Ok(()) => {}
+            Err(PermissionDecisionError::Journal(_)) => return Err(deny(None)),
+            Err(error @ PermissionDecisionError::Config { .. }) => {
+                warn!(%error);
+                event_tx.try_send(AgentEvent::Post(Post {
+                    text: error.to_string(),
+                    level: PostLevel::Warn,
+                    agent: None,
+                }));
+            }
         }
         if answer.is_allow() {
             Ok(())
@@ -2248,6 +2284,55 @@ mod tests {
             drop(prepared);
             manager.set_yolo(true);
             assert_eq!(journal.snapshot().state.iter().len(), 2);
+        });
+    }
+
+    #[test]
+    fn always_allow_config_failure_warns_and_keeps_session_grant() {
+        const REQUEST: &str = "permission-test";
+        const SCOPE: &str = "cargo test";
+        smol::block_on(async {
+            let project = tempfile::tempdir().unwrap();
+            let manager = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
+            let path = project.path().join(PROJECT_PERMISSIONS);
+            std::fs::create_dir_all(&path).unwrap();
+            let journal = Arc::new(SessionJournal::default());
+            manager.bind_journal(Arc::clone(&journal), None).unwrap();
+            let (event_tx, events) = flume::unbounded();
+            let (answers, receiver) = flume::unbounded();
+            answers
+                .send(TaggedAnswer::new(REQUEST, PermissionAnswer::AllowAlwaysProject).encode())
+                .unwrap();
+            let tool = ToolKey::native(BASH_TOOL);
+            manager
+                .enforce(
+                    &tool,
+                    &crate::tools::PermissionScopes::single(SCOPE.into()),
+                    &EventSender::new(event_tx),
+                    Some(&async_lock::Mutex::new(receiver)),
+                    REQUEST,
+                    &CancelToken::none(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.try_recv().unwrap().event,
+                AgentEvent::PermissionRequest { .. }
+            ));
+            let AgentEvent::Post(post) = events.try_recv().unwrap().event else {
+                panic!("expected permission persistence warning");
+            };
+            assert_eq!(post.level, PostLevel::Warn);
+            assert!(post.text.contains(PROJECT_PERMISSIONS));
+            assert!(matches!(
+                manager.check(&tool, SCOPE, None),
+                PermissionCheck::Allowed
+            ));
+            assert!(journal.snapshot().state.iter().any(|record| matches!(
+                &record.change, StateChange::Rules { rules, .. } if rules == &manager.snapshot().stored_rules()
+            )));
+            assert!(path.is_dir());
         });
     }
 

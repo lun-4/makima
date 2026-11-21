@@ -14,7 +14,8 @@ use makima_storage::id::{AgentId, MakimaId, TurnId};
 use makima_storage::session_state::{
     SessionStateReducer, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
     StoredAgentRecord, StoredDelivery, StoredDeliveryOp, StoredPayload, StoredPluginValue,
-    StoredStateRecord, StoredTurnResult,
+    StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
+    StoredTurnResult, StoredTurnStatus,
 };
 use makima_storage::sessions::{Session, SessionRecord, StoredRule};
 use thiserror::Error;
@@ -35,9 +36,9 @@ use crate::{HistorySnapshot, ToolOutput, TurnOutcome};
 mod records;
 pub use records::{JournalRecord, JournalRecords};
 
-const CONVERSION_RETRY_DELAY: Duration = Duration::from_secs(1);
-const SPAWN_PUBLICATION_PENDING: &str =
-    "cannot publish spawn while an earlier journal change is pending";
+const CONVERSION_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(200)];
+const CONVERSION_FAILED: &str = "turn result could not be saved: ";
 
 fn context_address(source: &str) -> String {
     format!("\0context:{source}")
@@ -117,6 +118,10 @@ pub enum JournalError {
     StaleIncarnation(AgentId),
     #[error("journal preparation failed: {0}")]
     Preparation(String),
+    #[error("cannot publish spawn while an earlier journal change is pending")]
+    SpawnPublicationPending,
+    #[error("cannot install rewind while an earlier journal change is pending")]
+    RewindPublicationPending,
     #[error("prepared journal commits cannot add agent identities")]
     PreparedAgents,
     #[error("pending journal conversion does not match its reserved records")]
@@ -366,6 +371,7 @@ pub(crate) struct JournalState {
     checkpoint_error: Option<String>,
     writer_error: Option<String>,
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
+    last_failed_conversion: Option<((AgentId, TurnId), String)>,
     aborted_preparations: BTreeSet<u64>,
     incarnations: BTreeMap<AgentId, u64>,
     writer: Option<SessionWriter>,
@@ -599,6 +605,7 @@ impl Default for SessionJournal {
                 checkpoint_error: None,
                 writer_error: None,
                 conversion_errors: BTreeMap::new(),
+                last_failed_conversion: None,
                 aborted_preparations: BTreeSet::new(),
                 incarnations: BTreeMap::new(),
                 writer: None,
@@ -836,14 +843,14 @@ impl SessionJournal {
         self.lock().writer.is_some()
     }
 
-    pub fn flush_spawn(&self) -> Result<(), String> {
+    pub fn flush_spawn(&self, target: u64) -> Result<(), String> {
         let (writer, target) = {
             let mut state = self.lock();
             let Some(writer) = state.writer.clone() else {
                 return Ok(());
             };
-            if !state.staged.is_empty() {
-                return Err(SPAWN_PUBLICATION_PENDING.into());
+            if state.ready.revision < target {
+                return Err(JournalError::SpawnPublicationPending.to_string());
             }
             Self::emit_unwritten(&mut state);
             (writer, state.ready.revision)
@@ -924,6 +931,9 @@ impl SessionJournal {
     ) -> Result<(), JournalError> {
         let mut state = self.lock();
         Self::validate_incarnations(&state, from_ref(&binding))?;
+        if !state.staged.is_empty() {
+            return Err(JournalError::RewindPublicationPending);
+        }
         let candidate = Self::apply_commit(
             &state.snapshot,
             JournalCommit {
@@ -990,6 +1000,12 @@ impl SessionJournal {
             })
             .or_else(|| state.writer_error.clone())
             .or_else(|| state.checkpoint_error.clone())
+            .or_else(|| {
+                state
+                    .last_failed_conversion
+                    .as_ref()
+                    .map(|(_, error)| error.clone())
+            })
     }
 
     pub(crate) fn set_writer_error(&self, error: Option<String>) {
@@ -1012,11 +1028,29 @@ impl SessionJournal {
                 if let Some(error) = state.conversion_errors.get(&(agent, turn)) {
                     return Err(error.clone());
                 }
-                if !state.results.contains_key(&(agent, turn))
-                    && state.ready.state.iter().rev().any(|record| record.agent == Some(agent)
-                        && matches!(&record.change, StateChange::Turn { turn: saved, .. } if *saved == turn))
+                if let Some((key, error)) = &state.last_failed_conversion
+                    && *key == (agent, turn)
+                    && !state.results.contains_key(key)
                 {
-                    return Ok(());
+                    return Err(error.clone());
+                }
+                if !state.results.contains_key(&(agent, turn))
+                    && let Some(result) =
+                        state
+                            .ready
+                            .state
+                            .iter()
+                            .rev()
+                            .find_map(|record| match &record.change {
+                                StateChange::Turn {
+                                    turn: saved,
+                                    result,
+                                } if *saved == turn && record.agent == Some(agent) => Some(result),
+                                _ => None,
+                            })
+                {
+                    return Self::failed_conversion(result)
+                        .map_or(Ok(()), |error| Err(error.into()));
                 }
                 if let Some(error) = state.conversion_errors.values().next() {
                     return Err(error.clone());
@@ -1066,6 +1100,9 @@ impl SessionJournal {
         let Some(mut result) = result else {
             return Err(JournalError::InvalidPending);
         };
+        if Self::failed_conversion(&result).is_some() {
+            return Ok(());
+        }
         result.outcome = outcome.clone().into();
         let candidate = Self::apply_commit(
             &state.snapshot,
@@ -1288,68 +1325,154 @@ impl SessionJournal {
         Ok(true)
     }
 
+    fn failed_conversion(result: &StoredTurnResult) -> Option<&str> {
+        match &result.outcome.status {
+            StoredTurnStatus::Failed { failure }
+                if failure.diagnostic.starts_with(CONVERSION_FAILED) =>
+            {
+                Some(&failure.diagnostic)
+            }
+            _ => None,
+        }
+    }
+
     fn spawn_conversion(self: &Arc<Self>, key: (AgentId, TurnId)) {
-        let conversion = self
+        let Some(conversion) = self
             .lock()
             .results
             .get(&key)
-            .map(|result| Arc::clone(&result.conversion));
-        if let Some(conversion) = conversion {
-            let inline = {
-                let mut conversion = conversion.lock().unwrap_or_else(|error| error.into_inner());
-                if let Some(stored) = &conversion.stored {
-                    Some(stored.clone())
-                } else {
-                    let RuntimeResult {
-                        result, progress, ..
-                    } = &mut *conversion;
-                    result
-                        .to_stored_with_progress(progress, MakimaId::generate(), None)
-                        .ok()
-                }
-            };
-            if let Some(stored) = inline
-                && self.complete_conversion(key, &conversion, stored).is_ok()
-            {
-                return;
+            .map(|result| Arc::clone(&result.conversion))
+        else {
+            return;
+        };
+        let inline = {
+            let mut runtime = conversion.lock().unwrap_or_else(|error| error.into_inner());
+            if runtime.stored.is_none() {
+                runtime.stored = runtime.result.to_stored(MakimaId::generate(), None).ok();
             }
+            runtime.stored.clone()
+        };
+        if let Some(stored) = inline
+            && self.complete_conversion(key, &conversion, stored).is_ok()
+        {
+            return;
         }
+
         let journal = Arc::clone(self);
         smol::spawn(async move {
-            loop {
-                let (conversion, session, inline_session) = {
+            for retry in CONVERSION_RETRY_DELAYS.into_iter().map(Some).chain([None]) {
+                let (session, inline_session) = {
                     let state = journal.lock();
-                    let Some(result) = state.results.get(&key) else { return };
-                    (Arc::clone(&result.conversion), state.session_id, state.snapshot.epoch)
+                    if state.results.get(&key).is_none_or(|result| {
+                        !Arc::ptr_eq(&result.conversion, &conversion)
+                    }) {
+                        return;
+                    }
+                    (state.session_id, state.snapshot.epoch)
                 };
                 let expected = Arc::clone(&conversion);
                 let converted = smol::unblock(move || {
-                    let mut conversion = conversion.lock().unwrap_or_else(|error| error.into_inner());
-                    if let Some(stored) = &conversion.stored {
+                    let mut runtime = expected.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(stored) = &runtime.stored {
                         return Ok(stored.clone());
                     }
-                    let RuntimeResult { result, progress, store, .. } = &mut *conversion;
-                    let stored = result.to_stored_with_progress(progress, session.unwrap_or(inline_session), session.and(store.as_deref()))?;
-                    conversion.stored = Some(stored.clone());
+                    let RuntimeResult { result, progress, store, .. } = &mut *runtime;
+                    let stored = result.to_stored_with_progress(
+                        progress, session.unwrap_or(inline_session), session.and(store.as_deref()),
+                    )?;
+                    runtime.stored = Some(stored.clone());
                     Ok::<_, TurnResultStorageError>(stored)
                 }).await;
-                match converted {
-                    Ok(stored) => {
-                        if journal.complete_conversion(key, &expected, stored).is_ok() {
-                            return;
-                        }
-                        smol::Timer::after(CONVERSION_RETRY_DELAY).await;
+                let error = match converted {
+                    Ok(stored) => match journal.complete_conversion(key, &conversion, stored) {
+                        Ok(()) => return,
+                        Err(error) => error.to_string(),
+                    },
+                    Err(error) => error.to_string(),
+                };
+                if let Some(delay) = retry {
+                    if !journal.record_conversion_error(key, &conversion, error.clone()) {
+                        return;
                     }
-                    Err(error) => {
-                        if !journal.record_conversion_error(key, &expected, error.to_string()) {
-                            return;
-                        }
-                        tracing::warn!(%error, agent_id = %key.0, turn_id = %key.1, "turn result is unsaved; persistence will retry");
-                        smol::Timer::after(CONVERSION_RETRY_DELAY).await;
-                    }
+                    tracing::warn!(%error, agent_id = %key.0, turn_id = %key.1, "turn result is unsaved; persistence will retry");
+                    smol::Timer::after(delay).await;
+                } else {
+                    journal.fail_conversion(key, &conversion, error);
                 }
             }
         }).detach();
+    }
+
+    fn fail_conversion(
+        &self,
+        key: (AgentId, TurnId),
+        expected: &Arc<Mutex<RuntimeResult>>,
+        error: String,
+    ) {
+        let (mut outcome, provenance, duration_ms) = {
+            let runtime = expected.lock().unwrap_or_else(|error| error.into_inner());
+            (
+                StoredTurnOutcome::from(runtime.result.outcome.clone()),
+                runtime.result.provenance.clone().into(),
+                runtime.result.duration_ms,
+            )
+        };
+        let diagnostic = format!("{CONVERSION_FAILED}{error}");
+        outcome.status = StoredTurnStatus::Failed {
+            failure: StoredTurnFailure {
+                kind: StoredTurnFailureKind::Internal,
+                diagnostic: diagnostic.clone(),
+                user_message: diagnostic.clone(),
+                retryable: false,
+            },
+        };
+        // A terminal record clears the admission on replay even though the payload was lost.
+        let stored = StoredTurnResult {
+            outcome,
+            text: StoredPayload::Inline(String::new()),
+            output: StoredPayload::Inline(Vec::new()),
+            provenance,
+            duration_ms,
+        };
+        let mut state = self.lock();
+        if state
+            .results
+            .get(&key)
+            .is_none_or(|result| !Arc::ptr_eq(&result.conversion, expected))
+        {
+            return;
+        }
+        tracing::error!(%error, agent_id = %key.0, turn_id = %key.1, "turn result persistence retries exhausted");
+        state.last_failed_conversion = Some((key, diagnostic));
+        if let Err(error) = self.complete_conversion_locked(&mut state, key, stored) {
+            tracing::error!(%error, agent_id = %key.0, turn_id = %key.1, "failed to install terminal failure record");
+            if let Some(result) = state.results.remove(&key) {
+                let pending = result.terminal.into_iter().chain(
+                    result
+                        .deliveries
+                        .into_iter()
+                        .map(|(pending, _, _, _)| pending),
+                );
+                for pending in pending {
+                    if let Some(entry) = state
+                        .staged
+                        .iter_mut()
+                        .find(|entry| entry.pending.as_ref() == Some(&pending))
+                    {
+                        entry.pending = None;
+                    }
+                }
+            }
+            state
+                .delivery_envelopes
+                .retain(|(_, child, turn), _| (*child, *turn) != key);
+            state
+                .delivery_bytes
+                .retain(|(_, child, turn), _| (*child, *turn) != key);
+            state.conversion_errors.remove(&key);
+            Self::advance_ready(&mut state);
+            self.conversion_changed.notify(usize::MAX);
+        }
     }
 
     fn record_conversion_error(
@@ -1375,7 +1498,7 @@ impl SessionJournal {
         &self,
         key: (AgentId, TurnId),
         expected: &Arc<Mutex<RuntimeResult>>,
-        mut stored: StoredTurnResult,
+        stored: StoredTurnResult,
     ) -> Result<(), JournalError> {
         let mut state = self.lock();
         let Some(result) = state.results.get(&key) else {
@@ -1384,28 +1507,21 @@ impl SessionJournal {
         if !Arc::ptr_eq(&result.conversion, expected) {
             return Ok(());
         }
-        if let Some(binding) = &result.incarnation
-            && let Err(error) = Self::validate_incarnations(&state, std::slice::from_ref(binding))
-        {
-            let pending = result
-                .terminal
-                .iter()
-                .chain(result.deliveries.iter().map(|(pending, _, _, _)| pending))
-                .cloned()
-                .collect::<Vec<_>>();
-            state.staged.retain(|entry| {
-                !entry
-                    .pending
-                    .as_ref()
-                    .is_some_and(|candidate| pending.contains(candidate))
-            });
-            state.results.remove(&key);
-            state.conversion_errors.remove(&key);
-            Self::advance_ready(&mut state);
-            self.conversion_changed.notify(usize::MAX);
-            return Err(error);
+        self.complete_conversion_locked(&mut state, key, stored)
+    }
+
+    fn complete_conversion_locked(
+        &self,
+        state: &mut JournalState,
+        key: (AgentId, TurnId),
+        mut stored: StoredTurnResult,
+    ) -> Result<(), JournalError> {
+        let result = &state.results[&key];
+        if let Some(binding) = &result.incarnation {
+            Self::validate_incarnations(state, from_ref(binding))?;
         }
-        if let Some(outcome) = &result.outcome {
+        let failed = Self::failed_conversion(&stored).is_some();
+        if !failed && let Some(outcome) = &result.outcome {
             stored.outcome = outcome.clone().into();
         }
         let mut commits = Vec::new();
@@ -1443,7 +1559,7 @@ impl SessionJournal {
         let previous_snapshot = state.snapshot.clone();
         let previous_staged = state.staged.clone();
         for (pending, change) in commits {
-            if let Err(error) = Self::complete_locked(&mut state, pending, vec![change]) {
+            if let Err(error) = Self::complete_locked(state, pending, vec![change]) {
                 state.snapshot = previous_snapshot;
                 state.staged = previous_staged;
                 tracing::warn!(%error, agent_id = %key.0, turn_id = %key.1, "terminal journal conversion could not commit");
@@ -1452,9 +1568,14 @@ impl SessionJournal {
                 return Err(error);
             }
         }
+        if failed {
+            state
+                .delivery_envelopes
+                .retain(|(_, child, turn), _| (*child, *turn) != key);
+        }
         state.results.remove(&key);
         state.conversion_errors.remove(&key);
-        Self::advance_ready(&mut state);
+        Self::advance_ready(state);
         self.conversion_changed.notify(usize::MAX);
         Ok(())
     }
@@ -1681,12 +1802,18 @@ impl SessionJournal {
         build: impl FnOnce(&SessionJournalSnapshot) -> JournalCommit,
         apply: impl FnOnce(),
     ) -> Result<u64, JournalError> {
-        self.commit_with_receipts(build, apply)
+        self.commit_with_receipts(false, build, apply)
+            .map(|(revision, _)| revision)
+    }
+
+    pub(crate) fn commit_spawn(&self, commit: JournalCommit) -> Result<u64, JournalError> {
+        self.commit_with_receipts(true, |_| commit, || ())
             .map(|(revision, _)| revision)
     }
 
     pub(crate) fn commit_state_edit(&self, edit: StateEdit) -> Result<StateRevision, JournalError> {
         let (_, events) = self.commit_with_receipts(
+            false,
             |_| JournalCommit {
                 state_edits: vec![edit],
                 ..Default::default()
@@ -1701,10 +1828,14 @@ impl SessionJournal {
 
     fn commit_with_receipts(
         &self,
+        spawn: bool,
         build: impl FnOnce(&SessionJournalSnapshot) -> JournalCommit,
         apply: impl FnOnce(),
     ) -> Result<(u64, Vec<StateChangeEvent>), JournalError> {
         let mut state = self.lock();
+        if spawn && state.writer.is_some() && !state.staged.is_empty() {
+            return Err(JournalError::SpawnPublicationPending);
+        }
         let mut commit = build(&state.snapshot);
         Self::validate_incarnations(&state, &commit.incarnations)?;
         self.resolve_state_edits(&mut state, &mut commit)?;
@@ -2316,7 +2447,7 @@ mod tests {
     use makima_storage::id::{AgentId, TurnId};
     use makima_storage::session_state::{
         MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentConfig, StoredDelivery,
-        StoredDeliveryOp, StoredModeSnapshot, StoredTurnOrigin,
+        StoredDeliveryOp, StoredModeSnapshot, StoredPayload, StoredTurnOrigin,
     };
     use makima_storage::sessions::Session;
     use makima_storage::test_util::test_record;
@@ -2389,13 +2520,13 @@ mod tests {
         journal.bind_writer(writer).unwrap();
         let pending = journal.stage(JournalCommit::default(), 1).unwrap();
         assert_eq!(
-            journal.flush_spawn().unwrap_err(),
-            super::SPAWN_PUBLICATION_PENDING
+            journal.flush_spawn(pending.revision).unwrap_err(),
+            JournalError::SpawnPublicationPending.to_string()
         );
         journal
             .complete(pending, vec![admitted(AgentId::generate())])
             .unwrap();
-        journal.flush_spawn().unwrap();
+        journal.flush_spawn(journal.snapshot().revision).unwrap();
         assert_eq!(journal.published_revision(), journal.snapshot().revision);
     }
 
@@ -2952,6 +3083,171 @@ mod tests {
         );
         assert!(journal.pending_revision().is_none());
         assert_eq!(journal.snapshot().state.iter().len(), 1);
+    }
+
+    #[derive(Default)]
+    struct FailingOffload {
+        failures: usize,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::tools::offload::OffloadBackend for Arc<FailingOffload> {
+        fn create_new(&self, _: &str, _: &[u8]) -> std::io::Result<bool> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if attempt < self.failures {
+                return Err(std::io::Error::other(OFFLOAD_FAULT));
+            }
+            Ok(true)
+        }
+
+        fn total_bytes(&self) -> std::io::Result<u64> {
+            Ok(0)
+        }
+
+        fn remove_all(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            name.into()
+        }
+    }
+
+    const OFFLOAD_FAULT: &str = "injected result offload failure";
+
+    #[test_case(false; "transient")]
+    #[test_case(true; "permanent")]
+    fn offload_failure_retries_then_releases_ordered_prefix(permanent: bool) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut session = Session::new(FIRST, "/");
+            let agent = AgentId::generate();
+            session.bind_root_id(agent).unwrap();
+            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+            let writer =
+                crate::session_writer::SessionWriter::open_session(directory.path(), &session)
+                    .unwrap();
+            journal.bind_writer(writer).unwrap();
+            let backend = Arc::new(FailingOffload {
+                failures: if permanent { usize::MAX } else { 1 },
+                ..Default::default()
+            });
+            let store = Arc::new(OffloadStore::new(Box::new(Arc::clone(&backend))));
+            let turn = TurnId::generate();
+            let later = TurnId::generate();
+            let admission = |turn| JournalChange {
+                agent: Some(agent),
+                generation: 0,
+                change: StateChange::Admitted {
+                    turn,
+                    origin: StoredTurnOrigin::User,
+                },
+            };
+            let result = |turn, text| TurnResult {
+                outcome: TurnOutcome::cancelled(
+                    agent,
+                    turn,
+                    TokenUsage::default(),
+                    0,
+                    TurnCancellationReason::User,
+                ),
+                text,
+                output: Vec::new(),
+                provenance: TurnProvenance::default(),
+                duration_ms: 1,
+            };
+            let prefix = journal
+                .commit(JournalCommit {
+                    changes: vec![admission(turn)],
+                    ..Default::default()
+                })
+                .unwrap();
+            journal
+                .record_terminal(
+                    result(turn, FIRST.repeat(MAX_INLINE_TURN_RESULT_BYTES)),
+                    Some(store),
+                )
+                .unwrap();
+            journal
+                .commit(JournalCommit {
+                    changes: vec![admission(later)],
+                    ..Default::default()
+                })
+                .unwrap();
+            journal
+                .record_terminal(result(later, SECOND.into()), None)
+                .unwrap();
+            journal.release_terminal(agent, later);
+            assert_eq!(journal.snapshot().revision, prefix);
+            journal.release_terminal(agent, turn);
+            futures_lite::future::or(
+                async {
+                    loop {
+                        let changed = journal.conversion_changed.listen();
+                        if journal.pending_revision().is_none() {
+                            break;
+                        }
+                        changed.await;
+                    }
+                },
+                async {
+                    smol::Timer::after(std::time::Duration::from_secs(5)).await;
+                    panic!("failed conversion still blocks the journal");
+                },
+            )
+            .await;
+            let attempts = backend.attempts.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                attempts,
+                if permanent {
+                    super::CONVERSION_RETRY_DELAYS.len() + 1
+                } else {
+                    2
+                }
+            );
+            journal
+                .wait_terminal_conversion(agent, later)
+                .await
+                .unwrap();
+            if permanent {
+                assert!(
+                    journal
+                        .wait_terminal_conversion(agent, turn)
+                        .await
+                        .unwrap_err()
+                        .contains(OFFLOAD_FAULT)
+                );
+                assert!(journal.persistence_error().unwrap().contains(OFFLOAD_FAULT));
+            } else {
+                journal.wait_terminal_conversion(agent, turn).await.unwrap();
+                assert!(journal.persistence_error().is_none());
+            }
+            journal.flush().await.unwrap();
+            let reloaded =
+                Session::<Message, TokenUsage, ToolOutput>::load_from(session.id, directory.path())
+                    .unwrap();
+            let view = reloaded.latest_state().unwrap();
+            let scope = &view.scopes[&Some(agent)];
+            assert!(scope.admitted.is_empty());
+            assert_eq!(
+                scope.results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                [turn, later]
+            );
+            let stored = &scope.results[0].1;
+            assert_eq!(stored.duration_ms, 1);
+            if permanent {
+                assert!(
+                    SessionJournal::failed_conversion(stored)
+                        .unwrap()
+                        .contains(OFFLOAD_FAULT)
+                );
+                assert!(matches!(&stored.text, StoredPayload::Inline(text) if text.is_empty()));
+            } else {
+                assert!(matches!(&stored.text, StoredPayload::Offloaded(_)));
+            }
+        });
     }
 
     #[test]

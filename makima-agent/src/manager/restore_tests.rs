@@ -1233,6 +1233,29 @@ fn assert_dormant(manager: &AgentManagerHandle, id: AgentId) {
 }
 
 #[test]
+fn failed_work_rebind_preserves_dormant_incarnation() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let binding = journal.incarnation(id);
+        let reservation = manager.incarnation(id).unwrap().reservation;
+        manager.0.work.remove(id).unwrap();
+        let error = manager
+            .ensure_resident_with(id, |_| async {
+                panic!("failed work rebind must not invoke the factory")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, ManagerError::UnknownAgent(id));
+        assert_eq!(journal.incarnation(id), binding);
+        assert_eq!(manager.incarnation(id).unwrap().reservation, reservation);
+        assert_dormant(&manager, id);
+    });
+}
+
+#[test]
 fn restore_preserves_dormant_root_and_readable_terminal_children() {
     let records = records();
     let journal = journal(&records);

@@ -28,7 +28,8 @@ use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
 };
 use makima_agent::session_defaults;
-use makima_agent::session_options::SessionOptionError;
+use makima_agent::session_options::{MODEL_OPTION_ID, SessionOptionError};
+use makima_agent::session_recovery::{OpenModel, OpenSessionError, SessionSource, open_session};
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
@@ -48,10 +49,10 @@ use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
 use makima_providers::{Message, ProviderRegistry, TokenUsage, add_cost, settle_session};
 use makima_storage::StateDir;
-use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
-use makima_storage::sessions::{SESSIONS_DIR, SessionMeta, StoredTokenUsage, read_prefs};
+use makima_storage::session_state::StoredAgentConfig;
+use makima_storage::sessions::{SESSIONS_DIR, SessionMeta, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 use smol::io::AsyncBufReadExt;
@@ -67,8 +68,6 @@ const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
 const SESSION_ENDED_MESSAGE: &str = "session ended";
 const EVENT_STREAM_ENDED: &str = "session event stream ended";
-const RECOVERY_CANCELLED: &str = "session recovery publication cancelled";
-const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
     "Authentication failed. Run `makima auth login`, then send the prompt again.";
@@ -488,13 +487,25 @@ fn trusted_project_config(
     decision.project_config
 }
 
-fn recovery_claim() -> CheckpointClaim {
-    Arc::new(|publication| {
-        publication
-            .try_publish()
-            .then_some(())
-            .ok_or_else(|| Arc::from(RECOVERY_CANCELLED))
-    })
+fn open_model(params: &AcpParams) -> OpenModel<'_> {
+    OpenModel {
+        startup: &params.model,
+        explicit: params.model_explicit,
+        providers: &params.providers,
+        policy: &params.model_policy,
+    }
+}
+
+fn session_open_error(id: MakimaId, error: OpenSessionError) -> AcpError {
+    match error {
+        OpenSessionError::Load(error) => {
+            AcpError::resource_not_found(Some(format!("session/{id}"))).data(json_str(&error))
+        }
+        OpenSessionError::Busy(_) => {
+            session_registration_error(session_lock::OPEN_ELSEWHERE_MSG.to_owned())
+        }
+        error => session_registration_error(error.to_string()),
+    }
 }
 
 async fn new_session(
@@ -512,41 +523,37 @@ async fn new_session(
     );
     let permissions = load_permissions(&project_config)?;
     close_session(srv).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
+    let seed = StoredSession::new(&params.model.spec(), &cwd.to_string_lossy());
+    let id = seed.id;
+    let session_ref = SessionRef::from(id);
+    let opening = open_session(
+        &params.storage,
+        SessionSource::Create(seed),
+        open_model(params),
+        None,
+    )
+    .map_err(|error| session_open_error(id, error))?;
+    let model = opening.model.clone();
+    let (checkpoint, lock, recovered) = opening
+        .recover(&params.storage, &srv.lua_event_handle.mode_registry())
+        .await
+        .map_err(|error| session_open_error(id, error))?;
     let defaults = session_defaults::resolve(
         params.defaults,
         &read_prefs(&params.storage),
         &SessionMeta::default(),
         true,
-        &params.model,
+        &model,
     );
-    let mut seed = StoredSession::new(&params.model.spec(), &cwd.to_string_lossy());
-    let root_id = AgentId::generate();
-    seed.bind_root_id(root_id)
-        .map_err(|error| session_registration_error(error.to_string()))?;
-    let session_ref = SessionRef::from(seed.id);
-    let directory = params
-        .storage
-        .ensure_subdir(SESSIONS_DIR)
-        .map_err(|error| session_registration_error(error.to_string()))?;
-    let lock =
-        start_session_lock_in(directory.clone(), seed.id).map_err(session_registration_error)?;
-    let checkpoint = Arc::new(
-        SessionWriter::open_session(&directory, &seed)
-            .map_err(|error| session_registration_error(error.to_string()))?,
-    );
-    checkpoint.bind_publication_guard(Some(lock.publication_guard()));
-    let recovered = checkpoint
-        .recover(seed, CheckpointPublication::default(), recovery_claim())
-        .await
-        .map_err(|error| session_registration_error(error.to_string()))?;
-    let (handle, root_target) = spawn_session(
+    let spec = model.spec();
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone(), params).await;
+    let (handle, root_target) = spawn_session_with_checkpoint(
         params,
         SpawnSession {
-            model: params.model.clone(),
+            model,
             cwd: req.cwd,
             session_id: Some(session_ref),
-            root_id: Some(root_id),
+            root_id: recovered.session().root_agent_id(),
             journal: Some(recovered.journal()),
             history: Vec::new(),
             mcp_handle: mcp.clone(),
@@ -556,11 +563,12 @@ async fn new_session(
             project_config,
             permissions,
         },
+        None,
+        Some(Arc::clone(&checkpoint)),
     );
     let session_id = handle.session_id.to_string();
-    let spec = params.model.spec();
     let persisted_options = Default::default();
-    let snapshot = install_session(
+    let (snapshot, mode) = install_session(
         srv,
         params,
         InstallSession {
@@ -577,7 +585,6 @@ async fn new_session(
     )
     .await
     .map_err(session_registration_error)?;
-    let mode = finalize_session(srv).await?;
     let resp =
         methods::new_session_response(&session_id, &mode, &srv.lua_event_handle.mode_registry())
             .config_options(methods::session_config_options(
@@ -598,37 +605,47 @@ async fn load_session(
         .0
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
-    load_history_from(&params.storage, session_ref.id())?;
-    close_session(srv).await;
-    let directory = params
-        .storage
-        .ensure_subdir(SESSIONS_DIR)
-        .map_err(|error| session_registration_error(error.to_string()))?;
-    let lock = start_session_lock_in(directory.clone(), session_ref.id())
-        .map_err(session_registration_error)?;
-    let mut restored = load_history_from(&params.storage, session_ref.id())?;
-    if let Some(warning) = makima_agent::session_recovery::resolve_legacy_mode(
-        &mut restored.seed,
-        &srv.lua_event_handle.mode_registry(),
-        &params.storage,
-    )
-    .map_err(|error| session_registration_error(error.to_string()))?
+    let id = session_ref.id();
+    // ACP restores the saved cwd; the client's cwd is a fallback for old sessions.
+    if srv
+        .session
+        .as_ref()
+        .is_some_and(|session| session.handle.session_id.id() == id)
     {
-        warn!(%warning, "legacy mode restoration fell back to read-only");
+        // This process already owns the lock. Re-read after draining the old
+        // writer so recovery includes changes published during shutdown.
+        let seed = StoredSession::load(id, &params.storage)
+            .map_err(|error| session_open_error(id, OpenSessionError::Load(error)))?;
+        let state = seed
+            .latest_state()
+            .map_err(|error| session_open_error(id, OpenSessionError::Load(error)))?;
+        let config = state
+            .scopes
+            .get(&seed.root_agent_id())
+            .and_then(|scope| scope.config.as_ref());
+        load_permissions(&trusted_project_config(
+            &effective_session_cwd(config, &seed.cwd, &req.cwd),
+            &params.storage,
+            params.trust_mode,
+            &params.trust_policy,
+        ))?;
+        close_session(srv).await;
     }
-    let checkpoint = Arc::new(
-        SessionWriter::open_session(&directory, &restored.seed)
-            .map_err(|error| session_registration_error(error.to_string()))?,
-    );
-    checkpoint.bind_publication_guard(Some(lock.publication_guard()));
-    let recovered = checkpoint
-        .recover(
-            restored.seed,
-            CheckpointPublication::default(),
-            recovery_claim(),
-        )
+    let opening = open_session(
+        &params.storage,
+        SessionSource::Resume(id),
+        open_model(params),
+        None,
+    )
+    .map_err(|error| session_open_error(id, error))?;
+    if let Some(warning) = &opening.warning {
+        warn!(%warning, "saved session model could not be restored");
+    }
+    let recorded_model = opening.model.clone();
+    let (checkpoint, lock, recovered) = opening
+        .recover(&params.storage, &srv.lua_event_handle.mode_registry())
         .await
-        .map_err(|error| session_registration_error(error.to_string()))?;
+        .map_err(|error| session_open_error(id, error))?;
     let history_snapshot = recovered.session().history_snapshot();
     let root_id = recovered.session().root_agent_id();
     let recovered_state = recovered
@@ -639,11 +656,8 @@ async fn load_session(
         .scopes
         .get(&root_id)
         .and_then(|scope| scope.config.as_ref());
-    if let Some(config) = recovered_config {
-        restored.cwd = Some(PathBuf::from(&config.cwd));
-        restored.model = config.model.clone();
-    }
-    let session_cwd = effective_session_cwd(restored.cwd.as_deref(), &req.cwd);
+    let session = recovered.session();
+    let session_cwd = effective_session_cwd(recovered_config, &session.cwd, &req.cwd);
     let project_config = trusted_project_config(
         &session_cwd,
         &params.storage,
@@ -651,32 +665,8 @@ async fn load_session(
         &params.trust_policy,
     );
     let permissions = load_permissions(&project_config)?;
-    close_session(srv).await;
-    let mcp = start_mcp(
-        &session_cwd,
-        &req.mcp_servers,
-        project_config.clone(),
-        params,
-    )
-    .await;
     let sid = SessionId::from(session_ref.to_string());
     let home = makima_storage::paths::home();
-    let recorded_model = if let Some(config) = recovered_config {
-        if !params.model_policy.allows(&config.model) {
-            return Err(session_registration_error(
-                SessionOptionError::PolicyRejected(config.model.clone().into()).to_string(),
-            ));
-        }
-        params
-            .providers
-            .model(&config.model)
-            .map_err(|error| session_registration_error(error.to_string()))?
-    } else {
-        match params.providers.model(&restored.model) {
-            Ok(model) if params.model_policy.allows(&model.spec()) => model,
-            _ => params.model.clone(),
-        }
-    };
     let spec = recorded_model.spec();
     let yolo = params.yolo;
     let defaults = recovered_config.map_or_else(
@@ -684,7 +674,7 @@ async fn load_session(
             session_defaults::resolve(
                 params.defaults,
                 &read_prefs(&params.storage),
-                &restored.meta,
+                &session.meta,
                 history_snapshot.messages.is_empty(),
                 &recorded_model,
             )
@@ -695,9 +685,11 @@ async fn load_session(
             thinking: config.thinking,
         },
     );
-    let persisted_options = recovered_config
+    let mut persisted_options = recovered_config
         .map(|config| &config.options)
-        .unwrap_or(&restored.meta.session_options);
+        .unwrap_or(&session.meta.session_options)
+        .clone();
+    persisted_options.remove(MODEL_OPTION_ID);
     let mut continuation_count = recovered_state
         .scopes
         .values()
@@ -717,6 +709,13 @@ async fn load_session(
     }
     let continuation_notice =
         makima_agent::session_recovery::continuation_notice(continuation_count);
+    let mcp = start_mcp(
+        &session_cwd,
+        &req.mcp_servers,
+        project_config.clone(),
+        params,
+    )
+    .await;
     let replay_history = Arc::clone(&history_snapshot.messages);
     let (handle, root_target) = spawn_session_with_checkpoint(
         params,
@@ -737,14 +736,15 @@ async fn load_session(
         Some(history_snapshot),
         Some(Arc::clone(&checkpoint)),
     );
+    let mut usage_by_model = session.usage_by_model().clone();
     let restored_cost = settle_session(
-        &restored.usage,
-        &mut restored.by_model,
+        &session.token_usage,
+        &mut usage_by_model,
         &recorded_model,
         defaults.fast,
         &params.providers,
     );
-    let snapshot = install_session(
+    let (snapshot, mode) = install_session(
         srv,
         params,
         InstallSession {
@@ -756,12 +756,11 @@ async fn load_session(
             initial_cost: restored_cost,
             cwd: session_cwd.clone(),
             defaults,
-            persisted_options,
+            persisted_options: &persisted_options,
         },
     )
     .await
     .map_err(session_registration_error)?;
-    let mode = finalize_session(srv).await?;
     if let Some(session) = &srv.session {
         if let Some(message) = &continuation_notice {
             session_update(
@@ -784,19 +783,12 @@ async fn load_session(
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
+#[cfg(test)]
 fn spawn_session(
     params: &AcpParams,
     session: SpawnSession,
 ) -> (InteractiveHandle, Receiver<TrustedTarget>) {
-    spawn_session_with_history(params, session, None)
-}
-
-fn spawn_session_with_history(
-    params: &AcpParams,
-    session: SpawnSession,
-    snapshot: Option<makima_agent::agent::HistorySnapshot>,
-) -> (InteractiveHandle, Receiver<TrustedTarget>) {
-    spawn_session_with_checkpoint(params, session, snapshot, None)
+    spawn_session_with_checkpoint(params, session, None, None)
 }
 
 fn spawn_session_with_checkpoint(
@@ -971,8 +963,6 @@ async fn finish_in_flight(session: &SessionState) {
     session.handle.manager.wait_settled().await;
 }
 
-/// Stop the old session before the next one starts, so two generations of the
-/// same MCP servers never fight over a port or a lock file.
 async fn close_session(srv: &mut Server) {
     // A dispatch with an operation is answered with the operations below.
     if let Some(dispatch) = srv.dispatch.take()
@@ -1057,7 +1047,13 @@ async fn install_session(
     srv: &mut Server,
     params: &AcpParams,
     session: InstallSession<'_>,
-) -> Result<makima_agent::session_options::SessionOptionsSnapshot, String> {
+) -> Result<
+    (
+        makima_agent::session_options::SessionOptionsSnapshot,
+        String,
+    ),
+    String,
+> {
     let sessions_dir = match params.storage.ensure_subdir(SESSIONS_DIR) {
         Ok(sessions_dir) => sessions_dir,
         Err(error) => {
@@ -1077,7 +1073,13 @@ async fn install_session_with_lock(
     params: &AcpParams,
     session: InstallSession<'_>,
     lock_session: impl FnOnce(MakimaId) -> Result<Arc<session_lock::LockHeartbeat>, String>,
-) -> Result<makima_agent::session_options::SessionOptionsSnapshot, String> {
+) -> Result<
+    (
+        makima_agent::session_options::SessionOptionsSnapshot,
+        String,
+    ),
+    String,
+> {
     let InstallSession {
         handle,
         recovered_writer,
@@ -1193,12 +1195,6 @@ async fn install_session_with_lock(
         coordinator.clone(),
         Arc::clone(&checkpoint),
     );
-    params
-        .lua_event_handle
-        .install_orchestration_services(orchestration.clone());
-    let pending = PendingState::default();
-    let project_trusted = handle.permissions.project_is_trusted();
-    let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
     let usage_seed = match StoredSession::load(handle.session_id.id(), &params.storage) {
         Ok(seed) => seed,
         Err(error) => {
@@ -1206,6 +1202,22 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
+    let mode = match checkpoint_root_mode(&handle, &coordinator).await {
+        Ok(mode) => mode,
+        Err(error) => {
+            rollback_install(handle, mcp, Some(coordinator)).await;
+            return Err(error);
+        }
+    };
+    // Do not retire the active session or replace its Lua services until startup succeeds.
+    close_session(srv).await;
+    srv.catalog.attach(&orchestration);
+    params
+        .lua_event_handle
+        .install_orchestration_services(orchestration.clone());
+    let pending = PendingState::default();
+    let project_trusted = handle.permissions.project_is_trusted();
+    let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
     observer.persist_usage(
         checkpoint.as_ref().clone(),
         usage_seed.token_usage,
@@ -1278,7 +1290,7 @@ async fn install_session_with_lock(
         option_projection_task,
         lock: Some(lock),
     });
-    Ok(option_snapshot)
+    Ok((option_snapshot, mode))
 }
 
 /// The target a session's prompts dispatch on: commands control {handle}'s
@@ -1402,49 +1414,6 @@ fn watch_available_commands(
 
 type StoredSession =
     makima_storage::sessions::Session<Message, TokenUsage, makima_agent::ToolOutput>;
-
-struct Restored {
-    seed: StoredSession,
-    cwd: Option<PathBuf>,
-    usage: TokenUsage,
-    by_model: HashMap<String, StoredTokenUsage>,
-    model: String,
-    meta: makima_storage::sessions::SessionMeta,
-}
-
-fn load_history_from(
-    storage: &makima_storage::StateDir,
-    session_id: MakimaId,
-) -> Result<Restored, AcpError> {
-    let session: makima_storage::sessions::Session<
-        Message,
-        makima_providers::TokenUsage,
-        makima_agent::ToolOutput,
-    > = makima_storage::sessions::Session::load(session_id, storage).map_err(|e| {
-        AcpError::resource_not_found(Some(format!("session/{session_id}"))).data(json_str(&e))
-    })?;
-    let sessions_dir = storage
-        .ensure_subdir(SESSIONS_DIR)
-        .map_err(|e| AcpError::internal_error().data(json_str(&e)))?;
-    if session_lock::open_elsewhere(&sessions_dir, &session_id) {
-        return Err(AcpError::internal_error().data(json_str(&session_lock::OPEN_ELSEWHERE_MSG)));
-    }
-    let cwd = Path::new(&session.cwd)
-        .is_absolute()
-        .then(|| PathBuf::from(&session.cwd));
-    let model = session.model.clone();
-    let usage = session.token_usage;
-    let by_model = session.usage_by_model().clone();
-    let meta = session.meta.clone();
-    Ok(Restored {
-        seed: session,
-        cwd,
-        usage,
-        by_model,
-        model,
-        meta,
-    })
-}
 
 fn validate_session<'a>(srv: &'a Server, requested: &str) -> Result<&'a SessionState, AcpError> {
     let session = srv.session.as_ref().ok_or_else(no_session)?;
@@ -2119,8 +2088,13 @@ async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentRespons
     ))
 }
 
-fn effective_session_cwd(restored: Option<&Path>, client: &Path) -> PathBuf {
-    restored.unwrap_or(client).to_path_buf()
+fn effective_session_cwd(
+    config: Option<&StoredAgentConfig>,
+    saved: &str,
+    client: &Path,
+) -> PathBuf {
+    let cwd = Path::new(config.map_or(saved, |config| config.cwd.as_str()));
+    if cwd.is_absolute() { cwd } else { client }.to_path_buf()
 }
 
 fn answer_cancelled_requests(
@@ -2628,40 +2602,12 @@ fn no_session() -> AcpError {
     AcpError::new(-32600, "no active session")
 }
 
-async fn finalize_session(srv: &mut Server) -> Result<String, AcpError> {
-    match committed_mode(srv).await {
-        Ok(mode) => Ok(mode),
-        Err(error) => {
-            close_session(srv).await;
-            Err(error)
-        }
-    }
-}
-
-/// The mode the session's root committed, which is what a client must show.
-async fn committed_mode(srv: &Server) -> Result<String, AcpError> {
-    let session = srv.session.as_ref().ok_or_else(no_session)?;
-    let root = session
-        .handle
-        .initialized_root()
-        .await
-        .map_err(|error| AcpError::new(-32603, error))?;
-    let config = if let Some(coordinator) = session
-        .coordinator
-        .as_ref()
-        .filter(|_| session.checkpoint.is_some())
-    {
-        headless::checkpoint_startup_config(&root, coordinator)
-            .await
-            .map_err(|error| AcpError::new(-32603, error))?
-    } else {
-        root.effective_config()
-            .map_err(|error| AcpError::new(-32603, error.to_string()))?
-            .ok_or_else(|| AcpError::new(-32603, ROOT_CONFIG_UNAVAILABLE))?
-    };
-    if let Some(orchestration) = &session.orchestration {
-        srv.catalog.attach(orchestration);
-    }
+async fn checkpoint_root_mode(
+    handle: &InteractiveHandle,
+    coordinator: &SessionCoordinatorHandle,
+) -> Result<String, String> {
+    let root = handle.initialized_root().await?;
+    let config = headless::checkpoint_startup_config(&root, coordinator).await?;
     Ok(config.mode.id().key().to_owned())
 }
 
@@ -3430,6 +3376,7 @@ mod tests {
     fn test_params(model: Model, cwd: PathBuf) -> AcpParams {
         AcpParams {
             model,
+            model_explicit: false,
             config: Default::default(),
             permissions_config: Default::default(),
             timeouts: Default::default(),
@@ -3998,10 +3945,10 @@ mod tests {
             Session::new(OFFLINE_SPEC, "/project");
         session.meta.compacted = true;
         session.save(&storage).unwrap();
-        let restored = load_history_from(&storage, session.id).unwrap();
-        assert!(restored.seed.history_snapshot().compacted);
+        let restored = open_stored_session_for_test(&storage, session.id).unwrap();
+        assert!(restored.history_snapshot().compacted);
         assert_eq!(
-            serde_json::to_value(restored.seed.history_snapshot().messages.as_ref()).unwrap(),
+            serde_json::to_value(restored.history_snapshot().messages.as_ref()).unwrap(),
             serde_json::to_value(session.history_snapshot().messages.as_ref()).unwrap()
         );
     }
@@ -4260,7 +4207,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_startup_checkpoint_retires_session_and_releases_lock() {
+    fn startup_checkpoint_holds_lock_until_close() {
         let (entered, entering) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
         let checkpoint = Arc::new(
@@ -4293,13 +4240,17 @@ mod tests {
             state.checkpoint = Some(Arc::new(
                 SessionWriter::open_session(&sessions_dir, &seed).unwrap(),
             ));
-            let (result, ()) = smol::future::zip(finalize_session(&mut srv), async {
-                entering.recv_async().await.unwrap();
-                assert!(session_lock::claim(&sessions_dir, &id).unwrap().is_none());
-                release.send_async(()).await.unwrap();
-            })
+            let (result, ()) = smol::future::zip(
+                checkpoint_root_mode(&state.handle, state.coordinator.as_ref().unwrap()),
+                async {
+                    entering.recv_async().await.unwrap();
+                    assert!(session_lock::claim(&sessions_dir, &id).unwrap().is_none());
+                    release.send_async(()).await.unwrap();
+                },
+            )
             .await;
-            assert!(result.unwrap_err().message.contains(SAVE_FAILED));
+            assert!(result.unwrap_err().contains(SAVE_FAILED));
+            close_session(&mut srv).await;
             assert!(srv.session.is_none());
             assert!(SessionCoordinatorHandle::resolve(id).is_err());
             assert!(
@@ -6910,6 +6861,7 @@ mod tests {
             let (handle, root_target) = spawn_session(
                 &AcpParams {
                     model: model.clone(),
+                    model_explicit: false,
                     config: Default::default(),
                     permissions_config: Default::default(),
                     timeouts: Default::default(),
@@ -8069,8 +8021,11 @@ mod tests {
         let restored = PathBuf::from("/restored/project");
         let client = PathBuf::from("/client/project");
 
-        assert_eq!(effective_session_cwd(Some(&restored), &client), restored);
-        assert_eq!(effective_session_cwd(None, &client), client);
+        assert_eq!(
+            effective_session_cwd(None, restored.to_str().unwrap(), &client),
+            restored
+        );
+        assert_eq!(effective_session_cwd(None, "relative", &client), client);
     }
 
     /// A loaded session comes back in the mode and thinking it was saved
@@ -8252,19 +8207,19 @@ mod tests {
     }
 
     #[test]
-    fn load_failure_does_not_replay_transcript() {
+    fn failed_load_keeps_active_session_without_replaying_transcript() {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
-            let mut session: Session<Message, TokenUsage, makima_agent::ToolOutput> =
-                Session::new(OFFLINE_SPEC, &tmp.path().to_string_lossy());
-            session.replace_messages(vec![Message::user("not yet visible".into())]);
-            let storage = StateDir::from_path(tmp.path().to_path_buf());
-            session.save(&storage).unwrap();
-            let coordinator = test_coordinator(session.id, OFFLINE_SPEC);
-            let params = test_params(
-                spec_providers().model(OFFLINE_SPEC).unwrap(),
+            let providers = spec_providers();
+            let mut params = test_params(
+                providers.model(OFFLINE_SPEC).unwrap(),
                 tmp.path().to_path_buf(),
             );
+            params.providers = providers;
+            let mut candidate = StoredSession::new(OFFLINE_SPEC, &tmp.path().to_string_lossy());
+            candidate.replace_messages(vec![Message::user(PARKED_THOUGHT.into())]);
+            candidate.save(&params.storage).unwrap();
+            let conflicting_coordinator = test_coordinator(candidate.id, OFFLINE_SPEC);
             let (out_tx, out_rx) = flume::unbounded();
             let mut srv = Server {
                 out_tx,
@@ -8275,21 +8230,129 @@ mod tests {
                 lua_event_handle: params.lua_event_handle.clone(),
                 dispatch: None,
             };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": tmp.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let active = srv.session.as_ref().unwrap();
+            let active_id = active.handle.session_id.to_string();
+            let active_root = active.handle.initialized_root().await.unwrap();
+            drop(out_rx.drain());
             let raw = serde_json::json!({
                 "params": {
-                    "sessionId": session.id.to_string(),
+                    "sessionId": candidate.id.to_string(),
                     "cwd": tmp.path(),
                     "mcpServers": []
                 }
             });
 
-            assert!(load_session(&mut srv, &raw, &params).await.is_err());
+            let error = load_session(&mut srv, &raw, &params).await.unwrap_err();
+            assert_eq!(error.code, AcpError::internal_error().code);
             assert!(
                 out_rx.is_empty(),
                 "failed installation must not replay history"
             );
-            coordinator.close().await.unwrap();
+            let active = validate_session(&srv, &active_id).unwrap();
+            assert!(active_root.is_live());
+            assert_eq!(
+                active.handle.initialized_root().await.unwrap().id(),
+                active_root.id()
+            );
+            handle_set_mode(
+                &mut srv,
+                &serde_json::json!({ "params": { "sessionId": active_id, "modeId": "plan" } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let sessions_dir = params.storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            assert!(
+                session_lock::claim(&sessions_dir, &candidate.id)
+                    .unwrap()
+                    .is_some()
+            );
+            conflicting_coordinator.close().await.unwrap();
+            close_session(&mut srv).await;
         });
+    }
+
+    #[test]
+    fn load_uses_explicit_model_over_folded_root_model_and_options() {
+        smol::block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let providers = spec_providers();
+            let mut params = test_params(
+                providers.model(OFFLINE_SPEC).unwrap(),
+                tmp.path().to_path_buf(),
+            );
+            params.providers = providers;
+            params.model_explicit = true;
+            let mut seed = StoredSession::new(FAST_SPEC, &tmp.path().to_string_lossy());
+            let root_id = AgentId::generate();
+            seed.bind_root_id(root_id).unwrap();
+            seed.meta
+                .session_options
+                .insert(MODEL_OPTION_ID.into(), FAST_SPEC.into());
+            seed.resolve_legacy_mode(
+                makima_agent::ModeDef::default_for(ModeId::Build)
+                    .stored_snapshot(&AgentMode::Build),
+            )
+            .unwrap();
+            seed.save(&params.storage).unwrap();
+            let (out_tx, _out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                catalog: ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
+            };
+            load_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "sessionId": seed.id.to_string(), "cwd": tmp.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            let active = srv.session.as_ref().unwrap();
+            let root = active.handle.initialized_root().await.unwrap();
+            assert_eq!(
+                root.effective_config().unwrap().unwrap().model.spec(),
+                OFFLINE_SPEC
+            );
+            let saved = StoredSession::load(seed.id, &params.storage).unwrap();
+            let view = saved.latest_state().unwrap();
+            let config = view.scopes[&Some(root_id)].config.as_ref().unwrap();
+            assert_eq!(config.model, OFFLINE_SPEC);
+            assert_eq!(config.options[MODEL_OPTION_ID], OFFLINE_SPEC);
+            close_session(&mut srv).await;
+        });
+    }
+
+    fn open_stored_session_for_test(
+        storage: &StateDir,
+        id: MakimaId,
+    ) -> Result<StoredSession, AcpError> {
+        let providers = spec_providers();
+        let model = providers.model(OFFLINE_SPEC).unwrap();
+        open_session(
+            storage,
+            SessionSource::Resume(id),
+            OpenModel {
+                startup: &model,
+                explicit: false,
+                providers: &providers,
+                policy: &Default::default(),
+            },
+            None,
+        )
+        .map(|opening| opening.session)
+        .map_err(|error| session_open_error(id, error))
     }
 
     #[test]
@@ -8308,14 +8371,14 @@ mod tests {
             },
         ];
         let mut session: Session<Message, TokenUsage, makima_agent::ToolOutput> =
-            Session::new("anthropic/test-model", "/project");
+            Session::new(OFFLINE_SPEC, "/project");
         session.replace_messages(messages.clone());
         session.save(&dir).unwrap();
 
         let id: MakimaId = session.id;
-        let history = load_history_from(&dir, id).unwrap();
+        let history = open_stored_session_for_test(&dir, id).unwrap();
         assert_eq!(
-            serde_json::to_value(history.seed.history_snapshot().messages.as_ref()).unwrap(),
+            serde_json::to_value(history.history_snapshot().messages.as_ref()).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
     }
@@ -8325,7 +8388,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, makima_agent::ToolOutput> =
-            Session::new("anthropic/test-model", "/project");
+            Session::new(OFFLINE_SPEC, "/project");
         session.meta.yolo = Some(true);
         session.meta.fast = true;
         session.meta.workflow = true;
@@ -8358,9 +8421,9 @@ mod tests {
         });
         session.save(&dir).unwrap();
 
-        let restored = load_history_from(&dir, session.id).unwrap();
-        let state = restored.seed.latest_state().unwrap();
-        let config = state.scopes[&restored.seed.root_agent_id()]
+        let restored = open_stored_session_for_test(&dir, session.id).unwrap();
+        let state = restored.latest_state().unwrap();
+        let config = state.scopes[&restored.root_agent_id()]
             .config
             .as_ref()
             .unwrap();
@@ -8379,17 +8442,19 @@ mod tests {
     fn load_missing_session_is_resource_not_found() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
-        let err = load_history_from(&dir, MakimaId::generate()).err().unwrap();
+        let err = open_stored_session_for_test(&dir, MakimaId::generate())
+            .err()
+            .unwrap();
         assert_eq!(err.code, AcpError::resource_not_found(None).code);
     }
 
     #[test]
-    fn load_history_from_rejects_session_open_elsewhere() {
+    fn load_rejects_session_open_elsewhere() {
         const FAKE_PID: u32 = u32::MAX - 1;
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         let mut session: Session<Message, TokenUsage, makima_agent::ToolOutput> =
-            Session::new("anthropic/test-model", "/project");
+            Session::new(OFFLINE_SPEC, "/project");
         session.replace_messages(vec![Message::user("hi".into())]);
         session.save(&dir).unwrap();
         let id = session.id;
@@ -8397,7 +8462,7 @@ mod tests {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR).unwrap();
         let lock = session_lock::lock_path(&sessions_dir, &id);
         std::fs::write(&lock, FAKE_PID.to_string()).unwrap();
-        let err = load_history_from(&dir, id).err().unwrap();
+        let err = open_stored_session_for_test(&dir, id).err().unwrap();
         assert_eq!(err.code, AcpError::internal_error().code);
         assert_eq!(
             err.data,
@@ -8405,7 +8470,7 @@ mod tests {
         );
 
         std::fs::remove_file(&lock).unwrap();
-        assert!(load_history_from(&dir, id).is_ok());
+        assert!(open_stored_session_for_test(&dir, id).is_ok());
     }
 
     #[test]

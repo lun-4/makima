@@ -390,7 +390,7 @@ pub(crate) async fn commit_catalog(
     pending: &PendingSessionOptions,
 ) -> Result<(), String> {
     let validators = pending.validators();
-    catalog
+    match catalog
         .replace_plugin_options_with_validator(
             Arc::clone(&pending.plugin),
             pending.definitions(),
@@ -414,8 +414,14 @@ pub(crate) async fn commit_catalog(
             },
         )
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    {
+        Ok(_) => Ok(()),
+        Err(error @ SessionCoordinatorError::OptionsInstalled(_)) => {
+            tracing::warn!(plugin = %pending.plugin, %error);
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub(crate) fn activate_pending(lua: &Lua, pending: &PendingSessionOptions) {
@@ -459,18 +465,25 @@ pub(crate) async fn unload(
     lua: &Lua,
     catalog: &SessionOptionCatalog,
     plugin: &str,
-) -> Result<(), String> {
-    catalog
+) -> Result<(), SessionCoordinatorError> {
+    let result = catalog
         .replace_plugin_options(plugin, Vec::new())
         .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())?;
-    if let Some(mut validators) = lua.app_data_mut::<SessionOptionValidators>() {
-        validators
-            .0
-            .retain(|(owner, _, _), _| owner.as_ref() != plugin);
+        .map(|_| ());
+    if matches!(
+        &result,
+        Ok(()) | Err(SessionCoordinatorError::OptionsInstalled(_))
+    ) {
+        if let Some(mut validators) = lua.app_data_mut::<SessionOptionValidators>() {
+            validators
+                .0
+                .retain(|(owner, _, _), _| owner.as_ref() != plugin);
+        }
+        if let Some(mut store) = lua.app_data_mut::<SessionOptionStore>() {
+            store.invalidate(plugin);
+        }
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]

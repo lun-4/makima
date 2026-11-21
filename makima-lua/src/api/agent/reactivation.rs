@@ -5,10 +5,12 @@ use makima_agent::McpSession;
 use makima_agent::actor::{EffectiveAgentConfig, ModeCeiling};
 use makima_agent::agent::PromptSlotSource;
 use makima_agent::cancel::CancelToken;
+use makima_agent::config_change::ConfigChangeError;
 use makima_agent::manager::ReactivationError;
 use makima_agent::mcp::{TOOL_SEARCH_TOOL_NAME, internal_tool_name};
 use makima_agent::modes;
 use makima_agent::plan_state;
+use makima_agent::session_options::SessionOptionError;
 use makima_agent::tools::{
     Deadline, RequestTools, ToolAudience, ToolContext, TurnToolBindings, TurnToolRoute,
 };
@@ -71,9 +73,9 @@ pub(super) async fn prepare(
     let catalog_contains_model = || {
         context
             .providers
-            .offline_specs(&context.model_policy)
-            .iter()
-            .any(|available| available == &stored.model)
+            .listings()
+            .find(|provider| provider.id == model.provider.as_ref())
+            .is_some_and(|provider| provider.models.iter().any(|info| info.id == model.id))
     };
     if !catalog_contains_model() {
         let mut warnings = Vec::new();
@@ -105,9 +107,14 @@ pub(super) async fn prepare(
     let preparer = session_model_preparer(&context, prepare);
     let prepared = prepare_model(&stored.model, &context.model_policy, &preparer)
         .await
-        .map_err(|error| ReactivationError::ProviderUnavailable {
-            provider: model.provider.to_string(),
-            reason: error.to_string(),
+        .map_err(|error| match error {
+            ConfigChangeError::Option(
+                SessionOptionError::PolicyRejected(_) | SessionOptionError::UnresolvedModel(_),
+            ) => ReactivationError::ModelUnavailable {
+                model: stored.model.clone(),
+                reason: error.to_string(),
+            },
+            _ => ReactivationError::Initialization(error.to_string()),
         })?;
     let modes::RestoredMode {
         mode,
@@ -316,6 +323,7 @@ mod tests {
     const SERVER: &str = "server";
     const SAVED_DESCRIPTION: &str = "saved description";
     const ROOT_REPLY: &str = "root handler must not be inherited";
+    const PREPARE_ERROR: &str = "missing credentials for saved model";
 
     fn spec(tools: Vec<Value>, output_schema: Option<Value>) -> StoredAgentSpec {
         StoredAgentSpec {
@@ -337,9 +345,10 @@ mod tests {
         }
     }
 
-    #[test_case::test_case(false; "falls_back_before_admission")]
-    #[test_case::test_case(true; "ceiling_rejects_widening")]
-    fn unavailable_plan_restore_uses_shared_fallback_and_revalidates_ceiling(restricted: bool) {
+    #[test_case::test_case(false, false; "falls_back_before_admission")]
+    #[test_case::test_case(true, false; "ceiling_rejects_widening")]
+    #[test_case::test_case(false, true; "keeps_cached_model_prepare_error")]
+    fn reactivation_restores_saved_configuration(restricted: bool, fail_prepare: bool) {
         let directory = tempfile::tempdir().unwrap();
         let blocker = directory.path().join("blocked");
         std::fs::write(&blocker, ROOT_REPLY).unwrap();
@@ -382,8 +391,13 @@ mod tests {
         let before = serde_json::to_vec(&record).unwrap();
         let lua = Lua::new();
         let provider = Arc::clone(&template.provider);
-        let preparer: SessionProviderPreparer =
-            Arc::new(move |model| Ok((model, Arc::clone(&provider))));
+        let preparer: SessionProviderPreparer = Arc::new(move |model| {
+            if fail_prepare {
+                Err(PREPARE_ERROR.into())
+            } else {
+                Ok((model, Arc::clone(&provider)))
+            }
+        });
         lua.set_app_data(preparer);
         let restored = smol::block_on(prepare(
             &lua,
@@ -392,7 +406,12 @@ mod tests {
             AgentContext::from(&template),
             &SessionStateView::default(),
         ));
-        if restricted {
+        if fail_prepare {
+            assert!(
+                matches!(restored, Err(ReactivationError::Initialization(reason))
+                if reason == format!("model preparation failed: {PREPARE_ERROR}"))
+            );
+        } else if restricted {
             assert!(matches!(restored, Err(ReactivationError::ModeCeiling(_))));
         } else {
             let restored = restored.unwrap();

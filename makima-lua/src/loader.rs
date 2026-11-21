@@ -2257,8 +2257,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn unload_failure_clears_generic_state_and_can_retry_session_options() {
+    #[test_case(false; "unload_receipt_failure")]
+    #[test_case(true; "load_and_unload_receipt_failures")]
+    fn unload_failure_clears_generic_state_and_can_retry_session_options(fail_load: bool) {
+        const SAVE_FAILURE: &str = "deterministic option save failure";
+        const VALIDATION_FAILURE: &str = "validator remains active";
         const SOURCE: &str = r#"
             makima.api.register_tool({
                 name = "choice_tool",
@@ -2285,19 +2288,23 @@ mod tests {
         smol::block_on(async {
             let registry = Arc::new(ToolRegistry::new());
             let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-            host.load_source("choice", SOURCE).unwrap();
-            let fail = Arc::new(AtomicBool::new(true));
+            let fail = Arc::new(AtomicBool::new(fail_load));
+            let (saved, receipts) = flume::unbounded();
             let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = {
                 let fail = Arc::clone(&fail);
                 Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
                     let fail = Arc::clone(&fail);
+                    let saved = saved.clone();
                     Box::pin(async move {
                         if fail.load(Ordering::Relaxed) {
                             Err(CheckpointError::Save {
                                 session_id: request.session_id,
-                                message: Arc::from("deterministic unload failure"),
+                                message: Arc::from(SAVE_FAILURE),
                             })
                         } else {
+                            saved
+                                .send(CheckpointAck::for_request(&request))
+                                .map_err(|_| CheckpointError::Closed(request.session_id))?;
                             Ok(CheckpointAck::for_request(&request))
                         }
                     }) as CheckpointFuture
@@ -2308,9 +2315,15 @@ mod tests {
                 Default::default(),
                 checkpoint,
             );
-            let error = host.unload("choice").unwrap_err();
-            assert!(matches!(error, PluginError::Unload { .. }));
-            assert!(!registry.has("choice_tool"));
+            host.load_source("choice", SOURCE).unwrap();
+            assert!(registry.has("choice_tool"));
+            assert_eq!(receipts.try_recv().is_err(), fail_load);
+            let rejected = host
+                .event_handle()
+                .set_session_option(coordinator.clone(), "choice.value", "b")
+                .await
+                .unwrap_err();
+            assert!(rejected.to_string().contains(VALIDATION_FAILURE));
             assert!(
                 coordinator
                     .read()
@@ -2319,8 +2332,12 @@ mod tests {
                     .iter()
                     .any(|option| option.definition.id.as_ref() == "choice.value")
             );
-            fail.store(false, Ordering::Relaxed);
-            host.unload("choice").unwrap();
+            fail.store(true, Ordering::Relaxed);
+            let error = host.unload("choice").unwrap_err();
+            assert!(
+                matches!(error, PluginError::Unload { error, .. } if error.contains(SAVE_FAILURE))
+            );
+            assert!(!registry.has("choice_tool"));
             assert!(
                 coordinator
                     .read()
@@ -2328,6 +2345,12 @@ mod tests {
                     .options
                     .iter()
                     .all(|option| option.definition.id.as_ref() != "choice.value")
+            );
+            fail.store(false, Ordering::Relaxed);
+            host.unload("choice").unwrap();
+            assert_eq!(
+                receipts.try_recv().unwrap().session_id,
+                coordinator.session_id()
             );
             coordinator.close().await.unwrap();
         });

@@ -11,15 +11,13 @@ use crossterm::style::Stylize;
 use makima_agent::command::{self, CustomCommand};
 use makima_agent::tools::ToolRegistry;
 use makima_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
-use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files};
+use makima_config::{Config, ProjectConfig, load_env_files};
 use makima_lua::PluginHost;
 use makima_lua::ui_sink::{HeadlessUi, HostUi};
 use makima_providers::model::{Model, ModelTier};
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::StateDir;
 use makima_storage::id::MakimaId;
-use makima_storage::session_lock;
-use makima_storage::sessions::SESSIONS_DIR;
 use makima_ui::{AppSession, RunOutcome};
 
 use super::load_config;
@@ -195,68 +193,33 @@ fn build_stack(
     ))
 }
 
-fn restored_session_settings(session: &AppSession) -> Result<(String, PathBuf)> {
+fn session_cwd(session: &AppSession) -> Result<PathBuf> {
     let state = session.latest_state()?;
-    let config = session
-        .root_agent_id()
-        .and_then(|root| state.scopes.get(&Some(root)))
+    let config = state
+        .scopes
+        .get(&session.root_agent_id())
         .and_then(|scope| scope.config.as_ref());
-    Ok(match config {
-        Some(config) => (config.model.clone(), PathBuf::from(&config.cwd)),
-        None => (session.model.clone(), PathBuf::from(&session.cwd)),
-    })
+    Ok(PathBuf::from(
+        config.map_or(session.cwd.as_str(), |config| config.cwd.as_str()),
+    ))
 }
 
-fn restored_session_model(
-    providers: &ProviderRegistry,
-    startup: &Model,
-    session_model: &str,
-    explicit_model: bool,
-    model_policy: &ModelPolicy,
-) -> Model {
-    if explicit_model || !model_policy.allows(session_model) {
-        return startup.clone();
-    }
-    providers
-        .model(session_model)
-        .unwrap_or_else(|_| startup.clone())
-}
-
-fn resolve_session(
+fn select_initial_tab(
     last_session: bool,
     session_id: Option<&str>,
     model: &str,
     cwd: &str,
     storage: &StateDir,
 ) -> Result<AppSession> {
-    let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
     if let Some(raw) = session_id {
         let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-        if locked {
-            return Err(color_eyre::eyre::eyre!(
-                "session {id}: {}",
-                session_lock::OPEN_ELSEWHERE_MSG
-            ));
-        }
-        return Ok(session);
+        return Ok(AppSession::load(id, storage)?);
     }
     if last_session {
         match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
-                let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-                if locked {
-                    return Err(color_eyre::eyre::eyre!(
-                        "session {}: {}",
-                        session.id,
-                        session_lock::OPEN_ELSEWHERE_MSG
-                    ));
-                }
-                return Ok(session);
-            }
+            Ok(Some(session)) => return Ok(session),
             Ok(None) => {
                 tracing::info!("no previous session found for this directory, starting new");
             }
@@ -419,7 +382,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     let cwd_str = cwd.to_string_lossy().into_owned();
     let session_id = cli.continue_session.as_ref().and_then(|o| o.as_deref());
     let mut session_picker = session_picker_requested(&cli);
-    let mut tabs = vec![resolve_session(
+    let mut tabs = vec![select_initial_tab(
         cli.last_session && !session_picker,
         session_id,
         &stack.model.spec(),
@@ -430,19 +393,12 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
     loop {
-        let (session_model, session_cwd) = restored_session_settings(&tabs[focused])?;
-        let model = restored_session_model(
-            &stack.providers,
-            &stack.model,
-            &session_model,
-            apply_explicit_model,
-            &stack.config.provider.model_policy,
-        );
+        let session_cwd = session_cwd(&tabs[focused])?;
 
         let outcome = makima_ui::run(
             makima_ui::EventLoopParams {
                 cwd: session_cwd.clone(),
-                model,
+                model: stack.model.clone(),
                 needs_login: stack.needs_login,
                 explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
@@ -552,10 +508,7 @@ mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
     use makima_config::RawConfig;
-    use makima_storage::id::AgentId;
-    use makima_storage::session_state::{
-        StateChange, StoredAgentConfig, StoredModeSnapshot, StoredStateRecord,
-    };
+    use makima_storage::session_state::{StoredAgentConfig, StoredModeSnapshot};
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
@@ -565,7 +518,6 @@ mod tests {
     const STARTUP_MODEL: &str = "openai/gpt-5";
     const HEADER_MODEL: &str = "openai/gpt-4.1";
     const FOLDED_MODEL: &str = "anthropic/claude-opus-4-6";
-    const UNAVAILABLE_MODEL: &str = "unregistered/model";
 
     fn combined() -> String {
         format!("{PROMPT}{PIPED_INPUT_SEPARATOR}{PIPED}")
@@ -639,34 +591,6 @@ mod tests {
         RawConfig::default().into_config().expect("default config")
     }
 
-    #[test_case(false, false, FOLDED_MODEL; "fresh_header_model")]
-    #[test_case(true, false, FOLDED_MODEL; "legacy_header_model")]
-    #[test_case(false, true, STARTUP_MODEL; "explicit_model_overrides_fresh_header")]
-    #[test_case(true, true, STARTUP_MODEL; "explicit_model_overrides_legacy_header")]
-    fn tui_restored_model_precedence(legacy: bool, explicit_model: bool, expected: &str) {
-        let startup = Model::from_spec(STARTUP_MODEL).unwrap();
-        let mut session = AppSession::new(FOLDED_MODEL, OTHER_CWD);
-        if legacy {
-            session.bind_root_id(AgentId::generate()).unwrap();
-            let tmp = tempfile::tempdir().unwrap();
-            let storage = StateDir::from_path(tmp.path().to_path_buf());
-            session.save(&storage).unwrap();
-            session = AppSession::load(session.id, &storage).unwrap();
-            assert!(session.root_agent_id().is_some());
-        }
-        let (model, cwd) = restored_session_settings(&session).unwrap();
-        let resolved = restored_session_model(
-            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
-            &startup,
-            &model,
-            explicit_model,
-            &ModelPolicy::default(),
-        );
-
-        assert_eq!(resolved.spec(), expected);
-        assert_eq!(cwd, Path::new(OTHER_CWD));
-    }
-
     fn stored_config(model: &str, cwd: &str) -> StoredAgentConfig {
         StoredAgentConfig {
             cwd: cwd.into(),
@@ -685,70 +609,6 @@ mod tests {
         }
     }
 
-    #[test_case(false, false, false, FOLDED_MODEL, FOLDED_MODEL; "continue_restores_latest_root_config")]
-    #[test_case(true, false, false, FOLDED_MODEL, FOLDED_MODEL; "last_restores_latest_root_config")]
-    #[test_case(false, true, false, FOLDED_MODEL, STARTUP_MODEL; "explicit_model_wins_over_root_config")]
-    #[test_case(false, false, true, FOLDED_MODEL, STARTUP_MODEL; "policy_checks_folded_model_not_header")]
-    #[test_case(false, false, false, UNAVAILABLE_MODEL, STARTUP_MODEL; "unavailable_folded_model_uses_startup_not_header")]
-    fn tui_restores_folded_root_settings(
-        last: bool,
-        explicit_model: bool,
-        excluded: bool,
-        folded_model: &str,
-        expected: &str,
-    ) {
-        use tempfile::tempdir;
-
-        let tmp = tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new(HEADER_MODEL, THIS_CWD);
-        session
-            .resolve_legacy_config(stored_config(HEADER_MODEL, THIS_CWD))
-            .unwrap();
-        session.save(&storage).unwrap();
-        let id = session.id.to_string();
-        let mut loaded = resolve_session(
-            last,
-            (!last).then_some(id.as_str()),
-            STARTUP_MODEL,
-            THIS_CWD,
-            &storage,
-        )
-        .unwrap();
-        let root = loaded.root_agent_id().unwrap();
-        let seq = loaded.state().last().unwrap().seq + 1;
-        for (seq, agent, config) in [
-            (seq, Some(root), stored_config(folded_model, OTHER_CWD)),
-            (seq + 1, None, stored_config(HEADER_MODEL, THIS_CWD)),
-        ] {
-            loaded.push_state(StoredStateRecord {
-                seq,
-                agent,
-                generation: 0,
-                change: StateChange::Config(config),
-            });
-        }
-        assert_eq!(loaded.model, HEADER_MODEL);
-        assert_eq!(loaded.cwd, THIS_CWD);
-        let (model, cwd) = restored_session_settings(&loaded).unwrap();
-        let excluded_models = if excluded {
-            vec![folded_model.to_owned()]
-        } else {
-            Vec::new()
-        };
-        let policy = ModelPolicy::new(&[], &excluded_models).unwrap();
-        let resolved = restored_session_model(
-            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
-            &Model::from_spec(STARTUP_MODEL).unwrap(),
-            &model,
-            explicit_model,
-            &policy,
-        );
-
-        assert_eq!(resolved.spec(), expected);
-        assert_eq!(cwd, Path::new(OTHER_CWD));
-    }
-
     #[test]
     fn tui_rejects_invalid_fold_instead_of_using_header() {
         let mut session = AppSession::new(HEADER_MODEL, THIS_CWD);
@@ -757,7 +617,7 @@ mod tests {
             .unwrap();
         session.push_state(session.state().last().unwrap().clone());
 
-        assert!(restored_session_settings(&session).is_err());
+        assert!(session_cwd(&session).is_err());
     }
 
     #[test]
@@ -882,55 +742,27 @@ mod tests {
 
     const OTHER_CWD: &str = "/elsewhere";
     const THIS_CWD: &str = "/here";
-    /// A pid no live process on this machine has.
-    const FAKE_PID: u32 = u32::MAX - 1;
-
-    #[test]
-    fn resolve_session_preserves_the_stored_cwd() {
-        use tempfile::tempdir;
-
-        let tmp = tempdir().unwrap();
+    #[test_case(false; "valued_continue")]
+    #[test_case(true; "last")]
+    fn select_initial_tab_preserves_the_stored_cwd(last: bool) {
+        let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new("test-model", OTHER_CWD);
+        let mut session = AppSession::new(HEADER_MODEL, THIS_CWD);
+        session
+            .resolve_legacy_config(stored_config(FOLDED_MODEL, OTHER_CWD))
+            .unwrap();
         session.save(&storage).unwrap();
-        let loaded = resolve_session(
-            false,
-            Some(&session.id.to_string()),
-            "test-model",
-            THIS_CWD,
+        let id = session.id.to_string();
+        let loaded = select_initial_tab(
+            last,
+            (!last).then_some(id.as_str()),
+            STARTUP_MODEL,
+            OTHER_CWD,
             &storage,
         )
-        .expect("a session stored under another cwd is resumed");
-        assert_eq!(loaded.cwd, OTHER_CWD);
-    }
-
-    #[test_case(true; "valued_continue")]
-    #[test_case(false; "last")]
-    fn resolve_session_rejects_session_open_elsewhere(valued: bool) {
-        use tempfile::tempdir;
-
-        let tmp = tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new("test-model", THIS_CWD);
-        session.save(&storage).unwrap();
-        let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-        let (last, id_arg) = match valued {
-            true => (false, Some(session.id.to_string())),
-            false => (true, None),
-        };
-
-        let loaded = resolve_session(last, id_arg.as_deref(), "test-model", THIS_CWD, &storage)
-            .expect("an unlocked session loads");
-        assert_eq!(loaded.id, session.id);
-
-        fs::write(
-            session_lock::lock_path(&sessions_dir, &session.id),
-            FAKE_PID.to_string(),
-        )
         .unwrap();
-        let err = resolve_session(last, id_arg.as_deref(), "test-model", THIS_CWD, &storage)
-            .expect_err("a session locked by another instance must be rejected");
-        assert!(err.to_string().contains(session_lock::OPEN_ELSEWHERE_MSG));
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(session_cwd(&loaded).unwrap(), Path::new(OTHER_CWD));
     }
 
     #[test]
