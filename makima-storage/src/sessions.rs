@@ -495,7 +495,10 @@ impl StagedCheckpoint {
         if !claim_publication() {
             return Ok(false);
         }
-        crate::persist(self.temporary, &self.path)?;
+        let mut temporary = self.temporary.into_temp_path();
+        fs::rename(&temporary, &self.path).map_err(StorageError::from)?;
+        temporary.disable_cleanup(true);
+        crate::sync_parent_dir(&self.path);
         Ok(true)
     }
 }

@@ -1646,7 +1646,11 @@ impl Writer {
                     return false;
                 }
                 match (request.claim)(&request.publication) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        drop(state);
+                        self.logs.remove(&id);
+                        true
+                    }
                     Err(error) => {
                         claim_error = Some(error);
                         false
@@ -1659,7 +1663,6 @@ impl Writer {
                 claim_error.map_or_else(|| CHECKPOINT_CANCELLED.into(), |error| error.to_string())
             );
         }
-        self.logs.remove(&id);
         let mut state = lock(pending);
         if !state
             .incarnations
@@ -1796,7 +1799,7 @@ mod tests {
     use makima_storage::id::SessionRef;
     use makima_storage::session_lock;
     use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent, StoredThinking};
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1927,6 +1930,61 @@ mod tests {
             },
             wake_rx,
         )
+    }
+
+    #[test_case(false; "replacement_failure_releases_cursor")]
+    #[test_case(true; "rejected_claim_keeps_cursor")]
+    fn staged_checkpoint_handles_cursor_and_temp_on_failure(reject: bool) {
+        let (_tmp, dir) = state_dir();
+        let (writer, _wake_rx) = manual_writer();
+        let session = Arc::new(AppSession::new(MODEL, CWD));
+        let id = session.id;
+        writer.seed(Arc::clone(&session));
+        let (_lease, checkpoint) = guarded_writer(&writer, &dir, id);
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let mut disk = Writer {
+            dir: dir.clone(),
+            warn_tx,
+            logs: HashMap::new(),
+            failing: HashSet::new(),
+        };
+        disk.write(&session).unwrap();
+        let blocked = (!reject).then(|| BlockedSession::new(&dir, id));
+        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR).unwrap();
+        let entry_count = || fs::read_dir(&sessions_dir).unwrap().count();
+        let before = entry_count();
+        let claim: CheckpointClaim = if reject {
+            Arc::new(|_: &CheckpointPublication| Err(Arc::from(CHECKPOINT_CANCELLED)))
+        } else {
+            publication_claim()
+        };
+        let publication = CheckpointPublication::default();
+        let ack = checkpoint.checkpoint_guarded(
+            CheckpointRequest {
+                session_id: id,
+                version: CheckpointVersion {
+                    revision: session.revision(),
+                    epoch: session.history_snapshot().epoch,
+                },
+                snapshot: Arc::new(config_checkpoint(1, 1)),
+            },
+            publication.clone(),
+            claim,
+        );
+        disk.flush(&writer.pending);
+        assert!(matches!(
+            smol::block_on(ack),
+            Err(CheckpointError::Save { message, .. })
+                if !reject || message.as_ref() == CHECKPOINT_CANCELLED
+        ));
+        assert_eq!(publication.cancel(), reject);
+        assert_eq!(disk.logs.contains_key(&id), reject);
+        assert_eq!(entry_count(), before);
+        if let Some(blocked) = blocked {
+            blocked.restore();
+        }
+        assert_eq!(AppSession::load(id, &dir).unwrap().model, MODEL);
+        assert_eq!(writer.latest_snapshot(id).unwrap().model, MODEL);
     }
 
     #[test_case(false, false, false; "config_then_terminal_history")]
