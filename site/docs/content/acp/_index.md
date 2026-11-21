@@ -35,7 +35,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 
 ## What works
 
-- Sessions persist. Loading a session sends its saved conversation to the editor without replaying model requests or tools. A session that is open in another terminal cannot be loaded.
+- Sessions persist. Loading a session sends its saved conversation to the editor. A session that is open in another terminal cannot be loaded.
 - Session options include Model, YOLO, Fast, Workflow, and available plugin options such as Bash auto mode. New and loaded sessions return the complete ordered option list. Option updates also contain the complete list.
 - Model switching uses the editor's model selector. All configured providers appear. Providers such as OpenRouter add discovered models in the background. A model change and any required Fast disablement appear as one update.
 - Modes switch between build mode and plan mode. Build mode has full tool access. Plan mode limits writes to the plan file.
@@ -52,7 +52,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
 
-Loaded sessions retain durable agent IDs, child histories, committed configuration, and retained turn results. Children remain dormant until reactivated for work. Recovery marks unfinished admitted turns as `interrupted` rather than rerunning them. Recorded child-report delivery state survives restart. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) for reactivation limits.
+Loaded ACP sessions follow the shared [persistence and resume rules](/docs/agent-work/#persistence-and-resume).
 
 Rewind is not available over ACP. See [Rewind](/docs/agent-work/#rewind).
 

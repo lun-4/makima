@@ -13,19 +13,39 @@ The main agent and its subagents use the same message queue and input controls. 
 
 A saved session retains the main agent and its subagents as a graph. Each agent has a durable ID, distinct from the session ID and its turn IDs. `task_id` is the durable agent ID. History, committed configuration, recorded context, retained turn results, and recorded child-report delivery state survive a restart.
 
-An open agent without a running instance is dormant. Loading a session restores its graph without restarting every child. Sending new work to an eligible dormant agent reactivates it from its saved configuration and capabilities. Missing providers, models, tools, or MCP servers can prevent reactivation. Children that depend on local Lua tool closures cannot reactivate after a restart. Legacy child transcripts remain readable but cannot resume work.
+An open agent without a running instance is dormant. Loading a session restores its graph. An agent that was idle stays dormant until it receives work. Missing providers, models, tools, or MCP servers can prevent reactivation. Children that depend on local Lua tool closures cannot reactivate after a restart. Legacy child transcripts remain readable but cannot resume work.
 
-Unfinished admitted turns become cancelled with reason `interrupted` during recovery. Their model requests and tools are not replayed. Reading a transcript or retained result does not rerun the turn. Pending child reports retain their delivery state, so a report already consumed by the parent is not inserted again after restart.
+### Restart
 
-Closing the application releases running instances without permanently closing the saved agents. Explicit agent close through `task_despawn` or `agent:close` remains permanent, but does not retire durable identities. `/task-retire <task_or_agent_id>` separately retires an accessible quiescent leaf agent. Close and retirement preserve saved history and retained results.
+When a saved session is reopened after a quit or crash, every unfinished turn continues by default, including the root turn and any subagent turns. Makima requests a reply again if it was cut off while streaming. A resumable tool call runs or waits again. For example, `question` asks again and `task_wait` resumes waiting. For other in-flight calls, Makima sends the model this result instead of retrying the call:
+
+> This tool call was interrupted when makima stopped. It may have partly run. Check the current state before retrying, then continue your task.
+
+`MAKIMA_CONTINUE_ALL_AGENTS` defaults to `1`. Set it to `0` to record unfinished turns as `Interrupted` instead. When turns continue, Makima shows `continuing N interrupted turns (set MAKIMA_CONTINUE_ALL_AGENTS=0 to stop this)`. A subagent that cannot continue reports the reason to its parent. If the saved root mode cannot be restored, Makima warns, switches to read-only mode, and waits for input instead of resuming the root turn automatically.
+
+Pending child reports keep their delivery state. A report the parent already read is not delivered again. Reading a saved transcript or result does not rerun its turn.
+
+Quitting releases running instances without permanently closing the saved agents. Explicit agent close through `task_despawn` or `Agent:close` remains permanent, but does not retire durable identities. `/task-retire <task_or_agent_id>` separately retires an accessible quiescent leaf agent. Close and retirement preserve saved history and retained results.
 
 Instruction changes on disk do not silently replace the session's recorded context. See [Recorded context](/docs/context/#recorded-context) for `/reload-context`.
 
+### Session storage
+
+The session log is append-only. It keeps every saved message, including cut-off branches and the original messages from before compaction, until the session is deleted.
+
+If a write fails, the terminal UI shows an unsaved warning. Makima keeps the records in memory and retries while agents keep working. If any records remain unsaved at quit, Makima warns before exiting. Unsaved records may be lost on exit or crash.
+
 ## Rewind
 
-Rewind is being reworked. In this version `Esc Esc` on an idle agent only shows a notice.
+In the terminal UI, press `Esc Esc` in the idle root chat to open the rewind picker. If the root is running, stop it first. Only the root can be rewound.
 
-Approving a plan with clear context creates a separate implementation session linked to the planning session.
+- Current context lists user turns in the root's current conversation. Selecting one puts its prompt back in the input box and rewinds to just before that prompt. Makima drops the root's pending messages.
+- Rewound lists prompts outside the current context, including cut-off branches and prompts from before compaction. Select one to return to that line of conversation. This is how redo works.
+- Back to planning session is available after plan approval with clear context. It suspends the implementation session as a quit would and opens the planning session without cutting its conversation. Files changed during implementation stay changed. See [Restart](#restart) for what happens when the implementation session is reopened.
+
+Selecting a prompt appends a fork to the session log. The fork changes only the root's conversation context. Subagents keep running and their new reports still reach the root. Mode, plan, configuration, rules, recorded context, plugin state, and files all keep their current values.
+
+The root chat marks the fork and shows a system note with the current mode, a warning that files may differ from the conversation, and a list of existing subagents. The model sees the note too. The [`task_list` tool](/docs/tools/#task_list) can show the current task list later.
 
 ## Messages and turns
 

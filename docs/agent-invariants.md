@@ -91,24 +91,27 @@ These invariants cover the actor, manager and agent frontends as they are curren
 62. Agents use only the manager's per-outer-session concurrency limit. Do not add a second process-wide turn semaphore.
 63. `makima.async.run` inherits only the originating turn's managed authority. Timer fires intentionally inherit none and must fail closed for managed operations.
 64. The Lua Agent API and the task plugin may adapt actor state, result text, capture values, and cumulative usage, but they must not become a second lifecycle source.
-65. Durable configuration and history edits follow [durable publication](agent-system.md#durable-publication): the actor commits only after the claim, invalidation before the claim leaves actor, options, host and disk unchanged, and nothing suppresses finalization after it.
-66. SDK and ACP send a turn's terminal result only after its history checkpoint settles. Print publishes through the same path into a writer that saves nothing: its root model, mode and cwd changes apply, and nothing reaches disk.
+65. Durable configuration and history edits follow [durable publication](agent-system.md#durable-publication): invalidation before the claim prevents installation. Save acknowledgement follows journal installation and the requested durability receipt.
+66. SDK and ACP send a turn's terminal result only after its terminal journal flush settles. Print publishes through the same path into a writer that saves nothing: its root model, mode and cwd changes apply, and nothing reaches disk.
 
 ## Current scope boundary
 
 67. Actor config covers model, prompt, tools, permissions, modes, and request options. Do not add a second writable copy of those values in a frontend or coordinator; read them from the actor.
-68. Durable graph records, ids, retained results, configuration, state slots, and delivery disposition survive checkpointed restart. Active invocations, accepted input payloads, runtime resources, and permission prompts do not. Recovery terminalizes unfinished admissions as Interrupted and never reexecutes them.
+68. Active invocations, live resources, and pending permission prompts do not survive restart. Recovery continues unfinished root and child turns by default. It retries only in-flight tools marked resumable; other calls get the restart interruption result. `MAKIMA_CONTINUE_ALL_AGENTS=0` records unfinished turns as `Interrupted`.
 69. Do not weaken these current invariants to imitate a future design. Land the future ownership model first, migrate all affected callers, and update these docs with the new verified contract.
 
 ## Journal and recovery
 
 70. Agent revisions and state changes share one session journal sequence. Config, rules, context, plugin state, admissions, outcomes, and deliveries must not acquire independent competing orders.
 71. Teardown never records Closed or Retired for an open durable agent. Detachment revokes the old incarnation and retains ownership through tool completion and cleanup before making resources reusable.
-72. Recovery publishes sanitized history, interrupted results, and state before admission or observer activation. Configuration, permissions, plan state, registered plugin state, and recorded context must match that checkpoint.
+72. TUI, SDK, and ACP open saved sessions through `open_session`. The session lease protects loading and publication. Recovery installs the recovered journal before runtime activation.
 73. Delivery deduplication keys by `(AgentId, TurnId)` and records consumed, withdrawn, or dropped disposition durably. Restart and compaction must not redeliver a terminally disposed result from retained state.
 74. Plugin state uses registered, versioned JSON slots in explicit agent or session scope. Mutations validate authority and expected revision. Migration changes publish with the same journal transaction before observers run.
 75. Session saves write v3; v2 import has no downgrade path. The first v3 release writes an empty header feature set. Unknown versions, unsupported feature names, and complete unsupported record schemas fail closed.
 76. History epochs are opaque ordered identities within one namespace. Import remints distinct saved epochs while preserving order, equality, and all retained references. Independent imported namespaces must never be merged by equal raw epoch numbers.
+
+77. One `SessionWriter` per open saved session appends records in sequence order and acknowledges durability after fsync. Write failures retain pending records for retry. A torn final line is discarded before appending again. Compaction and forks cannot rewrite complete message records.
+78. Rewind holds the root idle guard and appends a fork with a stable target and a stored note. It can change only the root's context and pending input. Non-conversation state continues from its latest revision, and child delivery dispositions do not roll back.
 
 ## Lock order
 

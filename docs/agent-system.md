@@ -67,15 +67,15 @@ Every frontend, the coordinator and Lua commit a config change through one `conf
 
 Every mode name goes through one `modes::resolve`, against the registry the Lua host owns (`EventHandle::mode_registry`), and every frontend and Lua commit a mode with `ConfigChangeTicket::commit_mode`. `plan` keeps the current plan file or allocates one under the state directory. A mode is durable config committed once, like any other change: headless frontends admit turns without a mode of their own.
 
-An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints record per-agent Config state and project compatible header and metadata fields without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration commits append per-agent `Config` records without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
 
 ### Session state audit
 
 | State | Authority and restoration |
 |---|---|
 | Agent identity, ancestry, lifecycle, spawn specification and usage | Ordered agent revisions. Reservations, resident actors and runner tasks are rebuilt. |
-| Transcripts, tool outputs, observations and posts | Session message, child-message, output and post records. Conversation continuation metadata and compaction metadata belong to the matching transcript epoch. |
-| Turn admissions, outcomes and deliveries | Journal records. Recovery interrupts admitted unfinished turns without executing them again. Terminal delivery records prevent duplicate observations after restart and compaction. |
+| Transcripts, tool outputs, observations and posts | One `Msg` record type with stable message and agent IDs. Compactions and forks are separate records. Posts refer to messages by ID. |
+| Turn admissions, outcomes and deliveries | Journal records. Recovery continues unfinished turns by default. Terminal delivery records prevent duplicate observations after restart and compaction. |
 | Model, thinking, effective fast setting, workflow, cwd and resolved mode | Per-agent `Config` records. Provider instances, model capabilities, runtime generations and caches are rebuilt. The spawn ceiling remains separate from mutable mode configuration. |
 | Deferred fast intent | A model-pinned internal Config option. Discovery consumes the intent with the committed setting change. |
 | Plugin options | All current values belong to Config history. Resume applies values whose current definitions declare persistence. |
@@ -87,36 +87,29 @@ An actor commit publishes its identity, generation, and full configuration to fr
 | Plugin registrations, callbacks, timers and VM tables | Rebuilt when plugins load. `makima.state` stores registered, versioned JSON values in agent or session scope. VM tables, callbacks, timers and registrations are not stored. |
 | Focus, panels, scroll position and expanded rows | Transient UI state, except the existing persisted tool presentation state. Input history retains its separate storage. |
 
-Runtime configuration epochs and provider metadata are not independent durable settings. A restored actor receives its resolved mode definition with the configuration before admission. Saved mode snapshots do not consult changed or removed registry definitions. An unusable saved plan file requires a visible Build fallback; the fallback must pass through the normal configuration commit path.
+Runtime configuration epochs and provider metadata are not independent durable settings. A restored actor receives its resolved mode definition with the configuration before admission. Saved mode snapshots do not consult changed or removed registry definitions. If the saved mode cannot be restored, recovery warns and falls back to read-only without automatically continuing the root.
 
 ### Durable publication
 
-Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:
-
-```text
-writer guard      SessionPublicationGuard: session lock held, owner still ours
-  plugin gate     PluginAuthority::publication_gate: plugin generation alive
-    task scope    TaskCell: invocation live, same plugin origin
-      cancel      CancelToken publication gate: not cancelled
-        CAS       CheckpointPublication PENDING -> PUBLISHING
-          rename  staged file replaces the session file
-```
-
-The claim runs synchronously inside the writer guard and takes the locks in this order (`LuaCtx::publication_claim`). Hosts outside a Lua invocation use `session_coordinator::publication_claim`, which is the CAS alone. The claim callback must not take actor, manager, or option-catalog locks.
-
-Invalidation before the claim wins. Plugin revocation, the invocation ending, cancellation, or a dropped waiter moves the publication to `CANCELLED`. The staged file is discarded, the operation fails, and the finalizer never runs, so the actor, public options, host snapshot and disk all keep their previous state. A lost session lock or a failed rename has the same effect.
-
-After the claim, nothing can cancel the publication. The commit runs on an actor-owned task or the actor runner, so dropping the waiter does not drop it. Once the rename succeeds the actor commits, and the `PreparedFinalization` installs reserved public options and the host snapshot before observers see the new configuration. A publish callback that returns success without claiming is treated as a failure.
+Prepared configuration and history changes reserve an actor operation and a journal revision. `CheckpointPublication` is the claim that orders cancellation against journal installation. `LuaCtx::publication_claim` also checks plugin generation and invocation authority. Invalidation before the claim leaves the operation uncommitted. After the claim, dropping the waiter does not cancel publication. The save path installs the prepared records in the journal before acknowledging the write. An I/O error leaves installed records pending for retry.
 
 ## Session journal and recovery
 
-`SessionJournal` gives agent revisions and state changes one monotonic session sequence. Config, rules, recorded context, plugin slots, turn admissions and results, delivery disposition, and turn boundaries share that order. Agent scope and session scope are explicit. Actor histories remain the mutable transcript authority; journal snapshots include the matching histories for checkpoint publication.
+`SessionJournal` orders messages, compactions, forks, agent revisions, configuration, rules, recorded context, plugin state, turn admissions and outcomes, and deliveries in one session sequence. The actor owns mutable context. The journal retains the events used to rebuild it and the latest values of non-conversation state. Transcripts of agents without resident actors can read the journal before it flushes.
 
-Session JSONL format v3 stores agent revisions, state records, and transcript records. The reader imports v2, but every save writes v3. There is no v2 downgrade path. The first v3 release writes an empty header feature set. Legacy import assigns durable identities when the migrated checkpoint is published; a transient imported identity must not be used as a stable endpoint before that publication. Unknown format versions, unsupported header features, and complete records with unsupported schemas fail loading rather than being silently discarded. Torn non-JSON appends can be skipped. Later schema additions require a named feature gate so older v3 binaries reject files they cannot preserve.
+### Session writer
 
-Recovery sanitizes transcripts, repairs unavailable tool results, and records `Interrupted` cancellation for admitted turns without terminal results. It never reissues interrupted model requests, tools, shell commands, or queued input. Inactive root text returns to the draft. Recovery publishes its checkpoint before exposing the runtime or admitting work. Root and child Config records, saved mode snapshots, Rules, registered state slots, and recorded instructions supply restored state; runtime providers, tools, permissions, and authority are rebuilt. Instruction-file changes produce a reload notice but do not replace recorded content. `/reload-context` journals the new root content; children retain the system prompt resolved at spawn.
+One `SessionWriter` in `makima-agent` serves each open saved session. All frontends and agents submit typed records to it, including drafts and posts. It assigns sequence numbers in arrival order, appends batches to `sessions/<id>.jsonl`, and fsyncs once per batch. Turn completion, rewind, configuration changes, and spawns wait for durability. Streaming and presentation updates can enqueue without waiting. The writer holds no state mutex during I/O. Failed writes retain records for retry and return errors to waiting callers. See [Session storage](../site/docs/content/agent-work/_index.md#session-storage) for the TUI warning.
 
-Child result and delivery disposition records use `(AgentId, TurnId)`. Queued, consumed, withdrawn, and dropped deliveries survive restart and compaction. Recovery reconstructs pending delivery work from the journal. A consumed or withdrawn delivery cannot become eligible again because its presentation event was lost. This deduplication is separate from the best-effort event transport and applies only to state retained by a successful checkpoint.
+Compaction and rewind leave prior records intact. The reader ignores a torn final line, which the writer truncates before appending. Opening a v2 log migrates it to v3 once and archives the original. There is no downgrade path. The v3 header starts with an empty feature set. Unknown versions, unsupported features, and complete records with unsupported schemas fail loading. Later incompatible schema additions require a named feature gate.
+
+### Opening and continuing a session
+
+TUI, SDK, and ACP use `session_recovery::open_session`. It claims the session lock, loads under that lock, and selects the model. An explicit model wins. Otherwise it uses the recorded model if available and allowed, or warns and uses the startup model. `SessionOpening::recover` prepares recovery and binds the writer to the session lease before the frontend activates the runtime.
+
+Recovery rebuilds runtime providers, tools, permissions, and authority from current registrations and saved state. It continues unfinished turns with their recorded turn IDs, including child turns and parents waiting on them. It requests a cut-off streaming reply again. It reissues only in-flight tool calls marked resumable and inserts an interruption result for the rest. `MAKIMA_CONTINUE_ALL_AGENTS=0` records unfinished turns as `Interrupted` instead. See [Restart](../site/docs/content/agent-work/_index.md#restart) for the user-visible notice and tool result.
+
+Child result and delivery records key by `(AgentId, TurnId)`. Recovery reconstructs pending deliveries but does not deliver a consumed or withdrawn result again. This is independent of best-effort presentation events. `/reload-context` journals new root context; children retain the system prompt resolved at spawn.
 
 ### Legacy import identity
 
@@ -124,11 +117,13 @@ Decision: retain v2 import ambiguity markers and presentation fallbacks where du
 
 ### History epochs
 
-History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories, boundaries, and compactions. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
+History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories and compactions. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
 
 ### Rewind
 
-Rewind is being reworked and is unavailable. The old implementation restored whole-session state (boundary pins, branch files, child rewind, parent-session restore) and was removed. Clear-context plan approval still creates an implementation session with a durable parent link.
+`AgentRef::begin_rewind` acquires the root's idle guard. The guard prevents turn admission from starting root work while the picker is open. Dropping the guard makes no log change. Selecting a prompt appends a `Fork` with the target context entry ID and a stored note, then installs the rebuilt root context. The picker returns the selected prompt to the draft. It does not change child actors, files, or the latest non-conversation state.
+
+Context replay applies `Msg`, `Compaction`, and `Fork` records in log order. A fork selects the context prefix ending at its target, then adds its note. An earlier branch or pre-compaction context remains selectable because the log retains those events. Clear-context plan approval creates a separate implementation session with a durable `ParentLink`. Following that link suspends the implementation session and opens the planning session without appending a fork to either log.
 
 ## The actor
 
@@ -177,7 +172,7 @@ The actor orders submissions with configuration, working-directory changes, cont
 - `run_control`: execute a standalone control with no turn identity.
 - `run_compact`: compact history with no turn identity.
 
-A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal checkpoint turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
+A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal journal flush turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
 
 The `AgentInput` is moved exactly once from queue to backend. It is intentionally not cloned to paper over ownership or lifetime problems.
 
@@ -339,7 +334,7 @@ The bundled task plugin resolves durable task ids through the current manager. E
 
 ### Frontend roots
 
-TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `makima_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
+TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `makima_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP use the session writer. Print applies the same changes in memory. SDK and ACP wait for the terminal journal flush before reporting the turn result.
 
 ## Known implementation caveats
 
@@ -362,7 +357,7 @@ The following work is not part of the current implementation contract:
 - removal of the native mode enum and remaining host special cases
 - queue coalescing and contextual automode
 
-Live execution resources, accepted input payloads, pending permission prompts, shell processes, and plugin VM objects do not survive restart. Durable ids and recorded results do not preserve a live invocation or grant authority in a new manager.
+Live execution resources, pending permission prompts, shell processes, and plugin VM objects do not survive restart. Durable ids and recorded results do not preserve a live invocation or grant authority in a new manager.
 
 ## Source map
 
@@ -379,11 +374,11 @@ Live execution resources, accepted input payloads, pending permission prompts, s
 | Manager public projections | `makima-agent/src/manager/types.rs` |
 | Work capacity and graph transitions | `makima-agent/src/manager/work.rs` |
 | Session journal and durable state fold | `makima-agent/src/journal.rs`, `makima-storage/src/session_state.rs` |
-| Checkpoint-qualified restart recovery | `makima-agent/src/session_recovery.rs`, `makima-agent/src/session_checkpoint.rs` |
+| Session opening and restart continuation | `makima-agent/src/session_recovery.rs` |
 | Plugin state and recorded instructions | `makima-agent/src/state.rs`, `makima-lua/src/api/state.rs`, `makima-agent/src/context.rs` |
-| Turn boundaries and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
+| Root fork rewind and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
 | Session format | `makima-storage/src/sessions.rs` |
-| TUI checkpoint publication | `makima-ui/src/storage_writer.rs` |
+| Append-only writer and save receipts | `makima-agent/src/session_writer.rs`, `makima-agent/src/session_checkpoint.rs` |
 | Manager errors | `makima-agent/src/manager/manager_error.rs` |
 | TUI root construction/backend | `makima-ui/src/agent/mod.rs`, `makima-ui/src/agent/agent_loop.rs` |
 | TUI cancellation routing | `makima-ui/src/agent/command_router.rs` |
@@ -391,7 +386,7 @@ Live execution resources, accepted input payloads, pending permission prompts, s
 | Lua orchestration, targets and plugin authority | `makima-lua/src/orchestration.rs`, `makima-lua/src/orchestration/targets.rs` |
 | Prepared operations and durable commit | `makima-agent/src/actor/prepared.rs`, `makima-agent/src/actor/history_edit.rs` |
 | Publication state and session lock guard | `makima-storage/src/checkpoint.rs`, `makima-storage/src/session_lock.rs` |
-| Session coordinator and checkpoint projection | `makima-agent/src/session_coordinator.rs`, `makima-agent/src/session_checkpoint.rs` |
+| Session coordinator | `makima-agent/src/session_coordinator.rs` |
 | Print, SDK and ACP backend | `makima-agent/src/headless.rs` |
 | Lua turn-scoped authority | `makima-lua/src/runtime.rs`, `makima-lua/src/api/util/ctx.rs` |
 | Configured graph limits | `makima-config/src/lib.rs` |

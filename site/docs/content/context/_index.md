@@ -81,9 +81,7 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 Long sessions eventually approach the model's context limit. Makima reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Makima parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
-
-Archives can be inspected with `jq` or an editor. Replacing the live session log by hand bypasses the checks that keep agent state consistent.
+Compaction replaces older turns in the model's context with a summary. The original messages stay in [session storage](/docs/agent-work/#session-storage).
 
 `MAKIMA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 

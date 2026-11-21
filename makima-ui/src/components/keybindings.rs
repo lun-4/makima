@@ -482,7 +482,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
-        description: "Cancel agent",
+        description: "Cancel active work or open rewind in the idle root chat",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

@@ -94,7 +94,7 @@ SDK-only flags (`--session-id`, `--fork-session`, `--permission-mode`, `--includ
 
 One-shot `--print` always starts a new session in build mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). It saves no preferences either: `/thinking high` sets the level for the run, not the saved default for new sessions. Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
 
-SDK sessions persist the agent graph, histories, committed configuration, and recorded context. Resuming restores durable agent IDs and retained results without replaying unfinished model requests or tools. Recovery marks unfinished admitted turns as `interrupted`; new input starts new work. Children remain dormant until reactivated for work. See [Persistence and resume](/docs/agent-work/#persistence-and-resume) for reactivation limits and child-report delivery.
+SDK sessions follow the shared [persistence and resume rules](/docs/agent-work/#persistence-and-resume).
 
 Rewind is not available in SDK mode. See [Rewind](/docs/agent-work/#rewind).
 
