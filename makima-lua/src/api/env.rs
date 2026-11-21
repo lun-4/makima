@@ -101,7 +101,7 @@ fn shell(lua: &Lua) -> mlua::Result<&'static str> {
         .app_data_ref::<makima_config::Shell>()
         .map(|shell| *shell)
         .unwrap_or_default();
-    Ok(maki_agent::shell::name(shell))
+    Ok(makima_agent::shell::name(shell))
 }
 
 lua_table! {

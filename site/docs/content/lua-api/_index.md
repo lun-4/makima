@@ -8057,6 +8057,10 @@ function Spans.match_spans(text, indices, base_style, match_style)
 function M.case(name, fn)
 function M.eq(actual, expected, msg)
 function M.has(s, substr, msg)
+
+-- Absolute so a caller that resolves it again (a tool's ctx:resolve_path)
+-- gets the same spelling: a rooted path without a drive is not absolute on
+-- Windows and resolves against the cwd's drive.
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 

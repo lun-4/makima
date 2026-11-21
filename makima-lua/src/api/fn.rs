@@ -405,7 +405,7 @@ impl JobMeta {
 }
 
 fn shell_command(cmd: &str, shell: Shell) -> Command {
-    maki_agent::shell::command(shell, cmd)
+    makima_agent::shell::command(shell, cmd)
 }
 
 fn kill_job(meta: &mut JobMeta) {

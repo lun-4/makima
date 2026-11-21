@@ -2956,7 +2956,7 @@ mod tests {
     }
 
     impl BlockedSession {
-        fn new(dir: &StateDir, id: MakiId) -> Self {
+        fn new(dir: &StateDir, id: MakimaId) -> Self {
             let path = dir.path().join(SESSIONS_DIR).join(format!("{id}.jsonl"));
             let backup = path.exists().then(|| {
                 let backup = path.with_extension("jsonl.saved");
@@ -4584,7 +4584,7 @@ mod tests {
         let session = Arc::new(AppSession::new(MODEL, CWD));
         let id = session.id;
         let blocked = BlockedSession::new(&dir, id);
-        let undelatable = MakiId::generate();
+        let undelatable = MakimaId::generate();
         let blocked_other = BlockedSession::new(&dir, undelatable);
         let (writer, warn_rx) = writer(&dir);
 
