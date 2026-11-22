@@ -9,7 +9,7 @@ use common::{CannedProvider, RestartHost, TestSession};
 use makima_agent::{
     AgentActorHandle, AgentId, AgentRef, McpSession,
     manager::{AgentIncarnation, ReactivationError},
-    mcp::test_support::stub_session_with_result,
+    mcp::{TOOL_SEARCH_TOOL_NAME, test_support::stub_session_with_result},
     permissions::{PermissionCheck, PermissionSnapshot},
     session_coordinator::SessionCoordinatorHandle,
     tools::ToolContext,
@@ -83,6 +83,7 @@ const PERMISSION_TOOL: &str = "restart_permissions";
 const ALLOWED_SCOPE: &str = "allowed";
 const DENIED_SCOPE: &str = "denied";
 const MCP_TOOL: &str = "server__lookup";
+const SPAWN_MCP_GRANDCHILD_TOOL: &str = "spawn_mcp_grandchild";
 const MCP_DESCRIPTION: &str = "saved MCP lookup definition";
 const MCP_OLD_REPLY: &str = "MCP before restart";
 const MCP_FRESH_REPLY: &str = "fresh MCP transport after restart";
@@ -186,6 +187,16 @@ makima.api.register_tool({
         return "inherited child completed"
     end,
 })
+makima.api.register_tool({
+    name = "spawn_mcp_grandchild", description = "request MCP from an MCP-disabled parent",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    handler = function(input, ctx)
+        local descendant = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, mcp = true, tools = {} }))
+        local prompt = "grandchild work before restart"
+        remember(ctx, descendant, assert(descendant:send(ctx, prompt, { when = "idle" })), input.path, prompt)
+        return "grandchild completed"
+    end,
+})
 makima.api.register_command({
     name = "/restart_run", tui_only = false,
     arguments = { raw = true, required = true },
@@ -201,6 +212,10 @@ makima.api.register_command({
                 options.tools = { { name = "restart_permissions", description = "shared permission probe", input_schema = { type = "object", properties = {} } } }
             elseif input.kind == "mcp" then
                 options.tools = { { name = "server__lookup", description = "saved MCP lookup definition", input_schema = {} } }
+            elseif input.kind == "blocked_mcp" then
+                options.tools = { { name = "spawn_mcp_grandchild", description = "spawn a grandchild", input_schema = {
+                    type = "object", properties = { path = { type = "string" } }, required = { "path" },
+                } } }
             elseif input.kind == "structured" then
                 options.output_schema = { type = "object", properties = { answer = { type = "integer" } }, required = { "answer" } }
             elseif input.kind == "local" or input.kind == "inherited" then
@@ -219,7 +234,7 @@ makima.api.register_command({
             assert(child:set_mode(ctx, mode) == mode)
             local prompt = "child work before restart"
             local ticket = assert(child:send(ctx, prompt, { when = "idle" }))
-            if input.kind == "inherited" then
+            if input.kind == "inherited" or input.kind == "blocked_mcp" then
                 local result = assert(ticket:wait(ctx))
                 assert(result.status == "completed", result.error)
             else
@@ -1659,6 +1674,50 @@ fn concurrent_public_lua_sends_reactivate_one_resident_and_keep_both_turns() {
     let history = serde_json::to_string(&requests[2].messages).unwrap();
     for message in CONCURRENT_MESSAGES {
         assert!(history.contains(message));
+    }
+}
+
+#[test]
+fn grandchild_cannot_gain_mcp_after_restart() {
+    const MODE: &str = "build";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SAVED_IDS);
+    let provider = RestartProvider::new(vec![
+        common::canned_tool_use(SPAWN_MCP_GRANDCHILD_TOOL, json!({ "path": path })),
+        common::canned_reply(REPLY),
+        common::canned_reply(REPLY),
+        common::canned_reply(REPLY),
+    ]);
+    let mcp = || {
+        Some(stub_session_with_result(
+            &[("server.lookup", MCP_DESCRIPTION)],
+            MCP_FRESH_REPLY,
+        ))
+    };
+    let host = agent_host_with_mcp(dir.path(), provider.clone(), mcp());
+    command(
+        &host,
+        json!({ "action": "create", "kind": "blocked_mcp", "model": CHILD_MODEL, "mode": MODE, "path": path }),
+    );
+    let host = host.restart_host_with_mcp(dir.path(), mcp());
+    command(
+        &host,
+        json!({ "action": "resume", "kind": "recovery_read_only", "reply": REPLY,
+            "model": CHILD_MODEL, "mode": MODE, "path": path }),
+    );
+    let requests = provider.requests.lock().unwrap();
+    let [_, live, _, resumed] = requests.as_slice() else {
+        panic!("expected two parent requests and one grandchild request on each side of restart");
+    };
+    for request in [live, resumed] {
+        assert!(
+            request
+                .tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| { tool["name"] != TOOL_SEARCH_TOOL_NAME && tool["name"] != MCP_TOOL })
+        );
     }
 }
 

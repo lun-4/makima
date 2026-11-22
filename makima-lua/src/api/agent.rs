@@ -1816,7 +1816,7 @@ async fn build_session(
             .cloned()
             .unwrap_or_default(),
         audience: options.audience.name().unwrap_or("model").into(),
-        mcp: options.mcp,
+        mcp: child_template.mcp.is_some(),
         output_schema: opts
             .get::<Option<LuaValue>>("output_schema")?
             .map(|value| lua_to_json(&lua, &value))
@@ -1890,12 +1890,7 @@ async fn build_session(
         custom_system: options.system.take().unwrap_or_default(),
         tools: tools.request,
         opts: child.opts,
-        mcp: parent
-            .context
-            .mcp
-            .as_ref()
-            .filter(|_| options.mcp)
-            .map(McpSession::fresh),
+        mcp: child_template.mcp.as_ref().map(McpSession::fresh),
         chip_event_tx: EventSender::with_identity(sub_tx, parent.context.event_tx.identity()),
         answer_rx,
         answer_tx,

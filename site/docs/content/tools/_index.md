@@ -187,7 +187,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 
 ### `task_list` {#task_list}
 
-List the root agent's existing tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.
+List descendant tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

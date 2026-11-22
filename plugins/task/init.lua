@@ -734,7 +734,7 @@ end
 
 makima.api.register_tool({
   name = "task_list",
-  description = "List the root agent's existing tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.",
+  description = "List descendant tasks in the current session with their IDs, descriptions, and running, idle, or done status. Reads current task state without waiting for results or starting work.",
   kind = "search",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = { type = "object", properties = {}, additionalProperties = false },
@@ -743,28 +743,46 @@ makima.api.register_tool({
     if not tasks then
       return { llm_output = err, is_error = true }
     end
-    local ids = {}
-    for id in pairs(tasks) do
-      ids[#ids + 1] = id
+    if next(tasks) == nil then
+      return { llm_output = "No tasks." }
     end
-    table.sort(ids)
+    local caller, caller_err = ctx:agent()
+    if not caller then
+      return { llm_output = caller_err, is_error = true }
+    end
+    local root, root_err = makima.agent.root(ctx)
+    if not root then
+      return { llm_output = root_err, is_error = true }
+    end
+    local caller_id = caller:id()
+    local is_root = caller_id == root:id()
     local lines = {}
-    for _, id in ipairs(ids) do
-      local agent = makima.agent.get(ctx, id)
-      local status
-      if agent then
-        local status_err
-        status, status_err = agent:status(ctx)
-        if not status then
-          return { llm_output = status_err, is_error = true }
+    for id, task in pairs(tasks) do
+      if id ~= caller_id then
+        local agent, lookup_err = makima.agent.get(ctx, id)
+        local label
+        if agent then
+          local status, status_err = agent:status(ctx)
+          if not status then
+            return { llm_output = status_err, is_error = true }
+          end
+          if status.status == "closed" then
+            label = "done"
+          else
+            label = (status.status == "working" or (status.queued or 0) > 0) and "running" or "idle"
+          end
+        elseif lookup_err == "agent " .. id .. " is unknown" then
+          -- Only the root can list missing tasks, which have no graph ancestry to check.
+          label = is_root and "done" or nil
+        elseif lookup_err ~= "agent " .. id .. " is not a descendant of agent " .. caller_id then
+          return { llm_output = lookup_err, is_error = true }
+        end
+        if label then
+          lines[#lines + 1] = id .. ": " .. (task.description or "") .. " (" .. label .. ")"
         end
       end
-      local label = "done"
-      if status and status.status ~= "closed" then
-        label = (status.status == "working" or (status.queued or 0) > 0) and "running" or "idle"
-      end
-      lines[#lines + 1] = id .. ": " .. (tasks[id].description or "") .. " (" .. label .. ")"
     end
+    table.sort(lines)
     return { llm_output = #lines > 0 and table.concat(lines, "\n") or "No tasks." }
   end,
 })

@@ -109,6 +109,21 @@ const DESPAWN_UNKNOWN: &str = "Despawn failed: unknown task_id";
 
 const NESTED_CHILD_PROMPT: &str = "child prompt";
 const NESTED_CHILD_REPLY: &str = "child finished";
+const LIST_TASKS_PROMPT: &str = "List my tasks";
+const LISTING_TASK: &str = "List descendant tasks";
+const RUNNING_SIBLING: &str = "Keep sibling running";
+const TASK_IDLE: &str = "idle";
+const TASK_RUNNING: &str = "running";
+const TASK_DONE: &str = "done";
+const TASK_LIST_TOOLS_PRELUDE: &str = r#"
+makima.agent.tools = function(_, opts)
+  if opts.audience == "general_sub" then
+    return {
+      { name = "task_list", description = "list", input_schema = { type = "object" } },
+    }
+  end
+end
+"#;
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -2782,4 +2797,102 @@ fn managed_blocking_wait_yields_the_only_permit_to_its_child() {
     assert_eq!(echoed["result"]["text"], NESTED_CHILD_REPLY);
     assert_ne!(echoed["result"]["turn_id"], result["turn_id"]);
     assert_eq!(probe_real(&reg, &ctx)["sessions"], json!(2));
+}
+
+struct TaskListProvider(GatedProvider);
+
+impl Provider for TaskListProvider {
+    fn stream_message<'a>(
+        &'a self,
+        model: &'a Model,
+        messages: &'a [Message],
+        system: &'a str,
+        tools: &'a Value,
+        event_tx: &'a flume::Sender<ProviderEvent>,
+        opts: RequestOptions,
+        session_id: Option<&'a SessionRef>,
+        invocation: &'a Invocation,
+        delivery: RequestDelivery,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        if messages.first().and_then(Message::first_text_content) != Some(LIST_TASKS_PROMPT) {
+            return self.0.stream_message(
+                model, messages, system, tools, event_tx, opts, session_id, invocation, delivery,
+            );
+        }
+        Box::pin(async move {
+            let last = messages.last().unwrap();
+            if messages.len() == 1 {
+                assert!(
+                    common::tool_names(tools)
+                        .iter()
+                        .any(|name| name == TASK_LIST_TOOL)
+                );
+                return Ok(common::canned_tool_use(TASK_LIST_TOOL, json!({})));
+            }
+            for block in &last.content {
+                if let ContentBlock::ToolResult {
+                    content, is_error, ..
+                } = block
+                {
+                    assert!(!is_error, "task_list failed: {content}");
+                    return Ok(common::canned_reply(content));
+                }
+            }
+            panic!("missing task_list result: {last:?}");
+        })
+    }
+}
+
+#[test]
+fn delegated_task_list_omits_self_and_running_sibling() {
+    let (started_tx, started_rx) = flume::unbounded();
+    let (release_tx, release_rx) = flume::unbounded();
+    let provider = Arc::new(TaskListProvider(GatedProvider {
+        started_tx,
+        release_rx,
+    }));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(provider);
+    let (reg, _host, ctx) =
+        load_real_driver_host_with_prelude(&ctx, FIXTURE_ROOT_TURNS + 2, TASK_LIST_TOOLS_PRELUDE);
+    let sibling = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        TASK_SPAWN_TOOL,
+        task_input(RUNNING_SIBLING, None),
+    );
+    let started = smol::block_on(common::bounded(started_rx.recv_async())).unwrap();
+    assert_task_input(&started, TASK_PROMPT, false);
+
+    let listing = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        TASK_SPAWN_TOOL,
+        json!({
+            "description": LISTING_TASK,
+            "prompt": LIST_TASKS_PROMPT,
+            "subagent_type": "general",
+        }),
+    );
+    let wait = |task: &Value| {
+        exec_tool_json_with_ctx(
+            &reg,
+            &ctx,
+            TASK_WAIT_TOOL,
+            json!({"task_id": task["task_id"], "turn_id": task["turn_id"]}),
+        )
+    };
+    let delegated = wait(&listing);
+    let root_list = common::exec_tool_text(&reg, &ctx, TASK_LIST_TOOL, json!({}));
+    release_tx.send(()).unwrap();
+    assert_eq!(wait(&sibling)["status"], TASK_DONE);
+
+    assert_eq!(delegated["result"]["text"], NO_TASKS, "{delegated}");
+    let sibling_id = sibling["task_id"].as_str().unwrap();
+    let listing_id = listing["task_id"].as_str().unwrap();
+    let mut expected = [
+        format!("{listing_id}: {LISTING_TASK} ({TASK_IDLE})"),
+        format!("{sibling_id}: {RUNNING_SIBLING} ({TASK_RUNNING})"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(root_list.unwrap(), expected.join("\n"));
 }

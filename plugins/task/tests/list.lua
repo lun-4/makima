@@ -3,10 +3,21 @@ local originals = {
   tool = makima.api.register_tool,
   register = makima.state.register,
   get = makima.agent.get,
+  root = makima.agent.root,
 }
 local POLICY_ERROR = "task policy unavailable"
 local STATUS_ERROR = "status unavailable"
-local context = {}
+local root_id = "root"
+local caller_id = root_id
+local context = {
+  agent = function()
+    return {
+      id = function()
+        return caller_id
+      end,
+    }
+  end,
+}
 local tools = {}
 local policy_error
 local tasks
@@ -31,12 +42,23 @@ makima.state.register = function(name, spec)
     end,
   }
 end
+makima.agent.root = function(ctx)
+  eq(ctx, context)
+  return {
+    id = function()
+      return root_id
+    end,
+  }
+end
 makima.agent.get = function(ctx, id)
   eq(ctx, context)
   assert(tasks[id], "only resolve tasks from the policy")
   local status = agents[id]
   if not status then
-    return nil, "agent unavailable"
+    return nil, "agent " .. id .. " is unknown"
+  end
+  if caller_id ~= root_id and id ~= "idle" then
+    return nil, "agent " .. id .. " is not a descendant of agent " .. caller_id
   end
   return {
     status = function(_, status_ctx)
@@ -95,6 +117,10 @@ local ok, err = pcall(function()
     }, "\n")
   )
 
+  caller_id = "queued"
+  eq(output(), "idle: Waiting task (idle)")
+  caller_id = root_id
+
   tasks = { running = tasks.running }
   agents.running = { status = "idle", queued = 0 }
   eq(output(), "running: Active task (idle)")
@@ -117,4 +143,5 @@ makima.api.register_command = originals.command
 makima.api.register_tool = originals.tool
 makima.state.register = originals.register
 makima.agent.get = originals.get
+makima.agent.root = originals.root
 assert(ok, tostring(err))
