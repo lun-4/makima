@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use crate::journal::{
     JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
 };
+use crate::types::{decode_ask_answer, encode_ask_answer};
 use crate::{AgentEvent, CancelToken, EventSender, Post, PostLevel};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
@@ -201,11 +202,6 @@ impl PermissionAnswer {
     }
 }
 
-/// Splits the ask id from the encoded answer on the answer channel. A control
-/// character cannot appear in a tool-use id, and the answer is the tail, so
-/// deny guidance holding one still round-trips.
-const ANSWER_ID_SEPARATOR: char = '\u{1f}';
-
 /// An answer together with the id of the ask it answers.
 ///
 /// The name is what makes a late answer harmless. The answer channel is a
@@ -229,15 +225,11 @@ impl TaggedAnswer {
     }
 
     pub fn encode(&self) -> String {
-        format!(
-            "{}{ANSWER_ID_SEPARATOR}{}",
-            self.request_id,
-            self.answer.encode()
-        )
+        encode_ask_answer(&self.request_id, &self.answer.encode())
     }
 
     pub fn decode(raw: &str) -> Option<Self> {
-        let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
+        let (request_id, answer) = decode_ask_answer(raw)?;
         Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
 }

@@ -910,17 +910,15 @@ impl<'h> Agent<'h> {
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
         self.event_tx.send(AgentEvent::AuthRequired)?;
         let rx = rx.lock().await;
-        match futures_lite::future::race(rx.recv_async(), async {
-            self.cancel.cancelled().await;
-            Err(flume::RecvError::Disconnected)
-        })
-        .await
-        {
-            Ok(_) => {
-                self.provider.refresh_auth().await?;
-                Ok(TurnProgress::Continue)
+        loop {
+            match self.cancel.race(rx.recv_async()).await {
+                Ok(Ok(answer)) if answer.is_empty() => {
+                    self.provider.refresh_auth().await?;
+                    return Ok(TurnProgress::Continue);
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) | Err(_) => return Err(AgentError::Cancelled),
             }
-            Err(_) => Err(AgentError::Cancelled),
         }
     }
 

@@ -9,10 +9,11 @@ use makima_agent::cancel::CancelToken;
 use makima_agent::manager::AgentIncarnation;
 use makima_agent::state::StateAccess;
 use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
+use makima_agent::types::decode_ask_answer;
 use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, SessionRef};
 use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::agent_errors::INVOCATION_EXPIRED;
@@ -819,22 +820,30 @@ impl UserData for LuaCtx {
             };
             let guard = rx.lock().await;
             try_pair!(validate_task_origin(&lua, origin.as_ref(), false));
+            let ask_id = MakimaId::generate().to_string();
             if let Err(e) = agent.event_tx.send(AgentEvent::Question {
                 id: agent.tool_use_id.clone().unwrap_or_default(),
+                ask_id: ask_id.clone(),
                 questions: questions_value,
             }) {
                 return Ok((None, Some(e.to_string())));
             }
-            let answer = agent.cancel.race(guard.recv_async()).await;
-            drop(guard);
-            try_pair!(validate_task_origin(&lua, origin.as_ref(), false));
-            match answer {
-                Ok(Ok(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
-                    Ok(payload) => Ok((Some(lua.to_value(&payload)?), None)),
-                    Err(e) => Ok((None, Some(format!("invalid question response: {e}")))),
-                },
-                Ok(Err(_)) => Ok((None, Some("question channel closed".to_string()))),
-                Err(_) => Ok((None, Some("cancelled".to_string()))),
+            loop {
+                let answer = agent.cancel.race(guard.recv_async()).await;
+                try_pair!(validate_task_origin(&lua, origin.as_ref(), false));
+                let raw = match answer {
+                    Ok(Ok(raw)) => raw,
+                    Ok(Err(_)) => return Ok((None, Some("question channel closed".to_string()))),
+                    Err(_) => return Ok((None, Some("cancelled".to_string()))),
+                };
+                if let Some((answered_ask, payload)) = decode_ask_answer(&raw)
+                    && answered_ask == ask_id
+                {
+                    return match serde_json::from_str::<serde_json::Value>(payload) {
+                        Ok(payload) => Ok((Some(lua.to_value(&payload)?), None)),
+                        Err(e) => Ok((None, Some(format!("invalid question response: {e}")))),
+                    };
+                }
             }
         });
 

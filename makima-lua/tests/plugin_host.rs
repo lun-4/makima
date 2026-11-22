@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_lock::Mutex;
+
 use crossterm::event::{KeyCode, KeyModifiers};
 use makima_agent::agent::tool_dispatch;
 use makima_agent::context::RootContext;
@@ -18,10 +20,12 @@ use makima_agent::tools::{
     BoxFuture, CallOrigin, DescriptionContext, ExecFuture, FILE_TRUNCATED_MARKER, HeaderFuture,
     HeaderResult, ParseError, QuestionMode, Tool, ToolAudience, ToolContext, ToolExecResult,
     ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
-    format_line_truncated_marker, timeout_annotation,
+    format_line_truncated_marker, test_support::stub_ctx_with, timeout_annotation,
 };
+use makima_agent::types::encode_ask_answer;
 use makima_agent::{
-    AgentMode, CallScope, CancelToken, Instructions, SessionMailbox, SharedBuf, ToolOutput,
+    AgentEvent, AgentMode, CallScope, CancelToken, EventSender, Instructions, SessionMailbox,
+    SharedBuf, ToolOutput,
 };
 use makima_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use makima_config::{
@@ -47,6 +51,10 @@ mod common;
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const QUESTION_ANSWERS: &str = r#"{"answers":[["a"],["x","y"]]}"#;
+const QUESTION_ANSWER_TEXT: &str = "Q1: a\nQ2: x, y";
+const QUESTION_DISMISSAL: &str = r#"{"dismissed":true}"#;
+const QUESTION_DISMISSED_TEXT: &str = "(question dismissed by user)";
 const PICKER_TITLE: &str = " Sessions ";
 const PICKER_COMMAND: &str = "/sessions";
 const PICKER_MATCH_TITLE: &str = "Orchid";
@@ -5828,59 +5836,34 @@ fn call_tool_resolves_lua_tool_and_reports_unknown() {
     host.unload("echo_plugin").unwrap();
 }
 
-#[test]
-fn question_tool_elicits_from_the_host_in_elicitation_mode() {
+#[test_case::test_case(QUESTION_ANSWERS, QUESTION_ANSWER_TEXT; "answered")]
+#[test_case::test_case(QUESTION_DISMISSAL, QUESTION_DISMISSED_TEXT; "dismissed")]
+fn question_tool_uses_the_host_reply(payload: &str, expected: &str) {
     let (reg, _host) = builtins_host();
-
     let input = json!({
         "questions": [
             { "question": "Pick one", "options": [{ "label": "a" }, { "label": "b" }] },
             { "question": "Pick many", "multiSelect": true, "options": [{ "label": "x" }, { "label": "y" }] },
         ]
     });
-
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (event_tx, _event_rx) = flume::unbounded::<makima_agent::Envelope>();
-    let mut ctx = makima_agent::tools::test_support::stub_ctx_with(
-        &makima_agent::AgentMode::Build,
-        Some(&makima_agent::EventSender::new(event_tx)),
-        None,
-    );
+    let (answer_tx, answer_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::unbounded();
+    let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx)), None);
     ctx.question_mode = QuestionMode::Elicitation;
-    ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
-    answer_tx
-        .send(r#"{"answers": [["a"], ["x", "y"]]}"#.to_string())
-        .unwrap();
-
-    let out = exec_with_ctx(&reg, "question", input, &ctx).unwrap();
-    assert_eq!(out, "Q1: a\nQ2: x, y");
-}
-
-#[test]
-fn question_tool_dismissed_by_the_host() {
-    let (reg, _host) = builtins_host();
-
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (event_tx, _event_rx) = flume::unbounded::<makima_agent::Envelope>();
-    let mut ctx = makima_agent::tools::test_support::stub_ctx_with(
-        &makima_agent::AgentMode::Build,
-        Some(&makima_agent::EventSender::new(event_tx)),
-        None,
-    );
-    ctx.question_mode = QuestionMode::Elicitation;
-    ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
-    answer_tx
-        .send(r#"{"dismissed": true}"#.to_string())
-        .unwrap();
-
-    let out = exec_with_ctx(
-        &reg,
-        "question",
-        json!({ "questions": [{ "question": "Pick one" }] }),
-        &ctx,
-    )
-    .unwrap();
-    assert_eq!(out, "(question dismissed by user)");
+    ctx.user_response_rx = Some(Arc::new(Mutex::new(answer_rx)));
+    let invocation = reg.get("question").unwrap().tool.parse(&input).unwrap();
+    let (result, ()) = smol::block_on(smol::future::zip(invocation.execute(&ctx), async {
+        let event = smol::future::or(async { event_rx.recv_async().await.unwrap() }, async {
+            smol::Timer::after(CANCEL_TEST_TIMEOUT).await;
+            panic!("tool did not ask a question");
+        })
+        .await;
+        let AgentEvent::Question { ask_id, .. } = event.event else {
+            panic!("expected a question, got {:?}", event.event);
+        };
+        answer_tx.send(encode_ask_answer(&ask_id, payload)).unwrap();
+    }));
+    assert_eq!(result.output.unwrap().as_text(), expected);
 }
 
 #[test]

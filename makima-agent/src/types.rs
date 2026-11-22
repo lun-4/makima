@@ -20,6 +20,15 @@ use strum::Display;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 const CHECKPOINT_FAILED_PREFIX: &str = "failed to checkpoint completed turn";
+const ASK_ANSWER_SEPARATOR: char = '\u{1f}';
+
+pub fn encode_ask_answer(ask_id: &str, payload: &str) -> String {
+    format!("{ask_id}{ASK_ANSWER_SEPARATOR}{payload}")
+}
+
+pub fn decode_ask_answer(raw: &str) -> Option<(&str, &str)> {
+    raw.split_once(ASK_ANSWER_SEPARATOR)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -880,6 +889,7 @@ pub enum AgentEvent {
     /// host (e.g. an ACP elicitation form) instead of the makima TUI.
     Question {
         id: String,
+        ask_id: String,
         questions: serde_json::Value,
     },
     AuthRequired,
