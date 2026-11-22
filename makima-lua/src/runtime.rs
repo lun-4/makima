@@ -4112,6 +4112,7 @@ impl LuaRuntime {
         Some(PermissionScopes {
             scopes,
             force_prompt,
+            ignore_command_head_case: crate::api::env::uses_native_windows_shell(&self.lua, tool),
         })
     }
 

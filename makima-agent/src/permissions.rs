@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -362,6 +363,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &[&str],
         force_prompt: bool,
+        ignore_command_head_case: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules();
@@ -378,6 +380,7 @@ impl PermissionManager {
         };
 
         for scope in scopes {
+            let folded_scope = ignore_command_head_case.then(|| fold_command_head(scope));
             let mut has_allow = false;
             for r in session
                 .iter()
@@ -385,7 +388,9 @@ impl PermissionManager {
                 .chain(builtin.iter())
                 .chain(&plugin)
             {
-                if !rule_matches_tool(&r.tool, tool) || !rule_matches_scope(r, scope) {
+                if !rule_matches_tool(&r.tool, tool)
+                    || !rule_matches_scope(r, scope, folded_scope.as_deref())
+                {
                     continue;
                 }
                 match r.effect {
@@ -469,7 +474,7 @@ impl PermissionManager {
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path)
+        self.check_inner(tool, &[scope], false, false, plan_path)
     }
 
     pub fn check_multi(
@@ -479,7 +484,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path)
+        self.check_inner(tool, scopes, force_prompt, false, plan_path)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -658,16 +663,21 @@ impl PermissionManager {
             None => PermissionError::new(&tool_string, &scope_display()),
         };
 
-        let (pt, ps, force_prompt) =
-            match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
-                PermissionCheck::Allowed => return Ok(()),
-                PermissionCheck::Denied => return Err(deny(None)),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes,
-                    force_prompt,
-                } => (tool, scopes, force_prompt),
-            };
+        let (pt, ps, force_prompt) = match self.check_inner(
+            tool,
+            &scope_refs,
+            scopes.force_prompt,
+            scopes.ignore_command_head_case,
+            plan_path,
+        ) {
+            PermissionCheck::Allowed => return Ok(()),
+            PermissionCheck::Denied => return Err(deny(None)),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                force_prompt,
+            } => (tool, scopes, force_prompt),
+        };
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -676,7 +686,13 @@ impl PermissionManager {
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
+        let (t2, s2) = match self.check_inner(
+            &pt,
+            &refs,
+            force_prompt,
+            scopes.ignore_command_head_case,
+            plan_path,
+        ) {
             PermissionCheck::Allowed => return Ok(()),
             PermissionCheck::Denied => return Err(deny(None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
@@ -733,10 +749,28 @@ fn rule_matches_tool(rule_key: &ToolKey, actual: &ToolKey) -> bool {
     }
 }
 
-fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
-    match &rule.scope {
-        None => true,
-        Some(pattern) => scope_matches(pattern, scope),
+fn rule_matches_scope(rule: &PermissionRule, scope: &str, folded_scope: Option<&str>) -> bool {
+    let Some(pattern) = &rule.scope else {
+        return true;
+    };
+    if let Some(folded) = folded_scope
+        && !pattern.ends_with("/**")
+    {
+        return scope_matches(&fold_command_head(pattern), folded);
+    }
+    scope_matches(pattern, scope)
+}
+
+fn fold_command_head(command: &str) -> Cow<'_, str> {
+    let head_end = command
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(command.len());
+    if command[..head_end].bytes().any(|b| b.is_ascii_uppercase()) {
+        let mut folded = command.to_owned();
+        folded[..head_end].make_ascii_lowercase();
+        Cow::Owned(folded)
+    } else {
+        Cow::Borrowed(command)
     }
 }
 
@@ -1308,6 +1342,28 @@ mod tests {
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
+    }
+
+    #[test_case("Echo Ready", false, true => DENIED ; "native_head_matches_deny")]
+    #[test_case("Echo ready", false, true => ALLOWED ; "native_arguments_keep_case")]
+    #[test_case("Echo Ready", true, true => DENIED ; "forced_prompt_keeps_deny")]
+    #[test_case("Echo Ready", false, false => ALLOWED ; "bash_heads_keep_case")]
+    fn command_head_case_respects_shell_and_deny(
+        command: &str,
+        force_prompt: bool,
+        ignore_command_head_case: bool,
+    ) -> &'static str {
+        let mgr = mgr_with(
+            make_config(vec![allow_rule("*"), deny_rule("ECHO Ready")]),
+            PathBuf::from(TEST_CWD),
+        );
+        outcome(mgr.check_inner(
+            &ToolKey::native(BASH_TOOL),
+            &[command],
+            force_prompt,
+            ignore_command_head_case,
+            None,
+        ))
     }
 
     #[test]

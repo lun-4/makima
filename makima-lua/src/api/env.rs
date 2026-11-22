@@ -102,6 +102,10 @@ fn shell(lua: &Lua) -> mlua::Result<&'static str> {
     Ok(resolved_shell(lua).name())
 }
 
+pub(crate) fn uses_native_windows_shell(lua: &Lua, tool: &str) -> bool {
+    tool == "bash" && matches!(resolved_shell(lua).name(), "cmd" | "powershell")
+}
+
 pub(crate) fn resolved_shell(lua: &Lua) -> ResolvedShell {
     lua.app_data_ref::<ResolvedShell>()
         .map(|shell| shell.clone())

@@ -1017,6 +1017,7 @@ async fn permission_prompt(
     let perm_scopes = PermissionScopes {
         scopes,
         force_prompt,
+        ignore_command_head_case: crate::api::env::uses_native_windows_shell(&lua, &tool),
     };
     let result = tctx
         .permissions

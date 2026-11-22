@@ -180,6 +180,7 @@ impl Future for HeaderFuture {
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
     pub force_prompt: bool,
+    pub ignore_command_head_case: bool,
 }
 
 impl PermissionScopes {
@@ -187,6 +188,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: false,
+            ignore_command_head_case: false,
         }
     }
 
@@ -194,6 +196,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: true,
+            ignore_command_head_case: false,
         }
     }
 }

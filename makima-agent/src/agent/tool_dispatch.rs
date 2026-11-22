@@ -1020,7 +1020,7 @@ async fn enforce_permission(
                     .into_iter()
                     .map(|scope| ctx.resolve_path(&scope).unwrap_or(scope))
                     .collect(),
-                force_prompt: scopes.force_prompt,
+                ..scopes
             }
         } else {
             scopes
