@@ -2736,7 +2736,7 @@ mod tests {
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::types::{ActorWorkIdentity, ActorWorkKind};
-    use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput};
+    use makima_agent::{AgentMode, DoneReason, EventSender, ModeId, ToolOutput};
     use makima_agent::{TurnCancellationReason, TurnOutcome};
     use makima_commands::TargetCapabilities;
     use makima_lua::orchestration::{OrchestrationServices, TurnCompletion};
@@ -2762,6 +2762,13 @@ mod tests {
     use super::*;
 
     const ELICITATION_METHOD: &str = "elicitation/create";
+    const ELICITATION_PROMPT: &str = "parked prompt";
+    const ELICITATION_PROMPT_ID: i64 = 41;
+    const NEXT_ELICITATION_PROMPT_ID: i64 = 42;
+    const QUESTION_BARRIER: &str = "question pump barrier";
+    const SESSION_CANCEL_METHOD: &str = "session/cancel";
+    const CANCELLED: &str = "cancelled";
+    const END_TURN: &str = "end_turn";
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
@@ -3731,9 +3738,7 @@ mod tests {
         const OLD_REPLY: &str = "previous reply";
         const RESTORED_PROMPT: &str = "interrupted prompt";
         const NEW_PROMPT: &str = "prompt after cancellation";
-        const END_TURN: &str = "end_turn";
         const NEXT_ANSWER: &str = "next answer";
-        const QUESTION_BARRIER: &str = "question pump barrier";
 
         smol::block_on(async {
             let directory = TempDir::new().unwrap();
@@ -3923,29 +3928,7 @@ mod tests {
                     assert_eq!(turns.next_text().await, NEW_PROMPT);
                     if let Some((events, old_id, answers, queued)) = questions {
                         events.send_envelope(queued).unwrap();
-                        events
-                            .send(AgentEvent::TextDelta {
-                                text: QUESTION_BARRIER.into(),
-                            })
-                            .unwrap();
-                        within(
-                            async {
-                                loop {
-                                    let frame = out_rx.recv_async().await.unwrap();
-                                    assert_ne!(
-                                        frame["method"], ELICITATION_METHOD,
-                                        "stale elicitation: {frame}"
-                                    );
-                                    if frame["params"]["update"]["content"]["text"]
-                                        == QUESTION_BARRIER
-                                    {
-                                        break;
-                                    }
-                                }
-                            },
-                            "ACP did not drain the queued question",
-                        )
-                        .await;
+                        assert_no_elicitation_before_barrier(&events, &out_rx).await;
                         events
                             .send_envelope(test_question(turns.latest().turn_id()))
                             .unwrap();
@@ -6148,15 +6131,6 @@ mod tests {
         });
     }
 
-    #[test_case(serde_json::json!({"action": "accept", "content": {"q1": "a", "q2": ["x", "y"]}}), r#"{"answers":[["a"],["x","y"]]}"#; "accepted")]
-    #[test_case(serde_json::json!({"nonsense": true}), ELICITATION_DISMISSED; "malformed")]
-    fn decodes_elicitation_answer(result: Value, expected: &str) {
-        assert_eq!(
-            elicitation_answer(&serde_json::json!({"result": result})),
-            expected
-        );
-    }
-
     /// Closing a session forwards what it already emitted: a background
     /// child's last update is still in the channel when the session closes.
     #[test]
@@ -6243,49 +6217,236 @@ mod tests {
         .await
     }
 
-    #[test_case(())]
-    fn malformed_question_in_elicitation_mode_unblocks_the_tool(_: ()) {
-        smol::block_on(async {
-            const PROMPT: &str = "parked prompt";
-            let (mut srv, answers, out_rx, turns) = server_awaiting_answer();
-            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
-            handle_prompt(
-                &mut srv,
-                &prompt_request(&session_id, PROMPT, false),
-                &RequestId::Number(ANSWERED_ID),
-            )
-            .await
+    async fn assert_no_elicitation_before_barrier(events: &EventSender, out: &Receiver<Value>) {
+        events
+            .send(AgentEvent::TextDelta {
+                text: QUESTION_BARRIER.into(),
+            })
             .unwrap();
-            turns.next().await;
+        within(
+            async {
+                loop {
+                    let frame = out.recv_async().await.unwrap();
+                    assert_ne!(
+                        frame["method"], ELICITATION_METHOD,
+                        "unexpected elicitation: {frame}"
+                    );
+                    if frame["params"]["update"]["content"]["text"] == QUESTION_BARRIER {
+                        break;
+                    }
+                }
+            },
+            "ACP did not drain the queued question",
+        )
+        .await;
+    }
+
+    async fn server_with_parked_elicitation_turn()
+    -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
+        let (mut srv, answers, out, turns) = server_awaiting_answer();
+        let session = srv.session.as_mut().unwrap();
+        session.pending.lock().unwrap().permissions.clear();
+        session.event_pump = start_event_pump(
+            session.handle.event_rx.clone(),
+            session.handle.session_id.clone(),
+            srv.out_tx.clone(),
+            Arc::clone(&session.pending),
+            true,
+            session.handle.answer_tx.clone(),
+            session.coordinator.as_ref().unwrap().read(),
+            None,
+            PUMP_TRUSTED,
+            None,
+            test_observer(),
+        );
+        park_elicitation_turn(&mut srv, &turns, ELICITATION_PROMPT_ID).await;
+        (srv, answers, out, turns)
+    }
+
+    async fn park_elicitation_turn(srv: &mut Server, turns: &RootTurns, id: i64) {
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        handle_prompt(
+            srv,
+            &prompt_request(&session_id, ELICITATION_PROMPT, false),
+            &RequestId::Number(id),
+        )
+        .await
+        .unwrap();
+        turns.next().await;
+    }
+
+    fn parked_question(session: &SessionState, turns: &RootTurns) -> Envelope {
+        let mut question = test_question(turns.latest().turn_id());
+        let identity = question.identity.as_mut().unwrap();
+        identity.agent_id = session.command_root.target.id();
+        identity.presentation_id = session
+            .pending
+            .lock()
+            .unwrap()
+            .operation
+            .as_ref()
+            .unwrap()
+            .run_id
+            .unwrap();
+        question
+    }
+
+    async fn request_elicitation(srv: &Server, out: &Receiver<Value>, turns: &RootTurns) -> i64 {
+        let session = srv.session.as_ref().unwrap();
+        session
+            .command_root
+            .template
+            .event_tx
+            .send_envelope(parked_question(session, turns))
+            .unwrap();
+        next_elicitation(out).await
+    }
+
+    fn cancel_elicitation_turn(srv: &Server) {
+        let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+        handle_notification(
+            srv,
+            SESSION_CANCEL_METHOD,
+            &serde_json::json!({"params": {"sessionId": session_id}}),
+        );
+    }
+
+    #[test]
+    fn close_dismisses_outstanding_elicitation() {
+        smol::block_on(async {
+            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            request_elicitation(&srv, &out, &turns).await;
             let session = srv.session.as_ref().unwrap();
-            let (events, event_rx) = flume::unbounded();
-            let pump = start_event_pump(
-                event_rx,
-                session.handle.session_id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(&session.pending),
-                true,
-                session.handle.answer_tx.clone(),
-                session.coordinator.as_ref().unwrap().read(),
-                None,
-                PUMP_TRUSTED,
-                None,
-                test_observer(),
+
+            within(
+                smol::future::zip(finish_in_flight(session), async {
+                    assert_eq!(answers.recv_async().await.unwrap(), ELICITATION_DISMISSED);
+                    turns.release();
+                }),
+                "client close did not unblock the turn",
+            )
+            .await;
+
+            assert!(session.pending.lock().unwrap().elicitation.is_none());
+            assert_eq!(
+                prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
+                END_TURN
             );
-            let mut question = test_question(turns.latest().turn_id());
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn cancel_dismisses_pending_elicitation_and_rejects_late_answer() {
+        smol::block_on(async {
+            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let id = request_elicitation(&srv, &out, &turns).await;
+            let session = srv.session.as_ref().unwrap();
+
+            cancel_elicitation_turn(&srv);
+            assert!(session.pending.lock().unwrap().elicitation.is_none());
+            assert_eq!(
+                prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
+                CANCELLED
+            );
+
+            park_elicitation_turn(&mut srv, &turns, NEXT_ELICITATION_PROMPT_ID).await;
+            let next_id = request_elicitation(&srv, &out, &turns).await;
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({"id": id, "result": {"action": "accept", "content": {"q1": "late answer"}}}),
+            );
+            assert!(
+                answers.is_empty(),
+                "cancellation and the late reply must not enqueue an answer"
+            );
+            assert_eq!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .elicitation
+                    .as_ref()
+                    .unwrap()
+                    .request_id,
+                next_id
+            );
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn cancelled_operation_dismisses_late_question() {
+        smol::block_on(async {
+            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let session = srv.session.as_ref().unwrap();
+            let question = parked_question(session, &turns);
+            let events = session.command_root.template.event_tx.clone();
+
+            cancel_elicitation_turn(&srv);
+            assert_eq!(
+                prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
+                CANCELLED
+            );
+            park_elicitation_turn(&mut srv, &turns, NEXT_ELICITATION_PROMPT_ID).await;
+            events.send_envelope(question).unwrap();
+            assert_no_elicitation_before_barrier(&events, &out).await;
+
+            assert!(
+                srv.session
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .elicitation
+                    .is_none()
+            );
+            assert!(
+                answers.is_empty(),
+                "a stale question must not answer the next turn"
+            );
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test_case(serde_json::json!({"action": "accept", "content": {"q1": "a", "q2": ["x", "y"]}}), r#"{"answers":[["a"],["x","y"]]}"#; "accepted")]
+    #[test_case(serde_json::json!({"nonsense": true}), ELICITATION_DISMISSED; "malformed")]
+    fn elicitation_answer_is_routed_by_id_and_decoded(result: Value, expected: &str) {
+        smol::block_on(async {
+            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let id = request_elicitation(&srv, &out, &turns).await;
+            let reply = |id| serde_json::json!({"id": id, "result": result});
+
+            handle_incoming_response(&srv, &reply(id + 1));
+            assert!(
+                answers.is_empty(),
+                "an unknown id must not answer the pending question"
+            );
+            handle_incoming_response(&srv, &reply(id));
+            assert_eq!(answers.try_recv().unwrap(), expected);
+            handle_incoming_response(&srv, &reply(id));
+            assert!(answers.is_empty(), "a replayed answer must be ignored");
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn malformed_question_in_elicitation_mode_unblocks_the_tool() {
+        smol::block_on(async {
+            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let session = srv.session.as_ref().unwrap();
+            let events = &session.command_root.template.event_tx;
+            let mut question = parked_question(session, &turns);
             if let AgentEvent::Question { questions, .. } = &mut question.event {
                 *questions = Value::Null;
             }
-            events.send(question).unwrap();
-            assert_eq!(
-                within(answers.recv_async(), "question was not dismissed")
-                    .await
-                    .unwrap(),
-                ELICITATION_DISMISSED
-            );
-            assert!(out_rx.is_empty());
+            events.send_envelope(question).unwrap();
+            assert_no_elicitation_before_barrier(events, &out).await;
+            assert_eq!(answers.try_recv().unwrap(), ELICITATION_DISMISSED);
             close_session(&mut srv).await;
-            pump.finish().await;
         });
     }
 
