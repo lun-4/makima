@@ -814,17 +814,17 @@ impl UserData for LuaCtx {
                     Ok(v) => v,
                     Err(_) => return Ok((None, Some("invalid questions".to_string()))),
                 };
+            let Some(rx) = &agent.user_response_rx else {
+                return Ok((None, Some("no user response channel".to_string())));
+            };
+            let guard = rx.lock().await;
+            try_pair!(validate_task_origin(&lua, origin.as_ref(), false));
             if let Err(e) = agent.event_tx.send(AgentEvent::Question {
                 id: agent.tool_use_id.clone().unwrap_or_default(),
                 questions: questions_value,
             }) {
                 return Ok((None, Some(e.to_string())));
             }
-            let Some(rx) = &agent.user_response_rx else {
-                return Ok((None, Some("no user response channel".to_string())));
-            };
-            let guard = rx.lock().await;
-            try_pair!(validate_task_origin(&lua, origin.as_ref(), false));
             let answer = agent.cancel.race(guard.recv_async()).await;
             drop(guard);
             try_pair!(validate_task_origin(&lua, origin.as_ref(), false));

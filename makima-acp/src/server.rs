@@ -34,7 +34,8 @@ use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
 use makima_agent::{
-    AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError, TurnId, TurnTicket,
+    AgentId, AgentInput, AgentRef, Envelope, ImageMediaType, ImageSource, ModeError, TurnId,
+    TurnTicket,
 };
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
@@ -62,6 +63,7 @@ use tracing::{debug, info, warn};
 
 use crate::{AcpParams, methods, permissions, translate};
 
+const ELICITATION_DISMISSED: &str = r#"{"dismissed":true}"#;
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 const CANCELLATION_IN_PROGRESS_CODE: i32 = -32001;
 const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
@@ -111,6 +113,11 @@ impl PendingOperation {
     }
 }
 
+struct PendingElicitation {
+    request_id: i64,
+    turn_id: TurnId,
+}
+
 /// What the client still owes us. Subagents have independent answer channels,
 /// so more than one permission request can be outstanding.
 #[derive(Default)]
@@ -122,7 +129,8 @@ struct Pending {
     continuing_root: BTreeSet<TurnId>,
     cancelling_continuations: Vec<TurnTicket>,
     permissions: HashMap<i64, (String, Sender<String>)>,
-    elicitation: Option<i64>,
+    elicitation: Option<PendingElicitation>,
+    question_root: Option<AgentRef>,
     /// The client closed its input, so no answer to a new ask can arrive.
     input_closed: bool,
     /// Counts `session/cancel`s, so a prompt dispatching beside a turn, which
@@ -163,9 +171,20 @@ impl Pending {
         self.input_closed || self.cancellation_in_progress()
     }
 
+    fn with_live_question_turn<T>(
+        &self,
+        turn_id: TurnId,
+        deliver: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.question_root
+            .as_ref()?
+            .actor()
+            .ok()?
+            .with_live_turn(turn_id, deliver)
+    }
+
     fn settle(&mut self) -> PendingOperation {
         self.permissions.clear();
-        self.elicitation = None;
         self.settled.notify(usize::MAX);
         let settled = self.operation.take().unwrap();
         self.operation = self.queued.pop_front();
@@ -947,15 +966,20 @@ async fn start_mcp(
 /// The client closed its input, so the asks it can no longer answer are
 /// refused, now and from here on.
 fn refuse_asks(session: &SessionState) {
-    let (permission_answers, elicitation) = {
+    let permission_answers = {
         let mut pending = session.pending.lock().unwrap();
         pending.input_closed = true;
-        (
-            std::mem::take(&mut pending.permissions),
-            pending.elicitation.take(),
-        )
+        if let Some(elicitation) = pending.elicitation.take() {
+            let _ = pending.with_live_question_turn(elicitation.turn_id, || {
+                let _ = session
+                    .handle
+                    .answer_tx
+                    .try_send(ELICITATION_DISMISSED.into());
+            });
+        }
+        std::mem::take(&mut pending.permissions)
     };
-    answer_cancelled_requests(&session.handle, permission_answers, elicitation);
+    deny_permissions(permission_answers);
 }
 
 /// The client closed its input but still reads the output: the work in
@@ -990,19 +1014,16 @@ async fn close_session(srv: &mut Server) {
     srv.lua_event_handle.clear_orchestration_services();
     // The event pump dies with the session, so the requests it owed answers to
     // have to be answered here or the client waits on them forever.
-    let (operations, permission_answers, elicitation) = {
+    let (operations, permission_answers) = {
         let mut pending = state.pending.lock().unwrap();
-        (
-            pending.take_all(),
-            std::mem::take(&mut pending.permissions),
-            pending.elicitation.take(),
-        )
+        pending.elicitation = None;
+        (pending.take_all(), std::mem::take(&mut pending.permissions))
     };
     for request_id in operations.iter().flat_map(PendingOperation::requests) {
         respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
     }
     state.handle.manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
-    answer_cancelled_requests(&state.handle, permission_answers, elicitation);
+    deny_permissions(permission_answers);
     state.handle.manager.journal().invalidate_state_access();
     state.handle.task.cancel().await;
     if let Some(coordinator) = state.coordinator.take()
@@ -1246,6 +1267,7 @@ async fn install_session_with_lock(
         .install_orchestration_services(orchestration.clone());
     let pending = Arc::new(Mutex::new(Pending {
         continuing_root,
+        question_root: Some(trusted_root.target.clone()),
         ..Pending::default()
     }));
     let session_id = SessionId::from(handle.session_id.to_string());
@@ -2140,18 +2162,9 @@ fn effective_session_cwd(
     if cwd.is_absolute() { cwd } else { client }.to_path_buf()
 }
 
-fn answer_cancelled_requests(
-    handle: &InteractiveHandle,
-    permission_answers: HashMap<i64, (String, Sender<String>)>,
-    elicitation: Option<i64>,
-) {
+fn deny_permissions(permission_answers: HashMap<i64, (String, Sender<String>)>) {
     for (request_id, answer_tx) in permission_answers.into_values() {
         let _ = answer_tx.send(TaggedAnswer::new(request_id, PermissionAnswer::Deny).encode());
-    }
-    if elicitation.is_some() {
-        let _ = handle
-            .answer_tx
-            .send(serde_json::json!({ "dismissed": true }).to_string());
     }
 }
 
@@ -2166,7 +2179,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                 return;
             };
             if let Ok(session) = validate_session(srv, requested) {
-                let (cancellations, permission_answers, elicitation) = {
+                let (cancellations, permission_answers) = {
                     let mut pending = session.pending.lock().unwrap();
                     let pending = &mut *pending;
                     pending.cancels += 1;
@@ -2202,10 +2215,10 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                         return;
                     }
                     let permission_answers = std::mem::take(&mut pending.permissions);
-                    let elicitation = pending.elicitation.take();
-                    (cancellations, permission_answers, elicitation)
+                    pending.elicitation = None;
+                    (cancellations, permission_answers)
                 };
-                answer_cancelled_requests(&session.handle, permission_answers, elicitation);
+                deny_permissions(permission_answers);
                 for cancellation in cancellations {
                     cancellation.cancel();
                 }
@@ -2226,12 +2239,15 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
     let answer = {
         let mut pending = session.pending.lock().unwrap();
         if let Some(id) = id_num
-            && pending
+            && let Some(elicitation) = pending
                 .elicitation
-                .take_if(|pending| *pending == id)
-                .is_some()
+                .take_if(|elicitation| elicitation.request_id == id)
         {
-            Some((session.handle.answer_tx.clone(), elicitation_answer(raw)))
+            let answer = elicitation_answer(raw);
+            let _ = pending.with_live_question_turn(elicitation.turn_id, || {
+                let _ = session.handle.answer_tx.try_send(answer);
+            });
+            None
         } else if let Some(id) = id_num
             && let Some((request_id, answer_tx)) = pending.permissions.remove(&id)
         {
@@ -2257,7 +2273,7 @@ fn elicitation_answer(raw: &Value) -> String {
         .map(|result| serde_json::from_value::<CreateElicitationResponse>(result.clone()))
     {
         Some(Ok(resp)) => crate::elicitation::response_payload(resp),
-        _ => serde_json::json!({ "dismissed": true }).to_string(),
+        _ => ELICITATION_DISMISSED.into(),
     }
 }
 
@@ -2381,6 +2397,7 @@ fn start_event_pump(
             // ACP fences on the presentation the actor stamped, which is the
             // same identity the rest of the frontend uses.
             let run_id = envelope.presentation().unwrap_or_default();
+            let turn_id = envelope.identity.and_then(|identity| identity.turn_id());
             let (event, subagent) = (envelope.event, envelope.subagent);
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
@@ -2492,50 +2509,63 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Question { id, questions } => {
-                    if elicitation
-                        && let Some(request) = crate::elicitation::build_form(&questions, &sid, &id)
+                    let mut pending = pending.lock().unwrap();
+                    if let Some(turn_id) = turn_id
+                        && !pending.operation.as_ref().is_some_and(|operation| {
+                            operation.cancelling && operation.run_id == Some(run_id)
+                        })
+                        && !pending
+                            .cancelling_continuations
+                            .iter()
+                            .any(|ticket| ticket.turn_id() == turn_id)
                     {
-                        let request = AgentRequest::CreateElicitationRequest(request);
-                        let request_id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-                        let should_send = {
-                            let mut pending = pending.lock().unwrap();
-                            if pending.refuses_asks() {
-                                false
-                            } else {
-                                pending.elicitation = Some(request_id);
-                                true
-                            }
-                        };
-                        if should_send {
-                            send(
-                                &out_tx,
-                                Request {
-                                    id: RequestId::Number(request_id),
-                                    method: Arc::from(request.method()),
-                                    params: Some(request),
-                                },
-                            );
-                        } else {
-                            let _ = answer_tx
-                                .send(serde_json::json!({ "dismissed": true }).to_string());
+                        let form = (elicitation && !pending.input_closed)
+                            .then(|| crate::elicitation::build_form(&questions, &sid, &id))
+                            .flatten();
+                        let request_id = pending
+                            .with_live_question_turn(turn_id, || {
+                                if let Some(form) = form {
+                                    let request = AgentRequest::CreateElicitationRequest(form);
+                                    let outgoing_id =
+                                        NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                                    send(
+                                        &out_tx,
+                                        Request {
+                                            id: RequestId::Number(outgoing_id),
+                                            method: Arc::from(request.method()),
+                                            params: Some(request),
+                                        },
+                                    );
+                                    Some(outgoing_id)
+                                } else {
+                                    let _ = answer_tx.try_send(ELICITATION_DISMISSED.into());
+                                    None
+                                }
+                            })
+                            .flatten();
+                        if let Some(request_id) = request_id {
+                            pending.elicitation = Some(PendingElicitation {
+                                request_id,
+                                turn_id,
+                            });
                         }
-                    } else {
-                        // A question we cannot render as a form (non-array
-                        // input, or a host without elicitation) still has a
-                        // tool waiting on `user_response_rx`; dismiss it so
-                        // the turn fails gracefully instead of hanging.
-                        let _ =
-                            answer_tx.send(serde_json::json!({ "dismissed": true }).to_string());
                     }
                     continue;
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
-                    pending
-                        .lock()
-                        .unwrap()
-                        .continuing_root
-                        .remove(&outcome.turn_id());
+                    {
+                        let mut pending = pending.lock().unwrap();
+                        let turn_id = outcome.turn_id();
+                        pending.continuing_root.remove(&turn_id);
+                        if pending
+                            .elicitation
+                            .as_ref()
+                            .is_some_and(|elicitation| elicitation.turn_id == turn_id)
+                        {
+                            pending.elicitation = None;
+                        }
+                    }
                     finish_primary_run(&pending, run_id, |request_id| match &outcome {
                         makima_agent::TurnOutcome::Completed { reason, .. } => {
                             let resp = PromptResponse::new(translate::map_done_reason(*reason));
@@ -2582,6 +2612,7 @@ fn start_event_pump(
         }
         let unanswered = {
             let mut pending = pending.lock().unwrap();
+            pending.elicitation = None;
             if pending
                 .operation
                 .as_ref()
@@ -2704,6 +2735,7 @@ mod tests {
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
+    use makima_agent::types::{ActorWorkIdentity, ActorWorkKind};
     use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput};
     use makima_agent::{TurnCancellationReason, TurnOutcome};
     use makima_commands::TargetCapabilities;
@@ -2729,6 +2761,7 @@ mod tests {
 
     use super::*;
 
+    const ELICITATION_METHOD: &str = "elicitation/create";
     const ANSWERED_ID: i64 = 1001;
     const UNKNOWN_ID: i64 = 1002;
     const DISCOVERED_SPEC: &str = "openrouter/discovered-model";
@@ -3683,12 +3716,14 @@ mod tests {
     enum RestoredRootScenario {
         CancelWhileQueued,
         CancelWhileParked,
+        CancelWhileAsking,
         EmitImmediately,
     }
 
     #[test_case(RestoredRootScenario::CancelWhileQueued; "cancel_queued_root_before_provider_starts")]
     #[test_case(RestoredRootScenario::CancelWhileParked; "cancel_parked_root_before_prompt")]
     #[test_case(RestoredRootScenario::EmitImmediately; "replay_before_immediate_resumed_output")]
+    #[test_case(RestoredRootScenario::CancelWhileAsking; "cancel_restored_question_before_prompt")]
     fn acp_restored_root_protocol(scenario: RestoredRootScenario) {
         const LOAD_ID: i64 = 1;
         const PROMPT_ID: i64 = 2;
@@ -3697,6 +3732,8 @@ mod tests {
         const RESTORED_PROMPT: &str = "interrupted prompt";
         const NEW_PROMPT: &str = "prompt after cancellation";
         const END_TURN: &str = "end_turn";
+        const NEXT_ANSWER: &str = "next answer";
+        const QUESTION_BARRIER: &str = "question pump barrier";
 
         smol::block_on(async {
             let directory = TempDir::new().unwrap();
@@ -3748,7 +3785,7 @@ mod tests {
                 out_tx,
                 catalog: ModelCatalog::default(),
                 session: None,
-                elicitation: false,
+                elicitation: scenario == RestoredRootScenario::CancelWhileAsking,
                 supports_boolean: false,
                 lua_event_handle: params.lua_event_handle.clone(),
                 dispatch: None,
@@ -3771,7 +3808,8 @@ mod tests {
 
             match scenario {
                 RestoredRootScenario::CancelWhileQueued
-                | RestoredRootScenario::CancelWhileParked => {
+                | RestoredRootScenario::CancelWhileParked
+                | RestoredRootScenario::CancelWhileAsking => {
                     let response = prompt_terminal(&out_rx, LOAD_ID).await;
                     assert!(response.get("result").is_some(), "{response}");
                     let root = server
@@ -3800,6 +3838,32 @@ mod tests {
                         Some(reply)
                     } else {
                         assert_eq!(turns.next_text().await, RESTORED_PROMPT);
+                        None
+                    };
+                    let questions = if scenario == RestoredRootScenario::CancelWhileAsking {
+                        let events = server
+                            .session
+                            .as_ref()
+                            .unwrap()
+                            .command_root
+                            .template
+                            .event_tx
+                            .clone();
+                        let answers = Arc::clone(
+                            server
+                                .session
+                                .as_ref()
+                                .unwrap()
+                                .command_root
+                                .template
+                                .user_response_rx
+                                .as_ref()
+                                .unwrap(),
+                        );
+                        events.send_envelope(test_question(turn)).unwrap();
+                        let old_id = next_elicitation(&out_rx).await;
+                        Some((events, old_id, answers, test_question(turn)))
+                    } else {
                         None
                     };
                     let ticket = root.turn_ticket(turn).unwrap();
@@ -3857,6 +3921,49 @@ mod tests {
                         .unwrap();
                     }
                     assert_eq!(turns.next_text().await, NEW_PROMPT);
+                    if let Some((events, old_id, answers, queued)) = questions {
+                        events.send_envelope(queued).unwrap();
+                        events
+                            .send(AgentEvent::TextDelta {
+                                text: QUESTION_BARRIER.into(),
+                            })
+                            .unwrap();
+                        within(
+                            async {
+                                loop {
+                                    let frame = out_rx.recv_async().await.unwrap();
+                                    assert_ne!(
+                                        frame["method"], ELICITATION_METHOD,
+                                        "stale elicitation: {frame}"
+                                    );
+                                    if frame["params"]["update"]["content"]["text"]
+                                        == QUESTION_BARRIER
+                                    {
+                                        break;
+                                    }
+                                }
+                            },
+                            "ACP did not drain the queued question",
+                        )
+                        .await;
+                        events
+                            .send_envelope(test_question(turns.latest().turn_id()))
+                            .unwrap();
+                        let next_id = next_elicitation(&out_rx).await;
+                        for (id, answer) in [(old_id, OLD_REPLY), (next_id, NEXT_ANSWER)] {
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": { "action": "accept", "content": { "q1": answer } },
+                            });
+                            handle_line(&mut server, &response.to_string(), &params).await;
+                        }
+                        let answers = answers.lock().await;
+                        assert_eq!(
+                            answers.try_recv().unwrap(),
+                            serde_json::json!({"answers": [[NEXT_ANSWER]]}).to_string()
+                        );
+                        assert!(answers.is_empty());
+                    }
                     turns.release();
                     let response = prompt_terminal(&out_rx, PROMPT_ID).await;
                     assert_eq!(response["result"]["stopReason"], END_TURN, "{response}");
@@ -4405,6 +4512,7 @@ mod tests {
                 mcp: None,
                 pending: Arc::new(Mutex::new(Pending {
                     permissions: HashMap::from([(ANSWERED_ID, ("toolu_1".to_string(), answer_tx))]),
+                    question_root: Some(command_root.target.clone()),
                     ..Default::default()
                 })),
                 command_registry,
@@ -4737,27 +4845,6 @@ mod tests {
                 Some(TaggedAnswer::new("perm-id", PermissionAnswer::Deny).encode())
             );
             assert!(pending.lock().unwrap().permissions.is_empty());
-        });
-    }
-
-    #[test]
-    fn close_dismisses_outstanding_elicitation() {
-        smol::block_on(async {
-            let (mut srv, answer_rx, ..) = server_awaiting_answer();
-            let pending = Arc::clone(&srv.session.as_ref().unwrap().pending);
-            {
-                let mut pending = pending.lock().unwrap();
-                pending.permissions.clear();
-                pending.elicitation = Some(ANSWERED_ID);
-            }
-
-            close_session(&mut srv).await;
-
-            assert_eq!(
-                answer_rx.try_recv().ok(),
-                Some(r#"{"dismissed":true}"#.to_string())
-            );
-            assert!(pending.lock().unwrap().elicitation.is_none());
         });
     }
 
@@ -5479,40 +5566,6 @@ mod tests {
     }
 
     #[test]
-    fn cancel_dismisses_pending_elicitation_and_rejects_late_answer() {
-        let (srv, answer_rx, ..) = server_awaiting_answer();
-        let session = srv.session.as_ref().unwrap();
-        let mut pending = session.pending.lock().unwrap();
-        pending.permissions.clear();
-        pending.elicitation = Some(ANSWERED_ID);
-        pending.operation = Some(PendingOperation {
-            id: 1,
-            request_id: RequestId::Number(41),
-            kind: OperationKind::TestLocal,
-            run_id: None,
-            cancelling: false,
-            cancel: None,
-            joined: Vec::new(),
-        });
-        drop(pending);
-
-        handle_notification(
-            &srv,
-            "session/cancel",
-            &serde_json::json!({
-                "params": { "sessionId": session.handle.session_id.to_string() }
-            }),
-        );
-
-        assert_eq!(
-            answer_rx.try_recv().ok(),
-            Some(r#"{"dismissed":true}"#.to_string())
-        );
-        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
-        assert!(answer_rx.is_empty(), "the late answer must be ignored");
-    }
-
-    #[test]
     fn cancel_during_permission_allows_the_next_prompt() {
         smol::block_on(async {
             let (mut srv, answer_rx, out_rx, turns) = server_awaiting_answer();
@@ -6095,56 +6148,12 @@ mod tests {
         });
     }
 
-    #[test]
-    fn elicitation_answer_is_routed_by_id_and_decoded() {
-        let (srv, answer_rx, ..) = server_awaiting_answer();
-        {
-            let mut pending = srv.session.as_ref().unwrap().pending.lock().unwrap();
-            pending.permissions.clear();
-            pending.elicitation = Some(ANSWERED_ID);
-        }
-
-        handle_incoming_response(
-            &srv,
-            &serde_json::json!({
-                "id": ANSWERED_ID,
-                "result": {
-                    "action": "accept",
-                    "content": { "q1": "a", "q2": ["x", "y"] },
-                },
-            }),
-        );
+    #[test_case(serde_json::json!({"action": "accept", "content": {"q1": "a", "q2": ["x", "y"]}}), r#"{"answers":[["a"],["x","y"]]}"#; "accepted")]
+    #[test_case(serde_json::json!({"nonsense": true}), ELICITATION_DISMISSED; "malformed")]
+    fn decodes_elicitation_answer(result: Value, expected: &str) {
         assert_eq!(
-            answer_rx.try_recv().ok(),
-            Some(r#"{"answers":[["a"],["x","y"]]}"#.to_string())
-        );
-
-        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
-        assert!(
-            answer_rx.is_empty(),
-            "a replayed id cannot land on the next request"
-        );
-    }
-
-    #[test]
-    fn unparsable_elicitation_result_dismisses_instead_of_hanging() {
-        let (srv, answer_rx, ..) = server_awaiting_answer();
-        srv.session
-            .as_ref()
-            .unwrap()
-            .pending
-            .lock()
-            .unwrap()
-            .elicitation = Some(ANSWERED_ID);
-
-        handle_incoming_response(
-            &srv,
-            &serde_json::json!({ "id": ANSWERED_ID, "result": { "nonsense": true } }),
-        );
-        assert_eq!(
-            answer_rx.try_recv().ok(),
-            Some(r#"{"dismissed":true}"#.to_string()),
-            "a broken answer must still unblock the waiting tool"
+            elicitation_answer(&serde_json::json!({"result": result})),
+            expected
         );
     }
 
@@ -6194,104 +6203,90 @@ mod tests {
         drop(event_tx);
     }
 
-    #[test]
-    fn cancelled_operation_dismisses_late_question() {
-        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
-        let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, answer_rx) = flume::unbounded::<String>();
-        let pending = Arc::new(Mutex::new(Pending {
-            operation: Some(PendingOperation {
-                id: 1,
-                request_id: RequestId::Number(41),
-                kind: OperationKind::TestLocal,
-                run_id: None,
-                cancelling: true,
-                cancel: None,
-                joined: Vec::new(),
-            }),
-            ..Default::default()
-        }));
-        let session_id = SessionRef::from(MakimaId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
-
-        let pump = start_event_pump(
-            event_rx,
-            session_id,
-            out_tx,
-            Arc::clone(&pending),
-            true,
-            answer_tx,
-            coordinator.read(),
-            makima_storage::paths::home(),
-            PUMP_TRUSTED,
-            None,
-            test_observer(),
-        );
-        event_tx
-            .send(Envelope {
-                event: AgentEvent::Question {
-                    id: "t1".to_string(),
-                    questions: serde_json::json!([{
-                        "question": "Continue?",
-                        "header": "Confirm",
-                        "options": [{ "label": "Yes", "description": "Continue" }],
-                        "multiSelect": false
-                    }]),
-                },
-                subagent: None,
-                identity: None,
-            })
-            .unwrap();
-
-        smol::block_on(pump.finish());
-        assert_eq!(answer_rx.try_recv().unwrap(), r#"{"dismissed":true}"#);
-        assert!(out_rx.is_empty());
-        let state = pending.lock().unwrap();
-        assert!(state.elicitation.is_none());
-        assert!(state.operation.as_ref().unwrap().cancelling);
-        drop(state);
-        smol::block_on(coordinator.close()).unwrap();
+    fn question_identity(turn_id: TurnId) -> ActorWorkIdentity {
+        const QUESTION_RUN: u64 = 1;
+        ActorWorkIdentity::new(
+            AgentId::generate(),
+            ActorWorkKind::Turn {
+                operation_id: QUESTION_RUN,
+                turn_id,
+            },
+            QUESTION_RUN,
+        )
     }
 
-    #[test]
-    fn malformed_question_in_elicitation_mode_unblocks_the_tool() {
-        let (event_tx, event_rx) = flume::unbounded::<Envelope>();
-        let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, answer_rx) = flume::unbounded::<String>();
-        let pending = Arc::new(Mutex::new(Pending::default()));
-        let session_id = SessionRef::from(MakimaId::generate());
-        let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
+    fn test_question(turn_id: TurnId) -> Envelope {
+        const QUESTION_ID: &str = "question-tool";
+        const QUESTION_TEXT: &str = "Continue?";
+        Envelope {
+            event: AgentEvent::Question {
+                id: QUESTION_ID.into(),
+                questions: serde_json::json!([{ "question": QUESTION_TEXT }]),
+            },
+            subagent: None,
+            identity: Some(question_identity(turn_id)),
+        }
+    }
 
-        let pump = start_event_pump(
-            event_rx,
-            session_id,
-            out_tx,
-            Arc::clone(&pending),
-            true,
-            answer_tx,
-            coordinator.read(),
-            makima_storage::paths::home(),
-            PUMP_TRUSTED,
-            None,
-            test_observer(),
-        );
+    async fn next_elicitation(out: &Receiver<Value>) -> i64 {
+        within(
+            async {
+                loop {
+                    let message = out.recv_async().await.unwrap();
+                    if message["method"] == ELICITATION_METHOD {
+                        return message["id"].as_i64().unwrap();
+                    }
+                }
+            },
+            "ACP did not send an elicitation",
+        )
+        .await
+    }
 
-        event_tx
-            .send(Envelope {
-                event: AgentEvent::Question {
-                    id: "t1".to_string(),
-                    questions: serde_json::json!({ "not": "an array" }),
-                },
-                subagent: None,
-                identity: None,
-            })
+    #[test_case(())]
+    fn malformed_question_in_elicitation_mode_unblocks_the_tool(_: ()) {
+        smol::block_on(async {
+            const PROMPT: &str = "parked prompt";
+            let (mut srv, answers, out_rx, turns) = server_awaiting_answer();
+            let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
+            handle_prompt(
+                &mut srv,
+                &prompt_request(&session_id, PROMPT, false),
+                &RequestId::Number(ANSWERED_ID),
+            )
+            .await
             .unwrap();
-
-        smol::block_on(pump.finish());
-        assert_eq!(answer_rx.try_recv().unwrap(), r#"{"dismissed":true}"#);
-        assert!(out_rx.is_empty());
-        assert!(pending.lock().unwrap().elicitation.is_none());
-        smol::block_on(coordinator.close()).unwrap();
+            turns.next().await;
+            let session = srv.session.as_ref().unwrap();
+            let (events, event_rx) = flume::unbounded();
+            let pump = start_event_pump(
+                event_rx,
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(&session.pending),
+                true,
+                session.handle.answer_tx.clone(),
+                session.coordinator.as_ref().unwrap().read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+                test_observer(),
+            );
+            let mut question = test_question(turns.latest().turn_id());
+            if let AgentEvent::Question { questions, .. } = &mut question.event {
+                *questions = Value::Null;
+            }
+            events.send(question).unwrap();
+            assert_eq!(
+                within(answers.recv_async(), "question was not dismissed")
+                    .await
+                    .unwrap(),
+                ELICITATION_DISMISSED
+            );
+            assert!(out_rx.is_empty());
+            close_session(&mut srv).await;
+            pump.finish().await;
+        });
     }
 
     #[test]
@@ -6924,7 +6919,10 @@ mod tests {
             )
         });
         let permissions = pending.permissions.keys().copied().collect::<Vec<_>>();
-        let elicitation = pending.elicitation;
+        let elicitation = pending
+            .elicitation
+            .as_ref()
+            .map(|elicitation| elicitation.request_id);
         drop(pending);
         let coordinator = session.coordinator.as_ref().map(|coordinator| {
             let read = coordinator.read();

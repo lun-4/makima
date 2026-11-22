@@ -3356,6 +3356,15 @@ impl AgentActorHandle {
                     || !state.delivery_runs.is_empty()))
     }
 
+    /// Runs a nonblocking delivery under the actor lock, before the active turn can retire or be cancelled.
+    pub fn with_live_turn<T>(&self, turn_id: TurnId, deliver: impl FnOnce() -> T) -> Option<T> {
+        let state = self.inner.state.lock_unpoisoned();
+        (state.lifecycle == ActorLifecycle::Open
+            && state.status == ActorStatus::Running(turn_id)
+            && state.active.is_some())
+        .then(deliver)
+    }
+
     pub fn snapshot(&self) -> ActorSnapshot {
         #[cfg(test)]
         if let Some((entered, release)) = self.inner.before_snapshot_state.lock_unpoisoned().take()
