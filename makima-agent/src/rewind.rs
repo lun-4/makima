@@ -183,7 +183,7 @@ impl RewindGuard {
         let conversation = ConversationState::fresh(None);
         let root = self.agent.id();
         let queue = self.journal.snapshot().fold().map_err(JournalError::from)?;
-        let cleared_turns = queue
+        let cleared_turns: Vec<_> = queue
             .scopes
             .get(&Some(root))
             .into_iter()
@@ -201,7 +201,7 @@ impl RewindGuard {
             note,
             conversation: conversation.clone(),
             input_draft: Some(draft.clone()),
-            cleared_turns,
+            cleared_turns: cleared_turns.clone(),
         };
         let event = serde_json::to_value(&record)
             .map_err(|error| RewindError::Context(error.to_string()))?;
@@ -253,7 +253,9 @@ impl RewindGuard {
         };
         prepared.install_fork(root, event)?;
         self.idle.install_rewind(history.clone());
-        actor.clear_user_work();
+        for turn in cleared_turns {
+            let _ = actor.remove(turn);
+        }
         Ok(RewindOutcome::Fork {
             history,
             draft,
@@ -267,19 +269,20 @@ mod tests {
     use super::{RewindError, RewindOutcome, RewindTargetId};
     use crate::{
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
-        TurnOutcome,
+        TurnCancellationReason, TurnOutcome,
         journal::{JournalChange, JournalCommit, SessionJournal},
-        session_writer::{Record, SessionWriter, StoredSession},
+        session_writer::{Record, SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
     };
     use makima_providers::{Message, TokenUsage};
     use makima_storage::{
         id::{AgentId, MakimaId, TurnId},
         session_state::{ParentLink, StateChange, StoredDeliveryOp},
+        sessions::initialize_session_log,
     };
     use std::{
-        fs::{OpenOptions, read_to_string},
-        io::Write,
+        fs::{File, OpenOptions, read_to_string},
+        io::{self, Write},
         sync::Arc,
         time::Duration,
     };
@@ -295,6 +298,126 @@ mod tests {
     const FORK: &str = "fork";
     const TORN_DRAFT: &[u8] = br#"{"t":"draft","text":"incomplete"#;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    const LATE_PROMPT_CANCELLED: &str = "prompt admitted during fork write did not run";
+
+    struct ForkGateIo {
+        file: File,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl SessionIo for ForkGateIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.file.write(bytes)
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            self.file.sync_all()
+        }
+
+        fn position(&mut self) -> io::Result<u64> {
+            self.entered.send(()).map_err(io::Error::other)?;
+            self.release.recv().map_err(io::Error::other)?;
+            Ok(self.file.metadata()?.len())
+        }
+    }
+
+    #[test_case((); "durable_queue_cut")]
+    fn prompt_admitted_during_fork_write_survives_rewind(_: ()) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let session = StoredSession::new("test", "/");
+            initialize_session_log(directory.path(), &session).unwrap();
+            let path = directory.path().join(format!("{}.jsonl", session.id));
+            let (entered, writing) = flume::bounded(1);
+            let (release, blocked) = flume::bounded(1);
+            let writer = SessionWriter::with_io(
+                session.id,
+                ForkGateIo {
+                    file: OpenOptions::new().append(true).open(path).unwrap(),
+                    entered,
+                    release: blocked,
+                },
+                session.next_state_seq(),
+            );
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let journal = manager.journal();
+            journal.bind_writer(writer.clone()).unwrap();
+            let (started, running) = flume::bounded(1);
+            let (finish, running_gate) = flume::bounded(1);
+            let root = manager
+                .create_root(
+                    vec![Message::user(FIRST.into())],
+                    None,
+                    Box::new(MockBackend::STRICT.with_turn(move |_, ctx, input, _| {
+                        let started = started.clone();
+                        let running_gate = running_gate.clone();
+                        Box::pin(async move {
+                            started.send((ctx.turn_id.unwrap(), input.message)).unwrap();
+                            running_gate.recv_async().await.unwrap();
+                            BackendResult::EnteredRun(TurnOutcome::completed(
+                                ctx.agent_id,
+                                ctx.turn_id.unwrap(),
+                                TokenUsage::default(),
+                                1,
+                                DoneReason::EndTurn,
+                            ))
+                        })
+                    })),
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let target = journal.snapshot().histories[&root.id()].ids[0];
+            let guard = root.begin_rewind(&session).unwrap();
+            let admit = |prompt: &str| {
+                actor
+                    .admit_turn(
+                        AgentInput::new(prompt.into(), Vec::new()),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap()
+            };
+            let old = admit(OLD_QUEUE);
+            let fork = smol::spawn(guard.commit(RewindTargetId::Message(target)));
+            writing.recv_async().await.unwrap();
+            let late = admit(REPLACEMENT);
+            assert!(late.peek().is_none());
+            release.send(()).unwrap();
+            fork.await.unwrap();
+            assert!(matches!(
+                old.wait().await,
+                TurnOutcome::Cancelled {
+                    reason: TurnCancellationReason::User,
+                    ..
+                }
+            ));
+            let active = smol::future::race(async { running.recv_async().await.unwrap() }, async {
+                late.wait().await;
+                panic!("{LATE_PROMPT_CANCELLED}");
+            })
+            .await;
+            assert_eq!(active, (late.turn_id(), REPLACEMENT.into()));
+
+            writer.append(Vec::new()).await.unwrap();
+            let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+            let state = reopened.latest_state().unwrap();
+            let admitted = &state.scopes[&Some(root.id())].admitted;
+            assert!(!admitted.contains_key(&old.turn_id()));
+            assert!(admitted.contains_key(&late.turn_id()));
+
+            finish.send(()).unwrap();
+            late.wait().await;
+            assert!(
+                manager
+                    .shutdown(SHUTDOWN_TIMEOUT)
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+            writer.close().await.unwrap();
+        });
+    }
 
     #[test_case(false, false; "log_ends_at_fork")]
     #[test_case(false, true; "two_rewinds")]
