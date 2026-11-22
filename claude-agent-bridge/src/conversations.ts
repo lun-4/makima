@@ -100,8 +100,7 @@ export function unseen(record: Record, messages: readonly Message[]): Message[] 
     .filter((message) => message.content.length > 0)
 }
 
-// A conversation that starts again from the last reply Claude finished, for
-// when its transcript ends at a tool call nothing will answer.
+// Restarts at the last finished reply without resuming the unfinished turn.
 function restartedRecord(record: Record): Record {
   const point = record.boundaries.at(-1)
   if (!point) return freshRecord()
@@ -232,7 +231,10 @@ export class Conversations {
     const messages = request.messages
     const launch = launchKey(request)
     const live = conversation.live
-    if (conversation.record.waiting && (!live || live.session.ended || live.launch !== launch)) {
+    // Suspend drops the partial reply and reissues the same history. The SDK
+    // may have saved the input, so rewind its transcript before replaying it.
+    const replay = conversation.record.interrupted && messages.length === conversation.record.seen
+    if (replay || (conversation.record.waiting && (!live || live.session.ended || live.launch !== launch))) {
       await this.stopLive(conversation)
       conversation.record = restartedRecord(conversation.record)
     }
@@ -262,6 +264,7 @@ export class Conversations {
         for (const event of translator.translate(message)) sink.event(event)
         return translator.endsToolStep(message)
       }, signal)
+      signal.throwIfAborted()
       this.noteSession(conversation, translator)
       if (end === "tools") {
         for (const call of translator.toolCalls) opened.pending.expect(call.id, call.claudeName)
@@ -278,10 +281,10 @@ export class Conversations {
       return result
     } catch (error) {
       this.noteSession(conversation, translator)
+      if (signal.aborted || opened.session.running) record.interrupted = { tools: [] }
       if (opened.session.running) {
         await opened.session.interrupt().catch(() => {})
         opened.pending.clear()
-        record.interrupted = { tools: [] }
       }
       throw error
     } finally {

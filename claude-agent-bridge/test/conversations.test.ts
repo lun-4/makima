@@ -104,6 +104,32 @@ test("after a cancel, Claude keeps its partial reply and Makima's copy is left o
   assert.deepEqual(texts(h.sessions[0]!.sent[1]!.content), ["go on"])
 })
 
+for (const hasBoundary of [false, true]) {
+  test(`a suspended step replays its input after reopen (${hasBoundary ? "forked" : "fresh"} session)`, async () => {
+    const partial = sdk.assistant("cut-off", [text("partial")])
+    const hello = user(text("hello"))
+    const h = harness([[...(hasBoundary ? [textTurn("hi")] : []), [partial]], [textTurn("done")]])
+    if (hasBoundary) await h.step(request("c", [hello]))
+    const boundary = h.records.saved.get("c")?.boundaries.at(-1)
+    const messages = hasBoundary ? [hello, assistant(text("hi")), GO] : [GO]
+    const abort = new AbortController()
+    const running = h.conversations.step(request("c", messages), { open() {}, event: () => abort.abort() }, abort.signal)
+    await assert.rejects(running, { name: "AbortError" })
+    await h.conversations.close()
+
+    await h.step(request("c", messages))
+    const reopened = h.sessions[1]!
+    assert.deepEqual(
+      reopened.sent.map(({ content }) => content),
+      [GO.content],
+    )
+    assert.equal(reopened.options.resume, boundary?.session)
+    assert.equal(reopened.options.resumeSessionAt, boundary?.uuid)
+    if (hasBoundary) assert.equal(reopened.options.forkSession, true)
+    else assert.ok(reopened.options.sessionId)
+  })
+}
+
 test("a branch forks the source at its last finished reply", async () => {
   const h = harness([[textTurn("hi")], [textTurn("aside")]])
   await h.step(request("c1", [GO]))
