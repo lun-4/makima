@@ -7451,16 +7451,18 @@ mod tests {
     /// a helper thread with a bounded wait: a broken watchdog then fails the
     /// test with a reason instead of hanging the harness. The clock starts
     /// before the loop can, so the reported time is a lower bound.
-    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
+    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Instant, Instant) {
         let f = lua.load("while true do end").into_function().unwrap();
         let (tx, rx) = flume::bounded(1);
         let start = Instant::now();
-        thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
-        let err = rx
+        thread::spawn(move || {
+            let result = f.call::<bool>(());
+            drop(tx.send((result, Instant::now())));
+        });
+        let (result, killed_at) = rx
             .recv_timeout(WATCHDOG_TEST_TIMEOUT)
-            .expect("watchdog never killed the hot loop")
-            .unwrap_err();
-        (err, start.elapsed())
+            .expect("watchdog never killed the hot loop");
+        (result.unwrap_err(), start, killed_at)
     }
 
     /// Runs long enough (50ms) to guarantee several watchdog pokes.
@@ -7499,10 +7501,13 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(false);
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, start, killed_at) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_CANCELLED_MSG));
-        assert!(elapsed >= KILL_GRACE, "kill skipped the cleanup grace");
+        assert!(
+            killed_at - start >= KILL_GRACE,
+            "kill skipped the cleanup grace"
+        );
     }
 
     /// A healthy poke must leave nothing armed, or the first poke after esc
@@ -8232,7 +8237,7 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(true);
 
         let scope = TaskScope::detached(&lua);
-        let (err, _) = hot_loop_expecting_kill(&lua);
+        let (err, _, _) = hot_loop_expecting_kill(&lua);
         drop(scope);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
@@ -8248,7 +8253,7 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(true);
         lua.set_app_data::<TaskHandle>(expired_cancelled_handle());
 
-        let (err, _) = hot_loop_expecting_kill(&lua);
+        let (err, _, _) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
     }
@@ -8265,11 +8270,11 @@ mod tests {
         let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, _, killed_at) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_DEADLINE_MSG));
         assert!(
-            elapsed >= JIT_DEADLINE + KILL_GRACE,
+            killed_at >= deadline + KILL_GRACE,
             "kill skipped the cleanup grace"
         );
     }
