@@ -29,6 +29,10 @@ pub fn command(shell: impl Into<ResolvedShell>, script: &str) -> Command {
             .raw_arg(format!(r#""{script}""#));
         return command;
     }
+    #[cfg(windows)]
+    if shell.shell == Shell::Powershell {
+        command.args(["-NoProfile", "-NonInteractive"]);
+    }
     command.arg(flag).arg(script);
     command
 }
@@ -153,6 +157,17 @@ mod tests {
         );
         assert_eq!(name_of(Shell::Cmd), "cmd");
         assert_eq!(name_of(Shell::Powershell), "powershell");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_disables_profile_and_interactive_prompts() {
+        let script = "Write-Output 42";
+        let command = command(Shell::Powershell, script);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-NoProfile", "-NonInteractive", "-Command", script]
+        );
     }
 
     #[cfg(windows)]
