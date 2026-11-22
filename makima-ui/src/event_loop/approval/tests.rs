@@ -1227,10 +1227,10 @@ fn setup_with_registry(
         .install_orchestration_services(event_loop.orchestration.clone());
     host.load_source(OBSERVER_PLUGIN, &observer()).unwrap();
     event_loop.ctx.lua_event_handle = host.event_handle();
-    let path = PathBuf::from(&event_loop.session_cwd).join(PLAN_FILE);
+    let path = PathBuf::from(&event_loop.ctx.workspace_cwd).join(PLAN_FILE);
     fs::write(&path, PLAN).unwrap();
     let (requests, receiver) = flume::unbounded();
-    let mut session = AppSession::new(SOURCE_MODEL, &event_loop.session_cwd);
+    let mut session = AppSession::new(SOURCE_MODEL, &event_loop.ctx.workspace_cwd);
     session.meta.mode = Some(StoredMode::Plan);
     let root = AgentId::generate();
     session.bind_root_id(root).unwrap();

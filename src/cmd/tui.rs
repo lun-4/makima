@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -193,42 +194,43 @@ fn build_stack(
     ))
 }
 
-fn session_cwd(session: &AppSession) -> Result<PathBuf> {
-    let state = session.latest_state()?;
-    let config = state
-        .scopes
-        .get(&session.root_agent_id())
-        .and_then(|scope| scope.config.as_ref());
-    Ok(PathBuf::from(
-        config.map_or(session.cwd.as_str(), |config| config.cwd.as_str()),
-    ))
-}
-
-fn select_initial_tab(
-    last_session: bool,
-    session_id: Option<&str>,
-    model: &str,
-    cwd: &str,
+fn initial_workspace(
+    cli: &Cli,
+    launch_cwd: PathBuf,
     storage: &StateDir,
-) -> Result<AppSession> {
-    if let Some(raw) = session_id {
+) -> Result<(PathBuf, Option<AppSession>)> {
+    if cli.print || cli.is_sdk_mode() || session_picker_requested(cli) {
+        return Ok((launch_cwd, None));
+    }
+    let session = if let Some(raw) = cli.continue_session.as_ref().and_then(|id| id.as_deref()) {
         let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        return Ok(AppSession::load(id, storage)?);
-    }
-    if last_session {
-        match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => return Ok(session),
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
+        Some(AppSession::load(id, storage)?)
+    } else if cli.last_session {
+        match AppSession::latest(&launch_cwd.to_string_lossy(), storage) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load latest session, starting new");
+                None
             }
         }
+    } else {
+        None
+    };
+    let Some(session) = session else {
+        return Ok((launch_cwd, None));
+    };
+    // Loading folds the durable root config into `cwd`; the UI reopens under a lock.
+    let cwd = PathBuf::from(&session.cwd);
+    if !cwd.is_absolute() {
+        bail!(
+            "session {} has a non-absolute working directory: {}",
+            session.id,
+            cwd.display()
+        );
     }
-    Ok(AppSession::new(model, cwd))
+    Ok((cwd, Some(session)))
 }
 
 /// Piped stdin follows the `--prompt` text, or stands alone without it.
@@ -272,23 +274,16 @@ fn exit_resume_hint(id: &str, colored: bool) -> String {
     )
 }
 
-pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
-    if cli.print && session_picker_requested(&cli) {
-        bail!(PICKER_NEEDS_TUI_ERR);
-    }
-    let explicit_model = cli.model.is_some();
-    let mut apply_explicit_model = explicit_model;
-    let storage = StateDir::resolve().context("resolve data directory")?;
-    makima_providers::model_registry::load_from_storage(&storage);
-
-    let mode = cli.trust_mode();
-    let mut trust = project::resolve(&storage, &cwd, mode);
+fn build_startup_stack(
+    cli: &Cli,
+    cwd: &Path,
+    storage: &StateDir,
+    ask_trust: impl FnOnce(&project::TrustQuestion) -> Option<TrustAnswer>,
+) -> Result<(Stack, ProjectDecision, Vec<String>, Option<String>)> {
+    let mut trust = project::resolve(storage, cwd, cli.trust_mode());
     load_env_files(&trust.project_config);
 
-    let (mut stack, mut startup_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
-
-    let can_ask =
-        !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
+    let (mut stack, mut startup_warnings) = build_stack(cli, cwd, storage, &trust, None)?;
     let mut notice = None;
     let answer = trust.state.unanswered().and_then(|question| {
         policy_grant(question, &stack.config.trust)
@@ -297,16 +292,23 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 TrustAnswer::Trust
             })
             .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| makima_ui::ask_trust(question))
+                stack
+                    .config
+                    .trust
+                    .prompt
+                    .then(|| ask_trust(question))
+                    .flatten()
             })
     });
     match answer {
         Some(answer) => {
             let was_trusted = trust.project_config.is_trusted();
-            trust = project::apply_answer(&storage, trust, answer);
+            trust = project::apply_answer(storage, trust, answer);
             if should_load_project_env(was_trusted, trust.project_config.is_trusted()) {
+                drop(stack);
+                ToolRegistry::global().clear_lua();
                 load_env_files(&trust.project_config);
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, &trust, None)?;
+                let (new_stack, new_warnings) = build_stack(cli, cwd, storage, &trust, None)?;
                 stack = new_stack;
                 startup_warnings = new_warnings;
             } else {
@@ -316,6 +318,30 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
+    Ok((stack, trust, startup_warnings, notice))
+}
+
+pub fn run(mut cli: Cli, launch_cwd: PathBuf) -> Result<()> {
+    if cli.print && session_picker_requested(&cli) {
+        bail!(PICKER_NEEDS_TUI_ERR);
+    }
+    let explicit_model = cli.model.is_some();
+    let mut apply_explicit_model = explicit_model;
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    let (cwd, resumed) = initial_workspace(&cli, launch_cwd.clone(), &storage)?;
+    if cwd != launch_cwd {
+        env::set_current_dir(&cwd)
+            .with_context(|| format!("enter saved session directory {}", cwd.display()))?;
+    }
+    makima_providers::model_registry::load_from_storage(&storage);
+
+    let mode = cli.trust_mode();
+    let can_ask =
+        !cli.print && !cli.is_sdk_mode() && io::stdin().is_terminal() && io::stderr().is_terminal();
+    let (mut stack, mut trust, mut startup_warnings, mut notice) =
+        build_startup_stack(&cli, &cwd, &storage, |question| {
+            can_ask.then(|| makima_ui::ask_trust(question))
+        })?;
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
     startup_warnings.extend(super::unmatched_permission_rules(&stack.config.permissions));
@@ -380,24 +406,15 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     }
 
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let session_id = cli.continue_session.as_ref().and_then(|o| o.as_deref());
     let mut session_picker = session_picker_requested(&cli);
-    let mut tabs = vec![select_initial_tab(
-        cli.last_session && !session_picker,
-        session_id,
-        &stack.model.spec(),
-        &cwd_str,
-        &storage,
-    )?];
+    let mut tabs = vec![resumed.unwrap_or_else(|| AppSession::new(&stack.model.spec(), &cwd_str))];
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
     loop {
-        let session_cwd = session_cwd(&tabs[focused])?;
-
         let outcome = makima_ui::run(
             makima_ui::EventLoopParams {
-                cwd: session_cwd.clone(),
+                cwd: cwd.clone(),
                 model: stack.model.clone(),
                 needs_login: stack.needs_login,
                 explicit_model: apply_explicit_model,
@@ -411,7 +428,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 input_history_size: stack.config.storage.input_history_size,
                 permissions: Arc::new(makima_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
-                    session_cwd,
+                    cwd.clone(),
                     trust.project_config.clone(),
                     stack.plugin_host.plugin_rules(),
                 )),
@@ -610,17 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn tui_rejects_invalid_fold_instead_of_using_header() {
-        let mut session = AppSession::new(HEADER_MODEL, THIS_CWD);
-        session
-            .resolve_legacy_config(stored_config(FOLDED_MODEL, OTHER_CWD))
-            .unwrap();
-        session.push_state(session.state().last().unwrap().clone());
-
-        assert!(session_cwd(&session).is_err());
-    }
-
-    #[test]
     fn seed_automode_wires_bash_opt_when_requested() {
         let mut on = test_config();
         crate::cmd::seed_automode(&mut on, true);
@@ -740,29 +746,90 @@ mod tests {
         assert!(err.to_string().contains(PICKER_NEEDS_TUI_ERR));
     }
 
-    const OTHER_CWD: &str = "/elsewhere";
     const THIS_CWD: &str = "/here";
-    #[test_case(false; "valued_continue")]
-    #[test_case(true; "last")]
-    fn select_initial_tab_preserves_the_stored_cwd(last: bool) {
+
+    #[test_case(Some(TrustAnswer::Trust); "saved_trusted")]
+    #[test_case(Some(TrustAnswer::Never); "saved_untrusted")]
+    #[test_case(None; "saved_undecided")]
+    fn cross_project_resume_builds_only_the_saved_project_stack(answer: Option<TrustAnswer>) {
+        use clap::Parser;
+        use makima_agent::{mcp, permissions::PermissionManager};
+        use makima_config::project::{GatedFile, TrustMode};
+        use makima_storage::paths::canonicalize_clean;
+
+        const LAUNCH_MCP: &str = "launch_server";
+        const SAVED_MCP: &str = "saved_server";
         let tmp = tempfile::tempdir().unwrap();
-        let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut session = AppSession::new(HEADER_MODEL, THIS_CWD);
+        let storage = StateDir::from_path(tmp.path().join("state"));
+        let launch = tmp.path().join("launch");
+        let saved = tmp.path().join("saved");
+        for (root, server, init) in [
+            (&launch, LAUNCH_MCP, "error('launch project must not load')"),
+            (
+                &saved,
+                SAVED_MCP,
+                "makima.setup({ ui = { theme = 'saved-theme' } })",
+            ),
+        ] {
+            let config_dir = root.join(".makima");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(config_dir.join(GatedFile::InitLua.file_name()), init).unwrap();
+            fs::write(
+                config_dir.join(GatedFile::Mcp.file_name()),
+                format!("[mcp.{server}]\ncommand = ['unused']\nenabled = false\n"),
+            )
+            .unwrap();
+        }
+        let decide = |root, answer| {
+            let decision = project::resolve(&storage, root, TrustMode::Consult);
+            project::apply_answer(&storage, decision, answer)
+        };
+        let launch_answer = if answer == Some(TrustAnswer::Never) {
+            TrustAnswer::Trust
+        } else {
+            TrustAnswer::Never
+        };
+        assert_eq!(
+            decide(&launch, launch_answer).project_config.is_trusted(),
+            launch_answer == TrustAnswer::Trust
+        );
+        if let Some(answer) = answer {
+            decide(&saved, answer);
+        }
+        let mut session = AppSession::new(HEADER_MODEL, &launch.to_string_lossy());
         session
-            .resolve_legacy_config(stored_config(FOLDED_MODEL, OTHER_CWD))
+            .resolve_legacy_config(stored_config(FOLDED_MODEL, &saved.to_string_lossy()))
             .unwrap();
         session.save(&storage).unwrap();
-        let id = session.id.to_string();
-        let loaded = select_initial_tab(
-            last,
-            (!last).then_some(id.as_str()),
-            STARTUP_MODEL,
-            OTHER_CWD,
-            &storage,
-        )
+        let cli = Cli::parse_from(["makima", "-c", &session.id.to_string(), "-m", STARTUP_MODEL]);
+        let (cwd, loaded) = initial_workspace(&cli, launch, &storage).unwrap();
+        assert_eq!(loaded.unwrap().id, session.id);
+        assert_eq!(cwd, saved);
+        let mut prompted = false;
+        let (stack, trust, _, _) = build_startup_stack(&cli, &cwd, &storage, |question| {
+            prompted = true;
+            assert_eq!(question.folder.path(), canonicalize_clean(&saved));
+            Some(TrustAnswer::Trust)
+        })
         .unwrap();
-        assert_eq!(loaded.id, session.id);
-        assert_eq!(session_cwd(&loaded).unwrap(), Path::new(OTHER_CWD));
+        let trusted = answer != Some(TrustAnswer::Never);
+        assert_eq!(prompted, answer.is_none());
+        assert_eq!(trust.project_config.is_trusted(), trusted);
+        assert_eq!(
+            stack.config.ui.theme.as_deref(),
+            trusted.then_some("saved-theme")
+        );
+        let (mcp, errors) = mcp::config::load_config(&cwd, trust.project_config.clone());
+        assert!(errors.is_empty());
+        assert!(!mcp.mcp.contains_key(LAUNCH_MCP));
+        assert_eq!(mcp.mcp.contains_key(SAVED_MCP), trusted);
+        let permissions = PermissionManager::new(
+            stack.config.permissions.clone(),
+            cwd,
+            trust.project_config,
+            stack.plugin_host.plugin_rules(),
+        );
+        assert_eq!(permissions.project_is_trusted(), trusted);
     }
 
     #[test]

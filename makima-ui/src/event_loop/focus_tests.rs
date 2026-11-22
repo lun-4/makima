@@ -617,7 +617,7 @@ fn blank_session_sends_always_thinking_to_the_provider() {
         let runtime = event_loop
             .ctx
             .spawn_runtime_with_provider(
-                AppSession::new(THINKING_MODEL, &event_loop.session_cwd),
+                AppSession::new(THINKING_MODEL, &event_loop.ctx.workspace_cwd),
                 Some(PreparedProvider {
                     model: model.clone(),
                     provider,

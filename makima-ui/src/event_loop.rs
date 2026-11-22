@@ -1346,6 +1346,7 @@ impl SessionRuntime {
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     initial_model_override: bool,
+    workspace_cwd: String,
     file_write_locks: Arc<FileWriteLocks>,
     prepare_provider: ModelPreparer,
     providers: Arc<ProviderRegistry>,
@@ -1535,14 +1536,17 @@ impl SpawnCtx {
         let startup = self.model_slot.load().model.clone();
         let (guard, renewing, selection) = match ownership {
             RuntimeOwnership::Claim => {
-                let cwd = session.cwd.clone();
                 let source = if session.checkpoint_required() {
                     SessionSource::Resume(session.id)
                 } else {
                     SessionSource::ResumeOrCreate(session)
                 };
-                let opened =
-                    open_session(&self.storage, source, self.open_model(&startup), Some(&cwd))?;
+                let opened = open_session(
+                    &self.storage,
+                    source,
+                    self.open_model(&startup),
+                    Some(&self.workspace_cwd),
+                )?;
                 let selection = opened
                     .resumed
                     .then(|| (opened.model.clone(), opened.warning.clone()));
@@ -1918,7 +1922,6 @@ pub(crate) struct EventLoop<'t> {
     orchestration_revisions: Vec<OrchestrationRevision>,
     orchestration_focus: Option<usize>,
     sessions_dir: PathBuf,
-    session_cwd: String,
     last_heartbeat: Instant,
     input: InputReader,
     warn_rx: flume::Receiver<String>,
@@ -2121,6 +2124,7 @@ impl<'t> EventLoop<'t> {
             smol::block_on(mcp::start(&cwd, project_config.clone()));
         let mut ctx = SpawnCtx {
             initial_model_override: explicit_model,
+            workspace_cwd: cwd.to_string_lossy().into_owned(),
             file_write_locks: Arc::new(FileWriteLocks::new()),
             prepare_provider: default_model_preparer(Arc::clone(&providers)),
             providers,
@@ -2239,7 +2243,6 @@ impl<'t> EventLoop<'t> {
             app.flash(w);
         }
 
-        let session_cwd = runtimes[focused].app.state.session.cwd.clone();
         let orchestration = Arc::new(AgentOrchestration::new(ctx.catalog.specs()));
         ctx.catalog.attach(&orchestration);
         ctx.lua_event_handle
@@ -2264,7 +2267,6 @@ impl<'t> EventLoop<'t> {
             orchestration_revisions: Vec::new(),
             orchestration_focus: None,
             sessions_dir,
-            session_cwd,
             last_heartbeat: Instant::now(),
             input: InputReader::spawn(),
             warn_rx,
@@ -3406,7 +3408,7 @@ impl<'t> EventLoop<'t> {
         match req {
             SessionRequest::List => {
                 let storage = self.ctx.storage.clone();
-                let cwd = self.session_cwd.clone();
+                let cwd = self.ctx.workspace_cwd.clone();
                 smol::unblock(move || {
                     let reply = AppSession::list(&cwd, &storage)
                         .map_err(|e| e.to_string())
@@ -3716,7 +3718,7 @@ impl<'t> EventLoop<'t> {
 
     fn spawn_blank_runtime(&self) -> Result<SessionRuntime> {
         let (session, provider) =
-            new_session_from_slot(self.focused_model_slot(), &self.session_cwd);
+            new_session_from_slot(self.focused_model_slot(), &self.ctx.workspace_cwd);
         self.ctx
             .spawn_runtime_with_provider(session, Some(provider))
     }
@@ -4079,9 +4081,10 @@ impl<'t> EventLoop<'t> {
         }
         let session = AppSession::load(id, &self.ctx.storage)
             .map_err(|e| format!("Failed to load session: {e}"))?;
-        let cwd = self.session_cwd.clone();
         let open_elsewhere = session_lock::open_elsewhere(&self.sessions_dir, &id);
-        if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
+        if let Some(block) =
+            session_lock::resume_block(&session.cwd, &self.ctx.workspace_cwd, open_elsewhere)
+        {
             return Err(block.to_string());
         }
         let target = if self.blank_and_idle(self.focused) {
@@ -7319,7 +7322,6 @@ end })
             terminal_focused: true,
             notifier: None,
             sessions_dir: ctx.sessions_dir.clone(),
-            session_cwd: harness._temp_dir.path().to_string_lossy().into_owned(),
             orchestration: {
                 let orchestration = Arc::new(AgentOrchestration::new(ctx.catalog.specs()));
                 ctx.catalog.attach(&orchestration);
@@ -7540,6 +7542,7 @@ end })
             .unwrap();
             let ctx = SpawnCtx {
                 initial_model_override: false,
+                workspace_cwd: temp_dir.path().to_string_lossy().into_owned(),
                 file_write_locks: Arc::new(FileWriteLocks::new()),
                 prepare_provider: default_model_preparer(Arc::clone(&providers)),
                 providers,
@@ -7934,6 +7937,33 @@ end })
         );
     }
 
+    #[test_case(false; "session_picker")]
+    #[test_case(true; "back_to_planning")]
+    fn in_tui_switch_rejects_a_session_from_another_workspace(planning: bool) {
+        with_event_loop(|event_loop| {
+            let current = event_loop.sessions[0].id();
+            let other = tempfile::tempdir().unwrap();
+            let model = event_loop.ctx.model_slot.load().model.spec();
+            let mut session = AppSession::new(&model, &other.path().to_string_lossy());
+            session.save(&event_loop.ctx.storage).unwrap();
+            let expected = session_lock::ResumeBlock::OtherCwd(session.cwd.clone()).to_string();
+
+            if planning {
+                event_loop.back_to_planning(0, session.id);
+                assert_eq!(
+                    event_loop.sessions[0].app.flash_text(),
+                    Some(expected.as_str())
+                );
+            } else {
+                let (reply, result) = flume::bounded(1);
+                event_loop.focus_session(session.id, reply);
+                assert_eq!(result.try_recv().unwrap().unwrap_err(), expected);
+            }
+            assert_eq!(event_loop.sessions.len(), 1);
+            assert_eq!(event_loop.sessions[event_loop.focused].id(), current);
+        });
+    }
+
     #[test]
     fn planning_switch_suspends_implementation_without_terminal_results() {
         with_event_loop(|event_loop| {
@@ -8079,7 +8109,7 @@ end })
             Some(UNSAVED)
         );
 
-        let restarted = harness.snapshot_crash(runtime);
+        let mut restarted = harness.snapshot_crash(runtime);
         assert_ne!(restarted._temp_dir.path(), source_root);
         assert!(!source_root.exists());
         assert_eq!(
@@ -8090,6 +8120,7 @@ end })
         assert_eq!(durable.messages().len(), 1);
         assert_eq!(durable.messages()[0].user_text(), Some(PERSISTED));
         assert!(durable.meta.input_draft.is_none());
+        restarted.ctx.as_mut().unwrap().workspace_cwd = durable.cwd.clone();
         reopen_app(restarted, id, |event_loop| {
             let runtime = &event_loop.sessions[0];
             assert_eq!(runtime.id(), id);
@@ -8175,7 +8206,7 @@ end })
         with_event_loop(|event_loop| {
             let mut session = AppSession::new(
                 &event_loop.ctx.model_slot.load().model.spec(),
-                &event_loop.session_cwd,
+                &event_loop.ctx.workspace_cwd,
             );
             let id = session.id;
             let dir = makima_storage::sessions::offload_dir(&event_loop.ctx.sessions_dir, id);
@@ -8265,7 +8296,7 @@ end })
             if next {
                 let mut session = AppSession::new(
                     &event_loop.ctx.model_slot.load().model.spec(),
-                    &event_loop.session_cwd,
+                    &event_loop.ctx.workspace_cwd,
                 );
                 session.save(&event_loop.ctx.storage).unwrap();
                 let runtime = event_loop.ctx.spawn_runtime(session).unwrap();
@@ -8361,7 +8392,7 @@ end })
         with_event_loop(|event_loop| {
             let mut session = AppSession::new(
                 &event_loop.ctx.model_slot.load().model.spec(),
-                &event_loop.session_cwd,
+                &event_loop.ctx.workspace_cwd,
             );
             let id = session.id;
             session.save(&event_loop.ctx.storage).unwrap();
@@ -8650,7 +8681,7 @@ end })
                 let runtime = event_loop
                     .ctx
                     .spawn_runtime_with_provider(
-                        AppSession::new(spec, &event_loop.session_cwd),
+                        AppSession::new(spec, &event_loop.ctx.workspace_cwd),
                         Some(PreparedProvider {
                             model: Model::from_spec(spec).unwrap(),
                             provider: Arc::new(StubProvider),
@@ -8775,7 +8806,7 @@ end })
             for spec in [FIRST, SECOND] {
                 let (release, gate) = flume::unbounded();
                 releases.push(release);
-                let mut session = AppSession::new(spec, &event_loop.session_cwd);
+                let mut session = AppSession::new(spec, &event_loop.ctx.workspace_cwd);
                 session.meta.thinking = Some(DomainThinkingConfig::Off.into());
                 session.meta.fast = spec == FIRST;
                 let runtime = event_loop
@@ -8895,7 +8926,7 @@ end })
                 ("changed", FIRST.into(), changed(true))
             );
 
-            let mut stored = AppSession::new(THIRD, &event_loop.session_cwd);
+            let mut stored = AppSession::new(THIRD, &event_loop.ctx.workspace_cwd);
             stored.meta.thinking = Some(DomainThinkingConfig::Off.into());
             stored.push_message(Message::user(PROMPT.into()));
             stored.save(&event_loop.ctx.storage).unwrap();
@@ -9014,7 +9045,7 @@ end })
                 event_loop.ctx.model_slot.load().model.spec(),
                 PREPARED_MODEL
             );
-            let mut stored = AppSession::new(PREPARED_MODEL, &event_loop.session_cwd);
+            let mut stored = AppSession::new(PREPARED_MODEL, &event_loop.ctx.workspace_cwd);
             stored.push_message(Message::user(STARTUP_PROMPT.into()));
             stored.save(&event_loop.ctx.storage).unwrap();
             event_loop.sessions[0]
@@ -9055,7 +9086,7 @@ end })
             let runtime = event_loop
                 .ctx
                 .spawn_runtime_with_provider(
-                    AppSession::new(PREPARED_MODEL, &event_loop.session_cwd),
+                    AppSession::new(PREPARED_MODEL, &event_loop.ctx.workspace_cwd),
                     Some(PreparedProvider {
                         model: Model::from_spec(PREPARED_MODEL).unwrap(),
                         provider: Arc::clone(&pending) as Arc<dyn Provider>,
@@ -9990,6 +10021,7 @@ end })
         );
         drop(prepared);
 
+        harness.ctx.as_mut().unwrap().workspace_cwd = stored.cwd.clone();
         let runtime = harness.runtime(session);
         let config = runtime.config().unwrap();
         assert_eq!(config.context.cwd(), cwd);
@@ -10280,7 +10312,7 @@ end })
 
         with_event_loop(|event_loop| {
             let startup = event_loop.ctx.model_slot.load().model.spec();
-            let mut session = AppSession::new(INVALID_MODEL, &event_loop.session_cwd);
+            let mut session = AppSession::new(INVALID_MODEL, &event_loop.ctx.workspace_cwd);
             session.save(&event_loop.ctx.storage).unwrap();
             let (reply_tx, reply_rx) = flume::bounded(1);
             event_loop.bring_up(RuntimeTarget::Open { reply: reply_tx }, session.clone());
@@ -10307,7 +10339,7 @@ end })
 
         with_event_loop(|event_loop| {
             let current_id = event_loop.sessions[0].id();
-            let session = AppSession::new(MODEL, &event_loop.session_cwd);
+            let session = AppSession::new(MODEL, &event_loop.ctx.workspace_cwd);
             let loaded_id = session.id;
             let (reply_tx, reply_rx) = flume::bounded(1);
             let target = RuntimeTarget::Replace {
@@ -11211,7 +11243,7 @@ end })
     fn failed_directory_persistence_does_not_publish_actor_context() {
         with_event_loop(|event_loop| {
             let model = event_loop.sessions[0].app.root_config().model.clone();
-            let session = AppSession::new(&model.spec(), &event_loop.session_cwd);
+            let session = AppSession::new(&model.spec(), &event_loop.ctx.workspace_cwd);
             let prepared = event_loop
                 .ctx
                 .prepare_runtime_with_provider(
