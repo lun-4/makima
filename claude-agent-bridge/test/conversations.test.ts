@@ -104,8 +104,13 @@ test("after a cancel, Claude keeps its partial reply and Makima's copy is left o
   assert.deepEqual(texts(h.sessions[0]!.sent[1]!.content), ["go on"])
 })
 
-for (const hasBoundary of [false, true]) {
-  test(`a suspended step replays its input after reopen (${hasBoundary ? "forked" : "fresh"} session)`, async () => {
+for (const [hasBoundary, hasFollowUp] of [
+  [false, false],
+  [true, false],
+  [false, true],
+  [true, true],
+] as const) {
+  test(`a suspended step replays its input after reopen (${hasBoundary ? "forked" : "fresh"} session${hasFollowUp ? ", restored follow-up" : ""})`, async () => {
     const partial = sdk.assistant("cut-off", [text("partial")])
     const hello = user(text("hello"))
     const h = harness([[...(hasBoundary ? [textTurn("hi")] : []), [partial]], [textTurn("done")]])
@@ -117,11 +122,12 @@ for (const hasBoundary of [false, true]) {
     await assert.rejects(running, { name: "AbortError" })
     await h.conversations.close()
 
-    await h.step(request("c", messages))
+    const followUp = hasFollowUp ? [user(text("restored follow-up"))] : []
+    await h.step(request("c", [...messages, ...followUp]))
     const reopened = h.sessions[1]!
     assert.deepEqual(
       reopened.sent.map(({ content }) => content),
-      [GO.content],
+      [[...GO.content, ...followUp.flatMap(({ content }) => content)]],
     )
     assert.equal(reopened.options.resume, boundary?.session)
     assert.equal(reopened.options.resumeSessionAt, boundary?.uuid)

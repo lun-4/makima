@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto"
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import type { Message } from "./protocol.ts"
 
 // A point in an SDK session where Claude's transcript holds exactly the
 // first {count} Makima messages, ending with a finished reply. A fork from it
@@ -8,6 +10,7 @@ export interface Boundary {
   readonly count: number
   readonly session: string
   readonly uuid: string
+  readonly replyHash?: string
 }
 
 export interface Record {
@@ -23,18 +26,27 @@ export interface Record {
   launch?: string
   // Tool calls of the reply that ended the last step.
   waiting?: string[]
-  // The last turn was interrupted, so Claude's transcript holds the partial
-  // reply and the cancelled tool results itself.
-  interrupted?: { tools: string[] }
+  // An interrupted turn is replayed unless Makima explicitly ended it as cancelled.
+  interrupted?: { tools: string[]; cancelled?: true }
 }
 
 export function freshRecord(): Record {
   return { seen: 0, boundaries: [] }
 }
 
-// The last boundary within the first {shared} messages.
-export function forkPoint(record: Record, shared: number): Boundary | undefined {
-  return record.boundaries.findLast((boundary) => boundary.count <= shared)
+export function replyHash(message: Message): string | undefined {
+  const text = message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
+  // Makima writes a placeholder when a reply has no visible text.
+  if (!text.some((part) => part.trim() !== "")) return undefined
+  return createHash("sha256").update(JSON.stringify(text)).digest("hex")
+}
+
+export function hasReply(message: Message | undefined, hash?: string): boolean {
+  return message?.role === "assistant" && (hash === undefined || replyHash(message) === hash)
+}
+
+export function forkPoint(record: Record, messages: readonly Message[], shared = messages.length): Boundary | undefined {
+  return record.boundaries.findLast((boundary) => boundary.count <= shared && hasReply(messages[boundary.count - 1], boundary.replyHash))
 }
 
 export interface Records {
