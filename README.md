@@ -1,165 +1,62 @@
 <img src="./banner.png">
 
-a fucked up fork of [maki](https://github.com/tontinton/maki):
+makima is a harness for AI/LLM coding agents targeting stability and extensibility with a Rust core and Luau plugins.
 
-> An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
+primary features include but are not limited to:
+- async and nested subagents
+   - you can also select specific models, e.g. you can type `@6.2-sol`, press TAB, and watch as your main model creates a completely separate subagent with the model you want.
+- extensible LLM providers via a dedicated Luau API
+- see images the model is fetching if your terminal supports it
+- ACP support so you can use e.g Zed
 
-_maki is good! i just have different opinions that i dont think are upstreamable!_
+## installation procedure
 
-## things makima does on top of maki
+makima supports linux, windows, and macos.
 
-- `/thinking` that saves to storage and has an UI using the Pi's 7-level effort system
-- mode overrides and a plan mode inspired/stolen from [polytoken](https://docs.polytoken.dev)
-- `plan_submit` tool so model decides when it's time to go for it
-- async subagent implementation where you can talk to the subagents
-  - you can also use `@`-autocomplete to select a specific model as a subagent e.g type `@6.1-sol` and see it in action
-- Claude Code-style automode via `/automode`
-- misc ux fixes, such as
-   - `--apend-system-prompt` works in TUI mode
-   - `/login` has OpenAI Codex auth as an option
-   - Esc-Esc doesn't wipe the todo UI
-   - emit terminal bell when agent wants user input (stolen from polytoken)
+right now, makima is in constant flux and used by some friends of ours. we recommend users either.
+1. build from source
 
-## installing makima
-
-TODO
-
-## Features
-
-### Context efficiency
-
-* `index` tool - uses [tree-sitter](https://tree-sitter.github.io/tree-sitter) to parse supported programming languages to produce a high level skeleton of a file, with exact start-end lines of each item (e.g. a function's implementation is in lines 150-165). Encouraged to be used before reads. For my usage it adds 59 tok/turn but saves 224 tok/turn on read calls, saving 165 tok/turn.
-* `code_execution` tool - uses [monty](https://github.com/pydantic/monty) to run an interpreter that has all other tools available as async functions. Makima uses it to filter / summarize / transform / pipe data to other tools as input, without it ever reaching and polluting the context window. Sandbox limited by time & memory.
-* `task_spawn` tool - when delegating work to subagents, the AI chooses whether to run weak / medium / strong model of used provider. Think haiku / sonnet / opus.
-* System prompt, tool descriptions, and tool examples are all concise, I've made sure not to bloat your context.
-* Uses [rtk](https://github.com/rtk-ai/rtk) if you have it installed, disable with `--no-rtk`. Saves ~50% of bash output tokens. Remember bash is just 12% of total token usage, so 6% is nice, but saving on reads (65% of total) by using `index` gave me more benefit. I think I'll do bash output filtering like this myself in a future release.
-
-### User experience
-
-* SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
-* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/lun-4/makima/tree/mistress/plugins), [User made plugins showcase](https://github.com/lun-4/makima/discussions), [Lua API reference](https://makima.ln4.net/docs/lua-api/).
-* Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), makima leaves you in control.
-* UI fits everything well on my small screen laptop.
-* Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X).
-* Sensible permission system - when the agent runs `git diff && rm -rf /`, what do you think will happen in your current coding agent? It will treat it as `git *`. Makima uses tree-sitter to parse the bash command and figure out the permissions requested are `git *` and `rm *`. Disable using `--yolo`.
-* SSRF protection on `webfetch` calls.
-* A `memory` tool to keep long term context, just tell makima to remember something (sometimes it uses it automatically). Managed via `/memory` (view / edit / delete memories).
-* Fuzzy search with Ctrl-F.
-* `/btw` to run a command with the chat history without interfering with the current session.
-* Rewind on Escape-Escape (no code rewind yet, only chat history).
-* Attach images in prompts.
-* 26 of the most popular themes.
-* Resume sessions.
-* Skills & MCPs.
-* Plan mode.
-* Run bash commands using `!`, or `!!` if you want makima to not know about it.
-* `/cd` to change dir.
-* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions (although I wouldn't recommend that, makima is very new).
-
-## Supported providers
-
-* Anthropic - `ANTHROPIC_API_KEY` only (using OAuth is against TOS). Bedrock supported via `CLAUDE_CODE_USE_BEDROCK=1`.
-* OpenAI - `OPENAI_API_KEY` and OAuth via `makima auth login openai`.
-* Google - `GEMINI_API_KEY`.
-* Copilot - `GH_COPILOT_TOKEN` or an existing GitHub Copilot sign-in at `~/.config/github-copilot/`.
-* Ollama - `OLLAMA_HOST` for local (e.g. `http://localhost:11434`), or `OLLAMA_API_KEY` for cloud.
-* llama.cpp - `LLAMA_CPP_HOST` (e.g. `http://localhost:8080`), optionally `LLAMA_CPP_API_KEY`.
-* Mistral - `MISTRAL_API_KEY`.
-* Z.AI - `ZHIPU_API_KEY`.
-* DeepSeek - `DEEPSEEK_API_KEY`.
-* OpenRouter - `OPENROUTER_API_KEY`.
-* Synthetic - `SYNTHETIC_API_KEY`.
-* TensorX - `TENSORX_API_KEY`.
-* OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
-* OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
-* Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
-
-## Installation
-
-### Linux / macOS
-
-```sh
-# Download and read the script first (don't blindly trust shell scripts).
-curl -fsSL https://makima.ln4.net/install.sh -o install.sh
-cat install.sh
-
-# Then run.
-chmod +x install.sh && sh install.sh
+```
+git clone https://github.com/lun-4/makima
+cd makima
+cargo build --release
 ```
 
-One-liner:
+2. get prebuilt binaries from [the latest release](https://github.com/lun-4/makima/releases/latest).
 
-```sh
-curl -fsSL https://makima.ln4.net/install.sh | sh
-```
+## inspirations
 
-Installs to `~/.local/bin`. Override with `MAKIMA_INSTALL_DIR`.
+- [maki](https://github.com/tontinton/maki) as it's the core codebase we've hardforked from. _maki is good! I just have different opinions that I don't think are upstreamable!_
+- [polytoken](https://polytoken.dev)'s plan mode which we've copied.
 
-### Windows (PowerShell)
+## supported providers
 
-```powershell
-# Download and read the script first (don't blindly trust remote scripts).
-irm https://makima.ln4.net/install.ps1 -OutFile install.ps1
-Get-Content install.ps1
+_makima supports way more than just these providers, but we can confirm that these providers will work out-of-the-box as
+we work with their models on a day-to-day basis_
 
-# Then run.
-.\install.ps1
-```
+- OpenAI Codex
+- OpenRouter
+- Synthetic
+- Opencode Go
+- Claude Agent (so you can use your subscription, inspired by [opencode](https://github.com/anomalyco/opencode))
+- Any OpenAI-compatible provider (which includes llama.cpp, Strata, ninfer-all, and other local backends)
 
-One-liner:
+## other installation procedures
 
-```powershell
-irm https://makima.ln4.net/install.ps1 | iex
-```
+### with `cargo install`
 
-### Windows (Git Bash)
-
-```sh
-curl -fsSL https://makima.ln4.net/install.sh | sh
-```
-
-Both install to `%LOCALAPPDATA%\makima` and add it to your user PATH. Override with `MAKIMA_INSTALL_DIR` / `$env:MAKIMA_INSTALL_DIR`.
-
-### Living on the edge (mistress branch)
+latest `mistress`:
 
 ```sh
 cargo install --locked --git https://github.com/lun-4/makima.git makima
 ```
 
-Add `--tag v0.5.0` to build a release instead of the latest commit.
-
-### With Nix
+### with nix
 
 ```sh
 nix run github:lun-4/makima
 ```
 
-Or download a pre-built binary from [GitHub Releases](https://github.com/lun-4/makima/releases/latest).
+## documentation
 
-## ACP
-
-Run `makima acp` or configure your ACP supporting editor to use makima, e.g. in [Zed](https://zed.dev/)'s `settings.json`:
-
-```json
-"agent_servers": {
-  "Makima": {
-    "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
-    },
-    "type": "custom",
-    "command": "makima",
-    "args": ["acp"],
-    "env": {}
-  }
-}
-```
-
-## Documentation
-
-More info at the [official docs](https://makima.ln4.net/docs).
-
-## Example config
-
-[tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
-
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactored if needed nowadays.
+more info at the [official docs](https://lun-4.github.io/makima/docs).
