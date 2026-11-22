@@ -561,9 +561,10 @@ pub struct SdkParams {
 struct Shared {
     turn_start: Instant,
     pending: HashMap<String, (String, Sender<String>)>,
-    /// The SDK work in flight: one local operation, or the turns carrying
-    /// user messages. A message sent while a turn runs joins it.
+    /// One local operation or the turns carrying SDK user messages.
     work: Vec<WorkCancel>,
+    /// A restored admission cancelled before it starts may not emit a wire result.
+    restored_work: Vec<WorkCancel>,
     /// Counts the local operations begun, so one that ends after an
     /// interrupt dropped it leaves the work begun since alone.
     operation: u64,
@@ -594,6 +595,7 @@ impl Shared {
             turn_start: Instant::now(),
             pending: HashMap::new(),
             work: Vec::new(),
+            restored_work: Vec::new(),
             operation: 0,
             input_closed: false,
             output_closed: false,
@@ -767,11 +769,9 @@ impl SdkRuntime {
             .values()
             .map(|scope| scope.admitted.len())
             .sum::<usize>();
-        if let Some(stored) = recovered_state
-            .scopes
-            .get(&Some(root_id))
-            .and_then(|scope| scope.config.as_ref())
-        {
+        let root_scope = recovered_state.scopes.get(&Some(root_id));
+        let mut continuing_root = root_scope.is_some_and(|scope| !scope.admitted.is_empty());
+        if let Some(stored) = root_scope.and_then(|scope| scope.config.as_ref()) {
             let restored_mode = makima_agent::plan_state::prepare_restore_for_agent(
                 &recovered_state,
                 root_id,
@@ -780,14 +780,17 @@ impl SdkRuntime {
             )?;
             if makima_agent::modes::is_read_only_fallback(&restored_mode.mode) {
                 continuation_count -= recovered_state.scopes[&Some(root_id)].admitted.len();
+                continuing_root = false;
             }
+        }
+        if continuing_root && explicit_permission_mode {
+            return Err(eyre!(
+                "cannot apply --permission-mode to a continuing root turn; omit the flag or set MAKIMA_CONTINUE_ALL_AGENTS=0"
+            ));
         }
         let continuation_notice =
             makima_agent::session_recovery::continuation_notice(continuation_count);
-        let recovered_config = recovered_state
-            .scopes
-            .get(&Some(root_id))
-            .and_then(|scope| scope.config.as_ref());
+        let recovered_config = root_scope.and_then(|scope| scope.config.as_ref());
         let cwd = recovered_config
             .map(|config| PathBuf::from(&config.cwd))
             .unwrap_or(cwd);
@@ -971,9 +974,26 @@ impl SdkRuntime {
                     .try_set_yolo(permission_mode == PermissionMode::BypassPermissions)
                     .map_err(|error| eyre!(error))?;
             }
-            let committed_config = headless::checkpoint_startup_config(&root, &coordinator)
-                .await
-                .map_err(|error| eyre!(error))?;
+            let committed_config = if continuing_root {
+                root.effective_config()?
+                    .ok_or_else(|| eyre!("recovered root has no effective config"))?
+            } else {
+                headless::checkpoint_startup_config(&root, &coordinator)
+                    .await
+                    .map_err(|error| eyre!(error))?
+            };
+            let restored_work = if continuing_root && let Some(scope) = root_scope {
+                let actor = root.actor()?;
+                scope
+                    .admitted
+                    .keys()
+                    .filter_map(|&id| actor.turn_ticket(id))
+                    .filter(|ticket| ticket.peek().is_none())
+                    .map(|ticket| handle.input_tx.turn_cancel(ticket))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             catalog.attach(&orchestration);
             let committed_plan = matches!(committed_config.mode, AgentMode::Plan(_));
             let permission_mode = if committed_plan {
@@ -1016,6 +1036,7 @@ impl SdkRuntime {
                 catalog,
                 writer,
                 shared: Arc::new(Mutex::new(Shared {
+                    restored_work,
                     input_closed: session.input_closed.load(Ordering::Acquire),
                     ..Shared::new()
                 })),
@@ -1937,11 +1958,11 @@ fn admit_sdk_submission(
         Err(error) if error.is_closed() => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
-    if !shared
-        .work
-        .iter()
-        .any(|work| work.turn_id() == Some(ticket.turn_id()))
-    {
+    let turn_id = Some(ticket.turn_id());
+    if !shared.work.iter().any(|work| work.turn_id() == turn_id) {
+        shared
+            .restored_work
+            .retain(|work| work.turn_id() != turn_id);
         shared.work.push(input_tx.turn_cancel(ticket));
     }
     Ok(true)
@@ -1990,19 +2011,28 @@ fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
     let mut shared = shared.lock_unpoisoned();
     let tracked = shared.work.len();
     shared.work.retain(|work| work.turn_id() != Some(turn_id));
+    shared
+        .restored_work
+        .retain(|work| work.turn_id() != Some(turn_id));
     if shared.work.is_empty() {
         shared.idle.notify(usize::MAX);
     }
     shared.dispatching && shared.work.len() == tracked
 }
 
-/// Cancels all SDK work in flight; the turns still report their results.
+/// Cancels the captured SDK work and restored root admissions.
 fn cancel_sdk_work(shared: &Mutex<Shared>) {
-    let work = mem::take(&mut shared.lock_unpoisoned().work);
-    for work in work {
+    let (work, restored_work) = {
+        let mut shared = shared.lock_unpoisoned();
+        (
+            mem::take(&mut shared.work),
+            mem::take(&mut shared.restored_work),
+        )
+    };
+    for work in work.into_iter().chain(restored_work) {
         work.cancel();
     }
-    end_sdk_work(shared);
+    shared.lock_unpoisoned().idle.notify(usize::MAX);
 }
 
 /// Waits for the pump to report the dispatch in flight, unless it has
@@ -2585,14 +2615,17 @@ mod tests {
     };
     use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use makima_lua::orchestration::OrchestrationServices;
+    use makima_providers::login::{AuthStatus, InteractionService};
     use makima_providers::model::FastSupport;
     use makima_providers::provider::{BoxFuture, Provider};
     use makima_providers::{
-        ContentBlock, Invocation, ModelInfo, ProviderEvent, RequestDelivery, RequestOptions, Role,
-        StreamResponse,
+        ContentBlock, Invocation, ModelInfo, PreparedProvider, ProviderBackend, ProviderEvent,
+        RegisteredProvider, RequestDelivery, RequestOptions, Role, StreamResponse,
     };
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
-    use makima_storage::session_state::{StateChange, StoredAgentConfig, StoredStateRecord};
+    use makima_storage::session_state::{
+        StateChange, StoredAgentConfig, StoredStateRecord, StoredTurnOrigin,
+    };
     use makima_storage::sessions::{Prefs, SessionMeta, StoredEffect, StoredRule, StoredThinking};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -3734,6 +3767,46 @@ mod tests {
         }
     }
 
+    struct GatedSdkBackend(Arc<GatedProvider>);
+
+    impl ProviderBackend for GatedSdkBackend {
+        fn prepare(
+            &self,
+            model: Model,
+            _: ModelInfo,
+        ) -> BoxFuture<'static, Result<PreparedProvider, AgentError>> {
+            let provider: Arc<dyn Provider> = self.0.clone();
+            Box::pin(async move { Ok(PreparedProvider { model, provider }) })
+        }
+
+        fn discover(
+            &self,
+            _: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, AgentError>>> {
+            None
+        }
+
+        fn login(
+            &self,
+            _: String,
+            _: Value,
+            _: Arc<dyn InteractionService>,
+        ) -> BoxFuture<'static, Result<Option<String>, AgentError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn auth_status(
+            &self,
+            _: Value,
+        ) -> Option<BoxFuture<'static, Result<AuthStatus, AgentError>>> {
+            None
+        }
+
+        fn logout(&self) -> Option<BoxFuture<'static, Result<(), AgentError>>> {
+            None
+        }
+    }
+
     struct PendingSdkSession {
         handle: InteractiveHandle,
         coordinator: makima_agent::session_coordinator::SessionCoordinatorHandle,
@@ -4030,6 +4103,115 @@ mod tests {
             assert_eq!(result, Err(failure.to_string()));
         }
         assert_eq!(session.end_input().len(), 1);
+    }
+
+    #[test]
+    fn protocol_interrupt_cancels_continuing_root_before_any_prompt() {
+        use clap::Parser;
+        use makima_agent::TurnCancellationReason;
+
+        const INTERRUPT_ID: &str = "stop-restored-turn";
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let storage = StateDir::from_path(cwd.to_path_buf());
+        let root_id = AgentId::generate();
+        let turn = TurnId::generate();
+        let mut saved = StoredSession::new(RESET_MODEL, &cwd.to_string_lossy());
+        saved.bind_root_id(root_id).unwrap();
+        saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
+        saved.push_state(StoredStateRecord {
+            seq: 2,
+            agent: Some(root_id),
+            generation: 0,
+            change: StateChange::Admitted {
+                turn,
+                origin: StoredTurnOrigin::User,
+            },
+        });
+        saved.save(&storage).unwrap();
+
+        let (entered, requests) = flume::unbounded();
+        let (release, released) = flume::unbounded();
+        let (out_tx, out_rx) = flume::unbounded();
+        let mut params = reset_sdk_params(cwd.to_path_buf());
+        params.cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
+        params.providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+            id: RESET_PROVIDER.into(),
+            display_name: RESET_PROVIDER.into(),
+            models: vec![ModelInfo::id_only(params.model.id.clone())],
+            backend: Arc::new(GatedSdkBackend(Arc::new(GatedProvider {
+                entered,
+                release: released,
+            }))),
+            auth: Default::default(),
+            docs: None,
+        }]));
+        let session = SdkSession::new(params, storage, out_tx).unwrap();
+        let runtime = session.current();
+        let (user_tx, dispatcher) = session.spawn_dispatcher();
+        let send = |message| {
+            assert!(
+                handle_sdk_message(&session, &user_tx, serde_json::from_value(message).unwrap())
+                    .unwrap()
+            );
+        };
+        let read = || -> Value {
+            serde_json::from_str(&out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap()).unwrap()
+        };
+        assert_eq!(read()["subtype"], "init");
+        let notice = read();
+        assert_eq!(notice["subtype"], "warning");
+        assert_eq!(
+            notice["message"],
+            makima_agent::session_recovery::continuation_notice(1).unwrap()
+        );
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        let ticket = runtime.root.target.turn_ticket(turn).unwrap();
+
+        send(serde_json::json!({
+            "type": "control_request",
+            "request_id": INTERRUPT_ID,
+            "request": {"subtype": "interrupt"},
+        }));
+        let mut acknowledged = false;
+        let mut stopped = false;
+        while !acknowledged || !stopped {
+            let message = read();
+            match message["type"].as_str() {
+                Some("control_response") => {
+                    assert_eq!(message["response"]["request_id"], INTERRUPT_ID);
+                    assert_eq!(message["response"]["subtype"], "success");
+                    acknowledged = true;
+                }
+                Some("result") => {
+                    assert_eq!(message["is_error"], true);
+                    stopped = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(matches!(
+            smol::block_on(ticket.wait_result()).outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+
+        send(serde_json::json!({"type": "user", "message": {"content": SDK_CHILD_PROMPT}}));
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        release.send(()).unwrap();
+        loop {
+            let message = read();
+            if message["type"] == "result" {
+                assert_eq!(message["is_error"], false);
+                assert_eq!(message["result"], SDK_GATED_REPLY);
+                break;
+            }
+        }
+        drop(user_tx);
+        smol::block_on(dispatcher).unwrap();
+        smol::block_on(runtime.close()).unwrap();
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ use makima_agent::session_recovery::{OpenModel, OpenSessionError, SessionSource,
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
-use makima_agent::{AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError};
+use makima_agent::{AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError, TurnId};
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
     InputDispatch, PresentedCommand, TargetHandle,
@@ -117,6 +117,8 @@ struct Pending {
     /// Prompts whose message started a turn of its own behind the running
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
+    continuing_root: BTreeSet<TurnId>,
+    cancelling_continuation: bool,
     permissions: HashMap<i64, (String, Sender<String>)>,
     elicitation: Option<i64>,
     /// The client closed its input, so no answer to a new ask can arrive.
@@ -131,24 +133,30 @@ impl Pending {
     /// Whether a prompt may start now; `true` when it starts beside a turn
     /// its message may join.
     fn admits_prompt(&self) -> Result<bool, AcpError> {
-        match &self.operation {
-            None => Ok(false),
-            Some(operation) if operation.cancelling => Err(AcpError::new(
+        if self.cancellation_in_progress() {
+            return Err(AcpError::new(
                 CANCELLATION_IN_PROGRESS_CODE,
                 CANCELLATION_IN_PROGRESS_MESSAGE,
             )
-            .data(serde_json::json!({ "retryable": true }))),
+            .data(serde_json::json!({ "retryable": true })));
+        }
+        match &self.operation {
+            None => Ok(false),
             Some(operation) if operation.kind == OperationKind::PrimaryTurn => Ok(true),
             Some(_) => Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE)),
         }
     }
 
-    fn refuses_asks(&self) -> bool {
-        self.input_closed
+    fn cancellation_in_progress(&self) -> bool {
+        self.cancelling_continuation
             || self
                 .operation
                 .as_ref()
                 .is_some_and(|operation| operation.cancelling)
+    }
+
+    fn refuses_asks(&self) -> bool {
+        self.input_closed || self.cancellation_in_progress()
     }
 
     fn settle(&mut self) -> PendingOperation {
@@ -256,6 +264,9 @@ struct InstallSession<'a> {
     cwd: PathBuf,
     defaults: SessionDefaults,
     persisted_options: &'a BTreeMap<String, String>,
+    replay_history: &'a [Message],
+    continuation_count: usize,
+    continuing_root: BTreeSet<TurnId>,
 }
 
 struct Server {
@@ -581,6 +592,9 @@ async fn new_session(
             cwd,
             defaults,
             persisted_options: &persisted_options,
+            replay_history: &[],
+            continuation_count: 0,
+            continuing_root: BTreeSet::new(),
         },
     )
     .await
@@ -665,8 +679,6 @@ async fn load_session(
         &params.trust_policy,
     );
     let permissions = load_permissions(&project_config)?;
-    let sid = SessionId::from(session_ref.to_string());
-    let home = makima_storage::paths::home();
     let spec = recorded_model.spec();
     let yolo = params.yolo;
     let defaults = recovered_config.map_or_else(
@@ -695,6 +707,12 @@ async fn load_session(
         .values()
         .map(|scope| scope.admitted.len())
         .sum::<usize>();
+    let mut continuing_root: BTreeSet<_> = recovered_state
+        .scopes
+        .get(&root_id)
+        .into_iter()
+        .flat_map(|scope| scope.admitted.keys().copied())
+        .collect();
     if let (Some(config), Some(root)) = (recovered_config, root_id) {
         let restored_mode = makima_agent::plan_state::prepare_restore_for_agent(
             &recovered_state,
@@ -704,11 +722,10 @@ async fn load_session(
         )
         .map_err(|error| session_registration_error(error.to_string()))?;
         if makima_agent::modes::is_read_only_fallback(&restored_mode.mode) {
-            continuation_count -= recovered_state.scopes[&Some(root)].admitted.len();
+            continuation_count -= continuing_root.len();
+            continuing_root.clear();
         }
     }
-    let continuation_notice =
-        makima_agent::session_recovery::continuation_notice(continuation_count);
     let mcp = start_mcp(
         &session_cwd,
         &req.mcp_servers,
@@ -757,23 +774,16 @@ async fn load_session(
             cwd: session_cwd.clone(),
             defaults,
             persisted_options: &persisted_options,
+            replay_history: &replay_history,
+            continuation_count,
+            continuing_root,
         },
     )
     .await
     .map_err(session_registration_error)?;
     if let Some(session) = &srv.session {
-        if let Some(message) = &continuation_notice {
-            session_update(
-                &srv.out_tx,
-                &sid,
-                translate::text_delta(&format!("{message}\n")),
-            );
-        }
         srv.lua_event_handle
             .notify_state_restored(session.command_root.target.clone());
-    }
-    for update in translate::replay_history(&replay_history, Some(&session_cwd), home.as_deref()) {
-        session_update(&srv.out_tx, &sid, update);
     }
     let resp = methods::load_session_response(&mode, &srv.lua_event_handle.mode_registry())
         .config_options(methods::session_config_options(
@@ -1091,6 +1101,9 @@ async fn install_session_with_lock(
         cwd,
         defaults,
         persisted_options,
+        replay_history,
+        continuation_count,
+        continuing_root,
     } = session;
     let definitions = makima_agent::session_coordinator::builtin_option_definitions(
         Arc::from(current_model.as_str()),
@@ -1203,7 +1216,18 @@ async fn install_session_with_lock(
             return Err(error.to_string());
         }
     };
-    let mode = match checkpoint_root_mode(&handle, &coordinator).await {
+    let mode = if continuation_count == 0 {
+        checkpoint_root_mode(&handle, &coordinator).await
+    } else {
+        // The recovered config is already durable and replay may have made the graph busy.
+        trusted_root
+            .target
+            .effective_config()
+            .map_err(|error| error.to_string())
+            .and_then(|config| config.ok_or_else(|| SESSION_ENDED_MESSAGE.to_owned()))
+            .map(|config| config.mode.id().key().to_owned())
+    };
+    let mode = match mode {
         Ok(mode) => mode,
         Err(error) => {
             rollback_install(handle, mcp, Some(coordinator)).await;
@@ -1216,7 +1240,22 @@ async fn install_session_with_lock(
     params
         .lua_event_handle
         .install_orchestration_services(orchestration.clone());
-    let pending = PendingState::default();
+    let pending = Arc::new(Mutex::new(Pending {
+        continuing_root,
+        ..Pending::default()
+    }));
+    let session_id = SessionId::from(handle.session_id.to_string());
+    let home = makima_storage::paths::home();
+    for update in translate::replay_history(replay_history, Some(&cwd), home.as_deref()) {
+        session_update(&srv.out_tx, &session_id, update);
+    }
+    if let Some(message) = makima_agent::session_recovery::continuation_notice(continuation_count) {
+        session_update(
+            &srv.out_tx,
+            &session_id,
+            translate::text_delta(&format!("{message}\n")),
+        );
+    }
     let project_trusted = handle.permissions.project_is_trusted();
     let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
     observer.persist_usage(
@@ -1233,7 +1272,7 @@ async fn install_session_with_lock(
         srv.elicitation,
         handle.answer_tx.clone(),
         coordinator.read(),
-        makima_storage::paths::home(),
+        home,
         project_trusted,
         initial_cost,
         observer,
@@ -1256,7 +1295,6 @@ async fn install_session_with_lock(
             makima_lua::orchestration::headless_outcomes(&handle),
         ),
     );
-    let session_id = SessionId::from(handle.session_id.to_string());
     let command_projection_task = watch_available_commands(
         srv.out_tx.clone(),
         session_id.clone(),
@@ -2128,17 +2166,35 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     let mut pending = session.pending.lock().unwrap();
                     let pending = &mut *pending;
                     pending.cancels += 1;
-                    let Some(operation) = pending
-                        .operation
-                        .as_mut()
-                        .filter(|operation| !operation.cancelling)
-                    else {
+                    if pending.cancellation_in_progress() {
                         return;
-                    };
-                    let cancellations: Vec<_> = iter::once(operation)
+                    }
+                    let mut cancellations: Vec<_> = pending
+                        .operation
+                        .iter_mut()
                         .chain(&mut pending.queued)
                         .filter_map(PendingOperation::start_cancelling)
                         .collect();
+                    if !pending.continuing_root.is_empty()
+                        && let Ok(actor) = session.command_root.target.actor()
+                    {
+                        for &turn_id in &pending.continuing_root {
+                            if let Some(ticket) = actor.turn_ticket(turn_id)
+                                && ticket.peek().is_none()
+                            {
+                                pending.cancelling_continuation = true;
+                                if !cancellations
+                                    .iter()
+                                    .any(|cancel| cancel.turn_id() == Some(turn_id))
+                                {
+                                    cancellations.push(session.handle.input_tx.turn_cancel(ticket));
+                                }
+                            }
+                        }
+                    }
+                    if pending.operation.is_none() && !pending.cancelling_continuation {
+                        return;
+                    }
                     let permission_answers = std::mem::take(&mut pending.permissions);
                     let elicitation = pending.elicitation.take();
                     (cancellations, permission_answers, elicitation)
@@ -2469,6 +2525,14 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
+                    {
+                        let mut pending = pending.lock().unwrap();
+                        if pending.continuing_root.remove(&outcome.turn_id())
+                            && pending.continuing_root.is_empty()
+                        {
+                            pending.cancelling_continuation = false;
+                        }
+                    }
                     finish_primary_run(&pending, run_id, |request_id| match &outcome {
                         makima_agent::TurnOutcome::Completed { reason, .. } => {
                             let resp = PromptResponse::new(translate::map_done_reason(*reason));
@@ -2637,7 +2701,7 @@ mod tests {
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput, TurnTicket};
-    use makima_agent::{TurnCancellationReason, TurnId, TurnOutcome};
+    use makima_agent::{TurnCancellationReason, TurnOutcome};
     use makima_commands::TargetCapabilities;
     use makima_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use makima_providers::login::{AuthSpec, AuthStatus, InteractionService};
@@ -3612,6 +3676,213 @@ mod tests {
         });
     }
 
+    #[derive(PartialEq, Eq)]
+    enum RestoredRootScenario {
+        CancelWhileParked,
+        EmitImmediately,
+    }
+
+    #[test_case(RestoredRootScenario::CancelWhileParked; "cancel_parked_root_before_prompt")]
+    #[test_case(RestoredRootScenario::EmitImmediately; "replay_before_immediate_resumed_output")]
+    fn acp_restored_root_protocol(scenario: RestoredRootScenario) {
+        const LOAD_ID: i64 = 1;
+        const PROMPT_ID: i64 = 2;
+        const OLD_PROMPT: &str = "previous prompt";
+        const OLD_REPLY: &str = "previous reply";
+        const RESTORED_PROMPT: &str = "interrupted prompt";
+        const NEW_PROMPT: &str = "prompt after cancellation";
+        const END_TURN: &str = "end_turn";
+
+        smol::block_on(async {
+            let directory = TempDir::new().unwrap();
+            let cwd = directory.path();
+            let (requests, received) = flume::unbounded();
+            let (release, permits) = flume::unbounded();
+            if scenario == RestoredRootScenario::EmitImmediately {
+                release.send(()).unwrap();
+            }
+            let providers = spawn_test_providers(Arc::new(ParkedProvider {
+                requests,
+                release: permits,
+            }));
+            let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.into());
+            params.providers = providers;
+            let mut seed = StoredSession::new(SPAWN_TEST_SPEC, &cwd.to_string_lossy());
+            seed.bind_root_id(AgentId::generate()).unwrap();
+            seed.push_message(Message::user(OLD_PROMPT.into()));
+            seed.push_message(Message {
+                role: Role::Assistant,
+                content: vec![MsgBlock::Text {
+                    text: OLD_REPLY.into(),
+                }],
+                ..Default::default()
+            });
+            seed.push_message(Message::user(RESTORED_PROMPT.into()));
+            let turn = TurnId::generate();
+            seed.push_state(StoredStateRecord {
+                seq: seed.next_state_seq(),
+                agent: seed.root_agent_id(),
+                generation: 0,
+                change: StateChange::Admitted {
+                    turn,
+                    origin: StoredTurnOrigin::User,
+                },
+            });
+            seed.save(&params.storage).unwrap();
+            let session_id = seed.id.to_string();
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut server = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
+            };
+            within(
+                handle_line(
+                    &mut server,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": LOAD_ID,
+                        "method": "session/load",
+                        "params": { "sessionId": session_id, "cwd": cwd, "mcpServers": [] }
+                    })
+                    .to_string(),
+                    &params,
+                ),
+                "ACP session/load did not return",
+            )
+            .await;
+
+            match scenario {
+                RestoredRootScenario::CancelWhileParked => {
+                    let response = prompt_terminal(&out_rx, LOAD_ID).await;
+                    assert!(response.get("result").is_some(), "{response}");
+                    let root = server
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .handle
+                        .initialized_root()
+                        .await
+                        .unwrap();
+                    let turns = RootTurns {
+                        actor: root.actor().unwrap(),
+                        requests: received,
+                        release,
+                    };
+                    assert_eq!(turns.next_text().await, RESTORED_PROMPT);
+                    let ticket = root.turn_ticket(turn).unwrap();
+                    handle_line(
+                        &mut server,
+                        &serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": { "sessionId": session_id }
+                        })
+                        .to_string(),
+                        &params,
+                    )
+                    .await;
+                    let outcome = within(ticket.wait(), "ACP did not cancel the parked root").await;
+                    assert!(
+                        matches!(
+                            outcome,
+                            TurnOutcome::Cancelled {
+                                reason: TurnCancellationReason::User,
+                                ..
+                            }
+                        ),
+                        "{outcome:?}"
+                    );
+
+                    let prompt = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": PROMPT_ID,
+                        "method": "session/prompt",
+                        "params": {
+                            "sessionId": session_id,
+                            "prompt": [{ "type": "text", "text": NEW_PROMPT }]
+                        }
+                    })
+                    .to_string();
+                    within(
+                        async {
+                            loop {
+                                handle_line(&mut server, &prompt, &params).await;
+                                if let Some(dispatch) = server.dispatch.as_mut() {
+                                    let dispatched = (&mut dispatch.future).await;
+                                    respond_dispatch(&mut server, dispatched).await;
+                                    break;
+                                }
+                                let response = prompt_terminal(&out_rx, PROMPT_ID).await;
+                                assert_eq!(
+                                    response["error"]["code"], CANCELLATION_IN_PROGRESS_CODE,
+                                    "{response}"
+                                );
+                                assert_eq!(response["error"]["data"]["retryable"], true);
+                                smol::future::yield_now().await;
+                            }
+                        },
+                        "ACP did not admit a prompt after the restored root was cancelled",
+                    )
+                    .await;
+                    assert_eq!(turns.next_text().await, NEW_PROMPT);
+                    turns.release();
+                    let response = prompt_terminal(&out_rx, PROMPT_ID).await;
+                    assert_eq!(response["result"]["stopReason"], END_TURN, "{response}");
+                }
+                RestoredRootScenario::EmitImmediately => {
+                    let expected = [
+                        ("user_message_chunk", OLD_PROMPT),
+                        ("agent_message_chunk", OLD_REPLY),
+                        ("user_message_chunk", RESTORED_PROMPT),
+                    ];
+                    let mut replayed = 0;
+                    let mut loaded = false;
+                    let mut resumed = false;
+                    within(
+                        async {
+                            while !loaded || !resumed {
+                                let frame = out_rx.recv_async().await.unwrap();
+                                if frame["id"] == LOAD_ID {
+                                    assert!(frame.get("result").is_some(), "{frame}");
+                                    loaded = true;
+                                    continue;
+                                }
+                                let update = &frame["params"]["update"];
+                                match update["content"]["text"].as_str() {
+                                    Some(OLD_PROMPT | OLD_REPLY | RESTORED_PROMPT) => {
+                                        let (kind, text) = expected[replayed];
+                                        assert_eq!(update["sessionUpdate"], kind);
+                                        assert_eq!(update["content"]["text"], text);
+                                        assert_eq!(frame["params"]["sessionId"], session_id);
+                                        replayed += 1;
+                                    }
+                                    Some(PARKED_THOUGHT | PARKED_REPLY) => {
+                                        assert_eq!(
+                                            replayed,
+                                            expected.len(),
+                                            "live output before replay: {frame}"
+                                        );
+                                        assert_eq!(frame["params"]["sessionId"], session_id);
+                                        resumed |= update["content"]["text"] == PARKED_REPLY;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                        "ACP did not send load response and resumed output",
+                    )
+                    .await;
+                }
+            }
+            close_session(&mut server).await;
+        });
+    }
+
     #[test]
     fn acp_load_retains_opted_out_recovery_results_without_reissuing_work() {
         use makima_agent::session_recovery::RecoveryCandidate;
@@ -4186,6 +4457,9 @@ mod tests {
                     cwd: cwd.path().to_path_buf(),
                     defaults: SessionDefaults::default(),
                     persisted_options: &persisted_options,
+                    replay_history: &[],
+                    continuation_count: 0,
+                    continuing_root: BTreeSet::new(),
                 },
             )
             .await
@@ -4312,6 +4586,9 @@ mod tests {
                     cwd: cwd.path().to_path_buf(),
                     defaults: SessionDefaults::default(),
                     persisted_options: &persisted_options,
+                    replay_history: &[],
+                    continuation_count: 0,
+                    continuing_root: BTreeSet::new(),
                 },
                 |_| Err(session_lock::OPEN_ELSEWHERE_MSG.to_owned()),
             )
