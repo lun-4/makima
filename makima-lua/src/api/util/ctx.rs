@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use makima_agent::agent::LoadedInstructions;
 use makima_agent::cancel::CancelToken;
-use makima_agent::tools::{FileReadTracker, QuestionMode, ToolAudience, ToolContext, ToolLive};
+use makima_agent::tools::{
+    FileReadTracker, QuestionMode, ToolAudience, ToolClaim, ToolContext, ToolLive,
+};
 use makima_agent::{AgentEvent, AgentRef, MovedBy, SessionMailbox};
 use makima_config::{AgentConfig, ToolOutputLines};
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
@@ -56,6 +58,7 @@ pub(crate) struct AgentContext(ToolContext);
 impl From<&ToolContext> for AgentContext {
     fn from(ctx: &ToolContext) -> Self {
         let mut c = ctx.clone();
+        c.clear_tool_claim();
         c.loaded_instructions = LoadedInstructions::new();
         c.tool_output_lines = ToolOutputLines::default();
         Self(c)
@@ -101,6 +104,7 @@ enum Caps {
     },
     Handler {
         agent: Box<AgentContext>,
+        tool_claim: Option<ToolClaim>,
         /// Kept apart from `agent`, which resets its copy so child calls
         /// start with a clean instruction set.
         loaded_instructions: LoadedInstructions,
@@ -151,6 +155,7 @@ impl LuaCtx {
             ctx,
             Caps::Handler {
                 agent: Box::new(AgentContext::from(ctx)),
+                tool_claim: ctx.tool_claim().cloned(),
                 loaded_instructions: ctx.loaded_instructions.clone(),
             },
         )
@@ -399,6 +404,30 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("mode"));
             };
             Ok((Some(agent.mode.id().key().to_string()), None))
+        });
+        methods.add_method("tool_claim", |lua, this, ()| {
+            try_pair!(this.validate_origin(lua));
+            let Caps::Handler {
+                tool_claim: Some(claim),
+                agent,
+                ..
+            } = &this.caps
+            else {
+                return Ok((None, None));
+            };
+            // Unlike general agent context, this attribution is not lent to
+            // workers or callbacks descended from the answering handler.
+            let origin = this.origin.as_ref().map(|task| lock_cell(task).id);
+            if origin != crate::runtime::active_task_id(lua)
+                || agent.call.as_ref().is_some_and(|call| call.is_moved())
+            {
+                return Ok((None, None));
+            }
+            let table = lua.create_table()?;
+            table.set("turn_id", claim.turn_id().to_string())?;
+            table.set("activation", claim.activation().to_string())?;
+            table.set("current", claim.is_current(&agent.registry))?;
+            Ok((Some(table), None))
         });
         methods.add_method("cancelled", |_, this, ()| Ok(this.cancel.is_cancelled()));
 

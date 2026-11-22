@@ -1184,6 +1184,43 @@ makima.api.register_tool({
     );
 }
 
+#[test_case::test_case(true; "default")]
+#[test_case::test_case(false; "disabled")]
+fn goal_bundled_command_metadata_and_disable(enabled: bool) {
+    let mut plugins = HashMap::new();
+    if !enabled {
+        plugins.insert(
+            "goal".into(),
+            makima_config::PluginFileConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+    }
+    let (registry, host) = builtins_host_with(&PluginsConfig::from_plugins(plugins));
+    assert!(
+        !registry.has("goal"),
+        "the scaffold must not expose a model tool"
+    );
+    let snapshot = command_snapshot(&host);
+    let goal = snapshot
+        .commands()
+        .iter()
+        .find(|command| command.spec().name.as_ref() == "/goal");
+    assert_eq!(goal.is_some(), enabled);
+    if let Some(goal) = goal {
+        assert_eq!(
+            goal.spec().arguments,
+            makima_commands::CommandArguments::Raw { required: false }
+        );
+        assert!(
+            goal.spec()
+                .required_capabilities
+                .contains(makima_commands::TargetCapability::InteractiveUi)
+        );
+    }
+}
+
 #[test]
 fn bundled_commands_project_complete_metadata() {
     let (_reg, host) = builtins_host();
@@ -1234,10 +1271,10 @@ fn bundled_commands_project_complete_metadata() {
             ),
             (
                 "/goal".into(),
-                "Set a goal, clear it with /goal off, or inspect it with /goal status.".into(),
+                "Goal tracking (not available yet)".into(),
                 None,
                 None,
-                false
+                true
             ),
             (
                 "/memory".into(),

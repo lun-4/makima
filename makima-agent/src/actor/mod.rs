@@ -170,6 +170,7 @@ use makima_providers::{Message, TokenUsage};
 use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
+use crate::tools::ToolActivation;
 use crate::tools::offload::OffloadStore;
 use crate::types::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, EventSender, TurnCancellationReason,
@@ -321,6 +322,7 @@ pub(crate) struct ActorState {
     pub(super) parent_delivery_policy: Option<delivery::ParentDeliveryPolicy>,
 
     pub(crate) lifecycle: ActorLifecycle,
+    pub(crate) tool_attachments: HashMap<String, ToolActivation>,
     close_pending: bool,
     pending_publications: usize,
     idle_pending: bool,
@@ -919,6 +921,7 @@ impl ActorState {
             delivery_suspended: false,
             parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
+            tool_attachments: HashMap::new(),
             close_pending: false,
             pending_publications: 0,
             idle_pending: false,
@@ -2767,6 +2770,7 @@ impl AgentActorHandle {
             state.instructions.clear();
             let deliveries = delivery::take_pending(&mut state);
             state.lifecycle = lifecycle;
+            state.tool_attachments.clear();
             state.close_pending = true;
             state.preparing = None;
             for entry in &state.operations {

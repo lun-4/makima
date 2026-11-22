@@ -7,6 +7,7 @@ use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionError,
     THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
 };
+use makima_agent::tools::ToolRegistry;
 use makima_agent::{
     AgentInput, AgentRef, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId,
     TurnOrigin, TurnProvenance,
@@ -37,7 +38,8 @@ use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
 use crate::orchestration::{self, plugin_authority};
 use crate::runtime::{
-    current_managed_turn, current_plugin, register_defer_close, validate_plugin_effect,
+    current_managed_turn, current_plugin, in_delegated_tool, register_defer_close,
+    validate_plugin_effect,
 };
 use crate::session_snapshot::{STATUS_CLOSED, STATUS_IDLE, STATUS_WORKING};
 
@@ -53,6 +55,71 @@ const TYPED_OPTIONS: [&str; 3] = [MODEL_OPTION_ID, THINKING_OPTION_ID, FAST_OPTI
 #[lua_fn(name = "id")]
 fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
     Ok((Some(this.identity()), None))
+}
+
+/// Attach an opt-in tool registered by this plugin to the pinned TUI root.
+/// The next new model request can advertise it, even in the same turn. In-flight
+/// requests and their retries do not change. Repeated calls keep the existing
+/// activation identity; this is not a plugin-state revision or commit fence.
+/// @param ctx LuaCtx Trusted invocation pinned to this exact root.
+/// @param name string Registered tool name (`enabled_by_default = false`).
+/// @return (boolean?, string?) Success.
+#[lua_fn(name = "add_tool")]
+fn agent_add_tool(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    name: String,
+) -> mlua::Result<Pair<bool>> {
+    set_tool_attachment(lua, this, &ctx, &name, true)
+}
+
+/// Detach the plugin's opt-in tool from the pinned TUI root without unregistering it.
+/// Only new requests change. Removing a tool that is already detached succeeds.
+/// @param ctx LuaCtx Trusted invocation pinned to this exact root.
+/// @param name string Registered tool name (`enabled_by_default = false`).
+/// @return (boolean?, string?) Success.
+#[lua_fn(name = "remove_tool")]
+fn agent_remove_tool(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    name: String,
+) -> mlua::Result<Pair<bool>> {
+    set_tool_attachment(lua, this, &ctx, &name, false)
+}
+
+fn set_tool_attachment(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: &LuaCtx,
+    name: &str,
+    attach: bool,
+) -> mlua::Result<Pair<bool>> {
+    if in_delegated_tool(lua) {
+        return Ok(err_pair(
+            "tool attachments require trusted plugin authority",
+        ));
+    }
+    let trusted = try_pair!(ctx.trusted(lua));
+    if trusted.target.id() != this.id || !trusted.target.manager().same_manager(&this.manager) {
+        return Ok(err_pair("tool attachments require the exact pinned root"));
+    }
+    try_pair!(trusted.validate_target(lua, &trusted.target));
+    try_pair!(ensure_validation_not_in_progress(lua));
+    let registry = try_pair!(
+        lua.app_data_ref::<Arc<ToolRegistry>>()
+            .ok_or("tool registry is unavailable")
+    );
+    try_pair!(this.manager.set_tool_attachment(
+        this.id,
+        &registry,
+        name,
+        &trusted.plugin,
+        trusted.plugin_revocation(),
+        attach
+    ));
+    Ok((Some(true), None))
 }
 
 /// Read lifecycle, active turn, queue size, and cumulative usage.
@@ -631,7 +698,7 @@ lua_class! {
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "makima.agent.Agent" => LuaAgent, AGENT_DOCS [
         agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
-        agent_transcript, agent_ref, agent_send, agent_set_model,
+        agent_transcript, agent_ref, agent_send, agent_add_tool, agent_remove_tool, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]

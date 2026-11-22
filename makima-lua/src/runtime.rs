@@ -3689,6 +3689,7 @@ impl LuaRuntime {
                     name: Arc::clone(&t.name),
                     description: t.description.clone(),
                     schema: t.schema,
+                    enabled_by_default: t.enabled_by_default,
                     audience: t.audience,
                     kind: t.kind.clone(),
                     tx: self.tx.clone(),

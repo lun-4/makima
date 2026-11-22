@@ -6,15 +6,16 @@ use makima_agent::session_coordinator::{
 };
 use makima_agent::session_options::SessionOptionError;
 use makima_agent::{
-    ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings, TurnCancellationReason,
-    TurnContext, TurnId, TurnOutcome, WorkKind,
+    ActorBackend, Agent, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
+    AgentParams, AgentRunParams, BackendResult, ControlWork, DoneReason, History, ManagerError,
+    ModeId, RunSettings, TurnCancellationReason, TurnContext, TurnId, TurnOutcome, WorkKind,
     actor::{
         ActorEvent, ActorLifecycle, DeliveryStatus, EffectiveAgentConfig, TurnOrigin,
         TurnProvenance,
     },
+    agent::{PromptSlotSource, TurnSetup},
     cancel::CancelToken,
-    tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
+    tools::{PLAN_WRITE_RESTRICTED, RequestTools, ToolContext, ToolRegistry},
 };
 use makima_commands::CommandInvocation;
 use makima_lua::{
@@ -35,7 +36,7 @@ use makima_lua::{
 };
 use makima_providers::{
     AgentError, ContentBlock, Effort, Invocation, Message, Model, ObservationSource, ProviderEvent,
-    RequestDelivery, RequestOptions, Role, StreamResponse, ThinkingConfig,
+    RequestDelivery, RequestOptions, RetryKind, Role, StreamResponse, ThinkingConfig,
     provider::{BoxFuture, Provider},
 };
 use makima_storage::StateDir;
@@ -86,7 +87,10 @@ struct CapturedRequest {
     options: RequestOptions,
     system: String,
     tools: Value,
+    operation_id: Arc<str>,
+    attempt: u32,
     reply: flume::Sender<StreamResponse>,
+    fail: flume::Sender<AgentError>,
 }
 
 async fn request_with_command_diagnostics(
@@ -375,11 +379,12 @@ impl Provider for ScriptedProvider {
         _: &'a flume::Sender<ProviderEvent>,
         options: RequestOptions,
         _: Option<&'a SessionRef>,
-        _invocation: &'a Invocation,
+        invocation: &'a Invocation,
         _delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let (reply, response) = flume::bounded(1);
+            let (fail, failure) = flume::bounded(1);
             self.requests
                 .send(CapturedRequest {
                     model: model.spec(),
@@ -387,14 +392,25 @@ impl Provider for ScriptedProvider {
                     options,
                     system: system.into(),
                     tools: tools.clone(),
+                    operation_id: invocation.operation_id.clone(),
+                    attempt: invocation.attempt,
                     reply,
+                    fail,
                 })
                 .map_err(|_| AgentError::Config {
                     message: "scripted request receiver closed".into(),
                 })?;
-            response.recv_async().await.map_err(|_| AgentError::Config {
-                message: "scripted response gate closed".into(),
+            futures_lite::future::race(async { response.recv_async().await.map(Ok) }, async {
+                match failure.recv_async().await {
+                    Ok(error) => Ok(Err(error)),
+                    // Callers that only use `reply` can drop the failure gate.
+                    Err(_) => std::future::pending().await,
+                }
             })
+            .await
+            .map_err(|_| AgentError::Config {
+                message: "scripted response gate closed".into(),
+            })?
         })
     }
 }
@@ -5088,5 +5104,392 @@ fn trusted_command_wait_keeps_child_delivery() {
             ]
         );
         shutdown_manager(&fixture.manager).await;
+    });
+}
+
+struct AttachmentBackend(ToolContext);
+
+impl ActorBackend for AttachmentBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        turn: TurnContext,
+        input: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let ctx = &self.0;
+            let params = AgentParams {
+                agent_id: turn.agent_id,
+                provider: ctx.provider.clone(),
+                model: (*ctx.model).clone(),
+                config: ctx.config.clone(),
+                tool_output_lines: ctx.tool_output_lines,
+                permissions: ctx.permissions.clone(),
+                session_id: None,
+                mailbox: None,
+                timeouts: ctx.timeouts,
+                file_tracker: ctx.file_tracker.clone(),
+                prompt_slots: ctx.prompt_slots.clone(),
+                modes: ctx.modes.clone(),
+                subagent_cancels: ctx.subagent_cancels.clone(),
+                registry: ctx.registry.clone(),
+                audience: ctx.audience,
+                question_mode: ctx.question_mode,
+                model_policy: ctx.model_policy.clone(),
+                providers: ctx.providers.clone(),
+                file_write_locks: ctx.file_write_locks.clone(),
+                offload: None,
+                managed_turn: None,
+            };
+            let run = AgentRunParams {
+                history,
+                system: String::new(),
+                event_tx: ctx.event_tx.clone(),
+                tools: RequestTools::build_for_tui(
+                    &ctx.registry,
+                    &Default::default(),
+                    &ctx.model,
+                    &ctx.config,
+                    false,
+                    false,
+                ),
+            };
+            BackendResult::EnteredRun(
+                Agent::for_actor_turn(params, run, &turn, Default::default())
+                    .run(turn.turn_id.unwrap(), input)
+                    .await,
+            )
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+
+    fn admission_preparation(&self) -> Option<makima_agent::actor::AdmissionPreparation> {
+        Some(
+            TurnSetup {
+                registry: self.0.registry.clone(),
+                modes: self.0.modes.clone(),
+                local_tools: self.0.local_tools.clone(),
+                slots: PromptSlotSource::default(),
+                mcp: None,
+                instructions: false,
+            }
+            .preparation(),
+        )
+    }
+}
+
+const ATTACHED_TOOL: &str = "attachment_probe";
+const NESTING_TOOL: &str = "attachment_nest";
+const ATTACHMENT_DENIED: &str = "tool not available for this agent";
+const ATTACHMENT_LUA: &str = r#"
+    makima.api.register_tool({
+        name = "attachment_probe", description = "Snapshot probe", enabled_by_default = false,
+        schema = { type = "object", properties = {} },
+        handler = function(_, ctx)
+            local claim, err = ctx:tool_claim()
+            assert(not err, err)
+            return claim and makima.json.encode(claim) or "no claim"
+        end,
+    })
+    makima.api.register_tool({
+        name = "attachment_nest", description = "Nested dispatch probe",
+        schema = { type = "object", properties = {} },
+        handler = function(_, ctx)
+            assert(ctx:tool_claim() == nil)
+            local ok, err = assert(ctx:agent()):add_tool(ctx, "attachment_probe")
+            assert(not ok and err)
+            local result, call_err = makima.agent.call_tool(ctx, "attachment_probe", {})
+            if not result then return { llm_output = call_err, is_error = true } end
+            return result
+        end,
+    })
+    makima.api.register_command({
+        name = "attachment", tui_only = true, arguments = { raw = true },
+        handler = function(opts, ctx)
+            local root = assert(ctx:agent())
+            assert(ctx:tool_claim() == nil)
+            if opts.args == "remove" then
+                assert(root:remove_tool(ctx, "attachment_probe"))
+                assert(root:remove_tool(ctx, "attachment_probe"))
+            else
+                assert(root:add_tool(ctx, "attachment_probe"))
+            end
+            assert(not root:add_tool(ctx, "attachment_nest"))
+        end,
+    })
+"#;
+
+fn last_attachment_output(request: &CapturedRequest) -> (&str, bool) {
+    match request.messages.last().unwrap().content.last().unwrap() {
+        ContentBlock::ToolResult {
+            content, is_error, ..
+        } => (content, *is_error),
+        block => panic!("expected a tool result: {block:?}"),
+    }
+}
+
+#[test_case::test_case(false, AgentMode::Build; "non_tui_root")]
+#[test_case::test_case(true, AgentMode::Plan("/test/attachment-plan.md".into()); "mode_excludes_attachment")]
+fn conditional_tool_respects_frontend_and_mode(tui: bool, mode: AgentMode) {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(registry.clone()).unwrap();
+        host.load_source("attachment_owner", ATTACHMENT_LUA)
+            .unwrap();
+        let (requests_tx, requests) = flume::unbounded();
+        let (mut context, _events, _cancel) =
+            common::ctx_with_provider(Arc::new(ScriptedProvider {
+                requests: requests_tx,
+            }));
+        context.registry = registry;
+        context.mode = mode;
+        let mut definition = context.modes.current(&context.mode);
+        if tui {
+            definition.tools = Some(vec![NESTING_TOOL.into()]);
+        }
+        let config = common::effective_config(&context)
+            .with_context(makima_agent::AgentContextSnapshot::new(context.cwd.clone()))
+            .with_mode_def(Some(definition));
+        let manager = if tui {
+            AgentManagerHandle::new_tui(Default::default())
+        } else {
+            AgentManagerHandle::new(Default::default())
+        }
+        .unwrap();
+        let root = manager
+            .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                Ok::<_, String>(
+                    Box::new(AttachmentBackend(context.clone())) as Box<dyn ActorBackend>
+                )
+            })
+            .unwrap();
+        let target = common::install_root(&host, root.clone(), context);
+        let attach = run_command(&host.command_registry(), "/attachment", 0, Some(target));
+        let result = bounded(attach.recv_async(), "try attachment")
+            .await
+            .unwrap();
+        if tui {
+            assert_eq!(result, Ok(()));
+        } else {
+            assert!(result.unwrap_err().contains("require a live TUI root"));
+        }
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(
+                AgentInput::new("probe".into(), Vec::new()),
+                None,
+                String::new(),
+            )
+            .unwrap();
+        let first = bounded(requests.recv_async(), "initial request")
+            .await
+            .unwrap();
+        assert!(
+            !common::tool_names(&first.tools)
+                .iter()
+                .any(|name| name == ATTACHED_TOOL)
+        );
+        first
+            .reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({})))
+            .unwrap();
+        let next = bounded(requests.recv_async(), "request after rejected tool")
+            .await
+            .unwrap();
+        assert_eq!(next.tools, first.tools);
+        let (output, error) = last_attachment_output(&next);
+        assert!(error && output.contains(ATTACHMENT_DENIED), "{output}");
+        next.reply.send(common::canned_reply("done")).unwrap();
+        assert!(matches!(
+            bounded(ticket.wait(), "settle attachment test").await,
+            TurnOutcome::Completed { .. }
+        ));
+        shutdown_manager(&manager).await;
+    });
+}
+
+#[test]
+fn conditional_tool_uses_answering_request_and_strips_nested_claims() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(registry.clone()).unwrap();
+        host.load_source("attachment_owner", ATTACHMENT_LUA)
+            .unwrap();
+        host.load_source(
+            "attachment_foreign",
+            r#"
+            makima.api.register_command({
+                name = "attachment_foreign", tui_only = true,
+                handler = function(_, ctx)
+                    local root = assert(ctx:agent())
+                    local ok, err = root:remove_tool(ctx, "attachment_probe")
+                    assert(not ok and string.find(err, "owned by this plugin", 1, true))
+                end,
+            })
+        "#,
+        )
+        .unwrap();
+        let (requests_tx, requests) = flume::unbounded();
+        let (mut context, _events, _cancel) =
+            common::ctx_with_provider(Arc::new(ScriptedProvider {
+                requests: requests_tx,
+            }));
+        context.registry = registry;
+        context.timeouts.retry.base_delay = Duration::ZERO;
+        context.timeouts.retry.max_delay = Duration::ZERO;
+        let config = common::effective_config(&context)
+            .with_context(makima_agent::AgentContextSnapshot::new(context.cwd.clone()));
+        let manager = AgentManagerHandle::new_tui(Default::default()).unwrap();
+        let root = manager
+            .create_root_with_config(Some(config), Vec::new(), None, |_| {
+                Ok::<_, String>(
+                    Box::new(AttachmentBackend(context.clone())) as Box<dyn ActorBackend>
+                )
+            })
+            .unwrap();
+        let target = common::install_root(&host, root.clone(), context);
+        let command = |cmd| run_command(&host.command_registry(), cmd, 0, Some(target.clone()));
+        let actor = root.actor().unwrap();
+        let ticket = actor
+            .admit_turn(
+                AgentInput::new("probe".into(), Vec::new()),
+                None,
+                String::new(),
+            )
+            .unwrap();
+        let request = || bounded(requests.recv_async(), "attachment provider request");
+        let first = request().await.unwrap();
+        assert_eq!(common::tool_names(&first.tools), [NESTING_TOOL]);
+        assert_eq!(
+            bounded(command("/attachment").recv_async(), "attach")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            bounded(
+                command("/attachment_foreign").recv_async(),
+                "foreign remove"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        first
+            .fail
+            .send(AgentError::Transport {
+                message: "scripted retry".into(),
+                retry: Some(RetryKind::Connect),
+            })
+            .unwrap();
+        let retry = request().await.unwrap();
+        assert_eq!(retry.operation_id, first.operation_id);
+        assert_eq!(retry.attempt, first.attempt + 1);
+        assert_eq!(retry.tools, first.tools);
+        retry
+            .reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({})))
+            .unwrap();
+        let exposed = request().await.unwrap();
+        assert_ne!(exposed.operation_id, first.operation_id);
+        assert_eq!(
+            common::tool_names(&exposed.tools),
+            [NESTING_TOOL, ATTACHED_TOOL]
+        );
+        let (output, error) = last_attachment_output(&exposed);
+        assert!(error && output.contains(ATTACHMENT_DENIED), "{output}");
+        exposed
+            .reply
+            .send(common::canned_tool_use(NESTING_TOOL, json!({})))
+            .unwrap();
+        let direct = request().await.unwrap();
+        assert_eq!(last_attachment_output(&direct), ("no claim", false));
+        direct
+            .reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({})))
+            .unwrap();
+        let replacing = request().await.unwrap();
+        let (output, error) = last_attachment_output(&replacing);
+        assert!(!error, "{output}");
+        let first_claim: Value = serde_json::from_str(output).unwrap();
+        assert_eq!(first_claim["turn_id"], ticket.turn_id().to_string());
+        assert_eq!(first_claim["current"], true);
+        assert_eq!(
+            bounded(command("/attachment").recv_async(), "idempotent attach")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        replacing
+            .reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({"round": 2})))
+            .unwrap();
+        let old = request().await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(last_attachment_output(&old).0).unwrap(),
+            first_claim
+        );
+        assert_eq!(
+            bounded(command("/attachment remove").recv_async(), "detach")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            bounded(command("/attachment").recv_async(), "reattach")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        old.reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({"round": 3})))
+            .unwrap();
+        let new = request().await.unwrap();
+        let historical: Value = serde_json::from_str(last_attachment_output(&new).0).unwrap();
+        assert_eq!(historical["activation"], first_claim["activation"]);
+        assert_eq!(historical["current"], false);
+        assert_eq!(new.tools, exposed.tools);
+        new.reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({"round": 4})))
+            .unwrap();
+        let revoked = request().await.unwrap();
+        let after_reattach: Value =
+            serde_json::from_str(last_attachment_output(&revoked).0).unwrap();
+        assert_ne!(after_reattach["activation"], first_claim["activation"]);
+        assert_eq!(after_reattach["turn_id"], first_claim["turn_id"]);
+        assert_eq!(after_reattach["current"], true);
+        host.unload("attachment_owner").unwrap();
+        revoked
+            .reply
+            .send(common::canned_tool_use(ATTACHED_TOOL, json!({"round": 5})))
+            .unwrap();
+        let hidden = request().await.unwrap();
+        assert!(common::tool_names(&hidden.tools).is_empty());
+        assert!(last_attachment_output(&hidden).1);
+        hidden.reply.send(common::canned_reply("done")).unwrap();
+        assert!(matches!(
+            bounded(ticket.wait(), "settle attachment test").await,
+            TurnOutcome::Completed { .. }
+        ));
+        shutdown_manager(&manager).await;
     });
 }

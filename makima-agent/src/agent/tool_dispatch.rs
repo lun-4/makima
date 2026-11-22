@@ -134,6 +134,7 @@ pub async fn run(
     }
     let is_mcp = matches!(resolved.route, Route::Mcp(..));
     let mut execution_ctx = ctx.clone();
+    execution_ctx.tool_claim = None;
     execution_ctx.pending_output_limits = hook
         .as_ref()
         .filter(|hook| hook.installed.wraps(name, HookStage::Output))
@@ -552,7 +553,9 @@ pub(crate) fn authorize_advertised(ctx: &ToolContext, name: &str) -> bool {
     }
     let available = match &resolved.route {
         Route::Native(entry) => {
-            entry.tool.audience().contains(ctx.audience) && ctx.tool_filter.matches(resolved.name)
+            entry.tool.audience().contains(ctx.audience)
+                && ctx.tool_filter.matches(resolved.name)
+                && (entry.tool.enabled_by_default() || ctx.advertised_attachment(entry).is_some())
         }
         Route::Local(local) => local.audience.contains(ctx.audience),
         Route::Mcp(..) | Route::ToolSearch(_) => true,
@@ -849,13 +852,15 @@ async fn run_native_tool(
         None => None,
     };
 
-    if !binding_matches(
-        &Resolved {
-            name,
-            route: Route::Native(entry.clone()),
-        },
-        ctx,
-    ) {
+    if (!entry.tool.enabled_by_default() && ctx.advertised_attachment(&entry).is_none())
+        || !binding_matches(
+            &Resolved {
+                name,
+                route: Route::Native(entry.clone()),
+            },
+            ctx,
+        )
+    {
         return done_error(format!("{UNAVAILABLE_TOOL_PREFIX}: {name}"));
     }
     if origin.is_model() {
@@ -864,14 +869,31 @@ async fn run_native_tool(
             .send(AgentEvent::ToolExecutionStart { id: id.clone() });
     }
 
+    let claim = if origin.is_model() && !entry.tool.enabled_by_default() {
+        ctx.advertised_attachment(&entry)
+            .zip(ctx.managed_turn.as_ref())
+            .map(|(activation, turn)| crate::tools::ToolClaim {
+                turn: turn.clone(),
+                tool: Arc::clone(&tool_id),
+                activation: activation.id,
+            })
+    } else {
+        None
+    };
     let result = match locked {
-        Some((exec_ctx, guard, key)) => {
+        Some((mut exec_ctx, guard, key)) => {
+            exec_ctx.tool_claim = claim;
             let result = invocation.execute(&exec_ctx).await;
             if result.output.is_ok() {
                 ctx.file_tracker.record_read(&key);
             }
             drop(guard);
             result
+        }
+        None if claim.is_some() => {
+            let mut exec_ctx = ctx.clone();
+            exec_ctx.tool_claim = claim;
+            invocation.execute(&exec_ctx).await
         }
         None => invocation.execute(ctx).await,
     };

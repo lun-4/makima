@@ -31,11 +31,14 @@ use event_listener::Event;
 use makima_providers::Message;
 use tracing::{info, warn};
 
-use crate::actor::{ActorCloseCut, ActorIdleGuard, ManagedTurnAdmission};
+use crate::CancelToken;
+use crate::actor::{ActorCloseCut, ActorIdleGuard, ActorState, ManagedTurnAdmission};
+use crate::tools::{RegisteredTool, ToolActivation, ToolRegistry, ToolSource};
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
     ReasonedCancelTrigger, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
+use makima_storage::id::MakimaId;
 
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(test, feature = "test-util"))]
@@ -171,6 +174,7 @@ struct TestGate {
 
 pub(crate) struct ManagerInner {
     generation: u64,
+    tui: bool,
     limits: AgentLimits,
     graph: Mutex<GraphState>,
     limiter: Arc<Semaphore>,
@@ -195,6 +199,15 @@ pub struct AgentManagerHandle(Arc<ManagerInner>);
 
 impl AgentManagerHandle {
     pub fn new(limits: AgentLimits) -> Result<Self, ManagerError> {
+        Self::new_inner(limits, false)
+    }
+
+    /// A graph hosted by the interactive TUI, whose root supports tool attachments.
+    pub fn new_tui(limits: AgentLimits) -> Result<Self, ManagerError> {
+        Self::new_inner(limits, true)
+    }
+
+    fn new_inner(limits: AgentLimits, tui: bool) -> Result<Self, ManagerError> {
         if limits.max_concurrent_agent_turns == 0
             || limits.max_agent_depth == 0
             || limits.max_children_per_agent == 0
@@ -204,6 +217,7 @@ impl AgentManagerHandle {
         }
         Ok(AgentManagerHandle(Arc::new(ManagerInner {
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
+            tui,
             limiter: Arc::new(Semaphore::new(limits.max_concurrent_agent_turns)),
             limits,
             watchers: Mutex::new(WatcherRegistry::default()),
@@ -234,6 +248,115 @@ impl AgentManagerHandle {
 }
 
 impl AgentManagerHandle {
+    /// Change an opt-in binding for the pinned root. The host must supply
+    /// the caller's validated plugin identity and revocation token.
+    pub fn set_tool_attachment(
+        &self,
+        agent_id: AgentId,
+        registry: &ToolRegistry,
+        name: &str,
+        plugin: &str,
+        owner: &CancelToken,
+        attach: bool,
+    ) -> Result<(), String> {
+        self.with_tool_root(agent_id, |state| {
+            if owner.is_cancelled() {
+                return Err("tool attachment owner is revoked".into());
+            }
+            let entry = registry.get(name).ok_or_else(|| format!("unknown tool: {name}"))?;
+            if !matches!(&entry.source, ToolSource::Lua { plugin: registered } if registered.as_ref() == plugin)
+                || entry.tool.enabled_by_default()
+            {
+                return Err(format!("not an opt-in tool owned by this plugin: {name}"));
+            }
+            if attach {
+                if !state.tool_attachments.get(name).is_some_and(|current| current.matches(&entry)) {
+                    state.tool_attachments.insert(name.into(), ToolActivation {
+                        id: MakimaId::generate(),
+                        entry,
+                        owner: owner.clone(),
+                    });
+                }
+            } else {
+                state.tool_attachments.remove(name);
+            }
+            Ok(())
+        })?
+    }
+
+    fn with_tool_root<R>(
+        &self,
+        agent_id: AgentId,
+        f: impl FnOnce(&mut ActorState) -> R,
+    ) -> Result<R, &'static str> {
+        const ROOT_REQUIRED: &str = "tool attachments require a live TUI root";
+        if !self.0.tui {
+            return Err(ROOT_REQUIRED);
+        }
+        // Same lock order as root idle reservation. Snapshot/mutation share
+        // the actor state lock with close and future retirement fences.
+        let graph = self.lock_graph();
+        if graph.shutting_down || graph.root_id != Some(agent_id) {
+            return Err(ROOT_REQUIRED);
+        }
+        let node = graph.nodes.get(&agent_id).ok_or(ROOT_REQUIRED)?;
+        if node.lifecycle != GraphLifecycle::Live {
+            return Err(ROOT_REQUIRED);
+        }
+        let actor = node.actor.as_ref().ok_or(ROOT_REQUIRED)?;
+        let mut state = actor
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(ROOT_REQUIRED);
+        }
+        Ok(f(&mut state))
+    }
+
+    pub(crate) fn tool_attachments(
+        &self,
+        agent_id: AgentId,
+        candidates: &[(RegisteredTool, serde_json::Value)],
+    ) -> HashMap<String, ToolActivation> {
+        self.with_tool_root(agent_id, |state| {
+            state
+                .tool_attachments
+                .retain(|_, activation| !activation.owner.is_cancelled());
+            candidates
+                .iter()
+                .filter_map(|(entry, _)| {
+                    let name = entry.name();
+                    let activation = state.tool_attachments.get(name)?;
+                    activation
+                        .matches(entry)
+                        .then(|| (name.to_owned(), activation.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn has_tool_activation(
+        &self,
+        turn: &CurrentManagedTurn,
+        name: &str,
+        activation: MakimaId,
+        registry: &ToolRegistry,
+    ) -> bool {
+        self.validate_active(turn).is_ok()
+            && self
+                .with_tool_root(turn.agent_id(), |state| {
+                    state.tool_attachments.get(name).is_some_and(|current| {
+                        current.id == activation
+                            && !current.owner.is_cancelled()
+                            && registry.is_current(&current.entry)
+                    })
+                })
+                .unwrap_or(false)
+    }
+
     pub fn same_manager(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

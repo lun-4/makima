@@ -717,6 +717,10 @@ impl TrustedContext {
         Ok(())
     }
 
+    pub(crate) fn plugin_revocation(&self) -> &CancelToken {
+        &self.authority.owner.publication_cancel
+    }
+
     pub(crate) fn validate_target(&self, lua: &Lua, target: &AgentRef) -> Result<(), String> {
         self.validate(lua)?;
         self.services

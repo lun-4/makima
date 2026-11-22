@@ -78,6 +78,15 @@ const CONTEXT_DOCS: ModuleDoc = ModuleDoc {
             example: "",
             guard: None,
         },
+        FnDoc {
+            name: "tool_claim",
+            args: "",
+            desc: "Read attribution for a direct model call to an attached tool. Nested, named, and background calls get nil, as do other live contexts without a claim. This describes the answering request, not the tool state at the time of dispatch.",
+            params: &[],
+            returns: "(table?, string?) {turn_id, activation, current}; IDs are opaque strings. current is a point-in-time check that the turn and attachment are still live, not authority to commit a plugin-state change. Fence commits separately.",
+            example: "",
+            guard: None,
+        },
     ],
 };
 

@@ -564,6 +564,8 @@ impl HeadlessBackend {
             pending_output_limits: None,
             write_lock_chain: Arc::new(Vec::new()),
             managed_turn: None,
+            advertised_attachments: None,
+            tool_claim: None,
         }
     }
 

@@ -414,12 +414,11 @@ impl TuiActorBackend {
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
     fn build_tools(&self, model: &Model, workflow: bool) -> RequestTools {
-        RequestTools::build(
+        RequestTools::build_for_tui(
             ToolRegistry::global(),
             &self.vars,
             model,
             &self.config,
-            &[],
             workflow,
             self.mcp.is_some(),
         )
