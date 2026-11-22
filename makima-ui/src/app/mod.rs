@@ -1058,6 +1058,11 @@ impl App {
         self.status_bar.flash(msg);
     }
 
+    #[cfg(test)]
+    pub(crate) fn flash_text(&self) -> Option<&str> {
+        self.status_bar.flash_text()
+    }
+
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
         if let Some(map) = data.as_object_mut() {
             map.insert(

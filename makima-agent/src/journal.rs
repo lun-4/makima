@@ -124,8 +124,6 @@ pub enum JournalError {
     Preparation(String),
     #[error("cannot publish spawn while an earlier journal change is pending")]
     SpawnPublicationPending,
-    #[error("cannot install rewind while an earlier journal change is pending")]
-    RewindPublicationPending,
     #[error("prepared journal commits cannot add agent identities")]
     PreparedAgents,
     #[error("pending journal conversion does not match its reserved records")]
@@ -411,12 +409,22 @@ pub struct JournalPrepared {
     pending: Option<JournalPending>,
     commit: JournalCommit,
     candidate: SessionJournalSnapshot,
+    fork: Option<(AgentId, serde_json::Value)>,
     _boundary: RwLockWriteGuardArc<()>,
     _publication: RwLockWriteGuardArc<()>,
 }
 
 impl JournalPrepared {
     pub fn commit(mut self) -> Result<u64, JournalError> {
+        self.install()
+    }
+
+    pub(crate) fn install_fork(
+        mut self,
+        root: AgentId,
+        event: serde_json::Value,
+    ) -> Result<u64, JournalError> {
+        self.fork = Some((root, event));
         self.install()
     }
 
@@ -551,6 +559,20 @@ impl JournalPrepared {
         }
         for address in SessionJournal::state_addresses(&self.commit) {
             state.plugin_state.reservations.remove(&address);
+        }
+        if let Some((root, event)) = &self.fork {
+            let history = &self.commit.histories[root];
+            state.context_events.push(event.clone());
+            state.staged[index].histories.remove(root);
+            state.emitted_histories.insert(
+                *root,
+                EmittedHistory {
+                    epoch: history.epoch,
+                    len: history.messages.len(),
+                    compacted: history.compacted,
+                    conversation: history.conversation.clone(),
+                },
+            );
         }
         SessionJournal::collect_ready(state);
         state.published_revision = state.published_revision.max(self.candidate.revision);
@@ -943,50 +965,8 @@ impl SessionJournal {
         self.lock().context_events.clone()
     }
 
-    pub(crate) fn install_rewind(
-        &self,
-        binding: JournalIncarnation,
-        history: HistorySnapshot,
-        record: JournalSessionRecord,
-    ) -> Result<(), JournalError> {
-        let mut state = self.lock();
-        Self::validate_incarnations(&state, from_ref(&binding))?;
-        if !state.staged.is_empty() {
-            return Err(JournalError::RewindPublicationPending);
-        }
-        let candidate = Self::apply_commit(
-            &state.snapshot,
-            JournalCommit {
-                incarnations: vec![binding.clone()],
-                histories: [(binding.agent, history.clone())].into(),
-                managed_histories: [binding.agent].into(),
-                ..Default::default()
-            },
-        )?;
-        state.snapshot = candidate.clone();
-        state.staged.push_back(StagedCommit {
-            snapshot: candidate,
-            pending: None,
-            histories: BTreeSet::new(),
-        });
-        state.emitted_histories.insert(
-            binding.agent,
-            EmittedHistory {
-                epoch: history.epoch,
-                len: history.messages.len(),
-                compacted: history.compacted,
-                conversation: history.conversation.clone(),
-            },
-        );
-        Self::collect_ready(&mut state);
-        state.unwritten.push(record);
-        state.unwritten.push(SessionRecord::History {
-            agent: binding.agent,
-            compacted: history.compacted,
-            conversation: history.conversation,
-        });
-        Self::emit_unwritten(&mut state);
-        Ok(())
+    pub(crate) fn writer(&self) -> Option<SessionWriter> {
+        self.lock().writer.clone()
     }
 
     pub fn session_id(&self) -> Option<MakimaId> {
@@ -1708,6 +1688,7 @@ impl SessionJournal {
                         pending: Some(pending),
                         commit,
                         candidate,
+                        fork: None,
                         _boundary: boundary,
                         _publication: publication,
                     });
@@ -2292,7 +2273,7 @@ impl SessionJournal {
                 record,
                 SessionRecord::Msg { .. }
                     | SessionRecord::Compaction { .. }
-                    | SessionRecord::Fork { .. }
+                    | SessionRecord::History { .. }
             ) && let Ok(event) = serde_json::to_value(record)
             {
                 state.context_events.push(event);

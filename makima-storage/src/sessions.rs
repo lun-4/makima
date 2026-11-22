@@ -500,7 +500,9 @@ pub enum SessionRecord<M, U, T> {
     #[serde(rename = "fork")]
     Fork {
         target: Option<MakimaId>,
+        note_id: MakimaId,
         note: String,
+        conversation: ConversationState,
     },
     #[serde(rename = "history")]
     History {
@@ -696,7 +698,6 @@ impl ContextEntry {
 }
 
 /// Replays a root's events, retaining the historical line at each message for redo.
-/// Fork notes occupy stable ids outside the UUIDv7 namespace used by messages.
 pub fn context_entries(
     events: &[serde_json::Value],
     root: AgentId,
@@ -705,7 +706,7 @@ pub fn context_entries(
     let mut nodes: Vec<(Option<usize>, ContextEntry)> = Vec::new();
     let mut head = None;
     let mut lines = HashMap::new();
-    for (index, event) in events.iter().enumerate() {
+    for event in events {
         if event["t"] == "fork" {
             let target: Option<MakimaId> =
                 serde_json::from_value(event["target"].clone()).map_err(StorageError::from)?;
@@ -717,10 +718,8 @@ pub fn context_entries(
                         .ok_or(SessionError::InvalidForkTarget { target })
                 })
                 .transpose()?;
-            let mut bytes = [0; 16];
-            bytes[8..].copy_from_slice(&(index as u64).to_be_bytes());
-            let id = serde_json::from_value(serde_json::json!(bs58::encode(bytes).into_string()))
-                .map_err(StorageError::from)?;
+            let id =
+                serde_json::from_value(event["note_id"].clone()).map_err(StorageError::from)?;
             let note = serde_json::from_value(event["note"].clone()).map_err(StorageError::from)?;
             nodes.push((head, ContextEntry::Note { id, note }));
             head = Some(nodes.len() - 1);
@@ -1283,11 +1282,22 @@ where
             })
             .collect();
     }
+    let root_value = serde_json::json!(root);
     for event in &context_events {
-        if event["t"] == "history" && event["agent"] == serde_json::json!(root) {
-            meta.compacted = event["compacted"].as_bool().unwrap_or_default();
-            meta.conversation = serde_json::from_value(event["conversation"].clone())
-                .map_err(StorageError::from)?;
+        match event["t"].as_str() {
+            Some("fork") => {
+                meta.compacted = false;
+                meta.conversation = Some(
+                    serde_json::from_value(event["conversation"].clone())
+                        .map_err(StorageError::from)?,
+                );
+            }
+            Some("history") if event["agent"] == root_value => {
+                meta.compacted = event["compacted"].as_bool().unwrap_or_default();
+                meta.conversation = serde_json::from_value(event["conversation"].clone())
+                    .map_err(StorageError::from)?;
+            }
+            _ => {}
         }
     }
     let mut session = Session {
@@ -1795,6 +1805,10 @@ impl<M, U, T> Session<M, U, T> {
 
     pub fn context_events(&self) -> &[serde_json::Value] {
         &self.context_events
+    }
+
+    pub fn replace_context_events(&mut self, events: Vec<serde_json::Value>) {
+        self.context_events = events;
     }
 
     #[cfg(test)]
@@ -2376,8 +2390,14 @@ where
     }
 
     pub fn fork(&mut self, target: Option<MakimaId>, note: String) -> Result<(), SessionError> {
-        let event = serde_json::to_value(SessionRecord::<M, U, T>::Fork { target, note })
-            .map_err(StorageError::from)?;
+        let conversation = ConversationState::fresh(None);
+        let event = serde_json::to_value(SessionRecord::<M, U, T>::Fork {
+            target,
+            note_id: MakimaId::generate(),
+            note,
+            conversation: conversation.clone(),
+        })
+        .map_err(StorageError::from)?;
         self.context_events.push(event);
         let rebuilt =
             context_entries(&self.context_events, self.message_agent()).and_then(|entries| {
@@ -2398,6 +2418,8 @@ where
         };
         self.message_ids = ids;
         self.messages = Arc::new(messages);
+        self.meta.compacted = false;
+        self.meta.conversation = Some(conversation);
         self.rewrite_messages();
         Ok(())
     }
@@ -3145,12 +3167,13 @@ mod tests {
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionMeta, SessionRecord,
-        StorageError, TitleSource, encode_records,
+        StorageError, TitleSource, context_entries, encode_records,
     };
     use super::{LEGACY_CHILD_UNRESTORABLE, LEGACY_PLAN_SLOT, StoredMode};
     use super::{Post, PostLevel, StoredPost};
     use super::{Prefs, read_prefs, write_prefs};
     use crate::StateDir;
+    use crate::conversation::ConversationState;
     use crate::id::{AgentId, MakimaId};
     use crate::plans::{PLAN_STATE_KEY, PlanSlot};
     use crate::session_lock;
@@ -3209,10 +3232,15 @@ mod tests {
         let second_id = session.last_message_id().unwrap();
         if compact {
             session.replace_messages(vec![user_message("summary")]);
+            session.meta.compacted = true;
+            session.meta.conversation = Some(ConversationState::fresh(None));
         }
         session.save_to(directory.path()).unwrap();
         let historical_events = session.context_events().to_vec();
+        let previous = session.meta.conversation.clone();
         session.fork(Some(first_id), NOTE.into()).unwrap();
+        assert!(!session.meta.compacted);
+        assert_ne!(session.meta.conversation, previous);
         assert_eq!(session.messages()[0], first);
         assert_eq!(session.messages()[1]["content"][0]["text"], NOTE);
         assert_eq!(session.messages()[1]["kind"], "observation");
@@ -3243,6 +3271,69 @@ mod tests {
                 .filter(|event| event["t"] == "fork")
                 .count(),
             2
+        );
+    }
+
+    #[test_case(false; "fork_is_latest_root_history")]
+    #[test_case(true; "later_root_history_supersedes_fork")]
+    fn replay_fork_metadata_and_note_id(later_history: bool) {
+        const NOTE: &str = "rewound to session start";
+        let directory = TempDir::new().unwrap();
+        let mut session = TestSession::new("model", "/project");
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        session.meta.compacted = true;
+        session.meta.conversation = Some(ConversationState::fresh(None));
+        session.save_to(directory.path()).unwrap();
+
+        let note_id = MakimaId::generate();
+        let conversation = ConversationState::fresh(None);
+        let mut records = vec![
+            SessionRecord::<Value, Value, Value>::Fork {
+                target: None,
+                note_id,
+                note: NOTE.into(),
+                conversation: conversation.clone(),
+            },
+            SessionRecord::History {
+                agent: AgentId::generate(),
+                compacted: true,
+                conversation: Some(ConversationState::fresh(None)),
+            },
+        ];
+        let expected = if later_history {
+            let next = ConversationState::fresh(None);
+            records.push(SessionRecord::History {
+                agent: root,
+                compacted: true,
+                conversation: Some(next.clone()),
+            });
+            next
+        } else {
+            conversation
+        };
+        OpenOptions::new()
+            .append(true)
+            .open(jsonl_path(directory.path(), session.id))
+            .unwrap()
+            .write_all(&encode_records(&records).unwrap())
+            .unwrap();
+
+        let loaded = TestSession::load_from(session.id, directory.path()).unwrap();
+        let history = loaded.history_snapshot();
+        assert_eq!(history.compacted, later_history);
+        assert_eq!(history.conversation, Some(expected));
+        assert_eq!(history.covered, None);
+        assert_eq!(loaded.chat_message_ids(None), [note_id]);
+        let transcript_events: Vec<_> = loaded
+            .context_events()
+            .iter()
+            .filter(|event| event["t"] != "history")
+            .cloned()
+            .collect();
+        assert_eq!(
+            context_entries(&transcript_events, root).unwrap()[0].id(),
+            note_id
         );
     }
 

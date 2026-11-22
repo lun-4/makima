@@ -5174,7 +5174,7 @@ fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
     app.recoverable_queue.push("queued prompt".into());
     app.finish_rewind(CUT.into());
     assert_eq!(app.input_box.buffer.value(), CUT);
-    assert_eq!(app.recoverable_queue, ["queued prompt"]);
+    assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats[1].last_message_text(), "child work");
     assert_eq!(app.chats[0].message_count(), 3);
     assert_eq!(app.chats[0].message_at(0).unwrap().text, FIRST);

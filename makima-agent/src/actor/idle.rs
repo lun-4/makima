@@ -73,18 +73,10 @@ impl ActorIdleGuard {
         self.actor.inner.history.load_full().as_ref().clone()
     }
 
-    pub(crate) fn install_rewind(
-        &self,
-        snapshot: HistorySnapshot<Message>,
-    ) -> Result<(), ActorError> {
+    pub(crate) fn install_rewind(&self, snapshot: HistorySnapshot<Message>) {
         let mut state = self.actor.inner.state.lock_unpoisoned();
-        if state.lifecycle != ActorLifecycle::Open {
-            return Err(lifecycle_error(state.lifecycle));
-        }
-        state.owned_idle(&self.owner).ok_or(ActorError::Busy)?;
         state.latest_history_turn = None;
         self.actor.inner.history.store(Arc::new(snapshot));
-        Ok(())
     }
 
     pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ActorError> {

@@ -1,7 +1,7 @@
 use crate::{
     AgentRef, History, HistorySnapshot, ToolOutput,
     actor::{ActorError, ActorIdleGuard},
-    journal::{JournalError, SessionJournal},
+    journal::{JournalCommit, JournalError, SessionJournal},
     subagents::format_subagents,
 };
 use makima_providers::{Message, TokenUsage};
@@ -172,18 +172,20 @@ impl RewindGuard {
         let note = format!(
             "The session was rewound. Current mode: {mode}.\n{FILE_WARNING}\n\nExisting subagents:\n{subagents}"
         );
+        let conversation = ConversationState::fresh(None);
         let record: SessionRecord<Message, TokenUsage, ToolOutput> = SessionRecord::Fork {
             target: predecessor,
+            note_id: MakimaId::generate(),
             note,
+            conversation: conversation.clone(),
         };
+        let event = serde_json::to_value(&record)
+            .map_err(|error| RewindError::Context(error.to_string()))?;
         let mut events = self.journal.context_events();
         if events.is_empty() {
             events = self.events.clone();
         }
-        events.push(
-            serde_json::to_value(&record)
-                .map_err(|error| RewindError::Context(error.to_string()))?,
-        );
+        events.push(event.clone());
         let entries = context_entries(&events, self.agent.id())
             .map_err(|error| RewindError::Context(error.to_string()))?;
         let mut messages = Vec::new();
@@ -202,18 +204,30 @@ impl RewindGuard {
         history.ids = Arc::new(ids);
         history.compacted = false;
         history.covered = None;
-        history.conversation = Some(ConversationState::fresh(None));
-        let _publication = self.journal.reserve_publication().await;
-        self.journal.install_rewind(
-            self.journal.incarnation(self.agent.id()),
-            history.clone(),
-            record,
-        )?;
-        self.idle.install_rewind(history.clone())?;
-        self.journal
-            .flush()
-            .await
-            .map_err(RewindError::Persistence)?;
+        history.conversation = Some(conversation);
+        let root = self.agent.id();
+        let prepared = self
+            .journal
+            .prepare(JournalCommit {
+                incarnations: vec![self.journal.incarnation(root)],
+                histories: [(root, history.clone())].into(),
+                managed_histories: [root].into(),
+                ..Default::default()
+            })
+            .await?;
+        if let Some(writer) = self.journal.writer() {
+            writer
+                .append_fork(record)
+                .await
+                .map_err(|error| RewindError::Persistence(error.to_string()))?;
+        } else if prepared.is_persistent() {
+            return Err(RewindError::Persistence(
+                "session journal has no writer".into(),
+            ));
+        }
+        prepared.install_fork(root, event)?;
+        self.idle.install_rewind(history.clone());
+        actor.clear_user_work();
         Ok(RewindOutcome::Fork { history, draft })
     }
 }
@@ -222,22 +236,173 @@ impl RewindGuard {
 mod tests {
     use super::{RewindError, RewindOutcome, RewindTargetId};
     use crate::{
-        AgentLimits, AgentManagerHandle, HistorySnapshot,
+        AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
+        TurnOutcome,
         journal::{JournalChange, JournalCommit, SessionJournal},
-        session_writer::StoredSession,
+        session_writer::{SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
     };
-    use makima_providers::Message;
+    use makima_providers::{Message, TokenUsage};
     use makima_storage::{
         id::{AgentId, MakimaId, TurnId},
         session_state::{ParentLink, StateChange, StoredDeliveryOp},
     };
-    use std::sync::Arc;
+    use std::{
+        fs::{File, OpenOptions},
+        io::{self, Seek, SeekFrom, Write},
+        sync::Arc,
+        time::Duration,
+    };
     use test_case::test_case;
 
     const FIRST: &str = "first user turn";
     const SECOND: &str = "second user turn";
     const REPORT: &str = "consumed child report";
+
+    const REPLACEMENT: &str = "replacement user turn";
+    const TORN_DRAFT: &[u8] = br#"{"t":"draft","text":"incomplete"#;
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct LogIo(File);
+
+    impl SessionIo for LogIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.write(bytes)
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            self.0.sync_all()
+        }
+
+        fn position(&mut self) -> io::Result<u64> {
+            self.0.seek(SeekFrom::End(0))
+        }
+
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.0.set_len(len)?;
+            self.0.seek(SeekFrom::Start(len))?;
+            Ok(())
+        }
+    }
+
+    #[test_case(false; "two_rewinds")]
+    #[test_case(true; "torn_line_after_fork")]
+    fn durable_fork_reopens_with_identical_history(torn_tail: bool) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("test", "/");
+            session.save_to(directory.path()).unwrap();
+            let path = directory.path().join(format!("{}.jsonl", session.id));
+            let log = || {
+                LogIo(
+                    OpenOptions::new()
+                        .read(true)
+                        .append(true)
+                        .open(&path)
+                        .unwrap(),
+                )
+            };
+            let writer = SessionWriter::with_io(session.id, log(), 1);
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let journal = manager.journal();
+            journal.bind_writer(writer.clone()).unwrap();
+            let root = manager
+                .create_root(
+                    vec![Message::user(FIRST.into()), Message::user(SECOND.into())],
+                    None,
+                    Box::new(MockBackend::STRICT.with_turn(|mut history, ctx, input, _| {
+                        Box::pin(async move {
+                            history.push(Message::user(input.message)).await.unwrap();
+                            BackendResult::EnteredRun(TurnOutcome::completed(
+                                ctx.agent_id,
+                                ctx.turn_id.unwrap(),
+                                TokenUsage::default(),
+                                1,
+                                DoneReason::EndTurn,
+                            ))
+                        })
+                    })),
+                )
+                .unwrap();
+            let actor = root.actor().unwrap();
+            let mut compacted = actor.committed_history_snapshot();
+            compacted.compacted = true;
+            journal
+                .commit(JournalCommit {
+                    histories: [(root.id(), compacted)].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let first = journal.snapshot().histories[&root.id()].ids[1];
+            let RewindOutcome::Fork { mut history, .. } = root
+                .begin_rewind(&session)
+                .unwrap()
+                .commit(RewindTargetId::Message(first))
+                .await
+                .unwrap()
+            else {
+                panic!("expected fork");
+            };
+            if !torn_tail {
+                actor
+                    .admit_turn(
+                        AgentInput::new(REPLACEMENT.into(), Vec::new()),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap()
+                    .wait()
+                    .await;
+                actor.runtime_barrier().await.unwrap();
+                let before = journal.snapshot();
+                let replacement = &before.histories[&root.id()];
+                assert_eq!(
+                    replacement.messages.last().unwrap().user_text(),
+                    Some(REPLACEMENT)
+                );
+                let RewindOutcome::Fork {
+                    history: second, ..
+                } = root
+                    .begin_rewind(&session)
+                    .unwrap()
+                    .commit(RewindTargetId::Message(*replacement.ids.last().unwrap()))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected fork");
+                };
+                assert_eq!(&second.ids[..history.ids.len()], history.ids.as_slice());
+                history = second;
+            }
+            assert_eq!(actor.committed_history_snapshot().ids, history.ids);
+            assert!(
+                manager
+                    .shutdown(SHUTDOWN_TIMEOUT)
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+            writer.append(Vec::new()).await.unwrap();
+            writer.close().await.unwrap();
+            if torn_tail {
+                let mut io = log();
+                assert_eq!(io.write(TORN_DRAFT).unwrap(), TORN_DRAFT.len());
+                io.sync().unwrap();
+            }
+            let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+            let restored = reopened.history_snapshot();
+            assert_eq!(restored.messages, history.messages);
+            assert_eq!(restored.ids, history.ids);
+            assert_eq!(restored.conversation, history.conversation);
+            assert!(!restored.compacted);
+            let forks = reopened
+                .context_events()
+                .iter()
+                .filter(|event| event["t"] == "fork")
+                .count();
+            assert_eq!(forks, if torn_tail { 1 } else { 2 });
+        });
+    }
 
     fn fixture() -> (AgentManagerHandle, crate::AgentRef, StoredSession) {
         let journal = Arc::new(SessionJournal::nonpersistent());

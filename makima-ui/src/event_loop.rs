@@ -2591,19 +2591,14 @@ impl<'t> EventLoop<'t> {
                 if let Some(idx) = self.runtime_position(&runtime) {
                     self.sessions[idx].app.rewind_pending = false;
                     match result {
-                        Ok(makima_agent::rewind::RewindOutcome::Fork { history: _, draft }) => {
+                        Ok(makima_agent::rewind::RewindOutcome::Fork { history, draft }) => {
                             let rt = &mut self.sessions[idx];
-                            let mut session =
-                                Arc::unwrap_or_clone(Arc::clone(&rt.app.state.session));
-                            match project_session_journal(&mut session, &rt.handles) {
-                                Ok(()) => {
-                                    rt.app.state.session = Arc::new(session);
-                                    rt.app.finish_rewind(
-                                        draft.user_text().unwrap_or_default().to_owned(),
-                                    );
-                                }
-                                Err(error) => rt.app.flash(error),
-                            }
+                            let journal = rt.handles.manager_and_root().0.journal();
+                            let session = rt.app.state.session_mut();
+                            session.adopt_history(&history);
+                            session.replace_context_events(journal.context_events());
+                            rt.app
+                                .finish_rewind(draft.user_text().unwrap_or_default().to_owned());
                         }
                         Ok(makima_agent::rewind::RewindOutcome::PlanningSession(parent)) => {
                             self.back_to_planning(idx, parent.session);
@@ -4291,9 +4286,6 @@ impl<'t> EventLoop<'t> {
                     rt.app.rewind_pending = false;
                     return;
                 };
-                if matches!(target, makima_agent::rewind::RewindTargetId::Message(_)) {
-                    rt.app.clear_rewind_queue();
-                }
                 let runtime = rt.handles.identity();
                 let tx = self.internal_tx.clone();
                 smol::spawn(async move {
@@ -5733,11 +5725,12 @@ mod tests {
         }
     }
     use crate::selection::SelectionZone;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use makima_agent::session_options::{
         SessionOptionCategory, SessionOptionDefinition, SessionOptionOwner, SessionOptionValue,
         SessionOptionsSnapshot, YOLO_OPTION_ID,
     };
+    use makima_agent::session_writer::SessionIo;
     use makima_agent::tools::ToolRegistry;
     use makima_agent::tools::offload::{MAX_OFFLOAD_SESSION_BYTES, OffloadBackend, OffloadError};
     use makima_agent::{
@@ -5749,7 +5742,13 @@ mod tests {
     use makima_providers::model::FastSupport;
     use makima_providers::{Effort, ModelCapabilities, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
-    use std::{fs, mem, pin::Pin, sync::atomic::AtomicBool};
+    use std::{
+        fs,
+        io::{Seek, SeekFrom, Write},
+        mem,
+        pin::Pin,
+        sync::atomic::AtomicBool,
+    };
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -7717,61 +7716,222 @@ end })
         shutdown_manager(&manager);
     }
 
+    const REWIND_TARGET: &str = "rewind target";
+    const REWIND_DRAFT: &str = "unfinished draft";
+    const REWIND_QUEUED: &str = "queued user turn";
+    const REWIND_IO_ERROR: &str = "injected fork I/O failure";
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ForkFailure {
+        Write,
+        Sync,
+    }
+
+    struct FailingForkIo {
+        log: fs::File,
+        failure: ForkFailure,
+        writing_fork: bool,
+    }
+
+    impl SessionIo for FailingForkIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.writing_fork && self.failure == ForkFailure::Write {
+                return Err(io::Error::other(REWIND_IO_ERROR));
+            }
+            self.log.write(bytes)
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            if self.writing_fork && self.failure == ForkFailure::Sync {
+                return Err(io::Error::other(REWIND_IO_ERROR));
+            }
+            self.log.sync_all()
+        }
+
+        fn position(&mut self) -> io::Result<u64> {
+            self.writing_fork = true;
+            self.log.seek(SeekFrom::End(0))
+        }
+
+        fn truncate(&mut self, len: u64) -> io::Result<()> {
+            self.writing_fork = false;
+            self.log.set_len(len)
+        }
+    }
+
+    fn rewind_runtime(
+        harness: &mut RuntimeHarness,
+        failure: Option<ForkFailure>,
+    ) -> SessionRuntime {
+        let mut session = harness.session();
+        session.push_message(Message::user(REWIND_TARGET.into()));
+        let ctx = harness.ctx();
+        let mut prepared = ctx.prepare_runtime(session).unwrap();
+        if let Some(failure) = failure {
+            let session = &prepared.app.app.state.session;
+            makima_storage::sessions::initialize_session_log(&ctx.sessions_dir, session).unwrap();
+            let log = fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(ctx.sessions_dir.join(format!("{}.jsonl", session.id)))
+                .unwrap();
+            let writer = SessionWriter::with_io(
+                session.id,
+                FailingForkIo {
+                    log,
+                    failure,
+                    writing_fork: false,
+                },
+                1,
+            );
+            prepared.checkpoint = Arc::new(writer.clone());
+            prepared.app.app.session_writer = Some(writer);
+        }
+        let mut runtime = prepared.activate(&ctx.model_slot, None).unwrap();
+        runtime.app.restore_display();
+        runtime
+    }
+
+    fn select_rewind(event_loop: &mut EventLoop<'_>) -> InternalEvent {
+        let app = &mut event_loop.sessions[0].app;
+        let actions = app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(matches!(actions.as_slice(), [Action::CommitRewind(_)]));
+        assert!(!app.has_modal_overlay());
+        event_loop.dispatch(0, actions);
+        loop {
+            let completion = event_loop.internal_rx.recv_timeout(PUMP_TIMEOUT).unwrap();
+            if matches!(completion, InternalEvent::RewindCommitted { .. }) {
+                return completion;
+            }
+        }
+    }
+
+    #[test_case(ForkFailure::Write; "write")]
+    #[test_case(ForkFailure::Sync; "fsync")]
+    fn rewind_persistence_failure_preserves_chat_draft_and_queue(failure: ForkFailure) {
+        with_event_loop_runtime(
+            |harness| rewind_runtime(harness, Some(failure)),
+            |event_loop| {
+                event_loop.dispatch(0, vec![Action::BeginRewind]);
+                let rt = &mut event_loop.sessions[0];
+                assert!(rt.app.has_modal_overlay());
+                let root = rt.app.root_agent.as_ref().unwrap().clone();
+                let journal = root.manager().journal();
+                let actor = root.actor().unwrap();
+                let ticket = actor
+                    .admit_turn(
+                        AgentInput::new(REWIND_QUEUED.into(), vec![]),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap();
+                rt.app.input_box.set_input(REWIND_DRAFT.into());
+                rt.app.persist_input();
+                rt.app.sync_focused_queue();
+                rt.app.queue.set_focus();
+                let events = journal.context_events();
+                let saved = journal.snapshot().histories[&root.id()].clone();
+                let history = rt.handles.history.load_full();
+                assert_eq!(rt.app.main_chat().last_message_text(), REWIND_TARGET);
+                assert_eq!(rt.app.queue.focus(), Some(0));
+                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
+                let completion = select_rewind(event_loop);
+                event_loop.handle_internal(completion);
+                let rt = &mut event_loop.sessions[0];
+                assert!(!rt.app.rewind_pending);
+                assert!(
+                    rt.app
+                        .flash_text()
+                        .is_some_and(|text| text.contains(REWIND_IO_ERROR))
+                );
+                assert_eq!(rt.app.main_chat().last_message_text(), REWIND_TARGET);
+                assert_eq!(rt.app.input_box.buffer.value(), REWIND_DRAFT);
+                assert_eq!(
+                    rt.app.state.session.meta.input_draft.as_deref(),
+                    Some(REWIND_DRAFT)
+                );
+                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
+                assert_eq!(rt.app.queue.focus(), Some(0));
+                assert_eq!(rt.app.queue.text_messages(), [REWIND_QUEUED]);
+                assert_eq!(actor.snapshot().queued, 1);
+                assert!(ticket.peek_result().is_none());
+                assert!(Arc::ptr_eq(&history, &rt.handles.history.load_full()));
+                let snapshot = journal.snapshot();
+                let current = &snapshot.histories[&root.id()];
+                assert_eq!(current.epoch, saved.epoch);
+                assert_eq!(current.ids, saved.ids);
+                assert_eq!(current.messages, saved.messages);
+                assert_eq!(current.conversation, saved.conversation);
+                assert_eq!(journal.context_events(), events);
+                assert!(!rt.app.has_modal_overlay());
+                smol::block_on(rt.checkpoint.close()).unwrap();
+                let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
+                assert_eq!(reopened.history_snapshot().messages, history.messages);
+                assert_eq!(reopened.history_snapshot().ids, history.ids);
+                assert_eq!(reopened.meta.input_draft.as_deref(), Some(REWIND_DRAFT));
+                assert!(
+                    !reopened
+                        .context_events()
+                        .iter()
+                        .any(|event| event["t"] == "fork")
+                );
+            },
+        );
+    }
+
     #[test]
     fn rewind_clears_admitted_user_work_before_releasing_guard() {
-        with_event_loop(|event_loop| {
-            let rt = &mut event_loop.sessions[0];
-            rt.app
-                .state
-                .session_mut()
-                .push_message(Message::user("rewind target".into()));
-            let root = rt.app.root_agent.as_ref().unwrap().clone();
-            let journal = root.manager().journal();
-            let mut history = rt.app.state.session.history_snapshot();
-            history.epoch = journal.snapshot().histories[&root.id()].epoch;
-            journal
-                .commit(makima_agent::journal::JournalCommit {
-                    histories: [(root.id(), history)].into(),
-                    ..Default::default()
-                })
-                .unwrap();
-            let guard = root.begin_rewind(&rt.app.state.session).unwrap();
-            let index = guard
-                .targets()
-                .iter()
-                .position(|target| {
-                    matches!(target.id, makima_agent::rewind::RewindTargetId::Message(_))
-                })
-                .unwrap();
-            let actor = root.actor().unwrap();
-            let ticket = actor
-                .admit_turn(
-                    AgentInput::new("queued user turn".into(), vec![]),
-                    None,
-                    String::new(),
-                )
-                .unwrap();
-            rt.app.persist_input();
-            assert!(!rt.app.state.session.meta.queued_messages.is_empty());
-            rt.app.rewind_guard = Some(guard);
-            event_loop.dispatch(0, vec![Action::CommitRewind(index)]);
-            assert_eq!(actor.snapshot().queued, 0);
-            assert!(event_loop.sessions[0].app.queue.is_empty());
-            assert!(
-                event_loop.sessions[0]
-                    .app
-                    .state
-                    .session
-                    .meta
-                    .queued_messages
-                    .is_empty()
-            );
-            let view = root.manager().journal().snapshot().fold().unwrap();
-            assert!(!view.scopes[&Some(root.id())].results.is_empty());
-            drop(ticket);
-            let completion = smol::block_on(event_loop.internal_rx.recv_async()).unwrap();
-            event_loop.handle_internal(completion);
-        });
+        with_event_loop_runtime(
+            |harness| rewind_runtime(harness, None),
+            |event_loop| {
+                event_loop.dispatch(0, vec![Action::BeginRewind]);
+                let rt = &mut event_loop.sessions[0];
+                let root = rt.app.root_agent.as_ref().unwrap().clone();
+                let actor = root.actor().unwrap();
+                let ticket = actor
+                    .admit_turn(
+                        AgentInput::new(REWIND_QUEUED.into(), vec![]),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap();
+                rt.app.persist_input();
+                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
+                let completion = select_rewind(event_loop);
+                assert!(matches!(
+                    &completion,
+                    InternalEvent::RewindCommitted { result: Ok(_), .. }
+                ));
+                assert_eq!(actor.snapshot().queued, 0);
+                assert!(ticket.peek_result().is_some());
+                assert_eq!(
+                    event_loop.sessions[0]
+                        .app
+                        .state
+                        .session
+                        .meta
+                        .queued_messages,
+                    [REWIND_QUEUED]
+                );
+                event_loop.handle_internal(completion);
+                let app = &mut event_loop.sessions[0].app;
+                assert_eq!(app.input_box.buffer.value(), REWIND_TARGET);
+                assert!(
+                    app.main_chat()
+                        .last_message_text()
+                        .contains("The session was rewound.")
+                );
+                assert!(app.queue.is_empty());
+                assert!(app.state.session.meta.queued_messages.is_empty());
+                let view = root.manager().journal().snapshot().fold().unwrap();
+                assert!(
+                    view.scopes[&Some(root.id())]
+                        .results
+                        .iter()
+                        .any(|(turn, _)| *turn == ticket.turn_id())
+                );
+            },
+        );
     }
 
     #[test]

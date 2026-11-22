@@ -148,6 +148,10 @@ impl MessageQueue {
         if let Some(ref shared) = self.shared {
             shared.clear_user_work();
         }
+        self.unfocus_root();
+    }
+
+    pub(crate) fn unfocus_root(&mut self) {
         if !self.child_selected {
             self.unfocus();
         }

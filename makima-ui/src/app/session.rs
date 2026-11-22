@@ -300,13 +300,9 @@ impl App {
             .collect()
     }
 
-    pub(crate) fn clear_rewind_queue(&mut self) {
-        self.queue.clear_root_user_work();
-        self.recoverable_queue.clear();
-        self.persist_input();
-    }
-
     pub(crate) fn finish_rewind(&mut self, draft: String) {
+        self.queue.unfocus_root();
+        self.recoverable_queue.clear();
         let notes = self.root_fork_notes();
         let (display, items) = history_to_display_with_notes(
             self.state.session.messages(),
