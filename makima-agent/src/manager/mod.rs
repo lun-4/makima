@@ -44,10 +44,10 @@ use futures_lite::FutureExt;
 use makima_providers::{Message, TokenUsage};
 use tracing::{info, warn};
 
-use crate::actor::delivery::{ChildDelivery, DeliveryRejection, admit_queued_delivery};
+use crate::actor::delivery::{ChildDelivery, DeliveryRejection, admit_delivery_bound};
 use crate::actor::{
     ActorCloseCut, ActorIdleGuard, ActorRestoration, ManagedTurnAdmission, TranscriptRequest,
-    TranscriptSnapshot,
+    TranscriptSnapshot, TurnProvenance, TurnResult,
 };
 use crate::journal::{
     JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
@@ -55,12 +55,12 @@ use crate::journal::{
 use crate::tools::offload::OffloadStore;
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
-    HistorySnapshot, ReasonedCancelTrigger, SharedMessages, TurnCancellationReason, TurnId,
-    TurnOutcome, TurnTicket,
+    HistorySnapshot, ReasonedCancelTrigger, SharedMessages, TurnCancellationReason, TurnFailure,
+    TurnFailureKind, TurnId, TurnOutcome, TurnTicket,
 };
 use makima_storage::session_state::{
     SessionStateView, StateChange, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
-    StoredDelivery, StoredDeliveryOp, StoredOffloadRef,
+    StoredDeliveryOp, StoredOffloadRef,
 };
 
 const OPAQUE_BACKEND: &str = "agent backend has no stored restoration specification";
@@ -603,8 +603,8 @@ impl AgentManagerHandle {
                 turn,
                 TokenUsage::default(),
                 0,
-                crate::TurnFailure {
-                    kind: crate::TurnFailureKind::Internal,
+                TurnFailure {
+                    kind: TurnFailureKind::Internal,
                     user_message: diagnostic.clone(),
                     diagnostic: diagnostic.clone(),
                     retryable: false,
@@ -633,69 +633,32 @@ impl AgentManagerHandle {
         let Some(scope) = view.scopes.get(&Some(agent_id)) else {
             return Ok(0);
         };
-        let mut changes = scope
-            .admitted
-            .iter()
-            .map(|(turn, origin)| {
-                let result = crate::actor::TurnResult {
-                    outcome: outcome(*turn),
-                    text: String::new(),
-                    output: Vec::new(),
-                    provenance: crate::actor::TurnProvenance {
-                        origin: origin.clone().into(),
-                        ..Default::default()
-                    },
-                    duration_ms: 0,
-                }
+        let parent = view.agents.get(&agent_id).and_then(|record| {
+            record
+                .spec
+                .as_ref()
+                .filter(|spec| spec.auto_deliver && !spec.silent)?;
+            let parent = record.parent?;
+            (view.agents.get(&parent)?.lifecycle == StoredAgentLifecycle::Open)
+                .then_some((parent, record.label.as_ref()))
+        });
+        let mut changes = Vec::with_capacity(scope.admitted.len());
+        // Queue reports first so every durable terminal record follows its accepted report.
+        for (&turn, origin) in &scope.admitted {
+            let result = TurnResult {
+                outcome: outcome(turn),
+                text: String::new(),
+                output: Vec::new(),
+                provenance: TurnProvenance {
+                    origin: origin.clone().into(),
+                    ..Default::default()
+                },
+                duration_ms: 0,
+            };
+            let stored = result
                 .to_stored(snapshot.epoch, None)
                 .map_err(|error| ManagerError::Persistence(error.to_string()))?;
-                Ok(JournalChange {
-                    agent: Some(agent_id),
-                    generation: scope.generation,
-                    change: StateChange::Turn {
-                        turn: *turn,
-                        result,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, ManagerError>>()?;
-        let count = changes.len();
-        let record = view.agents.get(&agent_id);
-        let parent = record
-            .filter(|record| {
-                record
-                    .spec
-                    .as_ref()
-                    .is_some_and(|spec| spec.auto_deliver && !spec.silent)
-            })
-            .and_then(|record| record.parent)
-            .filter(|parent| {
-                view.agents
-                    .get(parent)
-                    .is_some_and(|record| record.lifecycle == StoredAgentLifecycle::Open)
-            });
-        let mut reports = Vec::new();
-        if let Some(parent) = parent {
-            let parent_scope = view.scopes.get(&Some(parent));
-            for change in &changes {
-                let StateChange::Turn { turn, result } = &change.change else {
-                    continue;
-                };
-                if parent_scope
-                    .is_some_and(|scope| scope.deliveries.contains_key(&(agent_id, *turn)))
-                {
-                    continue;
-                }
-                let delivery = Arc::new(ChildDelivery {
-                    label: record.and_then(|record| record.label.clone()),
-                    result: crate::actor::TurnResult::from_stored(result.clone(), |_| {
-                        Err(IoError::new(
-                            ErrorKind::NotFound,
-                            "inline restored failure expected",
-                        ))
-                    })
-                    .map_err(|error| ManagerError::Persistence(error.to_string()))?,
-                });
+            if let Some((parent, label)) = parent {
                 let work = self
                     .0
                     .work
@@ -706,24 +669,30 @@ impl AgentManagerHandle {
                             "delivery source has no parent work reservation".into(),
                         )
                     })?;
-                reports.push((parent, *turn, result.clone(), delivery, work));
+                let delivery = Arc::new(ChildDelivery {
+                    label: label.cloned(),
+                    result,
+                });
+                match self.deliver_locked(&graph, parent, delivery, vec![work], None) {
+                    Ok(()) => (),
+                    Err(DeliveryRejection::Journal(error)) => {
+                        return Err(ManagerError::Persistence(error));
+                    }
+                    Err(reason) => {
+                        warn!(%agent_id, %parent, %turn, ?reason, "recovery report rejected")
+                    }
+                }
             }
-        }
-        for (parent, turn, result, delivery, _) in &reports {
             changes.push(JournalChange {
-                agent: Some(*parent),
-                generation: 0,
-                change: StateChange::Delivery {
-                    id: (agent_id, *turn),
-                    op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                        label: delivery.label.clone(),
-                        result: result.clone(),
-                        preview_bytes: None,
-                        held: false,
-                    })),
+                agent: Some(agent_id),
+                generation: scope.generation,
+                change: StateChange::Turn {
+                    turn,
+                    result: stored,
                 },
             });
         }
+        let count = changes.len();
         if count != 0 {
             self.0
                 .journal
@@ -732,25 +701,6 @@ impl AgentManagerHandle {
                     ..Default::default()
                 })
                 .map_err(|error| ManagerError::Persistence(error.to_string()))?;
-        }
-        // Keep activation and subtree close out of the handoff from the journal.
-        for (parent, turn, _, delivery, work) in reports {
-            let target = graph.nodes.get(&parent).and_then(|node| {
-                if (node.residency == AgentResidency::Resident || node.activation_finishing)
-                    && !node.detach_pending
-                {
-                    node.actor.as_ref()
-                } else {
-                    None
-                }
-            });
-            if let Some(actor) = target {
-                admit_queued_delivery(&actor.inner, delivery, vec![work]);
-            } else {
-                self.retain_delivery_work(parent, agent_id, turn, vec![work]);
-            }
-        }
-        if count != 0 {
             self.0.reaped.notify(usize::MAX);
         }
         Ok(count)
@@ -1853,6 +1803,17 @@ impl AgentManagerHandle {
         {
             return Err(DeliveryRejection::ParentUnavailable);
         }
+        self.deliver_locked(&graph, parent_id, delivery, work, source_incarnation)
+    }
+
+    fn deliver_locked(
+        &self,
+        graph: &GraphState,
+        parent_id: AgentId,
+        delivery: Arc<ChildDelivery>,
+        work: Vec<WorkReservation>,
+        source_incarnation: Option<JournalIncarnation>,
+    ) -> Result<(), DeliveryRejection> {
         let target = if let Some(node) = graph.nodes.get(&parent_id) {
             if !graph.shutting_down
                 && matches!(
@@ -1868,7 +1829,7 @@ impl AgentManagerHandle {
             ((node.lifecycle == GraphLifecycle::Live && node.residency == AgentResidency::Resident
                 || node.activation_finishing)
                 && !node.detach_pending)
-                .then(|| node.actor.clone())
+                .then_some(node.actor.as_ref())
                 .flatten()
         } else {
             match self.0.journal.agent(parent_id) {
@@ -1878,16 +1839,7 @@ impl AgentManagerHandle {
             }
         };
         match target {
-            Some(parent) => {
-                let result = crate::actor::delivery::admit_delivery_bound(
-                    &parent.inner,
-                    delivery,
-                    work,
-                    source_incarnation,
-                );
-                drop(graph);
-                result
-            }
+            Some(parent) => admit_delivery_bound(&parent.inner, delivery, work, source_incarnation),
             None => {
                 let preview = delivery.preview(None);
                 let bytes = preview

@@ -310,30 +310,6 @@ pub(crate) fn admit_delivery_bound(
     Ok(())
 }
 
-pub(crate) fn admit_queued_delivery(
-    inner: &ActorInner,
-    delivery: Arc<ChildDelivery>,
-    work: Vec<WorkReservation>,
-) {
-    let mut state = inner.state.lock_unpoisoned();
-    if state.lifecycle == ActorLifecycle::Shutdown {
-        retain_work(inner, &delivery, work);
-        return;
-    }
-    if state.lifecycle != ActorLifecycle::Open {
-        record_drop(inner, &delivery);
-        return;
-    }
-    let id = delivery.result.outcome.turn_id();
-    if state.deliveries.contains_key(&id) || state.delivery_seen.contains(&id) {
-        return;
-    }
-    let preview = Arc::new(delivery.preview(None));
-    let message = preview.input().preamble.remove(0);
-    let bytes = message.first_text_content().map_or(0, str::len);
-    enqueue_live(inner, &mut state, preview, message, bytes, work);
-}
-
 fn enqueue_live(
     inner: &ActorInner,
     state: &mut super::ActorState,
