@@ -132,7 +132,7 @@ impl App {
     }
 
     pub(crate) fn persist_input(&mut self) {
-        if self.restore_in_progress {
+        if self.restore_in_progress || self.rewind_pending {
             return;
         }
         let meta = self.build_meta();
@@ -314,10 +314,12 @@ impl App {
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);
+        let meta = &mut self.state.session_mut().meta;
+        meta.input_draft = (!draft.is_empty()).then(|| draft.clone());
+        meta.queued_messages.clear();
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
-        self.persist_input();
         self.pending_dirty |= crate::repaint::Dirty::YES;
     }
 

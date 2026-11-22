@@ -2,6 +2,7 @@ use crate::{
     AgentRef, History, HistorySnapshot, ToolOutput,
     actor::{ActorError, ActorIdleGuard},
     journal::{JournalCommit, JournalError, SessionJournal},
+    session_writer::WriterError,
     subagents::format_subagents,
 };
 use makima_providers::{Message, TokenUsage};
@@ -52,7 +53,8 @@ pub enum RewindError {
 pub enum RewindOutcome {
     Fork {
         history: HistorySnapshot,
-        draft: Message,
+        draft: String,
+        warning: Option<WriterError>,
     },
     PlanningSession(ParentLink),
 }
@@ -151,7 +153,13 @@ impl RewindGuard {
                 .map(RewindOutcome::PlanningSession)
                 .ok_or(RewindError::InvalidTarget);
         };
-        let draft = selected.prompt.clone().ok_or(RewindError::InvalidTarget)?;
+        let draft = selected
+            .prompt
+            .as_ref()
+            .ok_or(RewindError::InvalidTarget)?
+            .user_text()
+            .unwrap_or_default()
+            .to_owned();
         let position = self
             .events
             .iter()
@@ -173,11 +181,27 @@ impl RewindGuard {
             "The session was rewound. Current mode: {mode}.\n{FILE_WARNING}\n\nExisting subagents:\n{subagents}"
         );
         let conversation = ConversationState::fresh(None);
+        let root = self.agent.id();
+        let queue = self.journal.snapshot().fold().map_err(JournalError::from)?;
+        let cleared_turns = queue
+            .scopes
+            .get(&Some(root))
+            .into_iter()
+            .flat_map(|scope| {
+                scope
+                    .admitted
+                    .keys()
+                    .filter(|turn| scope.turn_inputs.contains_key(turn))
+                    .copied()
+            })
+            .collect();
         let record: SessionRecord<Message, TokenUsage, ToolOutput> = SessionRecord::Fork {
             target: predecessor,
             note_id: MakimaId::generate(),
             note,
             conversation: conversation.clone(),
+            input_draft: Some(draft.clone()),
+            cleared_turns,
         };
         let event = serde_json::to_value(&record)
             .map_err(|error| RewindError::Context(error.to_string()))?;
@@ -205,7 +229,6 @@ impl RewindGuard {
         history.compacted = false;
         history.covered = None;
         history.conversation = Some(conversation);
-        let root = self.agent.id();
         let prepared = self
             .journal
             .prepare(JournalCommit {
@@ -215,20 +238,27 @@ impl RewindGuard {
                 ..Default::default()
             })
             .await?;
-        if let Some(writer) = self.journal.writer() {
+        let warning = if let Some(writer) = self.journal.writer() {
             writer
                 .append_fork(record)
                 .await
-                .map_err(|error| RewindError::Persistence(error.to_string()))?;
+                .map_err(|error| RewindError::Persistence(error.to_string()))?
+                .warning
         } else if prepared.is_persistent() {
             return Err(RewindError::Persistence(
                 "session journal has no writer".into(),
             ));
-        }
+        } else {
+            None
+        };
         prepared.install_fork(root, event)?;
         self.idle.install_rewind(history.clone());
         actor.clear_user_work();
-        Ok(RewindOutcome::Fork { history, draft })
+        Ok(RewindOutcome::Fork {
+            history,
+            draft,
+            warning,
+        })
     }
 }
 
@@ -239,7 +269,7 @@ mod tests {
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
         TurnOutcome,
         journal::{JournalChange, JournalCommit, SessionJournal},
-        session_writer::{SessionIo, SessionWriter, StoredSession},
+        session_writer::{Record, SessionWriter, StoredSession},
         test_util::MockBackend,
     };
     use makima_providers::{Message, TokenUsage};
@@ -248,8 +278,8 @@ mod tests {
         session_state::{ParentLink, StateChange, StoredDeliveryOp},
     };
     use std::{
-        fs::{File, OpenOptions},
-        io::{self, Seek, SeekFrom, Write},
+        fs::{OpenOptions, read_to_string},
+        io::Write,
         sync::Arc,
         time::Duration,
     };
@@ -260,49 +290,32 @@ mod tests {
     const REPORT: &str = "consumed child report";
 
     const REPLACEMENT: &str = "replacement user turn";
+    const OLD_DRAFT: &str = "old draft";
+    const OLD_QUEUE: &str = "old queued prompt";
+    const FORK: &str = "fork";
     const TORN_DRAFT: &[u8] = br#"{"t":"draft","text":"incomplete"#;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-    struct LogIo(File);
-
-    impl SessionIo for LogIo {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.write(bytes)
-        }
-
-        fn sync(&mut self) -> io::Result<()> {
-            self.0.sync_all()
-        }
-
-        fn position(&mut self) -> io::Result<u64> {
-            self.0.seek(SeekFrom::End(0))
-        }
-
-        fn truncate(&mut self, len: u64) -> io::Result<()> {
-            self.0.set_len(len)?;
-            self.0.seek(SeekFrom::Start(len))?;
-            Ok(())
-        }
-    }
-
-    #[test_case(false; "two_rewinds")]
-    #[test_case(true; "torn_line_after_fork")]
-    fn durable_fork_reopens_with_identical_history(torn_tail: bool) {
+    #[test_case(false, false; "log_ends_at_fork")]
+    #[test_case(false, true; "two_rewinds")]
+    #[test_case(true, false; "torn_line_after_fork")]
+    fn durable_fork_restores_history_and_input(torn_tail: bool, redo: bool) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
-            let mut session = StoredSession::new("test", "/");
-            session.save_to(directory.path()).unwrap();
+            let session = StoredSession::new("test", "/");
             let path = directory.path().join(format!("{}.jsonl", session.id));
-            let log = || {
-                LogIo(
-                    OpenOptions::new()
-                        .read(true)
-                        .append(true)
-                        .open(&path)
-                        .unwrap(),
-                )
-            };
-            let writer = SessionWriter::with_io(session.id, log(), 1);
+            let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+            writer
+                .append(vec![
+                    Record::Draft {
+                        text: Some(OLD_DRAFT.into()),
+                    },
+                    Record::Queued {
+                        messages: vec![OLD_QUEUE.into()],
+                    },
+                ])
+                .await
+                .unwrap();
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let journal = manager.journal();
             journal.bind_writer(writer.clone()).unwrap();
@@ -333,17 +346,17 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            let first = journal.snapshot().histories[&root.id()].ids[1];
+            let target = journal.snapshot().histories[&root.id()].ids[1];
             let RewindOutcome::Fork { mut history, .. } = root
                 .begin_rewind(&session)
                 .unwrap()
-                .commit(RewindTargetId::Message(first))
+                .commit(RewindTargetId::Message(target))
                 .await
                 .unwrap()
             else {
                 panic!("expected fork");
             };
-            if !torn_tail {
+            if redo {
                 actor
                     .admit_turn(
                         AgentInput::new(REPLACEMENT.into(), Vec::new()),
@@ -375,6 +388,16 @@ mod tests {
                 history = second;
             }
             assert_eq!(actor.committed_history_snapshot().ids, history.ids);
+            let log = read_to_string(&path).unwrap();
+            let last: serde_json::Value =
+                serde_json::from_str(log.lines().last().unwrap()).unwrap();
+            assert_eq!(last["t"], FORK);
+            let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+            assert_eq!(
+                reopened.meta.input_draft.as_deref(),
+                Some(if redo { REPLACEMENT } else { SECOND })
+            );
+            assert!(reopened.meta.queued_messages.is_empty());
             assert!(
                 manager
                     .shutdown(SHUTDOWN_TIMEOUT)
@@ -385,9 +408,9 @@ mod tests {
             writer.append(Vec::new()).await.unwrap();
             writer.close().await.unwrap();
             if torn_tail {
-                let mut io = log();
-                assert_eq!(io.write(TORN_DRAFT).unwrap(), TORN_DRAFT.len());
-                io.sync().unwrap();
+                let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(TORN_DRAFT).unwrap();
+                file.sync_all().unwrap();
             }
             let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
             let restored = reopened.history_snapshot();
@@ -400,7 +423,12 @@ mod tests {
                 .iter()
                 .filter(|event| event["t"] == "fork")
                 .count();
-            assert_eq!(forks, if torn_tail { 1 } else { 2 });
+            assert_eq!(forks, if redo { 2 } else { 1 });
+            assert_eq!(
+                reopened.meta.input_draft.as_deref(),
+                Some(if redo { REPLACEMENT } else { SECOND })
+            );
+            assert!(reopened.meta.queued_messages.is_empty());
         });
     }
 
@@ -496,13 +524,10 @@ mod tests {
                 .commit(RewindTargetId::Message(selected))
                 .await
                 .unwrap();
-            let RewindOutcome::Fork { history, draft } = outcome else {
+            let RewindOutcome::Fork { history, draft, .. } = outcome else {
                 panic!("expected fork")
             };
-            assert_eq!(
-                draft.user_text(),
-                Some(if index == 0 { FIRST } else { SECOND })
-            );
+            assert_eq!(draft, if index == 0 { FIRST } else { SECOND });
             assert_eq!(history.messages.len(), index + 1);
             assert!(
                 history
@@ -541,9 +566,7 @@ mod tests {
                 .commit(RewindTargetId::Message(session.message_id(2).unwrap()))
                 .await
                 .unwrap();
-            assert!(
-                matches!(redo, RewindOutcome::Fork { draft, .. } if draft.user_text() == Some(SECOND))
-            );
+            assert!(matches!(redo, RewindOutcome::Fork { draft, .. } if draft == SECOND));
             assert_eq!(
                 manager.journal().snapshot().state.to_vec(),
                 before.state.to_vec()

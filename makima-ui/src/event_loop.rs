@@ -38,6 +38,7 @@ use makima_agent::manager::AgentResidency;
 #[cfg(test)]
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
+use makima_agent::rewind::RewindOutcome;
 use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
@@ -139,6 +140,7 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
+const REWIND_UNCERTAIN: &str = "Rewind applied, but durability is uncertain";
 const CONFIG_EXPIRED_ERR: &str = "configuration preparation expired";
 const UNSUPPORTED_AGENT_OPTION_PREFIX: &str = "unsupported agent option";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
@@ -1787,7 +1789,7 @@ impl SpawnCtx {
 enum InternalEvent {
     RewindCommitted {
         runtime: Arc<()>,
-        result: Result<makima_agent::rewind::RewindOutcome, String>,
+        result: Result<RewindOutcome, String>,
     },
     ModelsDiscovered,
     /// The UI slot's model prepared differently once discovery landed.
@@ -2599,16 +2601,22 @@ impl<'t> EventLoop<'t> {
                 if let Some(idx) = self.runtime_position(&runtime) {
                     self.sessions[idx].app.rewind_pending = false;
                     match result {
-                        Ok(makima_agent::rewind::RewindOutcome::Fork { history, draft }) => {
+                        Ok(RewindOutcome::Fork {
+                            history,
+                            draft,
+                            warning,
+                        }) => {
                             let rt = &mut self.sessions[idx];
                             let journal = rt.handles.manager_and_root().0.journal();
                             let session = rt.app.state.session_mut();
                             session.adopt_history(&history);
                             session.replace_context_events(journal.context_events());
-                            rt.app
-                                .finish_rewind(draft.user_text().unwrap_or_default().to_owned());
+                            rt.app.finish_rewind(draft);
+                            if let Some(warning) = warning {
+                                rt.app.flash(format!("{REWIND_UNCERTAIN}: {warning}"));
+                            }
                         }
-                        Ok(makima_agent::rewind::RewindOutcome::PlanningSession(parent)) => {
+                        Ok(RewindOutcome::PlanningSession(parent)) => {
                             self.back_to_planning(idx, parent.session);
                         }
                         Err(error) => self.sessions[idx].app.flash(error),
@@ -7722,11 +7730,13 @@ end })
     const REWIND_DRAFT: &str = "unfinished draft";
     const REWIND_QUEUED: &str = "queued user turn";
     const REWIND_IO_ERROR: &str = "injected fork I/O failure";
+    const REWIND_NOTE: &str = "The session was rewound.";
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ForkFailure {
         Write,
         Sync,
+        Rollback,
     }
 
     struct FailingForkIo {
@@ -7744,7 +7754,7 @@ end })
         }
 
         fn sync(&mut self) -> io::Result<()> {
-            if self.writing_fork && self.failure == ForkFailure::Sync {
+            if self.writing_fork && self.failure != ForkFailure::Write {
                 return Err(io::Error::other(REWIND_IO_ERROR));
             }
             self.log.sync_all()
@@ -7756,6 +7766,9 @@ end })
         }
 
         fn truncate(&mut self, len: u64) -> io::Result<()> {
+            if self.failure == ForkFailure::Rollback {
+                return Err(io::Error::other(REWIND_IO_ERROR));
+            }
             self.writing_fork = false;
             self.log.set_len(len)
         }
@@ -7881,10 +7894,11 @@ end })
         );
     }
 
-    #[test]
-    fn rewind_clears_admitted_user_work_before_releasing_guard() {
+    #[test_case(None; "durable")]
+    #[test_case(Some(ForkFailure::Rollback); "sync_and_rollback_fail")]
+    fn applied_rewind_matches_reopened_session(failure: Option<ForkFailure>) {
         with_event_loop_runtime(
-            |harness| rewind_runtime(harness, None),
+            |harness| rewind_runtime(harness, failure),
             |event_loop| {
                 event_loop.dispatch(0, vec![Action::BeginRewind]);
                 let rt = &mut event_loop.sessions[0];
@@ -7897,12 +7911,14 @@ end })
                         String::new(),
                     )
                     .unwrap();
+                rt.app.input_box.set_input(REWIND_DRAFT.into());
                 rt.app.persist_input();
                 assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
                 let completion = select_rewind(event_loop);
                 assert!(matches!(
                     &completion,
-                    InternalEvent::RewindCommitted { result: Ok(_), .. }
+                    InternalEvent::RewindCommitted { result: Ok(RewindOutcome::Fork { warning, .. }), .. }
+                        if warning.is_some() == failure.is_some()
                 ));
                 assert_eq!(actor.snapshot().queued, 0);
                 assert!(ticket.peek_result().is_some());
@@ -7918,13 +7934,29 @@ end })
                 event_loop.handle_internal(completion);
                 let app = &mut event_loop.sessions[0].app;
                 assert_eq!(app.input_box.buffer.value(), REWIND_TARGET);
-                assert!(
-                    app.main_chat()
-                        .last_message_text()
-                        .contains("The session was rewound.")
-                );
+                assert!(app.main_chat().last_message_text().contains(REWIND_NOTE));
                 assert!(app.queue.is_empty());
                 assert!(app.state.session.meta.queued_messages.is_empty());
+                if failure.is_some() {
+                    assert!(
+                        app.flash_text()
+                            .is_some_and(|text| text.starts_with(REWIND_UNCERTAIN)
+                                && text.contains(REWIND_IO_ERROR))
+                    );
+                }
+                let rt = &event_loop.sessions[0];
+                let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
+                assert_eq!(reopened.meta.input_draft.as_deref(), Some(REWIND_TARGET));
+                assert!(reopened.meta.queued_messages.is_empty());
+                let reopened_view = reopened.latest_state().unwrap();
+                assert!(
+                    !reopened_view.scopes[&Some(root.id())]
+                        .admitted
+                        .contains_key(&ticket.turn_id())
+                );
+                let history = rt.handles.history.load_full();
+                assert_eq!(reopened.history_snapshot().messages, history.messages);
+                assert_eq!(reopened.history_snapshot().ids, history.ids);
                 let view = root.manager().journal().snapshot().fold().unwrap();
                 assert!(
                     view.scopes[&Some(root.id())]

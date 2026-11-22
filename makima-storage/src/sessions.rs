@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::conversation::ConversationState;
-use crate::id::{AgentId, MakimaId};
+use crate::id::{AgentId, MakimaId, TurnId};
 use crate::offload_cleanup::Root;
 use crate::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
 use crate::session_state::{
@@ -519,6 +519,10 @@ pub enum SessionRecord<M, U, T> {
         note_id: MakimaId,
         note: String,
         conversation: ConversationState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_draft: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cleared_turns: Vec<TurnId>,
     },
     #[serde(rename = "history")]
     History {
@@ -1102,6 +1106,7 @@ where
     let mut messages: Vec<M> = Vec::new();
     let mut message_ids = Vec::new();
     let mut context_events = Vec::new();
+    let mut cleared_turns = HashSet::new();
     let mut agent_messages: BTreeMap<AgentId, Vec<M>> = BTreeMap::new();
     let mut agent_message_ids: BTreeMap<AgentId, Vec<MakimaId>> = BTreeMap::new();
     let mut tool_outputs = HashMap::new();
@@ -1257,7 +1262,18 @@ where
                 );
                 agent_messages.insert(agent, summary);
             }
-            SessionRecord::History { .. } | SessionRecord::Fork { .. } => {}
+            SessionRecord::History { .. } => {}
+            SessionRecord::Fork {
+                input_draft,
+                cleared_turns: turns,
+                ..
+            } => {
+                cleared_turns.extend(turns);
+                if let Some(draft) = input_draft {
+                    meta.input_draft = (!draft.is_empty()).then_some(draft);
+                    meta.queued_messages.clear();
+                }
+            }
             SessionRecord::Out { id: out_id, d } => {
                 tool_outputs.insert(out_id, Arc::new(d));
             }
@@ -1329,6 +1345,14 @@ where
                 .flatten()
         })
         .unwrap_or_else(|| id.to_string().parse().expect("matching id representation"));
+    if !cleared_turns.is_empty() {
+        state.retain(|record| {
+            record.agent != Some(root)
+                || !matches!(record.change,
+                StateChange::Admitted { turn, .. } | StateChange::TurnInput { turn, .. }
+                    | StateChange::JoinedInput { turn, .. } if cleared_turns.contains(&turn))
+        });
+    }
     if let Some(root_messages) = agent_messages.remove(&root) {
         messages = root_messages;
         message_ids = agent_message_ids.remove(&root).unwrap_or_default();
@@ -2479,6 +2503,8 @@ where
             note_id: MakimaId::generate(),
             note,
             conversation: conversation.clone(),
+            input_draft: None,
+            cleared_turns: Vec::new(),
         })
         .map_err(StorageError::from)?;
         self.context_events.push(event);
@@ -3381,6 +3407,8 @@ mod tests {
                 note_id,
                 note: NOTE.into(),
                 conversation: conversation.clone(),
+                input_draft: None,
+                cleared_turns: Vec::new(),
             },
             SessionRecord::History {
                 agent: AgentId::generate(),

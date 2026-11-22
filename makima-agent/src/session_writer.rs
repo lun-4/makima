@@ -78,7 +78,7 @@ impl SessionIo for SessionFile {
     }
 }
 
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("session {session_id} was not saved: {message}")]
 pub struct WriterError {
     pub session_id: MakimaId,
@@ -88,6 +88,7 @@ pub struct WriterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendAck {
     pub next_seq: u64,
+    pub(crate) warning: Option<WriterError>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +139,7 @@ enum ForkWriteError {
     Rollback {
         write: io::Error,
         rollback: io::Error,
+        fork_visible: bool,
     },
 }
 
@@ -242,8 +244,7 @@ impl SessionWriter {
         self.enqueue(Payload::Records(records), None)
     }
 
-    /// Appends a fork once. The receipt reports success only after sync.
-    /// If rollback fails, the writer rejects further requests. The log tail can remain on disk.
+    /// A visible fork whose durability cannot be confirmed returns an acknowledgment with a warning.
     pub(crate) fn append_fork(&self, record: Record) -> Receipt {
         self.enqueue(Payload::Fork(Box::new(record)), None)
     }
@@ -368,7 +369,10 @@ async fn initialize(
             let request = pending.swap_remove(index);
             drop(rx);
             status.lock_unpoisoned().unsaved_records = 0;
-            let _ = request.reply.send(Ok(AppendAck { next_seq: 0 }));
+            let _ = request.reply.send(Ok(AppendAck {
+                next_seq: 0,
+                warning: None,
+            }));
             return;
         }
         if let Some(error) = &ordinary_error {
@@ -465,7 +469,10 @@ async fn run(
                     drop(io);
                     drop(rx);
                     status.lock_unpoisoned().unsaved_records = 0;
-                    let _ = reply.send(Ok(AppendAck { next_seq }));
+                    let _ = reply.send(Ok(AppendAck {
+                        next_seq,
+                        warning: None,
+                    }));
                     return;
                 }
                 Payload::Fork(record) => {
@@ -501,20 +508,33 @@ async fn run(
                     .await;
                     io = returned_io;
                     let fenced = matches!(&result, Err(ForkWriteError::Rollback { .. }));
-                    let result = result
-                        .map(|()| {
-                            next_seq = candidate_seq;
-                            AppendAck { next_seq }
+                    let visible = result.is_ok()
+                        || matches!(
+                            &result,
+                            Err(ForkWriteError::Rollback {
+                                fork_visible: true,
+                                ..
+                            })
+                        );
+                    let error = result.err().map(|error| writer_error(session_id, error));
+                    let receipt = if let Some(error) = &error
+                        && !visible
+                    {
+                        Err(error.clone())
+                    } else {
+                        next_seq = candidate_seq;
+                        Ok(AppendAck {
+                            next_seq,
+                            warning: error.clone(),
                         })
-                        .map_err(|error| writer_error(session_id, error));
-                    let error = result.as_ref().err().cloned();
+                    };
                     {
                         let mut status = status.lock_unpoisoned();
                         status.unsaved_records -= 1;
                         status.error = error.clone();
                     }
                     update_journals(&journals, error.as_ref().map(ToString::to_string));
-                    let _ = reply.send(result);
+                    let _ = reply.send(receipt);
                     if fenced && let Some(error) = error {
                         drop(io);
                         // The durable tail is unknown. Keep this writer fenced, including against close/reopen.
@@ -577,7 +597,10 @@ async fn run(
                 }
                 update_journals(&journals, None);
                 for reply in replies.drain(..) {
-                    let _ = reply.send(Ok(AppendAck { next_seq }));
+                    let _ = reply.send(Ok(AppendAck {
+                        next_seq,
+                        warning: None,
+                    }));
                 }
                 bytes.clear();
                 written = 0;
@@ -648,9 +671,22 @@ fn write_fork(io: &mut dyn SessionIo, bytes: &[u8]) -> Result<(), ForkWriteError
     let position = io.position()?;
     let mut written = 0;
     if let Err(write) = write_and_sync(io, bytes, &mut written) {
-        return match io.truncate(position).and_then(|()| io.sync()) {
+        let (rollback, fork_visible) = match io.truncate(position) {
+            Ok(()) => (io.sync(), false),
+            Err(error) => {
+                let fork_visible = io.position().map_or(written == bytes.len(), |end| {
+                    end.saturating_sub(position) >= bytes.len() as u64
+                });
+                (Err(error), fork_visible)
+            }
+        };
+        return match rollback {
             Ok(()) => Err(write.into()),
-            Err(rollback) => Err(ForkWriteError::Rollback { write, rollback }),
+            Err(rollback) => Err(ForkWriteError::Rollback {
+                write,
+                rollback,
+                fork_visible,
+            }),
         };
     }
     Ok(())
@@ -812,6 +848,8 @@ mod tests {
                 note_id: MakimaId::generate(),
                 note: "rewind".into(),
                 conversation: ConversationState::fresh(None),
+                input_draft: None,
+                cleared_turns: Vec::new(),
             };
             let error = writer.append_fork(fork).await.unwrap_err();
             assert_eq!(
