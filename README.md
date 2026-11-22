@@ -8,7 +8,6 @@ primary features include but are not limited to:
 - extensible LLM providers via a dedicated Luau API
 - see images the model is fetching if your terminal supports it
 - ACP support so you can use e.g Zed
-- (TODO complete this)
 
 ## installation procedure
 
