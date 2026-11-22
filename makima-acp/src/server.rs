@@ -33,7 +33,9 @@ use makima_agent::session_recovery::{OpenModel, OpenSessionError, SessionSource,
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::AgentEvent;
-use makima_agent::{AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError, TurnId};
+use makima_agent::{
+    AgentId, AgentInput, Envelope, ImageMediaType, ImageSource, ModeError, TurnId, TurnTicket,
+};
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
     InputDispatch, PresentedCommand, TargetHandle,
@@ -118,7 +120,7 @@ struct Pending {
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
     continuing_root: BTreeSet<TurnId>,
-    cancelling_continuation: bool,
+    cancelling_continuations: Vec<TurnTicket>,
     permissions: HashMap<i64, (String, Sender<String>)>,
     elicitation: Option<i64>,
     /// The client closed its input, so no answer to a new ask can arrive.
@@ -148,7 +150,9 @@ impl Pending {
     }
 
     fn cancellation_in_progress(&self) -> bool {
-        self.cancelling_continuation
+        self.cancelling_continuations
+            .iter()
+            .any(|ticket| ticket.peek().is_none())
             || self
                 .operation
                 .as_ref()
@@ -2175,24 +2179,26 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                         .chain(&mut pending.queued)
                         .filter_map(PendingOperation::start_cancelling)
                         .collect();
+                    pending.cancelling_continuations.clear();
                     if !pending.continuing_root.is_empty()
                         && let Ok(actor) = session.command_root.target.actor()
                     {
-                        for &turn_id in &pending.continuing_root {
+                        for turn_id in std::mem::take(&mut pending.continuing_root) {
                             if let Some(ticket) = actor.turn_ticket(turn_id)
                                 && ticket.peek().is_none()
                             {
-                                pending.cancelling_continuation = true;
                                 if !cancellations
                                     .iter()
                                     .any(|cancel| cancel.turn_id() == Some(turn_id))
                                 {
-                                    cancellations.push(session.handle.input_tx.turn_cancel(ticket));
+                                    cancellations
+                                        .push(session.handle.input_tx.turn_cancel(ticket.clone()));
                                 }
+                                pending.cancelling_continuations.push(ticket);
                             }
                         }
                     }
-                    if pending.operation.is_none() && !pending.cancelling_continuation {
+                    if pending.operation.is_none() && pending.cancelling_continuations.is_empty() {
                         return;
                     }
                     let permission_answers = std::mem::take(&mut pending.permissions);
@@ -2525,14 +2531,11 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
-                    {
-                        let mut pending = pending.lock().unwrap();
-                        if pending.continuing_root.remove(&outcome.turn_id())
-                            && pending.continuing_root.is_empty()
-                        {
-                            pending.cancelling_continuation = false;
-                        }
-                    }
+                    pending
+                        .lock()
+                        .unwrap()
+                        .continuing_root
+                        .remove(&outcome.turn_id());
                     finish_primary_run(&pending, run_id, |request_id| match &outcome {
                         makima_agent::TurnOutcome::Completed { reason, .. } => {
                             let resp = PromptResponse::new(translate::map_done_reason(*reason));
@@ -2697,10 +2700,11 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use makima_agent::actor::{ActorLifecycle, ActorStatus, TurnResult};
+    use makima_agent::agent::PromptSlotSource;
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
-    use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput, TurnTicket};
+    use makima_agent::{AgentMode, DoneReason, ModeId, ToolOutput};
     use makima_agent::{TurnCancellationReason, TurnOutcome};
     use makima_commands::TargetCapabilities;
     use makima_lua::orchestration::{OrchestrationServices, TurnCompletion};
@@ -3677,10 +3681,12 @@ mod tests {
 
     #[derive(PartialEq, Eq)]
     enum RestoredRootScenario {
+        CancelWhileQueued,
         CancelWhileParked,
         EmitImmediately,
     }
 
+    #[test_case(RestoredRootScenario::CancelWhileQueued; "cancel_queued_root_before_provider_starts")]
     #[test_case(RestoredRootScenario::CancelWhileParked; "cancel_parked_root_before_prompt")]
     #[test_case(RestoredRootScenario::EmitImmediately; "replay_before_immediate_resumed_output")]
     fn acp_restored_root_protocol(scenario: RestoredRootScenario) {
@@ -3706,6 +3712,14 @@ mod tests {
             }));
             let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.into());
             params.providers = providers;
+            let (slot_requests, slot_replies) = flume::unbounded();
+            if scenario == RestoredRootScenario::CancelWhileQueued {
+                params.prompt_slots = PromptSlotSource::new(move || {
+                    let (reply, slots) = flume::bounded(1);
+                    slot_requests.send(reply).unwrap();
+                    slots
+                });
+            }
             let mut seed = StoredSession::new(SPAWN_TEST_SPEC, &cwd.to_string_lossy());
             seed.bind_root_id(AgentId::generate()).unwrap();
             seed.push_message(Message::user(OLD_PROMPT.into()));
@@ -3756,7 +3770,8 @@ mod tests {
             .await;
 
             match scenario {
-                RestoredRootScenario::CancelWhileParked => {
+                RestoredRootScenario::CancelWhileQueued
+                | RestoredRootScenario::CancelWhileParked => {
                     let response = prompt_terminal(&out_rx, LOAD_ID).await;
                     assert!(response.get("result").is_some(), "{response}");
                     let root = server
@@ -3772,7 +3787,21 @@ mod tests {
                         requests: received,
                         release,
                     };
-                    assert_eq!(turns.next_text().await, RESTORED_PROMPT);
+                    let parked_slots = if scenario == RestoredRootScenario::CancelWhileQueued {
+                        let reply = within(
+                            slot_replies.recv_async(),
+                            "restored turn never requested prompt slots",
+                        )
+                        .await
+                        .unwrap();
+                        let snapshot = turns.actor.snapshot();
+                        assert_eq!(snapshot.status, ActorStatus::Idle);
+                        assert_eq!(snapshot.queued, 1);
+                        Some(reply)
+                    } else {
+                        assert_eq!(turns.next_text().await, RESTORED_PROMPT);
+                        None
+                    };
                     let ticket = root.turn_ticket(turn).unwrap();
                     handle_line(
                         &mut server,
@@ -3807,27 +3836,26 @@ mod tests {
                         }
                     })
                     .to_string();
-                    within(
-                        async {
-                            loop {
-                                handle_line(&mut server, &prompt, &params).await;
-                                if let Some(dispatch) = server.dispatch.as_mut() {
-                                    let dispatched = (&mut dispatch.future).await;
-                                    respond_dispatch(&mut server, dispatched).await;
-                                    break;
-                                }
-                                let response = prompt_terminal(&out_rx, PROMPT_ID).await;
-                                assert_eq!(
-                                    response["error"]["code"], CANCELLATION_IN_PROGRESS_CODE,
-                                    "{response}"
-                                );
-                                assert_eq!(response["error"]["data"]["retryable"], true);
-                                smol::future::yield_now().await;
-                            }
-                        },
-                        "ACP did not admit a prompt after the restored root was cancelled",
-                    )
-                    .await;
+                    handle_line(&mut server, &prompt, &params).await;
+                    let dispatch = server
+                        .dispatch
+                        .as_mut()
+                        .expect("ACP did not admit a prompt after the restored root was cancelled");
+                    let dispatched =
+                        within(&mut dispatch.future, "prompt dispatch never settled").await;
+                    respond_dispatch(&mut server, dispatched).await;
+                    if let Some(reply) = parked_slots {
+                        assert!(turns.requests.is_empty());
+                        reply.send(Default::default()).unwrap();
+                        within(
+                            slot_replies.recv_async(),
+                            "new turn never requested prompt slots",
+                        )
+                        .await
+                        .unwrap()
+                        .send(Default::default())
+                        .unwrap();
+                    }
                     assert_eq!(turns.next_text().await, NEW_PROMPT);
                     turns.release();
                     let response = prompt_terminal(&out_rx, PROMPT_ID).await;
