@@ -519,10 +519,6 @@ mod tests {
 
     const APPROVED_CONTENT: &str = "# Approved\nPreserve these exact bytes.\n";
     const MUTATED_CONTENT: &str = "disk changed after approval";
-    #[cfg(windows)]
-    const EXTERNAL_PLAN_CONTENT: &str = "user changed projected plan";
-    #[cfg(windows)]
-    const PLAN_ROLLBACK_CONFLICT: &str = "Plan rollback destination changed after projection";
 
     #[cfg(windows)]
     fn approved_plan_snapshot(path: &Path) -> (SessionJournalSnapshot, AgentId) {

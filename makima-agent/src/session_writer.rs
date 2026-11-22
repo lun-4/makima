@@ -8,6 +8,7 @@ use makima_storage::{
     id::MakimaId,
     session_lock::SessionPublicationGuard,
     sessions::{Session, SessionError, SessionRecord, append_record, initialize_session_log},
+    sync_directory,
 };
 use serde_json::Value;
 use std::{
@@ -49,8 +50,7 @@ pub trait SessionIo: Send + 'static {
 
 struct SessionFile {
     file: File,
-    directory: File,
-    directory_synced: bool,
+    unsynced_directory: Option<PathBuf>,
 }
 
 impl SessionIo for SessionFile {
@@ -60,9 +60,9 @@ impl SessionIo for SessionFile {
 
     fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
-        if !self.directory_synced {
-            self.directory.sync_all()?;
-            self.directory_synced = true;
+        if let Some(directory) = &self.unsynced_directory {
+            sync_directory(directory)?;
+            self.unsynced_directory = None;
         }
         Ok(())
     }
@@ -192,12 +192,10 @@ impl SessionWriter {
                     initialize_session_log(directory, session).map_err(io::Error::other)?;
                 }
                 let (file, next_seq) = open_log(&path)?;
-                let directory = File::open(directory)?;
                 Ok((
                     Box::new(SessionFile {
                         file,
-                        directory,
-                        directory_synced: false,
+                        unsynced_directory: Some(directory.to_owned()),
                     }),
                     next_seq,
                 ))
@@ -708,7 +706,7 @@ pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError
 
 #[cfg(test)]
 mod tests {
-    use super::{Record, SessionIo, SessionWriter, StoredSession, WriterStatus, open_log};
+    use super::{Record, SessionIo, SessionWriter, StoredSession, WriterStatus, forget, open_log};
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
     use makima_storage::conversation::ConversationState;
@@ -717,7 +715,7 @@ mod tests {
     use makima_storage::sessions::encode_records;
     use serde_json::{Value, json};
     use std::{
-        fs::{read, remove_file, write},
+        fs::{create_dir, read, remove_file, write},
         io,
         sync::{Arc, Mutex},
     };
@@ -1201,6 +1199,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(path).unwrap(), migrated);
+    }
+
+    #[test_case(false; "new_sessions_directory")]
+    #[test_case(true; "existing_sessions_directory")]
+    fn appended_records_survive_close_and_reopen(directory_exists: bool) {
+        const FIRST: &str = "first";
+        const SECOND: &str = "second";
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sessions");
+        if directory_exists {
+            create_dir(&directory).unwrap();
+        }
+        let session = StoredSession::new("writer-test-model", "/writer-test");
+        let writer = SessionWriter::open_session(&directory, &session).unwrap();
+        let first_ack = smol::block_on(writer.append(vec![output(FIRST)])).unwrap();
+        forget(&directory, session.id).unwrap();
+
+        let reopened = StoredSession::load_from(session.id, &directory).unwrap();
+        assert!(reopened.tool_outputs().contains_key(FIRST));
+        let writer = SessionWriter::open_session(&directory, &reopened).unwrap();
+        let second_ack = smol::block_on(writer.append(vec![output(SECOND)])).unwrap();
+        assert_eq!(second_ack.next_seq, first_ack.next_seq + 1);
+        forget(&directory, session.id).unwrap();
+
+        let reopened = StoredSession::load_from(session.id, &directory).unwrap();
+        assert_eq!(reopened.tool_outputs().len(), 2);
+        assert!(reopened.tool_outputs().contains_key(FIRST));
+        assert!(reopened.tool_outputs().contains_key(SECOND));
     }
 
     #[test]

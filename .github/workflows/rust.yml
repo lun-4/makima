@@ -124,7 +124,7 @@ jobs:
       - run: just build
 
   windows:
-    name: Lint + Offload Tests + Build (Windows)
+    name: Lint + Session and Offload Tests + Build (Windows)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
@@ -159,7 +159,8 @@ jobs:
             Remove-Item -LiteralPath $root -Recurse -Force
           }
       - run: cargo test -p makima-agent --lib tools::offload
-      - run: cargo test -p makima-storage --lib sessions::tests::delete
+      - run: cargo test -p makima-agent --lib session_writer
+      - run: cargo test -p makima-storage --lib sessions::tests
       - run: just lint
       - run: just build
 

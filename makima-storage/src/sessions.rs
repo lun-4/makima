@@ -32,7 +32,7 @@ pub use makima_domain::{
     Effort, MIN_THINKING_BUDGET, Post, PostLevel, StoredThinking, ThinkingParseError,
 };
 
-use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock};
+use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock, sync_directory};
 
 const LOG_FORMAT_VERSION: u32 = 3;
 const LEGACY_LOG_FORMAT_VERSION: u32 = 2;
@@ -563,18 +563,9 @@ pub enum SessionRecord<M, U, T> {
 }
 
 fn sync_dir_and_ancestors(path: &Path) -> Result<(), StorageError> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-            if let Some(ancestor) = parent.parent() {
-                File::open(ancestor)?.sync_all()?;
-            }
-        }
+    for directory in path.ancestors().take(3) {
+        sync_directory(directory)?;
     }
-    #[cfg(not(unix))]
-    crate::sync_parent_dir(path);
     Ok(())
 }
 
