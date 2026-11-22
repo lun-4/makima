@@ -19,8 +19,8 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fprintf ",
 }
 local SEPARATOR = "──────"
--- Windows can be configured to run cmd or powershell (agent.shell).
-local IS_BASH = makima.env.shell() == "bash"
+local SHELL = makima.env.shell()
+local IS_BASH = SHELL == "bash"
 
 local rtk_available
 
@@ -257,8 +257,6 @@ local function collect_commands(node, source)
   return out
 end
 
-local SHELL = makima.env.shell()
-
 local description = [[Execute a ]]
   .. SHELL
   .. [[ command.
@@ -368,14 +366,16 @@ makima.api.register_command({
   end,
 })
 
--- The bash grammar cannot split cmd or powershell commands, so under those the
--- whole command stays one scope and prompts.
 local function command_scopes(command)
   if not command or command:match("^%s*$") then
     return nil
   end
 
-  local parser = IS_BASH and makima.treesitter.get_parser(command, "bash")
+  if not IS_BASH then
+    return { scopes = { command }, force_prompt = not bh.is_simple_windows_command(SHELL, command) }
+  end
+
+  local parser = makima.treesitter.get_parser(command, "bash")
   if not parser then
     return { scopes = { command }, force_prompt = true }
   end
@@ -572,7 +572,9 @@ makima.api.register_tool({
     ctx:set_deadline(timeout_secs, {
       expire = opts.background_on_timeout and "background" or "timeout",
     })
-    makima.fn.jobstart(command, {
+    local script = SHELL == "powershell" and command == input.command and bh.qualify_powershell_command(command)
+      or command
+    makima.fn.jobstart(script, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
