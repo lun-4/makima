@@ -4,14 +4,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 use std::time::Duration;
 
 use test_case::test_case;
 
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
-use crate::session_writer::{SessionIo, SessionWriter};
+use crate::session_writer::{Record, SessionIo, SessionWriter};
 use crate::test_util::poll_until;
 use event_listener::Event;
+use flume::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use futures_lite::future::or;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
@@ -45,61 +48,102 @@ const CONDITION_TIMEOUT: &str = "condition never became true";
 const SMALL_RETAINED_QUOTA: usize = 4;
 const SUSPEND_PUBLICATION_SLOT: &str = "fixture/suspend-publication";
 const SUSPEND_PUBLICATION_VERSION: u32 = 1;
+const RECEIPT_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const RECEIPT_TEST_TIMED_OUT: &str = "receipt test did not finish";
+const RECEIPT_GATE_TIMED_OUT: &str = "receipt gate was not released";
+const SPAWN_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const PRIVATE_TOOLS_REASON: &str = "private tools cannot be restored";
 
 struct ReceiptGateIo {
-    entered: flume::Sender<()>,
-    release: Option<flume::Receiver<()>>,
-    skip_syncs: usize,
+    entered: Sender<()>,
+    release: Option<Receiver<()>>,
+    matches: fn(&Record) -> bool,
+    matched: bool,
+}
+
+impl ReceiptGateIo {
+    fn writer(matches: fn(&Record) -> bool) -> (SessionWriter, Receiver<()>, Sender<()>) {
+        let (entered, syncing) = flume::bounded(1);
+        let (release, gate) = flume::bounded(1);
+        let writer = SessionWriter::with_io(
+            MakimaId::generate(),
+            Self {
+                entered,
+                release: Some(gate),
+                matches,
+                matched: false,
+            },
+            0,
+        );
+        (writer, syncing, release)
+    }
 }
 
 impl SessionIo for ReceiptGateIo {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.release.is_some() && !self.matched {
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let record = serde_json::from_slice(line)?;
+                if (self.matches)(&record) {
+                    self.matched = true;
+                    break;
+                }
+            }
+        }
         Ok(bytes.len())
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        if self.skip_syncs > 0 {
-            self.skip_syncs -= 1;
-            return Ok(());
-        }
-        if let Some(release) = self.release.take() {
-            self.entered.send(()).unwrap();
-            release.recv().unwrap();
+        if self.matched
+            && let Some(release) = self.release.take()
+        {
+            let _ = self.entered.try_send(());
+            if release.recv_timeout(RECEIPT_TEST_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    RECEIPT_GATE_TIMED_OUT,
+                ));
+            }
         }
         Ok(())
     }
 }
 
+fn receipt_test(test: impl Future<Output = ()>) {
+    smol::block_on(or(test, async {
+        smol::Timer::after(RECEIPT_TEST_TIMEOUT).await;
+        panic!("{RECEIPT_TEST_TIMED_OUT}");
+    }));
+}
+
 #[test]
 fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
-    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let (entered, syncing) = flume::bounded(1);
-    let (release, gate) = flume::bounded(1);
-    let writer = SessionWriter::with_io(
-        MakimaId::generate(),
-        ReceiptGateIo {
-            entered,
-            release: Some(gate),
-            skip_syncs: 0,
-        },
-        0,
-    );
-    manager.journal().bind_writer(writer).unwrap();
-    let spawning = manager.clone();
-    let task =
-        std::thread::spawn(move || spawning.create_root(Vec::new(), None, TestBackend::boxed()));
-    syncing.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    assert!(!task.is_finished());
-    let root_id = manager.root_id().unwrap();
-    assert_eq!(
-        manager.node(root_id).unwrap().graph_lifecycle,
-        GraphLifecycle::Reserved
-    );
-    assert!(manager.actor(root_id).is_err());
-    release.send(()).unwrap();
-    let root = task.join().unwrap().unwrap();
-    assert!(root.actor().is_ok());
-    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+    receipt_test(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (writer, syncing, release) =
+            ReceiptGateIo::writer(|record| matches!(record, Record::Agent { .. }));
+        manager.journal().bind_writer(writer).unwrap();
+        let spawning = manager.clone();
+        let (done, spawned) = flume::bounded(1);
+        thread::spawn(move || {
+            let _ = done.send(spawning.create_root(Vec::new(), None, TestBackend::boxed()));
+        });
+        syncing.recv_async().await.unwrap();
+        assert!(matches!(spawned.try_recv(), Err(TryRecvError::Empty)));
+        let root_id = manager.root_id().unwrap();
+        assert_eq!(
+            manager.node(root_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Reserved
+        );
+        assert!(manager.actor(root_id).is_err());
+        drop(release);
+        let root = spawned.recv_async().await.unwrap().unwrap();
+        assert!(root.actor().is_ok());
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
+    });
 }
 
 #[test]
@@ -146,96 +190,81 @@ fn blocked_spawn_leaves_no_agent_to_publish_later() {
 #[test_case(false; "restorable")]
 #[test_case(true; "private_tools")]
 fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_tools: bool) {
-    const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-    const PRIVATE_REASON: &str = "private tools cannot be restored";
-    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
-    let spec = StoredAgentSpec {
-        model: Default::default(),
-        system: String::new(),
-        tools: Vec::new(),
-        audience: "general_sub".into(),
-        mcp: false,
-        output_schema: None,
-        name: None,
-        silent: false,
-        auto_deliver: true,
-        inherit_provider: false,
-        mode_ceiling: StoredModeCeiling {
-            restrict_write_to: None,
-            tools: None,
-        },
-        plugin: None,
-    };
-    let expected_spec = serde_json::to_value(&spec).unwrap();
-    let restorable = if private_tools {
-        Err(PRIVATE_REASON.to_owned())
-    } else {
-        Ok(())
-    };
-    let expected_restorable = restorable.clone();
-    let (entered, syncing) = flume::bounded(1);
-    let (release, gate) = flume::bounded(1);
-    let writer = SessionWriter::with_io(
-        MakimaId::generate(),
-        ReceiptGateIo {
-            entered,
-            release: Some(gate),
-            skip_syncs: 1,
-        },
-        0,
-    );
-    manager.journal().bind_writer(writer.clone()).unwrap();
-    smol::block_on(writer.append(Vec::new())).unwrap();
-    let spawning = manager.clone();
-    let task = std::thread::spawn(move || {
-        spawning.spawn_child_trusted_with_config_and_restoration(
-            &root,
-            config(MODEL, false),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            Some(SpawnRestoration { spec, restorable }),
-            |_| Ok::<_, String>(TestBackend::boxed()),
-        )
-    });
-    syncing.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    smol::block_on(yield_until(|| {
-        manager
-            .journal()
-            .snapshot()
+    receipt_test(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let spec = StoredAgentSpec {
+            model: Default::default(),
+            system: String::new(),
+            tools: Vec::new(),
+            audience: "general_sub".into(),
+            mcp: false,
+            output_schema: None,
+            name: None,
+            silent: false,
+            auto_deliver: true,
+            inherit_provider: false,
+            mode_ceiling: StoredModeCeiling {
+                restrict_write_to: None,
+                tools: None,
+            },
+            plugin: None,
+        };
+        let expected_spec = serde_json::to_value(&spec).unwrap();
+        let restorable = if private_tools {
+            Err(PRIVATE_TOOLS_REASON.to_owned())
+        } else {
+            Ok(())
+        };
+        let expected_restorable = restorable.clone();
+        let (writer, syncing, release) = ReceiptGateIo::writer(
+            |record| matches!(record, Record::Agent { d, .. } if d.parent.is_some()),
+        );
+        manager.journal().bind_writer(writer).unwrap();
+        let spawning = manager.clone();
+        let (done, spawned) = flume::bounded(1);
+        thread::spawn(move || {
+            let result = spawning.spawn_child_trusted_with_config_and_restoration(
+                &root,
+                config(SPAWN_MODEL, false),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                Some(SpawnRestoration { spec, restorable }),
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            );
+            let _ = done.send(result);
+        });
+        syncing.recv_async().await.unwrap();
+        let snapshot = manager.journal().snapshot();
+        let children: Vec<_> = snapshot
             .agent_revisions
             .iter()
-            .any(|(_, record)| record.parent.is_some())
-    }));
-    let snapshot = manager.journal().snapshot();
-    let children: Vec<_> = snapshot
-        .agent_revisions
-        .iter()
-        .filter(|(_, record)| record.parent.is_some())
-        .collect();
-    assert_eq!(children.len(), 1);
-    let (_, child) = children[0];
-    assert_eq!(
-        serde_json::to_value(child.spec.as_ref().unwrap()).unwrap(),
-        expected_spec
-    );
-    assert_eq!(child.restorable, expected_restorable);
-    assert!(
-        snapshot
-            .state
-            .iter()
-            .any(|state| state.agent == Some(child.id)
-                && matches!(&state.change, StateChange::Config(saved) if saved.model == MODEL))
-    );
-    assert!(manager.actor(child.id).is_err());
-    assert!(!task.is_finished());
-    release.send(()).unwrap();
-    let child = task.join().unwrap().unwrap();
-    assert!(child.actor().is_ok());
-    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
+            .filter(|(_, record)| record.parent.is_some())
+            .collect();
+        assert_eq!(children.len(), 1);
+        let (_, child) = children[0];
+        assert_eq!(
+            serde_json::to_value(child.spec.as_ref().unwrap()).unwrap(),
+            expected_spec
+        );
+        assert_eq!(child.restorable, expected_restorable);
+        assert!(
+            snapshot
+                .state
+                .iter()
+                .any(|state| state.agent == Some(child.id)
+                    && matches!(&state.change, StateChange::Config(saved) if saved.model == SPAWN_MODEL))
+        );
+        assert!(manager.actor(child.id).is_err());
+        assert!(matches!(spawned.try_recv(), Err(TryRecvError::Empty)));
+        drop(release);
+        let child = spawned.recv_async().await.unwrap().unwrap();
+        assert!(child.actor().is_ok());
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
+    });
 }
 
 #[test]
@@ -257,41 +286,33 @@ fn synchronous_spawn_on_global_executor_receives_durable_acknowledgment() {
 
 #[test]
 fn generic_terminal_waits_for_writer_receipt_before_end() {
-    smol::block_on(async {
+    receipt_test(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
             .unwrap();
         let actor = root.actor().unwrap();
         let events = actor.subscribe_events();
-        let (entered, syncing) = flume::bounded(1);
-        let (release, gate) = flume::bounded(1);
-        let writer = SessionWriter::with_io(
-            MakimaId::generate(),
-            ReceiptGateIo {
-                entered,
-                release: Some(gate),
-                skip_syncs: 0,
-            },
-            0,
+        let (writer, syncing, release) = ReceiptGateIo::writer(
+            |record| matches!(record, Record::State { d } if matches!(d.change, StateChange::Turn { .. })),
         );
         manager.journal().bind_writer(writer).unwrap();
         let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
         syncing.recv_async().await.unwrap();
-        yield_until(|| ticket.peek_result().is_some()).await;
+        assert!(ticket.peek_result().is_some());
         assert!(ticket.peek().is_none());
         assert!(
             !events
                 .try_iter()
                 .any(|event| matches!(event, crate::ActorEvent::End(_)))
         );
-        release.send(()).unwrap();
+        drop(release);
         ticket.wait_result().await;
         while !matches!(
             events.recv_async().await.unwrap(),
             crate::ActorEvent::End(_)
         ) {}
-        manager.shutdown(COMPLETION_TIMEOUT).await;
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
     });
 }
 
@@ -299,8 +320,8 @@ fn generic_terminal_waits_for_writer_receipt_before_end() {
 #[test_case(true; "retired")]
 fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool) {
     const HISTORY_TEXT: &str = "retained child transcript";
-    let (manager, _, current, root_gate) = active_root(AgentLimits::default());
-    smol::block_on(async {
+    receipt_test(async {
+        let (manager, _, current, root_gate) = active_root_async(AgentLimits::default()).await;
         let child = current
             .spawn_child(
                 AgentMetadata::default(),
@@ -322,26 +343,16 @@ fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool)
             child.transcript(request.clone()).unwrap().through_turn,
             Some(ticket.turn_id())
         );
-        let (entered, syncing) = flume::bounded(1);
-        let (release, gate) = flume::bounded(1);
-        let writer = SessionWriter::with_io(
-            MakimaId::generate(),
-            ReceiptGateIo {
-                entered,
-                release: Some(gate),
-                skip_syncs: 0,
-            },
-            0,
-        );
+        let (writer, syncing, release) = ReceiptGateIo::writer(|_| true);
         manager.journal().bind_writer(writer.clone()).unwrap();
         syncing.recv_async().await.unwrap();
-        let (finish_cleanup, cleanup) = flume::bounded(1);
+        let (finish_cleanup, cleanup) = flume::bounded::<()>(1);
         {
             let mut graph = manager.lock_graph();
             let node = graph.nodes.get_mut(&child.id()).unwrap();
             let task = node.task.take().unwrap();
             node.task = Some(smol::spawn(async move {
-                cleanup.recv_async().await.unwrap();
+                let _ = cleanup.recv_async().await;
                 task.await;
             }));
         }
@@ -359,11 +370,11 @@ fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool)
         assert_eq!(transcript.through_turn, None);
         assert!(transcript.messages.to_string().contains(HISTORY_TEXT));
         assert!(writer.status().unsaved_records > 0);
-        finish_cleanup.send(()).unwrap();
-        release.send(()).unwrap();
+        drop(finish_cleanup);
+        drop(release);
         manager.journal().flush().await.unwrap();
         root_gate.release(1);
-        manager.shutdown(COMPLETION_TIMEOUT).await;
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
     });
 }
 
@@ -2390,6 +2401,17 @@ fn active_root(
     crate::CurrentManagedTurn,
     Arc<Gate>,
 ) {
+    smol::block_on(active_root_async(limits))
+}
+
+async fn active_root_async(
+    limits: AgentLimits,
+) -> (
+    super::AgentManagerHandle,
+    super::AgentRef,
+    crate::CurrentManagedTurn,
+    Arc<Gate>,
+) {
     let manager = AgentManagerHandle::new(limits).unwrap();
     let (tx, rx) = flume::bounded(1);
     let gate = Gate::new();
@@ -2405,7 +2427,7 @@ fn active_root(
         .unwrap()
         .admit_turn(input(), None, "root".into())
         .unwrap();
-    let current = smol::block_on(rx.recv_async()).unwrap();
+    let current = rx.recv_async().await.unwrap();
     (manager, root, current, gate)
 }
 
