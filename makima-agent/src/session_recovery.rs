@@ -24,7 +24,7 @@ use makima_storage::{
     sessions::{HistorySnapshot, SESSIONS_DIR, Session, SessionError, SessionRecord, next_epoch},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, io,
     mem::take,
     path::{Path, PathBuf},
@@ -426,12 +426,48 @@ impl RecoveryCandidate {
                 records.push(SessionRecord::State { d: record });
             }
         }
-        for (&agent, scope) in view.scopes.iter().filter(|_| !continue_turns) {
+        // A parent can consume a report before the child's terminal record reaches disk.
+        let mut reported: BTreeMap<_, _> = session
+            .state()
+            .iter()
+            .filter_map(|record| {
+                let StateChange::Delivery {
+                    id: (child, turn),
+                    op: StoredDeliveryOp::Queued(delivery),
+                } = &record.change
+                else {
+                    return None;
+                };
+                (record.agent == Some(view.agents.get(child)?.parent?)
+                    && view.scopes.get(&Some(*child))?.admitted.contains_key(turn)
+                    && !matches!(
+                        delivery.result.outcome.status,
+                        StoredTurnStatus::Completed { .. }
+                    ))
+                .then(|| ((*child, *turn), delivery.result.clone()))
+            })
+            .collect();
+        for (&agent, scope) in &view.scopes {
             let Some(agent) = agent else { continue };
             for (&turn, origin) in &scope.admitted {
+                let reported_result = reported.remove(&(agent, turn));
+                if continue_turns && reported_result.is_none() {
+                    continue;
+                }
                 seq = seq
                     .checked_add(1)
-                    .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.to_owned()))?;
+                    .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                if let Some(result) = reported_result {
+                    let record = StoredStateRecord {
+                        seq,
+                        agent: Some(agent),
+                        generation: scope.generation,
+                        change: StateChange::Turn { turn, result },
+                    };
+                    session.push_state(record.clone());
+                    records.push(SessionRecord::State { d: record });
+                    continue;
+                }
                 let child = view
                     .agents
                     .get(&agent)

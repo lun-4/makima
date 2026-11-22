@@ -1,4 +1,6 @@
-use super::{AgentLimits, AgentManagerHandle, AgentResidency, ReactivationError, ResidentAgent};
+use super::{
+    AgentLimits, AgentManagerHandle, AgentResidency, ManagerError, ReactivationError, ResidentAgent,
+};
 use crate::{
     ActorBackend, AgentActorHandle, AgentId, AgentInput, AgentMode, BackendResult, ControlWork,
     DoneReason, History, ModeDef, ModeId, RunSettings, ToolOutput, TurnContext, TurnId,
@@ -8,11 +10,14 @@ use crate::{
         TurnResult, graph_quiescence_barrier,
     },
     journal::{JournalChange, JournalCommit, SessionJournal},
+    session_recovery::RecoveryCandidate,
     session_writer::{Record, SessionWriter, forget},
+    test_util::MockBackend,
 };
 use futures_lite::future::or;
 use makima_providers::{Message, Model, ObservationSource, TokenUsage, provider::unconfigured};
 use makima_storage::{
+    checkpoint::CheckpointPublication,
     session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
         StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
@@ -35,7 +40,6 @@ use std::{
 };
 use tempfile::TempDir;
 use test_case::test_case;
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 const MODEL: &str = "test/restart-model";
 const INITIAL: &str = "retained history before report";
 const REPORT: &str = "disk-backed child report";
@@ -49,6 +53,10 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const FAILURE_REPORT_TIMEOUT: &str = "restored child failure report did not settle";
 const FAILURE_REPORT_MISSING: &str = "restored child failure report did not execute";
 const TERMINAL_RECORD_MISSING: &str = "recovery terminal record is missing from the log";
+const PUBLICATION_REJECTED: &str = "recovery publication rejected";
+
+type StoredSession = Session<Message, TokenUsage, ToolOutput>;
+
 #[derive(Debug, PartialEq, Eq)]
 enum Progress {
     Turn(TurnId),
@@ -250,28 +258,36 @@ async fn activate(
     };
     let agent = manager
         .ensure_resident_with(parent, |_| async move {
-            Ok(ResidentAgent {
-                backend: Box::new(backend),
-                config: EffectiveAgentConfig::new(
-                    RunSettings {
-                        provider: unconfigured(),
-                        model: Model::from_spec(MODEL).unwrap(),
-                        fast: true,
-                        workflow: false,
-                        thinking: Default::default(),
-                    },
-                    AgentMode::Build,
-                )
-                .with_mode_def(Some(ModeDef::default_for(ModeId::Build))),
-                shared_messages: None,
-                start: Some(wait),
-                initialize: None,
-            })
+            Ok(resident_agent(backend, Some(wait)))
         })
         .await
         .unwrap();
     (agent.actor().unwrap(), start)
 }
+
+fn resident_agent(
+    backend: impl ActorBackend + 'static,
+    start: Option<flume::Receiver<()>>,
+) -> ResidentAgent {
+    ResidentAgent {
+        backend: Box::new(backend),
+        config: EffectiveAgentConfig::new(
+            RunSettings {
+                provider: unconfigured(),
+                model: Model::from_spec(MODEL).unwrap(),
+                fast: true,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            AgentMode::Build,
+        )
+        .with_mode_def(Some(ModeDef::default_for(ModeId::Build))),
+        shared_messages: None,
+        start,
+        initialize: None,
+    }
+}
+
 async fn publish(
     journal: &SessionJournal,
     session: &mut StoredSession,
@@ -562,7 +578,7 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         .await;
     assert!(matches!(
         error,
-        Err(super::ManagerError::Reactivation(
+        Err(ManagerError::Reactivation(
             ReactivationError::ModelUnavailable { .. }
         ))
     ));
@@ -604,23 +620,75 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
             .set_len(boundary as u64)
             .unwrap();
         session = StoredSession::load_from(session.id, directory).unwrap();
-        journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        let view = session.latest_state().unwrap();
+        assert_eq!(
+            view.scopes[&Some(child)].admitted.contains_key(&turn),
+            !terminal_on_disk
+        );
+        let StoredDeliveryOp::Queued(report) =
+            &view.scopes[&Some(parent)].deliveries[&(child, turn)]
+        else {
+            panic!("{FAILURE_REPORT_MISSING}");
+        };
+        let writer = SessionWriter::open_session(directory, &session).unwrap();
+        let recovered = RecoveryCandidate::prepare_with_continuation(session, true)
+            .unwrap()
+            .publish(
+                &writer,
+                CheckpointPublication::default(),
+                Arc::new(|publication| {
+                    publication
+                        .try_publish()
+                        .then_some(())
+                        .ok_or_else(|| Arc::from(PUBLICATION_REJECTED))
+                }),
+            )
+            .await
+            .unwrap();
+        session = StoredSession::load_from(recovered.session().id, directory).unwrap();
+        journal = recovered.journal();
         manager = restore(&journal);
+        let child_executions = Arc::new(AtomicUsize::new(0));
+        let child_actor = manager
+            .ensure_resident_with(child, |_| {
+                let child_executions = Arc::clone(&child_executions);
+                async move {
+                    let backend = MockBackend::STRICT.with_turn(move |_, context, _, _| {
+                        child_executions.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            BackendResult::EnteredRun(TurnOutcome::completed(
+                                context.agent_id,
+                                context.turn_id.unwrap(),
+                                TokenUsage::default(),
+                                0,
+                                DoneReason::EndTurn,
+                            ))
+                        })
+                    });
+                    Ok(resident_agent(backend, None))
+                }
+            })
+            .await
+            .unwrap()
+            .actor()
+            .unwrap();
+        settled(&child_actor).await;
+        assert_eq!(child_executions.load(Ordering::SeqCst), 0);
+        let view = session.latest_state().unwrap();
+        assert!(
+            view.scopes[&Some(child)]
+                .results
+                .contains(&(turn, report.result.clone()))
+        );
+    } else {
         assert_eq!(
             manager
                 .fail_restored_turns(child, REACTIVATION_FAILURE.into())
                 .await
                 .unwrap(),
-            usize::from(!terminal_on_disk),
+            0
         );
     }
-    assert_eq!(
-        manager
-            .fail_restored_turns(child, REACTIVATION_FAILURE.into())
-            .await
-            .unwrap(),
-        0
-    );
     let actor = if let Some(actor) = actor {
         actor
     } else {
@@ -647,7 +715,12 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
     settled(&actor).await;
     assert_eq!(manager.active_child_count(parent), 0);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    let saved = publish(&journal, &mut session, directory).await;
+    let saved = if terminal_on_disk.is_some() {
+        journal.flush().await.unwrap();
+        StoredSession::load_from(session.id, directory).unwrap()
+    } else {
+        publish(&journal, &mut session, directory).await
+    };
     let view = saved.latest_state().unwrap();
     assert!(view.scopes[&Some(child)].admitted.is_empty());
     assert_eq!(
@@ -657,6 +730,9 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
     assert_eq!(report_count(&saved, &delivery), 1);
     drop(actor);
     crash(manager, &events, true).await;
+    if terminal_on_disk.is_some() {
+        forget(directory, session.id).unwrap();
+    }
 }
 
 #[test_case(true; "resident")]
