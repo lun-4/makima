@@ -3,12 +3,12 @@ mod common;
 
 use common::{RestartHost, TestSession};
 use makima_agent::{
-    AgentId, AgentInput, TurnAdmissionOptions, TurnId, TurnOutcome, actor::ActorStatus,
+    AgentEvent, AgentId, AgentInput, TurnAdmissionOptions, TurnId, TurnOutcome, actor::ActorStatus,
 };
 use makima_lua::test_support::{InMemoryFs, run_command};
 use makima_providers::{
     AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
-    RequestOptions, StreamResponse,
+    RequestOptions, Role, StreamResponse,
     provider::{BoxFuture, Provider},
 };
 use makima_storage::{
@@ -43,6 +43,9 @@ const TASK_WAIT: &str = "task_wait";
 const WAIT_ENTERED: &str = "wait_entered.json";
 const NON_RESUMABLE: &str = "restart_non_resumable";
 const NON_RESUMABLE_ENTERED: &str = "non_resumable_entered";
+const COMPLETED_NON_RESUMABLE: &str = "restart_completed_non_resumable";
+const COMPLETED_NON_RESUMABLE_ENTERED: &str = "completed_non_resumable_entered";
+const COMPLETED_OUTPUT: &str = "  completed sibling\nsecond line: \"verbatim\"  \n";
 const RESTART_RESULT: &str = "This tool call was interrupted when makima stopped. It may have partly run. Check the current state before retrying, then continue your task.";
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 const TASK_PARENT: &str = "parent waiting for disk-backed task";
@@ -432,6 +435,7 @@ fn published_task_wait_resumes_parent_and_child_without_respawning(graceful: boo
     );
     let marker = tmp.path().join(WAIT_ENTERED);
     let non_resumable_marker = tmp.path().join(NON_RESUMABLE_ENTERED);
+    let completed_marker = tmp.path().join(COMPLETED_NON_RESUMABLE_ENTERED);
     let task_source = format!(
         r#"
 local register = makima.api.register_tool
@@ -462,9 +466,21 @@ register({{
         error("the non-resumable call did not park")
     end,
 }})
+register({{
+    name = "{COMPLETED_NON_RESUMABLE}", description = "Complete a non-resumable call",
+    audiences = {{ "main", "general_sub" }},
+    schema = {{ type = "object", properties = {{}} }},
+    handler = function()
+        local previous = makima.fs.read({completed_marker}) or ""
+        assert(makima.fs.write({completed_marker}, previous .. "+"))
+        return {completed_output}
+    end,
+}})
 "#,
         marker = json!(marker),
         non_resumable_marker = json!(non_resumable_marker),
+        completed_marker = json!(completed_marker),
+        completed_output = json!(COMPLETED_OUTPUT),
     );
     fs.seed(
         &tmp.path()
@@ -529,6 +545,11 @@ register({{
     }
     if graceful {
         wait.message.content.push(ContentBlock::tool_use(
+            COMPLETED_NON_RESUMABLE,
+            COMPLETED_NON_RESUMABLE,
+            json!({}),
+        ));
+        wait.message.content.push(ContentBlock::tool_use(
             NON_RESUMABLE,
             NON_RESUMABLE,
             json!({}),
@@ -549,6 +570,20 @@ register({{
         }))
         .unwrap_or_else(|| panic!("tool handler did not write {}", marker.display()));
     }
+    if graceful {
+        let done = smol::block_on(common::bounded_at("completed sibling tool event", async {
+            loop {
+                let envelope = host.events.recv_async().await.unwrap();
+                if let AgentEvent::ToolDone(done) = envelope.event
+                    && done.id == COMPLETED_NON_RESUMABLE
+                {
+                    break done;
+                }
+            }
+        }));
+        assert!(!done.is_error);
+        assert_eq!(done.output.as_text(), COMPLETED_OUTPUT);
+    }
     command(&host, "publish");
     let saved_ids = ids(&host);
     let prefix = TestSession::load(session_id, &state).unwrap();
@@ -557,6 +592,7 @@ register({{
             .unwrap()
             .contains(TASK_WAIT)
     );
+    let batch_ids = [TASK_WAIT, COMPLETED_NON_RESUMABLE, NON_RESUMABLE];
     let host = if graceful {
         const SUSPEND_TIMEOUT: Duration = Duration::from_secs(15);
         let report = smol::block_on(futures_lite::future::race(
@@ -575,6 +611,26 @@ register({{
         let suspended = TestSession::load(session_id, &state).unwrap();
         let messages = serde_json::to_string(suspended.subagent_messages()).unwrap();
         assert!(!messages.contains(CANCEL_MARKER));
+        let saved_results: Vec<_> = suspended
+            .subagent_messages()
+            .values()
+            .flat_map(|messages| messages.iter())
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if batch_ids.contains(&tool_use_id.as_str()) => {
+                    Some((tool_use_id.as_str(), content.as_str(), *is_error))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            saved_results,
+            [(COMPLETED_NON_RESUMABLE, COMPLETED_OUTPUT, false)]
+        );
         host.restart_host(tmp.path())
     } else {
         host.crash_restart_host(tmp.path())
@@ -605,34 +661,52 @@ register({{
                 .iter()
                 .any(|(path, bytes)| path == &non_resumable_marker && bytes == b"+")
         );
-        let results: Vec<_> = resumed_parent
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } if tool_use_id == NON_RESUMABLE => Some((content.as_str(), *is_error)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(results, vec![(RESTART_RESULT, true)]);
+        assert!(
+            files
+                .iter()
+                .any(|(path, bytes)| path == &completed_marker && bytes == b"+")
+        );
     }
-    let result: Value = resumed_parent
+    let batch_messages: Vec<_> = resumed_parent
         .messages
         .iter()
-        .flat_map(|message| &message.content)
-        .find_map(|block| match block {
+        .filter(|message| {
+            message.content.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { tool_use_id, .. }
+                    if batch_ids.contains(&tool_use_id.as_str()))
+            })
+        })
+        .collect();
+    let [batch] = batch_messages.as_slice() else {
+        panic!("expected one tool-result message for the batch, got {batch_messages:?}");
+    };
+    assert_eq!(batch.role, Role::User);
+    let results: Vec<_> = batch
+        .content
+        .iter()
+        .filter_map(|block| match block {
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
-                is_error: false,
-            } if tool_use_id == TASK_WAIT => Some(serde_json::from_str(content).unwrap()),
+                is_error,
+            } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
             _ => None,
         })
-        .unwrap();
+        .collect();
+    let (&(wait_id, wait_output, wait_error), siblings) = results.split_first().unwrap();
+    assert_eq!((wait_id, wait_error), (TASK_WAIT, false));
+    if graceful {
+        assert_eq!(
+            siblings,
+            &[
+                (COMPLETED_NON_RESUMABLE, COMPLETED_OUTPUT, false),
+                (NON_RESUMABLE, RESTART_RESULT, true),
+            ]
+        );
+    } else {
+        assert!(siblings.is_empty());
+    }
+    let result: Value = serde_json::from_str(wait_output).unwrap();
     assert_eq!(result["status"], "done");
     assert_eq!(result["result"]["turn_id"], task["turn_id"]);
     assert_eq!(result["result"]["text"], REPLY);
@@ -653,6 +727,27 @@ register({{
         recovered.latest_state().unwrap().agents.len(),
         prefix.latest_state().unwrap().agents.len()
     );
+    if graceful {
+        let parent: AgentId = saved_ids["parent"].as_str().unwrap().parse().unwrap();
+        let transcript_key = &recovered.latest_state().unwrap().agents[&parent].transcript_key;
+        let transcript = &recovered.subagent_messages()[transcript_key];
+        let stored_batch: Vec<_> = transcript
+            .iter()
+            .filter(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { tool_use_id, .. }
+                    if batch_ids.contains(&tool_use_id.as_str()))
+                })
+            })
+            .collect();
+        let [completed, resumed] = stored_batch.as_slice() else {
+            panic!("expected separate saved and resumed tool-result messages");
+        };
+        assert_eq!(completed.content, [batch.content[1].clone()]);
+        assert_eq!(resumed.content.len(), 2);
+        assert!(resumed.content.contains(&batch.content[0]));
+        assert!(resumed.content.contains(&batch.content[2]));
+    }
     for turn in [
         saved_ids["turns"][0]["turn"].clone(),
         task["turn_id"].clone(),

@@ -619,16 +619,14 @@ impl<'h> Agent<'h> {
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         if !super::history::pending_tool_calls(self.history.as_slice()).is_empty() {
             let ctx = self.tool_context()?;
-            self.cancel
-                .race(tool_dispatch::resume_tool_calls(
-                    &mut self.recent_calls,
-                    self.history.reborrow(),
-                    &self.event_tx,
-                    &ctx,
-                    self.cancel_reason_source.as_ref(),
-                ))
-                .await
-                .map_err(|_| AgentError::Cancelled)??;
+            tool_dispatch::resume_tool_calls(
+                &mut self.recent_calls,
+                self.history.reborrow(),
+                &self.event_tx,
+                &ctx,
+                self.cancel_reason_source.as_ref(),
+            )
+            .await?;
         }
         let mut completion_recovery_attempts = 0;
         loop {

@@ -595,21 +595,17 @@ impl History {
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
     let mut changed = false;
+    let mut valid_ids = Vec::new();
     let mut i = 0;
     while i < messages.len() {
         if !matches!(messages[i].role, Role::User) {
+            valid_ids.clear();
+            if matches!(messages[i].role, Role::Assistant) {
+                valid_ids.extend(messages[i].tool_uses().map(|(id, _, _)| id.to_owned()));
+            }
             i += 1;
             continue;
         }
-
-        let valid_ids: Vec<String> = if i > 0 && matches!(messages[i - 1].role, Role::Assistant) {
-            messages[i - 1]
-                .tool_uses()
-                .map(|(id, _, _)| id.to_owned())
-                .collect()
-        } else {
-            Vec::new()
-        };
 
         let content_len = messages[i].content.len();
         let (mut had_results, mut kept_results) = (false, false);
@@ -633,6 +629,9 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
             messages.remove(i);
             changed = true;
         } else {
+            if !kept_results {
+                valid_ids.clear();
+            }
             i += 1;
         }
     }
@@ -1468,6 +1467,31 @@ mod tests {
             [ContentBlock::Text { text }] if text == "keep me"
         ));
         assert!(!remove_orphaned_tool_results(&mut messages));
+    }
+
+    #[test_case(false; "completed_batch_is_unchanged")]
+    #[test_case(true; "partial_batch_keeps_real_results")]
+    fn sanitize_restored_split_results(partial: bool) {
+        let mut calls = vec![FIRST, SECOND];
+        if partial {
+            calls.push(GO);
+        }
+        let mut messages = vec![
+            make_tool_use_msg(&calls),
+            make_tool_result_msg(&[FIRST]),
+            make_tool_result_msg(&[SECOND]),
+        ];
+        let history = History::restored(messages.clone());
+        if partial {
+            let mut missing = make_tool_result_msg(&[]);
+            missing.content.push(ContentBlock::ToolResult {
+                tool_use_id: GO.into(),
+                content: UNAVAILABLE_RESULT.into(),
+                is_error: true,
+            });
+            messages.push(missing);
+        }
+        assert_eq!(history.as_slice(), messages.as_slice());
     }
 
     #[test]

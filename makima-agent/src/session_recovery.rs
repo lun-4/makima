@@ -616,56 +616,55 @@ impl RecoveredSession {
 pub(crate) fn sanitize(mut history: HistorySnapshot<Message>) -> HistorySnapshot<Message> {
     let mut messages: Vec<Message> = Vec::with_capacity(history.messages.len());
     let mut ids = Vec::with_capacity(history.messages.len());
-    for (index, mut message) in history.messages.iter().cloned().enumerate() {
-        let previous = messages.last();
-        let mut calls: Vec<_> = previous
-            .filter(|message| matches!(message.role, Role::Assistant))
-            .into_iter()
-            .flat_map(Message::tool_uses)
-            .map(|(id, _, _)| id.to_owned())
-            .collect();
+    let mut calls: Vec<(&str, bool)> = Vec::new();
+    for (index, original) in history.messages.iter().enumerate() {
+        let mut message = original.clone();
+        let (mut had_results, mut kept_results) = (false, false);
         if matches!(message.role, Role::User) {
-            let had_results = message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
-            if !had_results && !calls.is_empty() {
-                messages.push(results(take(&mut calls)));
-                ids.push(MakimaId::generate());
-            }
-            message.content.retain(|block| !matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if !calls.contains(tool_use_id)));
-            if had_results
-                && !message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
-            {
+            message.content.retain(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    had_results = true;
+                    let mut matched = false;
+                    for (id, seen) in &mut calls {
+                        if *id == tool_use_id {
+                            *seen = true;
+                            matched = true;
+                        }
+                    }
+                    kept_results |= matched;
+                    matched
+                }
+                _ => true,
+            });
+            if had_results && !kept_results {
                 message
                     .content
                     .retain(|block| !matches!(block, ContentBlock::Image { .. }));
+                if message.content.is_empty() {
+                    continue;
+                }
             }
-            if message.content.is_empty() {
-                continue;
+        }
+        if !kept_results {
+            if had_results
+                && messages
+                    .last()
+                    .is_some_and(|last| last.role == Role::Assistant)
+            {
+                message.content.extend(missing_results(&mut calls));
+            } else {
+                complete_tool_results(&mut messages, &mut ids, &mut calls);
             }
-            let missing: Vec<_> = calls.into_iter().filter(|id| !message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id))).collect();
-            message.content.extend(missing.into_iter().map(unavailable));
-        } else if !calls.is_empty() {
-            messages.push(results(calls));
-            ids.push(MakimaId::generate());
+        }
+        if matches!(message.role, Role::Assistant) {
+            calls.extend(original.tool_uses().map(|(id, _, _)| (id, false)));
         }
         if !message.content.is_empty() {
             messages.push(message);
             ids.push(history.ids[index]);
         }
     }
-    if let Some(last) = messages.last()
-        && matches!(last.role, Role::Assistant)
-        && last.has_tool_calls()
-    {
-        let calls = last.tool_uses().map(|(id, _, _)| id.to_owned()).collect();
-        messages.push(results(calls));
-        ids.push(MakimaId::generate());
-    }
+    complete_tool_results(&mut messages, &mut ids, &mut calls);
     if history.messages.as_ref() != &messages {
         history.epoch = next_epoch();
         history.covered = history.ids.last().copied();
@@ -683,12 +682,34 @@ fn unavailable(tool_use_id: String) -> ContentBlock {
     }
 }
 
-fn results(calls: Vec<String>) -> Message {
-    Message {
-        role: Role::User,
-        content: calls.into_iter().map(unavailable).collect(),
-        display_text: Some(String::new()),
-        ..Default::default()
+fn missing_results<'a>(
+    calls: &'a mut Vec<(&str, bool)>,
+) -> impl Iterator<Item = ContentBlock> + 'a {
+    calls
+        .drain(..)
+        .filter(|(_, seen)| !seen)
+        .map(|(id, _)| unavailable(id.to_owned()))
+}
+
+fn complete_tool_results(
+    messages: &mut Vec<Message>,
+    ids: &mut Vec<MakimaId>,
+    calls: &mut Vec<(&str, bool)>,
+) {
+    if calls.is_empty() {
+        return;
+    }
+    let missing = missing_results(calls);
+    if let Some(last) = messages.last_mut().filter(|last| last.role == Role::User) {
+        last.content.extend(missing);
+    } else {
+        messages.push(Message {
+            role: Role::User,
+            content: missing.collect(),
+            display_text: Some(String::new()),
+            ..Default::default()
+        });
+        ids.push(MakimaId::generate());
     }
 }
 
@@ -894,6 +915,52 @@ mod tests {
         assert_eq!(again.epoch, history.epoch);
         assert!(Arc::ptr_eq(&again.ids, &history.ids));
         assert!(Arc::ptr_eq(&again.messages, &history.messages));
+    }
+
+    #[test_case(false; "completed_batch_is_unchanged")]
+    #[test_case(true; "partial_batch_only_fills_missing_result")]
+    fn disabled_continuation_preserves_split_results(partial: bool) {
+        const FIRST_CALL: &str = "first";
+        const SECOND_CALL: &str = "second";
+        const MISSING_CALL: &str = "missing";
+
+        let mut session = StoredSession::new(MODEL, CWD);
+        session.bind_root_id(AgentId::generate()).unwrap();
+        let mut calls = vec![FIRST_CALL, SECOND_CALL];
+        if partial {
+            calls.push(MISSING_CALL);
+        }
+        session.push_message(Message {
+            role: Role::Assistant,
+            content: calls
+                .into_iter()
+                .map(|id| ContentBlock::tool_use(id, TOOL, json!({})))
+                .collect(),
+            ..Default::default()
+        });
+        for id in [FIRST_CALL, SECOND_CALL] {
+            session.push_message(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: id.into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            });
+        }
+        session.push_message(Message::user(DRAFT.into()));
+        let original = session.history_snapshot();
+        let candidate = RecoveryCandidate::prepare_with_continuation(session, false).unwrap();
+        let recovered = candidate.session.history_snapshot();
+        let mut expected = original.messages.as_ref().clone();
+        if partial {
+            expected[2].content.push(unavailable(MISSING_CALL.into()));
+        } else {
+            assert_eq!(recovered.epoch, original.epoch);
+        }
+        assert_eq!(recovered.messages.as_ref(), &expected);
+        assert_eq!(recovered.ids, original.ids);
     }
 
     #[test]

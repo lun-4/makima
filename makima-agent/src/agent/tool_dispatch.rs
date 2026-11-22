@@ -25,10 +25,11 @@ use crate::tools::{
     TurnToolRoute, truncate_scope,
 };
 use crate::{
-    AgentError, AgentEvent, ReasonedCancelToken, SessionMailbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentError, AgentEvent, EventSender, ReasonedCancelToken, SessionMailbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use makima_config::{FILE_WRITE_TOOLS, ToolKey};
+use makima_providers::StreamResponse;
 use makima_storage::id::SessionRef;
 
 const MOVED_PERMISSION_ERR: &str = "tool moved to the background before permission was answered";
@@ -1184,10 +1185,10 @@ async fn execute_mcp_tool(
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 pub(super) async fn process_tool_calls(
-    response: makima_providers::StreamResponse,
+    response: StreamResponse,
     recent_calls: &mut RecentCalls,
     mut history: ActorHistory<'_>,
-    event_tx: &crate::EventSender,
+    event_tx: &EventSender,
     ctx: &ToolContext,
     cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
@@ -1218,10 +1219,13 @@ pub(super) async fn process_tool_calls(
 pub(super) async fn resume_tool_calls(
     recent_calls: &mut RecentCalls,
     history: ActorHistory<'_>,
-    event_tx: &crate::EventSender,
+    event_tx: &EventSender,
     ctx: &ToolContext,
     cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
+    if ctx.cancel.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
     let calls = super::history::pending_tool_calls(history.as_slice());
     if calls.is_empty() {
         return Ok(());
@@ -1243,7 +1247,7 @@ async fn execute_tool_calls(
     restarting: bool,
     recent_calls: &mut RecentCalls,
     mut history: ActorHistory<'_>,
-    event_tx: &crate::EventSender,
+    event_tx: &EventSender,
     ctx: &ToolContext,
     cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
@@ -1282,7 +1286,7 @@ async fn execute_tool_calls(
         .as_ref()
         .and_then(|session| SessionMailbox::open(session.id()).ok());
     let (move_tx, move_rx) = flume::unbounded::<String>();
-    let (result_tx, result_rx) = flume::unbounded::<(String, ToolDoneEvent)>();
+    let (result_tx, result_rx) = flume::unbounded::<ToolDoneEvent>();
     let mut pending: HashMap<String, smol::Task<()>> = HashMap::new();
     let mut scopes: HashMap<String, Arc<CallScope>> = HashMap::new();
 
@@ -1292,9 +1296,7 @@ async fn execute_tool_calls(
             id.clone(),
             Arc::clone(&tool_name),
             call_summary(&ctx.registry, &name, &input),
-            ctx.session_id
-                .as_ref()
-                .map(makima_storage::id::SessionRef::id),
+            ctx.session_id.as_ref().map(SessionRef::id),
             ctx.execution_agent_id,
             &ctx.cancel,
             Some(move_tx.clone()),
@@ -1316,6 +1318,7 @@ async fn execute_tool_calls(
         let result_tx_clone = result_tx.clone();
         let mailbox_clone = mailbox.clone();
         let task_scope = Arc::clone(&scope);
+        let cancel_reason = cancel_reason.cloned();
         let task = smol::spawn(async move {
             let _guard = guard;
             let run_id = task_scope.id().to_owned();
@@ -1337,11 +1340,18 @@ async fn execute_tool_calls(
                 }
             };
             if task_scope.claim_foreground() {
-                event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
                 if let Some(mailbox) = &mailbox_clone {
                     mailbox.finish_call(task_scope.id());
                 }
-                let _ = result_tx_clone.send((task_scope.id().to_owned(), done));
+                let publish = || {
+                    let _ = result_tx_clone.send(done.clone());
+                };
+                if let Some(cancel) = cancel_reason {
+                    cancel.unless_suspended(publish);
+                } else {
+                    publish();
+                }
+                event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done)));
             } else {
                 // A move took the call, or the dispatcher already claimed the
                 // receipt. Either way the result belongs to the mailbox.
@@ -1362,17 +1372,18 @@ async fn execute_tool_calls(
     }
 
     enum Next {
-        Result(String, Box<ToolDoneEvent>),
+        Result(Box<ToolDoneEvent>),
+        Cancelled,
         Moved(String),
         Closed,
     }
 
-    let mut results: Vec<ToolDoneEvent> = Vec::new();
+    let mut results = immediate_errors;
     while !pending.is_empty() {
         let next = futures_lite::future::or(
             async {
                 match result_rx.recv_async().await {
-                    Ok((id, done)) => Next::Result(id, Box::new(done)),
+                    Ok(done) => Next::Result(Box::new(done)),
                     Err(_) => Next::Closed,
                 }
             },
@@ -1383,22 +1394,30 @@ async fn execute_tool_calls(
                 }
             },
         );
-        let next = match cancel_reason {
-            Some(cancel) => {
-                futures_lite::future::or(
-                    async {
-                        cancel.suspended().await;
-                        Err(AgentError::Cancelled)
-                    },
-                    async { Ok(next.await) },
-                )
-                .await?
-            }
-            None => next.await,
-        };
+        let next = futures_lite::future::or(
+            async {
+                if restarting {
+                    ctx.cancel.cancelled().await;
+                } else if let Some(cancel) = cancel_reason {
+                    cancel.suspended().await;
+                } else {
+                    futures_lite::future::pending().await
+                }
+                Next::Cancelled
+            },
+            next,
+        )
+        .await;
         match next {
-            Next::Result(id, done) => {
-                if pending.remove(&id).is_some() {
+            Next::Cancelled => {
+                if !cancel_reason.is_some_and(ReasonedCancelToken::is_suspended) {
+                    return Err(AgentError::Cancelled);
+                }
+                results.extend(result_rx.try_iter());
+                break;
+            }
+            Next::Result(done) => {
+                if pending.remove(&done.id).is_some() {
                     results.push(*done);
                 }
             }
@@ -1441,20 +1460,23 @@ async fn execute_tool_calls(
         }
     }
 
-    if cancel_reason.is_some_and(ReasonedCancelToken::is_suspended) {
+    let suspended = cancel_reason.is_some_and(ReasonedCancelToken::is_suspended);
+    if !results.is_empty() {
+        let tool_msg = crate::types::tool_results(results);
+        history
+            .push_observation(tool_msg.clone())
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
+        if !suspended {
+            event_tx.send(AgentEvent::ToolResultsSubmitted {
+                message: Box::new(tool_msg),
+            })?;
+        }
+    }
+    if suspended {
         return Err(AgentError::Cancelled);
     }
-    let mut all_results = results;
-    all_results.extend(immediate_errors);
-    let tool_msg = crate::types::tool_results(all_results);
-    event_tx.send(AgentEvent::ToolResultsSubmitted {
-        message: Box::new(tool_msg.clone()),
-    })?;
-    history
-        .push_observation(tool_msg)
-        .map_err(|error| AgentError::Config {
-            message: error.to_string(),
-        })?;
     Ok(())
 }
 

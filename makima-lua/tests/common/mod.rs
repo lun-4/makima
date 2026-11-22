@@ -349,6 +349,7 @@ pub struct RestartHost {
     pub fs: Arc<InMemoryFs>,
     pub root: TrustedTarget,
     pub history: SharedMessages,
+    pub events: flume::Receiver<Envelope>,
     plugins: Vec<String>,
     provider: Option<Arc<dyn Provider>>,
     providers: Option<Arc<ProviderRegistry>>,
@@ -411,7 +412,7 @@ impl RestartHost {
             host.load_source(name, std::str::from_utf8(bytes).unwrap())
                 .unwrap();
         }
-        let (mut context, _events, cancel) = ctx_with_canned_provider();
+        let (mut context, events, cancel) = ctx_with_canned_provider();
         context.session_id = Some(session_id.into());
         context.cwd = session.cwd.clone().into();
         context.model = Arc::new(Model::from_spec(&session.model).unwrap());
@@ -438,6 +439,7 @@ impl RestartHost {
             fs,
             root,
             history,
+            events,
             plugins,
             provider: None,
             providers: None,
@@ -511,7 +513,7 @@ impl RestartHost {
             host.load_source(name, std::str::from_utf8(bytes).unwrap())
                 .unwrap();
         }
-        let (mut context, _events, cancel) = ctx_with_canned_provider();
+        let (mut context, events, cancel) = ctx_with_canned_provider();
         context.provider = Arc::clone(&provider);
         context.providers = Arc::clone(&providers);
         context.mcp = mcp;
@@ -720,6 +722,7 @@ impl RestartHost {
             fs,
             root,
             history,
+            events,
             plugins,
             provider: Some(provider),
             providers: Some(providers),

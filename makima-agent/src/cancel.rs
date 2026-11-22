@@ -217,6 +217,13 @@ impl ReasonedCancelToken {
         matches!(*self.0.cause.lock_unpoisoned(), Some(CancelCause::Suspend))
     }
 
+    pub(crate) fn unless_suspended(&self, effect: impl FnOnce()) {
+        let cause = self.0.cause.lock_unpoisoned();
+        if !matches!(*cause, Some(CancelCause::Suspend)) {
+            effect();
+        }
+    }
+
     pub(crate) async fn suspended(&self) {
         self.cancelled().await;
         if !self.is_suspended() {
