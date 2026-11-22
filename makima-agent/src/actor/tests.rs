@@ -2829,9 +2829,10 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool, close_bef
             if close_before_publish {
                 cancel_handle.close();
             }
-            let close_pending = !events
-                .drain()
-                .any(|event| matches!(event, super::ActorEvent::Close { .. }));
+            let close_pending = !cancel_handle.close_emitted()
+                && !events
+                    .drain()
+                    .any(|event| matches!(event, super::ActorEvent::Close { .. }));
             release.send(()).unwrap();
             assert!(pending && retained && presentation_pending && close_pending && idle);
             (result, rx, events)
@@ -2854,6 +2855,7 @@ fn terminal_ticket_is_retired_before_notification(setup_failure: bool, close_bef
         );
         if close_before_publish {
             task.await;
+            assert!(handle.close_emitted());
             assert!(matches!(
                 events.try_recv().unwrap(),
                 super::ActorEvent::Close { .. }

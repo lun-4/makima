@@ -181,8 +181,7 @@ impl AgentOwner {
         let Some(actor) = self.actor.upgrade() else {
             return true;
         };
-        let snapshot = actor.snapshot();
-        snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none()
+        actor.close_emitted()
     }
 }
 

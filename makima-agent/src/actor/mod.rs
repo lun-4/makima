@@ -2455,6 +2455,11 @@ impl AgentActorHandle {
         }
     }
 
+    /// Whether close has settled, including publication of terminal tickets.
+    pub fn close_emitted(&self) -> bool {
+        self.inner.state.lock_unpoisoned().close_emitted()
+    }
+
     pub fn subscribe_events(&self) -> flume::Receiver<ActorEvent> {
         let (sender, receiver) = flume::unbounded();
         let mut state = self.inner.state.lock_unpoisoned();

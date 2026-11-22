@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use makima_agent::actor::ActorLifecycle;
 use makima_agent::{ActorEvent, AgentId, AgentManagerHandle};
 use makima_lua_macro::lua_fn;
 use mlua::{Lua, Table, UserDataRef, Value as LuaValue};
@@ -214,8 +213,7 @@ pub(in crate::api::agent) fn retain_session(
         owners
     });
     owners.insert(session, owner);
-    let snapshot = actor.snapshot();
-    if snapshot.lifecycle != ActorLifecycle::Open && snapshot.active_turn.is_none() {
+    if actor.close_emitted() {
         owners.retire_incarnation(id, &identity);
     }
     let cleanup = {
