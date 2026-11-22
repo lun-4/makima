@@ -10,7 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 use async_lock::{RwLock, RwLockReadGuardArc, RwLockWriteGuardArc};
-use event_listener::Event;
+use event_listener::{Event, EventListener};
 use imbl::{OrdMap, OrdSet};
 use makima_providers::{Message, TokenUsage};
 use makima_storage::conversation::ConversationState;
@@ -21,7 +21,7 @@ use makima_storage::session_state::{
     StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
     StoredTurnResult, StoredTurnStatus,
 };
-use makima_storage::sessions::{Session, SessionRecord, StoredRule};
+use makima_storage::sessions::{Session, SessionRecord, StoredRule, append_context_events};
 use thiserror::Error;
 
 use crate::actor::{
@@ -1014,6 +1014,10 @@ impl SessionJournal {
 
     pub fn set_checkpoint_error(&self, error: Option<String>) {
         self.lock().checkpoint_error = error;
+    }
+
+    pub(crate) fn listen_for_terminal_conversion(&self) -> EventListener {
+        self.conversion_changed.listen()
     }
 
     pub async fn wait_terminal_conversion(
@@ -2274,9 +2278,10 @@ impl SessionJournal {
                 SessionRecord::Msg { .. }
                     | SessionRecord::Compaction { .. }
                     | SessionRecord::History { .. }
+                    | SessionRecord::Input { .. }
             ) && let Ok(event) = serde_json::to_value(record)
             {
-                state.context_events.push(event);
+                append_context_events(&mut state.context_events, event);
             }
         }
         state.captured_unwritten = state.unwritten.len();
@@ -2313,6 +2318,18 @@ impl SessionJournal {
                     ))
                     .collect();
                 records.sort_by_key(|(seq, _)| *seq);
+                let mut consumed_input = match records.last() {
+                    Some((_, SessionRecord::State { d }))
+                        if matches!(d.change, StateChange::JoinedInput { input: None, .. })
+                            && d.agent
+                                .is_some_and(|agent| entry.histories.contains(&agent)) =>
+                    {
+                        let d = d.clone();
+                        records.pop();
+                        Some(d)
+                    }
+                    _ => None,
+                };
                 state
                     .unwritten
                     .extend(records.into_iter().map(|(_, record)| record));
@@ -2326,18 +2343,28 @@ impl SessionJournal {
                     });
                     if appended {
                         let start = previous.map_or(0, |previous| previous.len);
-                        state.unwritten.extend(
-                            history
-                                .messages
-                                .iter()
-                                .zip(history.ids.iter())
-                                .skip(start)
-                                .map(|(message, id)| SessionRecord::Msg {
+                        let messages = history.ids.iter().zip(history.messages.iter()).skip(start);
+                        if consumed_input
+                            .as_ref()
+                            .is_some_and(|d| d.agent == Some(agent))
+                            && let Some(d) = consumed_input.take()
+                        {
+                            // A complete log line must contain both the messages and the inbox retirement.
+                            state.unwritten.push(SessionRecord::Input {
+                                d,
+                                messages: messages
+                                    .map(|(id, message)| (*id, message.clone()))
+                                    .collect(),
+                            });
+                        } else {
+                            state.unwritten.extend(messages.map(|(id, message)| {
+                                SessionRecord::Msg {
                                     id: *id,
                                     agent,
                                     d: message.clone(),
-                                }),
-                        );
+                                }
+                            }));
+                        }
                     } else {
                         state.unwritten.push(SessionRecord::Compaction {
                             agent,
@@ -2366,6 +2393,9 @@ impl SessionJournal {
                         },
                     );
                 }
+                state
+                    .unwritten
+                    .extend(consumed_input.map(|d| SessionRecord::State { d }));
                 state.ready = entry.snapshot;
             }
         }

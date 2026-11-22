@@ -1,4 +1,4 @@
-use super::{AgentLimits, AgentManagerHandle, AgentResidency, ResidentAgent};
+use super::{AgentLimits, AgentManagerHandle, AgentResidency, ReactivationError, ResidentAgent};
 use crate::{
     ActorBackend, AgentActorHandle, AgentId, AgentInput, AgentMode, BackendResult, ControlWork,
     DoneReason, History, ModeDef, ModeId, RunSettings, ToolOutput, TurnContext, TurnId,
@@ -13,7 +13,8 @@ use futures_lite::future::or;
 use makima_providers::{Message, Model, ObservationSource, TokenUsage, provider::unconfigured};
 use makima_storage::{
     session_state::{
-        StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredDeliveryOp,
+        StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
+        StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
     },
     sessions::Session,
     test_util::test_record,
@@ -36,6 +37,7 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 const MODEL: &str = "test/restart-model";
 const INITIAL: &str = "retained history before report";
 const REPORT: &str = "disk-backed child report";
+const REACTIVATION_FAILURE: &str = "restored model is unavailable";
 const SUMMARY: &str = "compacted retained history";
 const CHILD_KEY: &str = "restart-child";
 const UNPUBLISHED: &str = "unpublished-after-checkpoint";
@@ -52,6 +54,7 @@ enum Progress {
 struct ReportBackend {
     executions: Arc<AtomicUsize>,
     progress: flume::Sender<Progress>,
+    expected_failure: Option<&'static str>,
 }
 impl Drop for ReportBackend {
     fn drop(&mut self) {
@@ -77,7 +80,25 @@ impl ActorBackend for ReportBackend {
                     .split_once('\n')
                     .unwrap();
                 let envelope: serde_json::Value = serde_json::from_str(envelope).unwrap();
-                assert_eq!(envelope["text"].as_str(), Some(REPORT));
+                if let Some(diagnostic) = self.expected_failure {
+                    let outcome: TurnOutcome =
+                        serde_json::from_value(envelope["outcome"].clone()).unwrap();
+                    let TurnOutcome::Failed { failure, .. } = outcome else {
+                        panic!("expected restored child failure");
+                    };
+                    assert_eq!(failure.diagnostic, diagnostic);
+                    assert_eq!(
+                        context
+                            .managed_turn
+                            .as_ref()
+                            .unwrap()
+                            .manager()
+                            .active_child_count(context.agent_id),
+                        1,
+                    );
+                } else {
+                    assert_eq!(envelope["text"].as_str(), Some(REPORT));
+                }
                 history.push_observation(message).unwrap();
                 consumed += 1;
             });
@@ -214,11 +235,13 @@ async fn activate(
     parent: AgentId,
     executions: &Arc<AtomicUsize>,
     progress: &flume::Sender<Progress>,
+    expected_failure: Option<&'static str>,
 ) -> (AgentActorHandle, flume::Sender<()>) {
     let (start, wait) = flume::bounded(1);
     let backend = ReportBackend {
         executions: Arc::clone(executions),
         progress: progress.clone(),
+        expected_failure,
     };
     let agent = manager
         .ensure_resident_with(parent, |_| async move {
@@ -314,7 +337,7 @@ async fn scenario(resident: bool, withdraw: bool) {
         AgentResidency::Dormant
     );
     let parked = if resident {
-        Some(activate(&manager, parent, &executions, &progress).await)
+        Some(activate(&manager, parent, &executions, &progress, None).await)
     } else {
         None
     };
@@ -356,7 +379,7 @@ async fn scenario(resident: bool, withdraw: bool) {
     );
     let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
     let manager = restore(&journal);
-    let (actor, start) = activate(&manager, parent, &executions, &progress).await;
+    let (actor, start) = activate(&manager, parent, &executions, &progress, None).await;
     assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
     if withdraw {
         assert!(actor.withdraw_child_delivery(identity.1));
@@ -403,7 +426,7 @@ async fn scenario(resident: bool, withdraw: bool) {
         let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
         let manager = restore(&journal);
         manager.deliver(parent, Arc::clone(&delivery)).unwrap();
-        let (actor, start) = activate(&manager, parent, &executions, &progress).await;
+        let (actor, start) = activate(&manager, parent, &executions, &progress, None).await;
         manager.deliver(parent, Arc::clone(&delivery)).unwrap();
         assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
         start.send(()).unwrap();
@@ -432,4 +455,140 @@ async fn scenario(resident: bool, withdraw: bool) {
         drop(actor);
         crash(manager, &events, true).await;
     }
+}
+
+#[test_case(true; "resident")]
+#[test_case(false; "dormant")]
+fn restored_child_failure_reaches_parent_exactly_once(resident: bool) {
+    smol::block_on(or(restored_child_failure_scenario(resident), async {
+        smol::Timer::after(TIMEOUT).await;
+        panic!("restored child failure report did not settle");
+    }));
+}
+
+async fn restored_child_failure_scenario(resident: bool) {
+    let directory = TempDir::new().unwrap();
+    let (mut session, journal, delivery) = seed();
+    let parent = session.root_agent_id().unwrap();
+    let child = delivery.result.outcome.agent_id();
+    let turn = TurnId::generate();
+    let mut record = journal.agent(child).unwrap();
+    record.lifecycle = StoredAgentLifecycle::Open;
+    record.spec = Some(StoredAgentSpec {
+        model: Default::default(),
+        system: String::new(),
+        tools: Vec::new(),
+        audience: "general_sub".into(),
+        mcp: false,
+        output_schema: None,
+        name: None,
+        silent: false,
+        auto_deliver: true,
+        inherit_provider: false,
+        mode_ceiling: StoredModeCeiling {
+            restrict_write_to: None,
+            tools: None,
+        },
+        plugin: None,
+    });
+    journal
+        .commit(JournalCommit {
+            agents: vec![record],
+            changes: vec![JournalChange {
+                agent: Some(child),
+                generation: 0,
+                change: StateChange::Admitted {
+                    turn,
+                    origin: StoredTurnOrigin::Internal,
+                },
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let mut session = publish(&journal, &mut session, directory.path()).await;
+    let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+    let manager = restore(&journal);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (progress, events) = flume::unbounded();
+    let activate_parent = || {
+        activate(
+            &manager,
+            parent,
+            &executions,
+            &progress,
+            Some(REACTIVATION_FAILURE),
+        )
+    };
+    let actor = if resident {
+        let (actor, start) = activate_parent().await;
+        start.send(()).unwrap();
+        settled(&actor).await;
+        Some(actor)
+    } else {
+        None
+    };
+    let error = manager
+        .ensure_resident_with(child, |_| async {
+            Err(ReactivationError::ModelUnavailable {
+                model: MODEL.into(),
+                reason: REACTIVATION_FAILURE.into(),
+            })
+        })
+        .await;
+    assert!(matches!(
+        error,
+        Err(super::ManagerError::Reactivation(
+            ReactivationError::ModelUnavailable { .. }
+        ))
+    ));
+    assert_eq!(
+        manager
+            .fail_restored_turns(child, REACTIVATION_FAILURE.into())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        manager
+            .fail_restored_turns(child, REACTIVATION_FAILURE.into())
+            .await
+            .unwrap(),
+        0
+    );
+    let actor = if let Some(actor) = actor {
+        actor
+    } else {
+        assert_eq!(manager.active_child_count(parent), 1);
+        let (actor, start) = activate_parent().await;
+        start.send(()).unwrap();
+        actor
+    };
+    let Progress::Turn(parent_turn) = events.recv_async().await.unwrap() else {
+        panic!("restored child failure report did not execute");
+    };
+    journal
+        .wait_terminal_conversion(parent, parent_turn)
+        .await
+        .unwrap();
+    let ticket = manager
+        .retained_turn_ticket(&manager.reference(child), turn)
+        .unwrap();
+    let delivery = Arc::new(ChildDelivery {
+        label: None,
+        result: ticket.peek_result().unwrap(),
+    });
+    manager.deliver(parent, Arc::clone(&delivery)).unwrap();
+    settled(&actor).await;
+    assert_eq!(manager.active_child_count(parent), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    let saved = publish(&journal, &mut session, directory.path()).await;
+    let view = saved.latest_state().unwrap();
+    assert!(view.scopes[&Some(child)].admitted.is_empty());
+    assert_eq!(
+        view.scopes[&Some(parent)].deliveries[&(child, turn)],
+        StoredDeliveryOp::Consumed
+    );
+    assert_eq!(report_count(&saved, &delivery), 1);
+    drop(actor);
+    crash(manager, &events, true).await;
 }

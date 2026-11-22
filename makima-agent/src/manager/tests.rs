@@ -5401,7 +5401,6 @@ fn unauthorized_descendant_wait_does_not_cancel_child_turn() {
         let Err(error) = wrong_current.lease().observe_descendant(
             &wrong_current,
             child.id(),
-            &actor,
             ticket.clone(),
             None,
         ) else {
@@ -5425,68 +5424,6 @@ fn unauthorized_descendant_wait_does_not_cancel_child_turn() {
             .shutdown(std::time::Duration::from_secs(1))
             .await;
         assert!(report.timed_out.is_empty());
-    });
-}
-
-#[test_case(false; "parent_actor")]
-#[test_case(true; "foreign_manager_actor")]
-fn descendant_wait_rejects_mismatched_actor_without_suspending(foreign: bool) {
-    smol::block_on(async {
-        const CORRELATION: &str = "child";
-        let (manager, root, current, root_gate) = active_root(AgentLimits::default());
-        let child = manager
-            .spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            )
-            .unwrap();
-        let child_actor = child.actor().unwrap();
-        let foreign_root = foreign.then(|| active_root(AgentLimits::default()));
-        let wrong_actor = foreign_root
-            .as_ref()
-            .map_or(&root, |(_, root, _, _)| root)
-            .actor()
-            .unwrap();
-        let ticket = child_actor
-            .admit_turn(input(), None, CORRELATION.into())
-            .unwrap();
-        let error = current
-            .lease()
-            .observe_descendant(&current, child.id(), &wrong_actor, ticket.clone(), None)
-            .err()
-            .unwrap();
-        assert_eq!(
-            error,
-            ManagerError::ActorMismatch {
-                expected_id: child.id(),
-                actual_id: wrong_actor.agent_id(),
-            }
-        );
-        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
-        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-        root_gate.release(1);
-        if let Some((_, _, _, gate)) = &foreign_root {
-            gate.release(1);
-        }
-        assert!(
-            manager
-                .shutdown(COMPLETION_TIMEOUT)
-                .await
-                .timed_out
-                .is_empty()
-        );
-        if let Some((manager, _, _, _)) = foreign_root {
-            assert!(
-                manager
-                    .shutdown(COMPLETION_TIMEOUT)
-                    .await
-                    .timed_out
-                    .is_empty()
-            );
-        }
     });
 }
 
@@ -5525,13 +5462,7 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
 
         let error = current
             .lease()
-            .observe_descendant(
-                &current,
-                first.id(),
-                &first.actor().unwrap(),
-                ticket.clone(),
-                None,
-            )
+            .observe_descendant(&current, first.id(), ticket.clone(), None)
             .err()
             .unwrap();
         assert!(matches!(error, ManagerError::TicketActorMismatch { .. }));
@@ -5800,7 +5731,7 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
         let ticket = child_actor.admit_turn(input(), None, CHILD.into()).unwrap();
         let wait = current
             .lease()
-            .observe_descendant(&current, child.id(), &child_actor, ticket.clone(), None)
+            .observe_descendant(&current, child.id(), ticket.clone(), None)
             .unwrap();
         rx.recv_async().await.unwrap();
         child_gate.release(1);
@@ -5855,6 +5786,62 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
     });
 }
 
+#[test_case(false; "latest")]
+#[test_case(true; "exact")]
+fn managed_observation_waits_for_a_closing_child(exact: bool) {
+    smol::block_on(async {
+        let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let (popped, release) = actor.pause_after_next_pop();
+        let ticket = actor.admit_turn(input(), None, "child".into()).unwrap();
+        popped.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+        child.close_subtree().unwrap();
+        assert!(!manager.is_live(child.id()));
+        let observed = manager
+            .observe_retained_turn(&child, exact.then_some(ticket.turn_id()), |_| {
+                unreachable!("the pending ticket is resident")
+            })
+            .unwrap();
+        let Some(super::RetainedTurn::Ticket(observed)) = observed else {
+            panic!("the closing child must retain its pending ticket");
+        };
+        assert_eq!(observed.turn_id(), ticket.turn_id());
+        assert!(observed.peek().is_none());
+
+        let wait = current
+            .lease()
+            .observe_descendant(&current, child.id(), observed, Some(COMPLETION_TIMEOUT))
+            .unwrap();
+        release.send(()).unwrap();
+        let outcome = wait.wait().await.unwrap();
+        assert_eq!(outcome.turn_id(), ticket.turn_id());
+        assert!(matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: crate::TurnCancellationReason::Closed,
+                ..
+            }
+        ));
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
 #[test_case(false; "timeout")]
 #[test_case(true; "drop")]
 fn managed_observation_preserves_child_on_timeout_or_drop(drop_wait: bool) {
@@ -5886,7 +5873,6 @@ fn managed_observation_preserves_child_on_timeout_or_drop(drop_wait: bool) {
             .observe_descendant(
                 &current,
                 child.id(),
-                &actor,
                 ticket.clone(),
                 if drop_wait {
                     None
@@ -5924,7 +5910,7 @@ fn managed_observation_preserves_child_on_timeout_or_drop(drop_wait: bool) {
         ));
         let repeat = current
             .lease()
-            .observe_descendant(&current, child.id(), &actor, ticket.clone(), None)
+            .observe_descendant(&current, child.id(), ticket.clone(), None)
             .unwrap();
         assert_eq!(
             repeat.wait_result().await.unwrap().outcome,
@@ -5987,7 +5973,7 @@ fn parent_waiting_for_child_yields_permit() {
             .unwrap();
         let wait = current
             .lease()
-            .observe_descendant(&current, child.id(), &child.actor().unwrap(), ticket, None)
+            .observe_descendant(&current, child.id(), ticket, None)
             .unwrap();
 
         child_rx.recv_async().await.unwrap();
@@ -6032,11 +6018,10 @@ fn parent_cancellation_seals_descendant_wait_registration() {
 
     let lease = current.lease();
     let wait_current = current.clone();
-    let wait_actor = child_actor.clone();
     let child_id = child.id();
     let pending_ticket = child_ticket.clone();
     let registration = std::thread::spawn(move || {
-        lease.observe_descendant(&wait_current, child_id, &wait_actor, pending_ticket, None)
+        lease.observe_descendant(&wait_current, child_id, pending_ticket, None)
     });
     registration_entered_rx.recv().unwrap();
 
@@ -6121,13 +6106,7 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
             .unwrap();
         let wait = current
             .lease()
-            .observe_descendant(
-                &current,
-                child.id(),
-                &child.actor().unwrap(),
-                child_ticket.clone(),
-                None,
-            )
+            .observe_descendant(&current, child.id(), child_ticket.clone(), None)
             .unwrap();
         let wait_inner = Arc::clone(&wait.inner);
         child_entered_rx.recv_async().await.unwrap();
@@ -6233,13 +6212,7 @@ fn two_child_waits_share_one_parent_suspension() {
             .unwrap();
         let first_wait = current
             .lease()
-            .observe_descendant(
-                &current,
-                first.id(),
-                &first.actor().unwrap(),
-                first_ticket,
-                None,
-            )
+            .observe_descendant(&current, first.id(), first_ticket, None)
             .unwrap();
         let first_wait_inner = Arc::clone(&first_wait.inner);
 
@@ -6261,13 +6234,7 @@ fn two_child_waits_share_one_parent_suspension() {
             .unwrap();
         let second_wait = current
             .lease()
-            .observe_descendant(
-                &current,
-                second.id(),
-                &second.actor().unwrap(),
-                second_ticket,
-                None,
-            )
+            .observe_descendant(&current, second.id(), second_ticket, None)
             .unwrap();
         {
             let state = current.lease.inner.state.lock().unwrap();

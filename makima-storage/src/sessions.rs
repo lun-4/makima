@@ -488,6 +488,11 @@ pub enum SessionRecord<M, U, T> {
         agent: AgentId,
         d: M,
     },
+    #[serde(rename = "input")]
+    Input {
+        d: StoredStateRecord,
+        messages: Vec<(MakimaId, M)>,
+    },
     #[serde(rename = "compaction")]
     Compaction {
         agent: AgentId,
@@ -1013,6 +1018,22 @@ fn decode_log_record(mut record: serde_json::Value) -> serde_json::Value {
     record
 }
 
+pub fn append_context_events(events: &mut Vec<serde_json::Value>, event: serde_json::Value) {
+    match event["t"].as_str() {
+        Some("msg" | "compaction" | "history" | "fork") => events.push(event),
+        Some("input") => {
+            if let Some(messages) = event["messages"].as_array() {
+                for message in messages {
+                    events.push(serde_json::json!({
+                        "t": "msg", "agent": event["d"]["agent"], "id": message[0], "d": message[1],
+                    }));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -1094,15 +1115,22 @@ where
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
             sequence_high_water = sequence_high_water.max(value["seq"].as_u64());
         }
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
-            && matches!(
-                value["t"].as_str(),
-                Some("msg" | "compaction" | "history" | "fork")
-            )
-        {
-            context_events.push(decode_log_record(value));
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
+            append_context_events(&mut context_events, decode_log_record(value));
         }
         match record {
+            SessionRecord::Input { d, messages } => {
+                let agent = d.agent.ok_or_else(|| SessionError::UnreadableRecord {
+                    path: display_path.to_owned(),
+                    line: line_count,
+                    reason: "input record has no agent".into(),
+                })?;
+                for (id, message) in messages {
+                    agent_messages.entry(agent).or_default().push(message);
+                    agent_message_ids.entry(agent).or_default().push(id);
+                }
+                state.push(d);
+            }
             SessionRecord::Header {
                 v,
                 id: h_id,
@@ -1516,6 +1544,9 @@ struct JsonlHeader {
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ScanRecord {
     Msg,
+    Input {
+        messages: Vec<serde::de::IgnoredAny>,
+    },
     Title {
         title: String,
     },
@@ -1674,13 +1705,12 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
                 serde_json::from_slice(line.trim_ascii_end())
         {
             title = normalize_title(&next_title);
-        } else if line.ends_with(b"\n")
-            && matches!(
-                serde_json::from_slice::<ScanRecord>(&line),
-                Ok(ScanRecord::Msg)
-            )
-        {
-            message_count += 1;
+        } else if line.ends_with(b"\n") {
+            match serde_json::from_slice::<ScanRecord>(&line) {
+                Ok(ScanRecord::Msg) => message_count += 1,
+                Ok(ScanRecord::Input { messages }) => message_count += messages.len(),
+                _ => {}
+            }
         }
     }
 

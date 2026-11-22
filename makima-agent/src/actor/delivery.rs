@@ -1,10 +1,13 @@
 use makima_domain::LockExt;
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::Arc;
 
 use crate::manager::WorkReservation;
 use makima_providers::{Message, ObservationSource};
-use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StateChange, StoredDeliveryOp};
+use makima_storage::session_state::{
+    MAX_STORED_TURN_RESULTS, StateChange, StoredDeliveryOp, StoredOffloadRef,
+};
 use serde_json::{Value, json};
 
 use super::{
@@ -303,7 +306,43 @@ pub(crate) fn admit_delivery_bound(
     {
         return Err(DeliveryRejection::Overflow);
     }
-    let delivery = preview;
+    enqueue_live(inner, &mut state, preview, message, bytes, work);
+    Ok(())
+}
+
+pub(crate) fn admit_queued_delivery(
+    inner: &ActorInner,
+    delivery: Arc<ChildDelivery>,
+    work: Vec<WorkReservation>,
+) {
+    let mut state = inner.state.lock_unpoisoned();
+    if state.lifecycle == ActorLifecycle::Shutdown {
+        retain_work(inner, &delivery, work);
+        return;
+    }
+    if state.lifecycle != ActorLifecycle::Open {
+        record_drop(inner, &delivery);
+        return;
+    }
+    let id = delivery.result.outcome.turn_id();
+    if state.deliveries.contains_key(&id) || state.delivery_seen.contains(&id) {
+        return;
+    }
+    let preview = Arc::new(delivery.preview(None));
+    let message = preview.input().preamble.remove(0);
+    let bytes = message.first_text_content().map_or(0, str::len);
+    enqueue_live(inner, &mut state, preview, message, bytes, work);
+}
+
+fn enqueue_live(
+    inner: &ActorInner,
+    state: &mut super::ActorState,
+    delivery: Arc<ChildDelivery>,
+    message: Message,
+    bytes: usize,
+    work: Vec<WorkReservation>,
+) {
+    let id = delivery.result.outcome.turn_id();
     state.delivery_suspended = false;
     state.delivery_seen.push_back(id);
     if state.delivery_seen.len() > MAX_STORED_TURN_RESULTS {
@@ -326,7 +365,6 @@ pub(crate) fn admit_delivery_bound(
         status: DeliveryStatus::Accepted,
     }));
     inner.queue.notify();
-    Ok(())
 }
 
 pub(super) fn publish(inner: &ActorInner, ticket: &TurnTicket) {
@@ -397,21 +435,43 @@ impl AgentActorHandle {
     pub(crate) fn reconcile_pending_deliveries(
         &self,
         mut work: impl FnMut(crate::AgentId, TurnId) -> Vec<WorkReservation>,
+        mut resolve: impl FnMut(&StoredOffloadRef) -> io::Result<Vec<u8>>,
     ) -> Result<(), super::ActorError> {
         let mut state = self.inner.state.lock_unpoisoned();
         let Some(journal) = &self.inner.journal else {
             return Ok(());
         };
-        let pending = journal
+        let mut pending = journal
             .pending_deliveries(self.inner.agent_id)
             .map_err(super::ActorError::HistoryCheckpoint)?;
         if pending
             .iter()
             .any(|(_, turn, delivery)| delivery.is_none() && !state.deliveries.contains_key(turn))
         {
-            return Err(super::ActorError::HistoryCheckpoint(
-                "stored delivery was not hydrated before initialization".into(),
-            ));
+            let view = journal
+                .snapshot()
+                .fold()
+                .map_err(|error| super::ActorError::HistoryCheckpoint(error.to_string()))?;
+            for (source, turn, delivery) in &mut pending {
+                if delivery.is_some() || state.deliveries.contains_key(turn) {
+                    continue;
+                }
+                let Some(StoredDeliveryOp::Queued(stored)) = view
+                    .scopes
+                    .get(&Some(self.inner.agent_id))
+                    .and_then(|scope| scope.deliveries.get(&(*source, *turn)))
+                else {
+                    return Err(super::ActorError::HistoryCheckpoint(
+                        "queued delivery is missing from the journal".into(),
+                    ));
+                };
+                let result = TurnResult::from_stored(stored.result.clone(), &mut resolve)
+                    .map_err(|error| super::ActorError::HistoryCheckpoint(error.to_string()))?;
+                *delivery = Some(Arc::new(ChildDelivery {
+                    label: stored.label.clone(),
+                    result,
+                }));
+            }
         }
         let ids = pending.iter().map(|(_, turn, _)| *turn).collect::<Vec<_>>();
         state.deliveries.retain(|turn, _| ids.contains(turn));

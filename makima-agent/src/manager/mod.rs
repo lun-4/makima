@@ -23,8 +23,8 @@ pub use manager_error::{ManagerError, ReactivationError};
 pub use types::{
     AgentIncarnation, AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, AgentResidency,
     CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, PromptWaitError, ReactivationInput,
-    ResidentAgent, ResidentInitialization, ResidentInitializer, ShutdownReport, SpawnRestoration,
-    TurnPermitLease,
+    ResidentAgent, ResidentInitialization, ResidentInitializer, RetainedTurn, ShutdownReport,
+    SpawnRestoration, TurnPermitLease,
 };
 
 use makima_domain::LockExt;
@@ -34,7 +34,7 @@ use std::io::{self, Error as IoError, ErrorKind};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -44,7 +44,7 @@ use futures_lite::FutureExt;
 use makima_providers::{Message, TokenUsage};
 use tracing::{info, warn};
 
-use crate::actor::delivery::{ChildDelivery, DeliveryRejection};
+use crate::actor::delivery::{ChildDelivery, DeliveryRejection, admit_queued_delivery};
 use crate::actor::{
     ActorCloseCut, ActorIdleGuard, ActorRestoration, ManagedTurnAdmission, TranscriptRequest,
     TranscriptSnapshot,
@@ -625,10 +625,8 @@ impl AgentManagerHandle {
         if node.actor.is_some() || node.reservation_pending {
             return Err(ManagerError::BusySubtree(agent_id));
         }
-        let view = self
-            .0
-            .journal
-            .snapshot()
+        let snapshot = self.0.journal.snapshot();
+        let view = snapshot
             .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
         let Some(scope) = view.scopes.get(&Some(agent_id)) else {
@@ -648,7 +646,7 @@ impl AgentManagerHandle {
                     },
                     duration_ms: 0,
                 }
-                .to_stored(self.0.journal.snapshot().epoch, None)
+                .to_stored(snapshot.epoch, None)
                 .map_err(|error| ManagerError::Persistence(error.to_string()))?;
                 Ok(JournalChange {
                     agent: Some(agent_id),
@@ -669,13 +667,24 @@ impl AgentManagerHandle {
                     .as_ref()
                     .is_some_and(|spec| spec.auto_deliver && !spec.silent)
             })
-            .and_then(|record| record.parent);
+            .and_then(|record| record.parent)
+            .filter(|parent| {
+                view.agents
+                    .get(parent)
+                    .is_some_and(|record| record.lifecycle == StoredAgentLifecycle::Open)
+            });
         let mut reports = Vec::new();
         if let Some(parent) = parent {
+            let parent_scope = view.scopes.get(&Some(parent));
             for change in &changes {
                 let StateChange::Turn { turn, result } = &change.change else {
                     continue;
                 };
+                if parent_scope
+                    .is_some_and(|scope| scope.deliveries.contains_key(&(agent_id, *turn)))
+                {
+                    continue;
+                }
                 let delivery = Arc::new(ChildDelivery {
                     label: record.and_then(|record| record.label.clone()),
                     result: crate::actor::TurnResult::from_stored(result.clone(), |_| {
@@ -686,10 +695,20 @@ impl AgentManagerHandle {
                     })
                     .map_err(|error| ManagerError::Persistence(error.to_string()))?,
                 });
-                reports.push((parent, *turn, result.clone(), delivery));
+                let work = self
+                    .0
+                    .work
+                    .restore_hold(agent_id)?
+                    .take_report()
+                    .ok_or_else(|| {
+                        ManagerError::InvalidGraph(
+                            "delivery source has no parent work reservation".into(),
+                        )
+                    })?;
+                reports.push((parent, *turn, result.clone(), delivery, work));
             }
         }
-        for (parent, turn, result, delivery) in &reports {
+        for (parent, turn, result, delivery, _) in &reports {
             changes.push(JournalChange {
                 agent: Some(*parent),
                 generation: 0,
@@ -713,14 +732,25 @@ impl AgentManagerHandle {
                 })
                 .map_err(|error| ManagerError::Persistence(error.to_string()))?;
         }
-        drop(graph);
-        for (parent, _, _, delivery) in reports {
-            let mut work = self.0.work.restore_hold(agent_id)?;
-            let work = work.take_report().into_iter().collect();
-            self.deliver_reserved_for(parent, delivery, work, None)
-                .map_err(|error| {
-                    ManagerError::Persistence(format!("restored failure delivery: {error:?}"))
-                })?;
+        // Keep activation and subtree close out of the handoff from the journal.
+        for (parent, turn, _, delivery, work) in reports {
+            let target = graph.nodes.get(&parent).and_then(|node| {
+                if (node.residency == AgentResidency::Resident || node.activation_finishing)
+                    && !node.detach_pending
+                {
+                    node.actor.as_ref()
+                } else {
+                    None
+                }
+            });
+            if let Some(actor) = target {
+                admit_queued_delivery(&actor.inner, delivery, vec![work]);
+            } else {
+                self.retain_delivery_work(parent, agent_id, turn, vec![work]);
+            }
+        }
+        if count != 0 {
+            self.0.reaped.notify(usize::MAX);
         }
         Ok(count)
     }
@@ -976,6 +1006,20 @@ impl AgentManagerHandle {
                             ))
                         })?
                         .unwrap_or_else(|| crate::AgentInput::new(String::new(), Vec::new())),
+                    joined: scope
+                        .and_then(|scope| scope.joined_inputs.get(turn_id))
+                        .into_iter()
+                        .flatten()
+                        .map(|(id, saved)| {
+                            let input =
+                                serde_json::from_value(saved.input.clone()).map_err(|error| {
+                                    ManagerError::InvalidGraph(format!(
+                                        "invalid saved joined input for {turn_id}: {error}"
+                                    ))
+                                })?;
+                            Ok((*id, input, saved.mcp_startup_notice))
+                        })
+                        .collect::<Result<_, ManagerError>>()?,
                     provenance: crate::actor::TurnProvenance {
                         origin: origin.clone().into(),
                         ..Default::default()
@@ -1107,9 +1151,10 @@ impl AgentManagerHandle {
             }
             if !prepared {
                 actor
-                    .reconcile_pending_deliveries(|source, turn| {
-                        self.take_delivery_work(incarnation.agent_id, source, turn)
-                    })
+                    .reconcile_pending_deliveries(
+                        |source, turn| self.take_delivery_work(incarnation.agent_id, source, turn),
+                        |reference| self.resolve_result_payload(reference),
+                    )
                     .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
                 self.0.work.set_open_for_incarnation(
                     incarnation.agent_id,
@@ -1167,9 +1212,10 @@ impl AgentManagerHandle {
             }
             initialization
                 .actor
-                .reconcile_pending_deliveries(|source, turn| {
-                    self.take_delivery_work(initialization.agent.id(), source, turn)
-                })
+                .reconcile_pending_deliveries(
+                    |source, turn| self.take_delivery_work(initialization.agent.id(), source, turn),
+                    |reference| self.resolve_result_payload(reference),
+                )
                 .map_err(|error| ReactivationError::Initialization(error.to_string()))?;
             self.0
                 .work
@@ -1567,6 +1613,7 @@ impl AgentManagerHandle {
         if let Some(actor) = actor {
             actor.close();
         }
+        self.0.reaped.notify(usize::MAX);
         Ok(())
     }
 
@@ -2069,6 +2116,88 @@ impl AgentManagerHandle {
         store.read(name, reference.bytes)
     }
 
+    /// Select an observable turn without starting the agent. Restored admissions
+    /// take precedence over older terminal results.
+    pub fn observe_retained_turn(
+        &self,
+        agent: &AgentRef,
+        turn: Option<TurnId>,
+        resolve: impl FnMut(&StoredOffloadRef) -> io::Result<Vec<u8>>,
+    ) -> Result<Option<RetainedTurn>, ManagerError> {
+        if !self.same_manager(&agent.manager) {
+            return Err(ManagerError::WrongManager);
+        }
+        let graph = self.lock_graph();
+        let node = graph
+            .nodes
+            .get(&agent.agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent.agent_id))?;
+        if let Some(actor) = &node.actor
+            && node.residency != AgentResidency::Activating
+        {
+            match turn {
+                None => return Ok(actor.latest_ticket().map(RetainedTurn::Ticket)),
+                Some(turn) => {
+                    if let Some(ticket) = actor.turn_ticket(turn) {
+                        return Ok(Some(RetainedTurn::Ticket(ticket)));
+                    }
+                }
+            }
+        }
+        let snapshot = self
+            .0
+            .journal
+            .checkpoint_snapshot()
+            .map_err(ManagerError::InvalidGraph)?;
+        let view = snapshot
+            .fold()
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        let scope = view.scopes.get(&Some(agent.agent_id));
+        if !graph.shutting_down
+            && node.lifecycle == GraphLifecycle::Dormant
+            && let Some(scope) = scope
+        {
+            let admitted = match turn {
+                Some(turn) => scope.admitted.contains_key(&turn).then_some(turn),
+                None => scope.admitted.last_key_value().map(|(turn, _)| *turn),
+            };
+            if let Some(turn) = admitted {
+                return Ok(Some(RetainedTurn::Restoring(turn)));
+            }
+        }
+        let stored = turn.or_else(|| scope?.results.back().map(|(turn, _)| *turn));
+        drop(graph);
+        stored
+            .map(|turn| self.stored_turn_ticket(agent.agent_id, turn, &view, resolve))
+            .transpose()
+            .map(|ticket| ticket.map(RetainedTurn::Ticket))
+    }
+
+    /// Resolve a restored admission after activation or recovery failure.
+    pub async fn wait_for_restored_turn(
+        &self,
+        agent: &AgentRef,
+        turn: TurnId,
+        mut resolve: impl FnMut(&StoredOffloadRef) -> io::Result<Vec<u8>>,
+    ) -> Result<TurnTicket, ManagerError> {
+        loop {
+            let changed = self.0.reaped.listen();
+            let converted = self.0.journal.listen_for_terminal_conversion();
+            match self.observe_retained_turn(agent, Some(turn), &mut resolve)? {
+                Some(RetainedTurn::Ticket(ticket)) => return Ok(ticket),
+                Some(RetainedTurn::Restoring(_)) => {
+                    futures_lite::future::or(changed, converted).await
+                }
+                None => {
+                    return Err(ManagerError::TurnResultUnavailable {
+                        agent_id: agent.agent_id,
+                        turn_id: turn,
+                    });
+                }
+            }
+        }
+    }
+
     /// Read the latest admitted ticket even while its actor is closing or closed.
     /// Nonresident agents fall back to their latest stored terminal result.
     pub fn latest_retained_turn_ticket(
@@ -2151,17 +2280,23 @@ impl AgentManagerHandle {
         let view = snapshot
             .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        self.stored_turn_ticket(agent.agent_id, turn_id, &view, resolve)
+    }
+
+    fn stored_turn_ticket(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+        view: &SessionStateView,
+        mut resolve: impl FnMut(&StoredOffloadRef) -> io::Result<Vec<u8>>,
+    ) -> Result<TurnTicket, ManagerError> {
         let stored = view
             .scopes
-            .get(&Some(agent.agent_id))
+            .get(&Some(agent_id))
             .and_then(|scope| scope.results.iter().find(|(turn, _)| *turn == turn_id))
             .map(|(_, result)| result.clone())
-            .ok_or(ManagerError::TurnResultUnavailable {
-                agent_id: agent.agent_id,
-                turn_id,
-            })?;
+            .ok_or(ManagerError::TurnResultUnavailable { agent_id, turn_id })?;
         let owning_session = self.0.journal.session_id();
-        let mut resolve = resolve;
         let result = crate::actor::TurnResult::from_stored(stored, |reference| {
             if Some(reference.session) != owning_session {
                 return Err(IoError::new(
@@ -2171,10 +2306,7 @@ impl AgentManagerHandle {
             }
             resolve(reference)
         })
-        .map_err(|_| ManagerError::TurnResultUnavailable {
-            agent_id: agent.agent_id,
-            turn_id,
-        })?;
+        .map_err(|_| ManagerError::TurnResultUnavailable { agent_id, turn_id })?;
         Ok(crate::TurnTicket::from_result(result))
     }
 
@@ -2839,7 +2971,7 @@ impl AgentManagerHandle {
         &self,
         current: &CurrentManagedTurn,
         child_id: AgentId,
-    ) -> Result<(), ManagerError> {
+    ) -> Result<MutexGuard<'_, GraphState>, ManagerError> {
         self.validate_manager(current)?;
         let graph = self.lock_graph();
         if graph
@@ -2872,19 +3004,10 @@ impl AgentManagerHandle {
                 });
             };
             if parent_id == current.agent_id() {
-                return Ok(());
+                return Ok(graph);
             }
             cursor = parent_id;
         }
-    }
-
-    fn validated_descendant_actor(
-        &self,
-        current: &CurrentManagedTurn,
-        child_id: AgentId,
-    ) -> Result<AgentActorHandle, ManagerError> {
-        self.validate_descendant(current, child_id)?;
-        self.actor(child_id)
     }
 
     fn register_turn_wait(
@@ -2892,26 +3015,32 @@ impl AgentManagerHandle {
         current: &CurrentManagedTurn,
         lease: &TurnPermitLease,
         child_id: AgentId,
-        actor: &AgentActorHandle,
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, ManagerError> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
             return Err(ManagerError::WrongManager);
         }
-        let managed_actor = self.validated_descendant_actor(current, child_id)?;
-        if !managed_actor.same_actor(actor) {
-            return Err(ManagerError::ActorMismatch {
-                expected_id: child_id,
-                actual_id: actor.agent_id(),
-            });
-        }
+        let graph = self.validate_descendant(current, child_id)?;
+        let node = &graph.nodes[&child_id];
+        let managed_actor = node
+            .actor
+            .as_ref()
+            .filter(|_| {
+                !node.detach_pending
+                    && matches!(
+                        node.lifecycle,
+                        GraphLifecycle::Live | GraphLifecycle::Closing | GraphLifecycle::Closed
+                    )
+            })
+            .ok_or(ManagerError::NonLiveAgent(child_id))?;
         if !managed_actor.owns_ticket(&ticket) {
             return Err(ManagerError::TicketActorMismatch {
                 agent_id: child_id,
                 turn_id: ticket.turn_id(),
             });
         }
+        drop(graph);
         #[cfg(test)]
         self.wait_at_prompt_wait_registration_gate();
 
@@ -3639,6 +3768,7 @@ impl AgentManagerHandle {
         for (actor, cut) in actors {
             actor.settle_close(cut);
         }
+        self.0.reaped.notify(usize::MAX);
         Ok(())
     }
 
@@ -3647,6 +3777,7 @@ impl AgentManagerHandle {
         for (actor, cut) in actors {
             actor.settle_close(cut);
         }
+        self.0.reaped.notify(usize::MAX);
         Ok(())
     }
 
@@ -3845,6 +3976,7 @@ impl AgentManagerHandle {
                     })
                     .collect::<Vec<_>>()
             };
+            self.0.reaped.notify(usize::MAX);
             drop(completion);
             for &id in &timed_out {
                 if let Ok(incarnation) = self.incarnation(id) {
@@ -3878,10 +4010,11 @@ impl AgentManagerHandle {
                 .iter()
                 .filter_map(|id| {
                     let actor = graph.nodes[id].actor.clone()?;
-                    if preserve_turns {
-                        actor.preserve_unfinished_turns();
-                    }
-                    let cut = actor.capture_close(true)?;
+                    let cut = if preserve_turns {
+                        actor.capture_suspend()?
+                    } else {
+                        actor.capture_close(true)?
+                    };
                     Some((actor, cut))
                 })
                 .collect::<Vec<_>>();
@@ -4421,7 +4554,7 @@ impl AgentManagerHandle {
         }
     }
 
-    fn lock_graph(&self) -> std::sync::MutexGuard<'_, GraphState> {
+    fn lock_graph(&self) -> MutexGuard<'_, GraphState> {
         self.0.graph.lock_unpoisoned()
     }
 }

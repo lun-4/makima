@@ -1,13 +1,17 @@
 use std::{
+    future::Future,
     io::{self, ErrorKind},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use futures::future::BoxFuture;
 use futures_lite::future::race;
+use makima_agent::manager::{ManagerError, RetainedTurn};
 use makima_agent::{
     CurrentManagedTurn, PromptWaitError, TurnCancellationReason, TurnId, TurnTicket,
 };
 use makima_lua_macro::{lua_class, lua_fn};
+use makima_storage::session_state::StoredOffloadRef;
 use mlua::{Lua, Table, UserDataRef};
 use smol::Timer;
 
@@ -22,38 +26,62 @@ use crate::runtime::CANCELLED_MSG;
 
 const UNSETTLED_TURN_RESULT: &str = "turn has no settled result";
 
-pub(super) fn retained_ticket(
+pub(super) fn observe_turn(
     lua: &Lua,
     agent: &LuaAgent,
-    turn: TurnId,
-) -> Result<TurnTicket, String> {
+    turn: Option<TurnId>,
+) -> Result<Option<RetainedTurn>, ManagerError> {
     agent
         .manager
-        .retained_turn_ticket_with(&agent.manager.reference(agent.id), turn, |reference| {
-            let denied = || {
-                io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "stored result is outside the authorized session",
-                )
-            };
-            let root = agent.manager.root().map_err(|_| denied())?;
-            let services = orchestration::services(lua).ok_or_else(denied)?;
-            let template = services.template(&root).map_err(|_| denied())?;
-            if template.session_id.as_ref().map(|session| session.id()) != Some(reference.session) {
-                return Err(denied());
-            }
-            let name = reference.path.to_str().ok_or_else(denied)?;
-            let store = template.offload.as_ref().ok_or_else(denied)?;
-            store.read(name, reference.bytes)
+        .observe_retained_turn(&agent.manager.reference(agent.id), turn, |reference| {
+            resolve_payload(lua, agent, reference)
         })
-        .map_err(|error| error.to_string())
+}
+
+fn resolve_payload(
+    lua: &Lua,
+    agent: &LuaAgent,
+    reference: &StoredOffloadRef,
+) -> io::Result<Vec<u8>> {
+    let denied = || {
+        io::Error::new(
+            ErrorKind::PermissionDenied,
+            "stored result is outside the authorized session",
+        )
+    };
+    let root = agent.manager.root().map_err(|_| denied())?;
+    let services = orchestration::services(lua).ok_or_else(denied)?;
+    let template = services.template(&root).map_err(|_| denied())?;
+    if template.session_id.as_ref().map(|session| session.id()) != Some(reference.session) {
+        return Err(denied());
+    }
+    let name = reference.path.to_str().ok_or_else(denied)?;
+    let store = template.offload.as_ref().ok_or_else(denied)?;
+    store.read(name, reference.bytes)
+}
+
+impl LuaAgentTurn {
+    fn current_ticket(&self, lua: &Lua) -> Result<Option<TurnTicket>, ManagerError> {
+        if let RetainedTurn::Ticket(ticket) = &self.turn {
+            return Ok(Some(ticket.clone()));
+        }
+        if let Some(ticket) = self.resolved.get() {
+            return Ok(Some(ticket.clone()));
+        }
+        match observe_turn(lua, &self.agent, Some(self.turn.turn_id()))? {
+            Some(RetainedTurn::Ticket(ticket)) => {
+                Ok(Some(self.resolved.get_or_init(|| ticket).clone()))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Read the stable turn ID.
 /// @return (string?, string?) Turn ID.
 #[lua_fn(name = "id")]
 fn turn_id(_lua: &Lua, this: &LuaAgentTurn) -> mlua::Result<Pair<String>> {
-    Ok((Some(this.ticket.turn_id().to_string()), None))
+    Ok((Some(this.turn.turn_id().to_string()), None))
 }
 
 /// Read the target agent ID.
@@ -78,10 +106,10 @@ fn ticket_result(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, &this.agent));
-    if this.ticket.peek().is_none() {
-        return Ok((None, None));
+    match try_pair!(this.current_ticket(lua)) {
+        Some(ticket) if ticket.peek().is_some() => turn_result(lua, &ticket),
+        _ => Ok((None, None)),
     }
-    turn_result(lua, &this.ticket)
 }
 
 /// A wait in the parent's own turn hands the result to its model, which makes
@@ -105,60 +133,100 @@ async fn ticket_wait(
     ctx: UserDataRef<LuaCtx>,
     opts: Option<Table>,
 ) -> mlua::Result<Pair<Table>> {
+    wait_for_ticket(lua, this, ctx, opts).await
+}
+
+fn wait_for_ticket(
+    lua: Lua,
+    this: UserDataRef<LuaAgentTurn>,
+    ctx: UserDataRef<LuaCtx>,
+    opts: Option<Table>,
+) -> BoxFuture<'static, mlua::Result<Pair<Table>>> {
+    Box::pin(wait_for_ticket_inner(lua, this, ctx, opts))
+}
+
+async fn wait_for_ticket_inner(
+    lua: Lua,
+    this: UserDataRef<LuaAgentTurn>,
+    ctx: UserDataRef<LuaCtx>,
+    opts: Option<Table>,
+) -> mlua::Result<Pair<Table>> {
     let active = try_pair!(observe(&lua, &ctx, &this.agent));
     let agent = this.agent.clone();
-    let ticket = this.ticket.clone();
-    let retained_ticket = ticket.clone();
+    let turn_id = this.turn.turn_id();
     let timeout = opts
         .map(|opts| opts.get::<Option<u64>>("timeout"))
         .transpose()?
-        .flatten();
-    if ticket.peek().is_some() {
-        withdraw_delivery(active.as_ref(), ticket.turn_id());
-        return turn_result(&lua, &ticket);
+        .flatten()
+        .map(Duration::from_secs);
+    let ticket = try_pair!(this.current_ticket(&lua));
+    if let Some(ticket) = &ticket
+        && ticket.peek().is_some()
+    {
+        withdraw_delivery(active.as_ref(), turn_id);
+        return turn_result(&lua, ticket);
     }
-    if timeout == Some(0) {
+    if timeout == Some(Duration::ZERO) {
         return Ok((None, None));
     }
+    if active
+        .as_ref()
+        .is_some_and(|active| active.agent_id() == agent.id)
+    {
+        return Ok(err_pair(SELF_TURN_WAIT));
+    }
+    let start = Instant::now();
+    let resolved = this.resolved.clone();
     drop(this);
-    if let Some(active) = &active {
-        if active.agent_id() == agent.id {
-            return Ok(err_pair(SELF_TURN_WAIT));
+    let ticket = match ticket {
+        Some(ticket) => ticket,
+        None => {
+            let target = agent.manager.reference(agent.id);
+            let activated = agent
+                .manager
+                .wait_for_restored_turn(&target, turn_id, |reference| {
+                    resolve_payload(&lua, &agent, reference)
+                });
+            let ticket = try_pair!(with_timeout(activated, timeout).await);
+            let ticket = try_pair!(ticket);
+            try_pair!(ctx.validate_origin(&lua));
+            resolved.get_or_init(|| ticket).clone()
         }
-        let actor = try_pair!(agent.manager.actor(agent.id));
-        let wait = try_pair!(active.lease().observe_descendant(
-            active,
-            agent.id,
-            &actor,
-            ticket,
-            timeout.map(Duration::from_secs)
-        ));
-        try_pair!(wait.wait().await.map_err(|error| match error {
-            PromptWaitError::Timeout => TURN_WAIT_TIMEOUT,
-            PromptWaitError::Cancelled => CANCELLED_MSG,
-        }));
-    } else {
-        try_pair!(wait_ticket(ticket, timeout).await);
+    };
+    let timeout = timeout.map(|duration| duration.saturating_sub(start.elapsed()));
+    if ticket.peek().is_none() {
+        if let Some(active) = &active {
+            let wait = try_pair!(active.lease().observe_descendant(
+                active,
+                agent.id,
+                ticket.clone(),
+                timeout
+            ));
+            try_pair!(wait.wait().await.map_err(|error| match error {
+                PromptWaitError::Timeout => TURN_WAIT_TIMEOUT,
+                PromptWaitError::Cancelled => CANCELLED_MSG,
+            }));
+        } else {
+            try_pair!(with_timeout(ticket.wait(), timeout).await);
+        }
     }
     try_pair!(ctx.validate_origin(&lua));
-    withdraw_delivery(active.as_ref(), retained_ticket.turn_id());
-    turn_result(&lua, &retained_ticket)
+    withdraw_delivery(active.as_ref(), turn_id);
+    turn_result(&lua, &ticket)
 }
 
-async fn wait_ticket(ticket: TurnTicket, timeout: Option<u64>) -> Result<(), &'static str> {
-    let Some(seconds) = timeout else {
-        ticket.wait().await;
-        return Ok(());
+async fn with_timeout<T>(
+    future: impl Future<Output = T>,
+    timeout: Option<Duration>,
+) -> Result<T, &'static str> {
+    let Some(duration) = timeout else {
+        return Ok(future.await);
     };
-    let settled = async {
-        ticket.wait().await;
-        Ok(())
-    };
-    let expired = async {
-        Timer::after(Duration::from_secs(seconds)).await;
+    race(async { Ok(future.await) }, async {
+        Timer::after(duration).await;
         Err(TURN_WAIT_TIMEOUT)
-    };
-    race(settled, expired).await
+    })
+    .await
 }
 
 /// Cancel this admitted turn. For a managed turn, also close the child
@@ -174,7 +242,7 @@ fn ticket_cancel(
     try_pair!(authorize(lua, &ctx, &this.agent));
     try_pair!(this.agent.manager.cancel_turn(
         this.agent.id,
-        this.ticket.turn_id(),
+        this.turn.turn_id(),
         TurnCancellationReason::User
     ));
     Ok((Some(true), None))

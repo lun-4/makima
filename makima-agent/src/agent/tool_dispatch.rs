@@ -24,7 +24,10 @@ use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
     TurnToolRoute, truncate_scope,
 };
-use crate::{AgentError, AgentEvent, SessionMailbox, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{
+    AgentError, AgentEvent, ReasonedCancelToken, SessionMailbox, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
+};
 use makima_config::{FILE_WRITE_TOOLS, ToolKey};
 use makima_storage::id::SessionRef;
 
@@ -1186,6 +1189,7 @@ pub(super) async fn process_tool_calls(
     mut history: ActorHistory<'_>,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
@@ -1199,7 +1203,16 @@ pub(super) async fn process_tool_calls(
             message: error.to_string(),
         })?;
 
-    execute_tool_calls(tool_uses, false, recent_calls, history, event_tx, ctx).await
+    execute_tool_calls(
+        tool_uses,
+        false,
+        recent_calls,
+        history,
+        event_tx,
+        ctx,
+        cancel_reason,
+    )
+    .await
 }
 
 pub(super) async fn resume_tool_calls(
@@ -1207,12 +1220,22 @@ pub(super) async fn resume_tool_calls(
     history: ActorHistory<'_>,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
     let calls = super::history::pending_tool_calls(history.as_slice());
     if calls.is_empty() {
         return Ok(());
     }
-    execute_tool_calls(calls, true, recent_calls, history, event_tx, ctx).await
+    execute_tool_calls(
+        calls,
+        true,
+        recent_calls,
+        history,
+        event_tx,
+        ctx,
+        cancel_reason,
+    )
+    .await
 }
 
 async fn execute_tool_calls(
@@ -1222,6 +1245,7 @@ async fn execute_tool_calls(
     mut history: ActorHistory<'_>,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
@@ -1355,8 +1379,20 @@ async fn execute_tool_calls(
                     Err(_) => Next::Closed,
                 }
             },
-        )
-        .await;
+        );
+        let next = match cancel_reason {
+            Some(cancel) => {
+                futures_lite::future::or(
+                    async {
+                        cancel.suspended().await;
+                        Err(AgentError::Cancelled)
+                    },
+                    async { Ok(next.await) },
+                )
+                .await?
+            }
+            None => next.await,
+        };
         match next {
             Next::Result(id, done) => {
                 if pending.remove(&id).is_some() {
@@ -1402,6 +1438,9 @@ async fn execute_tool_calls(
         }
     }
 
+    if cancel_reason.is_some_and(ReasonedCancelToken::is_suspended) {
+        return Err(AgentError::Cancelled);
+    }
     let mut all_results = results;
     all_results.extend(immediate_errors);
     let tool_msg = crate::types::tool_results(all_results);
@@ -1761,6 +1800,7 @@ mod tests {
                 ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -1779,6 +1819,7 @@ mod tests {
                 ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -5182,6 +5223,7 @@ mod tests {
                 ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -5264,6 +5306,7 @@ mod tests {
                 ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -5329,6 +5372,7 @@ mod tests {
                     ActorHistory::new(&mut history),
                     &event_tx,
                     &ctx,
+                    None,
                 )
                 .await
                 .unwrap();

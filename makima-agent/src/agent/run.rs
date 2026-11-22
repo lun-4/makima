@@ -38,7 +38,7 @@ use crate::{
     TurnCompleteEvent, TurnFailure, TurnId, TurnOutcome,
 };
 use makima_config::{ModelPolicy, ToolOutputLines};
-use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, SessionRef};
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 pub const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
@@ -556,9 +556,15 @@ impl<'h> Agent<'h> {
                 context_window,
             },
             Err(AgentError::Cancelled) => {
-                self.history.sanitize_cancelled(self.rollback_len).await;
-                if let Some(ended) = self.history.continue_conversation() {
-                    end_conversation_detached(&self.provider, ended, ConversationEnd::Cancelled);
+                if !self.is_suspended() {
+                    self.history.sanitize_cancelled(self.rollback_len).await;
+                    if let Some(ended) = self.history.continue_conversation() {
+                        end_conversation_detached(
+                            &self.provider,
+                            ended,
+                            ConversationEnd::Cancelled,
+                        );
+                    }
                 }
                 let reason = match &self.cancel_reason_source {
                     Some(source) => source
@@ -594,6 +600,12 @@ impl<'h> Agent<'h> {
         outcome
     }
 
+    fn is_suspended(&self) -> bool {
+        self.cancel_reason_source
+            .as_ref()
+            .is_some_and(ReasonedCancelToken::is_suspended)
+    }
+
     async fn land_mailbox(&mut self) {
         let Some(mailbox) = &self.mailbox else {
             return;
@@ -613,6 +625,7 @@ impl<'h> Agent<'h> {
                     self.history.reborrow(),
                     &self.event_tx,
                     &ctx,
+                    self.cancel_reason_source.as_ref(),
                 ))
                 .await
                 .map_err(|_| AgentError::Cancelled)??;
@@ -803,7 +816,7 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
-                if !streamed.is_empty() {
+                if !streamed.is_empty() && !self.is_suspended() {
                     self.history
                         .push_observation(Message {
                             role: Role::Assistant,
@@ -997,6 +1010,7 @@ impl<'h> Agent<'h> {
             self.history.reborrow(),
             &self.event_tx,
             &ctx,
+            self.cancel_reason_source.as_ref(),
         )
         .await
     }
@@ -1150,13 +1164,16 @@ impl<'h> Agent<'h> {
             &mut history,
             &self.event_tx,
             self.mailbox.as_ref(),
-            instructions
-                .into_iter()
-                .map(|(presentation, input)| crate::PresentedInput {
-                    input,
-                    already_displayed: presentation.already_displayed,
-                    mcp_startup_notice: presentation.mcp_startup_notice,
-                }),
+            instructions.into_iter().map(|(presentation, input)| {
+                (
+                    crate::PresentedInput {
+                        input,
+                        already_displayed: presentation.already_displayed,
+                        mcp_startup_notice: presentation.mcp_startup_notice,
+                    },
+                    presentation.journal_id.map(|id| (presentation.turn_id, id)),
+                )
+            }),
             || {
                 self.pending_instruction_request = true;
                 if let Some(capture) = &self.local_tool_capture {
@@ -1207,10 +1224,15 @@ impl<'h> Agent<'h> {
                     &mut history,
                     &self.event_tx,
                     self.mailbox.as_ref(),
-                    inputs.into_iter().map(|input| crate::PresentedInput {
-                        input,
-                        already_displayed: true,
-                        mcp_startup_notice: None,
+                    inputs.into_iter().map(|input| {
+                        (
+                            crate::PresentedInput {
+                                input,
+                                already_displayed: true,
+                                mcp_startup_notice: None,
+                            },
+                            None,
+                        )
                     }),
                     || {
                         self.pending_instruction_request = true;
@@ -1228,7 +1250,7 @@ impl<'h> Agent<'h> {
                     &mut history,
                     &self.event_tx,
                     self.mailbox.as_ref(),
-                    inputs,
+                    inputs.into_iter().map(|input| (input, None)),
                     || {
                         self.pending_instruction_request = true;
                         if let Some(capture) = &self.local_tool_capture {
@@ -1253,11 +1275,11 @@ fn consume_presented_inputs(
     history: &mut HistoryBatch<'_>,
     event_tx: &EventSender,
     mailbox: Option<&SessionMailbox>,
-    inputs: impl IntoIterator<Item = crate::PresentedInput>,
+    inputs: impl IntoIterator<Item = (crate::PresentedInput, Option<(TurnId, MakimaId)>)>,
     mut consumed: impl FnMut(),
 ) -> Result<(), AgentError> {
     let mut presentation_failed = false;
-    for presented in inputs {
+    for (presented, joined) in inputs {
         let input = presented.input;
         consumed();
         presentation_failed |= event_tx
@@ -1268,13 +1290,9 @@ fn consume_presented_inputs(
                 already_displayed: presented.already_displayed,
             })
             .is_err();
-        for message in input.preamble {
-            history.push(message);
-        }
+        let mut messages = input.preamble;
         if let Some(mailbox) = mailbox {
-            for message in mailbox.drain() {
-                history.push(message);
-            }
+            messages.extend(mailbox.drain());
         }
         let wrapped = format!(
             "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
@@ -1300,7 +1318,14 @@ fn consume_presented_inputs(
                 display.push_str(&notice);
             }
         }
-        history.push(message);
+        messages.push(message);
+        if let Some((turn, id)) = joined {
+            history.append_joined_input(turn, id, messages);
+        } else {
+            for message in messages {
+                history.push(message);
+            }
+        }
     }
     if presentation_failed {
         return Err(AgentError::Channel);
@@ -1791,6 +1816,7 @@ mod tests {
                 .map(|input| {
                     let presentation = PendingSubmission {
                         id: SUBMISSION,
+                        journal_id: None,
                         turn_id: TurnId::generate(),
                         text: input.message.clone(),
                         images: input.images.clone(),
@@ -1895,6 +1921,7 @@ mod tests {
                 let input = self.0.pending.lock().unwrap().pop()?;
                 Some(PendingSubmission {
                     id: SubmissionId(1),
+                    journal_id: None,
                     turn_id: TurnId::generate(),
                     text: input.message,
                     images: input.images,
@@ -2194,6 +2221,7 @@ mod tests {
                     .map(|input| {
                         let presentation = PendingSubmission {
                             id: SUBMISSION,
+                            journal_id: None,
                             turn_id: TurnId::generate(),
                             text: input.message.clone(),
                             images: input.images.clone(),

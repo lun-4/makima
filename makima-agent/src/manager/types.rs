@@ -15,6 +15,21 @@ use crate::{
 
 use super::ReactivationError;
 
+#[derive(Clone)]
+pub enum RetainedTurn {
+    Ticket(TurnTicket),
+    Restoring(TurnId),
+}
+
+impl RetainedTurn {
+    pub fn turn_id(&self) -> TurnId {
+        match self {
+            Self::Ticket(ticket) => ticket.turn_id(),
+            Self::Restoring(turn) => *turn,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
     pub max_concurrent_agent_turns: usize,
@@ -316,7 +331,10 @@ impl CurrentManagedTurn {
     }
 
     pub fn validate_descendant(&self, child_id: AgentId) -> Result<(), super::ManagerError> {
-        self.token.manager.validate_descendant(self, child_id)
+        self.token
+            .manager
+            .validate_descendant(self, child_id)
+            .map(drop)
     }
 
     pub fn same_authority(&self, other: &Self) -> bool {
@@ -349,18 +367,18 @@ impl TurnPermitLease {
         self.inner.turn_id
     }
 
+    /// Wait for an owned descendant ticket, including one settling after close.
     pub fn observe_descendant(
         &self,
         current: &CurrentManagedTurn,
         child_id: AgentId,
-        actor: &AgentActorHandle,
         ticket: TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, super::ManagerError> {
         current
             .token
             .manager
-            .register_turn_wait(current, self, child_id, actor, ticket, timeout)
+            .register_turn_wait(current, self, child_id, ticket, timeout)
     }
 }
 

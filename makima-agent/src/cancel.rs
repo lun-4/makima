@@ -146,17 +146,25 @@ impl Drop for CancelRegistration {
 
 /// Fires once, from the first trigger to drop, then keeps the winning reason.
 struct ReasonedShared {
-    cancelled: AtomicBool,
-    reason: Mutex<Option<TurnCancellationReason>>,
+    cause: Mutex<Option<CancelCause>>,
     event: Event,
 }
 
+#[derive(Clone, Copy)]
+enum CancelCause {
+    Stop(TurnCancellationReason),
+    /// Unwind the runtime without cancelling the persisted turn.
+    Suspend,
+}
+
 impl ReasonedShared {
-    fn fire(&self, reason: TurnCancellationReason) {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
+    fn fire(&self, cause: CancelCause) {
+        let mut current = self.cause.lock_unpoisoned();
+        if current.is_some() {
             return;
         }
-        *self.reason.lock_unpoisoned() = Some(reason);
+        *current = Some(cause);
+        drop(current);
         self.event.notify(usize::MAX);
     }
 }
@@ -181,8 +189,7 @@ pub struct ReasonedCancelTrigger(Arc<ReasonedShared>);
 impl ReasonedCancelToken {
     pub fn new() -> (ReasonedCancelTrigger, Self) {
         let shared = Arc::new(ReasonedShared {
-            cancelled: AtomicBool::new(false),
-            reason: Mutex::new(None),
+            cause: Mutex::new(None),
             event: Event::new(),
         });
         (ReasonedCancelTrigger(Arc::clone(&shared)), Self(shared))
@@ -190,18 +197,31 @@ impl ReasonedCancelToken {
 
     pub fn none() -> Self {
         Self(Arc::new(ReasonedShared {
-            cancelled: AtomicBool::new(false),
-            reason: Mutex::new(None),
+            cause: Mutex::new(None),
             event: Event::new(),
         }))
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.reason().is_some()
     }
 
     pub fn reason(&self) -> Option<TurnCancellationReason> {
-        *self.0.reason.lock_unpoisoned()
+        self.0.cause.lock_unpoisoned().map(|cause| match cause {
+            CancelCause::Stop(reason) => reason,
+            CancelCause::Suspend => TurnCancellationReason::Shutdown,
+        })
+    }
+
+    pub(crate) fn is_suspended(&self) -> bool {
+        matches!(*self.0.cause.lock_unpoisoned(), Some(CancelCause::Suspend))
+    }
+
+    pub(crate) async fn suspended(&self) {
+        self.cancelled().await;
+        if !self.is_suspended() {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// Waits until the token fires, returning the winning reason.
@@ -234,13 +254,17 @@ impl ReasonedCancelToken {
 
 impl ReasonedCancelTrigger {
     pub fn cancel(self, reason: TurnCancellationReason) {
-        self.0.fire(reason);
+        self.0.fire(CancelCause::Stop(reason));
+    }
+
+    pub(crate) fn suspend(self) {
+        self.0.fire(CancelCause::Suspend);
     }
 }
 
 impl Drop for ReasonedCancelTrigger {
     fn drop(&mut self) {
-        self.0.fire(crate::types::TurnCancellationReason::User);
+        self.0.fire(CancelCause::Stop(TurnCancellationReason::User));
     }
 }
 

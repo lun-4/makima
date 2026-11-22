@@ -196,7 +196,8 @@ use crate::{
     AgentInput, AgentMode, CancelTrigger, History, HistorySnapshot, ModeDef, RunSettings,
     SharedMessages,
 };
-use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StateChange};
+use makima_storage::id::MakimaId;
+use makima_storage::session_state::{MAX_STORED_TURN_RESULTS, StateChange, StoredJoinedInput};
 
 /// One scheduler operation. Every admitted turn settles into one outcome;
 /// controls and compaction do not produce turn outcomes.
@@ -409,6 +410,7 @@ impl ActorInner {
                     change: StateChange::TurnInput {
                         turn: turn_id,
                         input: Some(input),
+                        promoted: None,
                     },
                 }))
                 .collect(),
@@ -416,6 +418,23 @@ impl ActorInner {
             })
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn record_joined_input(&self, change: StateChange) -> Result<(), ActorError> {
+        if let Some(journal) = &self.journal {
+            journal
+                .commit(JournalCommit {
+                    incarnations: self.journal_incarnation.clone().into_iter().collect(),
+                    changes: vec![JournalChange {
+                        agent: Some(self.agent_id),
+                        generation: 0,
+                        change,
+                    }],
+                    ..Default::default()
+                })
+                .map_err(|error| ActorError::WorkAdmission(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -987,6 +1006,7 @@ impl ActorState {
         self.next_submission_id += 1;
         PendingSubmission {
             id: SubmissionId(self.next_submission_id),
+            journal_id: None,
             turn_id,
             text: input.message.clone(),
             images: input.images.clone(),
@@ -1212,6 +1232,11 @@ impl ActiveCancel {
     /// fires the abort signal so the run unwinds. First reason wins.
     pub(crate) fn fire(self, reason: TurnCancellationReason) {
         self.reasoned.cancel(reason);
+        self.plain.cancel();
+    }
+
+    fn suspend(self) {
+        self.reasoned.suspend();
         self.plain.cancel();
     }
 }
@@ -1627,6 +1652,15 @@ impl HistoryBatch<'_> {
         self.history.append_turn_input(turn, messages);
     }
 
+    pub(crate) fn append_joined_input(
+        &mut self,
+        turn: TurnId,
+        id: MakimaId,
+        messages: Vec<Message>,
+    ) {
+        self.history.append_joined_input(turn, id, messages);
+    }
+
     pub fn push_observation(&mut self, message: Message) -> Result<(), HistoryMutationError> {
         self.history.checked_observation(message)
     }
@@ -1655,6 +1689,7 @@ pub struct RestoredTurnAdmission {
     pub input: AgentInput,
     pub provenance: TurnProvenance,
     pub(crate) work: Vec<WorkReservation>,
+    pub(crate) joined: Vec<(MakimaId, AgentInput, Option<usize>)>,
 }
 
 pub struct ActorRestoration {
@@ -1888,6 +1923,18 @@ impl AgentActorHandle {
                 let presentation = state.reserve_presentation(0);
                 let mut inbox = inbox::InstructionInbox::new(ticket.clone(), presentation);
                 inbox.operation = operation_id;
+                inbox.batchable = crate::batchable(&admission.input);
+                for (id, input, notice) in admission.joined {
+                    let presentation = state.pending_submission(turn_id, &input, false, notice);
+                    let bytes = submission_bytes(&input).unwrap_or(MAX_PENDING_INSTRUCTION_BYTES);
+                    inbox.pending.push_back(inbox::InstructionEntry {
+                        journal_id: Some(id),
+                        presentation,
+                        input,
+                        provenance: Default::default(),
+                        bytes,
+                    });
+                }
                 inbox.drained.push((ticket.provenance().clone(), 0));
                 state.instructions.insert(turn_id, inbox);
                 inner
@@ -2287,6 +2334,15 @@ impl AgentActorHandle {
             .iter()
             .position(|entry| entry.presentation.id == id)
         {
+            if let Some(id) = inbox.pending[index].journal_id {
+                self.inner
+                    .record_joined_input(StateChange::JoinedInput {
+                        turn: turn_id,
+                        id,
+                        input: None,
+                    })
+                    .ok()?;
+            }
             return inbox.pending.remove(index).map(|entry| entry.presentation);
         }
         // Initial input is held by the operation until the runner commits it.
@@ -2307,6 +2363,17 @@ impl AgentActorHandle {
         }
         if self.inner.queue.has_prepared_turn(turn_id) {
             return None;
+        }
+        if let Some(entry) = state.instructions.get(&turn_id)?.pending.front()
+            && let Some(id) = entry.journal_id
+        {
+            self.inner
+                .record_joined_input(StateChange::TurnInput {
+                    turn: turn_id,
+                    input: Some(serde_json::to_value(&entry.input).ok()?),
+                    promoted: Some(id),
+                })
+                .ok()?;
         }
         let submission = state.instructions.get_mut(&turn_id)?.initial.take()?;
         if let Some(entry) = state.instructions.get_mut(&turn_id)?.pending.pop_front() {
@@ -2618,6 +2685,27 @@ impl AgentActorHandle {
                     }
                 }
                 state.check_instruction_capacity(bytes)?;
+                if deferred_constraint && !state.operations.iter().any(
+                    |work| matches!(work, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == target),
+                ) {
+                    return Err(ActorError::PolicyPending);
+                }
+                let journal_id = if self.inner.journal.is_some() {
+                    let id = MakimaId::generate();
+                    let payload =
+                        serde_json::to_value(&input).map_err(|_| ActorError::InvalidInstruction)?;
+                    self.inner.record_joined_input(StateChange::JoinedInput {
+                        turn: target,
+                        id,
+                        input: Some(StoredJoinedInput {
+                            input: payload,
+                            mcp_startup_notice: options.mcp_startup_notice,
+                        }),
+                    })?;
+                    Some(id)
+                } else {
+                    None
+                };
                 if deferred_constraint {
                     let Some(ActorOperation::Turn { policy_constraint, .. }) = state.operations.iter_mut()
                         .find(|work| matches!(work, ActorOperation::Turn { ticket, .. } if ticket.turn_id() == target))
@@ -2653,6 +2741,7 @@ impl AgentActorHandle {
                     inbox.correlations.push(correlation.clone());
                 }
                 inbox.pending.push_back(inbox::InstructionEntry {
+                    journal_id,
                     presentation,
                     input,
                     provenance: options.provenance,
@@ -3318,6 +3407,14 @@ impl AgentActorHandle {
     }
 
     pub(crate) fn capture_close(&self, shutdown: bool) -> Option<ActorCloseCut> {
+        self.capture_close_inner(shutdown, false)
+    }
+
+    pub(crate) fn capture_suspend(&self) -> Option<ActorCloseCut> {
+        self.capture_close_inner(true, true)
+    }
+
+    fn capture_close_inner(&self, shutdown: bool, suspend: bool) -> Option<ActorCloseCut> {
         let (lifecycle, reason) = if shutdown {
             (ActorLifecycle::Shutdown, TurnCancellationReason::Shutdown)
         } else {
@@ -3331,6 +3428,7 @@ impl AgentActorHandle {
             if state.lifecycle != ActorLifecycle::Open {
                 return None;
             }
+            state.suspended |= suspend;
             if let Some(processing) = &mut state.processing {
                 processing.cancellation_reason.get_or_insert(reason);
             }
@@ -3374,7 +3472,11 @@ impl AgentActorHandle {
                     .as_ref()
                     .and_then(|processing| processing.cancellation_reason)
                     .unwrap_or(reason);
-                active.fire(active_reason);
+                if state.suspended && active_reason == TurnCancellationReason::Shutdown {
+                    active.suspend();
+                } else {
+                    active.fire(active_reason);
+                }
             }
             (
                 state.operations.drain(..).collect::<Vec<_>>(),

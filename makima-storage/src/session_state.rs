@@ -36,6 +36,13 @@ pub enum StateChange {
     TurnInput {
         turn: TurnId,
         input: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promoted: Option<MakimaId>,
+    },
+    JoinedInput {
+        turn: TurnId,
+        id: MakimaId,
+        input: Option<StoredJoinedInput>,
     },
     Config(StoredAgentConfig),
     Rules {
@@ -286,6 +293,12 @@ pub struct StoredPluginValue {
     pub value: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredJoinedInput {
+    pub input: Value,
+    pub mcp_startup_notice: Option<usize>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredScopeState {
     pub generation: u64,
@@ -296,6 +309,7 @@ pub struct StoredScopeState {
     pub plugins: BTreeMap<String, StoredPluginValue>,
     pub admitted: BTreeMap<TurnId, StoredTurnOrigin>,
     pub turn_inputs: BTreeMap<TurnId, Value>,
+    pub joined_inputs: BTreeMap<TurnId, BTreeMap<MakimaId, StoredJoinedInput>>,
     pub results: VecDeque<(TurnId, StoredTurnResult)>,
     pub deliveries: BTreeMap<(AgentId, TurnId), StoredDeliveryOp>,
 }
@@ -326,12 +340,22 @@ struct ReducedScope {
     plugins: OrdMap<String, Arc<StoredPluginValue>>,
     admitted: OrdMap<TurnId, Arc<StoredTurnOrigin>>,
     turn_inputs: OrdMap<TurnId, Arc<Value>>,
+    joined_inputs: OrdMap<TurnId, Arc<BTreeMap<MakimaId, Arc<StoredJoinedInput>>>>,
     results: Arc<VecDeque<(TurnId, StoredTurnResult)>>,
     deliveries: OrdMap<(AgentId, TurnId), Arc<StoredDeliveryOp>>,
     delivery_sequences: OrdMap<(AgentId, TurnId), u64>,
 }
 
 impl ReducedScope {
+    fn remove_joined_input(&mut self, turn: &TurnId, id: &MakimaId) {
+        if let Some(inputs) = self.joined_inputs.get_mut(turn) {
+            Arc::make_mut(inputs).remove(id);
+            if inputs.is_empty() {
+                self.joined_inputs.remove(turn);
+            }
+        }
+    }
+
     fn materialize(&self) -> StoredScopeState {
         StoredScopeState {
             generation: self.generation,
@@ -357,6 +381,19 @@ impl ReducedScope {
                 .turn_inputs
                 .iter()
                 .map(|(turn, input)| (*turn, input.as_ref().clone()))
+                .collect(),
+            joined_inputs: self
+                .joined_inputs
+                .iter()
+                .map(|(turn, inputs)| {
+                    (
+                        *turn,
+                        inputs
+                            .iter()
+                            .map(|(id, input)| (*id, input.as_ref().clone()))
+                            .collect(),
+                    )
+                })
                 .collect(),
             results: self.results.as_ref().clone(),
             deliveries: self
@@ -500,13 +537,30 @@ impl SessionStateReducer {
                     scope.admitted.insert(*turn, Arc::new(origin.clone()));
                 }
             }
-            StateChange::TurnInput { turn, input } => {
+            StateChange::TurnInput {
+                turn,
+                input,
+                promoted,
+            } => {
+                if let Some(id) = promoted {
+                    scope.remove_joined_input(turn, id);
+                }
                 if let Some(input) = input {
                     if !scope.results.iter().any(|(id, _)| id == turn) {
                         scope.turn_inputs.insert(*turn, Arc::new(input.clone()));
                     }
                 } else {
                     scope.turn_inputs.remove(turn);
+                }
+            }
+            StateChange::JoinedInput { turn, id, input } => {
+                if let Some(input) = input {
+                    if scope.admitted.contains_key(turn) {
+                        Arc::make_mut(scope.joined_inputs.entry(*turn).or_default())
+                            .insert(*id, Arc::new(input.clone()));
+                    }
+                } else {
+                    scope.remove_joined_input(turn, id);
                 }
             }
             StateChange::Config(config) => scope.config = Some(Arc::new(config.clone())),
@@ -544,6 +598,7 @@ impl SessionStateReducer {
             StateChange::Turn { turn, result } => {
                 scope.admitted.remove(turn);
                 scope.turn_inputs.remove(turn);
+                scope.joined_inputs.remove(turn);
                 let results = Arc::make_mut(&mut scope.results);
                 results.retain(|(id, _)| id != turn);
                 results.push_back((*turn, result.clone()));

@@ -310,6 +310,13 @@ impl History {
                             }
                         }
                     }
+                    // Keep the input retirement last so it can share a log line with its messages.
+                    if let Some(index) = changes.iter().position(|change| {
+                        matches!(change.change, StateChange::JoinedInput { input: None, .. })
+                    }) {
+                        let retirement = changes.remove(index);
+                        changes.push(retirement);
+                    }
                     JournalCommit {
                         incarnations: self.incarnation.clone().into_iter().collect(),
                         changes,
@@ -336,13 +343,37 @@ impl History {
         }
     }
 
-    pub(crate) fn append_turn_input(&mut self, turn: TurnId, mut messages: Vec<Message>) {
+    pub(crate) fn append_turn_input(&mut self, turn: TurnId, messages: Vec<Message>) {
+        self.append_input(turn, None, messages);
+    }
+
+    pub(crate) fn append_joined_input(
+        &mut self,
+        turn: TurnId,
+        id: MakimaId,
+        messages: Vec<Message>,
+    ) {
+        self.append_input(turn, Some(id), messages);
+    }
+
+    fn append_input(&mut self, turn: TurnId, joined: Option<MakimaId>, mut messages: Vec<Message>) {
         let mut changes = take_history_changes();
         if let Some((agent, _)) = &self.journal {
             changes.push(JournalChange {
                 agent: Some(*agent),
                 generation: self.snapshot.epoch,
-                change: StateChange::TurnInput { turn, input: None },
+                change: match joined {
+                    Some(id) => StateChange::JoinedInput {
+                        turn,
+                        id,
+                        input: None,
+                    },
+                    None => StateChange::TurnInput {
+                        turn,
+                        input: None,
+                        promoted: None,
+                    },
+                },
             });
         }
         let last = messages.pop();

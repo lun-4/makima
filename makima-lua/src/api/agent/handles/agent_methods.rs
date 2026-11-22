@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use makima_agent::actor::{ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch};
 use makima_agent::config_change::prepare_selection;
+use makima_agent::manager::RetainedTurn;
 use makima_agent::session_coordinator::SessionCoordinatorHandle;
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionError,
@@ -23,7 +24,7 @@ use super::subscriptions::{
     on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
-use super::tickets::retained_ticket;
+use super::tickets::observe_turn;
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn, session_state};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, RESTRICTED_MODE_CHANGE,
@@ -432,10 +433,7 @@ fn admit(
         ActorError::StaleTurn => STALE_TURN.to_owned(),
         other => other.to_string(),
     })?;
-    Ok(LuaAgentTurn {
-        agent: agent.clone(),
-        ticket,
-    })
+    Ok(LuaAgentTurn::new(agent, RetainedTurn::Ticket(ticket)))
 }
 
 /// When a turn a plugin sends starts.
@@ -531,14 +529,8 @@ fn agent_turn(
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     try_pair!(observe(lua, &ctx, this));
     let turn_id = try_pair!(turn_id.parse::<TurnId>());
-    let ticket = try_pair!(retained_ticket(lua, this, turn_id));
-    Ok((
-        Some(LuaAgentTurn {
-            agent: this.clone(),
-            ticket,
-        }),
-        None,
-    ))
+    let turn = try_pair!(observe_turn(lua, this, Some(turn_id)));
+    Ok((turn.map(|turn| LuaAgentTurn::new(this, turn)), None))
 }
 
 /// Read the most recently admitted turn, including turns the runtime admitted
@@ -552,17 +544,8 @@ fn agent_latest_turn(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     try_pair!(observe(lua, &ctx, this));
-    let ticket = try_pair!(
-        this.manager
-            .latest_retained_turn_ticket(&this.manager.reference(this.id))
-    );
-    Ok((
-        ticket.map(|ticket| LuaAgentTurn {
-            agent: this.clone(),
-            ticket,
-        }),
-        None,
-    ))
+    let turn = try_pair!(observe_turn(lua, this, None));
+    Ok((turn.map(|turn| LuaAgentTurn::new(this, turn)), None))
 }
 
 /// Switch model through a reserved actor configuration operation.

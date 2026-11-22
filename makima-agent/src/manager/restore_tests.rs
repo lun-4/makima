@@ -16,7 +16,7 @@ use makima_providers::{Message, Model, ObservationSource, provider::unconfigured
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::session_state::{
     StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
-    StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
+    StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredOffloadRef, StoredTurnOrigin,
 };
 use makima_storage::sessions::Session;
 use makima_storage::test_util::test_record;
@@ -24,7 +24,7 @@ use test_case::test_case;
 
 use super::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
-    ReactivationError, ResidentAgent, ResidentInitialization,
+    ReactivationError, ResidentAgent, ResidentInitialization, RetainedTurn,
 };
 use crate::{
     ActorBackend, AgentId, AgentInput, AgentMode, BackendResult, ControlWork, History,
@@ -2390,6 +2390,125 @@ fn restored_admission_continues_original_turn_without_duplicate_input(child: boo
         }
         assert_eq!(manager.pending_continuation_count().unwrap(), 0);
         assert_eq!(actor.snapshot().queued, 0);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "activated")]
+#[test_case(true; "activation_failed")]
+fn restored_exact_and_latest_waits_pin_the_admission_before_activation(fail: bool) {
+    smol::block_on(async {
+        let records = records();
+        let child = records[1].id;
+        let journal = journal(&records);
+        let previous = TurnId::generate();
+        let admission = TurnId::generate();
+        let result = TurnResult {
+            outcome: crate::TurnOutcome::completed(
+                child,
+                previous,
+                TokenUsage::default(),
+                0,
+                crate::DoneReason::EndTurn,
+            ),
+            text: String::new(),
+            output: Vec::new(),
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        }
+        .to_stored(journal.snapshot().epoch, None)
+        .unwrap();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Turn {
+                        turn: previous,
+                        result,
+                    },
+                    StateChange::Admitted {
+                        turn: admission,
+                        origin: StoredTurnOrigin::User,
+                    },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(child),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let target = manager.reference(child);
+        let resolve = |_: &StoredOffloadRef| panic!("test results are inline");
+        let exact = manager
+            .observe_retained_turn(&target, Some(admission), resolve)
+            .unwrap();
+        let latest = manager
+            .observe_retained_turn(&target, None, resolve)
+            .unwrap();
+        let [
+            Some(RetainedTurn::Restoring(exact)),
+            Some(RetainedTurn::Restoring(latest)),
+        ] = [exact, latest]
+        else {
+            panic!("both lookups must expose the restored admission before the factory starts");
+        };
+        assert_eq!([exact, latest], [admission; 2]);
+
+        let (release, ready) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(child, |_| async {
+            ready.recv_async().await.unwrap();
+            if fail {
+                return Err(ReactivationError::Initialization(
+                    INITIALIZATION_ERROR.into(),
+                ));
+            }
+            Ok(ResidentAgent {
+                backend: Box::new(continuation_backend()),
+                ..resident()
+            })
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        assert_eq!(
+            manager.node(child).unwrap().residency,
+            AgentResidency::Activating
+        );
+        let wait = |turn| manager.wait_for_restored_turn(&target, turn, resolve);
+        let mut exact_wait = Box::pin(wait(exact));
+        let mut latest_wait = Box::pin(wait(latest));
+        assert!(poll_once(exact_wait.as_mut()).await.is_none());
+        assert!(poll_once(latest_wait.as_mut()).await.is_none());
+
+        release.send(()).unwrap();
+        let activated = activation.await;
+        if fail {
+            assert!(activated.is_err());
+            assert!(poll_once(exact_wait.as_mut()).await.is_none());
+            assert!(poll_once(latest_wait.as_mut()).await.is_none());
+            manager
+                .fail_restored_turns(child, INITIALIZATION_ERROR.into())
+                .await
+                .unwrap();
+        } else {
+            activated.unwrap();
+        }
+        let exact = exact_wait.await.unwrap().wait().await;
+        assert_eq!(latest_wait.await.unwrap().wait().await, exact);
+        assert_eq!(exact.turn_id(), admission);
+        if fail {
+            assert!(matches!(exact, crate::TurnOutcome::Failed { .. }));
+        } else {
+            assert!(matches!(exact, crate::TurnOutcome::Completed { .. }));
+        }
         assert!(
             manager
                 .shutdown(SHUTDOWN_TIMEOUT)

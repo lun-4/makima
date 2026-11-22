@@ -2,7 +2,9 @@ use makima_agent::test_util::poll_until;
 mod common;
 
 use common::{RestartHost, TestSession};
-use makima_agent::{AgentId, TurnId, actor::ActorStatus};
+use makima_agent::{
+    AgentId, AgentInput, TurnAdmissionOptions, TurnId, TurnOutcome, actor::ActorStatus,
+};
 use makima_lua::test_support::{InMemoryFs, run_command};
 use makima_providers::{
     AgentError, ContentBlock, Invocation, Message, Model, ProviderEvent, RequestDelivery,
@@ -39,6 +41,10 @@ const TASK_PLUGIN: &str = "task";
 const TASK_SPAWN: &str = "task_spawn";
 const TASK_WAIT: &str = "task_wait";
 const WAIT_ENTERED: &str = "wait_entered.json";
+const NON_RESUMABLE: &str = "restart_non_resumable";
+const NON_RESUMABLE_ENTERED: &str = "non_resumable_entered";
+const RESTART_RESULT: &str = "This tool call was interrupted when makima stopped. It may have partly run. Check the current state before retrying, then continue your task.";
+const CANCEL_MARKER: &str = "[Cancelled by user]";
 const TASK_PARENT: &str = "parent waiting for disk-backed task";
 const TASK_CHILD: &str = "child awaited across crash";
 const TASK_SOURCE: &str = include_str!("../../plugins/task/init.lua");
@@ -89,14 +95,16 @@ makima.api.register_command({
                 remember(ids, child, assert(child:send(ctx, "crash queued child", { when = "queue" })), true)
             end
             write(ids)
-        elseif action == "task_parent" then
+        elseif action == "task_parent" or action == "joined_parent" then
             local ids = { turns = {}, tool_calls = 0 }
             local child = assert(makima.agent.spawn(ctx, {
                 inherit_provider = true, mcp = false, auto_deliver = false,
                 audience = "general_sub",
             }))
             ids.parent = child:id()
-            remember(ids, child, assert(child:send(ctx, "parent waiting for disk-backed task", { when = "idle" })), true)
+            if action == "task_parent" then
+                remember(ids, child, assert(child:send(ctx, "parent waiting for disk-backed task", { when = "idle" })), true)
+            end
             write(ids)
         elseif action == "wait_parent" then
             local ids = read()
@@ -404,8 +412,9 @@ fn published_crash_prefix_continues_exact_lua_tickets(continuation: bool) {
     }
 }
 
-#[test]
-fn published_task_wait_resumes_parent_and_child_without_respawning() {
+#[test_case(false; "crash")]
+#[test_case(true; "graceful_suspend")]
+fn published_task_wait_resumes_parent_and_child_without_respawning(graceful: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let state = StateDir::from_path(tmp.path().into());
     let mut session = TestSession::new(
@@ -422,6 +431,7 @@ fn published_task_wait_resumes_parent_and_child_without_respawning() {
             .into_bytes(),
     );
     let marker = tmp.path().join(WAIT_ENTERED);
+    let non_resumable_marker = tmp.path().join(NON_RESUMABLE_ENTERED);
     let task_source = format!(
         r#"
 local register = makima.api.register_tool
@@ -429,7 +439,8 @@ makima.api.register_tool = function(spec)
     if spec.name == "task_wait" then
         local handler = spec.handler
         spec.handler = function(input, ctx)
-            assert(makima.fs.write({marker}, makima.json.encode(input)))
+            local previous = makima.fs.read({marker}) or ""
+            assert(makima.fs.write({marker}, previous .. "+"))
             return handler(input, ctx)
         end
     end
@@ -437,8 +448,23 @@ makima.api.register_tool = function(spec)
 end
 {TASK_SOURCE}
 makima.api.register_tool = register
+register({{
+    name = "{NON_RESUMABLE}", description = "Park a non-resumable call",
+    audiences = {{ "main", "general_sub" }},
+    schema = {{ type = "object", properties = {{}} }},
+    handler = function()
+        local gate = makima.async.semaphore(1)
+        local held = gate:acquire()
+        local previous = makima.fs.read({non_resumable_marker}) or ""
+        assert(makima.fs.write({non_resumable_marker}, previous .. "+"))
+        gate:acquire()
+        held:release()
+        error("the non-resumable call did not park")
+    end,
+}})
 "#,
         marker = json!(marker),
+        non_resumable_marker = json!(non_resumable_marker),
     );
     fs.seed(
         &tmp.path()
@@ -501,15 +527,28 @@ makima.api.register_tool = register
             *id = TASK_WAIT.into();
         }
     }
+    if graceful {
+        wait.message.content.push(ContentBlock::tool_use(
+            NON_RESUMABLE,
+            NON_RESUMABLE,
+            json!({}),
+        ));
+    }
     parent.reply.send(wait).unwrap();
-    smol::block_on(poll_until(RESTORED_REQUEST_TIMEOUT, || {
-        host.fs
-            .files()
-            .iter()
-            .any(|(path, _)| path == &marker)
-            .then_some(())
-    }))
-    .expect("task_wait handler did not enter");
+    let mut markers = vec![&marker];
+    if graceful {
+        markers.push(&non_resumable_marker);
+    }
+    for marker in markers {
+        smol::block_on(poll_until(RESTORED_REQUEST_TIMEOUT, || {
+            host.fs
+                .files()
+                .iter()
+                .any(|(path, bytes)| path == marker && bytes == b"+")
+                .then_some(())
+        }))
+        .unwrap_or_else(|| panic!("tool handler did not write {}", marker.display()));
+    }
     command(&host, "publish");
     let saved_ids = ids(&host);
     let prefix = TestSession::load(session_id, &state).unwrap();
@@ -518,11 +557,33 @@ makima.api.register_tool = register
             .unwrap()
             .contains(TASK_WAIT)
     );
-    let host = host.crash_restart_host(tmp.path());
+    let host = if graceful {
+        const SUSPEND_TIMEOUT: Duration = Duration::from_secs(15);
+        let report = smol::block_on(futures_lite::future::race(
+            host.manager.suspend(SUSPEND_TIMEOUT),
+            async {
+                smol::Timer::after(SUSPEND_TIMEOUT + RESTORED_REQUEST_TIMEOUT).await;
+                panic!("graceful manager suspend did not return");
+            },
+        ));
+        assert!(report.timed_out.is_empty(), "{report:?}");
+        smol::block_on(common::bounded_at(
+            "flush suspended journal",
+            host.manager.journal().flush(),
+        ))
+        .unwrap();
+        let suspended = TestSession::load(session_id, &state).unwrap();
+        let messages = serde_json::to_string(suspended.subagent_messages()).unwrap();
+        assert!(!messages.contains(CANCEL_MARKER));
+        host.restart_host(tmp.path())
+    } else {
+        host.crash_restart_host(tmp.path())
+    };
     drop(child);
-    let resumed_child = restored_request(&host, &requests, "task child automatic wake after crash");
+    let resumed_child = restored_request(&host, &requests, "task child automatic wake on reopen");
     assert!(contains(&resumed_child, TASK_CHILD));
     assert!(!contains(&resumed_child, PARTIAL));
+    assert!(!contains(&resumed_child, CANCEL_MARKER));
     resumed_child
         .reply
         .send(common::canned_reply(REPLY))
@@ -531,6 +592,34 @@ makima.api.register_tool = register
     assert!(contains(&resumed_parent, TASK_PARENT));
     assert!(contains(&resumed_parent, REPLY));
     assert!(!contains(&resumed_parent, PARTIAL));
+    assert!(!contains(&resumed_parent, CANCEL_MARKER));
+    let files = host.fs.files();
+    assert!(
+        files
+            .iter()
+            .any(|(path, bytes)| path == &marker && bytes == b"++")
+    );
+    if graceful {
+        assert!(
+            files
+                .iter()
+                .any(|(path, bytes)| path == &non_resumable_marker && bytes == b"+")
+        );
+        let results: Vec<_> = resumed_parent
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == NON_RESUMABLE => Some((content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, vec![(RESTART_RESULT, true)]);
+    }
     let result: Value = resumed_parent
         .messages
         .iter()
@@ -591,4 +680,89 @@ makima.api.register_tool = register
     command(&host, "inspect");
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
     assert!(requests.is_empty());
+}
+
+#[test_case(false; "pending")]
+#[test_case(true; "already_consumed")]
+fn joined_input_survives_crash_exactly_once(consumed: bool) {
+    const FIRST: &str = TASK_PARENT;
+    const JOINED: &str = "joined request across restart";
+    let tmp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(tmp.path().into());
+    let mut session = TestSession::new(
+        &common::default_model().spec(),
+        tmp.path().to_str().unwrap(),
+    );
+    session.save(&state).unwrap();
+    let (send, requests) = flume::unbounded();
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        &tmp.path().join("plugins").join(format!("{PLUGIN}.lua")),
+        SOURCE
+            .replace("__IDS_PATH__", &json!(tmp.path().join(IDS)).to_string())
+            .into_bytes(),
+    );
+    let host = RestartHost::open_with_provider(
+        tmp.path(),
+        session.id,
+        fs,
+        vec![PLUGIN.into()],
+        Arc::new(GatedProvider {
+            requests: send,
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    command(&host, "joined_parent");
+    let saved = ids(&host);
+    let child: AgentId = saved["parent"].as_str().unwrap().parse().unwrap();
+    let actor = host.manager.actor(child).unwrap();
+    let submit = |text: &str| {
+        actor
+            .submit(
+                AgentInput::new(text.into(), Vec::new()),
+                None,
+                text.into(),
+                TurnAdmissionOptions::default(),
+            )
+            .unwrap()
+    };
+    let turn = submit(FIRST).turn_id();
+    let parked = request(&requests, "initial request");
+    assert_eq!(submit(JOINED).turn_id(), turn);
+    assert!(!contains(&parked, JOINED));
+    let parked = if consumed {
+        parked.reply.send(common::canned_reply(REPLY)).unwrap();
+        let request = request(&requests, "request with drained input");
+        assert!(contains(&request, JOINED));
+        request
+    } else {
+        parked
+    };
+    let host = host.crash_restart_host(tmp.path());
+    drop(parked);
+    let request = restored_request(&host, &requests, "resumed request with joined input");
+    assert!(contains(&request, FIRST));
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text.contains(JOINED)),
+                )
+            })
+            .count(),
+        1
+    );
+    request.reply.send(common::canned_reply(REPLY)).unwrap();
+    let ticket = host
+        .manager
+        .actor(child)
+        .unwrap()
+        .turn_ticket(turn)
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(common::bounded(ticket.wait())),
+        TurnOutcome::Completed { .. }
+    ));
 }

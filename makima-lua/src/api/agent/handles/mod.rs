@@ -7,9 +7,10 @@ mod tickets;
 
 use makima_domain::LockExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use makima_agent::actor::ActorLifecycle;
+use makima_agent::manager::RetainedTurn;
 use makima_agent::{AgentActorHandle, AgentId, AgentManagerHandle, AgentRef, TurnTicket};
 use makima_lua_macro::{lua_class, lua_fn};
 use mlua::Lua;
@@ -70,7 +71,18 @@ pub(crate) struct LuaAgentRef {
 #[derive(Clone)]
 struct LuaAgentTurn {
     agent: LuaAgent,
-    ticket: TurnTicket,
+    turn: RetainedTurn,
+    resolved: Arc<OnceLock<TurnTicket>>,
+}
+
+impl LuaAgentTurn {
+    fn new(agent: &LuaAgent, turn: RetainedTurn) -> Self {
+        Self {
+            agent: agent.clone(),
+            turn,
+            resolved: Arc::default(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
