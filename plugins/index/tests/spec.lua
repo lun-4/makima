@@ -5,7 +5,7 @@
 -- existing file as a template) and adding a require line below — keep them
 -- alphabetized.
 
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 local case = th.case
 local eq = th.eq
 local mktmpdir = function()
@@ -13,7 +13,7 @@ local mktmpdir = function()
 end
 local rmtree = th.rmtree
 
-local dir_listing = require("maki.dir_listing")
+local dir_listing = require("makima.dir_listing")
 
 local function mock_ctx(path)
   return {
@@ -31,14 +31,14 @@ end
 
 case("dir_listing_sort_and_filter", function()
   local tmpdir = mktmpdir()
-  maki.fs.write(maki.fs.joinpath(tmpdir, "c.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "m.txt"), "")
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
+  makima.fs.write(makima.fs.joinpath(tmpdir, "c.txt"), "")
+  makima.fs.write(makima.fs.joinpath(tmpdir, "a.txt"), "")
+  makima.fs.write(makima.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
+  makima.fs.write(makima.fs.joinpath(tmpdir, "b.txt"), "")
+  makima.fs.write(makima.fs.joinpath(tmpdir, "m.txt"), "")
+  makima.fs.mkdir(makima.fs.joinpath(tmpdir, "zdir"))
+  makima.fs.mkdir(makima.fs.joinpath(tmpdir, "adir"))
+  makima.fs.mkdir(makima.fs.joinpath(tmpdir, "idir"))
 
   local listing, err = dir_listing.list(tmpdir, mock_ctx(tmpdir))
   assert(err == nil, "dir listing should succeed: " .. tostring(err))

@@ -4,32 +4,24 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use maki_providers::manifest::ManifestRegistry;
-use maki_providers::model::{Model, ModelError, ModelTier};
-use maki_storage::StateDir;
-use maki_storage::log::RotatingFileWriter;
-use maki_storage::model::read_model;
+use makima_providers::ProviderRegistry;
+use makima_providers::login::{AuthState, auth_status};
+use makima_providers::model::{Model, ModelTier};
+use makima_storage::StateDir;
+use makima_storage::log::RotatingFileWriter;
+use makima_storage::model::read_model;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
-const LOG_ENV: &str = "MAKI_LOG";
+const LOG_ENV: &str = "MAKIMA_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
 
-const PROVIDER_PRIORITY: &[&str] = &[
-    "anthropic",
-    "openai",
-    "copilot",
-    "zai",
-    "synthetic",
-    "deepseek",
-    "regolo",
-];
-
 pub fn resolve_model(
+    providers: &ProviderRegistry,
     explicit: Option<&str>,
-    provider_config: &maki_config::ProviderConfig,
+    provider_config: &makima_config::ProviderConfig,
     storage: &StateDir,
 ) -> Result<Model> {
     let policy = &provider_config.model_policy;
@@ -39,11 +31,11 @@ pub fn resolve_model(
                 "model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid --model spec");
+        return providers.model(spec).context("invalid --model spec");
     }
     if let Some(spec) = read_model(storage) {
         if policy.allows(&spec)
-            && let Ok(m) = from_spec_or_warm_catalog(&spec)
+            && let Ok(m) = providers.model(&spec)
         {
             return Ok(m);
         }
@@ -58,68 +50,43 @@ pub fn resolve_model(
                 "default model {spec:?} is not allowed by provider model policy"
             ));
         }
-        return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
+        return providers
+            .model(spec)
+            .context("invalid default_model in config");
     }
-    auto_detect_model(policy).ok_or_else(|| {
+    auto_detect_model(providers, policy, storage).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
             "\nnote: an allowed_models/excluded_models policy is active and may exclude every candidate"
         } else {
             ""
         };
         color_eyre::eyre::eyre!(
-            "no provider available - set an API key (e.g. ANTHROPIC_API_KEY), run `makima auth login`, or use -m to specify a model{policy_note}\n\nSee https://makima.ln4.net/docs/providers/ for setup instructions"
+            "no provider available - set a provider's API key, run `makima auth login`, or use -m to specify a model{policy_note}\n\nSee https://makima.ln4.net/docs/providers/ for setup instructions"
         )
     })
 }
 
-/// An unknown slug may just mean the models.dev catalog has not been loaded
-/// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
-/// non-blocking: the UI draws with it.
-fn from_spec_or_warm_catalog(spec: &str) -> Result<Model, ModelError> {
-    match Model::from_spec(spec) {
-        Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog();
-            Model::from_spec(spec)
-        }
-        result => result,
-    }
-}
-
-fn auto_detect_model(policy: &maki_config::ModelPolicy) -> Option<Model> {
-    for tier in [ModelTier::Strong, ModelTier::Medium] {
-        for &slug in PROVIDER_PRIORITY {
-            if maki_providers::provider::provider_available(slug)
-                && let Ok(model) = Model::from_tier(slug, tier)
-                && policy.allows(&model.spec())
-            {
-                return Some(model);
-            }
-        }
-    }
-    None
-}
-
-/// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
-/// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). Call this after `init_logging`, otherwise the warning has no
-/// subscriber to reach.
-pub fn warn_ignored_provider_fields() {
-    for (slug, def) in &maki_config::providers::ProvidersConfig::load().providers {
-        if ManifestRegistry::get(slug).is_none() {
-            continue;
-        }
-        let ignored = maki_config::providers::ignored_builtin_fields(slug, def);
-        if ignored.is_empty() {
-            continue;
-        }
-        tracing::warn!(
-            slug,
-            fields = %ignored.join(", "),
-            "providers.toml entry for built-in provider ignores these fields \
-             (base_url/plan/api_key still apply), use a custom slug to set \
-             protocol or models"
-        );
-    }
+/// The first provider, in auth status order, that reports credentials and
+/// has a model for the tier.
+fn auto_detect_model(
+    providers: &ProviderRegistry,
+    policy: &makima_config::ModelPolicy,
+    storage: &StateDir,
+) -> Option<Model> {
+    let usable: Vec<_> = smol::block_on(auth_status(providers, storage))
+        .into_iter()
+        .filter(|provider| {
+            !matches!(
+                provider.status.state,
+                AuthState::Missing | AuthState::Failed
+            )
+        })
+        .collect();
+    usable.iter().find_map(|provider| {
+        [ModelTier::Strong, ModelTier::Medium]
+            .into_iter()
+            .find_map(|tier| providers.model_for_tier(&provider.id, tier, policy).ok())
+    })
 }
 
 pub fn install_panic_log_hook() {
@@ -170,11 +137,11 @@ impl<'a> MakeWriter<'a> for SharedWriter {
     }
 }
 
-/// `MAKI_LOG` is ours and is taken literally, `MAKI_LOG=off` included.
+/// `MAKIMA_LOG` is ours and is taken literally, `MAKIMA_LOG=off` included.
 ///
 /// `RUST_LOG` belongs to every Rust program on the machine, and `EnvFilter`
 /// drops any target no directive names, so a `RUST_LOG=other_crate=debug` left
-/// in a shell profile for an unrelated project silenced maki entirely. We still
+/// in a shell profile for an unrelated project silenced makima entirely. We still
 /// read it, and a value that names a level decides ours, but a value that only
 /// lists other people's targets gets our level added underneath, so a foreign
 /// variable can add to our logs and never take them away.
@@ -215,7 +182,7 @@ fn sets_a_level(value: &str) -> bool {
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(storage_config: &makima_config::StorageConfig) {
     let writer =
         match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
             Ok(writer) => writer,
@@ -235,7 +202,9 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
 mod tests {
     use test_case::test_case;
 
-    use super::{DEFAULT_LOG_LEVEL, build_log_filter};
+    use makima_storage::paths::APP_NAME;
+
+    use super::{DEFAULT_LOG_LEVEL, LOG_ENV, build_log_filter};
 
     const FOREIGN: &str = "other_crate=debug";
     const FOREIGN_EMPTY_PIECES: &str = ",other_crate=debug,,";
@@ -259,6 +228,11 @@ mod tests {
             rendered.split(',').any(|d| d == expected),
             "{ours:?} + {shared:?} rendered as {rendered:?}, wanted {expected:?}"
         );
+    }
+
+    #[test]
+    fn log_env_is_the_app_name_upper() {
+        assert_eq!(LOG_ENV, format!("{}_LOG", APP_NAME.to_uppercase()));
     }
 
     #[test]

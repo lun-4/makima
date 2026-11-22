@@ -1,5 +1,5 @@
 local PLAN_FILE = "plan.md"
-local plan_spec = require("maki.plan_spec")
+local plan_spec = require("makima.plan_spec")
 
 local PLAN_DIRECTIVE = [[
 You are in **Plan mode**. The plan file is `{plan_path}`. This is a read-only planning and investigation mode.
@@ -57,14 +57,14 @@ Only call `plan_submit` after the plan is fully written to `{plan_path}`; then c
 Plan-mode context is valuable: focus any summary on investigation findings, design decisions, unresolved questions, and the state of the plan document. Preserve what has been discovered about the codebase, which options were considered and rejected, and the rationale for the planned approach. Never present investigation steps as completed implementation work.
 ]]
 
-local ok, err = maki.api.mode.define({
+local ok, err = makima.api.mode.define({
   name = "plan",
   label = "[PLAN]",
   system_prompt = PLAN_DIRECTIVE,
   restrict_write_to = PLAN_FILE,
 })
 if not ok then
-  maki.log.warn("mode_plan_override: define failed: " .. err)
+  makima.log.warn("mode_plan_override: define failed: " .. err)
 end
 
 local function set_mode(ctx, name)
@@ -78,7 +78,7 @@ local function set_mode(ctx, name)
   end
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/plan",
   description = "Switch to plan mode (analyse and write only the plan file)",
   tui_only = false,
@@ -87,7 +87,7 @@ maki.api.register_command({
   end,
 })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/build",
   description = "Switch to build mode (full tool access)",
   tui_only = false,

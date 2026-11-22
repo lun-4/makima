@@ -55,11 +55,13 @@ curl -fsSL https://makima.ln4.net/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\makima` and add it to your user PATH. Override with `MAKIMA_INSTALL_DIR` / `$env:MAKIMA_INSTALL_DIR`.
 
-### Living on the edge (main branch)
+### Living on the edge (mistress branch)
 
 ```sh
 cargo install --locked --git https://github.com/lun-4/makima.git makima
 ```
+
+Add `--tag v0.5.0` to build a release instead of the latest commit.
 
 ### With Nix
 
@@ -72,11 +74,11 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/lun-4/m
 ## Connect a provider
 
 ```bash
-makima auth login              # interactive picker (OAuth or API key)
-export ANTHROPIC_API_KEY=... # or just export a key
+makima auth login              # pick a provider and log in
+export ANTHROPIC_API_KEY=...   # or just export a key
 ```
 
-Anthropic, OpenAI, Google, Ollama, and friends all work; multiple keys in one var rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
+Inside the TUI, `/login` does the same. Anthropic, OpenAI, Google, Ollama, and friends all work, and so does any provider in the models.dev catalog or an endpoint you add yourself. Multiple keys in one variable rotate on rate limits. Every env var and model catalog is in [Providers](/docs/providers/).
 
 ## First session
 
@@ -106,7 +108,7 @@ Main and subagent views use the same input and controls. Messages sent during wo
 
 ```lua
 -- ~/.config/makima/init.lua
-maki.setup({
+makima.setup({
     provider = {
         default_model = "anthropic/claude-sonnet-4-6",
     },

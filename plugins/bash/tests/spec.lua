@@ -1,5 +1,5 @@
 local bh = require("bash_helpers")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq
@@ -60,6 +60,57 @@ local function fake_spawn(spawn_log, result, prompt_err, throws)
 end
 
 local OPT = { auto_model = "test/model", auto_mode = true, auto_timeout_secs = 17 }
+
+case("windows_permission_scopes_recognize_literal_commands", function()
+  for _, entry in ipairs({
+    { "cmd", "echo hello" },
+    { "cmd", "DIR /b C:\\work" },
+    { "cmd", "ver" },
+    { "powershell", "Write-Output hello" },
+    { "powershell", "Get-ChildItem -Name C:\\work" },
+    { "powershell", "Get-Location" },
+  }) do
+    assert(bh.is_simple_windows_command(entry[1], entry[2]), entry[2])
+  end
+end)
+
+case("windows_permission_scopes_leave_uncertain_syntax_to_approval", function()
+  for _, entry in ipairs({
+    { "cmd", "echo hello && echo world" },
+    { "cmd", "echo %TEMP%" },
+    { "cmd", "echo hello > file.txt" },
+    { "cmd", "echo hello\necho world" },
+    { "cmd", "if 1==1 echo hello" },
+    { "cmd", 'type "file name.txt"' },
+    { "cmd", " echo hello" },
+    { "cmd", "echo  hello" },
+    { "cmd", "echo hello " },
+    { "powershell", "Write-Output hello; Write-Output world" },
+    { "powershell", "Write-Output hello | Out-String" },
+    { "powershell", "Write-Output $HOME" },
+    { "powershell", "Get-ChildItem @(.)" },
+    { "powershell", "Invoke-Expression hello" },
+    { "bash", "echo hello" },
+  }) do
+    assert(not bh.is_simple_windows_command(entry[1], entry[2]), entry[2])
+  end
+end)
+
+case("powershell_qualifies_only_recognized_literal_commands", function()
+  eq(
+    bh.qualify_powershell_command("wRiTe-OuTpUt CaseSensitive"),
+    "Microsoft.PowerShell.Utility\\Write-Output CaseSensitive"
+  )
+  eq(bh.qualify_powershell_command("echo hello"), "Microsoft.PowerShell.Utility\\Write-Output hello")
+  eq(
+    bh.qualify_powershell_command("Get-ChildItem -Name C:\\work"),
+    "Microsoft.PowerShell.Management\\Get-ChildItem -Name C:\\work"
+  )
+  local compound = "Write-Output first; Write-Output second"
+  eq(bh.qualify_powershell_command(compound), compound)
+  local qualified = "Microsoft.PowerShell.Utility\\Write-Output hello"
+  eq(bh.qualify_powershell_command(qualified), qualified)
+end)
 
 case("parse_verdict_approve", function()
   local verdict, reason, err = bh.parse_verdict('{"approved": true}')
@@ -210,7 +261,7 @@ end)
 
 case("spawn_opts_inherits_session_model_when_unset", function()
   local o = bh.spawn_opts({})
-  eq(o.model, nil, "an omitted model makes maki.agent.spawn inherit the parent model")
+  eq(o.model, nil, "an omitted model makes makima.agent.spawn inherit the parent model")
   eq(o.system, CLASSIFIER_SYSTEM)
   eq(o.silent, true)
 end)

@@ -3,8 +3,8 @@ use std::ffi::CString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use maki_storage::version::{self, VersionError};
-use maki_storage::{StateDir, StorageError};
+use makima_storage::version::{self, VersionError};
+use makima_storage::{StateDir, StorageError};
 
 const INSTALL_SCRIPT_URL: &str = "https://makima.ln4.net/install.sh";
 const BACKUP_FILENAME: &str = "makima_backup";
@@ -190,7 +190,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     if no_color {
         println!("{script}");
     } else {
-        println!("{}", maki_ui::highlight_ansi("bash", &script));
+        println!("{}", makima_ui::highlight_ansi("bash", &script));
     }
 
     if !skip_confirm && !prompt_yes(&install_dir) {

@@ -1,4 +1,4 @@
-local ToolView = require("maki.tool_view")
+local ToolView = require("makima.tool_view")
 
 local MIN_CARD_LINES = 10
 local CARD_WIDTH = 80
@@ -39,7 +39,7 @@ function QuestionHelpers.view_opts(ctx)
 end
 
 local function markdown_lines(text, width)
-  local ok, lines = pcall(maki.ui.markdown, text, width)
+  local ok, lines = pcall(makima.ui.markdown, text, width)
   if not ok or type(lines) ~= "table" or #lines == 0 then
     return { { { text, "" } } }
   end
@@ -88,7 +88,7 @@ local function card_lines(questions, answers, width, expanded)
     for _, text in ipairs(ans) do
       local desc = option_desc(q.options, text)
       local key = i .. "\0" .. text
-      for j, piece in ipairs(maki.split(text, "\r?\n")) do
+      for j, piece in ipairs(makima.split(text, "\r?\n")) do
         local line = { { j == 1 and ANSWER_PREFIX or ANSWER_INDENT, "success" }, { piece, "success" } }
         if desc and j == 1 then
           line[#line + 1] = { expanded[key] and COLLAPSE_HINT or EXPAND_HINT, "dim" }
@@ -113,7 +113,7 @@ local function card_lines(questions, answers, width, expanded)
 end
 
 function QuestionHelpers.render_card(questions, answers, opts)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, opts)
   local expanded = {}
   local keys

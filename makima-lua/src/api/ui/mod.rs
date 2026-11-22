@@ -1,0 +1,2128 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use humantime::format_duration;
+use jiff::{Timestamp, tz::TimeZone};
+use makima_config::ClockFormat;
+use makima_lua_macro::{lua_fn, lua_table};
+use mlua::{Lua, RegistryKey, Result as LuaResult, Table, UserDataRef};
+use strum::VariantNames;
+
+use makima_agent::{POST_LEVELS, Post, PostLevel};
+
+use crate::agent_errors::{
+    BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION, UNLINKABLE_POST_AGENT,
+};
+use crate::api::agent::{LuaAgent, LuaAgentRef, focused_agent_ref, send_post};
+use crate::api::util::command::{
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
+    StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
+    WinEvent, ui_send,
+};
+use crate::api::util::convert::opt_bool;
+use crate::api::util::ctx::LuaCtx;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::picker::{PickerCallbackEntry, PickerCallbacks, PickerResult};
+use crate::docs::{FnDoc, ParamDoc};
+pub(crate) mod blit;
+pub(crate) mod buf;
+pub(crate) mod win;
+
+use crate::runtime::{
+    current_managed_turn, in_delegated_tool, pinned_target, validate_plugin_effect, with_task_bufs,
+};
+use win::WinHandle;
+
+const POST_OPTIONS: &[&str] = &["agent", "level"];
+
+pub(crate) struct StatusContentStore {
+    content: BTreeMap<Arc<str>, StatusContent>,
+}
+
+impl StatusContentStore {
+    pub fn new() -> Self {
+        Self {
+            content: BTreeMap::new(),
+        }
+    }
+
+    pub fn set(&mut self, plugin: Arc<str>, content: StatusContent) -> bool {
+        let content: StatusContent = content
+            .into_iter()
+            .filter(|entry| !entry.text.is_empty())
+            .collect();
+        if content.is_empty() {
+            return self.content.remove(&plugin).is_some();
+        }
+        if self.content.get(&plugin) == Some(&content) {
+            return false;
+        }
+        self.content.insert(plugin, content);
+        true
+    }
+
+    pub fn clear_plugin(&mut self, plugin: &str) -> bool {
+        self.content.remove(plugin).is_some()
+    }
+
+    pub fn has_plugin_content(&self, plugin: &str) -> bool {
+        self.content.contains_key(plugin)
+    }
+
+    pub fn snapshot_entries(&self) -> StatusContentEntries {
+        self.content
+            .iter()
+            .map(|(plugin, content)| (Arc::clone(plugin), content.clone()))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ClickRegions {
+    next_id: u32,
+    ids: HashMap<(Arc<str>, usize), u32>,
+    keys: HashMap<u32, RegistryKey>,
+}
+
+impl ClickRegions {
+    fn register(
+        &mut self,
+        lua: &Lua,
+        plugin: &Arc<str>,
+        index: usize,
+        func: mlua::Function,
+    ) -> LuaResult<u32> {
+        let id = match self.ids.get(&(Arc::clone(plugin), index)) {
+            Some(id) => *id,
+            None => {
+                self.next_id += 1;
+                self.ids.insert((Arc::clone(plugin), index), self.next_id);
+                self.next_id
+            }
+        };
+        if let Some(old) = self.keys.remove(&id) {
+            let _ = lua.remove_registry_value(old);
+        }
+        let key = lua.create_registry_value(func)?;
+        self.keys.insert(id, key);
+        Ok(id)
+    }
+
+    fn clear_entry(&mut self, lua: &Lua, plugin: &Arc<str>, index: usize) -> LuaResult<()> {
+        if let Some(id) = self.ids.remove(&(Arc::clone(plugin), index))
+            && let Some(key) = self.keys.remove(&id)
+        {
+            lua.remove_registry_value(key)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_plugin(&mut self, lua: &Lua, plugin: &str) {
+        let ids: Vec<u32> = self
+            .ids
+            .iter()
+            .filter(|((owner, _), _)| owner.as_ref() == plugin)
+            .map(|(_, id)| *id)
+            .collect();
+        for id in ids {
+            if let Some(key) = self.keys.remove(&id) {
+                let _ = lua.remove_registry_value(key);
+            }
+        }
+        self.ids.retain(|(owner, _), _| owner.as_ref() != plugin);
+    }
+
+    pub(crate) fn function(&self, lua: &Lua, id: u32) -> Option<mlua::Function> {
+        let key = self.keys.get(&id)?;
+        lua.registry_value::<mlua::Function>(key).ok()
+    }
+}
+
+pub(crate) struct HintStore {
+    hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
+}
+
+pub(crate) type PendingHintStore = Arc<Mutex<Option<Vec<(String, String)>>>>;
+
+impl HintStore {
+    pub fn new() -> Self {
+        Self {
+            hints: BTreeMap::new(),
+        }
+    }
+
+    pub fn set(&mut self, plugin: Arc<str>, spans: Vec<(String, String)>) {
+        if spans.is_empty() {
+            self.hints.remove(&plugin);
+        } else {
+            self.hints.insert(plugin, spans);
+        }
+    }
+
+    pub fn clear_plugin(&mut self, plugin: &str) {
+        self.hints.retain(|k, _| k.as_ref() != plugin);
+    }
+
+    pub fn snapshot_entries(&self) -> HintEntries {
+        self.hints
+            .iter()
+            .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .collect()
+    }
+}
+
+fn publish_hint_snapshot(lua: &Lua) {
+    if let Some(store) = lua.app_data_ref::<HintStore>() {
+        let entries = store.snapshot_entries();
+        if let Some(writer) = lua.app_data_ref::<HintWriter>() {
+            writer.publish(entries);
+        }
+    }
+}
+
+fn publish_status_content_snapshot(lua: &Lua) {
+    if let Some(store) = lua.app_data_ref::<StatusContentStore>() {
+        let entries = store.snapshot_entries();
+        if let Some(writer) = lua.app_data_ref::<StatusContentWriter>() {
+            writer.publish(entries);
+        }
+    }
+}
+
+pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
+    let footer_tbl: Table = match tbl.get("footer") {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+    footer_tbl
+        .sequence_values::<Table>()
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.get(1)?, entry.get(2)?))
+        })
+        .collect()
+}
+
+/// Creates a new buffer for building UI content. The first buffer you
+/// create in a task becomes the "live" buffer, streamed to the UI while
+/// your tool runs. Pass `{ scratch = true }` to opt out: a toast or an
+/// interactive prompt raised from inside a tool needs its own window
+/// without stealing the live stream.
+///
+/// @param opts table? Optional. `scratch` (boolean, default false): never claim the live pane.
+/// @return (Buf) Buffer handle.
+/// @example
+/// local buf = makima.ui.buf()
+/// buf:line("hello world")
+/// local toast = makima.ui.buf({ scratch = true })
+/// toast:line("copied!")
+#[lua_fn]
+fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
+    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
+    Ok(with_task_bufs(lua, |store| {
+        if scratch {
+            store.create()
+        } else {
+            store.create_live()
+        }
+    }))
+}
+
+/// Formats a Unix timestamp as local time using the configured clock.
+///
+/// @param epoch_ms integer Unix timestamp in milliseconds.
+/// @param style string? Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+/// @return (string) Formatted local time.
+#[lua_fn]
+fn format_time(lua: &Lua, epoch_ms: u64, style: Option<String>) -> LuaResult<String> {
+    let format = lua
+        .app_data_ref::<ClockFormat>()
+        .map_or(ClockFormat::System, |f| *f);
+    let ts = Timestamp::from_second((epoch_ms / 1000) as i64)
+        .map_err(|e| mlua::Error::runtime(e.to_string()))?
+        .to_zoned(TimeZone::system());
+    let clock = if matches!(format, ClockFormat::Hour12) {
+        "%-I:%M %p"
+    } else {
+        "%H:%M"
+    };
+    let pattern = match style.as_deref() {
+        Some("weekday") => format!("%a {clock}"),
+        Some("date") => format!("%b %-d, {clock}"),
+        _ => clock.to_owned(),
+    };
+    Ok(ts.strftime(&pattern).to_string())
+}
+
+/// Looks up a semantic color from the current theme. Use this to keep
+/// your plugin's colors consistent with the rest of the UI.
+///
+/// @param name string Semantic color name, e.g. "accent" or "background".
+/// @return (string|nil) "#rrggbb" hex color, or nil if the name is unknown.
+/// @example
+/// local accent = makima.ui.theme_color("accent")
+/// if accent then
+///   buf:line({ { "note", { fg = accent, bold = true } } })
+/// end
+#[lua_fn]
+fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
+    let Some((r, g, b)) = makima_highlight::theme_color(&name) else {
+        return Ok(mlua::Value::Nil);
+    };
+    Ok(mlua::Value::String(
+        lua.create_string(format!("#{r:02x}{g:02x}{b:02x}"))?,
+    ))
+}
+
+/// Syntax-highlights a chunk of source code. Returns a table of styled
+/// lines that you can feed into a buffer. Each line is a list of
+/// `{text, style}` spans where style is a `{fg, bold?, italic?, underline?}` table.
+///
+/// @param code string Source text to highlight.
+/// @param lang string Language identifier, e.g. "rust", "python".
+/// @param opts table? Options. Fields:
+///   - independent (boolean): highlight each line without cross-line context. Default false.
+///   - prefix (string): prepend to the source before highlighting (affects token context). Default "".
+/// @return (table) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
+/// @example
+/// local lines = makima.ui.highlight("fn main() {}", "rust")
+/// for _, spans in ipairs(lines) do
+///   buf:line(spans)
+/// end
+#[lua_fn]
+async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
+    let independent = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "independent"))
+        .unwrap_or(false);
+    let prefix = opts
+        .and_then(|t| t.get::<String>("prefix").ok())
+        .unwrap_or_default();
+    let segments = smol::unblock(move || {
+        makima_highlight::pool::run(move || {
+            if independent {
+                makima_highlight::highlight_lines_independent(&lang, &code)
+            } else {
+                makima_highlight::highlight_code(&lang, &code, &prefix)
+            }
+        })
+    })
+    .await;
+    segments_to_lua_lines(&lua, &segments)
+}
+
+/// Renders Markdown into styled lines ready to display in a buffer.
+/// Each span's style is either a named string ("bold", "heading",
+/// "inline_code", etc.) or a `{fg, bold?, italic?, underline?}` table
+/// for syntax-highlighted code blocks.
+///
+/// @param text string Markdown source.
+/// @param width integer Wrap width in columns.
+/// @return (table) Lines: `{ { {text, style}, ... }, ... }`.
+/// @example
+/// local size = makima.ui.terminal_size()
+/// local lines = makima.ui.markdown("# Hello\n\nSome **bold** text.", size.cols)
+/// for _, spans in ipairs(lines) do
+///   buf:line(spans)
+/// end
+#[lua_fn]
+async fn markdown(lua: Lua, text: String, width: u16) -> LuaResult<Table> {
+    let lines = smol::unblock(move || {
+        makima_highlight::pool::run(move || makima_markdown::render::render(&text, width))
+    })
+    .await;
+    markdown_lines_to_lua(&lua, &lines)
+}
+
+/// Formats a number of seconds into a short, human-friendly string.
+/// Useful for displaying elapsed time in status messages.
+///
+/// @param secs integer Duration in seconds.
+/// @return (string) Human-readable duration, e.g. "1m30s".
+/// @example
+/// makima.ui.humantime(90)   -- "1m30s"
+/// makima.ui.humantime(3661) -- "1h1m1s"
+#[lua_fn]
+fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
+    Ok(format_duration(Duration::from_secs(secs))
+        .to_string()
+        .replace(' ', ""))
+}
+
+/// Returns the current terminal size. Handy for sizing floating windows
+/// or wrapping text to fit the screen.
+///
+/// @return (table) `{cols, rows}`, terminal width and height in characters.
+/// @example
+/// local size = makima.ui.terminal_size()
+/// local half_width = math.floor(size.cols / 2)
+#[lua_fn]
+fn terminal_size(lua: &Lua) -> LuaResult<Table> {
+    let (cols, rows) = tty_size().unwrap_or((80, 24));
+    let tbl = lua.create_table()?;
+    tbl.set("cols", cols)?;
+    tbl.set("rows", rows)?;
+    Ok(tbl)
+}
+
+/// `crossterm::terminal::size` runs `tput cols` and `tput lines` when there is
+/// no tty, two process spawns that block the Lua thread on every call in
+/// headless and test runs. The ioctl alone gives the same answer whenever a
+/// terminal is attached.
+#[cfg(unix)]
+fn tty_size() -> Option<(u16, u16)> {
+    crossterm::terminal::window_size()
+        .ok()
+        .map(|size| (size.columns, size.rows))
+}
+
+#[cfg(not(unix))]
+fn tty_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
+}
+
+/// Returns the display width of a string in terminal cells, matching
+/// how `ratatui` measures text.
+///
+/// @param text string The text to measure.
+/// @return (integer) Number of display cells the text occupies.
+/// @example
+/// local w = makima.ui.display_width("hello")
+#[lua_fn]
+fn display_width(_lua: &Lua, text: String) -> LuaResult<usize> {
+    use unicode_width::UnicodeWidthStr;
+    Ok(text.width())
+}
+
+/// Splits a string at a display-cell boundary.
+///
+/// @param text string The text to split.
+/// @param max_width integer Maximum display cells for the head.
+/// @return (table) `{head = string, tail = string}`.
+/// @example
+/// local t = makima.ui.truncate_text("hello world", 5)
+/// -- t.head == "hello", t.tail == " world"
+#[lua_fn]
+fn truncate_text(lua: &Lua, text: String, max_width: usize) -> LuaResult<Table> {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    let mut idx = 0;
+    for (i, c) in text.char_indices() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + w > max_width {
+            break;
+        }
+        width += w;
+        idx = i + c.len_utf8();
+    }
+    let tbl = lua.create_table()?;
+    tbl.set("head", &text[..idx])?;
+    tbl.set("tail", &text[idx..])?;
+    Ok(tbl)
+}
+
+/// Shows a brief message in the status bar. The message disappears
+/// after a short time. Good for confirming an action like "copied!"
+/// or showing a transient warning.
+///
+/// @param msg string Message text.
+/// @return
+/// @example
+/// makima.ui.flash("Copied to clipboard!")
+#[lua_fn]
+fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::Flash(msg));
+    Ok(())
+}
+
+/// Sets the terminal emulator's window title. Pass an empty string to
+/// clear it.
+///
+/// The title passes through tmux, GNU screen, and zellij untouched, and
+/// control characters are stripped, so model text cannot inject escape
+/// sequences into the terminal. On exit makima hands the title back to the
+/// shell, on terminals that support the title stack.
+///
+/// @param title string New window title, e.g. `"● 3/5 tests"`.
+/// @return
+/// @example
+/// makima.ui.set_window_title("makima: " .. session_name)
+/// -- Give the title back to the shell:
+/// makima.ui.set_window_title("")
+#[lua_fn]
+fn set_window_title(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    title: String,
+) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::SetWindowTitle(title));
+    Ok(())
+}
+
+/// Runs a built-in UI action by name, exactly as its default keybinding
+/// would. Handy when a default key never reaches makima because tmux or
+/// your terminal grabs it first: bind a new key with `makima.keymap.set`
+/// and call this from it.
+///
+/// Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+/// `"plan_toggle"`, `"plan_editor"`, `"plan_submit"`, `"edit_input"`,
+/// `"pop_queue"`, `"prev_chat"`, `"next_chat"`.
+///
+/// For slash commands rather than keybound actions, see
+/// `makima.api.run_command`.
+///
+/// @param name string Action name, e.g. `"file_picker"`.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error message for an unknown name.
+/// @example
+/// -- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
+/// makima.keymap.set("n", "<C-q>", function()
+///   makima.ui.action("file_picker")
+/// end)
+#[lua_fn]
+fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaResult<Pair<bool>> {
+    let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
+        "unknown action '{name}' (valid: {})",
+        BuiltinAction::VARIANTS.join(", ")
+    )));
+    try_pair!(ui_send(Some(&tx), UiAction::Builtin(builtin)));
+    Ok((Some(true), None))
+}
+
+/// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
+/// it to close. This suspends the TUI while the editor is running.
+/// Returns the editor's exit code so you can check if the user saved.
+///
+/// @param path string File to open.
+/// @return (integer) Editor exit code, or -1 if the action could not be dispatched.
+/// @example
+/// local code = makima.ui.open_editor("/tmp/scratch.lua")
+/// if code == 0 then
+///   makima.ui.flash("File saved")
+/// end
+#[lua_fn]
+async fn open_editor(lua: Lua, #[ctx] tx: flume::Sender<UiAction>, path: String) -> LuaResult<i32> {
+    if validate_plugin_effect(&lua).is_err() {
+        return Ok(-1);
+    }
+    let target = if in_delegated_tool(&lua) {
+        match current_managed_turn(&lua) {
+            Some(turn) => {
+                if turn.validate_active().is_err() {
+                    return Ok(-1);
+                }
+                match turn.agent_ref() {
+                    Ok(target) => Some(target),
+                    Err(_) => return Ok(-1),
+                }
+            }
+            None => None,
+        }
+    } else {
+        pinned_target(&lua).map(|target| target.target)
+    };
+    if let Some(services) = crate::orchestration::services(&lua) {
+        let Some(target) = &target else {
+            return Ok(-1);
+        };
+        if target.validate_live().is_err() || services.validate_target(target).is_err() {
+            return Ok(-1);
+        }
+    }
+    let (reply_tx, reply_rx) = flume::bounded::<i32>(1);
+    if tx
+        .try_send(UiAction::OpenEditor {
+            target,
+            path: PathBuf::from(path),
+            reply_tx,
+        })
+        .is_err()
+    {
+        return Ok(-1);
+    }
+    Ok(reply_rx.recv_async().await.unwrap_or(-1))
+}
+
+/// Opens a fuzzy-filtering list picker dialog and blocks until the user
+/// decides. Items are ranked by match score with matched characters
+/// highlighted, exactly like the built-in pickers. Filter edits keep the
+/// current row instead of jumping to the best match.
+///
+/// An item's optional `age` field is a timestamp from `makima.time.now` or
+/// `makima.time.at`, not an elapsed duration. The host renders it as a live
+/// delta (for example `9s` or `4d 7h 23m 9s`) and refreshes it about once
+/// per second while the dialog is open. `detail` and `age` can coexist;
+/// age follows the detail.
+///
+/// @param items table List of items: plain strings, or `{ label, detail?, section?, section_detail?, age? }` tables.
+/// @param opts table? Options:
+///   - title (string): dialog title.
+///   - footer (table): key-hint pairs for the footer border. Each entry is `{key, label}`.
+///   - cursor (integer): initial 1-based item index. Default 1.
+///   - submit_keys (table): extra key names that confirm the selection, in the "ctrl+o" notation; enter always confirms.
+///   - notify_initial (boolean): fire `on_change` for the initial item. Default false.
+///   - timeout_ms (integer): idle window; when it elapses `on_timeout` fires, and keeps firing while the dialog stays idle. Zero or omitted disables the window.
+///   - on_change (function): `on_change(item, index)` with the original item and its 1-based index, fired when the selection moves.
+///   - on_timeout (function): `on_timeout()` when the idle window elapses.
+/// @return (table) `{ type = "choice", index = n }` with the 1-based index of the chosen item, `{ type = "delete", index = n }` when the user presses Ctrl+D twice on an item (the first press flashes "Press Ctrl+D again to delete"), or `{ type = "close" }` when dismissed with Esc or Ctrl+C, or when the UI channel drops mid-pick.
+/// @example
+/// local result = makima.ui.open_list_picker({ "alpha", "beta" }, { title = "Pick" })
+/// if result.type == "choice" then
+///   makima.ui.flash("Picked " .. result.index)
+/// end
+#[lua_fn]
+async fn open_list_picker(
+    lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    items: mlua::Value,
+    opts: Option<Table>,
+) -> LuaResult<Table> {
+    let (items_table, specs) = crate::api::util::picker::decode_picker_items(&items)?;
+    let config = crate::api::util::picker::decode_picker_opts(opts.as_ref())?;
+    let (on_change, on_timeout) = crate::api::util::picker::decode_picker_callbacks(opts.as_ref());
+    let id = crate::api::util::picker::alloc_picker_id();
+    // The `AppDataRef` guard is `!Send`, so scope it: the call parks on the
+    // reply below and only the id must survive into that future.
+    {
+        let store = lua
+            .app_data_ref::<PickerCallbacks>()
+            .ok_or_else(|| mlua::Error::runtime("picker callback store unavailable"))?;
+        store.insert(
+            id,
+            PickerCallbackEntry {
+                items: items_table,
+                on_change,
+                on_timeout,
+            },
+        );
+    }
+    let (reply_tx, reply_rx) = flume::bounded::<PickerResult>(1);
+    if tx
+        .try_send(UiAction::OpenListPicker {
+            id,
+            items: specs,
+            config,
+            reply_tx,
+        })
+        .is_err()
+    {
+        if let Some(store) = lua.app_data_ref::<PickerCallbacks>() {
+            store.remove(id);
+        }
+        let t = lua.create_table()?;
+        t.set("type", "close")?;
+        return Ok(t);
+    }
+    let result = match reply_rx.recv_async().await {
+        Ok(result) => result,
+        // The sender was dropped (the UI process is gone) and its `Done`
+        // event never arrives, so drain the callback entry here; the
+        // caller's close path still runs on the synthesized dismiss.
+        Err(_) => {
+            if let Some(store) = lua.app_data_ref::<PickerCallbacks>() {
+                store.remove(id);
+            }
+            PickerResult::Close
+        }
+    };
+    let t = lua.create_table()?;
+    match result {
+        PickerResult::Choice(idx) => {
+            t.set("type", "choice")?;
+            t.set("index", idx + 1)?;
+        }
+        PickerResult::Delete(idx) => {
+            t.set("type", "delete")?;
+            t.set("index", idx + 1)?;
+        }
+        PickerResult::Close => {
+            t.set("type", "close")?;
+        }
+    }
+    Ok(t)
+}
+
+/// Opens a floating or split window that displays the contents of {buf}.
+/// Returns a Win handle you can use to receive events, update layout,
+/// and close the window when you are done.
+///
+/// @param buf Buf Buffer to display.
+/// @param opts table Float configuration. Fields:
+///   - width (integer|string): window width. Integer for absolute columns; "N%" for percent of terminal width. Default "60%".
+///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
+///   - row (integer?): row offset from the anchor corner. Negative values move up.
+///   - col (integer?): column offset from the anchor corner.
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
+///   - title (string): text shown in the top border. Default "".
+///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
+///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}.
+///   - zindex (integer): stacking order. Default 50.
+///   - cursor_line (boolean): highlight the focused row. Default false.
+///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
+///   - reserved_bottom (integer): rows reserved at the bottom of the content area. Default 0.
+///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
+///   - order (integer): paint order among split windows at the same edge. Default 50.
+///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
+///   - visible (boolean): whether the window is initially visible. Default true.
+///   - needs_input (boolean): whether the window means the session needs user input. Default false.
+/// @return (Win) Window handle.
+/// @example
+/// local buf = makima.ui.buf()
+/// buf:line("Pick an option:")
+/// local win = makima.ui.open_win(buf, {
+///   title = "Menu",
+///   width = "50%",
+///   height = 10,
+///   cursor_line = true,
+///   footer = { { "q", "quit" }, { "Enter", "select" } },
+/// })
+#[lua_fn]
+fn open_win(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    buf: mlua::AnyUserData,
+    opts: Table,
+) -> LuaResult<WinHandle> {
+    let buf_handle = buf.borrow::<buf::BufHandle>()?;
+    let title: String = opts.get("title").unwrap_or_default();
+    let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
+    let footer = parse_footer(&opts)?;
+    let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
+    let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
+    let focus = opt_bool(&opts, "focus").unwrap_or(true);
+    let zindex: u16 = opts.get("zindex").unwrap_or(50);
+
+    let width = parse_dimension(&opts, "width", Dimension::Percent(60));
+    let height = parse_dimension(&opts, "height", Dimension::Percent(70));
+    let row: Option<i16> = opts.get("row").ok();
+    let col: Option<i16> = opts.get("col").ok();
+    let anchor = parse_anchor(&opts);
+    let border = parse_border(&opts);
+    let title_pos = parse_title_pos(&opts);
+    let split = parse_split(&opts);
+    let order: u16 = opts.get("order").unwrap_or(50);
+    let visible = opt_bool(&opts, "visible").unwrap_or(true);
+    let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
+    let stack = opt_bool(&opts, "stack").unwrap_or(false);
+
+    let config = FloatConfig {
+        width,
+        height,
+        row,
+        col,
+        anchor,
+        border,
+        title,
+        title_pos,
+        footer,
+        zindex,
+        cursor_line,
+        reserved_bottom,
+        reserved_top,
+        split,
+        order,
+        visible,
+        needs_input,
+        stack,
+    };
+
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let border_chrome = match config.border {
+        Border::None => 0,
+        _ => 2,
+    };
+    let est_w = config
+        .width
+        .resolve(term_cols)
+        .saturating_sub(border_chrome);
+    let est_h = config
+        .height
+        .resolve(term_rows)
+        .saturating_sub(border_chrome);
+
+    // Unbounded on both sides: a full channel would silently drop keys or,
+    // worse, a Close command, leaving a zombie modal. Producers are human- or
+    // plugin-rate and both ends are drained every tick, so growth is bounded
+    // in practice.
+    let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
+    let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+
+    let _ = tx.try_send(UiAction::OpenWin {
+        buf: buf_handle.buf.clone(),
+        config,
+        focus,
+        event_tx,
+        cmd_rx,
+    });
+
+    Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
+}
+
+#[allow(non_upper_case_globals)]
+pub(crate) const set_status_content__doc: FnDoc = FnDoc {
+    name: "set_status_content",
+    args: "{spans}",
+    desc: "Sets styled status content for your plugin. Each span is {text, style_name} or {text, style_name, on_click}. An empty table clears your plugin's content. Only your own content is affected. Clickable entries run their callback when clicked in the status bar.",
+    params: &[ParamDoc {
+        name: "{spans}",
+        ty: "table",
+        desc: "Sequence of {text, style_name} or {text, style_name, on_click} entries.",
+    }],
+    returns: "",
+    guard: None,
+    example: "makima.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmakima.ui.set_status_content({ {\"refresh\", \"accent\", function() makima.ui.flash(\"refreshing\") end} })",
+};
+
+#[allow(non_upper_case_globals)]
+pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
+    name: "set_status_hint",
+    args: "{spans}",
+    desc: "Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.",
+    params: &[ParamDoc {
+        name: "{spans}",
+        ty: "table|nil",
+        desc: "Sequence of {key, label} pairs, e.g. `{{\"q\", \"quit\"}, {\"j\", \"down\"}}`. Pass nil to remove the plugin's hints.",
+    }],
+    returns: "",
+    guard: None,
+    example: "makima.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmakima.ui.set_status_hint(nil)",
+};
+
+/// Resolve the agent that has UI focus now. Later focus changes do not
+/// retarget the returned reference. Pass it to `makima.agent.get(ctx, ref)` for
+/// control; this call grants no authority. Delegated tool handlers cannot read
+/// UI focus.
+///
+/// @return (AgentRef?, string?) Visibility-only reference, or nil and an error when no agent has focus.
+/// @example
+/// local focused, err = makima.ui.focused_agent()
+/// if focused then
+///   local agent = assert(makima.agent.get(ctx, focused))
+///   local model = assert(agent:config(ctx)).model
+/// end
+#[lua_fn]
+fn focused_agent(lua: &Lua) -> LuaResult<Pair<LuaAgentRef>> {
+    Ok((Some(try_pair!(focused_agent_ref(lua))), None))
+}
+
+/// Show {text} as a row in the chat of the agent {ctx} is pinned to. A post
+/// is for the user only: it never reaches the model, and later focus changes
+/// do not move it. It is saved with the session and comes back on restore.
+/// Trusted commands, keymaps and callbacks can post; delegated tool handlers
+/// cannot, since their tool row already speaks for them.
+///
+/// `makima.agent.spawn` posts a row for each child it shows; see its `show`
+/// option.
+///
+/// @param ctx LuaCtx Trusted invocation context.
+/// @param text string Row text. Must not be blank.
+/// @param opts table? Optional fields:
+///   `level` (string?) - "info" (default), "warn" or "error".
+///   `agent` (Agent?) - a child spawned from Lua that the post is about. The row
+///     is underlined; clicking it opens the child's chat. If no unique chat is
+///     available, a status message explains why it cannot open. Keeps that child's
+///     transcript when this post survives a rewind.
+/// Any other option key is an error.
+/// @return (boolean?, string?) True once sent, or nil and an error.
+/// @example
+/// local ok, err = makima.ui.post(ctx, "review found 3 issues", {
+///   level = "warn",
+///   agent = reviewer,
+/// })
+#[lua_fn]
+fn post(
+    lua: &Lua,
+    ctx: UserDataRef<LuaCtx>,
+    text: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let target = try_pair!(ctx.trusted(lua));
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_POST));
+    }
+    let mut post = Post {
+        text,
+        level: PostLevel::default(),
+        agent: None,
+    };
+    if let Some(opts) = opts {
+        for entry in opts.pairs::<mlua::Value, mlua::Value>() {
+            let (key, _) = entry?;
+            let known = matches!(&key, mlua::Value::String(name) if POST_OPTIONS.contains(&&*name.to_str()?));
+            if !known {
+                return Ok(err_pair(format!(
+                    "{UNKNOWN_POST_OPTION}: {}",
+                    key.to_string()?
+                )));
+            }
+        }
+        if let Some(level) = opts.get::<Option<String>>("level")? {
+            post.level = try_pair!(PostLevel::parse(&level).ok_or_else(|| format!(
+                "{UNKNOWN_POST_LEVEL} '{level}', expected one of: {}",
+                POST_LEVELS.join(", ")
+            )));
+        }
+        if let Some(agent) = opts.get::<Option<UserDataRef<LuaAgent>>>("agent")? {
+            post.agent =
+                Some(try_pair!(agent.transcript_id().ok_or(UNLINKABLE_POST_AGENT)).to_owned());
+        }
+    }
+    try_pair!(send_post(lua, target, post));
+    Ok((Some(true), None))
+}
+
+lua_table! {
+    /// Functions for building interactive UI. Create buffers to hold
+    /// content, open floating or split windows to display them, highlight
+    /// code, render markdown, and show status hints.
+    ///
+    /// ```lua
+    /// local buf = makima.ui.buf()
+    /// buf:line("hello from my plugin!")
+    /// local win = makima.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
+    /// ```
+    extend "makima.ui" => pub(crate) fn add_ui_fns(), DOCS [
+        buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
+        display_width, truncate_text, focused_agent, post,
+        manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
+        manual set_status_content, manual set_status_hint, manual set_window_title,
+    ]
+}
+
+pub(crate) fn create_ui_table(
+    lua: &Lua,
+    ui_action_tx: Option<flume::Sender<UiAction>>,
+    plugin: Arc<str>,
+    pending_hint: Option<crate::api::ui::PendingHintStore>,
+) -> LuaResult<Table> {
+    let t = lua.create_table()?;
+    add_ui_fns(&t, lua)?;
+
+    if let Some(tx) = ui_action_tx {
+        flash__register(&t, lua, tx.clone())?;
+        set_window_title__register(&t, lua, tx.clone())?;
+        action__register(&t, lua, tx.clone())?;
+        open_editor__register(&t, lua, tx.clone())?;
+        open_list_picker__register(&t, lua, tx.clone())?;
+        open_win__register(&t, lua, tx)?;
+    }
+
+    let p = Arc::clone(&plugin);
+    let pending = pending_hint;
+    t.set(
+        "set_status_content",
+        lua.create_function(move |lua, value: mlua::Value| {
+            if matches!(value, mlua::Value::Nil) {
+                if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                    regions.remove_plugin(lua, &p);
+                }
+                let changed = lua
+                    .app_data_mut::<StatusContentStore>()
+                    .is_some_and(|mut store| store.set(Arc::clone(&p), Vec::new()));
+                if changed {
+                    publish_status_content_snapshot(lua);
+                }
+                return Ok(());
+            }
+            let mlua::Value::Table(tbl) = value else {
+                return Err(mlua::Error::runtime("set_status_content expects a table"));
+            };
+            let mut content = Vec::new();
+            for (index, entry) in tbl.sequence_values::<Table>().enumerate() {
+                let entry = entry?;
+                let text = match entry.get::<mlua::Value>(1)? {
+                    mlua::Value::String(value) => value.to_str()?.to_owned(),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content text must be a string",
+                        ));
+                    }
+                };
+                let style = match entry.get::<mlua::Value>(2)? {
+                    mlua::Value::String(value) => value.to_str()?.to_owned(),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content style_name must be a string",
+                        ));
+                    }
+                };
+                let click = match entry.get::<mlua::Value>(3) {
+                    Ok(mlua::Value::Function(func)) => {
+                        let id = lua
+                            .app_data_mut::<ClickRegions>()
+                            .ok_or_else(|| mlua::Error::runtime("click regions unavailable"))?
+                            .register(lua, &p, index, func)?;
+                        Some(id)
+                    }
+                    Ok(mlua::Value::Nil) | Err(_) => {
+                        if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                            regions.clear_entry(lua, &p, index)?;
+                        }
+                        None
+                    }
+                    Ok(_) => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_content click must be a function or nil",
+                        ));
+                    }
+                };
+                content.push(crate::api::util::command::StatusEntry { text, style, click });
+            }
+            if content.is_empty()
+                && let Some(mut regions) = lua.app_data_mut::<ClickRegions>()
+            {
+                regions.remove_plugin(lua, &p);
+            }
+            if let Some(mut regions) = lua.app_data_mut::<ClickRegions>() {
+                let len = content.len();
+                let stale: Vec<usize> = regions
+                    .ids
+                    .keys()
+                    .filter(|(owner, index)| owner.as_ref() == p.as_ref() && *index >= len)
+                    .map(|(_, index)| *index)
+                    .collect();
+                for index in stale {
+                    regions.clear_entry(lua, &p, index)?;
+                }
+            }
+            let changed = lua
+                .app_data_mut::<StatusContentStore>()
+                .is_some_and(|mut store| store.set(Arc::clone(&p), content));
+            if changed {
+                publish_status_content_snapshot(lua);
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let p = Arc::clone(&plugin);
+    t.set(
+        "set_status_hint",
+        lua.create_function(move |lua, value: mlua::Value| {
+            if crate::runtime::loading_plugin_is(lua, &p)
+                && let Some(pending) = &pending
+            {
+                let spans = match value {
+                    mlua::Value::Nil => None,
+                    mlua::Value::Table(tbl) => Some(
+                        tbl.sequence_values::<Table>()
+                            .map(|entry| {
+                                let entry = entry?;
+                                Ok((
+                                    entry.get::<String>(1)?,
+                                    entry.get::<String>(2).unwrap_or_default(),
+                                ))
+                            })
+                            .collect::<LuaResult<_>>()?,
+                    ),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "set_status_hint expects a table or nil",
+                        ));
+                    }
+                };
+                *pending.lock().unwrap_or_else(|e| e.into_inner()) = spans;
+                return Ok(());
+            }
+            match value {
+                mlua::Value::Nil => {
+                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+                        store.clear_plugin(&p);
+                    }
+                }
+                mlua::Value::Table(tbl) => {
+                    let spans: Vec<(String, String)> = tbl
+                        .sequence_values::<Table>()
+                        .map(|entry| {
+                            let entry = entry?;
+                            Ok((
+                                entry.get::<String>(1)?,
+                                entry.get::<String>(2).unwrap_or_default(),
+                            ))
+                        })
+                        .collect::<LuaResult<_>>()?;
+                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+                        store.set(Arc::clone(&p), spans);
+                    }
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "set_status_hint expects a table or nil",
+                    ));
+                }
+            }
+            publish_hint_snapshot(lua);
+            Ok(())
+        })?,
+    )?;
+
+    Ok(t)
+}
+
+pub(crate) fn try_parse_dimension(tbl: &Table, key: &str) -> Option<Dimension> {
+    if let Ok(s) = tbl.get::<String>(key)
+        && let Some(pct) = s.strip_suffix('%')
+        && let Ok(v) = pct.parse::<u16>()
+    {
+        return Some(Dimension::Percent(v));
+    }
+    if let Ok(v) = tbl.get::<u16>(key) {
+        return Some(Dimension::Abs(v));
+    }
+    None
+}
+
+pub(crate) fn parse_dimension(tbl: &Table, key: &str, default: Dimension) -> Dimension {
+    try_parse_dimension(tbl, key).unwrap_or(default)
+}
+
+fn parse_anchor(tbl: &Table) -> Anchor {
+    tbl.get::<String>("anchor")
+        .map(|s| Anchor::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_split(tbl: &Table) -> Split {
+    tbl.get::<String>("split")
+        .map(|s| Split::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_border(tbl: &Table) -> Border {
+    tbl.get::<String>("border")
+        .map(|s| Border::parse(&s))
+        .unwrap_or_default()
+}
+
+fn parse_title_pos(tbl: &Table) -> TitlePos {
+    tbl.get::<String>("title_pos")
+        .map(|s| TitlePos::parse(&s))
+        .unwrap_or_default()
+}
+
+fn segments_to_lua_lines(
+    lua: &Lua,
+    lines: &[Vec<makima_highlight::StyledSegment>],
+) -> LuaResult<Table> {
+    let result = lua.create_table_with_capacity(lines.len(), 0)?;
+    for (i, segs) in lines.iter().enumerate() {
+        let line_tbl = lua.create_table_with_capacity(segs.len(), 0)?;
+        for (j, seg) in segs.iter().enumerate() {
+            let span = lua.create_table_with_capacity(2, 0)?;
+            span.raw_set(1, seg.text.as_str())?;
+            let style = lua.create_table_with_capacity(0, 4)?;
+            let (r, g, b) = seg.fg;
+            style.raw_set("fg", format!("#{r:02x}{g:02x}{b:02x}"))?;
+            if seg.bold {
+                style.raw_set("bold", true)?;
+            }
+            if seg.italic {
+                style.raw_set("italic", true)?;
+            }
+            if seg.underline {
+                style.raw_set("underline", true)?;
+            }
+            span.raw_set(2, style)?;
+            line_tbl.raw_set(i32::try_from(j + 1).unwrap(), span)?;
+        }
+        result.raw_set(i32::try_from(i + 1).unwrap(), line_tbl)?;
+    }
+    Ok(result)
+}
+
+/// Most spans become a named style string. `Highlight` tokens carry their
+/// own rgb, so they become an inline `{fg, bold, italic, underline}` table.
+///
+/// No wildcard arm on `StyleToken`: adding a variant is a compile error
+/// here, so we can't forget to map it.
+fn span_style_to_lua(lua: &Lua, span: &makima_markdown::render::Span) -> LuaResult<mlua::Value> {
+    use makima_markdown::render::StyleToken;
+
+    let v = match &span.style {
+        StyleToken::Text => {
+            let name = emphasis_style_name(span.emphasis);
+            mlua::Value::String(lua.create_string(name)?)
+        }
+        StyleToken::InlineCode => mlua::Value::String(lua.create_string("inline_code")?),
+        StyleToken::Highlight {
+            fg,
+            bold,
+            italic,
+            underline,
+        } => {
+            let tbl = lua.create_table()?;
+            tbl.set("fg", format!("#{:02x}{:02x}{:02x}", fg.0, fg.1, fg.2))?;
+            if *bold {
+                tbl.set("bold", true)?;
+            }
+            if *italic {
+                tbl.set("italic", true)?;
+            }
+            if *underline {
+                tbl.set("underline", true)?;
+            }
+            mlua::Value::Table(tbl)
+        }
+        StyleToken::CodeBar => mlua::Value::String(lua.create_string("code_gutter")?),
+        StyleToken::Heading => mlua::Value::String(lua.create_string("heading")?),
+        StyleToken::ListMarker => mlua::Value::String(lua.create_string("list_marker")?),
+        StyleToken::TableBorder => mlua::Value::String(lua.create_string("table_border")?),
+        StyleToken::HorizontalRule => mlua::Value::String(lua.create_string("horizontal_rule")?),
+    };
+    Ok(v)
+}
+
+/// Flatten `Emphasis` to a single named style. Strike wins over bold/italic
+/// (the Lua theme has no combined slot). Underline only appears in
+/// `Highlight` tokens, not here.
+fn emphasis_style_name(e: makima_markdown::Emphasis) -> &'static str {
+    if e.strike {
+        "strikethrough"
+    } else if e.bold && e.italic {
+        "bold_italic"
+    } else if e.bold {
+        "bold"
+    } else if e.italic {
+        "italic"
+    } else {
+        ""
+    }
+}
+
+fn markdown_lines_to_lua(lua: &Lua, lines: &[makima_markdown::render::Line]) -> LuaResult<Table> {
+    let result = lua.create_table_with_capacity(lines.len(), 0)?;
+    for (i, rendered) in lines.iter().enumerate() {
+        let line_tbl = lua.create_table_with_capacity(rendered.spans.len(), 0)?;
+        for (j, sp) in rendered.spans.iter().enumerate() {
+            let span_tbl = lua.create_table_with_capacity(2, 0)?;
+            span_tbl.raw_set(1, sp.text.as_str())?;
+            span_tbl.raw_set(2, span_style_to_lua(lua, sp)?)?;
+            line_tbl.raw_set(i32::try_from(j + 1).unwrap(), span_tbl)?;
+        }
+        result.raw_set(i32::try_from(i + 1).unwrap(), line_tbl)?;
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use makima_highlight::StyledSegment;
+    use mlua::Lua;
+    use test_case::test_case;
+
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    const MISSING_KEY: &str = "missing";
+    const ORANGE_HEX: &str = "#ff8000";
+
+    #[test_case(false ; "no_target")]
+    #[test_case(true ; "delegated")]
+    fn editor_does_not_resolve_focus_without_a_pinned_subject(delegated: bool) {
+        struct Services;
+        impl crate::orchestration::OrchestrationServices for Services {
+            fn resolve_target(
+                &self,
+                _: Option<&makima_commands::CommandInvocation>,
+            ) -> Result<Option<crate::orchestration::TrustedTarget>, String> {
+                panic!("editor must not resolve current focus");
+            }
+        }
+        let lua = Lua::new();
+        lua.set_app_data(crate::orchestration::OrchestrationServicesSlot(Some(
+            Arc::new(Services),
+        )));
+        let scope = crate::runtime::TaskScope::detached(&lua);
+        if delegated {
+            crate::runtime::lock_cell(scope.handle()).delegated_tool = Some(Default::default());
+        }
+        let (tx, rx) = flume::unbounded();
+        assert_eq!(
+            smol::block_on(open_editor(lua.clone(), tx, "plan.md".into())).unwrap(),
+            -1
+        );
+        assert!(rx.is_empty());
+    }
+
+    #[test_case(false ; "active_own_agent")]
+    #[test_case(true ; "expired_turn")]
+    fn delegated_editor_uses_only_its_active_turn(expired: bool) {
+        struct Services;
+        impl crate::orchestration::OrchestrationServices for Services {
+            fn resolve_target(
+                &self,
+                _: Option<&makima_commands::CommandInvocation>,
+            ) -> Result<Option<crate::orchestration::TrustedTarget>, String> {
+                panic!("delegated editor must not resolve focus");
+            }
+
+            fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
+                target.validate_live().map_err(|error| error.to_string())
+            }
+        }
+        use makima_agent::{
+            ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
+            ControlWork, CurrentManagedTurn, History, TurnContext, WorkKind,
+        };
+        use std::{future::Future, pin::Pin};
+
+        struct Backend(flume::Sender<CurrentManagedTurn>, flume::Receiver<()>);
+        impl ActorBackend for Backend {
+            fn run_turn<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                context: TurnContext,
+                _: AgentInput,
+                _: WorkKind,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.send(context.managed_turn.unwrap()).unwrap();
+                    self.1.recv_async().await.unwrap();
+                    BackendResult::SetupFailed(None)
+                })
+            }
+            fn run_control<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: &'a ControlWork,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                unreachable!()
+            }
+            fn run_compact<'a>(
+                &'a mut self,
+                _: &'a mut History,
+                _: TurnContext,
+                _: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+                unreachable!()
+            }
+        }
+        smol::block_on(async {
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let root = manager
+                .create_root(Vec::new(), None, Box::new(Backend(entered_tx, release_rx)))
+                .unwrap();
+            let ticket = manager
+                .actor(root.id())
+                .unwrap()
+                .admit_turn(
+                    AgentInput {
+                        message: "editor".into(),
+                        images: Vec::new(),
+                        preamble: Vec::new(),
+                        prompt: None,
+                    },
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            let turn = entered_rx.recv_async().await.unwrap();
+            if expired {
+                release_tx.send(()).unwrap();
+                ticket.wait().await;
+            }
+            let lua = Lua::new();
+            lua.set_app_data(crate::orchestration::OrchestrationServicesSlot(Some(
+                Arc::new(Services),
+            )));
+            let scope = crate::runtime::TaskScope::detached(&lua);
+            {
+                let mut cell = crate::runtime::lock_cell(scope.handle());
+                cell.delegated_tool = Some(Default::default());
+                cell.managed_turn = Some(turn);
+            }
+            let (tx, rx) = flume::unbounded();
+            let request = open_editor(lua.clone(), tx, "plan.md".into());
+            if expired {
+                assert_eq!(request.await.unwrap(), -1);
+                assert!(rx.is_empty());
+            } else {
+                let consume = async {
+                    let UiAction::OpenEditor {
+                        target, reply_tx, ..
+                    } = rx.recv_async().await.unwrap()
+                    else {
+                        panic!("expected editor request");
+                    };
+                    assert_eq!(target.unwrap().id(), root.id());
+                    reply_tx.send(0).unwrap();
+                };
+                let (code, ()) = futures_lite::future::zip(request, consume).await;
+                assert_eq!(code.unwrap(), 0);
+                release_tx.send(()).unwrap();
+                ticket.wait().await;
+            }
+            manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        });
+    }
+
+    #[test]
+    fn standalone_editor_roundtrip_preserves_exit_code() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let (tx, rx) = flume::unbounded();
+            let request = open_editor(lua, tx, "plan.md".into());
+            let consume = async {
+                let UiAction::OpenEditor {
+                    target,
+                    path,
+                    reply_tx,
+                } = rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected editor request");
+                };
+                assert!(target.is_none());
+                assert_eq!(path, PathBuf::from("plan.md"));
+                reply_tx.send(0).unwrap();
+            };
+            let (code, ()) = futures_lite::future::zip(request, consume).await;
+            assert_eq!(code.unwrap(), 0);
+        });
+    }
+
+    fn footer_entry(lua: &Lua, key: &str, label: &str) -> Table {
+        let t = lua.create_table().unwrap();
+        t.raw_set(1, key).unwrap();
+        t.raw_set(2, label).unwrap();
+        t
+    }
+
+    #[test]
+    fn parse_footer_missing_returns_empty() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert!(parse_footer(&tbl).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_footer_non_table_value_returns_empty() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("footer", "not a table").unwrap();
+        assert!(parse_footer(&tbl).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_footer_preserves_entry_order() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        entries.raw_set(1, footer_entry(&lua, "q", "quit")).unwrap();
+        entries.raw_set(2, footer_entry(&lua, "j", "down")).unwrap();
+        entries.raw_set(3, footer_entry(&lua, "k", "up")).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        let parsed = parse_footer(&tbl).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("q".into(), "quit".into()),
+                ("j".into(), "down".into()),
+                ("k".into(), "up".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_footer_missing_label_errors() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        let one_elem = lua.create_table().unwrap();
+        one_elem.raw_set(1, "q").unwrap();
+        entries.raw_set(1, one_elem).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        assert!(parse_footer(&tbl).is_err());
+    }
+
+    #[test]
+    fn parse_footer_non_string_element_errors() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let entries = lua.create_table().unwrap();
+        let bad = lua.create_table().unwrap();
+        bad.raw_set(1, "q").unwrap();
+        bad.raw_set(2, lua.create_table().unwrap()).unwrap();
+        entries.raw_set(1, bad).unwrap();
+        tbl.raw_set("footer", entries).unwrap();
+
+        assert!(parse_footer(&tbl).is_err());
+    }
+
+    #[test]
+    fn try_parse_dimension_numeric_is_abs() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", 42u16).unwrap();
+        assert_eq!(try_parse_dimension(&tbl, "width"), Some(Dimension::Abs(42)));
+    }
+
+    #[test_case("0%", Dimension::Percent(0) ; "zero_percent")]
+    #[test_case("50%", Dimension::Percent(50) ; "half_percent")]
+    #[test_case("100%", Dimension::Percent(100) ; "full_percent")]
+    #[test_case("200%", Dimension::Percent(200) ; "over_hundred_accepted")]
+    fn try_parse_dimension_percent_strings(input: &str, expected: Dimension) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", input).unwrap();
+        assert_eq!(try_parse_dimension(&tbl, "width"), Some(expected));
+    }
+
+    #[test]
+    fn try_parse_dimension_missing_key_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert!(try_parse_dimension(&tbl, MISSING_KEY).is_none());
+    }
+
+    #[test]
+    fn try_parse_dimension_non_numeric_string_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "abc").unwrap();
+        assert!(try_parse_dimension(&tbl, "width").is_none());
+    }
+
+    #[test]
+    fn try_parse_dimension_malformed_percent_is_none() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "xx%").unwrap();
+        assert!(try_parse_dimension(&tbl, "width").is_none());
+    }
+
+    #[test]
+    fn parse_dimension_missing_key_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let default = Dimension::Percent(60);
+        assert_eq!(parse_dimension(&tbl, MISSING_KEY, default), default);
+    }
+
+    #[test]
+    fn parse_dimension_invalid_value_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("width", "garbage").unwrap();
+        let default = Dimension::Abs(80);
+        assert_eq!(parse_dimension(&tbl, "width", default), default);
+    }
+
+    #[test_case("NW", Anchor::NW ; "nw")]
+    #[test_case("NE", Anchor::NE ; "ne")]
+    #[test_case("SW", Anchor::SW ; "sw")]
+    #[test_case("SE", Anchor::SE ; "se")]
+    #[test_case("garbage", Anchor::NW ; "invalid_falls_back_to_default")]
+    fn parse_anchor_cases(input: &str, expected: Anchor) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("anchor", input).unwrap();
+        assert_eq!(parse_anchor(&tbl), expected);
+    }
+
+    #[test]
+    fn parse_anchor_missing_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert_eq!(parse_anchor(&tbl), Anchor::default());
+    }
+
+    #[test_case("none", Border::None ; "none")]
+    #[test_case("single", Border::Single ; "single")]
+    #[test_case("double", Border::Double ; "double")]
+    #[test_case("rounded", Border::Rounded ; "rounded")]
+    #[test_case("garbage", Border::Rounded ; "invalid_falls_back_to_default")]
+    fn parse_border_cases(input: &str, expected: Border) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("border", input).unwrap();
+        assert_eq!(parse_border(&tbl), expected);
+    }
+
+    #[test]
+    fn parse_border_missing_uses_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        assert_eq!(parse_border(&tbl), Border::default());
+    }
+
+    #[test_case("left", TitlePos::Left ; "left")]
+    #[test_case("center", TitlePos::Center ; "center")]
+    #[test_case("right", TitlePos::Right ; "right")]
+    #[test_case("garbage", TitlePos::Left ; "invalid_falls_back_to_default")]
+    fn parse_title_pos_cases(input: &str, expected: TitlePos) {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        tbl.raw_set("title_pos", input).unwrap();
+        assert_eq!(parse_title_pos(&tbl), expected);
+    }
+
+    fn seg(text: &str, bold: bool) -> StyledSegment {
+        StyledSegment {
+            text: text.into(),
+            fg: (255, 128, 0),
+            bold,
+            italic: false,
+            underline: false,
+        }
+    }
+
+    #[test]
+    fn segments_to_lua_lines_empty_input() {
+        let lua = Lua::new();
+        let result = segments_to_lua_lines(&lua, &[]).unwrap();
+        assert_eq!(result.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn segments_to_lua_lines_shape_and_fg_hex() {
+        let lua = Lua::new();
+        let lines = vec![vec![seg("fn ", true), seg("main", false)]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+
+        assert_eq!(result.len().unwrap(), 1);
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(line.len().unwrap(), 2);
+
+        let span: Table = line.get(1).unwrap();
+        let text: String = span.get(1).unwrap();
+        assert_eq!(text, "fn ");
+        let style: Table = span.get(2).unwrap();
+        let fg: String = style.get("fg").unwrap();
+        assert_eq!(fg, ORANGE_HEX);
+        let bold: bool = style.get("bold").unwrap();
+        assert!(bold);
+        assert!(style.get::<Option<bool>>("italic").unwrap().is_none());
+
+        let span2: Table = line.get(2).unwrap();
+        let text2: String = span2.get(1).unwrap();
+        assert_eq!(text2, "main");
+        let style2: Table = span2.get(2).unwrap();
+        assert!(style2.get::<Option<bool>>("bold").unwrap().is_none());
+    }
+
+    #[test]
+    fn segments_to_lua_lines_preserves_utf8() {
+        let lua = Lua::new();
+        let utf8 = "héllo 🦀 ✨";
+        let lines = vec![vec![seg(utf8, false)]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+        let line: Table = result.get(1).unwrap();
+        let span: Table = line.get(1).unwrap();
+        let text: String = span.get(1).unwrap();
+        assert_eq!(text, utf8);
+    }
+
+    const STYLE_BOLD: &str = "bold";
+    const STYLE_BOLD_ITALIC: &str = "bold_italic";
+    const STYLE_HEADING: &str = "heading";
+    const STYLE_LIST_MARKER: &str = "list_marker";
+    const STYLE_HR: &str = "horizontal_rule";
+    const STYLE_PLAIN: &str = "";
+    const STYLE_CODE: &str = "inline_code";
+    const STYLE_CODE_BAR: &str = "code_gutter";
+    const STYLE_ITALIC: &str = "italic";
+    const STYLE_STRIKE: &str = "strikethrough";
+    const STYLE_TABLE_BORDER: &str = "table_border";
+    const MD_WIDTH: u16 = 80;
+
+    fn render_markdown(lua: &Lua, input: &str) -> Table {
+        let lines = makima_markdown::render::render(input, MD_WIDTH);
+        markdown_lines_to_lua(lua, &lines).unwrap()
+    }
+
+    fn span_style(line: &Table, idx: usize) -> String {
+        let span: Table = line.get(idx).unwrap();
+        match span.get::<mlua::Value>(2).unwrap() {
+            mlua::Value::String(s) => s.to_str().unwrap().to_string(),
+            other => panic!("expected string style, got {other:?}"),
+        }
+    }
+
+    fn span_text(line: &Table, idx: usize) -> String {
+        let span: Table = line.get(idx).unwrap();
+        span.get::<String>(1).unwrap()
+    }
+
+    #[test]
+    fn markdown_returns_named_styles() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "hello **world**");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_text(&line, 1), "hello ");
+        assert_eq!(span_style(&line, 1), STYLE_PLAIN);
+        assert_eq!(span_text(&line, 2), "world");
+        assert_eq!(span_style(&line, 2), STYLE_BOLD);
+    }
+
+    #[test]
+    fn markdown_bold_italic_emits_bold_italic_not_collapsed_to_bold() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "***x***");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 1), STYLE_BOLD_ITALIC);
+    }
+
+    #[test]
+    fn markdown_unknown_constructs_fall_through_as_plain() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "a*b");
+        let line: Table = result.get(1).unwrap();
+        for i in 1..=line.len().unwrap() {
+            assert_eq!(span_style(&line, i as usize), STYLE_PLAIN);
+        }
+    }
+
+    #[test]
+    fn markdown_code_span_uses_inline_code_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "x `y` z");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 2), STYLE_CODE);
+    }
+
+    #[test]
+    fn markdown_heading_overrides_inline_emphasis_with_heading_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "# hello **world**");
+        let line: Table = result.get(1).unwrap();
+        for i in 1..=line.len().unwrap() {
+            assert_eq!(
+                span_style(&line, i as usize),
+                STYLE_HEADING,
+                "span {i} should be heading-styled"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_list_marker_styled_separately_from_item_content() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "- **item**");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 1), STYLE_LIST_MARKER);
+        assert_eq!(span_text(&line, 1), "• ");
+        assert_eq!(span_style(&line, 2), STYLE_BOLD);
+        assert_eq!(span_text(&line, 2), "item");
+    }
+
+    #[test]
+    fn markdown_horizontal_rule_emits_hr_span_filled_to_width() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "---");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(line.len().unwrap(), 1);
+        assert_eq!(span_style(&line, 1), STYLE_HR);
+        let text = span_text(&line, 1);
+        assert_eq!(text.chars().count(), MD_WIDTH as usize);
+        assert!(text.chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn markdown_code_inside_bold_collapses_to_inline_code_at_lua_boundary() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "**`code`**");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 1), STYLE_CODE);
+    }
+
+    #[test]
+    fn markdown_multiline_emits_one_lua_line_per_logical_line() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "line one\nline two\nline three");
+        assert_eq!(result.len().unwrap(), 3);
+        let l1: Table = result.get(1).unwrap();
+        let l2: Table = result.get(2).unwrap();
+        let l3: Table = result.get(3).unwrap();
+        assert_eq!(span_text(&l1, 1), "line one");
+        assert_eq!(span_text(&l2, 1), "line two");
+        assert_eq!(span_text(&l3, 1), "line three");
+    }
+
+    #[test]
+    fn markdown_italic_alone_surfaces_as_italic_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "*italic*");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_text(&line, 1), "italic");
+        assert_eq!(span_style(&line, 1), STYLE_ITALIC);
+    }
+
+    #[test]
+    fn markdown_strikethrough_surfaces_as_strikethrough_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "~~gone~~");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_text(&line, 1), "gone");
+        assert_eq!(span_style(&line, 1), STYLE_STRIKE);
+    }
+
+    #[test]
+    fn markdown_ordered_list_marker_text_and_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "1. foo");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_text(&line, 1), "1. ");
+        assert_eq!(span_style(&line, 1), STYLE_LIST_MARKER);
+        assert_eq!(span_text(&line, 2), "foo");
+        assert_eq!(span_style(&line, 2), STYLE_PLAIN);
+    }
+
+    #[test]
+    fn markdown_ordered_list_marker_keeps_list_marker_style_with_bold_content() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "1. **item**");
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 1), STYLE_LIST_MARKER);
+        assert_eq!(span_style(&line, 2), STYLE_BOLD);
+        assert_eq!(span_text(&line, 2), "item");
+    }
+
+    #[test]
+    fn markdown_code_fence_emits_code_bar_prefix_with_highlight_span_tables() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "```rust\nfn x() {}\n```");
+        let lines = result.len().unwrap();
+        let code_line: Table = (1..=lines)
+            .find_map(|i| {
+                let line: Table = result.get(i).ok()?;
+                (line.len().ok()? > 0
+                    && line
+                        .get::<Table>(1)
+                        .and_then(|s| s.get::<String>(2))
+                        .ok()
+                        .is_some_and(|s| s == STYLE_CODE_BAR))
+                .then_some(line)
+            })
+            .expect("code bar line");
+        assert_eq!(span_style(&code_line, 1), STYLE_CODE_BAR);
+        let content_span: Table = code_line.get(2).unwrap();
+        let style = content_span.get::<mlua::Value>(2).unwrap();
+        assert!(
+            matches!(style, mlua::Value::Table(_)),
+            "highlight span style must be an inline table"
+        );
+    }
+
+    #[test_case("# a" ; "h1")]
+    #[test_case("## a" ; "h2")]
+    #[test_case("### a" ; "h3")]
+    #[test_case("###### a" ; "h6")]
+    fn markdown_heading_levels_all_surface_as_heading_style(input: &str) {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, input);
+        let line: Table = result.get(1).unwrap();
+        assert_eq!(span_style(&line, 1), STYLE_HEADING);
+    }
+
+    fn seg_full(text: &str, bold: bool, italic: bool, underline: bool) -> StyledSegment {
+        StyledSegment {
+            text: text.into(),
+            fg: (255, 128, 0),
+            bold,
+            italic,
+            underline,
+        }
+    }
+
+    #[test]
+    fn segments_to_lua_lines_modifier_flags_only_present_when_true() {
+        let lua = Lua::new();
+        let lines = vec![vec![
+            seg_full("a", false, true, true),
+            seg_full("b", false, false, false),
+        ]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+        let line: Table = result.get(1).unwrap();
+        let s1: Table = line.get(1).unwrap();
+        let st1: Table = s1.get(2).unwrap();
+        assert!(st1.get::<bool>("italic").unwrap());
+        assert!(st1.get::<bool>("underline").unwrap());
+        let s2: Table = line.get(2).unwrap();
+        let st2: Table = s2.get(2).unwrap();
+        assert!(st2.get::<Option<bool>>("italic").unwrap().is_none());
+        assert!(st2.get::<Option<bool>>("underline").unwrap().is_none());
+    }
+
+    #[test]
+    fn segments_to_lua_lines_preserves_line_order() {
+        let lua = Lua::new();
+        let lines = vec![vec![seg("a", false)], vec![seg("b", false)]];
+        let result = segments_to_lua_lines(&lua, &lines).unwrap();
+        assert_eq!(result.len().unwrap(), 2);
+        let l1: Table = result.get(1).unwrap();
+        let l2: Table = result.get(2).unwrap();
+        let s1: Table = l1.get(1).unwrap();
+        let s2: Table = l2.get(1).unwrap();
+        assert_eq!(s1.get::<String>(1).unwrap(), "a");
+        assert_eq!(s2.get::<String>(1).unwrap(), "b");
+    }
+
+    #[test]
+    fn markdown_table_has_border_and_data_spans() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "| col1 | col2 |\n|------|------|\n| a    | b    |");
+        let mut saw_border = false;
+        let mut saw_plain = false;
+        for i in 1..=result.len().unwrap() {
+            let line: Table = result.get(i).unwrap();
+            for j in 1..=line.len().unwrap() {
+                let span: Table = line.get(j).unwrap();
+                if let mlua::Value::String(s) = span.get::<mlua::Value>(2).unwrap() {
+                    let s = s.to_str().unwrap();
+                    if s == STYLE_TABLE_BORDER {
+                        saw_border = true;
+                    } else if s == STYLE_PLAIN {
+                        saw_plain = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_border, "table must have border spans");
+        assert!(saw_plain, "table must have data/content spans");
+    }
+
+    #[test]
+    fn markdown_large_input_does_not_panic() {
+        let lua = Lua::new();
+        let mut input = String::with_capacity(2048);
+        for i in 0..200 {
+            input.push_str(&format!(
+                "# h{i}\n\npara **b{i}** *i{i}* `c{i}` ~~s{i}~~\n\n- item {i}\n\n"
+            ));
+        }
+        assert!(input.len() >= 2000);
+        let result = render_markdown(&lua, &input);
+        assert!(result.len().unwrap() > 0);
+    }
+
+    #[test]
+    fn markdown_code_inside_heading_keeps_inline_code_style() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "# foo `bar`");
+        let line: Table = result.get(1).unwrap();
+        let bar_idx = (1..=line.len().unwrap())
+            .find(|&i| span_text(&line, i as usize) == "bar")
+            .expect("bar span");
+        assert_eq!(span_style(&line, bar_idx as usize), STYLE_CODE);
+        let foo_idx = (1..=line.len().unwrap())
+            .find(|&i| span_text(&line, i as usize).contains("foo"))
+            .expect("foo span");
+        assert_eq!(span_style(&line, foo_idx as usize), STYLE_HEADING);
+    }
+
+    #[test_case(false, false, false, false, "" ; "default_emphasis_is_empty")]
+    #[test_case(true, false, false, false, "bold" ; "bold_only")]
+    #[test_case(false, true, false, false, "italic" ; "italic_only")]
+    #[test_case(true, true, false, false, "bold_italic" ; "bold_and_italic")]
+    #[test_case(false, false, true, false, "strikethrough" ; "strike_only")]
+    #[test_case(true, false, true, false, "strikethrough" ; "strike_wins_over_bold")]
+    #[test_case(false, true, true, false, "strikethrough" ; "strike_wins_over_italic")]
+    #[test_case(false, false, false, true, "" ; "underline_alone_not_surfaced")]
+    #[test_case(true, false, false, true, "bold" ; "underline_ignored_with_bold")]
+    fn emphasis_style_name_combos(
+        bold: bool,
+        italic: bool,
+        strike: bool,
+        underline: bool,
+        expected: &str,
+    ) {
+        let e = makima_markdown::Emphasis {
+            bold,
+            italic,
+            strike,
+            underline,
+        };
+        assert_eq!(emphasis_style_name(e), expected);
+    }
+
+    #[test]
+    fn span_style_to_lua_highlight() {
+        let lua = Lua::new();
+        for (bold, italic, underline) in [(true, false, false), (true, true, true)] {
+            let span = makima_markdown::render::Span {
+                text: "tok".into(),
+                style: makima_markdown::render::StyleToken::Highlight {
+                    fg: (255, 128, 0),
+                    bold,
+                    italic,
+                    underline,
+                },
+                emphasis: makima_markdown::Emphasis::default(),
+            };
+            let val = span_style_to_lua(&lua, &span).unwrap();
+            let tbl = match val {
+                mlua::Value::Table(t) => t,
+                other => panic!("expected table, got {other:?}"),
+            };
+            assert_eq!(tbl.get::<String>("fg").unwrap(), ORANGE_HEX);
+            assert_eq!(tbl.get::<bool>("bold").unwrap(), bold);
+            assert_eq!(
+                tbl.get::<Option<bool>>("italic").unwrap().unwrap_or(false),
+                italic
+            );
+            assert_eq!(
+                tbl.get::<Option<bool>>("underline")
+                    .unwrap()
+                    .unwrap_or(false),
+                underline
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_mixed_document_routes_styles_per_block_kind() {
+        let lua = Lua::new();
+        let result = render_markdown(&lua, "# Title\n\nBody **bold** here.\n\n- item");
+        assert!(result.len().unwrap() >= 5);
+
+        let heading_line: Table = result.get(1).unwrap();
+        for i in 1..=heading_line.len().unwrap() {
+            assert_eq!(span_style(&heading_line, i as usize), STYLE_HEADING);
+        }
+
+        let body_line: Table = result.get(3).unwrap();
+        let mut saw_bold = false;
+        for i in 1..=body_line.len().unwrap() {
+            if span_style(&body_line, i as usize) == STYLE_BOLD {
+                assert_eq!(span_text(&body_line, i as usize), "bold");
+                saw_bold = true;
+            }
+        }
+        assert!(saw_bold, "body line should contain a bold span");
+
+        let list_line: Table = result.get(5).unwrap();
+        assert_eq!(span_style(&list_line, 1), STYLE_LIST_MARKER);
+    }
+
+    #[test]
+    fn status_content_store_orders_plugins_and_tracks_changes() {
+        let mut store = StatusContentStore::new();
+        assert!(store.set(
+            Arc::from("zzz"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "z".into(),
+                style: "muted".into(),
+                click: None
+            }]
+        ));
+        assert!(store.set(
+            Arc::from("aaa"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "a".into(),
+                style: "accent".into(),
+                click: None
+            }]
+        ));
+        assert!(!store.set(
+            Arc::from("aaa"),
+            vec![crate::api::util::command::StatusEntry {
+                text: "a".into(),
+                style: "accent".into(),
+                click: None
+            }]
+        ));
+
+        let entries = store.snapshot_entries();
+        assert_eq!(entries[0].0.as_ref(), "aaa");
+        assert_eq!(entries[1].0.as_ref(), "zzz");
+        assert!(store.clear_plugin("aaa"));
+        assert!(!store.clear_plugin("aaa"));
+        assert_eq!(store.snapshot_entries()[0].0.as_ref(), "zzz");
+    }
+
+    #[test]
+    fn format_time_uses_explicit_clock_formats() {
+        let lua = Lua::new();
+        lua.set_app_data(ClockFormat::Hour12);
+        let ui = create_ui_table(&lua, None, Arc::from("test"), None).unwrap();
+        let f: mlua::Function = ui.get("format_time").unwrap();
+        let twelve: String = f.call((0_u64, "time")).unwrap();
+        lua.set_app_data(ClockFormat::Hour24);
+        let twenty_four: String = f.call((0_u64, "time")).unwrap();
+        assert!(twelve.contains("AM") || twelve.contains("PM"));
+        assert!(!twenty_four.contains("AM") && !twenty_four.contains("PM"));
+    }
+
+    #[test]
+    fn status_content_api_validates_strings_and_owns_plugin_entry() {
+        let lua = Lua::new();
+        lua.set_app_data(StatusContentStore::new());
+        let (writer, reader) = StatusContentWriter::new();
+        lua.set_app_data(writer);
+        let ui = create_ui_table(&lua, None, Arc::from("plug"), None).unwrap();
+        let other_ui = create_ui_table(&lua, None, Arc::from("other"), None).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+        lua.globals().set("other_ui", other_ui).unwrap();
+
+        lua.load(r#"ui.set_status_content({ { "ready", "success" } })"#)
+            .exec()
+            .unwrap();
+        let snapshot = reader.load_full();
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(snapshot.entries[0].0.as_ref(), "plug");
+        assert_eq!(
+            snapshot.entries[0].1[0],
+            crate::api::util::command::StatusEntry {
+                text: "ready".into(),
+                style: "success".into(),
+                click: None
+            }
+        );
+
+        lua.load(r#"ui.set_status_content({ { "ready", "success" } })"#)
+            .exec()
+            .unwrap();
+        assert_eq!(reader.load_full().generation, 1);
+
+        for source in [
+            r#"ui.set_status_content({ { 1, "success" } })"#,
+            r#"ui.set_status_content({ { "ready", false } })"#,
+        ] {
+            assert!(lua.load(source).exec().is_err(), "{source}");
+        }
+        lua.load(r#"ui.set_status_content(nil)"#).exec().unwrap();
+
+        lua.load(r#"other_ui.set_status_content({ { "other", "muted" } })"#)
+            .exec()
+            .unwrap();
+        lua.load("ui.set_status_content({})").exec().unwrap();
+        let snapshot = reader.load_full();
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].0.as_ref(), "other");
+    }
+
+    #[test]
+    fn hint_store_set_and_clear() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
+        assert_eq!(store.snapshot_entries().len(), 1);
+
+        store.clear_plugin("plug");
+        assert!(store.snapshot_entries().is_empty());
+    }
+
+    #[test]
+    fn hint_store_deterministic_order() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("zzz"), vec![("z".into(), "z".into())]);
+        store.set(Arc::from("aaa"), vec![("a".into(), "a".into())]);
+        let entries = store.snapshot_entries();
+        assert_eq!(entries[0].0.as_ref(), "aaa");
+        assert_eq!(entries[1].0.as_ref(), "zzz");
+    }
+
+    #[test]
+    fn hint_store_empty_clears() {
+        let mut store = HintStore::new();
+        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
+        store.set(Arc::from("plug"), vec![]);
+        assert!(store.snapshot_entries().is_empty());
+    }
+}

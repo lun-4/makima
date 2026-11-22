@@ -32,7 +32,7 @@ local function split_lines(s)
   if s:sub(-1) == "\n" then
     s = s:sub(1, -2)
   end
-  return maki.split(s, "\n")
+  return makima.split(s, "\n")
 end
 
 function M.replace_lines(content, start_line, end_line, new_string)

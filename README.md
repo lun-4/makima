@@ -12,6 +12,7 @@ _maki is good! i just have different opinions that i dont think are upstreamable
 - mode overrides and a plan mode inspired/stolen from [polytoken](https://docs.polytoken.dev)
 - `plan_submit` tool so model decides when it's time to go for it
 - async subagent implementation where you can talk to the subagents
+  - you can also use `@`-autocomplete to select a specific model as a subagent e.g type `@6.1-sol` and see it in action
 - Claude Code-style automode via `/automode`
 - misc ux fixes, such as
    - `--apend-system-prompt` works in TUI mode
@@ -73,8 +74,6 @@ TODO
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
-**Dynamic providers** - drop an executable script into `~/.config/makima/providers/` to add custom providers or proxies. See [docs](https://makima.ln4.net/docs/providers/#dynamic-providers) for details.
-
 ## Installation
 
 ### Linux / macOS
@@ -121,11 +120,13 @@ curl -fsSL https://makima.ln4.net/install.sh | sh
 
 Both install to `%LOCALAPPDATA%\makima` and add it to your user PATH. Override with `MAKIMA_INSTALL_DIR` / `$env:MAKIMA_INSTALL_DIR`.
 
-### Living on the edge (main branch)
+### Living on the edge (mistress branch)
 
 ```sh
 cargo install --locked --git https://github.com/lun-4/makima.git makima
 ```
+
+Add `--tag v0.5.0` to build a release instead of the latest commit.
 
 ### With Nix
 

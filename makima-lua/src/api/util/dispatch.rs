@@ -1,0 +1,186 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
+
+use crate::runtime::{TaskHandle, TaskScope, lock_cell, strip_traceback};
+
+pub const MAX_HOOK_DEPTH: u8 = 8;
+
+/// Tasks are numbered from 1, so this one means "outside any task". Plugin
+/// load and the other startup paths live there, one at a time.
+const NO_TASK: u64 = 0;
+
+/// One count per Lua task: a slot chain runs inside the caller's task, so
+/// re-entering stays in one task while two chains at once are two tasks, and
+/// counting those together would read a wide `batch` as recursion and drop
+/// layers it should have run. So this bounds re-entry within one chain, never
+/// a cycle across calls: a chain fired again by a fresh tool call is a fresh
+/// task, bounded by that call's window instead.
+fn current_task(lua: &Lua) -> u64 {
+    lua.app_data_ref::<TaskHandle>()
+        .map_or(NO_TASK, |handle| lock_cell(&handle).id)
+}
+
+#[derive(Default)]
+pub(crate) struct DepthStore {
+    depths: HashMap<(&'static str, String, u64), u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DepthExceeded;
+
+/// Reentrancy bound as RAII: `Drop` is the only decrement, so an error
+/// path can never leave the depth stuck high. It counts in an `Arc<Mutex>`
+/// rather than the VM's app data, because a guard can be dropped inside a
+/// Luau GC sweep, where any `Lua` call aborts.
+pub(crate) struct DepthGuard {
+    store: Arc<Mutex<DepthStore>>,
+    key: (&'static str, String, u64),
+}
+
+impl DepthGuard {
+    pub(crate) fn enter(lua: &Lua, kind: &'static str, name: &str) -> Result<Self, DepthExceeded> {
+        let store = depth_store(lua);
+        let key = (kind, name.to_owned(), current_task(lua));
+        let mut depths = store.lock().unwrap_or_else(|error| error.into_inner());
+        let depth = depths.depths.entry(key.clone()).or_insert(0);
+        if *depth >= MAX_HOOK_DEPTH {
+            return Err(DepthExceeded);
+        }
+        *depth += 1;
+        drop(depths);
+        Ok(Self { store, key })
+    }
+}
+
+fn depth_store(lua: &Lua) -> Arc<Mutex<DepthStore>> {
+    if let Some(store) = lua.app_data_ref::<Arc<Mutex<DepthStore>>>() {
+        return Arc::clone(&store);
+    }
+    let store = Arc::new(Mutex::new(DepthStore::default()));
+    lua.set_app_data(Arc::clone(&store));
+    store
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        let mut store = self.store.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(depth) = store.depths.get_mut(&self.key) {
+            *depth -= 1;
+            if *depth == 0 {
+                store.depths.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Calls a plugin callback so its failure stays its own: errors are logged
+/// with plugin and seam name, then swallowed.
+///
+/// Runs in the caller's task, not a detached one. Every seam using this waits
+/// for the answer, so the caller's cancellation and deadline belong on the
+/// callback producing it, and the per-task depth only tells nesting from
+/// concurrency while nesting stays inside one task.
+pub(crate) async fn call_swallowing<R: FromLuaMulti>(
+    func: &Function,
+    args: impl IntoLuaMulti,
+    seam: &str,
+    plugin: &str,
+) -> Option<R> {
+    match func.call_async::<R>(args).await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(seam, plugin, error = %strip_traceback(&e), "plugin callback failed");
+            None
+        }
+    }
+}
+
+/// Calls a plugin callback so its failure stays its own: errors are logged
+/// with plugin and seam name, then swallowed. The detached [`TaskScope`]
+/// matters here, because a callback that inherits the firer's scope gets
+/// cancelled when the firer's task dies, and plugin B should not pay for
+/// plugin A's crash. A callback fired from a delegated tool stays delegated,
+/// so synchronous dispatch cannot hand the tool trusted authority.
+pub(crate) fn call_isolated<R: FromLuaMulti>(
+    lua: &Lua,
+    func: &Function,
+    args: impl IntoLuaMulti,
+    seam: &str,
+    plugin: &str,
+) -> Option<R> {
+    if crate::runtime::validate_plugin_effect(lua).is_err() {
+        return None;
+    }
+    let delegated = crate::runtime::delegated_tool(lua);
+    let owner_plugin = Arc::<str>::from(plugin);
+    let owner = crate::orchestration::plugin_authority(lua, owner_plugin.clone());
+    let scope = TaskScope::detached(lua);
+    crate::runtime::lock_cell(scope.handle()).delegated_tool = delegated;
+    if owner.is_alive() && crate::runtime::bind_plugin_owner(lua, owner_plugin, owner).is_err() {
+        return None;
+    }
+    match func.call::<R>(args) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(seam, plugin, error = %strip_traceback(&e), "plugin callback failed");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::TaskScope;
+
+    use super::*;
+
+    const SEAM: &str = "seam";
+
+    #[test]
+    fn depth_guard_enforces_max_and_unwinds() {
+        let lua = Lua::new();
+        let guards: Vec<_> = (0..MAX_HOOK_DEPTH)
+            .map(|_| DepthGuard::enter(&lua, "test", SEAM).expect("within bound"))
+            .collect();
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_err());
+        assert!(DepthGuard::enter(&lua, "test", "other").is_ok());
+        drop(guards);
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_ok());
+        let store = depth_store(&lua);
+        let store = store.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(store.depths.is_empty(), "zero entries removed");
+    }
+
+    /// Chains running at once are separate tasks and never add up, while
+    /// nesting inside one of them still trips the bound.
+    #[test]
+    fn task_scoped_depth_separates_concurrency_from_nesting() {
+        let lua = Lua::new();
+        let concurrent: Vec<_> = (0..=MAX_HOOK_DEPTH)
+            .map(|_| {
+                let scope = TaskScope::detached(&lua);
+                let guard =
+                    DepthGuard::enter(&lua, "test", SEAM).expect("a fresh task starts at zero");
+                (scope, guard)
+            })
+            .collect();
+        let nested: Vec<_> = (1..MAX_HOOK_DEPTH)
+            .map(|_| DepthGuard::enter(&lua, "test", SEAM).expect("within the bound"))
+            .collect();
+        assert!(DepthGuard::enter(&lua, "test", SEAM).is_err());
+        drop((concurrent, nested));
+    }
+
+    #[test]
+    fn call_swallowing_hides_errors_but_not_values() {
+        let lua = Lua::new();
+        let bad: Function = lua.load("error('boom')").into_function().unwrap();
+        let ok: Function = lua.load("return 7").into_function().unwrap();
+        smol::block_on(async {
+            assert!(call_swallowing::<i64>(&bad, (), SEAM, "p").await.is_none());
+            assert_eq!(call_swallowing::<i64>(&ok, (), SEAM, "p").await, Some(7));
+        });
+    }
+}

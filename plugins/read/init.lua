@@ -1,6 +1,6 @@
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local shorten_path = require("makima.shorten_path")
+local output_limits = require("makima.output_limits")
 local helpers = require("read_helpers")
 
 local split_lines = helpers.split_lines
@@ -21,7 +21,7 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
-local opts = maki.api.register_options(output_limits.extend({}))
+local opts = makima.api.register_options(output_limits.extend({}))
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -29,7 +29,7 @@ local function read_view_opts(ctx)
 end
 
 local function apply_highlights(view, lines, ext)
-  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext)
+  local highlighted = makima.ui.highlight(table.concat(lines, "\n"), ext)
   if not highlighted then
     return
   end
@@ -44,7 +44,7 @@ local function apply_highlights(view, lines, ext)
 end
 
 local function build_file_view(lines, start_line, total_lines, path, ctx)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = ToolView.line_nr_fmt(start_line + #lines - 1) .. " "
 
@@ -69,7 +69,7 @@ local function build_file_view(lines, start_line, total_lines, path, ctx)
   view:finish()
 
   local ext = path:match("%.([^%.]+)$") or ""
-  maki.async.run(function()
+  makima.async.run(function()
     apply_highlights(view, lines, ext)
   end)
 
@@ -81,7 +81,7 @@ end
 
 local function read_file(path, offset, limit, ctx)
   local commit_read = ctx:capture_read(path)
-  local content, err = maki.fs.read(path)
+  local content, err = makima.fs.read(path)
   if not content then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
@@ -97,7 +97,7 @@ local function read_file(path, offset, limit, ctx)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
-    lines[#lines + 1] = maki.text.truncate_line(all_lines[i], max_line_bytes)
+    lines[#lines + 1] = makima.text.truncate_line(all_lines[i], max_line_bytes)
   end
 
   local parts = {}
@@ -107,7 +107,7 @@ local function read_file(path, offset, limit, ctx)
   end
   local trunc_start = start + #lines
   local remaining_lines = trunc_start <= total_lines and total_lines - trunc_start + 1 or 0
-  local llm_output = maki.text.truncate_file(table.concat(parts, "\n"), max_lines, max_bytes, remaining_lines)
+  local llm_output = makima.text.truncate_file(table.concat(parts, "\n"), max_lines, max_bytes, remaining_lines)
 
   local shown = #lines
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
@@ -115,7 +115,7 @@ local function read_file(path, offset, limit, ctx)
 
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
-    local parent = maki.fs.dirname(path)
+    local parent = makima.fs.dirname(path)
     if parent then
       local instructions = ctx:find_instructions(parent)
       if #instructions > 0 then
@@ -138,14 +138,14 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - When using the **read** tool, only read the sections you actually need.
 - Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "read",
   kind = "read",
   description = DESCRIPTION,
@@ -173,7 +173,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     local s = shorten_path(input.path or "")
     local start = input.offset or 1
     if input.limit and input.limit > 0 then
@@ -204,7 +204,7 @@ maki.api.register_tool({
     if not path then
       return { llm_output = "error: " .. tostring(path_err), is_error = true }
     end
-    local meta = maki.fs.metadata(path)
+    local meta = makima.fs.metadata(path)
     if not meta then
       return { llm_output = "error: path not found: " .. path, is_error = true }
     end

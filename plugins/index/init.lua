@@ -1,12 +1,12 @@
-local dir_listing = require("maki.dir_listing")
+local dir_listing = require("makima.dir_listing")
 local indexer = require("indexer")
-local ToolView = require("maki.tool_view")
-local shorten_path = require("maki.shorten_path")
+local ToolView = require("makima.tool_view")
+local shorten_path = require("makima.shorten_path")
 
 local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
 local TRUNCATED_INFIX = " more truncated]"
 
-local opts = maki.api.register_options({
+local opts = makima.api.register_options({
   max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
 })
 
@@ -56,7 +56,7 @@ end
 
 local function render_skeleton(view, text, meta)
   local hl_entries = {}
-  for line_nr, line in ipairs(maki.split(text:gsub("\n+$", ""), "\n")) do
+  for line_nr, line in ipairs(makima.split(text:gsub("\n+$", ""), "\n")) do
     local m = (meta and meta[line_nr]) or infer_line_meta(line)
     if line == "" then
       view:append("")
@@ -87,7 +87,7 @@ local function apply_highlights(view, hl_entries, ext)
   for _, e in ipairs(hl_entries) do
     texts[#texts + 1] = e.text
   end
-  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, { independent = true })
+  local highlighted = makima.ui.highlight(table.concat(texts, "\n"), ext, { independent = true })
   if not highlighted then
     return
   end
@@ -109,7 +109,7 @@ local function apply_highlights(view, hl_entries, ext)
 end
 
 local function render_header(path, line_count)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local spans = { { shorten_path(path), "path" } }
   if line_count then
     spans[#spans + 1] = { " (" .. line_count .. " lines)", "dim" }
@@ -120,7 +120,7 @@ end
 
 local function render_index(skeleton, path, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.index) or 5,
     keep = "head",
@@ -132,7 +132,7 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
   view:finish()
 
   if ext then
-    maki.async.run(function()
+    makima.async.run(function()
       apply_highlights(view, hl_entries, ext)
     end)
   end
@@ -141,17 +141,17 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
   return buf, render_header(path, line_count)
 end
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
 })
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "efficient_tools",
   content = "index",
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "index",
   kind = "read",
   description = [[
@@ -171,7 +171,7 @@ Return a compact overview of a source file: imports, type definitions, function 
     return render_header(input.path)
   end,
   restore = function(input, output, _is_error, ctx)
-    local meta = input.path and maki.fs.metadata(input.path)
+    local meta = input.path and makima.fs.metadata(input.path)
     if meta and meta.is_dir then
       return { body = dir_listing.view(output, ctx) }
     end
@@ -190,7 +190,7 @@ Return a compact overview of a source file: imports, type definitions, function 
     end
     path = resolved
 
-    local meta = maki.fs.metadata(path)
+    local meta = makima.fs.metadata(path)
     if not meta then
       return { llm_output = "error: path not found: " .. path, is_error = true }
     end
@@ -237,7 +237,7 @@ Return a compact overview of a source file: imports, type definitions, function 
       }
     end
 
-    local source, err = maki.fs.read(path)
+    local source, err = makima.fs.read(path)
     if not source then
       return { llm_output = "error: " .. err, is_error = true }
     end

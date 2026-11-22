@@ -1,0 +1,29 @@
+[package]
+name = "makima-providers"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test-util = []
+
+[dependencies]
+makima-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+makima-storage = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+strum = { workspace = true }
+smol = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+fastrand = { workspace = true }
+makima-config = { workspace = true }
+jiff = { workspace = true }
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
+
+[dev-dependencies]
+makima-storage = { workspace = true, features = ["test-util"] }
+test-case = { workspace = true }
+tempfile = { workspace = true }

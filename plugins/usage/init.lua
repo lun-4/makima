@@ -10,17 +10,17 @@ local modal = nil
 local generation = 0
 
 local function quota_state()
-  return maki.usage.get()
+  return makima.usage.get()
 end
 
 local function repaint_status(state)
-  maki.ui.set_status_content(helpers.status_content(state or quota_state()))
+  makima.ui.set_status_content(helpers.status_content(state or quota_state()))
 end
 
 local function fetch(force)
-  local _, err = maki.usage.fetch({ force = force })
+  local _, err = makima.usage.fetch({ force = force })
   if err then
-    maki.log.warn("usage refresh failed: " .. err)
+    makima.log.warn("usage refresh failed: " .. err)
   end
 end
 
@@ -29,17 +29,17 @@ local function activate()
     return
   end
   active = true
-  maki.usage.on_change(function(state)
+  makima.usage.on_change(function(state)
     repaint_status(state)
     if modal then
       modal.dirty = true
     end
   end)
   repaint_status()
-  maki.async.run(function()
+  makima.async.run(function()
     fetch(false)
   end)
-  maki.timer.set(REFRESH_SECONDS, function()
+  makima.timer.set(REFRESH_SECONDS, function()
     fetch(false)
   end)
 end
@@ -59,7 +59,7 @@ local function render(current)
     return
   end
   local lines = helpers.lines(quota_state(), current.session)
-  local size = maki.ui.terminal_size()
+  local size = makima.ui.terminal_size()
   local height = helpers.modal_height(#lines, size.rows)
   if height ~= current.height then
     current.height = height
@@ -73,7 +73,7 @@ end
 
 local function refresh_modal(current, force)
   local expected_generation = current.generation
-  maki.async.run(function()
+  makima.async.run(function()
     fetch(force)
     if modal and modal.generation == expected_generation then
       modal.dirty = true
@@ -82,14 +82,14 @@ local function refresh_modal(current, force)
 end
 
 local function update_session(current)
-  local snapshot, err = maki.session.read({ session = current.session_id })
+  local snapshot, err = makima.session.read({ session = current.session_id })
   if modal ~= current then
     return false
   end
   if snapshot then
     current.session = snapshot.usage
   elseif err then
-    maki.log.warn("session usage refresh failed: " .. err)
+    makima.log.warn("session usage refresh failed: " .. err)
   end
   return true
 end
@@ -101,13 +101,13 @@ local function open(_, ctx)
   end
   local session_id, session_err = ctx and ctx:session_id()
   if not session_id then
-    maki.ui.flash("Usage: " .. tostring(session_err or "no session"))
+    makima.ui.flash("Usage: " .. tostring(session_err or "no session"))
     return
   end
 
   generation = generation + 1
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = makima.ui.buf()
+  local win = makima.ui.open_win(buf, {
     title = " Usage ",
     width = MODAL_WIDTH,
     height = MODAL_HEIGHT,
@@ -160,23 +160,23 @@ local function open(_, ctx)
   end
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/usage",
   description = "Show provider quota and focused-session token usage",
   tui_only = true,
   handler = open,
 })
 
-maki.api.create_autocmd("SessionFocusChanged", {
+makima.api.create_autocmd("SessionFocusChanged", {
   once = true,
   callback = activate,
 })
 
-maki.api.create_autocmd("ProviderChanged", {
+makima.api.create_autocmd("ProviderChanged", {
   callback = function()
-    maki.ui.set_status_content(nil)
+    makima.ui.set_status_content(nil)
     if active then
-      maki.async.run(function()
+      makima.async.run(function()
         fetch(false)
       end)
     end

@@ -1,0 +1,1058 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use makima_agent::types::InlineStyle;
+use makima_agent::{SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use makima_lua_macro::{lua_class, lua_fn};
+use mlua::{Function, Lua, Result as LuaResult, Table, Value as LuaValue};
+
+use super::blit;
+use crate::runtime::{TaskHandle, lock_cell};
+
+/// `live_buf` tracks the first buffer a handler creates, the one
+/// that gets streamed to the UI during execution.
+pub(crate) struct BufferStore {
+    buffers: HashMap<u32, Arc<SharedBuf>>,
+    next_id: u32,
+    live_buf: Option<Arc<SharedBuf>>,
+    slots: Vec<HandlerSlot>,
+}
+
+/// `buf:on(...)` roots a Lua closure from the Rust side, and that closure
+/// usually captures its own handle. The Lua GC cannot see this cycle, so
+/// each registration is tracked on the task that made it and `clear`
+/// (TaskScope drop) breaks the cycle when the task retires.
+pub(crate) enum HandlerSlot {
+    Click(Arc<SharedBuf>),
+    Change(Arc<SharedBuf>),
+}
+
+impl HandlerSlot {
+    fn clear(&self) {
+        match self {
+            Self::Click(buf) => buf.clear_click(),
+            Self::Change(buf) => buf.clear_on_change(),
+        }
+    }
+}
+
+fn track_slot(lua: &Lua, slot: HandlerSlot) {
+    if let Some(h) = lua.app_data_ref::<TaskHandle>() {
+        lock_cell(&h).bufs.track(slot);
+    }
+}
+
+impl BufferStore {
+    pub fn new() -> Self {
+        Self {
+            buffers: HashMap::new(),
+            next_id: 1,
+            live_buf: None,
+            slots: Vec::new(),
+        }
+    }
+
+    pub fn create(&mut self) -> BufHandle {
+        let buf = Arc::new(SharedBuf::new());
+        let id = self.next_id;
+        self.next_id += 1;
+        self.buffers.insert(id, Arc::clone(&buf));
+        BufHandle { id, buf }
+    }
+
+    pub fn create_live(&mut self) -> BufHandle {
+        let handle = self.create();
+        if self.live_buf.is_none() {
+            self.live_buf = Some(Arc::clone(&handle.buf));
+        }
+        handle
+    }
+
+    #[cfg(test)]
+    pub fn append_line(&mut self, id: u32, line: SnapshotLine) {
+        if let Some(buf) = self.buffers.get(&id) {
+            buf.append(line);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self, id: u32) -> usize {
+        self.buffers.get(&id).map_or(0, |b| b.len())
+    }
+
+    #[cfg(test)]
+    pub fn take(&mut self, id: u32) -> Option<makima_agent::BufferSnapshot> {
+        self.buffers.remove(&id).map(|b| b.take())
+    }
+
+    pub fn track(&mut self, slot: HandlerSlot) {
+        self.slots.push(slot);
+    }
+
+    pub fn clear(&mut self) {
+        for slot in self.slots.drain(..) {
+            slot.clear();
+        }
+        self.buffers.clear();
+        self.live_buf = None;
+    }
+
+    pub fn live_buf(&self) -> Option<&Arc<SharedBuf>> {
+        self.live_buf.as_ref()
+    }
+}
+
+/// The click handler lives on the `SharedBuf` itself, so every handle
+/// wrapping the same buf (clones, replies, restores, foreign wrappers from
+/// `on_live_buf`) routes clicks to the one handler the owner registered.
+#[derive(Clone)]
+pub(crate) struct BufHandle {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub id: u32,
+    pub buf: Arc<SharedBuf>,
+}
+
+impl BufHandle {
+    /// Wraps a buf owned by another task, e.g. a child tool's live buf
+    /// delivered through `on_live_buf`. Clicks still reach the owner's
+    /// handler.
+    pub(crate) fn foreign(buf: Arc<SharedBuf>) -> Self {
+        Self { id: 0, buf }
+    }
+
+    pub(crate) fn click_fn(&self) -> Option<Function> {
+        click_fn(&self.buf)
+    }
+
+    fn set_click(&self, f: Function) {
+        self.buf.set_click(Arc::new(f));
+    }
+}
+
+pub(crate) fn click_fn(buf: &SharedBuf) -> Option<Function> {
+    let f = buf.click()?.downcast::<Function>().ok()?;
+    Some((*f).clone())
+}
+
+/// The buf a tool reply or restore return uses as its body: the value
+/// itself, or its `body` field.
+pub(crate) fn buf_from_reply(val: &LuaValue) -> Option<Arc<SharedBuf>> {
+    let ud = match val {
+        LuaValue::UserData(ud) => ud.clone(),
+        LuaValue::Table(t) => t.get::<mlua::AnyUserData>("body").ok()?,
+        _ => return None,
+    };
+    let h = ud.borrow::<BufHandle>().ok()?;
+    Some(Arc::clone(&h.buf))
+}
+
+/// Appends a single line to the end of the buffer. You can pass a
+/// plain string for unstyled text, or a table of `{text, style?}` spans
+/// for rich content. Style can be a named string like "bold" or
+/// "keyword", or an inline table `{fg?, bg?, bold?, italic?, underline?, dim?, strikethrough?, reversed?}`
+/// with "#rrggbb" color strings.
+///
+/// @param line string|table Plain string, or a sequence of spans: `{ {text, style?}, ... }`.
+/// @return
+/// @example
+/// buf:line("plain text")
+/// buf:line({ { "ERROR", { fg = "#ff0000", bold = true } }, { " something broke" } })
+#[lua_fn]
+fn line(_lua: &Lua, this: &BufHandle, line: LuaValue) -> LuaResult<()> {
+    let l = parse_line(&line)?;
+    this.buf.append(l);
+    Ok(())
+}
+
+/// Appends several lines at once. Each entry uses the same format as
+/// `buf:line()`, so you can mix plain strings and styled spans.
+///
+/// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @return
+/// @example
+/// buf:lines({
+///   "first line",
+///   { { "styled ", "bold" }, { "second line" } },
+///   "third line",
+/// })
+#[lua_fn]
+fn lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+    let mut parsed = Vec::with_capacity(lines.raw_len());
+    for i in 1..=lines.raw_len() {
+        let val: LuaValue = lines.raw_get(i)?;
+        parsed.push(parse_line(&val)?);
+    }
+    for l in parsed {
+        this.buf.append(l);
+    }
+    Ok(())
+}
+
+/// Replaces every line in the buffer with {lines}. Use this when you
+/// want to redraw the whole buffer, for example after the user toggles
+/// a view.
+///
+/// @param lines table Sequence of line values, each the same format accepted by `buf:line`.
+/// @return
+/// @example
+/// buf:set_lines({ "new content", "replaces everything" })
+#[lua_fn]
+fn set_lines(_lua: &Lua, this: &BufHandle, lines: Table) -> LuaResult<()> {
+    let mut parsed = Vec::with_capacity(lines.raw_len());
+    for i in 1..=lines.raw_len() {
+        let val: LuaValue = lines.raw_get(i)?;
+        parsed.push(parse_line(&val)?);
+    }
+    this.buf.set_lines(parsed);
+    Ok(())
+}
+
+/// Returns how many lines the buffer currently holds.
+///
+/// @return (integer) Line count.
+/// @example
+/// if buf:len() == 0 then
+///   buf:line("(empty)")
+/// end
+#[lua_fn]
+fn len(_lua: &Lua, this: &BufHandle) -> LuaResult<usize> {
+    Ok(this.buf.len())
+}
+
+/// Returns all lines in the buffer as a Lua table. Each line is a
+/// sequence of `{text, style?}` spans, the same format `buf:line()`
+/// accepts. Useful for reading back content, copying it to another
+/// buffer, or round-tripping through `set_lines()`.
+///
+/// @return (table) Sequence of lines.
+/// @example
+/// local lines = buf:get_lines()
+/// buf:set_lines(lines) -- round-trip
+#[lua_fn]
+fn get_lines(lua: &Lua, this: &BufHandle) -> LuaResult<Table> {
+    let ls = this.buf.read();
+    let out = lua.create_table_with_capacity(ls.len(), 0)?;
+    for (i, l) in ls.iter().enumerate() {
+        out.raw_set(i + 1, line_to_lua(lua, l)?)?;
+    }
+    Ok(out)
+}
+
+/// Registers an event handler on the buffer.
+///
+/// Supported events:
+/// - "click": fires when the user clicks a line. The handler receives
+///   a click-event table whose `row` is 1-based, with `row = 0` for clicks
+///   on chrome or outside the content. Transcript buffers deliver clicks
+///   here; float windows deliver them from `win:recv()` as a `click` event
+///   that also carries `col`.
+/// - "change": fires synchronously after every mutation (`line`,
+///   `lines`, `set_lines`). Must not yield.
+///
+/// Calling `on()` again for the same event replaces the previous handler.
+///
+/// @param event string Event name: "click" or "change".
+/// @param callback function Handler function. For "click", receives a click-event table. For "change", receives no arguments.
+/// @return
+/// @example
+/// buf:on("click", function(ev)
+///   makima.ui.flash("Clicked row " .. ev.row)
+/// end)
+#[lua_fn]
+fn on(lua: &Lua, this: &BufHandle, event: String, callback: Function) -> LuaResult<()> {
+    match event.as_str() {
+        "click" => {
+            this.set_click(callback);
+            track_slot(lua, HandlerSlot::Click(Arc::clone(&this.buf)));
+            Ok(())
+        }
+        // Change callbacks fire inline from buf mutations, so they
+        // must not yield or mutate this buffer.
+        "change" => {
+            this.buf.set_on_change(move || {
+                if let Err(e) = callback.call::<()>(()) {
+                    tracing::warn!(error = %e, "buf change callback failed");
+                }
+            });
+            track_slot(lua, HandlerSlot::Change(Arc::clone(&this.buf)));
+            Ok(())
+        }
+        _ => Err(mlua::Error::runtime(format!("unsupported event: {event}"))),
+    }
+}
+
+/// Programmatically fires the buffer's click handler with event {ev}.
+/// Does nothing if no click handler is registered. Useful for testing
+/// or simulating user interaction from code.
+///
+/// @param ev table Click event table passed to the handler.
+/// @return
+/// @example
+/// buf:click({ row = 1 })
+#[lua_fn]
+async fn click(_lua: Lua, this: mlua::UserDataRef<BufHandle>, ev: LuaValue) -> LuaResult<()> {
+    // Extract the handler before the await: holding the UserDataRef
+    // across it would block the handler's own calls back into this buf
+    // (mlua `send` borrows are exclusive).
+    let f = this.click_fn();
+    drop(this);
+    match f {
+        Some(f) => f.call_async::<()>(ev).await,
+        None => Ok(()),
+    }
+}
+
+/// Replaces the whole buffer with a pixel frame drawn as `"▀"` cells.
+/// Each cell's foreground is the top pixel and its background the
+/// bottom one, so one text line fits two pixel rows. When {height} is
+/// odd the last line leaves its background unset and the terminal
+/// default shows through.
+///
+/// {fb} is a Luau `buffer` of raw pixel bytes in row-major order,
+/// top-left origin. Its size must be exactly
+/// `width * height * bytes_per_pixel` for the chosen format, otherwise
+/// the call throws. A mismatch usually means a wrong width or format,
+/// and an early error beats hunting down a garbled frame.
+///
+/// Formats: "rgb" is the default at 3 bytes per pixel. "rgba" and
+/// "bgra" take 4 bytes per pixel and ignore the 4th byte. "bgra" is
+/// what a little-endian `uint32` holding `0xRRGGBB` looks like in
+/// memory, the layout doomgeneric uses for its framebuffer.
+///
+/// `char` swaps the `"▀"` glyph for another one column wide string,
+/// e.g. `"█"` when only the foreground color should show. The
+/// foreground still comes from the top pixel and the background from
+/// the bottom one, whatever the glyph.
+///
+/// @param fb buffer Raw pixel bytes.
+/// @param width integer Frame width in pixels, > 0.
+/// @param height integer Frame height in pixels, > 0.
+/// @param opts table|nil Options: `format` = "rgb"|"rgba"|"bgra", `char` = one column wide string.
+/// @return
+/// @example
+/// local fb = buffer.create(160 * 100 * 3)
+/// buffer.writeu8(fb, (y * 160 + x) * 3, 255) -- red channel
+/// buf:blit(fb, 160, 100)
+/// buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
+#[lua_fn]
+fn blit(
+    _lua: &Lua,
+    this: &BufHandle,
+    fb: mlua::Buffer,
+    width: u32,
+    height: u32,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    let mut format = blit::DEFAULT_FORMAT.to_owned();
+    let mut cell = blit::DEFAULT_CELL.to_owned();
+    if let Some(opts) = opts {
+        for pair in opts.pairs::<String, String>() {
+            match pair? {
+                (key, val) if key == "format" => format = val,
+                (key, val) if key == "char" => cell = val,
+                (key, _) => {
+                    return Err(mlua::Error::runtime(format!(
+                        "blit: unknown opts key {key:?}"
+                    )));
+                }
+            }
+        }
+    }
+    let fmt = blit::parse_format(&format).map_err(mlua::Error::external)?;
+    let lines = blit::render(&fb.to_vec(), width as usize, height as usize, fmt, &cell)
+        .map_err(mlua::Error::external)?;
+    this.buf.set_lines(lines);
+    Ok(())
+}
+
+lua_class! {
+    /// A content buffer that holds styled lines of text. Create one with
+    /// `makima.ui.buf()` and pass it to `makima.ui.open_win()` to show it in
+    /// a floating or split window.
+    ///
+    /// ```lua
+    /// local buf = makima.ui.buf()
+    /// buf:line("hello")
+    /// buf:line({ { "world", "bold" } })
+    /// ```
+    "makima.ui.Buf" => BufHandle, DOCS [line, lines, set_lines, len, get_lines, on, click, blit]
+}
+
+pub(crate) fn parse_line(arg: &LuaValue) -> LuaResult<SnapshotLine> {
+    match arg {
+        LuaValue::String(s) => {
+            let text = s.to_str().map_err(mlua::Error::external)?.to_owned();
+            Ok(SnapshotLine {
+                spans: vec![SnapshotSpan {
+                    text,
+                    style: SpanStyle::Default,
+                }],
+            })
+        }
+        LuaValue::Table(t) => {
+            let mut spans = Vec::new();
+            for i in 1..=t.raw_len() {
+                let entry: LuaValue = t.raw_get(i)?;
+                spans.push(parse_span(&entry)?);
+            }
+            Ok(SnapshotLine { spans })
+        }
+        _ => Err(mlua::Error::runtime(
+            "line argument must be a string or table of spans",
+        )),
+    }
+}
+
+fn parse_span(val: &LuaValue) -> LuaResult<SnapshotSpan> {
+    let LuaValue::Table(t) = val else {
+        return Err(mlua::Error::runtime("span must be a table {text, style?}"));
+    };
+    let text_val: LuaValue = t.raw_get(1)?;
+    let text = match &text_val {
+        LuaValue::String(s) => s.to_str().map_err(mlua::Error::external)?.to_owned(),
+        _ => return Err(mlua::Error::runtime("span[1] must be a string")),
+    };
+    let style_val: LuaValue = t.raw_get(2)?;
+    let style = parse_style(&style_val)?;
+    Ok(SnapshotSpan { text, style })
+}
+
+fn parse_style(val: &LuaValue) -> LuaResult<SpanStyle> {
+    match val {
+        LuaValue::Nil => Ok(SpanStyle::Default),
+        v if v.is_null() => Ok(SpanStyle::Default),
+        LuaValue::String(s) => {
+            let name = s.to_str().map_err(mlua::Error::external)?.to_owned();
+            Ok(SpanStyle::Named(name))
+        }
+        LuaValue::Table(t) => {
+            let mut inline = InlineStyle::default();
+            if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("fg") {
+                inline.fg = parse_hex_color(&s.to_str().map_err(mlua::Error::external)?);
+            }
+            if let Ok(LuaValue::String(s)) = t.raw_get::<LuaValue>("bg") {
+                inline.bg = parse_hex_color(&s.to_str().map_err(mlua::Error::external)?);
+            }
+            inline.bold = t.raw_get::<bool>("bold").unwrap_or(false);
+            inline.italic = t.raw_get::<bool>("italic").unwrap_or(false);
+            inline.underline = t.raw_get::<bool>("underline").unwrap_or(false);
+            inline.dim = t.raw_get::<bool>("dim").unwrap_or(false);
+            inline.strikethrough = t.raw_get::<bool>("strikethrough").unwrap_or(false);
+            inline.reversed = t.raw_get::<bool>("reversed").unwrap_or(false);
+            Ok(SpanStyle::Inline(inline))
+        }
+        _ => Err(mlua::Error::runtime(
+            "style must be nil, a string name, or a table {fg?, bg?, bold?, ...}",
+        )),
+    }
+}
+
+pub(crate) fn line_to_lua(lua: &Lua, line: &SnapshotLine) -> LuaResult<Table> {
+    let tbl = lua.create_table_with_capacity(line.spans.len(), 0)?;
+    for (i, span) in line.spans.iter().enumerate() {
+        tbl.raw_set(i + 1, span_to_lua(lua, span)?)?;
+    }
+    Ok(tbl)
+}
+
+fn span_to_lua(lua: &Lua, span: &SnapshotSpan) -> LuaResult<Table> {
+    let tbl = lua.create_table_with_capacity(2, 0)?;
+    tbl.raw_set(1, span.text.as_str())?;
+    match &span.style {
+        SpanStyle::Default => {}
+        SpanStyle::Named(name) => tbl.raw_set(2, name.as_str())?,
+        SpanStyle::Inline(inline) => tbl.raw_set(2, inline_to_lua(lua, inline)?)?,
+    }
+    Ok(tbl)
+}
+
+fn inline_to_lua(lua: &Lua, inline: &InlineStyle) -> LuaResult<Table> {
+    let tbl = lua.create_table()?;
+    if let Some(rgb) = inline.fg {
+        tbl.raw_set("fg", hex_color(rgb))?;
+    }
+    if let Some(rgb) = inline.bg {
+        tbl.raw_set("bg", hex_color(rgb))?;
+    }
+    for (key, on) in [
+        ("bold", inline.bold),
+        ("italic", inline.italic),
+        ("underline", inline.underline),
+        ("dim", inline.dim),
+        ("strikethrough", inline.strikethrough),
+        ("reversed", inline.reversed),
+    ] {
+        if on {
+            tbl.raw_set(key, true)?;
+        }
+    }
+    Ok(tbl)
+}
+
+fn hex_color((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    #[test]
+    fn take_removes_buffer_from_store() {
+        let mut store = BufferStore::new();
+        let id = store.create().id;
+        store.append_line(
+            id,
+            SnapshotLine {
+                spans: vec![SnapshotSpan {
+                    text: "hello".into(),
+                    style: SpanStyle::Default,
+                }],
+            },
+        );
+        let snap = store.take(id);
+        assert!(snap.is_some());
+        assert_eq!(snap.unwrap().lines.len(), 1);
+        assert!(store.take(id).is_none());
+    }
+
+    #[test]
+    fn take_nonexistent_id_returns_none() {
+        let mut store = BufferStore::new();
+        assert!(store.take(999).is_none());
+    }
+
+    #[test]
+    fn append_to_nonexistent_id_is_noop() {
+        let mut store = BufferStore::new();
+        store.append_line(42, SnapshotLine { spans: vec![] });
+        assert_eq!(store.len(42), 0);
+    }
+
+    #[test]
+    fn clear_frees_all_buffers() {
+        let mut store = BufferStore::new();
+        let a = store.create().id;
+        let b = store.create().id;
+        store.append_line(a, SnapshotLine { spans: vec![] });
+        store.append_line(b, SnapshotLine { spans: vec![] });
+        store.clear();
+        assert!(store.take(a).is_none());
+        assert!(store.take(b).is_none());
+    }
+
+    #[test]
+    fn clear_does_not_reset_next_id() {
+        let mut store = BufferStore::new();
+        store.create();
+        store.create();
+        store.clear();
+        assert_eq!(store.create().id, 3);
+    }
+
+    #[test_case("#ff0000", Some((255, 0, 0))   ; "red")]
+    #[test_case("#00ff00", Some((0, 255, 0))    ; "green")]
+    #[test_case("#0000ff", Some((0, 0, 255))    ; "blue")]
+    #[test_case("#AABBCC", Some((0xAA, 0xBB, 0xCC)) ; "uppercase_hex")]
+    #[test_case("ff0000",  None                 ; "missing_hash_prefix")]
+    #[test_case("#fff",    None                 ; "short_3_digit_hex")]
+    #[test_case("#gggggg", None                 ; "invalid_hex_digits")]
+    #[test_case("#ff00",   None                 ; "too_short")]
+    #[test_case("#ff000000", None               ; "too_long_8_digits")]
+    #[test_case("",        None                 ; "empty_string")]
+    fn hex_color_parsing(input: &str, expected: Option<(u8, u8, u8)>) {
+        assert_eq!(parse_hex_color(input), expected);
+    }
+
+    fn test_lua() -> mlua::Lua {
+        let lua = mlua::Lua::new();
+        lua.set_app_data(BufferStore::new());
+        lua
+    }
+
+    #[test]
+    fn parse_line_plain_string() {
+        let lua = test_lua();
+        let val = lua.create_string("hello world").unwrap();
+        let line = parse_line(&LuaValue::String(val)).unwrap();
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].text, "hello world");
+        assert_eq!(line.spans[0].style, SpanStyle::Default);
+    }
+
+    #[test]
+    fn parse_line_rejects_non_string_non_table() {
+        assert!(parse_line(&LuaValue::Integer(42)).is_err());
+    }
+
+    #[test]
+    fn parse_line_styled_spans() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        let span1 = lua.create_table().unwrap();
+        span1.raw_set(1, "fn ").unwrap();
+        span1.raw_set(2, "keyword").unwrap();
+        let span2 = lua.create_table().unwrap();
+        span2.raw_set(1, "main()").unwrap();
+        t.raw_set(1, span1).unwrap();
+        t.raw_set(2, span2).unwrap();
+
+        let line = parse_line(&LuaValue::Table(t)).unwrap();
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].text, "fn ");
+        assert_eq!(line.spans[0].style, SpanStyle::Named("keyword".into()));
+        assert_eq!(line.spans[1].text, "main()");
+        assert_eq!(line.spans[1].style, SpanStyle::Default);
+    }
+
+    #[test]
+    fn parse_line_empty_table_produces_empty_spans() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        let line = parse_line(&LuaValue::Table(t)).unwrap();
+        assert!(line.spans.is_empty());
+    }
+
+    #[test]
+    fn parse_span_rejects_non_table() {
+        assert!(parse_span(&LuaValue::Boolean(true)).is_err());
+    }
+
+    #[test]
+    fn parse_span_rejects_non_string_text() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        t.raw_set(1, 42).unwrap();
+        assert!(parse_span(&LuaValue::Table(t)).is_err());
+    }
+
+    #[test]
+    fn parse_style_inline_table() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        t.raw_set("fg", "#ff8000").unwrap();
+        t.raw_set("bold", true).unwrap();
+        t.raw_set("dim", true).unwrap();
+        let style = parse_style(&LuaValue::Table(t)).unwrap();
+        match style {
+            SpanStyle::Inline(ref i) => {
+                assert_eq!(i.fg, Some((255, 128, 0)));
+                assert!(i.bold);
+                assert!(i.dim);
+                assert!(!i.italic);
+                assert!(i.bg.is_none());
+            }
+            _ => panic!("expected inline style"),
+        }
+    }
+
+    #[test]
+    fn parse_style_invalid_hex_color_treated_as_none() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        t.raw_set("fg", "not_a_color").unwrap();
+        let style = parse_style(&LuaValue::Table(t)).unwrap();
+        match style {
+            SpanStyle::Inline(ref i) => assert!(i.fg.is_none()),
+            _ => panic!("expected inline style"),
+        }
+    }
+
+    #[test]
+    fn parse_style_rejects_integer() {
+        assert!(parse_style(&LuaValue::Integer(99)).is_err());
+    }
+
+    #[test]
+    fn parse_style_empty_table_produces_default_inline() {
+        let lua = test_lua();
+        let t = lua.create_table().unwrap();
+        let style = parse_style(&LuaValue::Table(t)).unwrap();
+        assert_eq!(style, SpanStyle::Inline(InlineStyle::default()));
+    }
+
+    #[test]
+    fn buf_handle_line_and_len_via_lua() {
+        let lua = test_lua();
+        let (handle, id) = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let handle = store.create();
+            let id = handle.id;
+            (handle, id)
+        };
+
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        lua.load(r#"buf:line("hello")"#).exec().unwrap();
+        lua.load(r#"buf:line({ { "styled", "dim" } })"#)
+            .exec()
+            .unwrap();
+
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 2);
+
+        let store = lua.app_data_ref::<BufferStore>().unwrap();
+        assert_eq!(store.len(id), 2);
+    }
+
+    #[test]
+    fn buf_handle_lines_adds_multiple() {
+        let lua = test_lua();
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        lua.load(r#"buf:lines({ "a", "b", "c" })"#).exec().unwrap();
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn buf_handle_line_with_inline_style_via_lua() {
+        let lua = test_lua();
+        let (handle, id) = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            let handle = store.create();
+            let id = handle.id;
+            (handle, id)
+        };
+
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        lua.load(r##"buf:line({ { "ERROR", { fg = "#ff0000", bold = true } } })"##)
+            .exec()
+            .unwrap();
+
+        let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+        let snap = store.take(id).unwrap();
+        assert_eq!(snap.lines.len(), 1);
+        assert_eq!(snap.lines[0].spans[0].text, "ERROR");
+        match &snap.lines[0].spans[0].style {
+            SpanStyle::Inline(i) => {
+                assert_eq!(i.fg, Some((255, 0, 0)));
+                assert!(i.bold);
+            }
+            other => panic!("expected inline style, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_live_and_take() {
+        let mut store = BufferStore::new();
+        let handle = store.create_live();
+        let id = handle.id;
+        store.append_line(id, SnapshotLine { spans: vec![] });
+        assert!(store.take(id).is_some());
+        assert!(store.take(id).is_none());
+    }
+
+    #[test]
+    fn create_live_second_call_does_not_overwrite_first() {
+        let mut store = BufferStore::new();
+        let handle1 = store.create_live();
+        let handle2 = store.create_live();
+        assert_ne!(handle1.id, handle2.id);
+        handle1.buf.append(SnapshotLine { spans: vec![] });
+        let live = store.live_buf().unwrap();
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
+    fn clear_resets_live_buf() {
+        let mut store = BufferStore::new();
+        store.create_live();
+        assert!(store.live_buf().is_some());
+        store.clear();
+        assert!(store.live_buf().is_none());
+    }
+
+    #[test]
+    fn live_buf_reflects_writes_through_handle() {
+        let mut store = BufferStore::new();
+        let handle = store.create_live();
+        handle.buf.append(SnapshotLine {
+            spans: vec![SnapshotSpan {
+                text: "via arc".into(),
+                style: SpanStyle::Default,
+            }],
+        });
+        assert_eq!(store.len(handle.id), 1);
+        assert_eq!(store.live_buf().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn set_lines_replaces_content() {
+        let lua = test_lua();
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+
+        lua.load(r#"buf:lines({ "a", "b", "c", "d", "e" })"#)
+            .exec()
+            .unwrap();
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 5);
+
+        lua.load(r#"buf:set_lines({ "x", "y" })"#).exec().unwrap();
+        let len: usize = lua.load("return buf:len()").eval().unwrap();
+        assert_eq!(len, 2, "set_lines should replace, not append");
+    }
+
+    #[test]
+    fn get_lines_round_trips_styles() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r##"
+            buf:set_lines({
+                "plain",
+                { { "named ", "tool" }, { "rest" } },
+                { { "inline", { fg = "#ff8000", bg = "#001122", bold = true, dim = true } } },
+                {},
+            })
+            buf:set_lines(buf:get_lines())
+            "##,
+        )
+        .exec()
+        .unwrap();
+
+        let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+        let lines = ud.borrow::<BufHandle>().unwrap().buf.read();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].spans[0].text, "plain");
+        assert_eq!(lines[0].spans[0].style, SpanStyle::Default);
+        assert_eq!(lines[1].spans[0].style, SpanStyle::Named("tool".into()));
+        assert_eq!(lines[1].spans[1].style, SpanStyle::Default);
+        assert_eq!(
+            lines[2].spans[0].style,
+            SpanStyle::Inline(InlineStyle {
+                fg: Some((255, 128, 0)),
+                bg: Some((0, 17, 34)),
+                bold: true,
+                dim: true,
+                ..InlineStyle::default()
+            })
+        );
+        assert!(lines[3].spans.is_empty());
+    }
+
+    #[test]
+    fn buf_on_unsupported_event_errors() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        let result = lua.load(r#"buf:on("hover", function() end)"#).exec();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsupported event"), "got: {err}");
+    }
+
+    fn set_buf_global(lua: &mlua::Lua) {
+        let handle = {
+            let mut store = lua.app_data_mut::<BufferStore>().unwrap();
+            store.create()
+        };
+        let ud = lua.create_userdata(handle).unwrap();
+        lua.globals().set("buf", ud).unwrap();
+    }
+
+    #[test]
+    fn buf_on_click_stores_in_handle_slot_and_replaces() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        let handle = {
+            let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+            ud.borrow::<BufHandle>().unwrap().clone()
+        };
+        assert!(handle.click_fn().is_none());
+
+        lua.load(r#"buf:on("click", function() return 1 end)"#)
+            .exec()
+            .unwrap();
+        let first = handle.click_fn().expect("handler stored in handle slot");
+
+        lua.load(r#"buf:on("click", function() return 2 end)"#)
+            .exec()
+            .unwrap();
+        let second = handle
+            .click_fn()
+            .expect("second on() replaces, not removes");
+        assert_ne!(
+            first.call::<i64>(()).unwrap(),
+            second.call::<i64>(()).unwrap()
+        );
+    }
+
+    #[test]
+    fn buf_click_invokes_own_handler_and_noops_without_one() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        smol::block_on(async {
+            lua.load(r#"buf:click({ row = 3 })"#)
+                .exec_async()
+                .await
+                .expect("click without handler is a no-op");
+
+            lua.load(
+                r#"
+                clicked_row = nil
+                buf:on("click", function(ev) clicked_row = ev.row end)
+                buf:click({ row = 3 })
+                "#,
+            )
+            .exec_async()
+            .await
+            .unwrap();
+        });
+        let row: i64 = lua.globals().get("clicked_row").unwrap();
+        assert_eq!(row, 3);
+    }
+
+    /// A foreign wrapper (the shape `on_live_buf` hands to a batch) must
+    /// route clicks to the handler the owning task registered: the click
+    /// slot lives on the SharedBuf, not on any one handle.
+    #[test]
+    fn foreign_handle_shares_click_handler() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+        lua.load(r#"buf:on("click", function(ev) clicked_row = ev.row end)"#)
+            .exec()
+            .unwrap();
+
+        let buf = lua
+            .globals()
+            .get::<mlua::AnyUserData>("buf")
+            .unwrap()
+            .borrow::<BufHandle>()
+            .map(|h| Arc::clone(&h.buf))
+            .unwrap();
+        lua.globals()
+            .set(
+                "foreign",
+                lua.create_userdata(BufHandle::foreign(buf)).unwrap(),
+            )
+            .unwrap();
+
+        smol::block_on(async {
+            lua.load(r#"foreign:click({ row = 7 })"#)
+                .exec_async()
+                .await
+                .unwrap();
+        });
+        let row: i64 = lua.globals().get("clicked_row").unwrap();
+        assert_eq!(row, 7);
+    }
+
+    /// A handler must be able to call back into its own buf (every
+    /// ToolView toggle does), so the click method may not hold the
+    /// userdata borrow across the handler call.
+    #[test]
+    fn buf_click_handler_can_mutate_own_buf() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        smol::block_on(async {
+            lua.load(
+                r#"
+                buf:on("click", function() buf:set_lines({ { { "toggled" } } }) end)
+                buf:click({ row = 1 })
+                "#,
+            )
+            .exec_async()
+            .await
+            .expect("handler mutating its own buf must not fail borrow");
+        });
+        let text: String = lua
+            .load(r#"return buf:get_lines()[1][1][1]"#)
+            .eval()
+            .unwrap();
+        assert_eq!(text, "toggled");
+    }
+
+    #[test]
+    fn blit_replaces_content_with_rendered_frame() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r#"
+            buf:set_lines({ "a", "b", "c" })
+            local fb = buffer.create(2 * 2 * 3)
+            buffer.writeu8(fb, 0, 255)
+            buffer.writeu8(fb, 4, 255)
+            buffer.writeu8(fb, 8, 255)
+            buf:blit(fb, 2, 2)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let mut bytes = [0u8; 12];
+        (bytes[0], bytes[4], bytes[8]) = (255, 255, 255);
+        let fmt = blit::parse_format(blit::DEFAULT_FORMAT).unwrap();
+        let expected = blit::render(&bytes, 2, 2, fmt, blit::DEFAULT_CELL).unwrap();
+        let ud: mlua::AnyUserData = lua.globals().get("buf").unwrap();
+        assert_eq!(*ud.borrow::<BufHandle>().unwrap().buf.read(), expected);
+    }
+
+    #[test_case(r#"buf:blit(buffer.create(3), 1, 1, { fromat = "bgra" })"#, "unknown opts key" ; "opts_key_typo")]
+    #[test_case(r#"buf:blit(buffer.create(3), 1, 1, { format = "argb" })"#, "unknown format" ; "unknown_format")]
+    #[test_case(r#"buf:blit(buffer.create(5), 1, 1)"#, "needs exactly 3" ; "wrong_size")]
+    fn blit_throws(code: &str, expected: &str) {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        let err = lua.load(code).exec().unwrap_err().to_string();
+        assert!(err.contains(expected), "expected {expected:?} in: {err}");
+    }
+
+    #[test]
+    fn buf_on_change_fires_for_mutations_without_recursion() {
+        let lua = test_lua();
+        set_buf_global(&lua);
+
+        lua.load(
+            r#"
+            changes = 0
+            buf:on("change", function()
+                changes = changes + 1
+                -- Mutating the watched buf must not recurse.
+                if changes == 1 then buf:line("from-watcher") end
+            end)
+            buf:line("a")
+            buf:lines({ "b", "c" })
+            buf:set_lines({ "x" })
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // line + 2x lines + set_lines = 4; the recursive append was dropped.
+        let changes: i64 = lua.globals().get("changes").unwrap();
+        assert_eq!(changes, 4);
+    }
+}

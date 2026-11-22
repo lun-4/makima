@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
-use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
-use maki_config::project::TrustMode;
+use makima_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use makima_config::AgentConfig;
+use makima_config::project::TrustMode;
 
 use crate::print::OutputFormat;
 
@@ -42,7 +43,7 @@ pub struct Cli {
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
 
-    /// Model spec (provider/model-id). Defaults to last used model, or claude-opus-4-6
+    /// Model spec (provider/model-id). Defaults to the saved, configured, or auto-detected model
     #[arg(short, long)]
     pub model: Option<String>,
 
@@ -217,6 +218,24 @@ impl Cli {
         }
     }
 
+    /// `--allowed-tools` replaces the allowlist and rejects an unknown name;
+    /// `--disallowed-tools` adds to the denylist and skips one.
+    pub fn apply_tool_flags(&self, agent: &mut AgentConfig) -> Result<()> {
+        if !self.allowed_tools.is_empty() {
+            agent.allowed_tools = self
+                .allowed_tools
+                .iter()
+                .map(|t| normalize_tool_name(t))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        agent.disabled_tools.extend(
+            self.disallowed_tools
+                .iter()
+                .filter_map(|t| normalize_tool_name(t).ok()),
+        );
+        Ok(())
+    }
+
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
     }
@@ -341,7 +360,7 @@ pub enum AuthAction {
     Status,
 }
 
-pub fn normalize_tool_name(name: &str) -> Result<String> {
+fn normalize_tool_name(name: &str) -> Result<String> {
     let mut result = String::with_capacity(name.len() + 4);
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() {
@@ -366,11 +385,13 @@ pub fn normalize_tool_name(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use clap::error::ErrorKind;
     use test_case::test_case;
 
     const PROMPT: &str = "hello";
     const PROMPT_EQUALS_ARG: &str = "--prompt=hello";
+    const MODEL_HELP: &str = "Defaults to the saved, configured, or auto-detected model";
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
@@ -390,6 +411,16 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    #[test]
+    fn model_help_describes_resolution_order() {
+        assert!(
+            Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains(MODEL_HELP)
+        );
     }
 
     #[test]

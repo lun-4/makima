@@ -13,8 +13,8 @@ local function eq(actual, expected, msg)
   end
 end
 
-case("maki_agent_has_expected_functions", function()
-  assert(type(maki.agent) == "table", "maki.agent must be a table")
+case("makima_agent_has_expected_functions", function()
+  assert(type(makima.agent) == "table", "makima.agent must be a table")
   local expected = {
     "resolve_model",
     "system_prompt",
@@ -26,12 +26,12 @@ case("maki_agent_has_expected_functions", function()
     "get",
   }
   for _, fn_name in ipairs(expected) do
-    eq(type(maki.agent[fn_name]), "function", "maki.agent." .. fn_name .. " must be a function")
+    eq(type(makima.agent[fn_name]), "function", "makima.agent." .. fn_name .. " must be a function")
   end
 end)
 
 case("schema_validator_compiles_and_validates", function()
-  local validator, err = maki.json.schema_validator({
+  local validator, err = makima.json.schema_validator({
     type = "object",
     properties = { answer = { type = "string" } },
     required = { "answer" },
@@ -43,7 +43,7 @@ case("schema_validator_compiles_and_validates", function()
 end)
 
 case("schema_validator_rejects_bad_schema", function()
-  local validator, err = maki.json.schema_validator({ type = 42 })
+  local validator, err = makima.json.schema_validator({ type = 42 })
   eq(validator, nil, "bad schema must not compile")
   assert(err ~= nil, "bad schema must return an error")
 end)

@@ -11,6 +11,39 @@ local M = {}
 
 local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
+local WINDOWS_COMMAND_HEADS = {
+  cmd = { dir = true, echo = true, type = true, ver = true },
+  powershell = {
+    ["get-childitem"] = "Microsoft.PowerShell.Management\\Get-ChildItem",
+    ["get-content"] = "Microsoft.PowerShell.Management\\Get-Content",
+    ["get-location"] = "Microsoft.PowerShell.Management\\Get-Location",
+    ["write-output"] = "Microsoft.PowerShell.Utility\\Write-Output",
+    echo = "Microsoft.PowerShell.Utility\\Write-Output",
+  },
+}
+
+local function simple_windows_command(shell, command)
+  local heads = WINDOWS_COMMAND_HEADS[shell]
+  local head, rest = command:match("^([A-Za-z][A-Za-z0-9-]*)(.*)$")
+  local resolved = heads and head and heads[head:lower()]
+  if
+    resolved
+    and (rest == "" or (rest:match("^ [A-Za-z0-9_./\\: -]+$") and not rest:find("  ", 1, true) and rest:sub(-1) ~= " "))
+  then
+    return resolved, rest
+  end
+  return nil, nil
+end
+
+function M.is_simple_windows_command(shell, command)
+  local resolved = simple_windows_command(shell, command)
+  return resolved ~= nil
+end
+
+function M.qualify_powershell_command(command)
+  local resolved, rest = simple_windows_command("powershell", command)
+  return resolved and resolved .. rest or command
+end
 
 -- Strict tri-state decoder: anything that is not `{approved: boolean}` (with an
 -- optional string `reason`) is "error" (never silently approve or deny).
@@ -18,7 +51,7 @@ function M.parse_verdict(text)
   if type(text) ~= "string" then
     return "error", nil, "verdict is not text"
   end
-  local ok, decoded = pcall(maki.json.decode, text)
+  local ok, decoded = pcall(makima.json.decode, text)
   if not ok or not decoded then
     return "error", nil, "verdict is not valid JSON"
   end
@@ -70,7 +103,7 @@ local classifier_verdict_tool = {
 }
 
 local function default_spawn(ctx, opts)
-  return maki.agent.spawn(ctx, M.spawn_opts(opts))
+  return makima.agent.spawn(ctx, M.spawn_opts(opts))
 end
 
 -- Explicit tools prevent the classifier from inheriting request tools.
@@ -119,7 +152,7 @@ function M.classify_verdict(command, cwd, opts, ctx, spawn)
   end
   local encoded
   if result and result.captured then
-    encoded = maki.json.encode(result.captured)
+    encoded = makima.json.encode(result.captured)
   elseif result and result.text and result.text ~= "" then
     encoded = result.text
   else

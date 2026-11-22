@@ -1,6 +1,6 @@
 # Porting fragment shaders to splashes
 
-Field guide for turning WGSL / GLSL / shadertoy fragment shaders into maki
+Field guide for turning WGSL / GLSL / shadertoy fragment shaders into makima
 splashes. The five ports in the live config (kaleidoscope, voronoi,
 caustics, metaballs, aurora, all from `shader-gallery.html`) follow exactly
 this playbook.
@@ -80,7 +80,7 @@ look blank in text dumps, judge them by `seg.style.fg` values.
 ## Performance playbook
 
 Budget reference: 2-3 ms/frame at 80x24 on stock lua5.1 is the established
-norm (tunnel, plasma); up to ~20 ms is tolerable. Maki's luau-jit is roughly
+norm (tunnel, plasma); up to ~20 ms is tolerable. Makima's luau-jit is roughly
 5x faster than lua5.1, so measure with the bundled smoke script and use the
 lua5.1 number as a pessimistic bound.
 

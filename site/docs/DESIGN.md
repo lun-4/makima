@@ -1,6 +1,6 @@
 # Docs design system
 
-**Terminal-editorial.** The one personality channel is maki's TUI heritage. If you cannot name a reason for a new element, do not add it.
+**Terminal-editorial.** The one personality channel is Makima's TUI heritage. If you cannot name a reason for a new element, do not add it.
 
 ## Principles
 
@@ -34,7 +34,7 @@
 
 ## Code blocks
 
-Dark panes (#1E1E2E) in both themes. Custom `maki` syntax theme (`extra/makima.json`, VSCode format, `extra_themes`, zola >= 0.22); single `theme` key so giallo emits plain hex. Tokens, all roman, no italics:
+Dark panes (#1E1E2E) in both themes. Custom `makima` syntax theme (`extra/makima.json`, VSCode format, `extra_themes`, zola >= 0.22); single `theme` key so giallo emits plain hex. Tokens, all roman, no italics:
 
 | ink | comment | keyword | operator | function/command | type | string | const |
 |---|---|---|---|---|---|---|---|

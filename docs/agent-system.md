@@ -39,11 +39,11 @@ The layers deliberately own different state:
 | `AgentManagerHandle` | One outer session's rooted graph, actor factory, runner tasks, topology, spawn authority, global active-turn limit, subtree lifecycle | A second per-agent queue, history, or outcome store |
 | TUI, headless and Lua backends | Dynamic provider/model/tool/prompt preparation and presentation | Lifecycle truth or graph authority derived from presentation ids |
 
-The core is dependency-neutral. `maki-agent` does not depend on `maki-ui` or `maki-lua`; those crates implement `ActorBackend` to prepare and execute their own turns against actor-owned history. `maki-agent::headless` holds the print, SDK and ACP backend.
+The core is dependency-neutral. `makima-agent` does not depend on `makima-ui` or `makima-lua`; those crates implement `ActorBackend` to prepare and execute their own turns against actor-owned history. `makima-agent::headless` holds the print, SDK and ACP backend.
 
 ## Turn lifecycle
 
-`AgentId` and `TurnId` are nominal wrappers around `MakiId`. They use the same compact UUIDv7/base58 representation but cannot be interchanged by the Rust type system.
+`AgentId` and `TurnId` are nominal wrappers around `MakimaId`. They use the same compact UUIDv7/base58 representation but cannot be interchanged by the Rust type system.
 
 Every accepted turn ends in exactly one variant of `TurnOutcome`:
 
@@ -90,7 +90,7 @@ After the claim, nothing can cancel the publication. The commit runs on an actor
 
 ## The actor
 
-The actor API is exported from `maki-agent::actor` and re-exported from `maki-agent`.
+The actor API is exported from `makima-agent::actor` and re-exported from `makima-agent`.
 
 ### Main types
 
@@ -231,7 +231,7 @@ A manager-created actor receives an internal managed-admission hook. Before its 
 
 Clones carry a restricted token, not the unique activation guard. Validation checks the manager and the still-active exact turn. A token retained after the turn ends becomes unusable. Agent ids, parent links, TUI focus, task ids, and tool-use ids are never bearer authority.
 
-This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `maki.agent.spawn(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
+This context propagates through `AgentParams` and `ToolContext` into the Lua invocation scope. `makima.agent.spawn(ctx, ...)` requires the invocation's current managed authority to exactly match the supplied `ctx`; stale, context-free, or wrong-manager attempts fail before child creation. A managed child receives its own context when it later executes, so it can create a grandchild subject to limits.
 
 ### Cross-agent concurrency and child waits
 
@@ -280,7 +280,7 @@ Session runtime replacement is prepared inertly and activated as a transaction. 
 
 ### Lua agent API
 
-`maki.agent.spawn(ctx, opts)` is the only way to create a child agent. It requires an active managed turn or a trusted manager-backed invocation and fails closed otherwise.
+`makima.agent.spawn(ctx, opts)` is the only way to create a child agent. It requires an active managed turn or a trusted manager-backed invocation and fails closed otherwise.
 
 - Spawn creates a child through the manager and returns an `Agent` handle.
 - `Agent:send` admits a turn only when the agent has no active, preparing or queued work; `Agent:prompt` does the same and waits for that exact turn.
@@ -290,13 +290,13 @@ Session runtime replacement is prepared inertly and activated as a transaction. 
 
 A descendant's cancellation token is independent of the spawning parent turn. Background children can outlive that parent turn. Structured outcomes and history are stamped for TUI routing, while presentation notifications must not be inserted into provider history.
 
-`maki.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
+`makima.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
 
 The bundled task plugin's ids are labels, not graph identity.
 
 ### Frontend roots
 
-TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `maki_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
+TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `makima_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
 
 ## Known implementation caveats
 
@@ -325,25 +325,25 @@ Runtime `AgentId` and `TurnId` values are not yet restart-durable. Graph snapsho
 
 | Concern | Primary implementation |
 |---|---|
-| IDs, outcomes, failure taxonomy, events | `maki-agent/src/types.rs` |
-| Low-level provider/tool run | `maki-agent/src/agent/run.rs` |
-| Actor API and retained state | `maki-agent/src/actor/mod.rs` |
-| Queue and interrupt extraction | `maki-agent/src/actor/queue.rs` |
-| Actor execution state machine | `maki-agent/src/actor/runner.rs` |
-| Tickets and exact waits | `maki-agent/src/actor/tickets.rs` |
-| Backend and work types | `maki-agent/src/actor/types.rs` |
-| Manager graph and permit machinery | `maki-agent/src/manager/mod.rs` |
-| Manager public projections | `maki-agent/src/manager/types.rs` |
-| Manager errors | `maki-agent/src/manager/manager_error.rs` |
-| TUI root construction/backend | `maki-ui/src/agent/mod.rs`, `maki-ui/src/agent/agent_loop.rs` |
-| TUI cancellation routing | `maki-ui/src/agent/command_router.rs` |
-| Lua agent backend and API | `maki-lua/src/api/agent.rs`, `maki-lua/src/api/agent/handles/` |
-| Lua orchestration, targets and plugin authority | `maki-lua/src/orchestration.rs`, `maki-lua/src/orchestration/targets.rs` |
-| Prepared operations and durable commit | `maki-agent/src/actor/prepared.rs`, `maki-agent/src/actor/history_edit.rs` |
-| Publication state and session lock guard | `maki-storage/src/checkpoint.rs`, `maki-storage/src/session_lock.rs` |
-| Session coordinator and checkpoint projection | `maki-agent/src/session_coordinator.rs`, `maki-agent/src/session_checkpoint.rs` |
-| Print, SDK and ACP backend | `maki-agent/src/headless.rs` |
-| Lua turn-scoped authority | `maki-lua/src/runtime.rs`, `maki-lua/src/api/util/ctx.rs` |
-| Configured graph limits | `maki-config/src/lib.rs` |
+| IDs, outcomes, failure taxonomy, events | `makima-agent/src/types.rs` |
+| Low-level provider/tool run | `makima-agent/src/agent/run.rs` |
+| Actor API and retained state | `makima-agent/src/actor/mod.rs` |
+| Queue and interrupt extraction | `makima-agent/src/actor/queue.rs` |
+| Actor execution state machine | `makima-agent/src/actor/runner.rs` |
+| Tickets and exact waits | `makima-agent/src/actor/tickets.rs` |
+| Backend and work types | `makima-agent/src/actor/types.rs` |
+| Manager graph and permit machinery | `makima-agent/src/manager/mod.rs` |
+| Manager public projections | `makima-agent/src/manager/types.rs` |
+| Manager errors | `makima-agent/src/manager/manager_error.rs` |
+| TUI root construction/backend | `makima-ui/src/agent/mod.rs`, `makima-ui/src/agent/agent_loop.rs` |
+| TUI cancellation routing | `makima-ui/src/agent/command_router.rs` |
+| Lua agent backend and API | `makima-lua/src/api/agent.rs`, `makima-lua/src/api/agent/handles/` |
+| Lua orchestration, targets and plugin authority | `makima-lua/src/orchestration.rs`, `makima-lua/src/orchestration/targets.rs` |
+| Prepared operations and durable commit | `makima-agent/src/actor/prepared.rs`, `makima-agent/src/actor/history_edit.rs` |
+| Publication state and session lock guard | `makima-storage/src/checkpoint.rs`, `makima-storage/src/session_lock.rs` |
+| Session coordinator and checkpoint projection | `makima-agent/src/session_coordinator.rs`, `makima-agent/src/session_checkpoint.rs` |
+| Print, SDK and ACP backend | `makima-agent/src/headless.rs` |
+| Lua turn-scoped authority | `makima-lua/src/runtime.rs`, `makima-lua/src/api/util/ctx.rs` |
+| Configured graph limits | `makima-config/src/lib.rs` |
 
 For the non-negotiable maintenance rules derived from this design, read [Agent invariants](agent-invariants.md).

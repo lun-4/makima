@@ -18,7 +18,7 @@ end
 
 -- Runs {fn} against a buf that records the rendered lines and replays clicks.
 local function with_mock_ui(fn)
-  local original = { buf = maki.ui.buf, markdown = maki.ui.markdown }
+  local original = { buf = makima.ui.buf, markdown = makima.ui.markdown }
   local lines, handlers = {}, {}
   local buf = {
     set_lines = function(_, new_lines)
@@ -34,15 +34,15 @@ local function with_mock_ui(fn)
       handlers[event](ev)
     end,
   }
-  maki.ui.buf = function()
+  makima.ui.buf = function()
     return buf
   end
-  maki.ui.markdown = function(text, _width)
+  makima.ui.markdown = function(text, _width)
     return { { { text, "" } } }
   end
   local ok, err = pcall(fn, buf)
-  maki.ui.buf = original.buf
-  maki.ui.markdown = original.markdown
+  makima.ui.buf = original.buf
+  makima.ui.markdown = original.markdown
   if not ok then
     error(err)
   end
@@ -228,7 +228,7 @@ end)
 local function line_width(line)
   local w = 0
   for _, span in ipairs(line) do
-    w = w + maki.ui.display_width(span[1])
+    w = w + makima.ui.display_width(span[1])
   end
   return w
 end
@@ -310,19 +310,19 @@ case("wrap_spans_hard_splits_oversize_word_on_valid_utf8_boundaries", function()
 end)
 
 case("truncate_text_returns_empty_head_when_narrower_than_glyph", function()
-  local t = maki.ui.truncate_text("你好", 1)
+  local t = makima.ui.truncate_text("你好", 1)
   eq(t.head, "")
   eq(t.tail, "你好")
-  local t2 = maki.ui.truncate_text("你a", 1)
+  local t2 = makima.ui.truncate_text("你a", 1)
   eq(t2.head, "")
   eq(t2.tail, "你a")
 end)
 
 case("truncate_text_zero_width_returns_empty", function()
-  local t = maki.ui.truncate_text("abc", 0)
+  local t = makima.ui.truncate_text("abc", 0)
   eq(t.head, "")
   eq(t.tail, "abc")
-  local empty = maki.ui.truncate_text("", 5)
+  local empty = makima.ui.truncate_text("", 5)
   eq(empty.head, "")
   eq(empty.tail, "")
 end)
@@ -387,7 +387,7 @@ local function find_span_with_text(lines, text)
 end
 
 case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function()
-  local original = maki.ui.markdown
+  local original = makima.ui.markdown
   local mocks = {
     {
       name = "error",
@@ -409,9 +409,9 @@ case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function
     },
   }
   for _, m in ipairs(mocks) do
-    maki.ui.markdown = m.fn
+    makima.ui.markdown = m.fn
     local ok, r = pcall(QuestionForm._render, selecting_single(), 80)
-    maki.ui.markdown = original
+    makima.ui.markdown = original
     assert(ok, m.name .. ": render must not propagate markdown errors")
     local span = find_span_with_text(r.lines, "Pick one")
     assert(span, m.name .. ": fallback must surface the question text")
@@ -420,22 +420,22 @@ case("question_md_falls_back_to_plain_text_on_invalid_markdown_return", function
 end)
 
 case("confirming_view_renders_all_question_lines_at_inline_width", function()
-  local original = maki.ui.markdown
-  maki.ui.markdown = function(_text, _width)
+  local original = makima.ui.markdown
+  makima.ui.markdown = function(_text, _width)
     return { { { "first", "" } }, { { "second", "" } } }
   end
   local s = confirming_multi()
   local r = QuestionForm._render(s, 80)
-  maki.ui.markdown = original
+  makima.ui.markdown = original
   eq(s.mode, MODE.CONFIRMING)
   assert(find_span_with_text(r.lines, "first"), "confirming row must include first markdown line")
   assert(find_span_with_text(r.lines, "second"), "confirming row must also include subsequent markdown lines")
 end)
 
 case("question_md_cache_invalidates_on_width_change", function()
-  local original = maki.ui.markdown
+  local original = makima.ui.markdown
   local calls = 0
-  maki.ui.markdown = function(_text, width)
+  makima.ui.markdown = function(_text, width)
     calls = calls + 1
     return { { { "w=" .. tostring(width), "" } } }
   end
@@ -445,7 +445,7 @@ case("question_md_cache_invalidates_on_width_change", function()
   QuestionForm._render(s, 80)
   eq(calls, calls_after_80, "same width must reuse cache")
   QuestionForm._render(s, 60)
-  maki.ui.markdown = original
+  makima.ui.markdown = original
   assert(calls > calls_after_80, "width change must invalidate cache and re-render")
 end)
 
@@ -654,11 +654,11 @@ case("render_selecting_long_label_and_desc_wrap_within_width", function()
 end)
 
 case("open_requests_bottom_split", function()
-  local original_open = maki.ui.open_win
-  local original_buf = maki.ui.buf
-  local original_size = maki.ui.terminal_size
+  local original_open = makima.ui.open_win
+  local original_buf = makima.ui.buf
+  local original_size = makima.ui.terminal_size
   local captured
-  maki.ui.open_win = function(_buf, opts)
+  makima.ui.open_win = function(_buf, opts)
     captured = opts
     return {
       width = 80,
@@ -669,16 +669,16 @@ case("open_requests_bottom_split", function()
       end,
     }
   end
-  maki.ui.buf = function()
+  makima.ui.buf = function()
     return { set_lines = function() end }
   end
-  maki.ui.terminal_size = function()
+  makima.ui.terminal_size = function()
     return { rows = 40, cols = 100 }
   end
   local ok, err = pcall(QuestionForm.open, single_question())
-  maki.ui.open_win = original_open
-  maki.ui.buf = original_buf
-  maki.ui.terminal_size = original_size
+  makima.ui.open_win = original_open
+  makima.ui.buf = original_buf
+  makima.ui.terminal_size = original_size
   assert(ok, "open must not error: " .. tostring(err))
   assert(captured, "open_win must be called")
   eq(captured.split, "below", "form must request a bottom split")
@@ -835,7 +835,7 @@ case("tabs_use_rendered_display_ranges_including_answer_marks", function()
   local state = QuestionForm._initial_state(questions)
   press(state, "enter")
   local rendered = QuestionForm._render(state, 80)
-  local first_width = maki.ui.display_width(rendered.lines[1][1][1])
+  local first_width = makima.ui.display_width(rendered.lines[1][1][1])
   click_form(state, 1, first_width + 1)
   eq(state.tab, 2, "separator is not a tab")
   click_form(state, 1, 2)

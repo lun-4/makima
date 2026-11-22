@@ -1,0 +1,1880 @@
+//! Exercises real plugins (bash, grep, batch) through `request_restore`.
+//! A broken restore silently falls back to raw LLM output, so we assert
+//! things only the real views produce (gutters, command headers, truncation).
+
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use makima_agent::actor::AgentContextSnapshot;
+use makima_agent::permissions::PermissionManager;
+use makima_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
+use makima_agent::session_coordinator::{
+    SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
+    builtin_option_definitions,
+};
+use makima_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, YOLO_OPTION_ID};
+use makima_agent::tools::offload::{OffloadStore, is_offload_notice};
+use makima_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
+use makima_agent::{
+    ActorBackend, AgentEvent, AgentInput, AgentManagerHandle, BackendResult, ControlWork,
+    DoneReason, History, SessionMailbox, TurnContext, TurnOutcome, WorkKind,
+};
+use makima_agent::{SnapshotLine, SpanStyle, ToolOutput};
+use makima_config::{
+    DefaultEffect, Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
+    ToolOutputLines,
+};
+use makima_lua::PluginHost;
+use makima_lua::orchestration::{AgentOrchestration, TrustedTarget};
+use makima_providers::{Message, StreamResponse};
+use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+use makima_storage::id::MakimaId;
+use serde_json::{Value, json};
+
+mod common;
+
+const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
+const GLOB_SRC: &str = include_str!("../../plugins/glob/init.lua");
+const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
+const BATCH_SRC: &str = include_str!("../../plugins/batch/init.lua");
+const TASK_SRC: &str = include_str!("../../plugins/task/init.lua");
+const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
+const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
+const AUTO_MODE_DENIED: &str = "command denied by auto-mode: ";
+
+/// Only the real ToolView emits this when collapsed.
+const EXPAND_HINT: &str = "click to expand";
+/// Fixed caps so truncation tests don't depend on the product defaults. The
+/// index and read caps differ so a body rendered through the wrong view is
+/// visibly different.
+const VIEW_CAP: usize = 3;
+const INDEX_VIEW_CAP: usize = 2;
+const READ_VIEW_CAP: usize = 5;
+const GREP_NO_MATCHES: &str = "No files found";
+const GREP_ERROR_OUTPUT: &str = "error: pattern is required";
+const TASK_WAIT_TOOL: &str = "task_wait";
+const TASK_SEND_TOOL: &str = "task_send";
+const TASK_SEND_LINE_PREFIX: &str = "Instruction line";
+const TASK_SEND_QUOTE_BAR: &str = "│ ";
+const TASK_ID: &str = "task-0123456789abcdef";
+const TASK_SHORT_ID: &str = "89abcdef";
+const TASK_TURN_ID: &str = "turn-restored-result";
+const TASK_INPUT_TURN_ID: &str = "turn-requested";
+const TASK_DESCRIPTION: &str = "Review restored task reports";
+const TASK_RUNNING: &str =
+    "Still running when checked. The wait timed out; the task was not cancelled.";
+const TASK_COMPLETED: &str = "Completed";
+const TASK_DETAILS_HINT: &str = "Details (click to expand)";
+const TASK_REPORT: &str = "**Restored report**";
+const TASK_REPORT_TEXT: &str = "Restored report";
+const TASK_PARTIAL_REPORT: &str = "Partial findings survive";
+const TASK_CHILD_ERROR: &str = "provider unavailable";
+const TASK_CHILD_USER_MESSAGE: &str = "Please retry the provider";
+const TASK_FAILED: &str = "Subagent failed: provider unavailable";
+const TASK_FAILED_USER_MESSAGE: &str = "Subagent failed: Please retry the provider";
+const TASK_CANCEL_REASON: &str = "stopped by parent";
+const TASK_CANCELLED: &str = "Subagent cancelled: stopped by parent";
+const TASK_UNKNOWN_ERROR: &str = "unknown task_id";
+const TASK_UNKNOWN_MESSAGE: &str =
+    "Cannot retrieve this task: it is no longer available. (unknown task_id)";
+const TASK_EVICTED_ERROR: &str = "turn_result_unavailable";
+const TASK_EVICTED_MESSAGE: &str =
+    "Cannot retrieve this turn: its result is no longer retained. (turn_result_unavailable)";
+const TASK_ACCESS_ERROR: &str = "task is owned by another agent branch";
+const TASK_ACCESS_MESSAGE: &str = "Cannot retrieve this task: it belongs to another agent branch. (task is owned by another agent branch)";
+const TASK_LEGACY_OUTPUT: &str = "Legacy report without JSON";
+const TASK_MALFORMED_OUTPUT: &str = "{\"status\":";
+const TASK_LEGACY_STATUS: &str = "Wait result";
+const TASK_STRUCTURED_MESSAGE: &str = "Structured result available in details.";
+const TASK_EMPTY_MESSAGE: &str = "No report returned.";
+const TASK_TOKEN_DETAILS: &str = "Tokens: 17 input, 9 output";
+const TASK_CAPTURED_DETAILS: &str = "Captured: {\"verified\":true}";
+const TASK_REPORT_PREFIX: &str = "Report line";
+const TASK_REPORT_EXTRA_LINES: usize = 3;
+const TASK_DURATION_MS: u64 = 2000;
+const TASK_COMPLETED_WITH_DURATION: &str = "Completed · 2s";
+const TASK_INPUT_TOKENS: u64 = 17;
+const TASK_OUTPUT_TOKENS: u64 = 9;
+
+fn view_lines() -> ToolOutputLines {
+    ToolOutputLines {
+        other: VIEW_CAP,
+        index: INDEX_VIEW_CAP,
+        read: READ_VIEW_CAP,
+        task_spawn: VIEW_CAP,
+        ..ToolOutputLines::DEFAULT
+    }
+}
+
+const GREP_OUT: &str =
+    "src/a.rs:\n  1: fn main() {}\n  2: fn helper() {}\n\nsrc/b.rs:\n  10: fn other() {}";
+
+const BATCH_INPUT_GREP_BASH: &str = r#"{ "tool_calls": [
+    { "tool": "grep", "parameters": { "pattern": "fn" } },
+    { "tool": "bash", "parameters": { "command": "echo hello-from-bash" } }
+]}"#;
+
+fn load_host() -> PluginHost {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("bash", BASH_SRC).unwrap();
+    host.load_source("glob", GLOB_SRC).unwrap();
+    host.load_source("grep", GREP_SRC).unwrap();
+    host.load_source("batch", BATCH_SRC).unwrap();
+    host.load_source("task", TASK_SRC).unwrap();
+    host
+}
+
+fn batch_state() -> Value {
+    json!({ "children": [
+        { "tool": "grep", "status": "success", "output": GREP_OUT },
+        { "tool": "bash", "status": "success", "output": "hello-from-bash" },
+    ]})
+}
+
+struct Restored {
+    body: String,
+    header: String,
+    spans: Vec<SnapshotLine>,
+}
+
+fn restore(
+    host: &PluginHost,
+    tool: &str,
+    input: Value,
+    output: &str,
+    state: Option<Value>,
+    clicks: Vec<usize>,
+) -> Restored {
+    restore_as(host, tool, input, output, false, state, clicks)
+}
+
+fn restore_as(
+    host: &PluginHost,
+    tool: &str,
+    input: Value,
+    output: &str,
+    is_error: bool,
+    state: Option<Value>,
+    clicks: Vec<usize>,
+) -> Restored {
+    restore_item(
+        host,
+        makima_lua::RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: "restore_id".to_owned(),
+            output: output.to_owned(),
+            input,
+            is_error,
+            tool_output_lines: view_lines(),
+            theme_gen: None,
+            clicks,
+            state,
+        },
+    )
+}
+
+fn restore_item(host: &PluginHost, item: makima_lua::RestoreItem) -> Restored {
+    let handle = host.event_handle();
+    let (tx, rx) = flume::unbounded();
+    handle.request_restore(item, makima_agent::EventSender::new(tx));
+    handle.wait_restore_complete_for_test();
+    // The empty LoadSource drains the async gate, so spawned highlight tasks
+    // finish before we inspect the buffers.
+    host.load_source("barrier", "").unwrap();
+    let mut out = Restored {
+        body: String::new(),
+        header: String::new(),
+        spans: Vec::new(),
+    };
+    for env in rx.drain() {
+        match env.event {
+            AgentEvent::ToolSnapshot { snapshot, .. } => {
+                out.body = snapshot.text();
+                out.spans = snapshot.lines.to_vec();
+            }
+            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => out.header = snapshot.text(),
+            _ => {}
+        }
+    }
+    out
+}
+
+const GREP_VIEW_CAP: usize = 2;
+const GLOB_OUT: &str = "/a/1.txt\n/a/2.txt\n/a/3.txt\n/a/4.txt";
+
+fn restore_with_capped_grep(host: &PluginHost, tool: &str, output: &str) -> Restored {
+    let lines = ToolOutputLines {
+        grep: GREP_VIEW_CAP,
+        other: VIEW_CAP,
+        ..view_lines()
+    };
+    restore_item(
+        host,
+        makima_lua::RestoreItem {
+            tool: Arc::from(tool),
+            tool_use_id: "restore_id".to_owned(),
+            output: output.to_owned(),
+            input: json!({ "pattern": "fn" }),
+            is_error: false,
+            tool_output_lines: lines,
+            theme_gen: None,
+            clicks: Vec::new(),
+            state: None,
+        },
+    )
+}
+
+#[test]
+fn grep_view_honors_the_grep_output_limit() {
+    let host = load_host();
+    let restored = restore_with_capped_grep(&host, "grep", GREP_OUT);
+    assert!(restored.body.contains("src/a.rs"), "{}", restored.body);
+    assert!(restored.body.contains("fn main"), "{}", restored.body);
+    assert!(!restored.body.contains("fn helper"), "{}", restored.body);
+    assert!(restored.body.contains(EXPAND_HINT), "{}", restored.body);
+}
+
+#[test]
+fn glob_view_honors_the_grep_output_limit() {
+    let host = load_host();
+    let restored = restore_with_capped_grep(&host, "glob", GLOB_OUT);
+    assert!(restored.body.contains("1.txt"), "{}", restored.body);
+    assert!(restored.body.contains("2.txt"), "{}", restored.body);
+    assert!(!restored.body.contains("3.txt"), "{}", restored.body);
+    assert!(restored.body.contains(EXPAND_HINT), "{}", restored.body);
+}
+
+#[test_case::test_case(Some(TASK_DESCRIPTION); "persisted_description")]
+#[test_case::test_case(None; "short_id_fallback")]
+fn task_wait_restore_running_is_historical(description: Option<&str>) {
+    let host = load_host();
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "running" }).to_string(),
+        description.map(|description| json!({ "description": description })),
+        Vec::new(),
+    );
+
+    assert_eq!(restored.header.trim(), description.unwrap_or(TASK_SHORT_ID));
+    assert_eq!(
+        restored.body.lines().collect::<Vec<_>>(),
+        [TASK_RUNNING, TASK_DETAILS_HINT]
+    );
+}
+
+#[test_case::test_case(false; "without_duration")]
+#[test_case::test_case(true; "with_duration")]
+fn task_wait_restore_done_renders_markdown(with_duration: bool) {
+    let host = load_host();
+    let mut result = json!({ "text": TASK_REPORT });
+    if with_duration {
+        result["duration_ms"] = json!(TASK_DURATION_MS);
+    }
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "done", "result": result }).to_string(),
+        None,
+        Vec::new(),
+    );
+
+    let status = if with_duration {
+        TASK_COMPLETED_WITH_DURATION
+    } else {
+        TASK_COMPLETED
+    };
+    assert_eq!(restored.body.lines().next(), Some(status));
+    assert!(
+        restored.body.contains(TASK_REPORT_TEXT),
+        "{}",
+        restored.body
+    );
+    assert!(!restored.body.contains(TASK_REPORT), "{}", restored.body);
+    assert!(
+        restored
+            .spans
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| {
+                span.text.contains(TASK_REPORT_TEXT)
+                    && matches!(&span.style, SpanStyle::Named(style) if style == "bold")
+            })
+    );
+}
+
+#[test_case::test_case(
+    json!({ "status": "failed", "error": TASK_CHILD_ERROR }), TASK_FAILED;
+    "failed"
+)]
+#[test_case::test_case(
+    json!({ "status": "failed", "error": TASK_CHILD_ERROR, "user_message": TASK_CHILD_USER_MESSAGE }),
+    TASK_FAILED_USER_MESSAGE;
+    "failed_user_message"
+)]
+#[test_case::test_case(
+    json!({ "status": "cancelled", "error": TASK_CANCEL_REASON }), TASK_CANCELLED;
+    "cancelled_error"
+)]
+#[test_case::test_case(
+    json!({ "status": "cancelled", "cancellation_reason": TASK_CANCEL_REASON }), TASK_CANCELLED;
+    "cancelled_reason"
+)]
+fn task_wait_restore_child_failure_keeps_partial_report(mut result: Value, status: &str) {
+    let host = load_host();
+    result["text"] = json!(TASK_PARTIAL_REPORT);
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        &json!({ "status": "done", "result": result }).to_string(),
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(restored.body.lines().next(), Some(status));
+    assert!(
+        restored.body.contains(TASK_PARTIAL_REPORT),
+        "{}",
+        restored.body
+    );
+    assert!(matches!(
+        &restored.spans[0].spans[0].style,
+        SpanStyle::Named(style) if style == "error"
+    ));
+}
+
+#[test_case::test_case(TASK_UNKNOWN_ERROR, TASK_UNKNOWN_MESSAGE; "unknown_task")]
+#[test_case::test_case(TASK_EVICTED_ERROR, TASK_EVICTED_MESSAGE; "evicted_turn")]
+#[test_case::test_case(TASK_ACCESS_ERROR, TASK_ACCESS_MESSAGE; "access_denied")]
+fn task_wait_restore_wait_errors_are_not_child_failures(output: &str, status: &str) {
+    let host = load_host();
+    let restored = restore_as(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        output,
+        true,
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(
+        restored.body.lines().collect::<Vec<_>>(),
+        [status, TASK_DETAILS_HINT]
+    );
+    assert!(matches!(
+        &restored.spans[0].spans[0].style,
+        SpanStyle::Named(style) if style == "error"
+    ));
+}
+
+#[test_case::test_case(TASK_LEGACY_OUTPUT; "legacy_text")]
+#[test_case::test_case(TASK_MALFORMED_OUTPUT; "malformed_json")]
+fn task_wait_restore_legacy_output_uses_text_fallback(output: &str) {
+    let host = load_host();
+    let restored = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        json!({ "task_id": TASK_ID }),
+        output,
+        None,
+        Vec::new(),
+    );
+
+    assert_eq!(restored.body.lines().next(), Some(TASK_LEGACY_STATUS));
+    assert!(restored.body.contains(output), "{}", restored.body);
+    assert!(
+        restored.body.contains(TASK_DETAILS_HINT),
+        "{}",
+        restored.body
+    );
+}
+
+#[test_case::test_case(false, TASK_EMPTY_MESSAGE; "no_report")]
+#[test_case::test_case(true, TASK_STRUCTURED_MESSAGE; "structured_result")]
+fn task_wait_restore_empty_report_and_expanded_details(captured: bool, message: &str) {
+    let host = load_host();
+    let mut result = json!({
+        "input_tokens": TASK_INPUT_TOKENS, "output_tokens": TASK_OUTPUT_TOKENS,
+    });
+    if captured {
+        result["turn_id"] = json!(TASK_TURN_ID);
+        result["captured"] = json!({ "verified": true });
+    }
+    let input = json!({ "task_id": TASK_ID, "turn_id": TASK_INPUT_TURN_ID });
+    let output = json!({ "status": "done", "result": result }).to_string();
+    let collapsed = restore(
+        &host,
+        TASK_WAIT_TOOL,
+        input.clone(),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert!(collapsed.body.contains(message), "{}", collapsed.body);
+    assert!(!collapsed.body.contains(TASK_ID), "{}", collapsed.body);
+    assert!(
+        !collapsed.body.contains(TASK_TOKEN_DETAILS),
+        "{}",
+        collapsed.body
+    );
+    assert!(
+        !collapsed.body.contains(TASK_CAPTURED_DETAILS),
+        "{}",
+        collapsed.body
+    );
+
+    let expanded = restore(&host, TASK_WAIT_TOOL, input.clone(), &output, None, vec![0]);
+    assert!(expanded.body.contains(message), "{}", expanded.body);
+    assert!(
+        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        "{}",
+        expanded.body
+    );
+    let turn_id = if captured {
+        TASK_TURN_ID
+    } else {
+        TASK_INPUT_TURN_ID
+    };
+    assert!(
+        expanded.body.contains(&format!("Turn: {turn_id}")),
+        "{}",
+        expanded.body
+    );
+    assert!(
+        expanded.body.contains(TASK_TOKEN_DETAILS),
+        "{}",
+        expanded.body
+    );
+    assert_eq!(expanded.body.contains(TASK_CAPTURED_DETAILS), captured);
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
+
+    let recollapsed = restore(&host, TASK_WAIT_TOOL, input, &output, None, vec![0, 0]);
+    assert_eq!(recollapsed.body, collapsed.body);
+}
+
+#[test_case::test_case(false; "standalone")]
+#[test_case::test_case(true; "batch_child")]
+fn task_send_restore_message_truncation_click_roundtrip(in_batch: bool) {
+    let host = load_host();
+    let message = (1..=VIEW_CAP + TASK_REPORT_EXTRA_LINES)
+        .map(|line| format!("{TASK_SEND_LINE_PREFIX} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = json!({ "queued": true, "turn_id": TASK_TURN_ID }).to_string();
+    let input = json!({ "task_id": TASK_ID, "message": message });
+    let state = json!({ "description": TASK_DESCRIPTION });
+    let (tool, input, state) = if in_batch {
+        (
+            "batch",
+            json!({ "tool_calls": [{ "tool": TASK_SEND_TOOL, "parameters": input }] }),
+            json!({ "children": [{
+                "tool": TASK_SEND_TOOL, "status": "success", "output": output, "state": state,
+            }] }),
+        )
+    } else {
+        (TASK_SEND_TOOL, input, state)
+    };
+    let collapsed = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        Vec::new(),
+    );
+    let tail = format!(
+        "{TASK_SEND_LINE_PREFIX} {}",
+        VIEW_CAP + TASK_REPORT_EXTRA_LINES
+    );
+    if !in_batch {
+        assert_eq!(
+            collapsed.header.trim(),
+            format!("To \"{TASK_DESCRIPTION}\"")
+        );
+    }
+    assert!(
+        collapsed
+            .body
+            .contains(&format!("{TASK_SEND_QUOTE_BAR}{TASK_SEND_LINE_PREFIX} 1")),
+        "{}",
+        collapsed.body
+    );
+    assert!(!collapsed.body.contains(&tail), "{}", collapsed.body);
+    assert!(!collapsed.body.contains(TASK_ID), "{}", collapsed.body);
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|line| line.contains(EXPAND_HINT))
+        .unwrap();
+    let expanded = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        vec![notice_row],
+    );
+    assert!(
+        expanded
+            .body
+            .contains(&format!("{TASK_SEND_QUOTE_BAR}{tail}")),
+        "{}",
+        expanded.body
+    );
+    assert!(!expanded.body.contains(TASK_ID), "{}", expanded.body);
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
+    let recollapsed = restore(
+        &host,
+        tool,
+        input,
+        &output,
+        Some(state),
+        vec![notice_row, notice_row],
+    );
+    assert_eq!(recollapsed.body, collapsed.body);
+}
+
+#[test_case::test_case(false; "standalone")]
+#[test_case::test_case(true; "batch_child")]
+fn task_wait_restore_report_truncation_click_roundtrip(in_batch: bool) {
+    let host = load_host();
+    let report = (1..=VIEW_CAP + TASK_REPORT_EXTRA_LINES)
+        .map(|line| format!("{TASK_REPORT_PREFIX} {line}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let output = json!({ "status": "done", "result": {
+        "text": report, "turn_id": TASK_TURN_ID,
+    }})
+    .to_string();
+    let input = json!({ "task_id": TASK_ID });
+    let state = json!({ "description": TASK_DESCRIPTION });
+    let (tool, input, state) = if in_batch {
+        (
+            "batch",
+            json!({ "tool_calls": [{ "tool": TASK_WAIT_TOOL, "parameters": input }] }),
+            json!({ "children": [{
+                "tool": TASK_WAIT_TOOL, "status": "success", "output": output, "state": state,
+            }] }),
+        )
+    } else {
+        (TASK_WAIT_TOOL, input, state)
+    };
+    let collapsed = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        Vec::new(),
+    );
+    let tail = format!(
+        "{TASK_REPORT_PREFIX} {}",
+        VIEW_CAP + TASK_REPORT_EXTRA_LINES
+    );
+    assert!(
+        collapsed.body.contains(TASK_COMPLETED),
+        "{}",
+        collapsed.body
+    );
+    assert!(
+        collapsed.body.contains(&format!("{TASK_REPORT_PREFIX} 1")),
+        "{}",
+        collapsed.body
+    );
+    assert!(!collapsed.body.contains(&tail), "{}", collapsed.body);
+    assert!(
+        !collapsed.body.contains(TASK_DETAILS_HINT),
+        "{}",
+        collapsed.body
+    );
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|line| line.contains(EXPAND_HINT))
+        .unwrap();
+    let expanded = restore(
+        &host,
+        tool,
+        input.clone(),
+        &output,
+        Some(state.clone()),
+        vec![notice_row],
+    );
+    assert!(expanded.body.contains(&tail), "{}", expanded.body);
+    assert!(
+        expanded.body.contains(&format!("Task: {TASK_ID}")),
+        "{}",
+        expanded.body
+    );
+    assert!(
+        expanded.body.contains(&format!("Turn: {TASK_TURN_ID}")),
+        "{}",
+        expanded.body
+    );
+    assert!(!expanded.body.contains(EXPAND_HINT), "{}", expanded.body);
+    let recollapsed = restore(
+        &host,
+        tool,
+        input,
+        &output,
+        Some(state),
+        vec![notice_row, notice_row],
+    );
+    assert_eq!(recollapsed.body, collapsed.body);
+    assert_eq!(recollapsed.header, collapsed.header);
+}
+
+#[test]
+fn bash_restore_renders_real_view() {
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "echo hi", "description": "print hi" }),
+        "hi",
+        None,
+        Vec::new(),
+    );
+    assert!(
+        r.body.contains("echo hi"),
+        "real view renders the command header; the fallback body is raw output only: {}",
+        r.body
+    );
+    assert!(r.header.contains("print hi"), "header: {}", r.header);
+}
+
+/// Phase 1: children render through their own real views (grep gutter,
+/// bash command header), not the raw-llm fallback. Phase 2: a replayed
+/// click inside grep's range reaches its real toggle and expands only it.
+#[test]
+fn batch_restore_renders_real_children_and_click_expands_grep() {
+    let host = load_host();
+    let input: Value = serde_json::from_str(BATCH_INPUT_GREP_BASH).unwrap();
+    let collapsed = restore(
+        &host,
+        "batch",
+        input.clone(),
+        "whatever",
+        Some(batch_state()),
+        Vec::new(),
+    );
+    let text = &collapsed.body;
+    assert!(text.contains("grep> "), "grep child header: {text}");
+    assert!(text.contains("bash> "), "bash child header: {text}");
+    // grep's real view reformats `nr:` into gutter lines.
+    assert!(text.contains(" 1 fn main() {}"), "grep gutter: {text}");
+    assert!(
+        !text.contains("\n1: fn main"),
+        "raw llm text means the child restore degraded to fallback: {text}"
+    );
+    assert!(
+        text.contains(EXPAND_HINT),
+        "grep view collapsed past its cap: {text}"
+    );
+    assert!(
+        text.contains("echo hello-from-bash"),
+        "bash child rendered its real view (command header): {text}"
+    );
+    assert!(
+        text.lines().any(|l| l.trim() == "hello-from-bash"),
+        "bash output line: {text}"
+    );
+
+    // Rows are 1-based (row 0 = header), so snapshot line i = row i+1.
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|l| l.contains(EXPAND_HINT))
+        .expect("grep truncation notice in collapsed render");
+    let clicked = restore(
+        &host,
+        "batch",
+        input,
+        "whatever",
+        Some(batch_state()),
+        vec![notice_row],
+    );
+    let text = &clicked.body;
+    assert!(
+        text.contains("10 fn other() {}"),
+        "expanded grep tail visible: {text}"
+    );
+    assert!(
+        !text.contains(EXPAND_HINT),
+        "grep no longer collapsed: {text}"
+    );
+    assert!(
+        text.contains("hello-from-bash"),
+        "bash child untouched: {text}"
+    );
+}
+
+/// Header fn that yields (e.g. highlight) must work, not fall back.
+#[test]
+fn restore_header_fn_may_await_async_apis() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source(
+        "hdr",
+        r#"makima.api.register_tool({
+            name = "hdr_await",
+            description = "t",
+            schema = { type = "object", properties = {} },
+            handler = function() return "ok" end,
+            header = function(input)
+                local hl = makima.ui.highlight("echo marker", "bash") or { { { "echo marker" } } }
+                local buf = makima.ui.buf()
+                buf:set_lines(hl)
+                return buf
+            end,
+            restore = function(input, output)
+                local buf = makima.ui.buf()
+                buf:line("body")
+                return buf
+            end,
+        })"#,
+    )
+    .unwrap();
+    let r = restore(&host, "hdr_await", json!({}), "ok", None, Vec::new());
+    assert_eq!(r.body.trim(), "body");
+    assert!(
+        r.header.contains("echo marker"),
+        "awaiting header fn must survive: {}",
+        r.header
+    );
+}
+
+/// Standalone edit diffs never truncate (Rust hardcodes it), so batch
+/// children must match: whole diff, `-` lines numbered by finding the new
+/// text in the edited file, `+` lines with a blank gutter.
+#[test]
+fn multiedit_batch_child_shows_full_numbered_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.rs");
+    std::fs::write(&path, "top\nzzz\nn1\nn2\nn3\nn4\nn5\nbottom\n").unwrap();
+
+    let host = PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).unwrap();
+    let input = json!({ "tool_calls": [{ "tool": "multiedit", "parameters": {
+        "path": path.to_str().unwrap(),
+        "edits": [{ "old_string": "old1\nold2\nold3\nold4\nold5", "new_string": "n1\nn2\nn3\nn4\nn5" }],
+    }}]});
+    let state = json!({ "children": [
+        { "tool": "multiedit", "status": "success", "output": "applied 1 edit" },
+    ]});
+    let r = restore(&host, "batch", input, "whatever", Some(state), Vec::new());
+
+    let text = &r.body;
+    // keep = "head" truncation would cut the tail, so the last added line
+    // present plus no collapse notice proves the 10-line diff is whole.
+    assert!(
+        text.contains("+ n5") && !text.contains(EXPAND_HINT),
+        "edit diffs must never truncate: {text}"
+    );
+    assert!(
+        text.contains("3 - old1") && text.contains("7 - old5"),
+        "removed lines numbered from the new text's file position: {text}"
+    );
+    assert!(
+        !text.contains("3 + n1"),
+        "added lines get a blank gutter: {text}"
+    );
+}
+
+const INDEX_TOOL: &str = "index";
+const LIVE_TOOL_USE_ID: &str = "live_id";
+/// More than the index view cap, exactly the read view cap, so a listing
+/// rendered through the index view is visibly truncated.
+const DIR_ENTRIES: [&str; READ_VIEW_CAP] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
+const ENTRIES_SUFFIX: &str = " entries";
+
+struct Live {
+    body: String,
+    spans: Vec<SnapshotLine>,
+    output: String,
+    state: Option<Value>,
+    annotation: Option<String>,
+}
+
+fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) -> Live {
+    exec_live_with(host, reg, tool, input, |_| {})
+}
+
+fn exec_live_with(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    tool: &str,
+    input: Value,
+    shape: impl FnOnce(&mut ToolContext),
+) -> Live {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = makima_agent::EventSender::new(tx);
+    let mut ctx = makima_agent::tools::test_support::stub_ctx_with(
+        &makima_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some(LIVE_TOOL_USE_ID),
+    );
+    ctx.tool_output_lines = view_lines();
+    shape(&mut ctx);
+    let inv = reg
+        .get(tool)
+        .unwrap_or_else(|| panic!("tool {tool} not registered"))
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    host.load_source("live_barrier", "").unwrap();
+    let mut body = String::new();
+    let mut spans = Vec::new();
+    for env in rx.drain() {
+        if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
+            body = snapshot.text();
+            spans = snapshot.lines.to_vec();
+        }
+    }
+    let (output, state) = match result.output.expect("tool failed") {
+        makima_agent::ToolOutput::Plain(s) | makima_agent::ToolOutput::Markdown(s) => {
+            (s.text, s.state)
+        }
+        other => panic!("unexpected output: {other:?}"),
+    };
+    Live {
+        body,
+        spans,
+        output,
+        state,
+        annotation: result.annotation,
+    }
+}
+
+/// A directory has no skeleton, so index shows the plain listing. Restore must
+/// rebuild that same listing view instead of the index skeleton view, which
+/// would truncate to the index cap and highlight the entries as code.
+#[test]
+fn index_dir_renders_identically_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in DIR_ENTRIES {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live(&host, &reg, INDEX_TOOL, input.clone());
+    let restored = restore(&host, INDEX_TOOL, input, &live.output, None, Vec::new());
+
+    let expected_annotation = format!("{}{ENTRIES_SUFFIX}", DIR_ENTRIES.len());
+    assert_eq!(
+        live.annotation.as_deref(),
+        Some(expected_annotation.as_str()),
+        "live dir listing is annotated with entry count"
+    );
+    for name in DIR_ENTRIES {
+        assert!(
+            live.body.contains(name),
+            "entry {name} missing: {}",
+            live.body
+        );
+    }
+    assert!(
+        !live.body.contains(EXPAND_HINT),
+        "listing fits the read view cap: {}",
+        live.body
+    );
+    assert_eq!(
+        restored.body, live.body,
+        "restored dir listing must match the live one"
+    );
+}
+
+const READ_TOOL: &str = "read";
+const RUST_SRC: &str = "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n";
+const RUST_LINES: usize = 4;
+
+fn has_syntax_colors(lines: &[SnapshotLine]) -> bool {
+    lines
+        .iter()
+        .flat_map(|l| &l.spans)
+        .any(|s| matches!(&s.style, SpanStyle::Inline(inline) if inline.fg.is_some()))
+}
+
+/// A finished tool is re-rendered through `restore` once its warm buffer is
+/// gone (cache eviction, theme rebake), so restore must produce the same
+/// highlighted view the live handler did, truncation notice included.
+/// Anything less shows up as "clicking lost the syntax highlighting".
+/// `path_key` is the model's spelling: restore gets the raw input, before
+/// alias resolution, so the view must not depend on it.
+#[test_case::test_case(0, "path" ; "whole_file")]
+#[test_case::test_case(2, "path" ; "truncated")]
+#[test_case::test_case(0, "file_path" ; "aliased_path")]
+fn read_renders_identically_live_and_restored(limit: usize, path_key: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, RUST_SRC).unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ path_key: path.to_str().unwrap(), "offset": 1, "limit": limit });
+
+    let live = exec_live(&host, &reg, READ_TOOL, input.clone());
+    let restored = restore(
+        &host,
+        READ_TOOL,
+        input,
+        &live.output,
+        live.state,
+        Vec::new(),
+    );
+
+    assert!(
+        has_syntax_colors(&live.spans),
+        "live read view is syntax highlighted: {}",
+        live.body
+    );
+    if limit > 0 && limit < RUST_LINES {
+        assert!(
+            live.body.contains("Truncated"),
+            "live view notes the cut: {}",
+            live.body
+        );
+    }
+    assert_eq!(
+        restored.spans, live.spans,
+        "restored read view must match the live one, colors included"
+    );
+}
+
+const GREP_TOOL: &str = "grep";
+
+/// Same contract as read: grep's restore used to rebuild a plain view from
+/// the LLM output while the live handler highlighted, so an expand that went
+/// through restore dropped the colors.
+#[test]
+fn grep_renders_identically_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "fn three() {}\n").unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live(&host, &reg, GREP_TOOL, input.clone());
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+
+    assert!(
+        has_syntax_colors(&live.spans),
+        "live grep view is syntax highlighted: {}",
+        live.body
+    );
+    assert_eq!(
+        restored.spans, live.spans,
+        "restored grep view must match the live one, colors included"
+    );
+}
+
+/// The host appends its truncation marker after the last entry. The view
+/// has to keep it, or a cut result set looks complete.
+#[test]
+fn grep_restore_keeps_truncation_marker() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let output = format!("src/a.rs:\n  1: fn main() {{}}\n\n{FILE_TRUNCATED_MARKER}");
+    let restored = restore(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.contains("fn main() {}"),
+        "entry rendered: {}",
+        restored.body
+    );
+    assert!(
+        restored.body.ends_with(FILE_TRUNCATED_MARKER),
+        "marker kept as the last line: {}",
+        restored.body
+    );
+}
+
+const GREP_MATCH_FILES: usize = 40;
+const SMALL_OUTPUT_LINES: usize = 12;
+
+fn many_match_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..GREP_MATCH_FILES {
+        std::fs::write(dir.path().join(format!("f{i}.rs")), "fn one() {}\n").unwrap();
+    }
+    dir
+}
+
+fn offloading(store: &Arc<OffloadStore>) -> impl FnOnce(&mut ToolContext) {
+    let store = Arc::clone(store);
+    move |ctx| {
+        ctx.offload = Some(store);
+        ctx.config.max_output_lines = SMALL_OUTPUT_LINES;
+    }
+}
+
+#[test]
+fn grep_offload_restore_keeps_preview_and_notice() {
+    let dir = many_match_dir();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(OffloadStore::on_disk(
+        store_dir.path().canonicalize().unwrap(),
+    ));
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live_with(&host, &reg, GREP_TOOL, input.clone(), offloading(&store));
+    let preview_matches = live.output.matches("fn one() {}").count();
+    assert!(preview_matches > 0 && preview_matches < GREP_MATCH_FILES);
+    let notice = live
+        .output
+        .lines()
+        .find(|line| is_offload_notice(line))
+        .unwrap();
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, vec![0]);
+    assert_eq!(
+        restored.body.matches("fn one() {}").count(),
+        preview_matches
+    );
+    assert!(restored.body.ends_with(notice), "{}", restored.body);
+}
+
+#[test_case::test_case(GREP_NO_MATCHES, false; "no_matches")]
+#[test_case::test_case(GREP_ERROR_OUTPUT, true; "error")]
+fn grep_no_matches_restore_unchanged(output: &str, is_error: bool) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let restored = restore_as(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        output,
+        is_error,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.is_empty(),
+        "grep must keep declining to restore no-match output: {}",
+        restored.body
+    );
+}
+
+/// A batch rebuilds each child through the child's own restore, both when
+/// the child settles live and on batch restore. The child's tool state has
+/// to travel with it, or a read child comes back plain and its expand click
+/// finds no truncated view to open.
+#[test]
+fn batch_read_child_restores_highlighted_and_click_expands_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.rs");
+    let src: String = (0..READ_VIEW_CAP + 3)
+        .map(|i| format!("fn f{i}() {{}}\n"))
+        .collect();
+    std::fs::write(&path, &src).unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let read_input = json!({ "path": path.to_str().unwrap(), "offset": 1, "limit": 0 });
+
+    let read = exec_live(&host, &reg, READ_TOOL, read_input.clone());
+    assert!(read.state.is_some(), "read reply carries state for restore");
+    let batch_input = json!({ "tool_calls": [
+        { "tool": READ_TOOL, "parameters": read_input },
+    ]});
+    let state = json!({ "children": [
+        { "tool": READ_TOOL, "status": "success", "output": read.output, "state": read.state },
+    ]});
+
+    let collapsed = restore(
+        &host,
+        "batch",
+        batch_input.clone(),
+        "whatever",
+        Some(state.clone()),
+        Vec::new(),
+    );
+    assert!(
+        has_syntax_colors(&collapsed.spans),
+        "read child keeps its highlighting inside a batch: {}",
+        collapsed.body
+    );
+    assert!(
+        collapsed.body.contains(EXPAND_HINT),
+        "read child collapsed past its cap: {}",
+        collapsed.body
+    );
+    let last_fn = format!("f{}()", READ_VIEW_CAP + 2);
+    assert!(
+        !collapsed.body.contains(&last_fn),
+        "tail hidden while collapsed: {}",
+        collapsed.body
+    );
+
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|l| l.contains(EXPAND_HINT))
+        .expect("read truncation notice in collapsed render");
+    let clicked = restore(
+        &host,
+        "batch",
+        batch_input,
+        "whatever",
+        Some(state),
+        vec![notice_row],
+    );
+    assert!(
+        clicked.body.contains(&last_fn),
+        "click on the read child expands it: {}",
+        clicked.body
+    );
+    assert!(
+        has_syntax_colors(&clicked.spans),
+        "expanded read child is still highlighted: {}",
+        clicked.body
+    );
+}
+
+// Phase 4: bash auto-mode gate integration. We drive the real bash handler
+// with `classify_verdict` stubbed on the shared `bash_helpers` module (require
+// caches the singleton, so `init.lua` sees the override). The deny and error
+// paths return synchronously *before* jobstart, so they are deterministic here;
+// the approve path falls through to the async jobstart loop, which this harness
+// cannot observe, so it is covered at the `spec.lua` unit layer instead.
+
+fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
+    let id = MakimaId::generate();
+    let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+    SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: id,
+        catalog: host.event_handle().session_option_catalog(),
+        definitions: builtin_option_definitions(
+            "test/model",
+            [Arc::from("test/model")],
+            false,
+            false,
+            false,
+            makima_agent::ThinkingConfig::Off,
+        ),
+        persisted_options: Default::default(),
+        model_policy: Arc::default(),
+        checkpoint,
+        mailbox: SessionMailbox::new(id),
+    })
+    .unwrap()
+}
+
+/// Load the real bash plugin with auto mode forced on and the classifier
+/// stubbed per `stub_code` (defines `bh.classify_verdict`).
+fn bash_host_with_classifier(
+    stub_code: &str,
+) -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    // The classifier stub must reach the same `bash_helpers` instance the
+    // handler captured. Every `load_source` gets a fresh per-env require cache,
+    // so run the setup in the same source.
+    let classifier_setup = format!(
+        r#"local bh = require("bash_helpers")
+{stub_code}
+"#
+    );
+    let mut opts = serde_json::Map::new();
+    opts.insert("auto_mode".to_string(), json!(true));
+    host.load_source_with_opts("bash", &format!("{BASH_SRC}\n{classifier_setup}"), opts)
+        .unwrap();
+    let session = session_for(&host);
+    (host, reg, session)
+}
+
+struct Verdict {
+    is_error: bool,
+    output: String,
+    /// Events emitted during the run (PermissionRequest, tool snapshots).
+    events: Vec<AgentEvent>,
+}
+
+/// Prompt-default `PermissionManager` so unclaimed scopes produce a real
+/// `NeedsPrompt` (the stock stub ctx silently allows them).
+fn prompt_permissions() -> Arc<PermissionManager> {
+    Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
+        Arc::default(),
+    ))
+}
+
+/// YOLO on {session} and its `PermissionManager`, as the frontends keep them:
+/// prompts are skipped, so a classifier deny must reject outright through the
+/// session's `yolo` option in the plugin (never reaching `enforce` at all).
+fn yolo_permissions(session: &SessionCoordinatorHandle) -> Arc<PermissionManager> {
+    smol::block_on(session.set_option(YOLO_OPTION_ID, ENABLED_VALUE)).unwrap();
+    Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            yolo: true,
+            rules: vec![],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
+        Arc::default(),
+    ))
+}
+
+/// Like [`exec_verdict`], but with a live event channel (so tests can assert
+/// `AgentEvent::PermissionRequest` was emitted) and an optional canned user
+/// answer pre-loaded on the response channel for the deny→prompt path to
+/// consume. `answer = None` leaves `user_response_rx` unset, modeling a
+/// headless/ACP run without an answerer.
+fn exec_verdict_prompt(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    session: &SessionCoordinatorHandle,
+    input: Value,
+    permissions: Arc<PermissionManager>,
+    answer: Option<&str>,
+) -> Verdict {
+    let (tx, rx) = flume::unbounded();
+    let event_tx = makima_agent::EventSender::new(tx);
+    let mut ctx = makima_agent::tools::test_support::stub_ctx_with_session(
+        &makima_agent::AgentMode::Build,
+        Some(&event_tx),
+        Some("classifier_tool_use_id"),
+        session.read().session_id(),
+    );
+    ctx.permissions = permissions;
+    if let Some(answer) = answer {
+        let (answer_tx, answer_rx) = flume::unbounded::<String>();
+        ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
+        let answer_parsed = makima_agent::permissions::PermissionAnswer::decode(answer)
+            .expect("valid permission answer");
+        let tagged =
+            makima_agent::permissions::TaggedAnswer::new("classifier_tool_use_id", answer_parsed)
+                .encode();
+        answer_tx.send(tagged).unwrap();
+    }
+    ctx.tool_output_lines = view_lines();
+    let inv = reg
+        .get("bash")
+        .expect("bash tool registered")
+        .tool
+        .parse(&input)
+        .expect("parse failed");
+    let result = smol::block_on(async { inv.execute(&ctx).await });
+    host.load_source("auto_barrier", "").unwrap();
+    let (is_error, output) = match result.output {
+        Ok(makima_agent::ToolOutput::Plain(s)) | Ok(makima_agent::ToolOutput::Markdown(s)) => {
+            (false, s.text)
+        }
+        Err(e) => (true, e),
+        other => panic!("unexpected output: {other:?}"),
+    };
+    let events = rx.drain().map(|env| env.event).collect();
+    Verdict {
+        is_error,
+        output,
+        events,
+    }
+}
+
+const CLASSIFY_DENY_STUB: &str =
+    r#"bh.classify_verdict = function(...) return "deny", "stub deny reason", nil end"#;
+const CLASSIFY_ERROR_STUB: &str =
+    r#"bh.classify_verdict = function(...) return "error", nil, "stub boom" end"#;
+
+#[test]
+fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let err = exec_bash_real(
+        &host,
+        &reg,
+        &session,
+        Arc::new(common::CannedProvider::new(vec![])),
+        yolo_permissions(&session),
+        json!({ "command": "echo denied-side-effect" }),
+    )
+    .expect_err("a yolo deny must fail the tool");
+    assert!(
+        err.starts_with(AUTO_MODE_DENIED) && err.contains("stub deny reason"),
+        "a yolo deny is final and carries the classifier reason: {err}"
+    );
+}
+
+#[test]
+fn auto_mode_error_without_responder_fails_closed() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo never-runs-2" }),
+        prompt_permissions(),
+        None,
+    );
+    assert!(
+        result.is_error,
+        "a classifier error without a responder must fail closed"
+    );
+    assert!(
+        result.output.contains(PERMISSION_DENIED_PREFIX),
+        "the fallback permission denial must be reported: {}",
+        result.output
+    );
+}
+
+/// Load the bundled bash handler unchanged. Its classifier inherits the provider
+/// from the manager-owned root when the handler executes.
+fn bash_host_with_real_classifier() -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
+    bash_host_with_real_classifier_auto(true)
+}
+
+/// Like [`bash_host_with_real_classifier`] but with auto mode initialized to
+/// `auto_on`. The bash plugin defaults auto mode OFF, so a separate host with
+/// `auto_on = false` models the state after `/automode` toggled it off. (Each
+/// `load_source` gets its own per-env require cache, so toggling `bash_helpers`
+/// from a separate chunk would hit a different singleton than the handler
+/// captured; two hosts avoid that footgun.)
+fn bash_host_with_real_classifier_auto(
+    auto_on: bool,
+) -> (PluginHost, Arc<ToolRegistry>, SessionCoordinatorHandle) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut opts = serde_json::Map::new();
+    opts.insert("auto_mode".to_string(), json!(auto_on));
+    host.load_source_with_opts("bash", BASH_SRC, opts).unwrap();
+    let session = session_for(&host);
+    (host, reg, session)
+}
+
+fn verdict_tool_use(approved: bool, reason: &str) -> StreamResponse {
+    common::canned_tool_use(
+        "classifier_verdict",
+        json!({ "approved": approved, "reason": reason }),
+    )
+}
+
+struct BashInvocationBackend {
+    context: ToolContext,
+    input: Value,
+    completed: flume::Sender<Result<ToolOutput, String>>,
+}
+
+impl ActorBackend for BashInvocationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: &'a mut History,
+        turn: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(inbox) = &turn.inbox {
+                for instruction in inbox.drain_instructions() {
+                    history.push(Message::user(instruction.message));
+                }
+                inbox.instructions_submitted();
+            }
+            self.context
+                .apply_effective_config(turn.policy.as_ref().expect("root policy"));
+            self.context.cancel = turn.cancel;
+            self.context.managed_turn = turn.managed_turn;
+            let invocation = self
+                .context
+                .registry
+                .get("bash")
+                .expect("bash tool registered")
+                .tool
+                .parse(&self.input)
+                .expect("parse failed");
+            let result = invocation.execute(&self.context).await.output;
+            self.completed.send(result).unwrap();
+            if let Some(inbox) = turn.inbox {
+                assert!(inbox.finish());
+            }
+            BackendResult::EnteredRun(TurnOutcome::completed(
+                turn.agent_id,
+                turn.turn_id.unwrap(),
+                Default::default(),
+                0,
+                DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+/// Run the real bash handler inside a managed root turn. Classifier children use
+/// the root's canned provider through the production orchestration binding.
+fn exec_bash_real(
+    host: &PluginHost,
+    reg: &ToolRegistry,
+    session: &SessionCoordinatorHandle,
+    provider: Arc<common::CannedProvider>,
+    permissions: Arc<PermissionManager>,
+    input: Value,
+) -> Result<ToolOutput, String> {
+    // The plugin highlights the command header, and the first highlight in a
+    // process builds the syntax set. The TUI pays that on its startup thread,
+    // so pay it here rather than inside the managed-turn budget below.
+    makima_highlight::warmup();
+    let (mut ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    makima_agent::tools::test_support::set_session(&mut ctx, session.read().session_id());
+    ctx.permissions = permissions;
+    ctx.tool_output_lines = view_lines();
+    ctx.registry = host.registry();
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    ctx = common::with_request_tools(reg, &ctx);
+    let policy =
+        common::effective_config(&ctx).with_context(AgentContextSnapshot::new(ctx.cwd.clone()));
+    let manager = AgentManagerHandle::new(Default::default()).unwrap();
+    let (completed_tx, completed) = flume::bounded(1);
+    let template = ctx.clone();
+    let root = manager
+        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(BashInvocationBackend {
+                context: ctx,
+                input,
+                completed: completed_tx,
+            }) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    host.event_handle()
+        .install_orchestration_services(Arc::new(AgentOrchestration::bind_root(
+            Arc::default(),
+            TrustedTarget {
+                target: root.clone(),
+                template,
+            },
+        )));
+    host.wait_for_worker_barrier_for_test();
+    let ticket = root
+        .actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput::new("run bash".into(), Vec::new()),
+            None,
+            "bash".into(),
+        )
+        .unwrap();
+    let result = smol::block_on(futures_lite::future::race(
+        async {
+            let result = completed.recv_async().await.unwrap();
+            assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+            assert!(
+                manager
+                    .list()
+                    .iter()
+                    .all(|agent| agent.snapshot().unwrap().parent_id.is_none())
+            );
+            let report = manager.shutdown(MANAGED_SHUTDOWN_TIMEOUT).await;
+            assert!(
+                report.timed_out.is_empty(),
+                "managed bash shutdown: {report:?}"
+            );
+            result
+        },
+        async {
+            smol::Timer::after(MANAGED_BASH_TIMEOUT).await;
+            panic!(
+                "managed bash did not complete: agents={:?}, requests={}",
+                manager
+                    .list()
+                    .iter()
+                    .map(|agent| agent.snapshot())
+                    .collect::<Vec<_>>(),
+                provider.captured_tools().len(),
+            );
+        },
+    ));
+    for tools in provider.captured_tools() {
+        assert_eq!(common::tool_names(&tools), [CLASSIFIER_TOOL_NAME]);
+    }
+    host.load_source("auto_barrier", "").unwrap();
+    result
+}
+
+fn bash_output(out: ToolOutput) -> String {
+    match out {
+        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
+/// Deny blocks the command (carrying the classifier reason) under YOLO;
+/// approve falls through to the real jobstart loop and the command runs. The
+/// approve path is the one the stub suite could not observe.
+#[test]
+fn automode_deny_blocks_and_approve_runs() {
+    let (host, reg, session) = bash_host_with_real_classifier();
+
+    let deny = Arc::new(common::CannedProvider::new(vec![
+        verdict_tool_use(false, "stub deny reason"),
+        common::canned_reply("done"),
+    ]));
+    let err = exec_bash_real(
+        &host,
+        &reg,
+        &session,
+        Arc::clone(&deny),
+        yolo_permissions(&session),
+        json!({ "command": "echo denied-side-effect" }),
+    )
+    .expect_err("under yolo a deny must fail the tool");
+    assert!(err.contains("denied"), "{err}");
+    assert!(
+        err.contains("stub deny reason"),
+        "deny carries the reason: {err}"
+    );
+    assert!(
+        !deny.captured_tools().is_empty(),
+        "the deny verdict must come from the real classifier"
+    );
+
+    smol::block_on(session.set_option(YOLO_OPTION_ID, DISABLED_VALUE)).unwrap();
+    let approve = Arc::new(common::CannedProvider::new(vec![
+        verdict_tool_use(true, "ok"),
+        common::canned_reply("done"),
+    ]));
+    let out = exec_bash_real(
+        &host,
+        &reg,
+        &session,
+        Arc::clone(&approve),
+        prompt_permissions(),
+        json!({ "command": "echo approved-side-effect" }),
+    )
+    .expect("an approve must run the command");
+    assert_eq!(bash_output(out), "approved-side-effect");
+}
+
+/// A classifier error (here: a verdict the tool rejects, so none is captured)
+/// falls back to permission enforcement and stays denied without a responder.
+#[test]
+fn automode_error_without_responder_fails_closed() {
+    let (host, reg, session) = bash_host_with_real_classifier();
+    let provider = Arc::new(common::CannedProvider::new(vec![
+        common::canned_tool_use("classifier_verdict", json!({ "approved": "not-a-bool" })),
+        common::canned_reply("done"),
+    ]));
+    let err = exec_bash_real(
+        &host,
+        &reg,
+        &session,
+        Arc::clone(&provider),
+        prompt_permissions(),
+        json!({ "command": "echo never-runs" }),
+    )
+    .expect_err("a classifier error without a responder must deny");
+    assert!(err.contains(PERMISSION_DENIED_PREFIX), "{err}");
+}
+
+/// With auto mode OFF the bash handler runs the plain path and never consults
+/// the classifier; with auto mode ON a subsequent command is gated by it. Two
+/// hosts model the `/automode` toggle state (each `load_source` has its own
+/// require cache, so the toggle is expressed as the host's initial auto state
+/// rather than a cross-chunk mutation).
+#[test]
+fn automode_toggle_flows_through_ui() {
+    let (host_off, reg_off, session_off) = bash_host_with_real_classifier_auto(false);
+    let idle = Arc::new(common::CannedProvider::new(vec![]));
+    let out = exec_bash_real(
+        &host_off,
+        &reg_off,
+        &session_off,
+        Arc::clone(&idle),
+        prompt_permissions(),
+        json!({ "command": "echo auto-off-runs" }),
+    )
+    .expect("with auto mode off the plain path runs");
+    assert_eq!(bash_output(out), "auto-off-runs");
+    assert!(
+        idle.captured_thinking().is_empty(),
+        "classifier must not run with auto mode off"
+    );
+
+    let (host_on, reg_on, session_on) = bash_host_with_real_classifier_auto(true);
+    let deny = Arc::new(common::CannedProvider::new(vec![
+        verdict_tool_use(false, "denied with auto on"),
+        common::canned_reply("done"),
+    ]));
+    let err = exec_bash_real(
+        &host_on,
+        &reg_on,
+        &session_on,
+        Arc::clone(&deny),
+        yolo_permissions(&session_on),
+        json!({ "command": "echo should-be-denied" }),
+    )
+    .expect_err("with auto mode on under yolo the classifier gates the command");
+    assert!(err.contains("denied with auto on"), "{err}");
+}
+
+// The default deny path: a classifier deny escalates to the same permission
+// prompt the automode-off path uses (`PermissionManager::enforce`). The stock
+// stub ctx would silently allow unclaimed scopes, so these tests install a
+// Prompt-default manager and a canned user answer on the response channel.
+
+/// PermissionRequest scopes plus the event's tool, in emission order.
+fn permission_requests(events: &[AgentEvent]) -> Vec<(String, Vec<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::PermissionRequest { tool, scopes, .. } => {
+                Some((tool.to_string(), scopes.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn auto_mode_deny_user_allow_runs() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo ask-allow-side-effect" }),
+        prompt_permissions(),
+        Some("allow"),
+    );
+    assert!(
+        !result.is_error,
+        "the user's allow must fall through to the jobstart run: {}",
+        result.output
+    );
+    assert_eq!(result.output, "ask-allow-side-effect");
+    assert_eq!(
+        permission_requests(&result.events),
+        vec![(
+            "bash".to_owned(),
+            vec!["echo ask-allow-side-effect".to_owned()]
+        )],
+        "a PermissionRequest for the command's scopes must be emitted"
+    );
+}
+
+#[test]
+fn auto_mode_deny_user_deny_fails() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo ask-deny-side-effect" }),
+        prompt_permissions(),
+        Some("deny"),
+    );
+    assert!(result.is_error, "a user deny must fail the tool");
+    assert_eq!(
+        result.output,
+        format!(
+            "{PERMISSION_DENIED_PREFIX} `bash` (echo ask-deny-side-effect). {DEFAULT_DENY_GUIDANCE}"
+        ),
+        "the deny must surface the standard permission message, byte-identical to automode-off"
+    );
+}
+
+#[test]
+fn auto_mode_classifier_error_user_allow_runs() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo classifier-error-allowed" }),
+        prompt_permissions(),
+        Some("allow"),
+    );
+    assert!(
+        !result.is_error,
+        "a classifier error should fall back to user approval: {}",
+        result.output
+    );
+    assert_eq!(result.output, "classifier-error-allowed");
+    assert!(
+        !permission_requests(&result.events).is_empty(),
+        "a classifier error must emit a PermissionRequest"
+    );
+}
+
+#[test]
+fn auto_mode_deny_no_response_channel_fails_closed() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo no-answerer" }),
+        prompt_permissions(),
+        None,
+    );
+    assert!(
+        result.is_error,
+        "a deny with no answerer must fail closed instead of hanging"
+    );
+    assert!(
+        result.output.contains(PERMISSION_DENIED_PREFIX),
+        "no response channel surfaces the permission message: {}",
+        result.output
+    );
+}
+
+#[test]
+fn auto_mode_deny_allow_rule_skips_prompt() {
+    let perms = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("echo *".to_owned()),
+                effect: Effect::Allow,
+            }],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
+        Arc::default(),
+    ));
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "echo allow-rule-side-effect" }),
+        perms,
+        None,
+    );
+    assert!(
+        !result.is_error,
+        "an allow rule matching the command must short-circuit the prompt: {}",
+        result.output
+    );
+    assert_eq!(result.output, "allow-rule-side-effect");
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "an allow rule must run without prompting"
+    );
+}
+
+/// A `cd`-hint input prompts on the raw `input.command` scopes (the two
+/// segments), not the `parse_cd_hint`-rewritten command. With only `echo *`
+/// allowed, the `cd /tmp` segment still prompts; with both segments allowed
+/// the whole call short-circuits like the automode-off path.
+#[test]
+fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
+    let (host, reg, session) = bash_host_with_classifier(CLASSIFY_DENY_STUB);
+
+    let echo_only = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("bash"),
+                scope: Some("echo *".to_owned()),
+                effect: Effect::Allow,
+            }],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
+        Arc::default(),
+    ));
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "cd /tmp && echo foo" }),
+        Arc::clone(&echo_only),
+        Some("allow"),
+    );
+    assert!(
+        !result.is_error,
+        "the user's allow must run: {}",
+        result.output
+    );
+    assert_eq!(result.output, "foo");
+    assert_eq!(
+        permission_requests(&result.events),
+        vec![("bash".to_owned(), vec!["cd /tmp".to_owned()])],
+        "scopes must come from the raw input.command, not the rewritten command"
+    );
+
+    let both = Arc::new(PermissionManager::new(
+        PermissionsConfig {
+            default: DefaultEffect::Prompt,
+            rules: vec![
+                PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some("cd *".to_owned()),
+                    effect: Effect::Allow,
+                },
+                PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some("echo *".to_owned()),
+                    effect: Effect::Allow,
+                },
+            ],
+            ..PermissionsConfig::default()
+        },
+        PathBuf::from("/tmp"),
+        ProjectConfig::for_project(std::path::Path::new("/tmp")),
+        Arc::default(),
+    ));
+    let result = exec_verdict_prompt(
+        &host,
+        &reg,
+        &session,
+        json!({ "command": "cd /tmp && echo foo" }),
+        both,
+        None,
+    );
+    assert!(
+        !result.is_error,
+        "allowing both raw segments must short-circuit: {}",
+        result.output
+    );
+    assert_eq!(result.output, "foo");
+    assert!(
+        permission_requests(&result.events).is_empty(),
+        "both segments allowed means no prompt"
+    );
+}

@@ -60,10 +60,10 @@ local function strip_html(html)
   return result:match("^%s*(.-)%s*$")
 end
 
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   max_response_bytes = {
     default = 5 * 1024 * 1024,
     min = 1024,
@@ -76,7 +76,7 @@ local function web_view_opts(ctx)
   return { max_lines = (tol and tol.web) or 3, keep = "head" }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "webfetch",
   kind = "fetch",
   permission = "net",
@@ -122,7 +122,7 @@ maki.api.register_tool({
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local resp, err = maki.net.request(url, {
+    local resp, err = makima.net.request(url, {
       timeout = input.timeout or 30,
       max_bytes = opts.max_response_bytes,
       headers = {
@@ -141,12 +141,18 @@ maki.api.register_tool({
     if ct:find("^image/") and not ct:find("svg") then
       return { llm_output = "error: image content cannot be displayed as text", is_error = true }
     end
+    -- Text never has NUL, PDFs and zips almost always do. The model can act on this error,
+    -- not on a page of U+FFFD.
+    if resp.body:find("\0", 1, true) then
+      return { llm_output = "error: binary content (" .. ct .. ") cannot be displayed as text", is_error = true }
+    end
 
-    local body = resp.body
+    -- Decode before truncating, so the cut counts final bytes and not legacy ones that triple.
+    local body = makima.text.to_utf8(resp.body)
     local is_html = ct:find("text/html") ~= nil
 
     if fmt == "markdown" and is_html then
-      local converted = maki.text.html_to_markdown(body)
+      local converted = makima.text.html_to_markdown(body)
       body = converted or body
     elseif fmt == "text" and is_html then
       body = strip_html(body)

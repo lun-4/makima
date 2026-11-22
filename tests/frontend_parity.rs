@@ -2,7 +2,7 @@
 //! provider the same thing for the same scenario. Runs the real binary
 //! against a loopback OpenAI-compatible server and inspects the request
 //! bodies. The scenarios: session defaults (`always_thinking` from
-//! `maki.setup`, and the saved `/thinking` preference ahead of it), a model
+//! `makima.setup`, and the saved `/thinking` preference ahead of it), a model
 //! switch between turns through each frontend's own mechanism, a mode set by
 //! a Lua command, and a Lua command whose UI round-trip answers "no UI" at
 //! once. SDK and ACP must also finish a turn whose input ended right after
@@ -11,7 +11,7 @@
 //! on, and fold a message sent mid-turn into the running turn; a resumed SDK
 //! session comes back in the mode it was saved in.
 //!
-//! The TUI cannot join without a pty. Its in-process tests in maki-ui check
+//! The TUI cannot join without a pty. Its in-process tests in makima-ui check
 //! the same scenarios at the provider:
 //! `event_loop::tests::live_session_requests_remain_independent_during_changes_and_restore`
 //! (model switch between turns),
@@ -34,11 +34,11 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use maki_agent::ToolOutput;
-use maki_lua::ui_sink::NO_UI_ERR;
-use maki_providers::{Message, TokenUsage};
-use maki_storage::StateDir;
-use maki_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
+use makima_agent::ToolOutput;
+use makima_lua::ui_sink::NO_UI_ERR;
+use makima_providers::{Message, TokenUsage};
+use makima_storage::StateDir;
+use makima_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -84,7 +84,7 @@ const PROMPT: &str = "say ok";
 const HIGH: &str = "high";
 const LOW: &str = "low";
 const OFF_EFFORT: &str = "none";
-const APP_DIR: &str = "makima";
+const APP_DIR: &str = makima_storage::paths::APP_NAME;
 const PREFS_FILE: &str = "prefs.json";
 const CATALOG_CACHE_FILE: &str = "models-dev-catalog.json";
 /// Any request that leaves loopback dies here instead of reaching the network.
@@ -254,7 +254,7 @@ impl Scenario {
                 let plans = home
                     .join(".local/state")
                     .join(APP_DIR)
-                    .join(maki_storage::plans::PLANS_DIR);
+                    .join(makima_storage::plans::PLANS_DIR);
                 assert!(
                     system_text(body).contains(plans.to_string_lossy().as_ref()),
                     "the plan file is not in {}",
@@ -950,7 +950,7 @@ fn write_config(home: &Path, base_url: &str, setup: Setup) {
         .unwrap_or_default();
     std::fs::write(
         config.join("init.lua"),
-        format!("maki.setup({{ {always} }})\n{}", parity_commands()),
+        format!("makima.setup({{ {always} }})\n{}", parity_commands()),
     )
     .unwrap();
 
@@ -976,7 +976,7 @@ local function prompt(ctx, text)
   local _, err = assert(assert(ctx:agent()):send(ctx, text, {{ when = "idle" }})):wait(ctx)
   assert(err == nil, tostring(err))
 end
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{SWITCH_COMMAND}", tui_only = false,
   handler = function(_, ctx)
     prompt(ctx, "{FIRST}")
@@ -984,44 +984,44 @@ maki.api.register_command({{
     prompt(ctx, "{SECOND}")
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{PLAN_COMMAND}", tui_only = false, arguments = {{ raw = true }},
   handler = function(opts, ctx)
     assert(assert(ctx:agent()):set_mode(ctx, "plan"))
     if opts.args ~= "" then prompt(ctx, opts.args) end
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local child = assert(maki.agent.spawn(ctx, {{ auto_deliver = false }}))
+    local child = assert(makima.agent.spawn(ctx, {{ auto_deliver = false }}))
     local _, err = assert(child:send(ctx, "{ASK_PROMPT}", {{ when = "idle" }})):wait(ctx)
     assert(err == nil, tostring(err))
     child:close(ctx)
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{BACKGROUND_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local child = assert(maki.agent.spawn(ctx, {{}}))
+    local child = assert(makima.agent.spawn(ctx, {{}}))
     assert(child:send(ctx, "{BACKGROUND_PROMPT}", {{ when = "join" }}))
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{PARITY_THINKING_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    assert(maki.api.run_command(ctx, "{THINKING_COMMAND}"))
+    assert(makima.api.run_command(ctx, "{THINKING_COMMAND}"))
     prompt(ctx, "{PROMPT}")
   end,
 }})
-maki.api.register_command({{
+makima.api.register_command({{
   name = "{UI_COMMAND}", tui_only = false,
   handler = function(_, ctx)
-    local _, err = maki.fn.winsaveview()
+    local _, err = makima.fn.winsaveview()
     prompt(ctx, "{UI_ANSWER}" .. tostring(err))
   end,
 }})

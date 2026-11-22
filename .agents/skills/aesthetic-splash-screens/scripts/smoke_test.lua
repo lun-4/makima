@@ -1,22 +1,22 @@
 #!/usr/bin/env lua5.1
--- Contract + perf smoke test for maki splashes, no maki build needed.
+-- Contract + perf smoke test for makima splashes, no makima build needed.
 --
 -- Usage:
 --   lua5.1 smoke_test.lua [--dir DIR] [--sizes WxH[,WxH...]] name [name...]
 --
 -- Each name is a splash module name (kaleidoscope) resolved in DIR
--- (default ~/.config/maki/lua), or a path to a .lua file.
+-- (default ~/.config/makima/lua), or a path to a .lua file.
 --
 -- Checks per splash, per size, per time step:
 --   * render returns exactly h rows
 --   * each row's seg.glyphs concatenate to exactly w terminal cells
 --     (UTF-8 aware: multi-byte glyphs count once)
 --   * the frame is not entirely blank
--- Then prints ms/frame at 80x24 (lua5.1, no jit: maki's luau-jit is ~5x
+-- Then prints ms/frame at 80x24 (lua5.1, no jit: makima's luau-jit is ~5x
 -- faster, so treat this as a pessimistic bound; 2-3 ms is the norm for
 -- full-cell splashes, up to ~20 ms is tolerable).
 
-local DIR = os.getenv("HOME") .. "/.config/maki/lua"
+local DIR = os.getenv("HOME") .. "/.config/makima/lua"
 local SIZES = { { 80, 24 }, { 40, 12 }, { 120, 40 } }
 
 local names = {}
@@ -45,7 +45,7 @@ end
 
 package.path = DIR .. "/?.lua;" .. package.path
 
-_G.maki = {
+_G.makima = {
   ui = { theme_color = function() return nil end },
   version = function() return { current = "0.0.0-test" } end,
   api = {

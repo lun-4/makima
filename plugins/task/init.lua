@@ -1,8 +1,8 @@
 -- Async tasks retain exact turn tickets, not invocation authority.
 -- Completion delivery belongs to the runtime; a wait in the parent's own turn withdraws it.
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
-local plan_spec = require("maki.plan_spec")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
+local plan_spec = require("makima.plan_spec")
 
 local MAX_RETAINED_TASKS = 128
 local MAX_RETAINED_TURNS = 64
@@ -16,6 +16,11 @@ local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
 local TURN_WAIT_TIMEOUT = "agent turn wait timed out"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
+local QUOTE_BAR = "│ "
+local SEND_FAILED_PREFIX = "Send failed: "
+local SPAWN_FAILED_PREFIX = "Spawn failed: "
+local DESPAWN_FAILED_PREFIX = "Despawn failed: "
+local DETAILS_HINT = "Details (click to expand)"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
@@ -61,10 +66,10 @@ Report findings classified by severity (critical / high / medium / low), quoting
 
 ]] .. plan_spec
 
-local opts = maki.api.register_options({
+local opts = makima.api.register_options({
   allow_model = {
-    default = false,
-    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+    default = true,
+    desc = "Expose a `model` input that overrides the subagent model. Only disable if you do not trust callers to pick an exact model themselves.",
   },
 })
 
@@ -101,8 +106,8 @@ local spawn_schema = {
   },
 }
 
--- Only advertise `model` when the plugin opts in: it costs tokens in every
--- task schema, and an off-by-default flag keeps the common path lean.
+-- Advertise `model` by default; disabling it keeps the task schema lean at the
+-- cost of dropping exact-model requests for subagents.
 if opts.allow_model then
   spawn_schema.properties.model = {
     type = "string",
@@ -138,7 +143,7 @@ local function prepare(input, ctx)
     return nil, { llm_output = GENERAL_BLOCKED_IN_PLAN_ERR, is_error = true }
   end
 
-  local model, model_err = maki.agent.resolve_model(ctx, {
+  local model, model_err = makima.agent.resolve_model(ctx, {
     tier = input.model_tier,
     spec = opts.allow_model and input.model or nil,
   })
@@ -153,7 +158,7 @@ local function prepare(input, ctx)
     system = PLAN_REVIEWER_PROMPT
   else
     local prompt_id = subagent_type == "research" and "research" or "general"
-    system, system_err = maki.agent.system_prompt(ctx, {
+    system, system_err = makima.agent.system_prompt(ctx, {
       prompt_id = prompt_id,
       instructions = true,
     })
@@ -162,7 +167,7 @@ local function prepare(input, ctx)
     return nil, { llm_output = system_err, is_error = true }
   end
 
-  local tool_defs, tools_err = maki.agent.tools(ctx, {
+  local tool_defs, tools_err = makima.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
   })
@@ -210,7 +215,7 @@ local function project_result(result)
 end
 
 local function spawn_agent(ctx, options)
-  local agent, err = maki.agent.spawn(ctx, options)
+  local agent, err = makima.agent.spawn(ctx, options)
   if not agent then
     return nil, err
   end
@@ -320,10 +325,10 @@ local function spawn(spec, input, ctx)
   while i <= #task_order do
     local id = task_order[i]
     local task = tasks[id]
-    if not task or task.owner:_maki_retired() then
+    if not task or task.owner:_makima_retired() then
       tasks[id] = nil
       table.remove(task_order, i)
-    elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_maki_can_control() then
+    elseif #task_order >= MAX_RETAINED_TASKS and task.owner:_makima_can_control() then
       if task.closed or task.turns:idle(ctx) then
         task.agent:close(ctx)
         tasks[id] = nil
@@ -347,7 +352,7 @@ local function spawn(spec, input, ctx)
   if not agent then
     return nil, turns
   end
-  local task_id = agent:_maki_session_id()
+  local task_id = agent:_makima_session_id()
   if tasks[task_id] then
     agent:close(ctx)
     return nil, "duplicate task_id"
@@ -355,7 +360,8 @@ local function spawn(spec, input, ctx)
   local task = {
     agent = agent,
     turns = turns,
-    owner = agent:_maki_task_owner(ctx),
+    owner = agent:_makima_task_owner(ctx),
+    description = input.description,
     closed = false,
     writes = spec.subagent_type == "general",
   }
@@ -371,21 +377,17 @@ local function spawn(spec, input, ctx)
   return { task_id = task_id, turn_id = admitted }, nil
 end
 
--- task_spawn -----------------------------------------------------------------
+local function rendered_reply(rendered, output, is_error, state)
+  rendered.llm_output = output
+  rendered.is_error = is_error
+  rendered.state = state
+  return rendered
+end
 
-local function spawn_handler(input, ctx)
-  local spec, err = prepare(input, ctx)
-  if err then
-    return err
-  end
-  local ok, task_id, spawn_err = pcall(spawn, spec, input, ctx)
-  if not ok then
-    return { llm_output = tostring(task_id), is_error = true }
-  end
-  if spawn_err then
-    return { llm_output = spawn_err, is_error = true }
-  end
-  return { llm_output = maki.json.encode(task_id) }
+local function label_buf(text)
+  local buf = makima.ui.buf()
+  buf:line(text)
+  return buf
 end
 
 local function resolve_task(task_id)
@@ -393,10 +395,235 @@ local function resolve_task(task_id)
   if not task then
     return nil, UNKNOWN_TASK_ERR
   end
-  if not task.owner:_maki_can_control() then
+  if not task.owner:_makima_can_control() then
     return nil, TASK_ACCESS_ERR
   end
   return task, nil
+end
+
+-- task_despawn ---------------------------------------------------------------
+
+local despawn_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = { type = "string", description = "Task id returned by task_spawn." },
+  },
+}
+
+local stop_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = {
+      type = "string",
+      description = "Task id returned by task_spawn, or the call id of a tool moved to the background.",
+    },
+  },
+}
+
+local wait_schema = {
+  type = "object",
+  required = { "task_id" },
+  additionalProperties = false,
+  properties = {
+    task_id = { type = "string", description = "Task id returned by task_spawn." },
+    turn_id = { type = "string", description = "Exact admitted turn. Omit to snapshot the latest retained turn once." },
+    timeout = {
+      type = "integer",
+      description = "Observation timeout in seconds. Zero checks without waiting; timeout never cancels work.",
+    },
+  },
+}
+
+local function wait_label(input, state)
+  if state and state.description then
+    return state.description
+  end
+  return input.task_id:sub(-8)
+end
+
+-- Shows {text} as plain lines at once and swaps in its Markdown rendering
+-- from a background task, then calls {on_rendered} so the caller redraws.
+-- Rendering hops to the highlight thread, which a busy machine can make slow,
+-- so a tool call must never wait on it. Unfinished so callers can append a
+-- fallback line before `view:finish()`. A `prefix` span starts every line,
+-- narrowing the wrap width to fit it.
+local function markdown_preview(text, ctx, prefix, on_rendered)
+  local tol = ctx and ctx:tool_output_lines()
+  local preview = makima.ui.buf()
+  local view = ToolView.new(preview, {
+    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+  })
+  if type(text) ~= "string" or text == "" then
+    return preview, view
+  end
+  local function append_lines(lines)
+    for _, line in ipairs(lines) do
+      if prefix then
+        table.insert(line, 1, { prefix, "dim" })
+      end
+      view:append(line)
+    end
+  end
+  local plain = {}
+  for _, line in ipairs(makima.split(text, "\n")) do
+    plain[#plain + 1] = { { line } }
+  end
+  append_lines(plain)
+  local prefix_cols = prefix and utf8.len(prefix) or 0
+  local width = math.max(makima.ui.terminal_size().cols - BODY_INDENT_COLS - prefix_cols, MIN_MD_WIDTH)
+  makima.async.run(function()
+    local ok, lines = pcall(makima.ui.markdown, text, width)
+    if not ok then
+      return
+    end
+    view:clear()
+    append_lines(lines)
+    view:finish()
+    on_rendered()
+  end)
+  return preview, view
+end
+
+local function details_view(status, style, preview, view, details)
+  local buf = makima.ui.buf()
+  local function render()
+    buf:set_lines({ { { status, style } } })
+    if preview:len() > 0 then
+      buf:line("")
+      buf:lines(preview:get_lines())
+    end
+    if view.expanded then
+      buf:line("")
+      for _, detail in ipairs(details) do
+        buf:line({ { detail, "dim" } })
+      end
+    elseif view.skipped < 2 then
+      buf:line({ { DETAILS_HINT, "dim" } })
+    end
+  end
+  render()
+  buf:on("click", function()
+    view:toggle()
+    render()
+  end)
+  return buf, render
+end
+
+local function wait_view(input, output, is_error, ctx, state)
+  local decoded = not is_error and makima.json.decode(output) or nil
+  local envelope = type(decoded) == "table" and decoded or {}
+  local result = type(envelope.result) == "table" and envelope.result or {}
+  local status, style, report = "Completed", "dim", result.text
+  if is_error then
+    local errors = {
+      [TURN_UNAVAILABLE_ERR] = "Cannot retrieve this turn: its result is no longer retained.",
+      [UNKNOWN_TASK_ERR] = "Cannot retrieve this task: it is no longer available.",
+      [TASK_ACCESS_ERR] = "Cannot retrieve this task: it belongs to another agent branch.",
+    }
+    status, style = errors[output] and (errors[output] .. " (" .. output .. ")") or ("Wait failed: " .. output), "error"
+  elseif envelope.status == "running" then
+    status = "Still running when checked. The wait timed out; the task was not cancelled."
+  elseif result.status == "cancelled" then
+    status, style =
+      "Subagent cancelled: " .. tostring(result.error or result.cancellation_reason or "cancelled"), "error"
+  elseif envelope.error or result.error or result.status == "failed" then
+    local err = result.user_message or result.error or envelope.error or "unknown error"
+    status, style = "Subagent failed: " .. tostring(err), "error"
+  elseif envelope.status ~= "done" then
+    status, report = "Wait result", output
+  end
+  if type(result.duration_ms) == "number" then
+    status = status .. " · " .. makima.ui.humantime(result.duration_ms / 1000)
+  end
+
+  local redraw
+  local preview, view = markdown_preview(report, ctx, nil, function()
+    redraw()
+  end)
+  if (type(report) ~= "string" or report == "") and envelope.status == "done" and style ~= "error" then
+    view:append({
+      { result.captured ~= nil and "Structured result available in details." or "No report returned.", "dim" },
+    })
+  end
+  view:finish()
+
+  local details = { "Task: " .. input.task_id }
+  local turn_id = result.turn_id or input.turn_id
+  if turn_id then
+    details[#details + 1] = "Turn: " .. turn_id
+  end
+  if result.input_tokens or result.output_tokens then
+    details[#details + 1] = "Tokens: "
+      .. tostring(result.input_tokens or 0)
+      .. " input, "
+      .. tostring(result.output_tokens or 0)
+      .. " output"
+  end
+  if result.captured ~= nil then
+    details[#details + 1] = "Captured: "
+      .. makima.text.truncate_line(makima.json.encode(result.captured), output_limits.DEFAULT_MAX_LINE_BYTES)
+  end
+  local body
+  body, redraw = details_view(status, style, preview, view, details)
+  return { body = body, header = label_buf(wait_label(input, state)) }
+end
+
+local function send_label(input, state)
+  if state and state.description then
+    return 'To "' .. state.description .. '"'
+  end
+  return "To " .. input.task_id:sub(-8)
+end
+
+-- Builds the quoted message before the handler admits any work and returns a
+-- finisher for the result. A child that runs while its parent is still busy
+-- can finish and have its result delivered ahead of the parent's next
+-- request. The Markdown may land while the handler waits on admission, so
+-- the body exists from the start. Clicks toggle the truncated view, and a
+-- failure line follows the quote so the user still sees what was sent.
+local function quote_view(text, ctx, failed_prefix, header_text)
+  local body = makima.ui.buf()
+  local quote, view, failure
+  local function render()
+    body:set_lines(quote:get_lines())
+    if failure then
+      body:line({ { failure, "error" } })
+    end
+  end
+  quote, view = markdown_preview(text, ctx, QUOTE_BAR, render)
+  view:finish()
+  render()
+  body:on("click", function()
+    view:toggle()
+    render()
+  end)
+  return function(output, is_error)
+    failure = is_error and failed_prefix .. output or nil
+    render()
+    return { body = body, header = label_buf(header_text) }
+  end
+end
+
+local function send_view(input, ctx, state)
+  return quote_view(input.message, ctx, SEND_FAILED_PREFIX, send_label(input, state))
+end
+
+local function spawn_view(input, ctx)
+  return quote_view(input.prompt, ctx, SPAWN_FAILED_PREFIX, input.description)
+end
+
+local function despawn_view(input, output, is_error, state)
+  local body = makima.ui.buf()
+  if is_error then
+    body:line({ { DESPAWN_FAILED_PREFIX .. output, "error" } })
+  end
+  return { body = body, header = label_buf(wait_label(input, state)) }
 end
 
 -- task_send ------------------------------------------------------------------
@@ -416,38 +643,55 @@ local send_schema = {
 
 local function send_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
+  local state = task and { description = task.description } or nil
+  local finish_view = send_view(input, ctx, state)
+  local function reply(output, is_error)
+    return rendered_reply(finish_view(output, is_error), output, is_error, state)
+  end
   if not task then
-    return { llm_output = access_err, is_error = true }
+    return reply(access_err, true)
   end
   local mode, mode_err = current_mode(ctx)
   if mode_err then
-    return { llm_output = mode_err, is_error = true }
+    return reply(mode_err, true)
   end
   if task.writes and mode == "plan" then
-    return { llm_output = GENERAL_SEND_IN_PLAN_ERR, is_error = true }
+    return reply(GENERAL_SEND_IN_PLAN_ERR, true)
   end
   local ok, err = enqueue(task, input.message, ctx)
   if not ok then
-    return { llm_output = err, is_error = true }
+    return reply(err, true)
   end
-  return { llm_output = maki.json.encode({ queued = true, turn_id = ok }) }
+  return reply(makima.json.encode({ queued = true, turn_id = ok }))
 end
 
--- task_despawn ---------------------------------------------------------------
-
-local despawn_schema = {
-  type = "object",
-  required = { "task_id" },
-  additionalProperties = false,
-  properties = {
-    task_id = { type = "string", description = "Task id returned by task_spawn." },
-  },
-}
+local function spawn_handler(input, ctx)
+  local finish_view = spawn_view(input, ctx)
+  local function reply(output, is_error)
+    return rendered_reply(finish_view(output, is_error), output, is_error)
+  end
+  local spec, err = prepare(input, ctx)
+  if err then
+    return reply(err.llm_output, true)
+  end
+  local ok, task_id, spawn_err = pcall(spawn, spec, input, ctx)
+  if not ok then
+    return reply(tostring(task_id), true)
+  end
+  if spawn_err then
+    return reply(spawn_err, true)
+  end
+  return reply(makima.json.encode(task_id))
+end
 
 local function despawn_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
+  local state = task and { description = task.description } or nil
+  local function reply(output, is_error)
+    return rendered_reply(despawn_view(input, output, is_error, state), output, is_error, state)
+  end
   if not task then
-    return { llm_output = access_err, is_error = true }
+    return reply(access_err, true)
   end
   fail_task(task, TASK_CLOSED_ERR, ctx)
   tasks[input.task_id] = nil
@@ -457,60 +701,96 @@ local function despawn_handler(input, ctx)
       break
     end
   end
-  return { llm_output = maki.json.encode({ ok = true }) }
+  return reply(makima.json.encode({ ok = true }))
 end
 
-local wait_schema = {
-  type = "object",
-  required = { "task_id" },
-  additionalProperties = false,
-  properties = {
-    task_id = { type = "string", description = "Task id returned by task_spawn." },
-    turn_id = { type = "string", description = "Exact admitted turn. Omit to snapshot the latest retained turn once." },
-    timeout = {
-      type = "integer",
-      description = "Observation timeout in seconds. Zero checks without waiting; timeout never cancels work.",
-    },
-  },
-}
+local function stop_handler(input, ctx)
+  local task = tasks[input.task_id]
+  if task then
+    if not task.owner:_makima_can_control() then
+      return { llm_output = TASK_ACCESS_ERR, is_error = true }
+    end
+    fail_task(task, TASK_CLOSED_ERR, ctx)
+    tasks[input.task_id] = nil
+    for i, id in ipairs(task_order) do
+      if id == input.task_id then
+        table.remove(task_order, i)
+        break
+      end
+    end
+    return makima.json.encode({ ok = true, task_id = input.task_id })
+  end
+  local ok, err = ctx:stop_background(input.task_id)
+  if not ok then
+    return { llm_output = "Stop failed: " .. tostring(err), is_error = true }
+  end
+  return makima.json.encode({ ok = true, task_id = input.task_id })
+end
+
+local function restore_stop(input, output, is_error, ctx)
+  local body = makima.ui.buf()
+  if is_error then
+    body:line({ { "Stop failed: " .. output, "error" } })
+  else
+    body:line({ { "Stopped " .. input.task_id, "dim" } })
+  end
+  return { body = body, header = label_buf(input.task_id) }
+end
 
 local function wait_handler(input, ctx)
   local task, access_err = resolve_task(input.task_id)
-  if not task then
-    return { llm_output = access_err, is_error = true }
+  local state = task and { description = task.description } or nil
+  local function reply(output, is_error)
+    return rendered_reply(wait_view(input, output, is_error, ctx, state), output, is_error, state)
   end
+  if not task then
+    return reply(access_err, true)
+  end
+  local waiting = makima.ui.buf()
+  waiting:line({ { wait_label(input, state), "dim" } })
+  waiting:line({ { "Waiting for the subagent…", "dim" } })
+  ctx:live_buf(waiting)
+  makima.async.on_cancel(function(reason)
+    waiting:set_lines({ { { "Wait failed: " .. reason, "error" } } })
+  end)
   local result, wait_err = task.turns:wait(ctx, input.turn_id, input.timeout)
   if wait_err == TURN_WAIT_TIMEOUT then
-    return { llm_output = maki.json.encode({ status = "running" }) }
+    return reply(makima.json.encode({ status = "running" }))
   end
   if wait_err then
-    return { llm_output = tostring(wait_err), is_error = true }
+    return reply(tostring(wait_err), true)
   end
-  return {
-    llm_output = maki.json.encode(result and {
-      status = "done",
-      result = result,
-      error = result.error,
-    } or { status = "running" }),
-  }
+  return reply(makima.json.encode(result and {
+    status = "done",
+    result = result,
+    error = result.error,
+  } or { status = "running" }))
+end
+
+local function restore_wait(input, output, is_error, ctx)
+  return wait_view(input, output, is_error, ctx, ctx:state())
+end
+
+local function restore_send(input, output, is_error, ctx)
+  return send_view(input, ctx, ctx:state())(output, is_error)
+end
+
+local function restore_spawn(input, output, is_error, ctx)
+  return spawn_view(input, ctx)(output, is_error)
+end
+
+local function task_header(input)
+  return wait_label(input, resolve_task(input.task_id))
 end
 local function header(input)
   return input.description
 end
 
--- Standalone runs render markdown on the Rust side (format = "markdown");
--- this mirrors that for restore and batch children, which build the body here.
-local function restore(_input, output, is_error, ctx)
-  local tol = ctx:tool_output_lines()
-  return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task_spawn) or DEFAULT_OUTPUT_LINES,
-    keep = "head",
-    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
-    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
-  })
+local function restore_despawn(input, output, is_error, ctx)
+  return despawn_view(input, output, is_error, ctx:state())
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "task_spawn",
   description = "Start a background subagent and return {task_id, turn_id} immediately. Observe results with task_wait, which yields the caller's turn capacity while it waits. Steer work with task_send and finish with task_despawn. Also callable from code_execution.\n\n"
     .. description,
@@ -520,23 +800,21 @@ maki.api.register_tool({
   schema = spawn_schema,
   handler = spawn_handler,
   header = header,
-  restore = restore,
+  restore = restore_spawn,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "task_wait",
   description = "Wait for one exact task turn. Omit turn_id to select the latest turn once. Messages joining that turn extend its work; the wait never follows a later turn. Returns {status, result?, error?}, with per-turn usage and duration_ms. Timeout returns running without cancelling work; zero checks without waiting. Unavailable or evicted turn IDs return turn_result_unavailable. The caller releases its turn capacity while waiting. Also callable from code_execution. See [Agent work](/docs/agent-work/#task-waits) for completion and retention rules.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   schema = wait_schema,
   handler = wait_handler,
-  header = function(input)
-    return "task_wait → " .. input.task_id
-  end,
-  restore = restore,
+  header = task_header,
+  restore = restore_wait,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "task_send",
   description = "Submit follow-up instructions to a background subagent and return { queued = true, turn_id }, or an admission error. Compatible messages join open work and share its turn_id; otherwise they start a new turn. Messages wait for the next model request, without interrupting a running request or tool. Acceptance does not mean processing. Overflow rejects only the new message. Also callable from code_execution. See [Agent work](/docs/agent-work/#messages-and-turns) for queue rules.",
   kind = "execute",
@@ -545,12 +823,12 @@ maki.api.register_tool({
   schema = send_schema,
   handler = send_handler,
   header = function(input)
-    return "task_send → " .. input.task_id
+    return send_label(input, resolve_task(input.task_id))
   end,
-  restore = restore,
+  restore = restore_send,
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "task_despawn",
   description = "Permanently close a background subagent and its descendants, discard pending work, flush its chat transcript, and release active turn permits. Unlike local UI cancellation, this retires the subtree. Returns { ok = true }. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
@@ -558,10 +836,22 @@ maki.api.register_tool({
   examples = {},
   schema = despawn_schema,
   handler = despawn_handler,
+  header = task_header,
+  restore = restore_despawn,
+})
+
+makima.api.register_tool({
+  name = "task_stop",
+  description = "Stop a background subagent or a tool call moved to the background. A moved call's final result still arrives as a message. Returns { ok = true }.",
+  kind = "execute",
+  audiences = { "main", "general_sub", "interpreter", "workflow" },
+  examples = {},
+  schema = stop_schema,
+  handler = stop_handler,
   header = function(input)
-    return "task_despawn → " .. input.task_id
+    return input.task_id
   end,
-  restore = restore,
+  restore = restore_stop,
 })
 
 local SUBAGENT_TYPES = {
@@ -571,7 +861,7 @@ local SUBAGENT_TYPES = {
 }
 local SUBAGENT_ORDER = { "research", "general", "plan_reviewer" }
 
-maki.api.register_completion_source("subagent", {
+makima.api.register_completion_source("subagent", {
   get_items = function(ctx)
     local mode = ctx.mode or "build"
     local items = {}
@@ -607,12 +897,12 @@ local function expand_subagent(ref)
   return "<subagent:" .. value .. ">", nil
 end
 
-maki.api.register_expander("subagent", expand_subagent)
-maki.api.register_expander("a", expand_subagent)
+makima.api.register_expander("subagent", expand_subagent)
+makima.api.register_expander("a", expand_subagent)
 
 -- `after_instructions` is a system-only slot, so this teaches the main agent
 -- what the token means without costing subagent prompts any tokens.
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "after_instructions",
   content = "A `<subagent:type>` token in a user message (typed as `@subagent:type`) is a delegation request: launch a subagent with task_spawn and observe it with task_wait, setting `subagent_type` to `type`.",
 })

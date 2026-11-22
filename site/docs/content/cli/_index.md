@@ -32,9 +32,12 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
-| `--max-turns`, `--session-id`, `--fork-session` | no | no | yes |
+| `--session-id`, `--fork-session` | no | no | yes |
+| `--max-turns` | no | yes | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
+
+ACP applies the global flags too, so `makima --allowed-tools read,grep --yolo acp` covers every ACP session. `--max-turns` does not apply there: an ACP server outlives one run. See [ACP](/docs/acp/).
 
 ### Shared flags (detail)
 
@@ -43,7 +46,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `-p`, `--prompt <TEXT>` | Initial prompt. Piped stdin is appended after a blank line. Use `--prompt=<TEXT>` when the text starts with `-` |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
-| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
+| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → the strong default (else medium) of the first provider in `makima auth status` order that has credentials |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue [ID]` | Continue a specific session by ID (TUI / SDK). With no ID (TUI only), opens the session picker with this directory's sessions. A following positional is taken as the ID, so run `--continue` alone to open the picker. Resuming a session stored under another directory, or one open in another terminal, is an error. In `--print` mode an ID is ignored (print mode always starts a new session) and a bare flag is an error |
 | `-l`, `--last` | Continue the most recent session in this directory (TUI / SDK only). Errors the same way if it is open in another terminal |
@@ -61,7 +64,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Session id for SDK mode |
 | `--fork-session` | Load a session's history under a new id (SDK) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt entirely |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
@@ -69,7 +72,7 @@ Pass a prompt with `-p` / `--prompt`, or pipe it on stdin. With both, stdin foll
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Makima lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names in `--allowed-tools` error out with the list of valid names; `--disallowed-tools` skips them. The opt-in edit tools (`edit_lines`, `insert_lines`, `multiedit`) are always valid names here, even while disabled; listing one does nothing until you enable the tool in config.
 
 ### Permission modes (SDK)
 
@@ -94,9 +97,15 @@ makima auth logout <provider>
 makima auth status
 ```
 
-`login` stores credentials under the state directory and can write plan / base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). OpenAI and Copilot have dedicated flows; other providers prompt for a key (and a plan when the provider has more than one). Custom providers can be created from the interactive picker.
+`login` and the TUI's `/login` run the same flow. You name a provider or pick one from the list, answer the settings it asks for (a plan, a base URL), and choose a login method. Each provider brings its own methods, such as pasting an API key, a device code in the browser for a ChatGPT login, or importing an existing Copilot token. A login alias like `openai-codex` skips the method question. Settings are written to `providers.toml` only after the login works, so a cancelled login leaves nothing behind. Credentials go to `auth/<provider>.json` in the state directory, readable only by you (paths in [Configuration](/docs/configuration/#directory-layout)). The provider's strong default becomes your model.
 
-`status` shows each provider as configured (key on disk), env-only, or missing.
+Pick **Custom provider...** to add an endpoint of your own.
+
+`logout` deletes the saved credentials and the provider's `providers.toml` section.
+
+`status` lists each provider as saved (credentials on disk), env (key from an environment variable), configured (key in `providers.toml`), error (the check failed, with the reason), or missing.
+
+The list is in the order Makima picks a default model when you have not chosen one: Anthropic, OpenAI, Copilot, Z.AI, Synthetic, DeepSeek, Regolo, then the other built-in providers, Ollama, llama.cpp and OpenCode, your own providers, and the models.dev catalog providers last. So with both `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` set, a fresh start uses Anthropic.
 
 ### `makima models`
 
@@ -105,7 +114,7 @@ makima models
 makima models --refresh    # refetch the models.dev catalog
 ```
 
-One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+One spec per line, warnings on stderr. Built-in and custom providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it and asks every provider to skip its caches. Startup reads only the cache and never waits on the network, so a provider new to the catalog shows up from the next start. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
 
 ### `makima sessions`
 

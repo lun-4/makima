@@ -7,11 +7,11 @@ group = "Reference"
 
 # Hooks
 
-Maki has two ways for Lua to react to what the agent does.
+Makima has two ways for Lua to react to what the agent does.
 
 | You want to | Use |
 | --- | --- |
-| Know that something happened | [Autocmds](/docs/lua-api/#maki-api-create_autocmd) |
+| Know that something happened | [Autocmds](/docs/lua-api/#makima-api-create_autocmd) |
 | Change what happens, or stop it | Slots |
 
 Autocmds are notifications. Many plugins can listen to one event, each callback
@@ -27,7 +27,7 @@ two plugins can layer the same point without capturing each other's function.
 
 ## Tool slots
 
-Every tool has two slots that maki fires itself, so the tool's author does not
+Every tool has two slots that makima fires itself, so the tool's author does not
 have to add a hook point. Both fire from the single function every tool call
 passes through, so builtins, MCP tools, and ACP client tools behave alike:
 
@@ -52,7 +52,7 @@ already done, so `reason` only replaces the text the model reads.
 
 `ctx` carries `tool`, `tool_id`, `session_id`, and `origin`. Origin is `"model"`
 for a call the model made and `"nested"` for one made on its behalf by `batch`,
-`code_execution`, or a plugin calling `maki.agent.call_tool`. Nested calls have
+`code_execution`, or a plugin calling `makima.agent.call_tool`. Nested calls have
 no id of their own, so their `tool_id` is empty. A subagent runs its own model,
 so its calls arrive as `"model"` under the subagent's `session_id`.
 
@@ -62,7 +62,7 @@ The model reaches for `grep -r` even when `rg` is installed. Denying costs a
 model round trip every time it happens. A rewrite fixes the command in place:
 
 ```lua
-maki.api.set_slot("tool.bash.input", function(prev, input, ctx)
+makima.api.set_slot("tool.bash.input", function(prev, input, ctx)
   local rewritten = input.command:gsub("^grep %-r ", "rg ")
   if rewritten == input.command then
     return
@@ -73,7 +73,7 @@ end)
 ```
 
 `rg` and `grep -r` do not search the same files: `rg` skips what `.gitignore`
-lists, hidden files, and binaries. That is why maki does not do this for you.
+lists, hidden files, and binaries. That is why makima does not do this for you.
 
 ### Blocking a command
 
@@ -81,7 +81,7 @@ When there is no good rewrite, stop the call and say why. The reason reaches
 the model as the tool result:
 
 ```lua
-maki.api.set_slot("tool.bash.input", function(prev, input, ctx)
+makima.api.set_slot("tool.bash.input", function(prev, input, ctx)
   if input.command:find("git push %-%-force") then
     return nil, "Force pushing is not allowed here. Open a PR instead."
   end
@@ -97,7 +97,7 @@ it drops is never paid for again:
 ```lua
 local MAX = 200
 
-maki.api.set_slot("tool.bash.output", function(prev, out, ctx)
+makima.api.set_slot("tool.bash.output", function(prev, out, ctx)
   local lines = {}
   for line in out.text:gmatch("[^\n]+") do
     if not line:match("^%s*Compiling ") then
@@ -177,9 +177,9 @@ means, tell the model by appending a line in the output layer.
 chain that hands back the value it was given leaves the original untouched.
 
 **JSON null arrives as `nil`.** A Lua table cannot hold a null, so a null field
-and a field that was never there look the same inside a layer. Maki carries
+and a field that was never there look the same inside a layer. Makima carries
 nulls across for you, which is what makes an untouched value a true no-op. The
-cost: you cannot delete a field whose value is null, because maki cannot tell
+cost: you cannot delete a field whose value is null, because makima cannot tell
 that apart from leaving it alone. Set it to another value, or deny the call.
 
 ## Wrapping every tool
@@ -196,8 +196,8 @@ local function redact(prev, out, ctx)
   return prev(out, ctx)
 end
 
-for _, tool in ipairs(maki.api.get_tools()) do
-  maki.api.set_slot("tool." .. tool.name .. ".output", redact)
+for _, tool in ipairs(makima.api.get_tools()) do
+  makima.api.set_slot("tool." .. tool.name .. ".output", redact)
 end
 ```
 
@@ -213,30 +213,30 @@ accepts a name before anything registers it.
 ## Plugin slots
 
 A plugin can define an extension point of its own with
-[`declare_slot`](/docs/lua-api/#maki-api-declare_slot). The declaring plugin
+[`declare_slot`](/docs/lua-api/#makima-api-declare_slot). The declaring plugin
 owns the name and supplies the default, and anyone can wrap it with `set_slot`:
 
 ```lua
 -- owner
-local render = maki.api.declare_slot("myplugin.render", function(text)
+local render = makima.api.declare_slot("myplugin.render", function(text)
   return text:upper()
 end)
 
 -- anyone
-maki.api.set_slot("myplugin.render", function(prev, text)
+makima.api.set_slot("myplugin.render", function(prev, text)
   return "[" .. prev(text) .. "]"
 end)
 
 -- render("hi") now returns "[HI]"
 ```
 
-Names starting with `tool.` are reserved for maki, which fires them at points
+Names starting with `tool.` are reserved for makima, which fires them at points
 whose ordering it guarantees.
 
-Use `maki.api.get_slots()` to see who owns and who wraps each slot.
+Use `makima.api.get_slots()` to see who owns and who wraps each slot.
 
 ## Limits
 
-A layer has no agent context, so `maki.agent.call_tool` and
-`maki.agent.spawn` are out of reach inside one. Read files, run jobs, and
+A layer has no agent context, so `makima.agent.call_tool` and
+`makima.agent.spawn` are out of reach inside one. Read files, run jobs, and
 decide from those.

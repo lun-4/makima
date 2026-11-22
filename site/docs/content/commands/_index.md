@@ -9,7 +9,7 @@ group = "Reference"
 
 Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`Agent:send`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt.
 
-The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
+The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `makima auth` are separate from slash commands.
 
 ## Built-in commands
 
@@ -28,7 +28,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/cd` | Change working directory. Quote paths containing spaces. | typed | [path] | all |
 | `/btw` | Ask a quick question (no tools, no history pollution) | raw (required) | <question> | all |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) | none |  | all |
-| `/fast` | Toggle fast mode (Anthropic Opus or Codex subscription models) | none |  | all |
+| `/fast` | Toggle fast mode on models that offer it | none |  | all |
 | `/workflow` | Toggle workflow mode (task tools callable inside code_execution) | none |  | all |
 | `/exit` | Exit the application | none |  | TUI only |
 | `/reload` | Reload plugins and config | none |  | TUI only |
@@ -79,13 +79,13 @@ Completion callbacks receive the typed argument name as `ctx.argument`, its type
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. The picker lists this directory's sessions; a session open in another terminal is greyed out and cannot be opened from here. When a background session finishes or needs input, Makima flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete.
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. The picker lists this directory's sessions; a session open in another terminal is greyed out and cannot be opened from here. When a background session finishes or needs input, Makima flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete. Deleting the current session moves you to another one and keeps the picker open.
 
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
 - **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`.
-- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
+- **`/fast`**: toggle fast mode when the selected model reports support for it. Availability can depend on the provider, model, and signed-in account. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the task tools (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Shift+Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
@@ -128,7 +128,7 @@ For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`.
 
 ## Aliasing commands
 
-Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+Prefer a different name for a command? `makima.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
 -- ~/.config/makima/init.lua
@@ -138,19 +138,19 @@ local aliases = {
 }
 
 for _, alias in ipairs(aliases) do
-    maki.api.register_command({
+    makima.api.register_command({
         name = alias.name,
         description = alias.description,
         handler = function()
-            local ok, err = maki.api.run_command(alias.target)
+            local ok, err = makima.api.run_command(alias.target)
             if not ok then
-                maki.ui.flash("could not run " .. alias.target .. ": " .. err)
+                makima.ui.flash("could not run " .. alias.target .. ": " .. err)
             end
         end,
     })
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `maki.ui.action` instead. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name.
+Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for commands that finish in their handler, such as `/new`, `/sessions`, `/cd` and plugin commands. A command that starts a model turn (custom Markdown commands, MCP prompts), `/compact` and `/btw` report an error from inside another command's handler; bind those to a key with `makima.ui.action` instead. See [`makima.api.run_command`](/docs/lua-api/#makima-api-run_command) for matching and error handling, or [`makima.ui.action`](/docs/lua-api/#makima-ui-action) to bind a key instead of a name.
 
 Related: [CLI](/docs/cli/) for shell flags and subcommands, [Skills](/docs/skills/) for on-demand playbooks.

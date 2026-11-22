@@ -1,11 +1,11 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
 -- sees (via the `describe(dctx)` callback), and the preamble. The sandbox and
--- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
--- `maki.agent.call_tool`); orchestration policy is here.
+-- dispatch live in Rust, which exposes primitives only (`makima.api.get_tools`,
+-- `makima.agent.call_tool`); orchestration policy is here.
 
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
-local partial = require("maki.partial")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
+local partial = require("makima.partial")
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
@@ -60,7 +60,7 @@ local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 30,
     min = 5,
@@ -77,9 +77,9 @@ end
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
 local function build_body(ctx, code)
-  local lines = maki.split(code:gsub("\n+$", ""), "\n")
+  local lines = makima.split(code:gsub("\n+$", ""), "\n")
   local hl
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = new_view(ctx, buf)
 
   local function header()
@@ -108,7 +108,7 @@ local function build_body(ctx, code)
   end)
 
   local function highlight()
-    local highlighted = maki.ui.highlight(table.concat(lines, "\n"), "py")
+    local highlighted = makima.ui.highlight(table.concat(lines, "\n"), "py")
     if highlighted then
       hl = highlighted
       view:set_header(header())
@@ -231,7 +231,7 @@ end
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
   local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
+  for _, t in ipairs(interpreter_tools(makima.api.get_tools(), dctx.audience, dctx.workflow)) do
     if matches_filter(t.name, dctx) then
       has_workflow_only = has_workflow_only or t.workflow_only
       parts[#parts + 1] = signature(t) .. "\n"
@@ -256,11 +256,12 @@ local function start(input, ctx)
 end
 
 local function handler(input, ctx)
+  local started_at = os.time()
   local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
-  maki.async.run(highlight)
+  makima.async.run(highlight)
 
   view:append({ { "Waiting for output...", "dim" } })
 
@@ -278,7 +279,7 @@ local function handler(input, ctx)
   local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
   local function cut(reason)
-    return partial.cut(view, table.concat(output_parts, "\n"), reason, timeout, {
+    return partial.cut(view, table.concat(output_parts, "\n"), reason, timeout, started_at, {
       preview = "head_tail",
       max_lines = max_lines,
       max_bytes = max_bytes,
@@ -287,14 +288,14 @@ local function handler(input, ctx)
 
   -- Only for a handler still parked when the host gives up on it: normally
   -- the interpreter sees the cancel and we return the partial reply below.
-  maki.async.on_cancel(function(reason)
+  makima.async.on_cancel(function(reason)
     ctx:finish(cut(reason))
   end)
 
   -- Registry, MCP and host tools in one list, already filtered by
   -- `disabled_tools`, each entry carrying the audience of the tool a call to
   -- that name would really reach.
-  local callable, callable_err = maki.agent.callable_tools(ctx)
+  local callable, callable_err = makima.agent.callable_tools(ctx)
   if callable_err then
     return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
   end
@@ -305,12 +306,12 @@ local function handler(input, ctx)
     if bind:match(PY_IDENTIFIER) then
       local call_opts = t.workflow_only and {} or { timeout = timeout }
       tools[bind] = function(tool_input)
-        return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+        return makima.agent.call_tool(ctx, name, tool_input, call_opts)
       end
     end
   end
 
-  local result, err = maki.interpreter.run(input.code, {
+  local result, err = makima.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
     preamble = PREAMBLE,
@@ -375,7 +376,7 @@ local function restore(input, output, is_error, ctx)
   return buf
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "code_execution",
   description = description,
   describe = describe,
@@ -390,7 +391,7 @@ maki.api.register_tool({
   restore = restore,
 })
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "efficient_tools",
   content = "code_execution",
 })

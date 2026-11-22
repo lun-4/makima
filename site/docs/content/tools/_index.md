@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 25 built-in tools in this reference (24 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -18,6 +18,7 @@ Commands run in <cwd> by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `background` | boolean | no |  | Run in the background and return at once; the result arrives as a message when it ends. |
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
 | `timeout` | integer | no | 120 | Execution timeout in seconds |
@@ -177,6 +178,7 @@ Start a background subagent and return {task_id, turn_id} immediately. Observe r
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
+| `model` | string | no | Exact model spec, e.g. "ollama/glm-5.2". You tell makima the model; makima will not guess. Overrides model_tier. |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
 | `output_schema` | object | no | JSON Schema the subagent's final result must match. task_wait returns the validated object in result.captured; result.text contains assistant text. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
@@ -210,6 +212,14 @@ Permanently close a background subagent and its descendants, discard pending wor
 |-----------|------|----------|-------------|
 | `task_id` | string | yes | Task id returned by task_spawn. |
 
+### `task_stop` {#task_stop}
+
+Stop a background subagent or a tool call moved to the background. A moved call's final result still arrives as a message. Returns { ok = true }.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task_id` | string | yes | Task id returned by task_spawn, or the call id of a tool moved to the background. |
+
 ### `todo_write` {#todo_write}
 
 Create or update a structured todo list to track tasks.
@@ -231,7 +241,7 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 ### `skill` {#skill}
 
-Load a skill that provides instructions and workflows for specific tasks.
+Load a skill that provides instructions and workflows for specific tasks. When the user message names a skill, load it with this tool, even if it is not in the list below.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

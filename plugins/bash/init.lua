@@ -1,7 +1,7 @@
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
 local bh = require("bash_helpers")
-local partial = require("maki.partial")
+local partial = require("makima.partial")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
@@ -19,12 +19,10 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fprintf ",
 }
 local SEPARATOR = "──────"
+local SHELL = makima.env.shell()
+local IS_BASH = SHELL == "bash"
 
 local rtk_available
-
-local function shell_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
 
 local function unquote(s)
   local q = s:sub(1, 1)
@@ -54,7 +52,7 @@ end
 
 local function relative_path(p)
   local np = normalize_sep(p)
-  local cwd = maki.uv.cwd()
+  local cwd = makima.uv.cwd()
   if cwd then
     cwd = normalize_sep(cwd)
     if np:sub(1, #cwd + 1) == cwd .. "/" then
@@ -65,7 +63,7 @@ local function relative_path(p)
       return "."
     end
   end
-  local home = maki.uv.os_homedir()
+  local home = makima.uv.os_homedir()
   if home then
     home = normalize_sep(home)
     if np:sub(1, #home + 1) == home .. "/" then
@@ -78,7 +76,7 @@ end
 
 local function build_header_lines(command, annotation)
   local header = {}
-  local highlighted = maki.ui.highlight(command, "bash")
+  local highlighted = makima.ui.highlight(command, "bash")
   if highlighted then
     for _, line in ipairs(highlighted) do
       header[#header + 1] = line
@@ -107,17 +105,21 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and not config.rtk then
+  if not IS_BASH or (config and not config.rtk) then
     return nil
   end
 
   if rtk_available == nil then
-    local id = maki.fn.jobstart("rtk --version")
-    local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+    local ok, id = pcall(makima.fn.jobstart, { "rtk", "--version" })
+    if not ok then
+      rtk_available = false
+      return nil
+    end
+    local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
     if result then
       rtk_available = (result.exit_code == 0)
     else
-      maki.fn.jobstop(id)
+      makima.fn.jobstop(id)
       rtk_available = false
     end
   end
@@ -131,10 +133,10 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local id = maki.fn.jobstart("rtk rewrite " .. shell_quote(command))
-  local result = maki.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
+  local id = makima.fn.jobstart({ "rtk", "rewrite", command })
+  local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
   if not result then
-    maki.fn.jobstop(id)
+    makima.fn.jobstop(id)
     return nil
   end
 
@@ -161,7 +163,7 @@ end
 
 local function create_bash_view(command, ctx, annotation)
   local tol = ctx:tool_output_lines()
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.bash) or 5,
     keep = "tail",
@@ -174,7 +176,7 @@ local function create_bash_view(command, ctx, annotation)
   return buf, view
 end
 
-local cwd = maki.uv.cwd() or "."
+local cwd = makima.uv.cwd() or "."
 
 local COMPLEX_TYPES = {
   command_substitution = true,
@@ -214,7 +216,7 @@ local WALK_THROUGH_TYPES = {
 }
 
 local function node_text(node, source)
-  return maki.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
+  return makima.treesitter.get_node_text(node, source):match("^%s*(.-)%s*$")
 end
 
 -- Anything we don't walk through becomes one scope, its own text. That covers
@@ -255,17 +257,22 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+local description = [[Execute a ]]
+  .. SHELL
+  .. [[ command.
+Commands run in ]]
+  .. cwd
+  .. [[ by default.
 
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output beyond 2000 lines or 50KB is saved to a file; the result shows its start and end and gives the path.
+- Use `background = true` for long builds, tests, or servers; the call returns at once and the result arrives as a message.
 - Interactive commands (sudo, ssh prompts) fail immediately.]]
 
-local opts = maki.api.register_options(output_limits.extend({
+local opts = makima.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 120,
     min = 5,
@@ -285,11 +292,16 @@ local opts = maki.api.register_options(output_limits.extend({
     min = 5,
     desc = "Stop the auto-mode classifier after this many seconds and fall back to normal permission handling.",
   },
+  background_on_timeout = {
+    default = false,
+    type = "boolean",
+    desc = "Move a command that hits its timeout to the background instead of killing it.",
+  },
 }))
 
 local AUTO_MODE = "bash.auto_mode"
 
-maki.api.register_session_option({
+makima.api.register_session_option({
   id = AUTO_MODE,
   name = "Bash auto mode",
   description = "Classify every bash command before executing it",
@@ -302,7 +314,7 @@ maki.api.register_session_option({
   persistent = true,
 })
 
--- Sessionless contexts (`maki index`, an embedding host with no coordinator)
+-- Sessionless contexts (`makima index`, an embedding host with no coordinator)
 -- have no session options. They still run bash, so fall back to the
 -- configured default rather than refusing to execute.
 local function auto_mode_enabled(options)
@@ -327,30 +339,30 @@ local function session_options(ctx)
   return config.options, nil
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/automode",
   description = "Toggle bash auto mode (classifier gates every bash command)",
   tui_only = false,
   handler = function(_, ctx)
     local agent, err = ctx and ctx:agent()
     if not agent then
-      maki.ui.flash(err or "no agent")
+      makima.ui.flash(err or "no agent")
       return
     end
     local config
     config, err = agent:config(ctx)
     if not config then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       return
     end
     local value = auto_mode_enabled(config.options) and "disabled" or "enabled"
     local ok
     ok, err = agent:set_option(ctx, AUTO_MODE, value)
     if not ok then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       return
     end
-    maki.ui.flash("auto mode: " .. (value == "enabled" and "on" or "off"))
+    makima.ui.flash("auto mode: " .. (value == "enabled" and "on" or "off"))
   end,
 })
 
@@ -359,7 +371,16 @@ local function command_scopes(command)
     return nil
   end
 
-  local parser = maki.treesitter.get_parser(command, "bash")
+  if not IS_BASH then
+    local scopes = { scopes = { command }, force_prompt = not bh.is_simple_windows_command(SHELL, command) }
+    if SHELL == "powershell" and not scopes.force_prompt then
+      local target = bh.qualify_powershell_command(command)
+      scopes.deny_scopes = { target, target:match("^[^\\]+\\(.+)$") }
+    end
+    return scopes
+  end
+
+  local parser = makima.treesitter.get_parser(command, "bash")
   if not parser then
     return { scopes = { command }, force_prompt = true }
   end
@@ -376,7 +397,7 @@ local function command_scopes(command)
   return { scopes = segments, force_prompt = false }
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "bash",
   kind = "execute",
   description = description,
@@ -388,10 +409,21 @@ maki.api.register_tool({
       timeout = { type = "integer", description = "Execution timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
+      background = {
+        type = "boolean",
+        description = "Run in the background and return at once; the result arrives as a message when it ends.",
+      },
     },
   },
   permission_scopes = function(input, ctx)
     if ctx and ctx.session_id and auto_mode_enabled(ctx.options) then
+      if SHELL == "powershell" then
+        local scopes = command_scopes(input.command)
+        if scopes and scopes.deny_scopes then
+          table.insert(scopes.deny_scopes, 1, input.command)
+          return { scopes = {}, deny_scopes = scopes.deny_scopes }
+        end
+      end
       return nil
     end
     return command_scopes(input.command)
@@ -404,8 +436,8 @@ maki.api.register_tool({
       s = s .. " in " .. relative_path(workdir)
     end
     if input.timeout then
-      local buf = maki.ui.buf()
-      buf:line({ { s }, { " (" .. maki.ui.humantime(input.timeout) .. " timeout)", "dim" } })
+      local buf = makima.ui.buf()
+      buf:line({ { s }, { " (" .. makima.ui.humantime(input.timeout) .. " timeout)", "dim" } })
       return buf
     end
     return s
@@ -442,6 +474,7 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
+    local started_at = os.time()
     local command, workdir = parse_cd_hint(input)
     local resolved_workdir, workdir_err = ctx:resolve_path(workdir or ".")
     if not resolved_workdir then
@@ -480,9 +513,10 @@ maki.api.register_tool({
         end
         -- Escalate to the normal permission prompt on the raw input text,
         -- so allow rules and prompt text match the automode-off path.
-        local ok, perr = maki.agent.permission_prompt(ctx, {
+        local ok, perr = makima.agent.permission_prompt(ctx, {
           tool = "bash",
           scopes = scopes.scopes,
+          deny_scopes = scopes.deny_scopes,
           force_prompt = scopes.force_prompt,
         })
         if ok then
@@ -504,6 +538,13 @@ maki.api.register_tool({
     end
 
     local buf, view = create_bash_view(command, ctx, auto_annotation)
+
+    if input.background then
+      local ok, err = ctx:background()
+      if not ok then
+        view:append({ { "background unavailable: " .. tostring(err), "dim" } })
+      end
+    end
 
     local output_parts = {}
     local has_output = false
@@ -541,8 +582,12 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
-    ctx:set_deadline(timeout_secs)
-    maki.fn.jobstart(command, {
+    ctx:set_deadline(timeout_secs, {
+      expire = opts.background_on_timeout and "background" or "timeout",
+    })
+    local script = SHELL == "powershell" and command == input.command and bh.qualify_powershell_command(command)
+      or command
+    makima.fn.jobstart(script, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
@@ -568,12 +613,12 @@ maki.api.register_tool({
 
     -- Esc or deadline: hand back the lines streamed so far, so the model
     -- keeps what the user just watched instead of a bare error.
-    maki.async.on_cancel(function(reason)
+    makima.async.on_cancel(function(reason)
       if finished then
         return
       end
       finished = true
-      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, {
+      ctx:finish(partial.cut(view, table.concat(output_parts), reason, timeout_secs, started_at, {
         preview = "head_tail",
         max_lines = max_lines,
         max_bytes = max_bytes,

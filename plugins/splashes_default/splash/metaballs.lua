@@ -9,7 +9,7 @@ local M = {}
 M.description = "Glowing metaballs that merge and flow together."
 
 local function theme_rgb(name)
-  local c = maki.ui.theme_color(name)
+  local c = makima.ui.theme_color(name)
   if not c then
     return nil
   end
@@ -168,7 +168,7 @@ function M.render(w, h, t, fade)
   if w < 8 or h < 6 then
     return flat_rows(w, h, { bold = false })
   end
-  local version = "v" .. maki.version().current
+  local version = "v" .. makima.version().current
   local version_x = w - #version + 1
   local version_style = FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false }
   local blobs = blob_positions(t)

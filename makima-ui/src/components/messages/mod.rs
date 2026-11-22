@@ -1,0 +1,2012 @@
+mod render;
+mod segment;
+mod selection;
+#[cfg(test)]
+mod tests;
+
+use self::render::RenderCursor;
+use self::segment::{Segment, SegmentCache};
+
+use super::tool_display::{
+    RenderCtx, RoleNames, RoleStyle, ToolLines, append_annotation, append_background_hint,
+    append_right_info, assistant_style, build_instructions_lines, build_tool_lines, done_style,
+    error_style, format_timestamp_now, instructions_search_text, post_style, search_text_for,
+    thinking_indicator, thinking_style, truncate_to_header, user_style,
+};
+use super::{
+    DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, apply_scroll_delta,
+    code_view::SectionFlags,
+};
+use crate::animation::spinner_str;
+use crate::components::keybindings::key;
+use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
+use crate::render_worker::RenderWorker;
+use crate::selection::Selection;
+use crate::splash::{ColorTransition, Splash};
+use crate::terminal_image;
+use crate::theme::{self, ThemesProvider};
+use crate::update;
+use makima_config::{ClockFormat, ToolOutputLines, UiConfig};
+use ratatui_image::picker::Picker;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::scrollbar::{ScrollbarHit, render_vertical_scrollbar};
+use super::streaming_content::StreamingContent;
+use makima_agent::{
+    AgentId, BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
+use makima_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+
+use crate::repaint::{Cadence, Dirty};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use tracing::warn;
+
+const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
+/// How far outside the drawn range an image keeps its encoded protocol.
+const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
+
+#[derive(Clone, Copy)]
+pub struct PromptProgress {
+    pub processed: u32,
+    pub total: u32,
+    pub cache: u32,
+}
+
+struct PendingSplashFrame {
+    receiver: flume::Receiver<Option<makima_lua::SplashFrame>>,
+    area: Rect,
+    latest: Option<&'static str>,
+}
+
+pub struct MessagesPanel {
+    pub messages: Vec<DisplayMessage>,
+    pub streaming_thinking: StreamingContent,
+    pub streaming_text: StreamingContent,
+    started_at: Instant,
+    scroll_top: u16,
+    auto_scroll: bool,
+    viewport_height: u16,
+    viewport_width: u16,
+    cache: SegmentCache,
+    last_total_lines: u16,
+    scrollbar_hit: Option<ScrollbarHit>,
+    hl_worker: RenderWorker,
+    image_picker: Option<Picker>,
+    inline_images: bool,
+    image_generation: u64,
+    provider: Arc<dyn ThemesProvider>,
+    theme_generation: u64,
+    highlight_segment: Option<usize>,
+    idle_splash: Splash,
+    accent: ColorTransition,
+    expanded_tools: HashMap<String, SectionFlags>,
+    /// Calls the user already moved, so their running row drops the hint.
+    backgrounded_tools: HashSet<String>,
+    /// Per-tool log of post-completion click rows, replayed on restore.
+    lua_clicks: HashMap<String, Vec<usize>>,
+    live_bufs: HashMap<String, Arc<SharedBuf>>,
+    /// Bufs of finished tools we keep polling so runtime-side warm
+    /// clicks stay visible. Purely local: every finished-tool click
+    /// carries a restore fallback, so we never track the runtime's
+    /// warm cache.
+    watched_bufs: VecDeque<(String, Arc<SharedBuf>)>,
+    tool_output_lines: ToolOutputLines,
+    role_names: RoleNames,
+    lua_event_handle: EventHandle,
+    restore_event_tx: Option<EventSender>,
+    show_thinking: bool,
+    thinking_collapsed: bool,
+    clock_format: ClockFormat,
+    /// Last-seen reported latest version; drives the Lua-side version store and
+    /// a one-shot repull when a newer version arrives.
+    last_seen_latest: Option<&'static str>,
+    /// One extra `splash.render` pull owed because the version changed; a
+    /// settled still splash re-renders its update notice exactly once.
+    force_pull_once: bool,
+    /// Whether version/update info has been forwarded to the Lua store yet.
+    /// Seeds `current` on the first pull so the notice never shows a blank
+    /// version before an update ever gets reported.
+    version_seeded: bool,
+    /// True once discovery marked the renderer dead so we stop hammering a
+    /// host with no splash.render. Reset on `SplashShown`.
+    splash_pull_suppressed: bool,
+    pending_splash_frame: Option<PendingSplashFrame>,
+    /// Whether the idle splash is currently shown; transitions queue a
+    /// `SplashShown`/`SplashHidden` event for the app to fire.
+    splash_shown: bool,
+    pending_splash_event: Option<bool>,
+    last_splash_area: Rect,
+    /// One re-bake per tool per generation; `snapshot_theme_gen`
+    /// only bumps when colors actually land.
+    rebake_requested: HashMap<String, u64>,
+    prompt_progress: Option<PromptProgress>,
+}
+
+impl MessagesPanel {
+    pub fn new(
+        ui_config: UiConfig,
+        lua_event_handle: EventHandle,
+        provider: Arc<dyn ThemesProvider>,
+    ) -> Self {
+        let role_names = RoleNames::default();
+        let thinking = thinking_style(&role_names);
+        let assistant = assistant_style(&role_names);
+        let ms = ui_config.typewriter_ms_per_char;
+        let theme_generation = provider.generation();
+        Self {
+            messages: Vec::new(),
+            streaming_thinking: StreamingContent::new(
+                thinking.prefix,
+                thinking.text_style,
+                thinking.prefix_style,
+                ms,
+            ),
+            streaming_text: StreamingContent::new(
+                assistant.prefix,
+                assistant.text_style,
+                assistant.prefix_style,
+                ms,
+            ),
+            started_at: Instant::now(),
+            scroll_top: u16::MAX,
+            auto_scroll: true,
+            viewport_height: 24,
+            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
+            cache: SegmentCache::new(),
+            last_total_lines: 0,
+            scrollbar_hit: None,
+            hl_worker: RenderWorker::new(),
+            image_picker: terminal_image::picker(ui_config.inline_images),
+            inline_images: ui_config.inline_images,
+            image_generation: terminal_image::generation(),
+            provider,
+            theme_generation,
+            highlight_segment: None,
+            idle_splash: Splash::new(ui_config.splash_animation),
+            accent: ColorTransition::new(theme::current().mode_build),
+            expanded_tools: HashMap::new(),
+            backgrounded_tools: HashSet::new(),
+            lua_clicks: HashMap::new(),
+            live_bufs: HashMap::new(),
+            watched_bufs: VecDeque::new(),
+            tool_output_lines: ui_config.tool_output_lines,
+            role_names,
+            lua_event_handle,
+            restore_event_tx: None,
+            show_thinking: ui_config.show_thinking,
+            thinking_collapsed: !ui_config.show_thinking,
+            clock_format: ui_config.clock_format,
+            last_seen_latest: None,
+            force_pull_once: false,
+            version_seeded: false,
+            splash_pull_suppressed: false,
+            pending_splash_frame: None,
+            splash_shown: false,
+            pending_splash_event: None,
+            last_splash_area: Rect::default(),
+            rebake_requested: HashMap::new(),
+            prompt_progress: None,
+        }
+    }
+
+    pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
+        self.restore_event_tx = event_tx;
+    }
+
+    pub fn push(&mut self, msg: DisplayMessage) {
+        self.messages.push(msg);
+    }
+
+    pub fn annotate_last_user_message(&mut self, annotation: String) {
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == DisplayRole::User)
+        {
+            message.annotation = Some(annotation);
+            self.cache.clear();
+        }
+    }
+
+    pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
+        if !self.show_thinking {
+            for msg in &mut msgs {
+                if matches!(msg.role, DisplayRole::Thinking) {
+                    msg.thinking_collapsed = true;
+                }
+            }
+        }
+        self.messages = msgs;
+        self.cache.clear();
+        self.expanded_tools.clear();
+        self.backgrounded_tools.clear();
+        self.lua_clicks.clear();
+        self.live_bufs.clear();
+        self.watched_bufs.clear();
+        self.rebake_requested.clear();
+        self.highlight_segment = None;
+        self.thinking_collapsed = !self.show_thinking;
+    }
+
+    pub fn thinking_delta(&mut self, text: &str) {
+        self.streaming_thinking.push(text);
+    }
+
+    pub fn end_thinking_block(&mut self) {
+        self.flush_thinking();
+    }
+
+    pub fn text_delta(&mut self, text: &str) {
+        self.flush_thinking();
+        self.streaming_text.push(text);
+    }
+
+    pub fn tool_pending(&mut self, id: String, name: &str) {
+        self.flush();
+        let role = DisplayRole::Tool(Box::new(ToolRole {
+            id,
+            status: ToolStatus::InProgress,
+            name: Arc::from(name),
+        }));
+        let mut msg = DisplayMessage::new(role, String::new());
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
+        self.messages.push(msg);
+    }
+
+    pub fn tool_start(&mut self, event: ToolStartEvent) {
+        if let Some(msg) = self.find_tool_msg_mut(&event.id) {
+            if let DisplayRole::Tool(t) = &mut msg.role {
+                t.name = Arc::clone(&event.tool);
+            }
+            msg.text = event.summary;
+            msg.tool_input = event.input.map(Arc::new);
+            msg.tool_raw_input = event.raw_input.map(Arc::new);
+            msg.tool_output = event.output.map(Arc::new);
+            msg.annotation = event.annotation;
+            msg.render_header = event.render_header;
+            self.rebuild_tool_segment(&event.id);
+            return;
+        }
+        self.flush();
+        let mut msg = DisplayMessage::new(
+            DisplayRole::Tool(Box::new(ToolRole {
+                id: event.id,
+                status: ToolStatus::InProgress,
+                name: Arc::clone(&event.tool),
+            })),
+            event.summary,
+        );
+        msg.tool_input = event.input.map(Arc::new);
+        msg.tool_raw_input = event.raw_input.map(Arc::new);
+        msg.tool_output = event.output.map(Arc::new);
+        msg.annotation = event.annotation;
+        msg.render_header = event.render_header;
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
+        self.messages.push(msg);
+    }
+
+    pub fn tool_output(&mut self, tool_id: &str, content: &str) {
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+        else {
+            return;
+        };
+        let tool_name = msg.role.tool_name().unwrap_or("");
+        truncate_to_header(&mut msg.text);
+        let truncated = truncate_output(content, self.tool_output_lines.get(tool_name));
+        msg.truncated_lines = truncated.skipped;
+        msg.text.push('\n');
+        msg.text.push_str(&truncated.kept);
+        msg.live_output = Some(content.to_owned());
+        self.rebuild_tool_segment(tool_id);
+    }
+
+    pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        let had_live_buf = self.retire_live_buf(&event.id);
+        self.backgrounded_tools.remove(&event.id);
+        let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
+        else {
+            return;
+        };
+        if let DisplayRole::Tool(t) = &mut msg.role {
+            t.status = if event.is_error {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Success
+            };
+        }
+        truncate_to_header(&mut msg.text);
+        let done_annotation = event
+            .annotation
+            .as_deref()
+            .map(str::to_owned)
+            .or_else(|| event.output.annotation());
+        if let Some(suffix) = &done_annotation {
+            append_annotation(&mut msg.annotation, suffix);
+        }
+
+        match &event.output {
+            ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
+                if msg.render_snapshot.is_none() =>
+            {
+                if had_live_buf {
+                    // The plugin streamed a body buf but no snapshot ever
+                    // landed: this is the raw llm_output glitch users report.
+                    warn!(
+                        tool_id = %event.id,
+                        tool = %event.tool,
+                        is_error = event.is_error,
+                        "live buf had no snapshot at tool_done; falling back to llm_output"
+                    );
+                }
+                let tr = truncate_output(&text.text, self.tool_output_lines.get(&event.tool));
+                msg.truncated_lines = tr.skipped;
+                if !tr.kept.is_empty() {
+                    msg.text = format!("{}\n{}", msg.text, tr.kept);
+                }
+            }
+            ToolOutput::GrepResult { entries } if entries.is_empty() => {
+                msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
+            }
+            _ => {}
+        }
+        msg.tool_output = Some(Arc::new(event.output));
+        msg.live_output = None;
+        self.rebuild_tool_segment(&event.id);
+    }
+
+    pub fn mark_backgrounded(&mut self, tool_id: &str) {
+        self.backgrounded_tools.insert(tool_id.to_owned());
+        self.rebuild_tool_segment(tool_id);
+    }
+
+    pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
+        self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
+    }
+
+    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
+        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    }
+
+    pub fn tool_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        theme_gen: Option<u64>,
+    ) {
+        self.store_snapshot(tool_id, snapshot, false, theme_gen);
+    }
+
+    pub fn tool_header_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        theme_gen: Option<u64>,
+    ) {
+        self.store_snapshot(tool_id, snapshot, true, theme_gen);
+    }
+
+    /// A subagent stamps its own cumulative usage on the task header, and that
+    /// header is usually the last tool of the turn, so an existing stamp wins.
+    pub fn set_turn_usage_on_last_tool(&mut self, usage: String) {
+        let last_tool = self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) => Some((tool.id.clone(), msg.turn_usage.is_none())),
+            _ => None,
+        });
+        if let Some((id, unstamped)) = last_tool
+            && unstamped
+        {
+            self.set_tool_turn_usage(&id, usage);
+        }
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.update_tool(tool_id, |msg| msg.turn_usage = Some(usage));
+    }
+
+    fn upsert_instruction_segment(
+        &mut self,
+        parent_id: &str,
+        blocks: &[InstructionBlock],
+        parent_idx: usize,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let inst_id = segment::instruction_id(parent_id);
+        let exp = self
+            .expanded_tools
+            .get(&inst_id)
+            .copied()
+            .unwrap_or_default();
+        let tl = build_instructions_lines(blocks, self.viewport_width, exp.output);
+
+        if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
+            let seg = self.cache.get_mut(seg_idx).unwrap();
+            seg.update_with_reuse(tl, &self.hl_worker, self.provider.generation());
+        } else {
+            let mut seg = Segment::with_tool(inst_id);
+            seg.apply_highlight(tl, &self.hl_worker, self.provider.generation());
+            self.cache.insert(parent_idx + 1, Segment::spacer());
+            self.cache.insert(parent_idx + 2, seg);
+        }
+    }
+
+    fn update_tool(&mut self, tool_id: &str, update_msg: impl FnOnce(&mut DisplayMessage)) {
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        update_msg(msg);
+        self.rebuild_tool_segment(tool_id);
+    }
+
+    pub fn stream_reset(&mut self) {
+        self.streaming_thinking.clear();
+        self.streaming_text.clear();
+        self.thinking_collapsed = !self.show_thinking;
+        self.cancel_in_progress();
+    }
+
+    pub fn fail_in_progress_with_message(&mut self, message: String) {
+        self.fail_in_progress_except(message, &HashSet::new());
+    }
+
+    pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
+        let ids: Vec<(String, Arc<str>)> = self
+            .messages
+            .iter()
+            .filter_map(|m| {
+                if let DisplayRole::Tool(t) = &m.role
+                    && t.status == ToolStatus::InProgress
+                    && !excluded.contains(&t.id)
+                {
+                    Some((t.id.clone(), Arc::clone(&t.name)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, tool) in ids {
+            self.tool_done(ToolDoneEvent {
+                id,
+                tool,
+                output: ToolOutput::Plain(message.clone().into()),
+                is_error: true,
+                annotation: None,
+                written_path: None,
+            });
+        }
+    }
+
+    pub fn cancel_in_progress(&mut self) {
+        let affected_ids: Vec<String> = self
+            .messages
+            .iter_mut()
+            .filter_map(|msg| {
+                if let DisplayRole::Tool(t) = &mut msg.role
+                    && t.status == ToolStatus::InProgress
+                {
+                    t.status = ToolStatus::Error;
+                    Some(t.id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for id in &affected_ids {
+            // The stale-run_id filter drops these tools' ToolDone events,
+            // so retire their live bufs here: keeps them clickable via
+            // the warm path and stops them being polled forever.
+            self.retire_live_buf(id);
+            self.rebuild_tool_segment(id);
+        }
+    }
+
+    pub fn in_progress_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(
+                |m| matches!(&m.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress),
+            )
+            .count()
+    }
+
+    #[cfg(test)]
+    pub fn toggle_expansion(&mut self, tool_id: &str) -> bool {
+        let Some(seg) = self
+            .cache
+            .segments()
+            .iter()
+            .find(|s| s.tool_id.as_deref() == Some(tool_id))
+        else {
+            return false;
+        };
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        if !seg.truncation.any() && !exp.any() {
+            return false;
+        }
+        let tool_id = tool_id.to_owned();
+        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
+        entry.script = !entry.script;
+        entry.output = !entry.output;
+        self.rebuild_expanded_tool(&tool_id);
+        true
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages.get(index)
+    }
+
+    /// Text of the last display message (agent text or tool-call output),
+    /// used by the `/tasks` row snippet. Empty when no message yet.
+    pub fn last_message_text(&self) -> &str {
+        self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
+    }
+
+    #[cfg(test)]
+    pub fn last_message_is_plan(&self) -> bool {
+        self.messages.last().is_some_and(|m| m.plan_path.is_some())
+    }
+
+    #[cfg(test)]
+    pub fn last_message_role(&self) -> Option<&DisplayRole> {
+        self.messages.last().map(|m| &m.role)
+    }
+
+    #[cfg(test)]
+    pub fn rebake_requested_gen(&self, tool_id: &str) -> Option<u64> {
+        self.rebake_requested.get(tool_id).copied()
+    }
+
+    #[cfg(test)]
+    pub fn snapshot_gen_of(&self, tool_id: &str) -> Option<u64> {
+        self.current_snapshot_gen(tool_id)
+    }
+
+    #[cfg(test)]
+    pub fn streaming_text_is_empty(&self) -> bool {
+        self.streaming_text.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn streaming_thinking_is_empty(&self) -> bool {
+        self.streaming_thinking.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages.iter().rev().find_map(|msg| match &msg.role {
+            DisplayRole::Tool(tool) if tool.id == tool_id => msg.turn_usage.as_deref(),
+            _ => None,
+        })
+    }
+
+    pub fn set_prompt_progress(&mut self, progress: Option<PromptProgress>) {
+        self.prompt_progress = progress;
+    }
+
+    pub fn clear_prompt_progress(&mut self) {
+        self.prompt_progress = None;
+    }
+
+    #[allow(dead_code)] // Lua will drive this once the role-prefix API lands.
+    pub fn set_role_names(&mut self, names: RoleNames) {
+        self.role_names = names;
+        let thinking = thinking_style(&self.role_names);
+        let assistant = assistant_style(&self.role_names);
+        self.streaming_thinking.set_style(
+            thinking.prefix,
+            thinking.text_style,
+            thinking.prefix_style,
+        );
+        self.streaming_text.set_style(
+            assistant.prefix,
+            assistant.text_style,
+            assistant.prefix_style,
+        );
+        self.cache.clear();
+    }
+
+    pub fn flush(&mut self) {
+        self.flush_thinking();
+        self.prompt_progress = None;
+        if !self.streaming_text.is_empty() {
+            self.messages.push(DisplayMessage::new(
+                DisplayRole::Assistant,
+                self.streaming_text.take_all(),
+            ));
+        }
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.set_scroll_top(apply_scroll_delta(self.scroll_top, delta));
+    }
+
+    /// Always unpins, and the next `view` re-pins if this lands on the
+    /// bottom line.
+    pub fn set_scroll_top(&mut self, top: u16) {
+        self.scroll_top = top.min(self.max_scroll());
+        self.auto_scroll = false;
+    }
+
+    pub fn auto_scroll(&self) -> bool {
+        self.auto_scroll
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.set_scroll_top(0);
+    }
+
+    pub fn enable_auto_scroll(&mut self) {
+        self.auto_scroll = true;
+    }
+
+    pub fn scroll_to_segment(&mut self, segment_index: usize) {
+        let width = self.viewport_width;
+        if let Some(msg_idx) = self.cache.get(segment_index).and_then(|seg| seg.msg_index)
+            && let Some(msg) = self.messages.get_mut(msg_idx)
+            && msg.result_preview.is_some()
+            && !msg.result_expanded
+        {
+            msg.result_expanded = true;
+            let lines = build_message_lines(msg, width, &self.role_names);
+            if let Some(seg) = self.cache.get_mut(segment_index) {
+                seg.set_lines(lines);
+            }
+        }
+        let offset = self
+            .cache
+            .segments()
+            .iter()
+            .take(segment_index)
+            .map(|s| s.height(width) as u32)
+            .sum::<u32>()
+            .min(u16::MAX as u32) as u16;
+        self.set_scroll_top(offset);
+    }
+
+    pub fn restore_scroll(&mut self, scroll_top: u16, auto_scroll: bool) {
+        self.scroll_top = scroll_top;
+        self.auto_scroll = auto_scroll;
+    }
+
+    pub fn set_highlight_segment(&mut self, idx: Option<usize>) {
+        self.highlight_segment = idx;
+    }
+
+    pub fn half_page(&self) -> i32 {
+        self.viewport_height as i32 / 2
+    }
+
+    pub fn set_accent(&mut self, color: ratatui::style::Color) {
+        self.accent.set(color);
+    }
+
+    pub fn message_at_row(&self, row: u16, area: Rect) -> Option<&DisplayMessage> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        self.messages.get(segment.msg_index?)
+    }
+
+    pub fn result_navigation_at(&self, row: u16, area: Rect) -> Option<AgentId> {
+        if row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let doc_row = u32::from(row - area.y) + u32::from(self.scroll_top);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let message = self.messages.get(segment.msg_index?)?;
+        let agent = message.result_agent?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        let line = segment.source_line_at(rel, self.viewport_width)?;
+        (line + 1 == segment.lines().len()).then_some(agent)
+    }
+
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+        self.message_at_row(row, area)?.post_agent.as_deref()
+    }
+
+    pub fn handle_click(&mut self, row: u16, area: Rect) -> bool {
+        if area.height == 0 {
+            return false;
+        }
+        let doc_row = (row.saturating_sub(area.y)) as u32 + self.scroll_top as u32;
+        let width = self.viewport_width;
+        // Both fallbacks toggle thinking: a row past the cached segments
+        // belongs to the still-streaming indicator, and a segment without a
+        // tool_id is a finished message's text.
+        let Some((seg_idx, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
+            return self.try_toggle_collapsed_thinking(doc_row, width);
+        };
+        let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
+        if !seg.images.is_empty() && rel >= seg.text_height(width) {
+            return false;
+        }
+        let Some(tool_id) = seg.tool_id.as_deref() else {
+            let msg_idx = seg.msg_index;
+            if let Some(idx) = msg_idx
+                && let Some(msg) = self.messages.get_mut(idx)
+                && msg.result_preview.is_some()
+            {
+                let old_height = seg.height(width);
+                let expanding = !msg.result_expanded;
+                msg.result_expanded = expanding;
+                let lines = build_message_lines(msg, width, &self.role_names);
+                let anchor = self.cache.anchor_at(u32::from(self.scroll_top), width);
+                let Some(seg) = self.cache.get_mut(seg_idx) else {
+                    return false;
+                };
+                seg.set_lines(lines);
+                let new_height = seg.height(width);
+                if let Some((anchor_idx, rel)) = anchor
+                    && anchor_idx == seg_idx
+                    && !expanding
+                    && rel > 0
+                {
+                    self.scroll_top = seg_start.min(u32::from(u16::MAX)) as u16;
+                }
+                let total = u32::from(self.last_total_lines)
+                    .saturating_sub(u32::from(old_height))
+                    .saturating_add(u32::from(new_height));
+                let max_scroll = total.saturating_sub(u32::from(self.viewport_height));
+                if u32::from(self.scroll_top) < max_scroll
+                    && (new_height > old_height || !expanding)
+                {
+                    self.auto_scroll = false;
+                }
+                return true;
+            }
+            return self.try_toggle_cached_thinking(msg_idx, width);
+        };
+
+        if self.has_snapshot(tool_id) {
+            let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
+            let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
+            if self.tool_in_progress(tool_id) {
+                self.lua_event_handle
+                    .request_click(tool_id.to_owned(), buf_row);
+                return true;
+            }
+            // Recorded even when the warm path serves the click: theme
+            // rebake and session restore replay the full sequence.
+            self.lua_clicks
+                .entry(tool_id.to_owned())
+                .or_default()
+                .push(buf_row);
+            let item = self.lua_restore_item(tool_id).map(|mut item| {
+                item.clicks = self.lua_clicks[tool_id].clone();
+                item
+            });
+            let Some(tx) = self.restore_event_tx.clone() else {
+                return true;
+            };
+            let eh = &self.lua_event_handle;
+            // Watching the buf means a runtime-side warm click would be
+            // visible here, so try the fast path; the fallback item lets
+            // the runtime degrade to restore+replay if its cache is cold.
+            // Without the buf only a fresh restore can show the result.
+            match (self.watching(tool_id), item) {
+                (true, Some(item)) => {
+                    eh.request_click_with_fallback(tool_id.to_owned(), buf_row, item, tx);
+                }
+                (true, None) => eh.request_click(tool_id.to_owned(), buf_row),
+                (false, Some(item)) => eh.request_restore(item, tx),
+                (false, None) => {}
+            }
+            return true;
+        }
+
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        if !seg.truncation.any() && !exp.any() {
+            return false;
+        }
+        let tool_id = tool_id.to_owned();
+        let truncation = seg.truncation;
+
+        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
+        if truncation.output || entry.output {
+            entry.output = !entry.output;
+        } else if truncation.script || entry.script {
+            entry.script = !entry.script;
+        }
+        self.rebuild_expanded_tool(&tool_id);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn toggle_expansion_at(&mut self, row: u16, area: Rect) -> bool {
+        self.handle_click(row, area)
+    }
+
+    fn rebuild_expanded_tool(&mut self, tool_id: &str) {
+        if segment::is_instruction_segment(tool_id) {
+            if let Some(parent_id) = segment::instruction_parent(tool_id)
+                && let Some(parent_idx) = self.cache.find_by_tool_id(parent_id)
+                && let Some(blocks) = self.get_instructions_for_tool(parent_id)
+            {
+                self.upsert_instruction_segment(parent_id, &blocks, parent_idx);
+            }
+        } else {
+            self.rebuild_tool_segment(tool_id);
+        }
+    }
+
+    fn get_instructions_for_tool(&self, tool_id: &str) -> Option<Vec<InstructionBlock>> {
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        msg.tool_output.as_deref()?.owned_instructions()
+    }
+
+    /// Drains the highlight worker, every live tool buffer and the finished
+    /// image decodes. These used to run inside [`Self::view`], which is why a
+    /// running tool had to claim it was animating: it was the only way to keep
+    /// them fed.
+    pub fn tick(&mut self) -> Dirty {
+        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
+
+        let shown_now = self.show_idle_splash();
+        if shown_now != self.splash_shown {
+            self.splash_shown = shown_now;
+            self.pending_splash_event = Some(shown_now);
+            if shown_now {
+                self.splash_pull_suppressed = false;
+            }
+        }
+
+        if self.show_idle_splash() {
+            dirty |= self.pull_splash_frame();
+        }
+        dirty
+    }
+
+    /// A resume can come back to a terminal whose font size changed while we
+    /// were suspended, and the picker caches those cell metrics, so rebuild it
+    /// and drop every protocol encoded against the old ones.
+    fn refresh_images(&mut self) -> Dirty {
+        let generation = terminal_image::generation();
+        if generation == self.image_generation {
+            return Dirty::any(
+                self.cache
+                    .segments_mut()
+                    .iter_mut()
+                    .map(Segment::poll_images),
+            );
+        }
+        self.image_generation = generation;
+        self.image_picker = terminal_image::picker(self.inline_images);
+        for seg in self.cache.segments_mut() {
+            seg.release_images();
+        }
+        Dirty::YES
+    }
+
+    /// Rebuilding an encoded protocol costs a decode, a resize and, on kitty, a
+    /// retransmit of megabytes. Releasing exactly at the viewport edge would
+    /// make a one row scroll thrash, so segments just outside keep theirs.
+    fn release_images_outside(&mut self, first_drawn: usize, last_drawn: usize) {
+        let keep = first_drawn.saturating_sub(IMAGE_KEEP_MARGIN_SEGMENTS)
+            ..=last_drawn.saturating_add(IMAGE_KEEP_MARGIN_SEGMENTS);
+        for (i, seg) in self.cache.segments_mut().iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                seg.release_images();
+            }
+        }
+    }
+
+    /// Poll and request Lua `splash.render` frames without waiting for the host.
+    /// A dead renderer returns `None` once and is suppressed until `SplashShown`.
+    fn pull_splash_frame(&mut self) -> Dirty {
+        let latest = update::latest_version();
+        let version_changed = !self.version_seeded || latest != self.last_seen_latest;
+        if version_changed {
+            self.version_seeded = true;
+            self.last_seen_latest = latest;
+            self.lua_event_handle.set_version(update::CURRENT, latest);
+            self.force_pull_once = true;
+        }
+
+        let area = self.last_splash_area;
+        let mut dirty = Dirty::NO;
+        if let Some(pending) = self.pending_splash_frame.as_ref() {
+            match pending.receiver.try_recv() {
+                Ok(frame) => {
+                    let pending = self.pending_splash_frame.take().unwrap();
+                    if pending.area == area && pending.latest == latest {
+                        self.force_pull_once = false;
+                        match frame {
+                            Some(frame) => {
+                                self.idle_splash.set_frame(Some(frame));
+                                self.splash_pull_suppressed = false;
+                                dirty = Dirty::YES;
+                            }
+                            None => {
+                                self.splash_pull_suppressed = true;
+                                self.idle_splash.set_frame(None);
+                            }
+                        }
+                    }
+                }
+                Err(flume::TryRecvError::Disconnected) => {
+                    self.pending_splash_frame = None;
+                }
+                Err(flume::TryRecvError::Empty) => return dirty,
+            }
+        }
+
+        if area.width == 0 {
+            return dirty;
+        }
+        let animating = self.idle_splash.cadence() == Cadence::SMOOTH;
+        let should_pull = self.force_pull_once || (animating && !self.splash_pull_suppressed);
+        if should_pull {
+            let (t, fade) = self.idle_splash.frame_inputs();
+            self.pending_splash_frame = self
+                .lua_event_handle
+                .request_splash_frame(area.width, area.height, t, fade)
+                .map(|receiver| PendingSplashFrame {
+                    receiver,
+                    area,
+                    latest,
+                });
+        }
+        dirty
+    }
+
+    /// The app drains this each tick and fires the matching autocmd.
+    pub fn take_splash_event(&mut self) -> Option<bool> {
+        self.pending_splash_event.take()
+    }
+
+    #[doc(hidden)]
+    pub fn splash_frame(&self) -> Option<&makima_lua::SplashFrame> {
+        self.idle_splash.frame()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_splash_frame(&mut self, frame: Option<makima_lua::SplashFrame>) {
+        self.idle_splash.set_frame(frame);
+    }
+
+    #[doc(hidden)]
+    pub fn splash_pull_suppressed(&self) -> bool {
+        self.splash_pull_suppressed
+    }
+
+    #[doc(hidden)]
+    pub fn splash_shown_flag(&self) -> bool {
+        self.splash_shown
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_splash_past_fade(&mut self) {
+        self.idle_splash.advance_past_fade();
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        // Collapsed thinking draws a line count, not the text, so its
+        // typewriter reveals nothing and never advances either, since only
+        // `view` ticks it. Believing it would pin the loop at full frame rate
+        // for the whole reasoning phase.
+        let smooth = self.streaming_text.is_animating()
+            || self.accent.is_animating()
+            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+        Cadence::any([
+            // A running tool draws a spinner. Its output arriving is data, and
+            // `tick` reports that separately.
+            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
+            Cadence::when(
+                self.show_idle_splash() && self.pending_splash_frame.is_some(),
+                Cadence::PENDING,
+            ),
+        ])
+    }
+
+    fn streaming_thinking_collapsed(&self) -> bool {
+        self.thinking_collapsed && !self.streaming_thinking.is_empty()
+    }
+
+    fn show_idle_splash(&self) -> bool {
+        self.messages.is_empty()
+            && self.streaming_thinking.is_empty()
+            && self.streaming_text.is_empty()
+    }
+
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        images_visible: bool,
+    ) {
+        self.viewport_height = area.height;
+        let width = area.width.saturating_sub(1);
+        let theme_gen = self.provider.generation();
+        let theme_changed = self.theme_generation != theme_gen;
+        let width_changed = self.viewport_width != width || theme_changed;
+        if width_changed {
+            self.viewport_width = width;
+            self.theme_generation = theme_gen;
+        }
+        if theme_changed {
+            self.rebake_stale_snapshots(theme_gen);
+        }
+
+        if self.show_idle_splash() {
+            if self.last_splash_area != area {
+                self.last_splash_area = area;
+                self.force_pull_once = true;
+            }
+            let accent = self.accent.resolve();
+            self.idle_splash.render(area, frame.buffer_mut(), accent);
+            return;
+        }
+
+        if width_changed {
+            self.cache.mark_all_width_stale();
+            let thinking = thinking_style(&self.role_names);
+            let assistant = assistant_style(&self.role_names);
+            self.streaming_thinking.set_style(
+                thinking.prefix,
+                thinking.text_style,
+                thinking.prefix_style,
+            );
+            self.streaming_text.set_style(
+                assistant.prefix,
+                assistant.text_style,
+                assistant.prefix_style,
+            );
+        }
+        self.rebuild_line_cache();
+        if self.in_progress_count() > 0 {
+            self.update_spinners();
+        }
+
+        let cached_count = self.cache.len();
+        let spacer_lines: [Line<'static>; 1] = [Line::default()];
+        let mut streaming_heights: Vec<u16> = Vec::new();
+
+        let thinking_collapsed = self.streaming_thinking_collapsed();
+        let collapsed_thinking_lines = if thinking_collapsed {
+            self.build_streaming_collapsed_lines()
+        } else {
+            Vec::new()
+        };
+
+        if thinking_collapsed {
+            if cached_count > 0 || !streaming_heights.is_empty() {
+                streaming_heights.push(1);
+            }
+            streaming_heights.push(collapsed_thinking_lines.len() as u16);
+        } else if !self.streaming_thinking.is_empty() {
+            let lines = self.streaming_thinking.render_lines(width, theme_gen);
+            if cached_count > 0 || !streaming_heights.is_empty() {
+                streaming_heights.push(1);
+            }
+            streaming_heights.push(crate::wrap::total_rows(lines, width));
+        }
+
+        if !self.streaming_text.is_empty() {
+            let lines = self.streaming_text.render_lines(width, theme_gen);
+            if cached_count > 0 || !streaming_heights.is_empty() {
+                streaming_heights.push(1);
+            }
+            streaming_heights.push(crate::wrap::total_rows(lines, width));
+        }
+
+        let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
+        // The reflow window is picked from `scroll_top` and the bottom pin,
+        // and the reflow changes the heights both are derived from: resolve
+        // before to aim the window, and after to place the result.
+        self.resolve_scroll(width, streaming_sum, has_selection);
+        self.reflow_viewport(width, has_selection);
+        let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
+
+        let viewport = Rect::new(area.x, area.y, width, area.height);
+        let mut cursor = RenderCursor::new(self.scroll_top, viewport);
+
+        let first_drawn = self
+            .cache
+            .segment_at_row(self.scroll_top as u32, width)
+            .map(|(idx, _, _)| idx)
+            .unwrap_or(0);
+        let mut last_drawn = first_drawn;
+        for (i, seg) in self.cache.segments_mut().iter_mut().enumerate() {
+            if cursor.past_bottom() {
+                break;
+            }
+            let h = seg.text_height(width);
+            let highlight = self.highlight_segment == Some(i);
+            let style = match &seg.tool_id {
+                Some(_) => Some(theme::current().tool_bg),
+                None => seg
+                    .msg_index
+                    .and_then(|idx| self.messages.get(idx))
+                    .filter(|msg| msg.role == DisplayRole::User)
+                    .map(|_| theme::current().user_bg),
+            };
+            cursor.render(seg.lines(), h, style, highlight, frame);
+            for image in &mut seg.images {
+                cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
+            }
+            last_drawn = i;
+        }
+        self.release_images_outside(first_drawn, last_drawn);
+
+        let mut height_idx = 0usize;
+        let streamed: [(&StreamingContent, bool); 2] = [
+            (&self.streaming_thinking, thinking_collapsed),
+            (&self.streaming_text, false),
+        ];
+        for (sc, collapsed) in streamed {
+            if sc.is_empty() || height_idx >= streaming_heights.len() || cursor.past_bottom() {
+                continue;
+            }
+            if cached_count > 0 || height_idx > 0 {
+                let h = streaming_heights[height_idx];
+                height_idx += 1;
+                cursor.render(&spacer_lines, h, None, false, frame);
+            }
+            if height_idx < streaming_heights.len() {
+                let h = streaming_heights[height_idx];
+                height_idx += 1;
+                if collapsed {
+                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
+                } else {
+                    cursor.render(sc.cached_lines(), h, None, false, frame);
+                }
+            }
+        }
+
+        if let Some(pp) = self.prompt_progress
+            && pp.total > 0
+        {
+            let ratio = pp.processed as f64 / pp.total as f64;
+            let bar_width = (width as f64 * 0.1).round() as u16;
+            let label = " Processing ";
+            let label_width = label.len() as u16;
+            let total_width = label_width + bar_width;
+            let bar_x = area.x + width.saturating_sub(total_width);
+            let bar_y = area.y + area.height.saturating_sub(1);
+            let bar_area = Rect::new(bar_x, bar_y, total_width, 1);
+            crate::components::progress_bar::render(
+                frame,
+                bar_area,
+                &crate::components::progress_bar::ProgressBarConfig {
+                    ratio,
+                    style: theme::current().progress_bar,
+                    cache_ratio: pp.cache as f64 / pp.total as f64,
+                    cache_style: Style::new().fg(Color::Green),
+                    label: Some(label),
+                    label_style: Some(theme::current().tool_dim),
+                    bar_width,
+                },
+            );
+        }
+
+        self.scrollbar_hit = if total_lines > area.height {
+            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top)
+        } else {
+            None
+        };
+    }
+
+    fn max_scroll(&self) -> u16 {
+        self.last_total_lines.saturating_sub(self.viewport_height)
+    }
+
+    pub fn scroll_top(&self) -> u16 {
+        self.scroll_top
+    }
+
+    pub fn scroll_to_line(&mut self, line: u16) {
+        self.set_scroll_top(line);
+    }
+
+    pub fn scrollbar_hit(&self) -> Option<ScrollbarHit> {
+        self.scrollbar_hit
+    }
+
+    pub fn content_len(&self) -> u16 {
+        self.last_total_lines
+    }
+
+    /// Backs `makima.fn.winsaveview`. The clamp matters: a pinned or restored
+    /// `scroll_top` can sit past the end until the next `view` resolves it
+    /// against the current line count.
+    pub fn win_view(&self) -> WinView {
+        WinView {
+            scroll_top: self.scroll_top.min(self.max_scroll()),
+            line_count: self.last_total_lines,
+            height: self.viewport_height,
+            auto_scroll: self.auto_scroll,
+        }
+    }
+
+    pub fn segment_heights(&self) -> Vec<u16> {
+        let width = self.viewport_width;
+        self.cache
+            .segments()
+            .iter()
+            .map(|s| s.height(width))
+            .collect()
+    }
+
+    /// Built on demand rather than retained: a plain-text copy of the whole
+    /// transcript, sitting beside the rendered one, was the second largest
+    /// thing the panel held. Entry `i` must describe segment `i`, because
+    /// `SearchAction::Select` feeds the index straight back to
+    /// [`Self::scroll_to_segment`].
+    pub fn segment_search_texts(&self) -> Vec<String> {
+        let by_tool: HashMap<&str, &DisplayMessage> = self
+            .messages
+            .iter()
+            .filter_map(|m| match &m.role {
+                DisplayRole::Tool(t) => Some((t.id.as_str(), m)),
+                _ => None,
+            })
+            .collect();
+        let tool_text = |id: &str| match segment::instruction_parent(id) {
+            Some(parent) => by_tool
+                .get(parent)
+                .and_then(|m| m.tool_output.as_deref())
+                .and_then(ToolOutput::instructions)
+                .map(instructions_search_text),
+            None => by_tool.get(id).map(|m| search_text_for(m)),
+        };
+        self.cache
+            .segments()
+            .iter()
+            .map(|seg| {
+                match seg.tool_id.as_deref() {
+                    Some(id) => tool_text(id),
+                    None => seg
+                        .msg_index
+                        .and_then(|i| self.messages.get(i))
+                        .map(|msg| message_search_text(msg, &self.role_names)),
+                }
+                .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
+        selection::extract_selection_text(&self.cache, self.viewport_width, sel, msg_area)
+    }
+
+    fn tool_in_progress(&self, tool_id: &str) -> bool {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|m| match &m.role {
+                DisplayRole::Tool(t) if t.id == tool_id => Some(t.status),
+                _ => None,
+            })
+            .is_some_and(|s| s == ToolStatus::InProgress)
+    }
+
+    fn watching(&self, tool_id: &str) -> bool {
+        self.watched_bufs.iter().any(|(id, _)| id == tool_id)
+    }
+
+    fn stop_watching(&mut self, tool_id: &str) {
+        self.watched_bufs.retain(|(id, _)| id != tool_id);
+    }
+
+    /// Moves a finished tool's live buf to the watched set, flushing any
+    /// last dirty lines. Called on completion and on cancellation, so
+    /// `live_bufs` never leaks entries that outlive their tool, and the capped
+    /// watched set keeps what `tick` polls bounded.
+    /// Returns whether a live buf existed for this id.
+    fn retire_live_buf(&mut self, id: &str) -> bool {
+        let Some(buf) = self.live_bufs.remove(id) else {
+            return false;
+        };
+        if let Some(lines) = buf.read_if_dirty() {
+            self.store_snapshot(id, BufferSnapshot::from_arc(lines), false, None);
+        }
+        self.watched_bufs.push_back((id.to_owned(), buf));
+        if self.watched_bufs.len() > WARM_TOOL_CAP {
+            self.watched_bufs.pop_front();
+        }
+        true
+    }
+
+    fn has_snapshot(&self, tool_id: &str) -> bool {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .is_some_and(|m| m.render_snapshot.is_some())
+    }
+
+    fn lua_restore_item(&self, tool_id: &str) -> Option<makima_lua::RestoreItem> {
+        let msg = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
+        crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
+    }
+
+    /// Re-restores every snapshot still painted with old-theme colors.
+    /// Replies carry a generation so stale ones can't overwrite fresher colors.
+    fn rebake_stale_snapshots(&mut self, current_gen: u64) {
+        let Some(tx) = self.restore_event_tx.clone() else {
+            return;
+        };
+        let eh = &self.lua_event_handle;
+        self.rebake_requested.retain(|_, g| *g >= current_gen);
+        let tol = self.tool_output_lines;
+        let mut requested = Vec::new();
+        for msg in &self.messages {
+            let DisplayRole::Tool(role) = &msg.role else {
+                continue;
+            };
+            if !self.should_request_rebake(
+                &role.id,
+                msg.snapshot_is_stale(current_gen),
+                current_gen,
+            ) {
+                continue;
+            }
+            if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+                item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
+                eh.request_restore(item, tx.clone());
+                requested.push(role.id.clone());
+            }
+        }
+        for id in requested {
+            // The watched buf still carries old-theme lines; clicks in
+            // the rebake window must go through restore, not warm.
+            self.stop_watching(&id);
+            self.rebake_requested.insert(id, current_gen);
+        }
+    }
+
+    fn should_request_rebake(&self, tool_id: &str, stale: bool, current_gen: u64) -> bool {
+        stale && self.rebake_requested.get(tool_id) != Some(&current_gen)
+    }
+
+    /// Live snapshots (`None`) get the panel's current generation.
+    /// Re-bake replies are monotonic: drop if something newer landed.
+    fn resolve_snapshot_gen(&self, tool_id: &str, incoming: Option<u64>) -> Option<u64> {
+        let Some(incoming_gen) = incoming else {
+            return Some(self.theme_generation);
+        };
+        match self.current_snapshot_gen(tool_id) {
+            Some(applied) if applied > incoming_gen => None,
+            _ => Some(incoming_gen),
+        }
+    }
+
+    fn current_snapshot_gen(&self, tool_id: &str) -> Option<u64> {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .map(|m| m.snapshot_theme_gen)
+    }
+
+    fn store_snapshot(
+        &mut self,
+        tool_id: &str,
+        snapshot: BufferSnapshot,
+        is_header: bool,
+        theme_gen: Option<u64>,
+    ) {
+        if theme_gen.is_some() {
+            // A generation only comes with restore replies. The restore
+            // superseded the old live view (and evicted the runtime's
+            // warm handle), so its buf must not overwrite this snapshot.
+            self.stop_watching(tool_id);
+        }
+        let Some(applied_gen) = self.resolve_snapshot_gen(tool_id, theme_gen) else {
+            return;
+        };
+        if let Some(msg) = self.find_tool_msg_mut(tool_id) {
+            if is_header {
+                msg.text = snapshot.first_line_text();
+                msg.render_header = Some(snapshot);
+            } else {
+                msg.render_snapshot = Some(snapshot);
+            }
+            msg.snapshot_theme_gen = applied_gen;
+            self.rebuild_tool_segment(tool_id);
+        } else {
+            warn!(
+                tool_id,
+                is_header, "snapshot dropped: no tool message with this id"
+            );
+        }
+    }
+
+    fn find_tool_msg_mut(&mut self, tool_id: &str) -> Option<&mut DisplayMessage> {
+        self.messages
+            .iter_mut()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+    }
+
+    fn rctx(&self) -> RenderCtx<'_> {
+        RenderCtx {
+            started_at: self.started_at,
+            width: self.viewport_width,
+            tool_output_lines: &self.tool_output_lines,
+        }
+    }
+
+    pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
+        self.live_bufs.insert(id, body);
+    }
+
+    /// Snapshots are baked at the last width `view` saw, and a resize
+    /// invalidates every segment anyway (see `width_changed` in `view`), so
+    /// polling ahead of the frame that reflows them is safe.
+    fn poll_live_bufs(&mut self) -> Dirty {
+        let updated: Vec<_> = self
+            .live_bufs
+            .iter()
+            .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
+            .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
+            .collect();
+        let dirty = Dirty::from(!updated.is_empty());
+        for (tool_id, lines) in updated {
+            self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
+        }
+        dirty
+    }
+
+    fn build_tool_segment_lines(
+        &self,
+        msg: &DisplayMessage,
+        status: ToolStatus,
+        rctx: &RenderCtx,
+        exp: SectionFlags,
+    ) -> ToolLines {
+        let mut tl = build_tool_lines(msg, status, rctx, exp);
+        if let DisplayRole::Tool(tool) = &msg.role
+            && status == ToolStatus::InProgress
+            && !msg.text.is_empty()
+            && !self.backgrounded_tools.contains(&tool.id)
+        {
+            append_background_hint(&mut tl.lines[0]);
+        }
+        if let Some(ts) = &msg.timestamp
+            && !tl.lines.is_empty()
+        {
+            append_right_info(
+                &mut tl.lines[0],
+                msg.turn_usage.as_deref(),
+                Some(ts),
+                rctx.width,
+            );
+        }
+        tl
+    }
+
+    fn flush_thinking(&mut self) {
+        if self.streaming_thinking.is_empty() {
+            return;
+        }
+        let mut msg =
+            DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
+        msg.thinking_collapsed = self.thinking_collapsed;
+        self.thinking_collapsed = !self.show_thinking;
+        self.messages.push(msg);
+    }
+
+    fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
+        thinking_indicator(self.streaming_thinking.line_count(), &self.role_names)
+    }
+
+    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
+        thinking_indicator(logical_line_count(text), &self.role_names)
+    }
+
+    fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
+        if !self.streaming_thinking_collapsed() {
+            return false;
+        }
+        let cached_height = self.cache.total_height(width);
+        let spacer = if self.cache.len() > 0 { 1 } else { 0 };
+        let thinking_start = cached_height + spacer;
+        let height = self.build_streaming_collapsed_lines().len() as u32;
+        if doc_row >= thinking_start && doc_row < thinking_start + height {
+            self.thinking_collapsed = false;
+            return true;
+        }
+        false
+    }
+
+    fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
+        if self.show_thinking {
+            return false;
+        }
+        let Some(idx) = msg_idx else { return false };
+        let Some(msg) = self.messages.get_mut(idx) else {
+            return false;
+        };
+        if !matches!(msg.role, DisplayRole::Thinking) {
+            return false;
+        }
+        msg.thinking_collapsed = !msg.thinking_collapsed;
+        self.rebuild_thinking_segment(idx, width);
+        true
+    }
+
+    fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
+        let Some((text, collapsed)) = self
+            .messages
+            .get(msg_idx)
+            .map(|m| (m.text.clone(), m.thinking_collapsed))
+        else {
+            return;
+        };
+        let lines = if collapsed {
+            self.build_cached_thinking_indicator(&text)
+        } else {
+            let style = thinking_style(&self.role_names);
+            text_to_lines(
+                &text,
+                style.prefix.as_ref(),
+                style.text_style,
+                style.prefix_style,
+                width,
+                None,
+            )
+        };
+        let seg_idx = self
+            .cache
+            .segments()
+            .iter()
+            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none());
+        let Some(seg_idx) = seg_idx else { return };
+        if let Some(seg) = self.cache.get_mut(seg_idx) {
+            seg.set_lines(lines);
+        }
+    }
+
+    fn update_spinners(&mut self) {
+        let spinner_span = Span::styled(
+            spinner_str(self.started_at.elapsed().as_millis()),
+            theme::current().spinner,
+        );
+        for seg in self.cache.segments_mut() {
+            seg.update_spinners(&spinner_span);
+        }
+    }
+
+    fn drain_highlights(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        while let Some(result) = self.hl_worker.try_recv() {
+            if let Some(seg) = self
+                .cache
+                .segments_mut()
+                .iter_mut()
+                .find(|s| s.matches_pending_highlight(result.id))
+            {
+                seg.apply_highlight_result(result.lines);
+                dirty = Dirty::YES;
+            }
+        }
+        dirty
+    }
+
+    fn rebuild_tool_segment(&mut self, tool_id: &str) {
+        let Some(msg) = self
+            .messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+        else {
+            return;
+        };
+        let DisplayRole::Tool(t) = &msg.role else {
+            unreachable!()
+        };
+        let status = t.status;
+        let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
+            return;
+        };
+
+        let exp = self
+            .expanded_tools
+            .get(tool_id)
+            .copied()
+            .unwrap_or_default();
+        let rctx = self.rctx();
+        let tl = self.build_tool_segment_lines(msg, status, &rctx, exp);
+
+        let instructions = msg
+            .tool_output
+            .as_deref()
+            .and_then(|o| o.owned_instructions());
+
+        let seg = self.cache.get_mut(seg_idx).unwrap();
+        seg.update_with_reuse(tl, &self.hl_worker, self.provider.generation());
+        seg.set_images(message_images(msg));
+
+        if let Some(blocks) = instructions {
+            self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
+        }
+    }
+
+    fn rebuild_line_cache(&mut self) {
+        if !self.cache.needs_rebuild(self.messages.len()) {
+            return;
+        }
+        for i in self.cache.msg_count()..self.messages.len() {
+            let msg = &self.messages[i];
+
+            if let DisplayRole::Tool(t) = &msg.role {
+                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
+                let status = t.status;
+                let tl = self.build_tool_segment_lines(msg, status, &self.rctx(), exp);
+                let id = t.id.clone();
+                self.cache.push_spacer_if_needed();
+                let mut seg = Segment::with_tool(id.clone());
+                seg.apply_highlight(tl, &self.hl_worker, self.provider.generation());
+                seg.set_images(message_images(msg));
+                self.cache.push(seg);
+
+                let blocks = msg
+                    .tool_output
+                    .as_deref()
+                    .and_then(|o| o.owned_instructions());
+                if let Some(blocks) = blocks {
+                    let last_idx = self.cache.len().saturating_sub(1);
+                    self.upsert_instruction_segment(&id, &blocks, last_idx);
+                }
+            } else {
+                if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
+                    let text = msg.text.clone();
+                    let lines = self.build_cached_thinking_indicator(&text);
+                    self.cache.push_spacer_if_needed();
+                    self.cache.push(Segment::with_lines(lines, Some(i)));
+                    continue;
+                }
+                let lines = build_message_lines(msg, self.viewport_width, &self.role_names);
+                self.cache.push_spacer_if_needed();
+                let mut seg = Segment::with_lines(lines, Some(i));
+                seg.set_images(message_images(msg));
+                self.cache.push(seg);
+            }
+        }
+        self.cache.mark_built(self.messages.len());
+    }
+
+    /// Clamps `scroll_top` against the document height and applies the bottom
+    /// pin, returning the total the scrollbar draws from.
+    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u16 {
+        let total_lines: u16 =
+            (self.cache.total_height(width) + streaming_sum).min(u16::MAX as u32) as u16;
+        self.last_total_lines = total_lines;
+        let max_scroll = total_lines.saturating_sub(self.viewport_height);
+        self.scroll_top = self.scroll_top.min(max_scroll);
+        if !has_selection {
+            if self.scroll_top >= max_scroll {
+                self.auto_scroll = true;
+            }
+            if self.auto_scroll {
+                self.scroll_top = max_scroll;
+            }
+        }
+        total_lines
+    }
+
+    /// Re-lays out the stale segments the viewport plus its margin reaches,
+    /// keeping the topmost visible one pinned: `scroll_top` is a line offset,
+    /// so re-laying out anything above the viewport would slide the content
+    /// the reader is looking at.
+    ///
+    /// The window is walked outward from an anchor segment, counting heights
+    /// only after each segment is reflowed. Document offsets move as the
+    /// reflow runs, so a window expressed in them would need repeated passes
+    /// to settle; this one is right the first time.
+    fn reflow_viewport(&mut self, width: u16, has_selection: bool) {
+        // `resolve_scroll` only pins to the bottom when it owns the scroll, so
+        // that is exactly when the viewport is the document tail.
+        let pinned_to_bottom = self.auto_scroll && !has_selection;
+        let anchor = (!pinned_to_bottom)
+            .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
+            .flatten();
+        let viewport = self.viewport_height as u32;
+        let margin = viewport.saturating_mul(REFLOW_MARGIN_VIEWPORTS);
+        let below = viewport.saturating_add(margin);
+        // Pinned to the bottom (or scrolled into the streaming tail): the
+        // viewport is the last `below` lines, so the window is all above.
+        //
+        // Anchored, the first visible row sits `rel` rows into the anchor
+        // segment, so the downward window has to clear those before it starts
+        // covering the viewport; counting from the segment's start instead
+        // leaves stale segments on screen whenever `rel` exceeds the margin.
+        let (start, above, below) = match anchor {
+            Some((i, rel)) => (i, margin, below.saturating_add(rel as u32)),
+            None => (self.cache.len().saturating_sub(1), below, below),
+        };
+        let len_before = self.cache.len();
+
+        let mut acc = 0;
+        let mut i = start;
+        while i < self.cache.len() && acc < below {
+            acc += self.reflowed_height(i, width);
+            i += 1;
+        }
+        let mut acc = 0;
+        let mut i = start;
+        while i > 0 && acc < above {
+            i -= 1;
+            acc += self.reflowed_height(i, width);
+        }
+
+        // A rebuild can insert a missing instruction segment, which shifts the
+        // anchor index. Rare enough to just skip the pin for one frame.
+        if let Some(anchor) = anchor
+            && self.cache.len() == len_before
+        {
+            self.scroll_top = self.cache.anchor_offset(anchor, width).min(u16::MAX as u32) as u16;
+        }
+    }
+
+    /// Reflows `seg_idx` if it is stale, then reports the height it draws at.
+    fn reflowed_height(&mut self, seg_idx: usize, width: u16) -> u32 {
+        // A tool segment and its instruction segment both map back to the
+        // same parent, and one `rebuild_tool_segment` clears both flags.
+        // Re-check so the parent is not rebuilt twice.
+        if self.cache.get(seg_idx).is_some_and(|s| s.stale) {
+            self.reflow_segment(seg_idx, width);
+        }
+        self.cache
+            .get(seg_idx)
+            .map_or(0, |s| s.height(width) as u32)
+    }
+
+    fn reflow_segment(&mut self, seg_idx: usize, width: u16) {
+        // Clear up front so a reflow that bails early (message gone, empty
+        // instructions) costs one frame of old-width lines instead of
+        // retrying forever.
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.stale = false;
+        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
+
+        if let Some(tid) = tool_id {
+            let parent = segment::instruction_parent(&tid)
+                .map(str::to_string)
+                .unwrap_or(tid);
+            self.rebuild_tool_segment(&parent);
+            return;
+        }
+
+        let Some(msg_idx) = msg_idx else {
+            return;
+        };
+
+        let collapsed = self
+            .messages
+            .get(msg_idx)
+            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
+        if collapsed {
+            // Geometry is width-independent, but `width_changed` also fires on
+            // theme changes; rebuild so spans pick up the new palette.
+            self.rebuild_thinking_segment(msg_idx, width);
+        } else {
+            self.reflow_text_segment(seg_idx, width);
+        }
+    }
+
+    fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
+        let Some(msg_idx) = self.cache.get(seg_idx).and_then(|s| s.msg_index) else {
+            return;
+        };
+        let Some(msg) = self.messages.get(msg_idx) else {
+            return;
+        };
+        let lines = build_message_lines(msg, width, &self.role_names);
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.set_lines(lines);
+    }
+}
+
+fn message_style(role: &DisplayRole, names: &RoleNames) -> RoleStyle {
+    match role {
+        DisplayRole::User => user_style(names),
+        DisplayRole::Assistant => assistant_style(names),
+        DisplayRole::Thinking => thinking_style(names),
+        DisplayRole::Error => error_style(),
+        DisplayRole::Done => done_style(),
+        DisplayRole::Post(level) => post_style(*level),
+        DisplayRole::Tool(_) => unreachable!(),
+    }
+}
+
+/// A plan message draws its own rule and path instead of the role prefix.
+fn message_prefix<'a>(msg: &DisplayMessage, style: &'a RoleStyle) -> &'a str {
+    if msg.plan_path.is_some() {
+        ""
+    } else {
+        style.prefix.as_ref()
+    }
+}
+
+/// Carries the role prefix so a query can hit either the prose or the "you>"
+/// and "thinking>" markers the reader sees. Collapsed thinking needs no case of
+/// its own: its indicator is drawn from the same prefix.
+fn message_search_text(msg: &DisplayMessage, names: &RoleNames) -> String {
+    let style = message_style(&msg.role, names);
+    format!("{}{}", message_prefix(msg, &style), msg.text)
+}
+
+fn visible_message_text(msg: &DisplayMessage) -> &str {
+    if !msg.result_expanded {
+        msg.result_preview.as_deref().unwrap_or(&msg.text)
+    } else {
+        &msg.text
+    }
+}
+
+fn child_result_lines(text: &str) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let Some((content, action)) = text.rsplit_once('\n') else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let Some((content, hint)) = content.rsplit_once('\n') else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let Some((label, body)) = content.split_once("] ") else {
+        return plain_lines(text, "", theme.tool, theme.tool_dim);
+    };
+    let (body, lookup) = body
+        .split_once("\n[Full result lookup: ")
+        .map_or((body, None), |(body, lookup)| (body, Some(lookup)));
+    let (body, truncated) = body
+        .strip_suffix(crate::chat::COMPLETION_TRUNCATED)
+        .map_or((body, false), |body| (body, true));
+    let mut lines = vec![Line::from(Span::styled(format!("{label}]"), theme.accent))];
+    lines.push(Line::from(""));
+    lines.extend(
+        body.split('\n')
+            .map(|line| Line::from(Span::styled(line.to_owned(), theme.assistant))),
+    );
+    if truncated && let Some(line) = lines.last_mut() {
+        line.spans.push(Span::styled(
+            crate::chat::COMPLETION_TRUNCATED,
+            theme.tool_dim,
+        ));
+    }
+    if let Some(lookup) = lookup {
+        lines.push(Line::from(Span::styled(
+            format!("[Full result lookup: {lookup}"),
+            theme.tool_dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(hint.to_owned(), theme.tool_dim)));
+    lines.push(Line::from(""));
+    let action_style = if action == "[View child transcript]" {
+        theme.accent.add_modifier(Modifier::UNDERLINED)
+    } else {
+        theme.tool_dim
+    };
+    lines.push(Line::from(Span::styled(action.to_owned(), action_style)));
+    lines
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes().filter(|&b| b == b'\n').count() + 1
+    }
+}
+
+/// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
+/// given width. Shared by `rebuild_line_cache` (new messages) and
+/// `reflow_text_segment` (stale-on-resize messages) so both paths produce
+/// identical segments.
+fn build_message_lines(msg: &DisplayMessage, width: u16, names: &RoleNames) -> Vec<Line<'static>> {
+    let style = message_style(&msg.role, names);
+    let prefix = message_prefix(msg, &style);
+    let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
+        ""
+    } else {
+        visible_message_text(msg)
+    };
+    let mut lines = if msg.result_preview.is_some() {
+        child_result_lines(text)
+    } else if style.use_markdown {
+        text_to_lines(
+            text,
+            prefix,
+            style.text_style,
+            style.prefix_style,
+            width,
+            style.max_line_bytes,
+        )
+    } else {
+        plain_lines(text, prefix, style.text_style, style.prefix_style)
+    };
+    if msg.post_agent.is_some() {
+        for line in &mut lines {
+            line.style = line.style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
+    if let Some(annotation) = &msg.annotation
+        && msg.role == DisplayRole::User
+    {
+        lines.push(Line::from(Span::styled(
+            annotation.clone(),
+            theme::current().tool_dim,
+        )));
+    }
+    if let Some(pp) = &msg.plan_path {
+        if !msg.text.is_empty() {
+            let rule = hr_line(width, theme::current().plan_rule);
+            lines.insert(0, rule.clone());
+            lines.push(rule);
+        } else {
+            lines.clear();
+        }
+        if !msg.text.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            pp.to_owned(),
+            theme::current().plan_path,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} to open in editor ($VISUAL / $EDITOR)",
+                key::OPEN_EDITOR.label
+            ),
+            theme::current().tool_dim,
+        )));
+    }
+    lines
+}
+
+/// An image the message carries is all there is to see, so a terminal without
+/// graphics gets an `[image]` line in its place. A tool's image already has a
+/// header naming the file above it, so it needs no stand-in.
+fn message_images(
+    msg: &DisplayMessage,
+) -> impl Iterator<Item = (ImageSource, Option<&'static str>)> + '_ {
+    msg.images
+        .iter()
+        .map(|source| (source.clone(), Some(IMAGE_PLACEHOLDER)))
+        .chain(match msg.tool_output.as_deref() {
+            Some(ToolOutput::Image { source, .. }) => Some((source.clone(), None)),
+            _ => None,
+        })
+}

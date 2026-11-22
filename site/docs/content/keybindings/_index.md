@@ -38,7 +38,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
 | `Ctrl+E` | Jump to end of line |
 | `Ctrl+G` | Scroll to top |
-| `Ctrl+B` | Scroll to bottom |
+| `Ctrl+Alt+G` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
 | `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
@@ -54,6 +54,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
+| `Ctrl+B` | Move the running tool call to the background |
 | `↑` / `↓` | Navigate input history |
 | `Esc Esc` | Cancel agent |
 
@@ -109,7 +110,7 @@ Every scrollable surface has a draggable scrollbar. Chips, menu rows, pickers, d
 
 ## Plugins
 
-Built-in plugins register these themselves, and your own plugins can add more with `maki.keymap.set`:
+Built-in plugins register these themselves, and your own plugins can add more with `makima.keymap.set`:
 
 | Key | Action |
 |-----|--------|
@@ -123,14 +124,14 @@ Child contexts inherit their parent's bindings and add their own.
 
 ## Overriding Keybindings
 
-Plugins and `init.lua` can rebind keys at runtime with `maki.keymap.set` and `maki.keymap.del`. The tables above are the built-in defaults. An override on the same key wins, unless a modal or overlay is open (help, plan form, permission prompt).
+Plugins and `init.lua` can rebind keys at runtime with `makima.keymap.set` and `makima.keymap.del`. The tables above are the built-in defaults. An override on the same key wins, unless a modal or overlay is open (help, plan form, permission prompt).
 
 Precedence, high to low:
 
 1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.
 2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
-3. **Lua overrides** from `maki.keymap.set`. Last set wins; binding the same key twice warns.
-4. **Built-in defaults.** An override on the same key shadows them; `maki.keymap.del` lifts the override so the default returns. Suspend is the only binding outside this layer, so every key is remappable except `Ctrl+Z`.
+3. **Lua overrides** from `makima.keymap.set`. Last set wins; binding the same key twice warns.
+4. **Built-in defaults.** An override on the same key shadows them; `makima.keymap.del` lifts the override so the default returns. Suspend is the only binding outside this layer, so every key is remappable except `Ctrl+Z`.
 
 Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 

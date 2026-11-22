@@ -4,21 +4,21 @@
 -- while background agents keep working. A session open in another terminal
 -- is greyed out and cannot be opened from here.
 
-local TextInput = require("maki.text_input")
-local Spans = require("maki.spans")
+local TextInput = require("makima.text_input")
+local Spans = require("makima.spans")
 local Helpers = require("sessions_helpers")
 
 local FILTER_PREFIX = "❯ "
 local RENAME_PREFIX = "Rename: "
 local CONFIRM_HINT = "  Ctrl+D again to delete"
-local DELETE_FOCUSED_HINT = "Cannot delete the current session"
 local RENAME_USAGE = "Usage: /rename <title>"
 local EMPTY_HINT = "  No sessions yet. Press Ctrl+N to start one."
 local NO_MATCHES_HINT = "  No matches"
 local LOADING_HINT = "  Loading sessions…"
 local OPEN_ELSEWHERE_MSG = "session is open in another terminal"
-local TICK_MS = 100
-local AGE_TICKS = 10
+local STATUS_POLL_MS = 100
+local NANOS_PER_MS = 1000000
+local NANOS_PER_SEC = 1000000000
 -- Placeholder only: the host swaps "spinner:*"-styled spans for the live
 -- animated frame, so working rows spin without this plugin redrawing.
 local WORKING_ICON = "· "
@@ -35,6 +35,9 @@ local RENAME_KEYS = {
 }
 
 local board = nil
+-- Filter text staged when the picker deletes the session hosting its own
+-- window; open() relaunches right away with it.
+local reopen_filter = nil
 
 local function icon_of(s)
   if s.status == "needs_input" then
@@ -111,8 +114,8 @@ end
 local function apply_filter()
   local prev_pos = sel_index() or 1
   local query = board.input:value()
-  board.items = Helpers.filter_rows(board.all, query, maki.match.completion, function(left, right)
-    return maki.match.compare(left, right)
+  board.items = Helpers.filter_rows(board.all, query, makima.match.completion, function(left, right)
+    return makima.match.compare(left, right)
   end)
   board.sel_id = Helpers.reconcile_selection(board.sel_id, prev_pos, board.items)
 end
@@ -123,20 +126,48 @@ local function filter_changed()
 end
 
 local function dispw(s)
-  return maki.ui.display_width(s)
+  return makima.ui.display_width(s)
+end
+
+local function record_age_bucket(reference)
+  board.age_secs = reference.secs
+end
+
+local function age_bucket_changed()
+  return board.age_secs ~= makima.time.now().secs
+end
+
+local function age_timeout_ms()
+  local now = makima.time.now()
+  local remaining = NANOS_PER_SEC - now.nanosecs
+  return math.max(1, math.min(math.ceil(remaining / NANOS_PER_MS), STATUS_POLL_MS))
 end
 
 local function render()
   local lines = {}
   board.confirm_columns = {}
   local inner = board.width - 4
+  local reference = makima.time.now()
+  record_age_bucket(reference)
+  board.age_visible = false
+  local rights, statuses, counts = {}, {}, {}
+  for i, s in ipairs(board.items) do
+    if not s.focused and not s.open_elsewhere then
+      board.age_visible = true
+    end
+    local selected = s.id == board.sel_id
+    rights[i] = { Helpers.right(s, selected, reference) }
+    statuses[i] = rights[i][1]
+    counts[i] = Helpers.format_count(s.message_count)
+  end
+  local columns = Helpers.layout(inner, statuses, counts)
   local input = board.rename and board.rename.input or board.input
   local prefix = board.rename and RENAME_PREFIX or FILTER_PREFIX
   board.input_render = input:render(prefix, dispw(prefix), inner)
   for _, ln in ipairs(board.input_render.lines) do
     lines[#lines + 1] = ln
   end
-  lines[#lines + 1] = Helpers.header_spans(inner)
+  lines[#lines + 1] = Helpers.header_spans(inner, columns)
   -- The query and header stay pinned while the list scrolls.
   if #lines ~= board.reserved then
     board.reserved = #lines
@@ -147,7 +178,7 @@ local function render()
     local selected = s.id == board.sel_id
     local icon, icon_style, spinning = icon_of(s)
     local base = Helpers.row_style(s, selected)
-    local right, right_style = Helpers.right(s, selected)
+    local right, right_style = rights[i][1], rights[i][2]
     if selected then
       icon_style = "selected"
     end
@@ -156,7 +187,14 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
-    local confirm_width = board.confirm == s.id and dispw(CONFIRM_HINT) or 0
+    local confirm_spans, confirm_width = {}, 0
+    local row_columns = columns
+    if board.confirm == s.id then
+      row_columns = Helpers.confirm_layout(columns)
+      local room = Helpers.confirm_width_budget(inner, row_columns)
+      confirm_spans = Helpers.clip_spans({ { CONFIRM_HINT, selected and "match_selected" or "error" } }, room)
+      confirm_width = Helpers.spans_width(confirm_spans)
+    end
     local title_spans = { { "  ", base }, { icon, icon_style } }
     for _, sp in
       ipairs(
@@ -165,18 +203,21 @@ local function render()
     do
       title_spans[#title_spans + 1] = sp
     end
-    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner))
-    if board.confirm == s.id then
+    title_spans = Helpers.clip_spans(title_spans, Helpers.title_width_budget(confirm_width, inner, row_columns))
+    if #confirm_spans > 0 then
       local first = 1
       for _, span in ipairs(title_spans) do
         first = first + dispw(span[1])
       end
-      board.confirm_columns[#lines + 1] = { first = first, last = first + dispw(CONFIRM_HINT) - 1 }
-      title_spans[#title_spans + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
+      board.confirm_columns[#lines + 1] = { first = first, last = first + confirm_width - 1 }
+      for _, span in ipairs(confirm_spans) do
+        title_spans[#title_spans + 1] = span
+      end
     end
-    local count_text, pad = Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count)
+    local count_text, pad =
+      Helpers.row_right_columns(Helpers.spans_width(title_spans), inner, s.message_count, row_columns)
     local count_style = selected and "selected" or "dim"
-    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style)
+    local line = Helpers.row_spans(title_spans, count_text, count_style, pad, right, right_style, row_columns)
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
@@ -199,12 +240,12 @@ end
 -- board is still current.
 local function refresh()
   local this_board = board
-  local live, live_err = maki.session.live()
+  local live, live_err = makima.session.live()
   if board ~= this_board then
     return
   end
   if live_err then
-    maki.ui.flash(live_err)
+    makima.ui.flash(live_err)
     render()
     return
   end
@@ -282,12 +323,12 @@ local function open_selected()
   end
   if not s.focused then
     if not Helpers.can_open(s) then
-      maki.ui.flash(OPEN_ELSEWHERE_MSG)
+      makima.ui.flash(OPEN_ELSEWHERE_MSG)
       return
     end
-    local _, err = maki.session.focus(s.id)
+    local _, err = makima.session.focus(s.id)
     if err then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       return
     end
   end
@@ -295,21 +336,29 @@ local function open_selected()
 end
 
 local function open_blank()
-  local _, err = maki.session.new({ focus = true })
+  local _, err = makima.session.new({ focus = true })
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
     return
   end
   close()
 end
 
+-- The picker window belongs to the focused session's App, so deleting the
+-- current session destroys it. Close it deliberately; open() relaunches with
+-- the same filter once the host has focused another session.
+local function delete_current(s)
+  reopen_filter = board.input:value()
+  close()
+  local _, err = makima.session.delete(s.id)
+  if err then
+    makima.ui.flash(err)
+  end
+end
+
 local function delete_selected()
   local s = selected()
   if not s then
-    return
-  end
-  if s.focused then
-    maki.ui.flash(DELETE_FOCUSED_HINT)
     return
   end
   if board.confirm ~= s.id then
@@ -318,9 +367,13 @@ local function delete_selected()
     return
   end
   board.confirm = nil
-  local _, err = maki.session.delete(s.id)
+  if s.focused then
+    delete_current(s)
+    return
+  end
+  local _, err = makima.session.delete(s.id)
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
     return
   end
   board.deleted[s.id] = true
@@ -357,9 +410,9 @@ local function commit_rename()
   if title == "" then
     return
   end
-  local _, err = maki.session.set_title({ id = id, title = title })
+  local _, err = makima.session.set_title({ id = id, title = title })
   if err then
-    maki.ui.flash(err)
+    makima.ui.flash(err)
   else
     local si = find_stored(id)
     if si then
@@ -426,12 +479,12 @@ local function handle_key(key)
   end
 end
 
-local function open(query)
+local function open_picker(filter)
   if board then
     return
   end
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
+  local buf = makima.ui.buf()
+  local win = makima.ui.open_win(buf, {
     title = " Sessions ",
     width = "70%",
     height = "70%",
@@ -448,31 +501,29 @@ local function open(query)
     reserved = 2,
     input = TextInput.new(),
     all = {},
-    query = query or "",
     items = {},
     rank = {},
     deleted = {},
     min_rank = 0,
     counts = { needs_input = 0, working = 0 },
     sel_id = nil,
-    frame = 0,
     loading = true,
   }
-  if query and query ~= "" then
-    board.input:insert_text(query)
+  if filter and filter ~= "" then
+    board.input:insert_text(filter)
   end
   -- Two-phase load: live sessions are cheap, so they show up and take keys
   -- right away; the stored scan can be slow, so a background task merges it
   -- in once it lands.
   refresh()
   local this_board = board
-  maki.async.run(function()
-    local stored, err = maki.session.list()
+  makima.async.run(function()
+    local stored, err = makima.session.list()
     if board ~= this_board then
       return
     end
     if err then
-      maki.ui.flash(err)
+      makima.ui.flash(err)
       stored = {}
     end
     -- A delete may have landed while the scan was in flight; never let the
@@ -488,17 +539,9 @@ local function open(query)
     refresh()
   end)
   while board do
-    local ev = board.win:recv(TICK_MS)
+    local ev = board.win:recv(board.age_visible and age_timeout_ms() or STATUS_POLL_MS)
     if not ev or ev.type == "close" then
       board = nil
-    elseif ev.type == "timeout" then
-      board.frame = board.frame + 1
-      if board.dirty then
-        board.dirty = false
-        refresh()
-      elseif board.frame % AGE_TICKS == 0 then
-        render()
-      end
     elseif ev.type == "click" then
       if ev.row > 0 and ev.row <= #board.input_render.lines then
         local input = board.rename and board.rename.input or board.input
@@ -532,23 +575,39 @@ local function open(query)
       board.height = ev.height
       render()
     end
+    if board and board.dirty then
+      board.dirty = false
+      refresh()
+    elseif board and board.age_visible and age_bucket_changed() then
+      render()
+    end
   end
+end
+
+-- Deleting the current session destroys this window, so relaunch with the
+-- staged filter instead of making the user reopen the picker by hand.
+local function open(query)
+  local filter = query
+  repeat
+    open_picker(filter)
+    filter, reopen_filter = reopen_filter, nil
+  until filter == nil
 end
 
 -- A background agent flipping state deserves a heads-up even with the picker
 -- closed, so the flash names the session and where to find it. The open
 -- board refreshes on the next tick of its recv loop.
 local last_status = {}
-maki.api.create_autocmd("SessionStatusChanged", {
+makima.api.create_autocmd("SessionStatusChanged", {
   callback = function(ev)
     local d = ev.data or {}
     local prev = last_status[d.session_id]
     last_status[d.session_id] = d.status
     if not d.focused then
       if d.status == "needs_input" then
-        maki.ui.flash("◆ " .. d.title .. " needs input · /sessions")
+        makima.ui.flash("◆ " .. d.title .. " needs input · /sessions")
       elseif d.status == "idle" and prev == "working" then
-        maki.ui.flash("✓ " .. d.title .. " finished · /sessions")
+        makima.ui.flash("✓ " .. d.title .. " finished · /sessions")
       end
     end
     if board then
@@ -557,7 +616,7 @@ maki.api.create_autocmd("SessionStatusChanged", {
   end,
 })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/sessions",
   description = "Browse and switch sessions",
   arguments = {
@@ -569,14 +628,14 @@ maki.api.register_command({
   end,
 })
 
-maki.api.create_autocmd("SessionPickerRequested", {
+makima.api.create_autocmd("SessionPickerRequested", {
   callback = function()
     open()
   end,
 })
-maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
+makima.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/rename",
   description = "Rename the current session",
   arguments = { raw = true, required = true },
@@ -584,15 +643,15 @@ maki.api.register_command({
   handler = function(opts, ctx)
     local title = opts.args:match("^%s*(.-)%s*$")
     if title == "" then
-      maki.ui.flash(RENAME_USAGE)
+      makima.ui.flash(RENAME_USAGE)
       return
     end
     local id, err = ctx and ctx:session_id()
     if not id then
-      maki.ui.flash(err or "no session")
+      makima.ui.flash(err or "no session")
       return
     end
-    local _, set_err = maki.session.set_title({ id = id, title = title })
-    maki.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
+    local _, set_err = makima.session.set_title({ id = id, title = title })
+    makima.ui.flash(set_err or ('Renamed to "' .. title .. '"'))
   end,
 })

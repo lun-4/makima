@@ -17,38 +17,38 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
-use maki_agent::cancel::CancelToken;
-use maki_agent::command::{
+use makima_agent::cancel::CancelToken;
+use makima_agent::command::{
     self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
-use maki_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
-use maki_agent::permissions::PluginRuleStore;
-use maki_agent::session_coordinator::{
+use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
+use makima_agent::permissions::PluginRuleStore;
+use makima_agent::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
 };
-use maki_agent::session_defaults;
-use maki_agent::tools::offload::OffloadCleanup;
-use maki_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
-use maki_agent::{
+use makima_agent::session_defaults;
+use makima_agent::tools::offload::OffloadCleanup;
+use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
+use makima_agent::{
     AgentConfig, AgentEvent, AgentInput, DoneReason, Envelope, ImageSource, PermissionsConfig,
     TurnOutcome,
 };
-use maki_commands::{
+use makima_commands::{
     CommandContent, CommandOutcome, CommandRegistry, InputDispatch, IsolatedTurn, TargetHandle,
 };
-use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
-use maki_lua::EventHandle;
-use maki_lua::orchestration::{
+use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+use makima_lua::EventHandle;
+use makima_lua::orchestration::{
     self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, TrustedTarget,
 };
-use maki_lua::session_snapshot::HeadlessObserver;
-use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
-use maki_storage::StateDir;
-use maki_storage::checkpoint::ClaimingWriter;
-use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::{SessionMeta, read_prefs};
+use makima_lua::session_snapshot::HeadlessObserver;
+use makima_providers::model::Model;
+use makima_providers::{ProviderRegistry, TokenUsage, add_cost};
+use makima_storage::StateDir;
+use makima_storage::checkpoint::ClaimingWriter;
+use makima_storage::id::{MakimaId, SessionRef};
+use makima_storage::sessions::{SessionMeta, read_prefs};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -63,9 +63,9 @@ fn load_images(paths: &[PathBuf]) -> Result<Vec<ImageSource>> {
     paths
         .iter()
         .map(|path| {
-            let media_type = maki_ui::image::media_type_for(path)
+            let media_type = makima_ui::image::media_type_for(path)
                 .ok_or_else(|| eyre!("unsupported image type: {}", path.display()))?;
-            maki_ui::image::load_file_image(path, media_type)
+            makima_ui::image::load_file_image(path, media_type)
                 .map_err(|e| eyre!("failed to load image: {e}"))
         })
         .collect()
@@ -322,7 +322,7 @@ fn start_print_session(
     registry: &CommandRegistry,
     discover: impl FnOnce(&ModelCatalog, String) -> Discovery,
 ) -> Result<PrintSession> {
-    let catalog = ModelCatalog::offline(&params.model_policy);
+    let catalog = ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy);
     let active_provider = params.model.provider.to_string();
     let definitions = builtin_option_definitions(
         Arc::from(params.model.spec()),
@@ -333,7 +333,7 @@ fn start_print_session(
         params.defaults.thinking.into(),
     );
     let model_policy = Arc::clone(&params.model_policy);
-    let timeouts = params.timeouts;
+    let providers = Arc::clone(&params.providers);
     let (binding, root_target) = orchestration::root_binding();
     let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
     smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
@@ -351,7 +351,7 @@ fn start_print_session(
         &handle,
         &coordinator,
         &root_target,
-        headless::default_model_preparer(timeouts),
+        headless::default_model_preparer(Arc::clone(&providers)),
     ))
     .map_err(|error| eyre!("bind print root: {error}"))?;
     let orchestration = Arc::new(orchestration::frontend_root(
@@ -366,10 +366,14 @@ fn start_print_session(
     let commands = registry.bind_target(
         session_capabilities(),
         Arc::new(orchestration::PinnedCommandHost::new(
-            SessionCommandHost::new(handle.control_tx.clone(), coordinator.clone()),
+            SessionCommandHost::new(
+                handle.control_tx.clone(),
+                coordinator.clone(),
+                Arc::clone(&providers),
+            ),
             root.clone(),
             &orchestration,
-            headless::default_model_preparer(timeouts),
+            headless::default_model_preparer(providers),
         )),
     );
     orchestration.bind_commands(
@@ -463,10 +467,11 @@ pub fn run(
     verbose: bool,
     config: AgentConfig,
     permissions_config: PermissionsConfig,
-    timeouts: maki_providers::Timeouts,
+    timeouts: makima_providers::Timeouts,
     lua_handle: EventHandle,
     defaults: SessionDefaults,
     model_policy: Arc<ModelPolicy>,
+    providers: Arc<ProviderRegistry>,
     system_prompt_override: Option<String>,
     append_system_prompt: Option<String>,
     plugin_rules: Arc<PluginRuleStore>,
@@ -494,7 +499,7 @@ pub fn run(
         StandardCommands::register(&command_registry, commands, StandardCompletions::default())?;
     let session_options = lua_handle.session_option_catalog();
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
-        let (handle, errors) = maki_agent::mcp::start_with_commands(
+        let (handle, errors) = makima_agent::mcp::start_with_commands(
             &cwd,
             project_config.clone(),
             command_registry.clone(),
@@ -510,7 +515,7 @@ pub fn run(
     }
 
     let terminal_result_emitted = std::cell::Cell::new(false);
-    let state_dir = maki_storage::paths::state_dir().ok();
+    let state_dir = makima_storage::paths::state_dir().ok();
     let outcome = (|| {
         let session = start_print_session(
             InteractiveParams {
@@ -529,6 +534,7 @@ pub fn run(
                 append_system_prompt,
                 defaults,
                 model_policy: Arc::clone(&model_policy),
+                providers: Arc::clone(&providers),
                 modes: lua_handle.mode_registry(),
                 question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
@@ -537,7 +543,7 @@ pub fn run(
                 state_dir,
                 answers: false,
             },
-            headless::default_preparation(),
+            headless::default_preparation(providers),
             session_options,
             &lua_handle,
             &command_registry,
@@ -627,6 +633,9 @@ pub fn run(
                                 | AgentEvent::ToolExecutionStart { .. }
                                 | AgentEvent::ToolOutput { .. }
                                 | AgentEvent::ToolDone(_)
+                                | AgentEvent::ToolMoved { .. }
+                                | AgentEvent::BackgroundDone(_)
+                                | AgentEvent::BackgroundLost { .. }
                                 | AgentEvent::QueueItemConsumed { .. }
                                 | AgentEvent::ModelSwitched { .. }
                                 | AgentEvent::QueueSettled
@@ -783,7 +792,7 @@ pub fn run(
             num_turns: 0,
             result: error.to_string(),
             stop_reason: None,
-            session_id: SessionRef::from_id(MakiId::generate()),
+            session_id: SessionRef::from_id(MakimaId::generate()),
             total_cost_usd: 0.0,
             usage: TokenUsage::default(),
         };
@@ -796,7 +805,7 @@ pub fn run(
 mod tests {
     use super::*;
     use flume::{Receiver, Sender};
-    use maki_agent::{
+    use makima_agent::{
         AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
@@ -804,15 +813,15 @@ mod tests {
             offload::{OffloadBackend, OffloadError, OffloadStore},
         },
     };
-    use maki_commands::{
+    use makima_commands::{
         CommandError, CommandFuture, FrontendFeedback, TargetCapabilities, TargetCapability,
     };
-    use maki_providers::{
-        ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage, model_registry,
+    use makima_providers::{
+        ContentBlock, FastSupport, Invocation, Message, ModelInfo, ProviderEvent, RequestDelivery,
+        RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
         provider::{BoxFuture, ModelBatch, Provider},
     };
-    use maki_storage::sessions::{SESSIONS_DIR, offload_dir};
+    use makima_storage::sessions::{SESSIONS_DIR, offload_dir};
     use std::borrow::Cow;
     use std::io::Write;
     use std::path::Path;
@@ -836,10 +845,24 @@ mod tests {
     const CHILD_RESPONSE: &str = "print child response";
     const GRANDCHILD_RESPONSE: &str = "print grandchild response";
     const COMMAND_CHILD_PROMPT: &str = "print command child request";
-    const DISCOVERY_PROVIDER: &str = "mistral";
+    /// Re-preparing needs a constructible native provider.
+    const DISCOVERY_PROVIDER: &str = "print-discovery";
     const DISCOVERY_MODEL_ID: &str = "print-discovery-root";
     const DISCOVERED_WINDOW: u32 = 777_000;
     const MODELS_COMMAND: &str = "/print_models";
+
+    /// The provider of [`PRINT_MODEL`], which supports fast mode.
+    fn print_providers() -> Arc<ProviderRegistry> {
+        let (provider, id) = Model::parse_spec(PRINT_MODEL).unwrap();
+        Arc::new(makima_providers::test_util::offline_registry(vec![(
+            provider,
+            vec![makima_providers::ModelInfo {
+                supports_fast: Some(FastSupport::Supported),
+                supports_thinking: Some(true),
+                ..makima_providers::ModelInfo::id_only(id.into())
+            }],
+        )]))
+    }
 
     #[test_case("completed"; "completed")]
     #[test_case("failed"; "failed")]
@@ -1066,6 +1089,7 @@ mod tests {
             append_system_prompt: None,
             defaults: Default::default(),
             model_policy: Arc::default(),
+            providers: print_providers(),
             modes: EventHandle::disconnected_for_test().mode_registry(),
             question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
@@ -1077,7 +1101,9 @@ mod tests {
     }
 
     fn provided(provider: Arc<dyn Provider>) -> ProviderPreparation {
-        Box::new(move |model, _| Box::pin(async move { Ok((model, provider)) }))
+        Box::new(move |model| {
+            Box::pin(async move { Ok(makima_agent::actor::PreparedModel { model, provider }) })
+        })
     }
 
     /// Starts a print session on {provider} and admits {message}.
@@ -1130,19 +1156,21 @@ mod tests {
         nested: Option<(Sender<()>, Receiver<()>)>,
     }
 
-    impl maki_providers::provider::Provider for RecordingPrintProvider {
+    impl makima_providers::provider::Provider for RecordingPrintProvider {
         fn stream_message<'a>(
             &'a self,
             model: &'a Model,
-            messages: &'a [maki_providers::Message],
+            messages: &'a [makima_providers::Message],
             system: &'a str,
             _: &'a Value,
-            events: &'a flume::Sender<maki_providers::ProviderEvent>,
-            options: maki_providers::RequestOptions,
+            events: &'a flume::Sender<makima_providers::ProviderEvent>,
+            options: makima_providers::RequestOptions,
             _: Option<&'a SessionRef>,
-        ) -> maki_providers::provider::BoxFuture<
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> makima_providers::provider::BoxFuture<
             'a,
-            Result<maki_providers::StreamResponse, maki_agent::AgentError>,
+            Result<makima_providers::StreamResponse, makima_agent::AgentError>,
         > {
             Box::pin(async move {
                 self.requests
@@ -1232,15 +1260,6 @@ mod tests {
                 })
             })
         }
-
-        fn list_models(
-            &self,
-        ) -> maki_providers::provider::BoxFuture<
-            '_,
-            Result<Vec<maki_providers::ModelInfo>, maki_agent::AgentError>,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
     }
 
     struct SettlementTool {
@@ -1298,6 +1317,8 @@ mod tests {
             _: &'a Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.polled.send_async(()).await.unwrap();
@@ -1317,10 +1338,6 @@ mod tests {
                     stop_reason: Some(StopReason::ToolUse),
                 })
             })
-        }
-
-        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-            Box::pin(async { Ok(Vec::new()) })
         }
     }
 
@@ -1384,31 +1401,35 @@ mod tests {
     #[test]
     fn print_root_starts_on_its_discovered_provider() {
         let state = tempfile::tempdir().unwrap();
+        makima_storage::paths::init_shared_for_test();
+        let models = Arc::<std::sync::Mutex<Vec<ModelInfo>>>::default();
+        let providers =
+            makima_lua::test_support::offline_registry(DISCOVERY_PROVIDER, Arc::clone(&models));
         let spec = format!("{DISCOVERY_PROVIDER}/{DISCOVERY_MODEL_ID}");
         let registry = CommandRegistry::new();
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        let host = maki_lua::PluginHost::with_session_provider_preparer(
+        let (ui, notices) = makima_lua::test_support::RecordingUi::new();
+        let host = makima_lua::PluginHost::with_session_provider_preparer(
             Arc::clone(ToolRegistry::global_arc()),
             registry.clone(),
             true,
-            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            Arc::new(makima_lua::test_support::InMemoryFs::new()),
             Some(state.path().to_path_buf()),
             None,
-            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
+            makima_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
         host.load_source(
             "print_models",
             &format!(
                 r#"
-                maki.api.register_command({{
+                makima.api.register_command({{
                     name = "{MODELS_COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local found = false
                         for _, model in ipairs(assert(assert(ctx:agent()):available_models(ctx))) do
                             found = found or model == "{spec}"
                         end
-                        maki.ui.flash(tostring(found))
+                        makima.ui.flash(tostring(found))
                     end,
                 }})
             "#
@@ -1417,7 +1438,8 @@ mod tests {
         .unwrap();
         let lua_handle = host.event_handle();
         let mut params = print_params(&std::env::temp_dir(), None);
-        params.model = Model::from_spec(&spec).unwrap();
+        params.model = providers.model(&spec).unwrap();
+        params.providers = Arc::clone(&providers);
         assert_ne!(params.model.context_window, DISCOVERED_WINDOW);
         let (requests, _) = flume::unbounded();
         let session = start_print_session(
@@ -1432,15 +1454,15 @@ mod tests {
             |catalog, active| {
                 catalog.discover_from(
                     async move |mut on_ready| {
-                        model_registry::set_known_models(
-                            DISCOVERY_PROVIDER,
-                            vec![ModelInfo {
-                                context_window: Some(DISCOVERED_WINDOW),
-                                ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
-                            }],
-                        );
+                        *models.lock().unwrap() = vec![ModelInfo {
+                            context_window: Some(DISCOVERED_WINDOW),
+                            ..ModelInfo::id_only(DISCOVERY_MODEL_ID.into())
+                        }];
+                        providers
+                            .fetch_all(&ModelPolicy::default(), false, |_| {})
+                            .await;
                         on_ready(ModelBatch {
-                            provider: Some(DISCOVERY_PROVIDER),
+                            provider: Some(DISCOVERY_PROVIDER.into()),
                             models: vec![spec],
                             warnings: Vec::new(),
                         });
@@ -1528,17 +1550,17 @@ mod tests {
             nested: nested.then_some((entered, gate)),
         });
         let child_provider = Arc::clone(&provider);
-        let (ui, notices) = maki_lua::test_support::RecordingUi::new();
-        let host = maki_lua::PluginHost::with_session_provider_preparer(
+        let (ui, notices) = makima_lua::test_support::RecordingUi::new();
+        let host = makima_lua::PluginHost::with_session_provider_preparer(
             Arc::clone(ToolRegistry::global_arc()),
             registry.clone(),
             true,
-            Arc::new(maki_lua::test_support::InMemoryFs::new()),
+            Arc::new(makima_lua::test_support::InMemoryFs::new()),
             Some(state_dir.path().to_path_buf()),
             Some(Arc::new(move |model| {
                 Ok((model, Arc::clone(&child_provider)))
             })),
-            maki_lua::ui_sink::HostUi::Sink(Box::new(ui)),
+            makima_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
         if nested {
@@ -1548,33 +1570,33 @@ mod tests {
             )
             .unwrap();
             host.load_source(PRINT_NESTED_TOOL, &format!(r#"
-                maki.api.register_tool({{
+                makima.api.register_tool({{
                     name = "{PRINT_NESTED_TOOL}", description = "Exercise nested print tasks",
                     schema = {{ type = "object", properties = {{ child = {{ type = "boolean" }} }} }},
                     audiences = {{ "main", "general_sub" }},
                     handler = function(input, ctx)
                         local agent = assert(ctx:agent())
                         local selection = assert(agent:config(ctx)).model
-                        local root_ref = assert(maki.agent.root(ctx))
+                        local root_ref = assert(makima.agent.root(ctx))
                         if input.child then
                             assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         else
-                            local root = assert(maki.agent.get(ctx, root_ref))
+                            local root = assert(makima.agent.get(ctx, root_ref))
                             assert(root:id() == agent:id())
                         end
                         local prompt = input.child and "{GRANDCHILD_PROMPT}" or "{CHILD_PROMPT}"
-                        local spawned, err = maki.agent.call_tool(ctx, "task_spawn", {{
+                        local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
                             description = prompt, prompt = prompt, subagent_type = "general",
                         }})
                         assert(not err, err)
-                        local task = maki.json.decode(spawned)
+                        local task = makima.json.decode(spawned)
                         if input.child then
                             local changed = assert(agent:set_model(ctx, {{ fast = false }}))
                             assert(not changed.fast)
                         end
-                        local joined, wait_err = maki.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                        local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                         assert(not wait_err, wait_err)
-                        local result = maki.json.decode(joined)
+                        local result = makima.json.decode(joined)
                         local expected = input.child and "{GRANDCHILD_RESPONSE}" or "{CHILD_RESPONSE}"
                         assert(result.result.text == expected, joined)
                         return result.result.text
@@ -1586,14 +1608,17 @@ mod tests {
             PRINT_RUNNER_AUTOCMD,
             &format!(
                 r#"
-                maki.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
+                makima.api.create_autocmd("{PRINT_RUNNER_AUTOCMD}", {{
                     callback = function(_, ctx)
-                        local ok, err = maki.api.run_command(ctx, "/cd {cwd}")
-                        maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+                        local ok, err = makima.api.run_command(ctx, "/cd {cwd}")
+                        makima.ui.flash(tostring(ok) .. "|" .. tostring(err))
                     end,
                 }})
             "#,
-                cwd = std::env::temp_dir().display()
+                cwd = std::env::temp_dir()
+                    .display()
+                    .to_string()
+                    .replace('\\', "\\\\")
             ),
         )
         .unwrap();
@@ -1601,11 +1626,11 @@ mod tests {
             MODE_AUTOCMD,
             &format!(
                 r#"
-                maki.api.create_autocmd("{MODE_AUTOCMD}", {{
+                makima.api.create_autocmd("{MODE_AUTOCMD}", {{
                     callback = function(ev, ctx)
                         local plan, plan_err = ev.agent:set_mode(ctx, "plan")
                         local build, build_err = ev.agent:set_mode(ctx, "build")
-                        maki.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
+                        makima.ui.flash(tostring(plan or plan_err) .. "|" .. tostring(build or build_err))
                     end,
                 }})
             "#
@@ -1615,17 +1640,17 @@ mod tests {
         host.load_source(
             "print_initialized_command",
             &format!(r#"
-                maki.api.register_command({{
+                makima.api.register_command({{
                     name = "{COMMAND}", tui_only = false,
                     handler = function(_, ctx)
                         local root = assert(ctx:agent())
-                        assert(root:id() == assert(maki.agent.root(ctx)):id())
+                        assert(root:id() == assert(makima.agent.root(ctx)):id())
                         local selection = assert(root:config(ctx)).model
                         assert(selection.spec == "{PRINT_MODEL}" and selection.fast)
                         local slow = assert(root:set_model(ctx, {{ fast = false }}))
                         assert(not slow.fast and not assert(root:config(ctx)).model.fast)
                         assert(assert(root:set_model(ctx, {{ fast = true }})).fast)
-                        local view, view_err = maki.fn.winsaveview()
+                        local view, view_err = makima.fn.winsaveview()
                         assert(view == nil and view_err == "{no_ui}", view_err)
                         assert(root:set_mode(ctx, "plan"))
                         assert(assert(root:config(ctx)).mode == "plan", assert(root:config(ctx)).mode)
@@ -1634,7 +1659,7 @@ mod tests {
                         assert(set == nil and set_err == "{typed_setter}", set_err)
                         assert(root:set_option(ctx, "workflow", "enabled"))
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
-                        local child = assert(maki.agent.spawn(ctx, {{
+                        local child = assert(makima.agent.spawn(ctx, {{
                             inherit_provider = true, silent = true, tools = {{}},
                         }}))
                         local refused, refused_err = child:set_option(ctx, "yolo", "enabled")
@@ -1642,11 +1667,11 @@ mod tests {
                         assert(child:set_option(ctx, "workflow", "disabled"))
                         assert(assert(child:config(ctx)).options.workflow == "disabled")
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
-                        local gate = maki.async.semaphore(1)
+                        local gate = makima.async.semaphore(1)
                         local held = gate:acquire()
                         local pinned, pinned_err
                         assert(child:on_turn_end(ctx, function(_, child_ctx)
-                            pinned, pinned_err = maki.api.run_command(child_ctx, "/workflow")
+                            pinned, pinned_err = makima.api.run_command(child_ctx, "/workflow")
                             held:release()
                         end))
                         assert(assert(assert(child:send(ctx, "{COMMAND_CHILD_PROMPT}", {{ when = "idle" }})):wait(ctx)).text == "{PRINT_RESPONSE}")
@@ -1655,13 +1680,13 @@ mod tests {
                         assert(assert(child:config(ctx)).options.workflow == "enabled")
                         assert(assert(root:config(ctx)).options.workflow == "enabled")
                         assert(child:close(ctx))
-                        maki.ui.flash("{COMMAND_FINISHED}")
+                        makima.ui.flash("{COMMAND_FINISHED}")
                     end,
                 }})
             "#,
-                typed_setter = maki_lua::agent_errors::TYPED_OPTION_SETTER,
-                session_level = maki_lua::agent_errors::SESSION_LEVEL_OPTION,
-                no_ui = maki_lua::ui_sink::NO_UI_ERR,
+                typed_setter = makima_lua::agent_errors::TYPED_OPTION_SETTER,
+                session_level = makima_lua::agent_errors::SESSION_LEVEL_OPTION,
+                no_ui = makima_lua::ui_sink::NO_UI_ERR,
             ),
         ).unwrap();
         let moved_to = std::fs::canonicalize(state_dir.path()).unwrap();
@@ -1876,10 +1901,10 @@ mod tests {
 
     struct ReplaceAttachment;
 
-    impl maki_commands::CommandBehavior for ReplaceAttachment {
+    impl makima_commands::CommandBehavior for ReplaceAttachment {
         fn execute(
             &self,
-            invocation: maki_commands::CommandInvocation,
+            invocation: makima_commands::CommandInvocation,
         ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
             Box::pin(async move {
                 let Some(attachment) = invocation.content.attachments.first() else {
@@ -1894,10 +1919,10 @@ mod tests {
                         "command attachment changed before dispatch",
                     )));
                 }
-                Ok(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+                Ok(CommandOutcome::AgentTurn(makima_commands::AgentTurn {
                     content: CommandContent {
                         text: Arc::from("inspected"),
-                        attachments: Arc::from([maki_commands::CommandAttachment {
+                        attachments: Arc::from([makima_commands::CommandAttachment {
                             media_type: Arc::from("image/jpeg"),
                             data: Arc::from("BBBB"),
                         }]),
@@ -1911,14 +1936,14 @@ mod tests {
     #[test]
     fn command_behavior_owns_attachment_policy() {
         let registry = CommandRegistry::new();
-        let producer = registry.create_producer(maki_commands::ProducerPrecedence::Plugin);
+        let producer = registry.create_producer(makima_commands::ProducerPrecedence::Plugin);
         producer
-            .replace(vec![maki_commands::Registration {
-                spec: maki_commands::CommandSpec {
+            .replace(vec![makima_commands::Registration {
+                spec: makima_commands::CommandSpec {
                     name: Arc::from("/inspect"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
-                    docs: maki_commands::CommandDocs {
+                    arguments: makima_commands::CommandArguments::Positional(Arc::from([])),
+                    docs: makima_commands::CommandDocs {
                         summary: Arc::from("inspect"),
                         argument_hint: None,
                     },
@@ -1932,7 +1957,7 @@ mod tests {
             .unwrap();
         let mut literal = input("/inspect");
         literal.images.push(ImageSource::new(
-            maki_agent::ImageMediaType::Png,
+            makima_agent::ImageMediaType::Png,
             Arc::from("AAAA"),
         ));
         let PrintWork::Turn(received) = dispatch_idle(&registry, literal).unwrap() else {
@@ -1942,7 +1967,7 @@ mod tests {
         assert_eq!(received.images.len(), 1);
         assert_eq!(
             received.images[0].media_type,
-            maki_agent::ImageMediaType::Jpeg
+            makima_agent::ImageMediaType::Jpeg
         );
         assert_eq!(received.images[0].data.as_ref(), "BBBB");
     }
@@ -1954,7 +1979,7 @@ mod tests {
             StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
         let mut literal = input("/btw explain this");
         literal.images.push(ImageSource::new(
-            maki_agent::ImageMediaType::Png,
+            makima_agent::ImageMediaType::Png,
             Arc::from("AAAA"),
         ));
         let PrintWork::IsolatedTurn(turn) = dispatch_idle(&registry, literal).unwrap() else {
@@ -1969,23 +1994,23 @@ mod tests {
     #[test]
     fn completed_command_skips_runner() {
         struct Completed;
-        impl maki_commands::CommandBehavior for Completed {
+        impl makima_commands::CommandBehavior for Completed {
             fn execute(
                 &self,
-                _invocation: maki_commands::CommandInvocation,
+                _invocation: makima_commands::CommandInvocation,
             ) -> CommandFuture<Result<CommandOutcome, CommandError>> {
                 Box::pin(async { Ok(CommandOutcome::Completed) })
             }
         }
         let registry = CommandRegistry::new();
         registry
-            .create_producer(maki_commands::ProducerPrecedence::Plugin)
-            .replace(vec![maki_commands::Registration {
-                spec: maki_commands::CommandSpec {
+            .create_producer(makima_commands::ProducerPrecedence::Plugin)
+            .replace(vec![makima_commands::Registration {
+                spec: makima_commands::CommandSpec {
                     name: Arc::from("/done"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
-                    docs: maki_commands::CommandDocs {
+                    arguments: makima_commands::CommandArguments::Positional(Arc::from([])),
+                    docs: makima_commands::CommandDocs {
                         summary: Arc::from("done"),
                         argument_hint: None,
                     },
@@ -2006,7 +2031,7 @@ mod tests {
         let registry = CommandRegistry::new();
         let mut literal = input("/unknown literal");
         literal.images.push(ImageSource::new(
-            maki_agent::ImageMediaType::Webp,
+            makima_agent::ImageMediaType::Webp,
             Arc::from("AAAA"),
         ));
         assert!(
@@ -2021,7 +2046,7 @@ mod tests {
         let registry = CommandRegistry::new();
         let mut literal = input(message);
         literal.images.push(ImageSource::new(
-            maki_agent::ImageMediaType::Webp,
+            makima_agent::ImageMediaType::Webp,
             Arc::from("AAAA"),
         ));
         let PrintWork::Turn(received) = dispatch_idle(&registry, literal).unwrap() else {
@@ -2031,7 +2056,7 @@ mod tests {
         assert_eq!(received.images.len(), 1);
         assert_eq!(
             received.images[0].media_type,
-            maki_agent::ImageMediaType::Webp
+            makima_agent::ImageMediaType::Webp
         );
         assert_eq!(received.images[0].data.as_ref(), "AAAA");
     }

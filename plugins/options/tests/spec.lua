@@ -1,5 +1,5 @@
 local helpers = require("options_helpers")
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq

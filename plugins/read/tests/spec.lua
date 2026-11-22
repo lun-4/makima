@@ -3,7 +3,7 @@ local helpers = require("read_helpers")
 local truncate_bytes = helpers.truncate_bytes
 local split_lines = helpers.split_lines
 
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 
 local case = th.case
 local eq = th.eq

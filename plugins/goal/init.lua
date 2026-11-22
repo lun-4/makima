@@ -1,6 +1,6 @@
 local M = {}
 
-local CONFIG = maki.api.register_options({
+local CONFIG = makima.api.register_options({
   checker_model = { default = "", desc = "Checker model spec; empty selects the weak model tier." },
   checker_thinking = { default = "", desc = "Checker thinking level; empty uses the model default." },
   checker_fast = { default = false, desc = "Enable fast mode for the checker." },
@@ -63,11 +63,11 @@ local function report(ctx, text, level)
   if level then
     opts = { level = level }
   end
-  local ok, posted = pcall(maki.ui.post, ctx, text, opts)
+  local ok, posted = pcall(makima.ui.post, ctx, text, opts)
   if ok and posted then
     return
   end
-  pcall(maki.notify, text, level, nil)
+  pcall(makima.notify, text, level, nil)
 end
 
 local function describe_error(err)
@@ -126,7 +126,7 @@ local function checker_model(ctx, config)
   if config.checker_model ~= "" then
     model = { spec = config.checker_model }
   else
-    local resolved, err = maki.agent.resolve_model(ctx, { tier = "weak" })
+    local resolved, err = makima.agent.resolve_model(ctx, { tier = "weak" })
     if not resolved then
       return nil, err
     end
@@ -164,7 +164,7 @@ local function start_checker(ctx, config)
   if not model then
     return nil, model_err
   end
-  return maki.agent.spawn(ctx, checker_opts(config, model))
+  return makima.agent.spawn(ctx, checker_opts(config, model))
 end
 
 local function prompt_checker(checker, ctx, message, config)
@@ -180,7 +180,7 @@ local function prompt_checker(checker, ctx, message, config)
 end
 
 local function ask_checker(checker, ctx, goal, evidence, config)
-  local encoded, encode_err = maki.json.encode({ goal = goal.text, evidence = evidence })
+  local encoded, encode_err = makima.json.encode({ goal = goal.text, evidence = evidence })
   if not encoded then
     return nil, encode_err
   end
@@ -510,7 +510,7 @@ local function handle_command(opts, ctx)
   return true
 end
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/goal",
   description = "Set a goal, clear it with /goal off, or inspect it with /goal status.",
   tui_only = false,

@@ -21,7 +21,7 @@ local spawns
 local checks
 local closed_subscriptions
 
-maki = {
+makima = {
   api = {
     register_command = function(spec)
       command = spec.handler

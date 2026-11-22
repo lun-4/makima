@@ -1,3 +1,5 @@
+local TRUTHY = { ["true"] = true, ["yes"] = true, ["on"] = true, ["1"] = true }
+
 local M = {}
 
 function M.parse_frontmatter(content)
@@ -11,17 +13,26 @@ function M.parse_frontmatter(content)
   end
   local yaml_str = rest:sub(1, end_pos)
   local body = rest:sub(end_pos + 4):match("^%s*(.-)%s*$")
-  local fm, _ = maki.yaml.decode(yaml_str)
+  local fm, _ = makima.yaml.decode(yaml_str)
   if not fm then
     fm = {}
   end
   return fm, body
 end
 
+function M.parse_bool(value)
+  if value == true or value == 1 then
+    return true
+  end
+  return type(value) == "string" and TRUTHY[value:lower()] == true
+end
+
 function M.build_skill_list(skills)
   local sorted = {}
   for _, s in pairs(skills) do
-    sorted[#sorted + 1] = s
+    if s.disable_model_invocation ~= true then
+      sorted[#sorted + 1] = s
+    end
   end
   table.sort(sorted, function(a, b)
     return a.name < b.name

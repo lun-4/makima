@@ -13,7 +13,7 @@ local last_render
 local rollback_queued = false
 local startup
 
-local plugin_opts = maki.api.register_options({
+local plugin_opts = makima.api.register_options({
   splash = {
     type = "string",
     desc = "Splash to select at startup, e.g. 'aurora' or 'default'. Wins over the persisted selection, re-wins on every boot, and updates the persisted selection to its value.",
@@ -28,7 +28,7 @@ local function refresh_renderers()
     return
   end
   dirty = false
-  renderers = maki.store.collect(REGISTRY)
+  renderers = makima.store.collect(REGISTRY)
   -- Discard cached renderers so a reloaded or unloaded plugin does not keep
   -- a function from an old instance alive through the picker.
   committed.renderer = nil
@@ -117,9 +117,9 @@ local function validate(selection)
 end
 
 local function state_dir()
-  local dir = maki.env.state_dir()
+  local dir = makima.env.state_dir()
   if dir then
-    return maki.fs.joinpath(dir, STATE_DIR)
+    return makima.fs.joinpath(dir, STATE_DIR)
   end
   return nil
 end
@@ -127,7 +127,7 @@ end
 local function state_path()
   local dir = state_dir()
   if dir then
-    return maki.fs.joinpath(dir, STATE_FILE)
+    return makima.fs.joinpath(dir, STATE_FILE)
   end
   return nil
 end
@@ -137,11 +137,11 @@ local function load_preference()
   if not path then
     return nil
   end
-  local ok, content = pcall(maki.fs.read, path)
+  local ok, content = pcall(makima.fs.read, path)
   if not content then
     return nil, not ok
   end
-  local decoded, value = pcall(maki.json.decode, content)
+  local decoded, value = pcall(makima.json.decode, content)
   if decoded and type(value) == "table" and type(value.name) == "string" then
     return value.name, false
   end
@@ -153,11 +153,11 @@ local function save_preference(name)
   if not dir then
     return true
   end
-  local ok, err = maki.fs.mkdir(dir, { parents = true })
+  local ok, err = makima.fs.mkdir(dir, { parents = true })
   if not ok and err then
     return nil, err
   end
-  return maki.fs.atomic_write(maki.fs.joinpath(dir, STATE_FILE), maki.json.encode({ name = name }))
+  return makima.fs.atomic_write(makima.fs.joinpath(dir, STATE_FILE), makima.json.encode({ name = name }))
 end
 
 local function queue_rollback(failed_persisted)
@@ -165,11 +165,11 @@ local function queue_rollback(failed_persisted)
     return
   end
   rollback_queued = true
-  maki.async.run(function()
+  makima.async.run(function()
     local ok, err = save_preference(committed.name)
     rollback_queued = false
     if not ok then
-      maki.ui.flash("splash rollback failed: " .. tostring(err))
+      makima.ui.flash("splash rollback failed: " .. tostring(err))
     end
   end)
 end
@@ -231,8 +231,8 @@ local function render(prev, w, h, t, fade)
   if startup then
     local pending = startup
     startup = nil
-    maki.async.run(function()
-      maki.ui.flash("unknown splash: " .. pending)
+    makima.async.run(function()
+      makima.ui.flash("unknown splash: " .. pending)
     end)
   end
   if candidate then
@@ -287,10 +287,10 @@ local function apply_startup()
     return
   end
   startup = nil
-  maki.async.run(function()
+  makima.async.run(function()
     local ok, err = commit(selection, true)
     if not ok then
-      maki.ui.flash("splash selection failed: " .. tostring(err))
+      makima.ui.flash("splash selection failed: " .. tostring(err))
     end
   end)
 end
@@ -300,13 +300,13 @@ local function command(opts)
   if name then
     local ok, err = select_and_commit(name:lower(), true)
     if not ok then
-      maki.ui.flash("splash selection failed: " .. tostring(err))
+      makima.ui.flash("splash selection failed: " .. tostring(err))
     end
     return
   end
 
   local picker_items = items()
-  local result = maki.ui.open_list_picker(picker_items, {
+  local result = makima.ui.open_list_picker(picker_items, {
     title = "Splash picker",
     cursor = item_index(picker_items, committed.name),
     timeout_ms = 100,
@@ -314,7 +314,7 @@ local function command(opts)
     on_change = function(item)
       local _, err = stage(item.name)
       if err then
-        maki.ui.flash("splash preview failed: " .. tostring(err))
+        makima.ui.flash("splash preview failed: " .. tostring(err))
       end
     end,
   })
@@ -326,16 +326,16 @@ local function command(opts)
     end
     local ok, err = commit(selection, true)
     if not ok then
-      maki.ui.flash("splash selection failed: " .. tostring(err))
+      makima.ui.flash("splash selection failed: " .. tostring(err))
     end
   else
     cancel()
   end
 end
 
-maki.api.set_slot("splash.render", render)
+makima.api.set_slot("splash.render", render)
 
-maki.api.create_autocmd("StoreChanged", {
+makima.api.create_autocmd("StoreChanged", {
   callback = function(ev)
     if ev.data and ev.data.registry == REGISTRY then
       dirty = true
@@ -346,23 +346,23 @@ maki.api.create_autocmd("StoreChanged", {
 
 -- Programmatic selection: any Lua context (config, keymap, tool) can fire
 -- this. data = { name = <splash name>, persist = <boolean, default true> }.
-maki.api.create_autocmd("SplashSelect", {
+makima.api.create_autocmd("SplashSelect", {
   callback = function(ev)
     local data = ev.data
     if type(data) ~= "table" or type(data.name) ~= "string" then
-      maki.ui.flash("SplashSelect requires data.name (string)")
+      makima.ui.flash("SplashSelect requires data.name (string)")
       return
     end
-    maki.async.run(function()
+    makima.async.run(function()
       local ok, err = select_and_commit(data.name:lower(), data.persist ~= false)
       if not ok then
-        maki.ui.flash("splash selection failed: " .. tostring(err))
+        makima.ui.flash("splash selection failed: " .. tostring(err))
       end
     end)
   end,
 })
 
-maki.api.register_command({
+makima.api.register_command({
   name = "/splash",
   description = "Preview and select a splash renderer",
   tui_only = true,
@@ -386,7 +386,7 @@ maki.api.register_command({
         on_highlight = function(_, item)
           local _, err = stage(item.insertion)
           if err then
-            maki.ui.flash("splash preview failed: " .. tostring(err))
+            makima.ui.flash("splash preview failed: " .. tostring(err))
           end
         end,
         on_accept = function(_, item)
@@ -396,7 +396,7 @@ maki.api.register_command({
           end
           local ok, err = commit(selection, true)
           if not ok then
-            maki.ui.flash("splash selection failed: " .. tostring(err))
+            makima.ui.flash("splash selection failed: " .. tostring(err))
           end
         end,
         on_cancel = cancel,
@@ -414,10 +414,10 @@ if saved then
   committed = { name = saved, persisted = true }
 end
 if invalid_saved then
-  maki.async.run(function()
+  makima.async.run(function()
     local ok, err = save_preference(FALLBACK_NAME)
     if not ok then
-      maki.ui.flash("splash rollback failed: " .. tostring(err))
+      makima.ui.flash("splash rollback failed: " .. tostring(err))
     end
   end)
 end

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use maki_config::ProjectConfig;
-use maki_config::project::{self, TrustMode, TrustQuestion, confirm_trust};
-use maki_storage::StateDir;
-use maki_storage::trusted_folders::{CanonicalFolder, Change, TrustStatus, TrustedFolders};
+use makima_config::ProjectConfig;
+use makima_config::project::{self, TrustMode, TrustQuestion, confirm_trust};
+use makima_storage::StateDir;
+use makima_storage::trusted_folders::{CanonicalFolder, Change, TrustStatus, TrustedFolders};
 
 const NEEDS_A_TERMINAL: &str = "trust add needs a terminal confirmation or --yes";
 
@@ -105,7 +105,8 @@ mod tests {
     #[test_case(&["trust", "add", "--yes", "/tmp"] ; "yes_before_path")]
     #[test_case(&["trust", "add", "/tmp", "--yes"] ; "yes_after_path")]
     fn trust_add_accepts_the_flag_on_either_side_of_the_path(args: &[&str]) {
-        let cli = Cli::try_parse_from(std::iter::once("maki").chain(args.iter().copied())).unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("makima").chain(args.iter().copied())).unwrap();
 
         assert!(matches!(
             cli.command,
@@ -115,7 +116,7 @@ mod tests {
         ));
     }
 
-    /// A path anywhere in the checkout trusts the checkout, so `maki trust add
+    /// A path anywhere in the checkout trusts the checkout, so `makima trust add
     /// src/main.rs` does not quietly trust a subdirectory instead.
     #[test_case(false ; "the_checkout_itself")]
     #[test_case(true ; "a_file_inside_the_checkout")]

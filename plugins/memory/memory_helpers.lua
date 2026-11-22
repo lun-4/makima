@@ -41,7 +41,7 @@ function M.fnv1a_64(data)
 end
 
 function M.project_id(path)
-  local base = maki.fs.basename(path) or "root"
+  local base = makima.fs.basename(path) or "root"
   return base .. "-" .. M.fnv1a_64(path)
 end
 
@@ -53,8 +53,8 @@ function M.safe_resolve(memories_dir, relative)
   if relative:find("\0") or first == "/" or first == "\\" or relative:match("^%a:") then
     return nil, "path must be relative"
   end
-  local resolved = maki.fs.normalize(maki.fs.joinpath(memories_dir, relative))
-  local norm_base = maki.fs.normalize(memories_dir)
+  local resolved = makima.fs.normalize(makima.fs.joinpath(memories_dir, relative))
+  local norm_base = makima.fs.normalize(memories_dir)
   local sep = norm_base:find("\\") and "\\" or "/"
   local prefix = norm_base .. sep
   if resolved:sub(1, #prefix) ~= prefix then
@@ -65,9 +65,9 @@ end
 
 local function file_entries(dir)
   local files = {}
-  for _, entry in ipairs(maki.fs.dir(dir) or {}) do
+  for _, entry in ipairs(makima.fs.dir(dir) or {}) do
     if entry[2] == "file" then
-      local meta = maki.fs.metadata(maki.fs.joinpath(dir, entry[1]))
+      local meta = makima.fs.metadata(makima.fs.joinpath(dir, entry[1]))
       if meta then
         files[#files + 1] = { entry[1], meta.size, meta.mtime }
       end
@@ -93,7 +93,7 @@ function M.normalize_tag(raw)
 end
 
 local function stem_tag(path)
-  local base = maki.fs.basename(path) or path
+  local base = makima.fs.basename(path) or path
   local stem = base:gsub("%.[^.]*$", "")
   if stem == "" then
     stem = base
@@ -217,7 +217,7 @@ function M.parse_frontmatter(content)
   end
   local yaml_str = rest:sub(1, end_pos)
   local body = rest:sub(end_pos + 4):match("^%s*(.-)%s*$")
-  local fm = maki.yaml.decode(yaml_str) or {}
+  local fm = makima.yaml.decode(yaml_str) or {}
   return fm, body
 end
 
@@ -247,7 +247,7 @@ function M.tags_for_file(path, content, read_err)
 end
 
 local function read_tags(dir, name)
-  local content, read_err = maki.fs.read(maki.fs.joinpath(dir, name))
+  local content, read_err = makima.fs.read(makima.fs.joinpath(dir, name))
   local tags, warn = M.tags_for_file(name, content, read_err and tostring(read_err))
   return tags, warn
 end
@@ -257,7 +257,7 @@ end
 local tag_cache = {}
 
 local function cached_tags(dir, name, size, mtime)
-  local key = maki.fs.joinpath(dir, name)
+  local key = makima.fs.joinpath(dir, name)
   local c = tag_cache[key]
   if c and mtime and c.mtime == mtime and c.size == size then
     return c.tags
@@ -286,7 +286,7 @@ local function matching_entries(dir, want)
     if warn then
       warnings[#warnings + 1] = name .. ": " .. warn
     elseif has_wanted_tag(tags, want) then
-      local content, read_err = maki.fs.read(maki.fs.joinpath(dir, name))
+      local content, read_err = makima.fs.read(makima.fs.joinpath(dir, name))
       if content then
         matches[#matches + 1] = { name = name, content = content, size = size }
       else
@@ -348,7 +348,7 @@ end
 
 -- serde_yaml renders an empty list as an empty mapping; extract_tags treats both as empty.
 function M.encode_frontmatter(tags)
-  local yaml, _ = maki.yaml.encode({ tags = tags })
+  local yaml, _ = makima.yaml.encode({ tags = tags })
   return "---\n" .. yaml .. "---\n"
 end
 

@@ -1,4 +1,4 @@
-local dir_listing = require("maki.dir_listing")
+local dir_listing = require("makima.dir_listing")
 
 local M = {}
 
@@ -13,7 +13,7 @@ function M.handler(input, ctx)
   if not path then
     return { llm_output = "error: " .. tostring(path_err), is_error = true }
   end
-  local meta = maki.fs.metadata(path)
+  local meta = makima.fs.metadata(path)
   if not meta then
     return { llm_output = "error: path not found: " .. path, is_error = true }
   end

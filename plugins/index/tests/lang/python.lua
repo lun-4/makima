@@ -1,4 +1,4 @@
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 local helpers = require("tests.helpers")
 local case = th.case
 local idx = helpers.idx

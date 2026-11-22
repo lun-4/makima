@@ -37,7 +37,7 @@ local function count_done(items)
 end
 
 local function update_hint(items)
-  maki.ui.set_status_hint({
+  makima.ui.set_status_hint({
     { string.format(" %d/%d ", count_done(items), #items), "foreground" },
     { "Ctrl+T", "keybind_key" },
     { " ", "" },
@@ -48,8 +48,8 @@ local function ensure_win(visible)
   if buf and win and win:is_open() then
     return
   end
-  buf = maki.ui.buf()
-  win = maki.ui.open_win(buf, {
+  buf = makima.ui.buf()
+  win = makima.ui.open_win(buf, {
     split = "panel",
     height = 4,
     order = 10,
@@ -79,7 +79,7 @@ local function render_panel(items, visible)
   buf:set_lines(build_lines(items))
   win:set_config({ height = #items + 2 })
   if win:is_visible() then
-    maki.ui.set_status_hint(nil)
+    makima.ui.set_status_hint(nil)
   else
     update_hint(items)
   end
@@ -89,7 +89,7 @@ local function hide_panel()
   if win and win:is_open() then
     win:hide()
   end
-  maki.ui.set_status_hint(nil)
+  makima.ui.set_status_hint(nil)
 end
 
 local function sync_panel(items, pop)
@@ -100,12 +100,12 @@ local function sync_panel(items, pop)
   end
 end
 
-maki.api.register_prompt_hint({
+makima.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Use todo_write for multi-step tasks (3+ steps); update **after EACH step** (done + next in_progress), never batched at the end.",
 })
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "todo_write",
   description = DESCRIPTION,
   schema = {
@@ -146,7 +146,7 @@ maki.api.register_tool({
       return nil
     end
     render_panel(items, false)
-    local body = maki.ui.buf()
+    local body = makima.ui.buf()
     body:set_lines(build_lines(items))
     return body
   end,
@@ -176,15 +176,15 @@ local function toggle()
     update_hint(items)
   elseif win:is_open() then
     win:show()
-    maki.ui.set_status_hint(nil)
+    makima.ui.set_status_hint(nil)
   else
     render_panel(items, true)
   end
 end
 
-maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
+makima.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
-maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
+makima.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
   callback = function(ev)
     if ev.data.parent_id then
       return
@@ -197,7 +197,7 @@ maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, {
   end,
 })
 
-maki.api.create_autocmd("SessionFocusChanged", {
+makima.api.create_autocmd("SessionFocusChanged", {
   callback = function(ev)
     focused = ev.data and ev.data.session_id
     -- Startup restore lands before the first focus event, so its items sit

@@ -13,10 +13,10 @@ Rust keeps the operationally sensitive pieces a plugin should not own: the frame
 
 ## The `splash.render` slot
 
-Every time the splash is allowed to animate, the UI pulls a frame from the slot `splash.render` and blits it. The bundled `splashes_default` plugin owns the slot and renders the default screen. Your plugin can wrap it with `maki.api.set_slot("splash.render", ...)`.
+Every time the splash is allowed to animate, the UI pulls a frame from the slot `splash.render` and blits it. The bundled `splashes_default` plugin owns the slot and renders the default screen. Your plugin can wrap it with `makima.api.set_slot("splash.render", ...)`.
 
 ```lua
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   -- call prev(w, h, t, fade) to keep the default and tweak it,
   -- or ignore it to fully replace the screen.
   return my_frame(w, h, t, fade)
@@ -45,16 +45,16 @@ Rust computes `fade` and passes it down; the plugin owns applying it. The defaul
 
 ## Version and the update notice
 
-Rust keeps running the update check. The result is mirrored into the Lua runtime, and plugins read it with `maki.version()`:
+Rust keeps running the update check. The result is mirrored into the Lua runtime, and plugins read it with `makima.version()`:
 
 ```lua
-local v = maki.version()
+local v = makima.version()
 -- v.current        string, e.g. "0.4.8"
 -- v.latest         string | nil
 -- v.update_available  boolean
 ```
 
-The default plugin draws the top-right version text and, when an update exists, appends ` run makima update to get v<latest>`. It queries `maki.version()` inside `splash.render`, so the version UI is fully plugin-owned.
+The default plugin draws the top-right version text and, when an update exists, appends ` run makima update to get v<latest>`. It queries `makima.version()` inside `splash.render`, so the version UI is fully plugin-owned.
 
 ## Bundled splashes
 
@@ -93,7 +93,7 @@ local splashes = {
   require("splash.kaleidoscope"),
   require("splash.aurora"),
 }
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   local splash = splashes[(math.floor(t / 3) % #splashes) + 1]
   return splash.render(w, h, t, fade)
 end)
@@ -101,12 +101,12 @@ end)
 
 Bundled modules resolve before files in the config `lua/` dir, so personal splashes must use plain names such as `require("mysplash")` outside the `splash.*` namespace. The bundled splashes live in `plugins/splashes_default/splash/` in the repository and follow the same single-file pattern as the custom splashes below.
 
-Third-party plugins can add entries to the same registry with `maki.store.register`. An entry is a table with a `label`, a `description`, and a `renderer` function. Entries are removed automatically when their plugin unloads, and the `StoreChanged` event tells the picker to re-resolve, so it does not retain a function from an old plugin instance.
+Third-party plugins can add entries to the same registry with `makima.store.register`. An entry is a table with a `label`, a `description`, and a `renderer` function. Entries are removed automatically when their plugin unloads, and the `StoreChanged` event tells the picker to re-resolve, so it does not retain a function from an old plugin instance.
 
 ```lua
 local mysplash = require("mysplash")
 
-maki.store.register("splash", "mysplash", {
+makima.store.register("splash", "mysplash", {
   label = "My splash",
   description = "A short description",
   renderer = mysplash.render,
@@ -120,7 +120,7 @@ The picker validates a selection before it persists the selection. If an active 
 The picker takes a `splash` option: the splash to select when makima boots. It wins over the persisted selection and updates it to the option's value, so it is a declarative default that re-wins on every boot; `/splash` can still override it at runtime.
 
 ```lua
-maki.setup({
+makima.setup({
   plugins = {
     splashes = { splash = "aurora" },
   },
@@ -134,7 +134,7 @@ The name resolves once the registry has it: a bundled name is applied before the
 Any Lua context can select a splash by firing the `SplashSelect` autocmd. The picker commits it with the same rules as `/splash`: it validates the renderer, persists the choice, and rolls back if the renderer fails later.
 
 ```lua
-maki.api.exec_autocmds("SplashSelect", { data = { name = "aurora" } })
+makima.api.exec_autocmds("SplashSelect", { data = { name = "aurora" } })
 ```
 
 `data` needs `name` (the registry key). The optional `persist` flag (default `true`) skips the persisted selection, which is what a temporary switch wants.
@@ -144,7 +144,7 @@ maki.api.exec_autocmds("SplashSelect", { data = { name = "aurora" } })
 `SplashShown` fires when the home screen appears (startup, and after returning to it). `SplashHidden` fires when it goes away, once the first message or turn lands. A plugin uses these to reset per-show state, like picking a fresh tip or clearing matrix-rain columns:
 
 ```lua
-maki.api.create_autocmd("SplashShown", {
+makima.api.create_autocmd("SplashShown", {
   callback = function()
     -- reset anything that should start fresh each time the home screen shows
   end,
@@ -168,7 +168,7 @@ local function reset(w)
   state.cols[w] = c
 end
 
-maki.api.create_autocmd("SplashShown", { callback = function() state.cols = {} end })
+makima.api.create_autocmd("SplashShown", { callback = function() state.cols = {} end })
 
 local function drop_glyph()
   return string.sub(GLYPHS, math.random(1, #GLYPHS), math.random(1, #GLYPHS))
@@ -197,7 +197,7 @@ local function matrix_frame(w, h, t, fade)
 
   -- a title line and the version, proving text + version are plugin-owned
   local title = "matrix rain"
-  local v = maki.version()
+  local v = makima.version()
   local vs = "v" .. v.current
 
   local rows = {}
@@ -227,12 +227,12 @@ local function matrix_frame(w, h, t, fade)
   return rows
 end
 
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   return matrix_frame(w, h, t, fade)
 end)
 ```
 
 Two notes on writing overrides:
 
-- The renderer must be pure and pull-driven. It runs on the Lua thread while the UI waits for the frame, so do not call blocking maki API from inside it (for example an `open_win` that waits on the UI would deadlock). The default and the example above only read `maki.version()` and theme colors.
+- The renderer must be pure and pull-driven. It runs on the Lua thread while the UI waits for the frame, so do not call blocking makima API from inside it (for example an `open_win` that waits on the UI would deadlock). The default and the example above only read `makima.version()` and theme colors.
 - A full replace only works while the bundled `splashes_default` plugin stays enabled, so `splash.render` keeps its default. Wrapping with `prev(...)` lets a layer tweak the default instead of replacing it.

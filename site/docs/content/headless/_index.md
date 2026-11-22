@@ -41,13 +41,13 @@ Add `--verbose` to include full turn-by-turn messages in the output.
 
 ## Slash commands
 
-A prompt whose first token is an available slash command runs that command before Maki creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text is rejected with an error; prefix a literal message that starts with `/` with another slash to send it as text (`//lmao` sends `/lmao`).
+A prompt whose first token is an available slash command runs that command before Makima creates model input. Custom Markdown commands, MCP prompts, and Lua commands can produce a normal agent turn. A side-effect-only command succeeds with empty output. A known available command with invalid arguments exits with an error. Unknown and unavailable slash-prefixed text is rejected with an error; prefix a literal message that starts with `/` with another slash to send it as text (`//lmao` sends `/lmao`).
 
-Print, SDK stream mode and ACP share one set of built-ins: `/model`, `/fast`, `/yolo`, `/workflow`, `/cd`, `/compact`, `/new` (or `/clear`) and `/btw`. `/model` accepts an explicit model spec. A plugin's `maki.api.run_command` runs them on the agent its `ctx` is pinned to, a subagent included, as in the TUI: `/model`, `/fast`, `/workflow`, `/cd` and `/compact` change that agent and a command's turn runs on it, while `/yolo` and `/new` act on the session. `/btw` answers beside the conversation without adding to it, and its answer is the result; `/compact` succeeds with empty output. In ACP, `/new` tells you to start a new session instead. Commands that need an interactive UI are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
+Print, SDK stream mode and ACP share one set of built-ins: `/model`, `/fast`, `/yolo`, `/workflow`, `/cd`, `/compact`, `/new` (or `/clear`) and `/btw`. `/model` accepts an explicit model spec. A plugin's `makima.api.run_command` runs them on the agent its `ctx` is pinned to, a subagent included, as in the TUI: `/model`, `/fast`, `/workflow`, `/cd` and `/compact` change that agent and a command's turn runs on it, while `/yolo` and `/new` act on the session. `/btw` answers beside the conversation without adding to it, and its answer is the result; `/compact` succeeds with empty output. In ACP, `/new` tells you to start a new session instead. Commands that need an interactive UI are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
 
 See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
 
-Plugins run the same way as in the TUI. A notification from `maki.ui.flash` or `maki.notify` is written to stderr, and any other UI call, such as opening a window or a picker, returns `nil, "no interactive UI attached"` right away.
+Plugins run the same way as in the TUI. A notification from `makima.ui.flash` or `makima.notify` is written to stderr, and any other UI call, such as opening a window or a picker, returns `nil, "no interactive UI attached"` right away.
 
 ## Claude Code Compatibility
 
@@ -88,7 +88,7 @@ Inbound messages (`user`, `control_request`, `control_response`, `control_cancel
 
 A `user` message sent while a turn runs joins that turn, as typing does in the TUI (see [messages and turns](/docs/agent-work/#messages-and-turns)), and the turn's one `result` covers both. A message that cannot join, for example after a model switch, runs as the next turn and gets its own `result`. While `/compact` or `/btw` runs, a new message is rejected. A plugin command whose handler runs turns also gets one `result`: the reply of the last turn it ran, the same text print prints for it.
 
-SDK-only flags (`--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
+SDK-only flags (`--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path). `--system-prompt` / `--append-system-prompt` apply in every run path.
 
 One caveat: one-shot `--print` always starts a **new** session in **build** mode and does not save it. Model, mode and directory changes made during the run apply to it, but session resume needs the SDK path (or the TUI). It saves no preferences either: `/thinking high` sets the level for the run, not the saved default for new sessions. Before the first turn it waits a few seconds at most for its own provider's model list, so the run uses the discovered context window; other providers are listed in the background.
 

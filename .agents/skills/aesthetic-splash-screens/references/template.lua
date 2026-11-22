@@ -10,7 +10,7 @@ local RAMP = " .:-=+*#%@"
 local M = {}
 
 local function theme_rgb(name)
-  local c = maki.ui.theme_color(name)
+  local c = makima.ui.theme_color(name)
   if not c then
     return nil
   end
@@ -25,7 +25,7 @@ local BG_HEX, FG
 local style_cache = {}
 
 local function refresh_colors()
-  BG_HEX = maki.ui.theme_color("background")
+  BG_HEX = makima.ui.theme_color("background")
   FG = theme_rgb("foreground")
   style_cache = {}
 end
@@ -201,11 +201,11 @@ function M.render(w, h, t, fade)
     end
   end
   place_text(grid, H - 1, math.floor((W - #LABEL) / 2) + 1, LABEL, FG and color(rgb_to_hex(FG, 0.5 * f)) or { bold = false })
-  place_text(grid, 1, W - #("v" .. maki.version().current) + 1, "v" .. maki.version().current, FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false })
+  place_text(grid, 1, W - #("v" .. makima.version().current) + 1, "v" .. makima.version().current, FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false })
   return build_rows(grid)
 end
 
-maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
+makima.api.set_slot("splash.render", function(prev, w, h, t, fade)
   return M.render(w, h, t, fade)
 end)
 

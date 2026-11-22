@@ -1,34 +1,34 @@
-local th = require("maki.test_helpers")
+local th = require("makima.test_helpers")
 local case, eq = th.case, th.eq
 
 local function selector(events)
   local originals = {
-    buf = maki.ui.buf,
-    open_win = maki.ui.open_win,
-    flash = maki.ui.flash,
-    register_command = maki.api.register_command,
-    keymap = maki.keymap.set,
-    info = maki.model.info,
-    levels = maki.model.thinking_levels,
-    default = maki.session.set_default_thinking,
+    buf = makima.ui.buf,
+    open_win = makima.ui.open_win,
+    flash = makima.ui.flash,
+    register_command = makima.api.register_command,
+    keymap = makima.keymap.set,
+    info = makima.model.info,
+    levels = makima.model.thinking_levels,
+    default = makima.session.set_default_thinking,
   }
   local command, lines, committed, saved, closed
-  maki.api.register_command = function(spec)
+  makima.api.register_command = function(spec)
     command = spec.handler
   end
-  maki.keymap.set = function() end
-  maki.model.info = function()
+  makima.keymap.set = function() end
+  makima.model.info = function()
     return { supports_thinking = true }
   end
-  maki.model.thinking_levels = function()
+  makima.model.thinking_levels = function()
     return { "off", "low", "high" }
   end
-  maki.session.set_default_thinking = function(level)
+  makima.session.set_default_thinking = function(level)
     saved = level
     return true
   end
-  maki.ui.flash = function() end
-  maki.ui.buf = function()
+  makima.ui.flash = function() end
+  makima.ui.buf = function()
     return {
       set_lines = function(_, value)
         lines = value
@@ -36,7 +36,7 @@ local function selector(events)
     }
   end
   local step = 0
-  maki.ui.open_win = function()
+  makima.ui.open_win = function()
     return {
       width = 50,
       close = function()
@@ -65,10 +65,10 @@ local function selector(events)
       end,
     })
   end)
-  maki.ui.buf, maki.ui.open_win, maki.ui.flash = originals.buf, originals.open_win, originals.flash
-  maki.api.register_command, maki.keymap.set = originals.register_command, originals.keymap
-  maki.model.info, maki.model.thinking_levels = originals.info, originals.levels
-  maki.session.set_default_thinking = originals.default
+  makima.ui.buf, makima.ui.open_win, makima.ui.flash = originals.buf, originals.open_win, originals.flash
+  makima.api.register_command, makima.keymap.set = originals.register_command, originals.keymap
+  makima.model.info, makima.model.thinking_levels = originals.info, originals.levels
+  makima.session.set_default_thinking = originals.default
   assert(ok, tostring(err))
   return committed, saved, closed, lines
 end

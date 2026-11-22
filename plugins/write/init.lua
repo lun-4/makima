@@ -1,7 +1,7 @@
-local shorten_path = require("maki.shorten_path")
-local ToolView = require("maki.tool_view")
-local output_limits = require("maki.output_limits")
-local long_lines = require("maki.long_lines")
+local shorten_path = require("makima.shorten_path")
+local ToolView = require("makima.tool_view")
+local output_limits = require("makima.output_limits")
+local long_lines = require("makima.long_lines")
 
 local DESCRIPTION = [[Write content to a file, replacing existing content.
 
@@ -15,14 +15,14 @@ local DESCRIPTION = [[Write content to a file, replacing existing content.
 -- The current text for the guard to compare against: "" for a new file, and
 -- false for non-UTF-8 content, which read can never have shown as lines.
 local function existing_text(path)
-  local meta, meta_err = maki.fs.metadata(path)
+  local meta, meta_err = makima.fs.metadata(path)
   if meta_err then
     return nil, meta_err
   end
   if not meta then
     return ""
   end
-  local bytes, read_err = maki.fs.read_bytes(path)
+  local bytes, read_err = makima.fs.read_bytes(path)
   if not bytes then
     return nil, read_err
   end
@@ -36,7 +36,7 @@ local function write_view_opts(ctx)
 end
 
 local function build_view(content, path, ctx)
-  local buf = maki.ui.buf()
+  local buf = makima.ui.buf()
   local view = ToolView.new(buf, write_view_opts(ctx))
   view:set_highlight(content, path:match("%.([^%.]+)$") or "")
   view:finish()
@@ -46,7 +46,7 @@ local function build_view(content, path, ctx)
   return buf
 end
 
-maki.api.register_tool({
+makima.api.register_tool({
   name = "write",
   kind = "edit",
   mutable_path = "path",
@@ -73,7 +73,7 @@ maki.api.register_tool({
   },
 
   header = function(input)
-    local buf = maki.ui.buf()
+    local buf = makima.ui.buf()
     buf:line({ { shorten_path(input.path or ""), "path" } })
     return buf
   end,
@@ -111,12 +111,12 @@ maki.api.register_tool({
       return { llm_output = guard_err, is_error = true }
     end
 
-    local parent = maki.fs.dirname(path)
+    local parent = makima.fs.dirname(path)
     if parent then
-      maki.fs.mkdir(parent, { parents = true })
+      makima.fs.mkdir(parent, { parents = true })
     end
 
-    local _, write_err = maki.fs.atomic_write(path, content)
+    local _, write_err = makima.fs.atomic_write(path, content)
     if write_err then
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end

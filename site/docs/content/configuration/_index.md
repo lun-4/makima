@@ -7,7 +7,7 @@ group = "Getting Started"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language as plugins.
+Settings go in `init.lua`, a Lua script that calls `makima.setup()`. Same language as plugins.
 
 Two places, both optional:
 
@@ -19,7 +19,7 @@ When both exist, project settings override global ones. Neither file is required
 ## Example
 
 ```lua
-maki.setup({
+makima.setup({
     ui = {
         splash_animation = true,
         mouse_scroll_lines = 5,
@@ -34,8 +34,8 @@ maki.setup({
         max_output_lines = 3000,
     },
     provider = {
-        default_model = "anthropic/claude-sonnet-4-6",
-        allowed_models = { "anthropic/*", "openai/gpt-5" },
+        default_model = "anthropic/claude-sonnet-5",
+        allowed_models = { "anthropic/*", "openai/gpt-6.1-terra" },
         excluded_models = { "*/*-preview" },
     },
 
@@ -51,9 +51,9 @@ maki.setup({
 
 All fields are optional. Typos in field names cause an error right away.
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `provider/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `makima models`.
 
-`maki.setup()` can only be called once per init.lua.
+`makima.setup()` can only be called once per init.lua.
 
 ## Full Reference
 
@@ -63,7 +63,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_automode` | bool | `false` | Start every session with bash auto mode (classify every bash command) |
-| `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
+| `always_fast` | bool | `false` | Start every session with fast mode on models that offer it, ignored elsewhere |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task tools callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget). A default saved with `/thinking` wins over it |
 
@@ -93,7 +93,7 @@ You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside
 
 Themes use 24-bit colors, but not every terminal can show them. Makima checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKIMA_TRUECOLOR=1` to force truecolor or `MAKIMA_TRUECOLOR=0` to force the fallback.
 
-A theme TOML file can define optional `italic` and `bold_italic` keys inside its `[ui]` table. These are theme styles, not fields in the `ui` table passed to `maki.setup()`. Without `[ui].italic`, Markdown italics use the foreground from the `markup.italic` syntax scope. An explicit `[ui].italic` takes precedence. Makima adds the italic modifier in either case.
+A theme TOML file can define optional `italic` and `bold_italic` keys inside its `[ui]` table. These are theme styles, not fields in the `ui` table passed to `makima.setup()`. Without `[ui].italic`, Markdown italics use the foreground from the `markup.italic` syntax scope. An explicit `[ui].italic` takes precedence. Makima adds the italic modifier in either case.
 
 Without `[ui].bold_italic`, bold italics preserve the resolved bold style, including its colors and modifiers, and add italic. An explicit `[ui].bold_italic` takes precedence and receives both bold and italic modifiers, even when it only specifies a color.
 
@@ -112,7 +112,7 @@ Theme files can also carry an optional `[completion]` table that recolors the `@
 | `subagent` | Subagent references | `accent` |
 | `model` | Model references | `accent` |
 
-Kinds registered by your own completion sources (via `maki.api.register_completion_source`) fall back to the plain item style until your theme defines them.
+Kinds registered by your own completion sources (via `makima.api.register_completion_source`) fall back to the plain item style until your theme defines them.
 
 ### `ui.tool_output_lines`
 
@@ -158,12 +158,13 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `shell` | string | `auto` | - | Windows shell for the bash tool: auto (Git Bash from GIT_INSTALL_ROOT, else cmd), cmd, or powershell; Unix ignores it |
 
 ### `provider`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
+| `default_model` | String | `none` | - | Default model identifier, as `provider/model` |
 | `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
 | `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
@@ -188,10 +189,10 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 |-------|------|---------|-------------|
 | `allowed_private_hosts` | string[] | `[]` | Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://` |
 
-`maki.net` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through:
+`makima.net.request` refuses private, loopback and metadata addresses, because the model picks the URLs. List a host here to let it through. Providers use `makima.net.send`, which has no such guard, so a local model server needs no entry:
 
 ```lua
-maki.setup({
+makima.setup({
     net = {
         allowed_private_hosts = { "localhost:8080", "nas.lan", "10.0.0.0/8" },
     },
@@ -205,7 +206,7 @@ An entry with no port covers every port. A name you list is allowed whatever it 
 Answers the folder trust question in advance. Read from the global `~/.config/makima/init.lua` only, since a project file that could set it would be trusting itself:
 
 ```lua
-maki.setup({
+makima.setup({
     trust = {
         paths = { "~/src/me/*", "/workspace" },
         prompt = false,
@@ -219,7 +220,7 @@ maki.setup({
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
 
-A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task_spawn` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task_spawn` already have rules in makima. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Makima warns you at load when this happens.
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
@@ -228,7 +229,7 @@ The edit plugin's extra tools are options too: `plugins.edit = { multiedit = fal
 This table is for bundled plugins only. Your own plugins go in `~/.config/makima/lua/`, see [Plugins](/docs/plugins/).
 
 ```lua
-maki.setup({
+makima.setup({
     plugins = {
         bash = { timeout_secs = 180 },
         websearch = { enabled = false },
@@ -243,6 +244,7 @@ maki.setup({
 | `auto_mode` | boolean | `false` | - | Classify every bash command before executing it (accept/deny with reason). |
 | `auto_model` | string | - | - | Model spec for the bash auto-mode classifier. Unset: inherits the current session model. |
 | `auto_timeout_secs` | integer | `30` | 5 | Stop the auto-mode classifier after this many seconds and fall back to normal permission handling. |
+| `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds of execution. Approval time is excluded. A call's `timeout` param overrides it. |
@@ -310,7 +312,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
+| `plugin_dev` | boolean | `true` | - | Offer the builtin makima-plugin-dev skill for writing makima plugins. |
 
 ### `plugins.splashes`
 
@@ -322,7 +324,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `allow_model` | boolean | `true` | - | Expose a `model` input that overrides the subagent model. Only disable if you do not trust callers to pick an exact model themselves. |
 
 ### `plugins.webfetch`
 
@@ -357,7 +359,7 @@ Makima follows platform directory conventions. On Linux and macOS that is XDG. O
 | Logs | `~/.local/logs/makima/` | `%APPDATA%\makima\` |
 | Cache | `~/.cache/makima/` | `%LOCALAPPDATA%\makima\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, provider credentials (`auth/<provider>.json`, readable only by you), memories, plans, and model-tier overrides. Cache holds the provider catalog (`models-dev/`). The install script puts the binary under `%LOCALAPPDATA%\makima` on Windows; that is separate from these runtime dirs.
 
 ## Personal Instructions
 

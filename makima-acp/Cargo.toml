@@ -1,0 +1,29 @@
+[package]
+name = "makima-acp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+makima-agent = { workspace = true }
+makima-commands = { workspace = true }
+makima-config = { workspace = true }
+makima-providers = { workspace = true }
+makima-storage = { workspace = true }
+makima-lua = { workspace = true }
+agent-client-protocol-schema = { workspace = true }
+smol = { workspace = true }
+flume = { workspace = true }
+event-listener = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+color-eyre = { workspace = true }
+
+[dev-dependencies]
+makima-providers = { workspace = true, features = ["test-util"] }
+makima-agent = { workspace = true, features = ["test-util"] }
+makima-storage = { workspace = true, features = ["test-util"] }
+makima-lua = { workspace = true, features = ["test-support"] }
+makima-config = { workspace = true, features = ["test-util"] }
+test-case = { workspace = true }
+tempfile = { workspace = true }

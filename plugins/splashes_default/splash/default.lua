@@ -2,7 +2,7 @@
 -- and the update check; this module owns every visible element (starfield,
 -- logo, tagline, tip, help, and the top-right version/update notice). The
 -- splashes_default plugin wires it into the `splash.render` slot and the
--- `splash` registry. Replace or wrap it with maki.api.set_slot.
+-- `splash` registry. Replace or wrap it with makima.api.set_slot.
 
 local INTENSITY_SCALE = 0.3
 local VIGNETTE_SCALE = 0.25
@@ -37,7 +37,7 @@ local TIPS = {
 }
 
 local function theme_rgb(name)
-  local c = maki.ui.theme_color(name)
+  local c = makima.ui.theme_color(name)
   if not c then
     return nil
   end
@@ -216,7 +216,7 @@ local function place_seqs(rows, rowidx, x1, items)
 end
 
 local tip_idx = 1
-maki.api.create_autocmd("SplashShown", {
+makima.api.create_autocmd("SplashShown", {
   callback = function()
     tip_idx = math.random(1, #TIPS)
   end,
@@ -288,7 +288,7 @@ local function render_splash(w, h, t, fade)
     place_seqs(rows, tip_y + 1, math.floor((w - total) / 2) + 1, items)
   end
 
-  local version = maki.version()
+  local version = makima.version()
   local version_text = "v" .. version.current
   if version.update_available then
     version_text = version_text .. " run makima update to get v" .. (version.latest or "")

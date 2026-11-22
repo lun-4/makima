@@ -12,7 +12,7 @@ local M = {}
 M.description = "A mirrored fractal kaleidoscope with tenfold symmetry."
 
 local function theme_rgb(name)
-  local c = maki.ui.theme_color(name)
+  local c = makima.ui.theme_color(name)
   if not c then
     return nil
   end
@@ -179,7 +179,7 @@ function M.render(w, h, t, fade)
   if w < 8 or h < 6 then
     return flat_rows(w, h, { bold = false })
   end
-  local version = "v" .. maki.version().current
+  local version = "v" .. makima.version().current
   local version_x = w - #version + 1
   local version_style = FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false }
   local tt, drift, phase = shade_terms(t)

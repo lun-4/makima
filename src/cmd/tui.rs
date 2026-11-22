@@ -8,23 +8,24 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 use crossterm::style::Stylize;
 
-use maki_agent::command::{self, CustomCommand};
-use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
-use maki_config::{Config, ModelPolicy, ProjectConfig, load_env_files, load_permissions};
-use maki_lua::PluginHost;
-use maki_lua::ui_sink::{HeadlessUi, HostUi};
-use maki_providers::model::Model;
-use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_storage::session_lock;
-use maki_storage::sessions::SESSIONS_DIR;
-use maki_ui::{AppSession, RunOutcome};
+use makima_agent::command::{self, CustomCommand};
+use makima_agent::tools::ToolRegistry;
+use makima_config::project::{self, ProjectDecision, TrustAnswer, policy_grant};
+use makima_config::{Config, ModelPolicy, ProjectConfig, load_env_files};
+use makima_lua::PluginHost;
+use makima_lua::ui_sink::{HeadlessUi, HostUi};
+use makima_providers::model::{Model, ModelTier};
+use makima_providers::{ProviderRegistry, Timeouts};
+use makima_storage::StateDir;
+use makima_storage::id::MakimaId;
+use makima_storage::session_lock;
+use makima_storage::sessions::SESSIONS_DIR;
+use makima_ui::{AppSession, RunOutcome};
 
-use crate::cli::{Cli, normalize_tool_name};
+use super::load_config;
+use crate::cli::Cli;
 use crate::setup;
 
-const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const PIPED_INPUT_SEPARATOR: &str = "\n\n";
@@ -43,13 +44,14 @@ struct Stack {
     plugin_host: PluginHost,
     config: Config,
     commands: Vec<CustomCommand>,
+    providers: Arc<ProviderRegistry>,
     model: Model,
     needs_login: bool,
 }
 
 impl Stack {
-    fn timeouts(&self) -> maki_providers::Timeouts {
-        maki_providers::Timeouts::from(&self.config.provider)
+    fn timeouts(&self) -> Timeouts {
+        Timeouts::from(&self.config.provider)
     }
 }
 
@@ -89,46 +91,6 @@ fn discover_commands(disable: bool, cwd: &Path, project: &ProjectConfig) -> Vec<
     command::discover_commands(cwd, project)
 }
 
-fn load_config(
-    plugin_host: &PluginHost,
-    cli: &Cli,
-    project_config: &ProjectConfig,
-    warnings: &mut Vec<String>,
-) -> Result<Config> {
-    let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, project_config, warnings)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config()
-        .context("invalid config")?;
-    maki_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
-    config.permissions = load_permissions(project_config)?;
-
-    if cli.yolo || config.always_yolo {
-        config.permissions.yolo = true;
-    }
-    let automode_on = cli.automode || config.always_automode;
-    super::seed_automode(&mut config, automode_on);
-    if !cli.allowed_tools.is_empty() {
-        config.agent.allowed_tools = cli
-            .allowed_tools
-            .iter()
-            .map(|t| normalize_tool_name(t))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !cli.disallowed_tools.is_empty() {
-        config.agent.disabled_tools.extend(
-            cli.disallowed_tools
-                .iter()
-                .filter_map(|t| normalize_tool_name(t).ok()),
-        );
-    }
-    config.validate()?;
-    Ok(config)
-}
-
 fn config_or_fallback(
     loaded: Result<Config>,
     fallback: Option<Config>,
@@ -156,7 +118,7 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
 
-    let command_registry = maki_commands::CommandRegistry::new();
+    let command_registry = makima_commands::CommandRegistry::new();
     let mut plugin_host = PluginHost::with_command_registry(
         Arc::clone(ToolRegistry::global_arc()),
         command_registry,
@@ -177,7 +139,7 @@ fn build_stack(
         &mut warnings,
     )?;
 
-    if let Err(e) = plugin_host.load_builtins(&config.plugins) {
+    if let Err(e) = plugin_host.load_configured_builtins(&config) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         if reloading {
             warnings.push(format!("{e:#}"));
@@ -188,15 +150,33 @@ fn build_stack(
 
     let commands = discover_commands(cli.no_commands, cwd, &trust.project_config);
 
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
+    let providers = plugin_host
+        .provider_registry(Timeouts::from(&config.provider))
+        .context("build provider registry")?;
+    let model_result =
+        setup::resolve_model(&providers, cli.model.as_deref(), &config.provider, storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok(m), _) => (m, false),
         (Err(e), Some(last_model)) => {
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
         }
-        (Err(_), None) if !cli.print => {
-            let placeholder = Model::from_spec(FALLBACK_MODEL_SPEC).expect("fallback model");
+        (Err(e), None) if !cli.print => {
+            let placeholder = [ModelTier::Strong, ModelTier::Medium, ModelTier::Weak]
+                .into_iter()
+                .find_map(|tier| {
+                    providers
+                        .spec_for_tier_any(tier)
+                        .filter(|spec| config.provider.model_policy.allows(spec))
+                        .and_then(|spec| providers.model(&spec).ok())
+                })
+                .or_else(|| {
+                    providers
+                        .offline_specs(&config.provider.model_policy)
+                        .into_iter()
+                        .find_map(|spec| providers.model(&spec).ok())
+                })
+                .ok_or(e)?;
             (placeholder, true)
         }
         (Err(e), None) => return Err(e),
@@ -207,6 +187,7 @@ fn build_stack(
             plugin_host,
             config,
             commands,
+            providers,
             model,
             needs_login,
         },
@@ -215,6 +196,7 @@ fn build_stack(
 }
 
 fn restored_session_model(
+    providers: &ProviderRegistry,
     startup: &Model,
     session: &AppSession,
     explicit_model: bool,
@@ -223,7 +205,9 @@ fn restored_session_model(
     if explicit_model || !model_policy.allows(&session.model) {
         return startup.clone();
     }
-    Model::from_spec(&session.model).unwrap_or_else(|_| startup.clone())
+    providers
+        .model(&session.model)
+        .unwrap_or_else(|_| startup.clone())
 }
 
 fn resolve_session(
@@ -235,23 +219,33 @@ fn resolve_session(
 ) -> Result<AppSession> {
     let sessions_dir = storage.ensure_subdir(SESSIONS_DIR)?;
     if let Some(raw) = session_id {
-        let id: MakiId = raw
+        let id: MakimaId = raw
             .parse()
             .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+        let mut session =
+            AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-        if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-            return Err(color_eyre::eyre::eyre!("session {id}: {block}"));
+        if locked {
+            return Err(color_eyre::eyre::eyre!(
+                "session {id}: {}",
+                session_lock::OPEN_ELSEWHERE_MSG
+            ));
         }
+        session.set_cwd(cwd.to_owned());
         return Ok(session);
     }
     if last_session {
         match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
+            Ok(Some(mut session)) => {
                 let locked = session_lock::open_elsewhere(&sessions_dir, &session.id);
-                if let Some(block) = session_lock::resume_block(&session.cwd, cwd, locked) {
-                    return Err(color_eyre::eyre::eyre!("session {}: {block}", session.id));
+                if locked {
+                    return Err(color_eyre::eyre::eyre!(
+                        "session {}: {}",
+                        session.id,
+                        session_lock::OPEN_ELSEWHERE_MSG
+                    ));
                 }
+                session.set_cwd(cwd.to_owned());
                 return Ok(session);
             }
             Ok(None) => {
@@ -313,7 +307,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     let explicit_model = cli.model.is_some();
     let mut apply_explicit_model = explicit_model;
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    makima_providers::model_registry::load_from_storage(&storage);
 
     let mode = cli.trust_mode();
     let mut trust = project::resolve(&storage, &cwd, mode);
@@ -331,7 +325,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 TrustAnswer::Trust
             })
             .or_else(|| {
-                (can_ask && stack.config.trust.prompt).then(|| maki_ui::ask_trust(question))
+                (can_ask && stack.config.trust.prompt).then(|| makima_ui::ask_trust(question))
             })
     });
     match answer {
@@ -352,7 +346,6 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 
     setup::init_logging(&stack.config.storage);
     setup::install_panic_log_hook();
-    setup::warn_ignored_provider_fields();
     startup_warnings.extend(super::unmatched_permission_rules(&stack.config.permissions));
 
     if cli.is_sdk_mode() || cli.print {
@@ -374,6 +367,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             prompt_slots: stack.plugin_host.event_handle().prompt_slot_source(),
             defaults: stack.config.session_defaults,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+            providers: stack.providers,
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
             commands: stack.commands,
@@ -401,6 +395,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
             stack.plugin_host.event_handle(),
             stack.config.session_defaults,
             Arc::new(stack.config.provider.model_policy.clone()),
+            stack.providers,
             cli.system_prompt,
             cli.append_system_prompt,
             stack.plugin_host.plugin_rules(),
@@ -428,14 +423,15 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
     loop {
         let focused_tab = &tabs[focused];
         let model = restored_session_model(
+            &stack.providers,
             &stack.model,
             focused_tab,
             apply_explicit_model,
             &stack.config.provider.model_policy,
         );
 
-        let outcome = maki_ui::run(
-            maki_ui::EventLoopParams {
+        let outcome = makima_ui::run(
+            makima_ui::EventLoopParams {
                 cwd: cwd.clone(),
                 model,
                 needs_login: stack.needs_login,
@@ -448,7 +444,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
                 input_history_size: stack.config.storage.input_history_size,
-                permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
+                permissions: Arc::new(makima_agent::permissions::PermissionManager::new(
                     stack.config.permissions.clone(),
                     cwd.clone(),
                     trust.project_config.clone(),
@@ -464,6 +460,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                providers: Arc::clone(&stack.providers),
                 session_defaults: stack.config.session_defaults,
                 system_prompt_override: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
@@ -545,7 +542,7 @@ pub fn run(mut cli: Cli, cwd: PathBuf) -> Result<()> {
 mod tests {
     use super::*;
     use color_eyre::eyre::eyre;
-    use maki_config::RawConfig;
+    use makima_config::RawConfig;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
     use test_case::test_case;
@@ -631,8 +628,13 @@ mod tests {
         let startup = Model::from_spec("openai/gpt-5").unwrap();
         let session = AppSession::new("anthropic/claude-opus-4-6", "/tmp");
 
-        let resolved =
-            restored_session_model(&startup, &session, explicit_model, &ModelPolicy::default());
+        let resolved = restored_session_model(
+            &makima_providers::test_util::offline_ids(&["anthropic", "openai"]),
+            &startup,
+            &session,
+            explicit_model,
+            &ModelPolicy::default(),
+        );
 
         assert_eq!(resolved.spec(), expected);
     }
@@ -690,14 +692,14 @@ mod tests {
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
@@ -722,7 +724,7 @@ mod tests {
         );
 
         plugin_host
-            .load_builtins(&config.plugins)
+            .load_configured_builtins(&config)
             .expect("builtins load on the live host under --no-plugins");
 
         plugin_host.begin_shutdown();
@@ -763,22 +765,22 @@ mod tests {
     const FAKE_PID: u32 = u32::MAX - 1;
 
     #[test]
-    fn resolve_session_rejects_session_from_other_cwd() {
+    fn resolve_session_adopts_the_current_cwd() {
         use tempfile::tempdir;
 
         let tmp = tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut session = AppSession::new("test-model", OTHER_CWD);
         session.save(&storage).unwrap();
-        let err = resolve_session(
+        let loaded = resolve_session(
             false,
             Some(&session.id.to_string()),
             "test-model",
             THIS_CWD,
             &storage,
         )
-        .expect_err("a session stored under another cwd must be rejected");
-        assert!(err.to_string().contains(OTHER_CWD));
+        .expect("a session stored under another cwd is resumed");
+        assert_eq!(loaded.cwd, THIS_CWD);
     }
 
     #[test_case(true; "valued_continue")]
@@ -848,14 +850,14 @@ mod tests {
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
         use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
+        use makima_agent::tools::ToolRegistry;
         use tempfile::tempdir;
 
         let dir = tempdir().expect("tempdir");
-        let maki_dir: PathBuf = dir.path().join(".makima");
-        fs::create_dir_all(&maki_dir).expect("mkdir .makima");
+        let makima_dir: PathBuf = dir.path().join(".makima");
+        fs::create_dir_all(&makima_dir).expect("mkdir .makima");
         fs::write(
-            maki_dir.join("init.lua"),
+            makima_dir.join("init.lua"),
             "error('broken init lua must not run')",
         )
         .expect("write init.lua");
