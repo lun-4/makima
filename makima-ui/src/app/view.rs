@@ -359,7 +359,7 @@ impl App {
                 self.hits
                     .push(hit.area, ClickTarget::Scrollbar(ScrollOwner::Input));
             }
-            if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
+            if !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
                 let hits = self.file_completion.hits();
                 self.absorb_hits(hits);

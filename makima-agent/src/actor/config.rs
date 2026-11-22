@@ -578,8 +578,9 @@ mod context_tests {
         definition.system_prompt = Some("exact saved prompt".into());
         definition.tools = Some(Vec::new());
         let mode = AgentMode::Custom(definition.id.clone());
+        let cwd = std::env::temp_dir().join("saved");
         let original = EffectiveAgentConfig::new(policy(true), mode.clone())
-            .with_context(AgentContextSnapshot::new(PathBuf::from("/saved")))
+            .with_context(AgentContextSnapshot::new(cwd.clone()))
             .with_mode_def(Some(definition.clone()));
         let mut stored = stored_agent_config(&original, BTreeMap::new()).unwrap();
         stored.thinking = Some(ThinkingConfig::Effort(Effort::High).into());
@@ -604,7 +605,7 @@ mod context_tests {
             (mode.clone(), definition.clone()),
         )
         .unwrap();
-        assert_eq!(restored.context.cwd(), PathBuf::from("/saved"));
+        assert_eq!(restored.context.cwd(), cwd.as_path());
         assert_eq!(restored.model.spec(), stored.model);
         assert_eq!(restored.fast, supported);
         assert_eq!(
@@ -622,15 +623,17 @@ mod context_tests {
 
     #[test]
     fn cwd_config_captures_context_generation_and_rejects_relative_paths() {
+        let original_cwd = std::env::temp_dir().join("original");
+        let changed_cwd = std::env::temp_dir().join("changed");
         let original =
             EffectiveAgentConfig::new(crate::actor::tests::policy(false), AgentMode::Build)
-                .with_context(AgentContextSnapshot::new(PathBuf::from("/original")));
-        let changed = ConfigChange::WorkingDirectory(PathBuf::from("/changed"))
+                .with_context(AgentContextSnapshot::new(original_cwd.clone()));
+        let changed = ConfigChange::WorkingDirectory(changed_cwd.clone())
             .apply(&original)
             .unwrap();
-        assert_eq!(original.context.cwd(), PathBuf::from("/original"));
+        assert_eq!(original.context.cwd(), original_cwd.as_path());
         assert_eq!(original.context.generation(), 0);
-        assert_eq!(changed.context.cwd(), PathBuf::from("/changed"));
+        assert_eq!(changed.context.cwd(), changed_cwd.as_path());
         assert_eq!(changed.context.generation(), 1);
         assert!(!super::equivalent(&original, &changed));
         assert!(

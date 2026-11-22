@@ -99,21 +99,23 @@ You need `AWS_REGION` and one of these for auth:
 
 | Tier | Model | Pricing (in/out per 1M tokens) | Limits |
 |------|-------|-------------------------------|--------|
-| weak | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
-| weak | gpt-6-luna | $0.10 / $0.50 | 272K ctx / 128K out |
+| weak | **gpt-6-luna** (default) | $0.10 / $0.50 | 1050K ctx / 128K out |
+| weak | gpt-5.6-luna | $1.00 / $6.00 | 372K ctx / 128K out |
 | weak | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | weak | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-| medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
-| medium | gpt-6.1-sol | $2.00 / $10.00 | 500K ctx / 128K out |
-| medium | gpt-6.1-terra | $1.00 / $5.00 | 500K ctx / 128K out |
-| medium | gpt-6-sol | $2.00 / $10.00 | 272K ctx / 128K out |
+| medium | **gpt-6.1-terra** (default) | $1.00 / $5.00 | 1050K ctx / 128K out |
+| medium | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
+| medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
-| strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
-| strong | gpt-6-astra | $10.00 / $50.00 | 272K ctx / 128K out |
+| strong | **gpt-6.2-sol** (default) | $2.00 / $10.00 | 1050K ctx / 128K out |
+| strong | gpt-6.2-astra | $8.00 / $40.00 | 1050K ctx / 128K out |
+| strong | gpt-5.6-sol | $5.00 / $30.00 | 372K ctx / 128K out |
+| strong | gpt-6-astra | $10.00 / $50.00 | 1050K ctx / 128K out |
 | strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
@@ -387,7 +389,7 @@ Talks to the server at the `base_url` saved by `makima auth login llama-cpp`, el
 | medium | **sonnet** (default) |  | 200K ctx |
 | strong | **opus** (default) |  | 200K ctx |
 
-Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider.
+Uses your Claude Code login through the Claude Agent SDK. Start the bridge first: `npm install --omit=optional` and then `node src/main.ts` in `claude-agent-bridge/` (Node 24 or later). It runs your installed `claude` with its own tools, settings, hooks, MCP servers and CLAUDE.md files turned off, and offers Claude Makima's tools instead, so Makima's permissions apply to every call. `socket` in the `[claude-agent]` section of `providers.toml` points at a bridge listening elsewhere. Claude Code retries failed requests itself, so Makima does not retry this provider. With a Claude subscription login, the usage view shows your plan's 5-hour and weekly limits; an API key login has none.
 
 ### Opencode Zen
 
@@ -476,7 +478,7 @@ Models are referenced as `provider/model_id`:
 
 ```
 anthropic/claude-sonnet-5
-openai/gpt-5.6-terra
+openai/gpt-6.1-terra
 copilot/gpt-5.6-terra
 ```
 

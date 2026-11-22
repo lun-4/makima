@@ -711,6 +711,7 @@ mod tests {
     use makima_providers::Message;
     use makima_storage::conversation::ConversationState;
     use makima_storage::id::MakimaId;
+    use makima_storage::session_lock;
     use makima_storage::session_state::StateChange;
     use makima_storage::sessions::encode_records;
     use serde_json::{Value, json};
@@ -1162,6 +1163,7 @@ mod tests {
 
     #[test]
     fn first_writer_open_archives_and_migrates_v2_once() {
+        const AFTER_MIGRATION: &str = "after-migration";
         let dir = tempfile::tempdir().unwrap();
         let mut session = StoredSession::new("writer-test-model", "/writer-test");
         session.save_to(dir.path()).unwrap();
@@ -1174,31 +1176,38 @@ mod tests {
             .collect();
         records[0]["v"] = json!(2);
         let legacy = encode_records(&records).unwrap();
-        let path = dir.path().join(format!("{}.jsonl", session.id));
         write(&path, &legacy).unwrap();
-        smol::block_on(
-            SessionWriter::open_session(dir.path(), &session)
-                .unwrap()
-                .append(Vec::new()),
-        )
-        .unwrap();
+        let lease = session_lock::claim(dir.path(), &session.id)
+            .unwrap()
+            .unwrap();
+        let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+        writer.bind_publication_guard(Some(lease.publication_guard()));
+        smol::block_on(writer.append(Vec::new())).unwrap();
         let archive = dir
             .path()
             .join("archive")
             .join(session.id.to_string())
             .join("v2.jsonl");
-        assert_eq!(read(archive).unwrap(), legacy);
+        assert_eq!(read(&archive).unwrap(), legacy);
         let migrated = read(&path).unwrap();
         let header: Value =
             serde_json::from_slice(migrated.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
         assert_eq!(header["v"], 3);
-        smol::block_on(
-            SessionWriter::open_session(dir.path(), &session)
-                .unwrap()
-                .append(Vec::new()),
-        )
-        .unwrap();
-        assert_eq!(read(path).unwrap(), migrated);
+        forget(dir.path(), session.id).unwrap();
+        lease.release().unwrap();
+
+        let lease = session_lock::claim(dir.path(), &session.id)
+            .unwrap()
+            .unwrap();
+        let loaded = StoredSession::load_from(session.id, dir.path()).unwrap();
+        let writer = SessionWriter::open_session(dir.path(), &loaded).unwrap();
+        writer.bind_publication_guard(Some(lease.publication_guard()));
+        smol::block_on(writer.append(vec![output(AFTER_MIGRATION)])).unwrap();
+        assert!(read(&path).unwrap().starts_with(&migrated));
+        assert_eq!(read(&archive).unwrap(), legacy);
+        let loaded = StoredSession::load_from(session.id, dir.path()).unwrap();
+        assert!(loaded.tool_outputs().contains_key(AFTER_MIGRATION));
+        forget(dir.path(), session.id).unwrap();
     }
 
     #[test_case(false; "new_sessions_directory")]

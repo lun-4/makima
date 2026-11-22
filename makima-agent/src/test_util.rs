@@ -6,8 +6,10 @@ use crate::{
 };
 use makima_providers::provider::BoxFuture;
 use makima_storage::id::MakimaId;
+#[cfg(any(unix, all(test, windows)))]
+use std::path::Path;
 #[cfg(unix)]
-use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 use std::{io, time::Duration};
 
 const UNEXPECTED_OPERATION: &str = "unexpected work in MockBackend";
@@ -34,6 +36,23 @@ pub fn make_fifo(path: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_symlink(
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    target: &Path,
+    path: &Path,
+) -> bool {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    match link(target, path) {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+            eprintln!("skipping symlink assertions: {error}");
+            false
+        }
+        Err(error) => panic!("could not create test symlink {path:?}: {error}"),
     }
 }
 

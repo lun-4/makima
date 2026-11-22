@@ -722,6 +722,19 @@ mod tests {
         assert_eq!(buf.handle_key(key), expected);
     }
 
+    /// Windows without kitty key mode reports Ctrl+Backspace as Ctrl+H, which
+    /// the app maps to help; with it the parser produces Backspace+Ctrl.
+    #[test]
+    fn ctrl_backspace_deletes_a_word() {
+        let mut buf = TextBuffer::new("hello world".into());
+        buf.raw_x = 11;
+        assert_eq!(
+            buf.handle_key(ctrl(KeyCode::Backspace)),
+            EditResult::Changed
+        );
+        assert_eq!(buf.value(), "hello ");
+    }
+
     #[test]
     fn kill_to_start_of_line() {
         let mut buf = TextBuffer::new("●hello world".into());

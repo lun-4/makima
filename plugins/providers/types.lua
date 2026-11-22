@@ -158,7 +158,15 @@ export type StreamContext = Context & {
   mark_request_delivery: () -> boolean,
 }
 
-export type UsageLimit = { kind: Json, percentage: number?, reset_at: number?, detail: string? }
+-- `ui_shortname_hint` is a short suffix for compact views (`w` + `f` reads `wf`);
+-- the provider keeps it from clashing with its other limits.
+export type UsageLimit = {
+  kind: Json,
+  percentage: number?,
+  reset_at: number?,
+  detail: string?,
+  ui_shortname_hint: string?,
+}
 
 export type Instance = {
   stream: (ctx: StreamContext, request: Request, emit: Emit) -> (StreamResult?, Error?),

@@ -4,6 +4,7 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::click::{ClickTarget, PickerId, ScrollOwner, Surface};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
+use crate::components::file_completion::DIRECTORY_SUFFIX;
 use crate::components::file_picker::EMPTY_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::{Action, ExitRequest, TEST_MODEL_PROVIDER, buffer_text, key, test_model};
@@ -11146,6 +11147,13 @@ fn completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
     (tmp, app, backend)
 }
 
+fn streaming_completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
+    let (tmp, mut app, backend) = completion_app();
+    app.status = Status::Streaming;
+    assert!(app.focused_streaming());
+    (tmp, app, backend)
+}
+
 fn write_completion_fixture(cwd: &Path, rel: &str, content: &str) {
     let path = cwd.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -11192,6 +11200,24 @@ fn typing_at_opens_popup() {
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(app.file_completion.is_active());
     assert_eq!(app.input_box.buffer.value(), "@");
+}
+
+#[test]
+fn at_completion_works_while_streaming() {
+    let (_tmp, mut app, backend) = streaming_completion_app();
+    seed_skill(&backend, "review");
+    for c in "@skill:rev".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    converge_completion(&mut app);
+    assert!(app.file_completion.is_active());
+    assert!(
+        rendered_rows(&mut app, 80, 24)
+            .iter()
+            .any(|row| row.contains("skill:review"))
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "@skill:review");
 }
 
 #[test]
@@ -11383,7 +11409,7 @@ fn parent_path_completion_advances_then_finishes() {
     assert!(app.file_completion.is_active());
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@../sibling{}", std::path::MAIN_SEPARATOR)
+        format!("@../sibling{}", DIRECTORY_SUFFIX)
     );
 
     for character in "out".chars() {
@@ -11393,7 +11419,7 @@ fn parent_path_completion_advances_then_finishes() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@../sibling{}outside.txt", std::path::MAIN_SEPARATOR)
+        format!("@../sibling{}outside.txt", DIRECTORY_SUFFIX)
     );
     assert!(!app.file_completion.is_active());
 }
@@ -11428,7 +11454,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     let directory = parent.path().join("release notes");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join("final report?.md"), b"report").unwrap();
+    std::fs::write(directory.join("final report!.md"), b"report").unwrap();
     Arc::get_mut(&mut app.state.session)
         .unwrap()
         .set_cwd(project.to_string_lossy().into_owned());
@@ -11440,7 +11466,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!("@\"../release notes{}", std::path::MAIN_SEPARATOR)
+        format!("@\"../release notes{}", DIRECTORY_SUFFIX)
     );
     assert!(app.file_completion.is_active());
 
@@ -11451,10 +11477,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!(
-            "@\"../release notes{}final report?.md\"",
-            std::path::MAIN_SEPARATOR
-        )
+        format!("@\"../release notes{}final report!.md\"", DIRECTORY_SUFFIX)
     );
     assert!(!app.file_completion.is_active());
 }
@@ -11486,10 +11509,7 @@ fn cd_completion_filters_directories_and_accepts_before_execution() {
     converge_completion(&mut app);
     let items = app.command_palette.argument_match_items();
     assert_eq!(items.len(), 1);
-    assert_eq!(
-        items[0].label,
-        format!("alpha{}", std::path::MAIN_SEPARATOR).into()
-    );
+    assert_eq!(items[0].label, format!("alpha{}", DIRECTORY_SUFFIX).into());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
@@ -11537,7 +11557,7 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Tab)));
 
-    let descended = format!("/cd \"release notes{}\"", std::path::MAIN_SEPARATOR);
+    let descended = format!("/cd \"release notes{}\"", DIRECTORY_SUFFIX);
     assert_eq!(app.input_box.buffer.value(), descended);
     assert_eq!(
         app.input_box.buffer.cursor_byte_offset(),
@@ -11547,10 +11567,7 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     app.update(Msg::Paste("draft copy".into()));
     assert_eq!(
         app.input_box.buffer.value(),
-        format!(
-            "/cd \"release notes{}draft copy\"",
-            std::path::MAIN_SEPARATOR
-        )
+        format!("/cd \"release notes{}draft copy\"", DIRECTORY_SUFFIX)
     );
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
@@ -14254,14 +14271,38 @@ fn plan_ready_fires_once_per_draft() {
     assert!(app.state.plan.is_ready());
 }
 
-#[test]
-fn ctrl_b_asks_the_session_to_move_the_running_call() {
-    let mut app = test_app();
+#[test_case(Some(1) ; "focused_queue")]
+#[test_case(None ; "unfocused_queue")]
+fn ctrl_b_backgrounds_the_running_call_without_changing_the_queue(focus: Option<usize>) {
+    let mut app = app_with_queued_message();
+    app.update(agent_msg(tool_start("call", "bash")));
+    app.queue_and_notify(queued_msg("second"));
+    if let Some(index) = focus {
+        app.queue.set_focus_at(index);
+    }
+
     let actions = app.update(Msg::Key(kb::BACKGROUND.to_key_event()));
+
     assert!(matches!(
         actions.as_slice(),
-        [Action::MoveToBackground { .. }]
+        [Action::MoveToBackground { agent }] if *agent == app.selected_agent_id()
     ));
+    assert_eq!(app.queue.text_messages(), ["queued", "second"]);
+    assert_eq!(app.queue.focus(), focus);
+}
+
+#[test]
+fn focused_queue_ctrl_b_respects_override_and_picker_precedence() {
+    let mut app = app_with_queued_message();
+    app.queue.set_focus_at(0);
+    let key = kb::BACKGROUND.to_key_event();
+    let _probe = install_override(&mut app, key.code, key.modifiers);
+
+    let actions = app.update(Msg::Key(key));
+    assert!(matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]));
+
+    app.open_tasks();
+    assert!(app.update(Msg::Key(key)).is_empty());
 }
 
 #[test]

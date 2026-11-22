@@ -1020,7 +1020,8 @@ impl PreparedSessionRuntime {
         startup_model_slot: &ProviderSlot,
         mut session_lock: Option<SessionLockState>,
         current: &mut SessionRuntime,
-    ) -> std::result::Result<SessionRuntime, (ConfigChangeError, Option<SessionLockState>)> {
+    ) -> std::result::Result<SessionRuntime, (Box<ConfigChangeError>, Option<SessionLockState>)>
+    {
         let Self {
             app,
             mut handles,
@@ -1044,7 +1045,12 @@ impl PreparedSessionRuntime {
             .and_then(SessionLockState::publication_guard)
         {
             Some(guard) => guard,
-            None => return Err((LOCK_UNAVAILABLE_REPLACEMENT_ERR.into(), session_lock)),
+            None => {
+                return Err((
+                    Box::new(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into()),
+                    session_lock,
+                ));
+            }
         };
         checkpoint.bind_publication_guard(Some(_guard.clone()));
         let same_session = app.session_id() == current.id();
@@ -1065,7 +1071,7 @@ impl PreparedSessionRuntime {
             ));
             let initialized = recovered.and_then(|recovered| handles.initialize(recovered));
             if let Err(error) = initialized {
-                return Err((error.into(), session_lock));
+                return Err((Box::new(error.into()), session_lock));
             }
         }
         match _guard.publish(|| ()) {
@@ -1078,7 +1084,7 @@ impl PreparedSessionRuntime {
                     || LOCK_LOST_REPLACEMENT_ERR.to_owned(),
                     |error| error.to_string(),
                 );
-                return Err((error.into(), session_lock));
+                return Err((Box::new(error.into()), session_lock));
             }
         }
         let activated = if same_session {
@@ -1089,7 +1095,7 @@ impl PreparedSessionRuntime {
         let coordinator = match activated {
             Ok(coordinator) => coordinator,
             Err(error) => {
-                return Err((error.into(), session_lock));
+                return Err((Box::new(error.into()), session_lock));
             }
         };
         let config_commits = match observe_config_commits(
@@ -1104,7 +1110,7 @@ impl PreparedSessionRuntime {
                 if same_session {
                     stop_runtime_after_recovery_failure(current, &error.to_string());
                 }
-                return Err((error, session_lock));
+                return Err((Box::new(error), session_lock));
             }
         };
         if !initialized_before_publication
@@ -1114,7 +1120,7 @@ impl PreparedSessionRuntime {
             if same_session {
                 stop_runtime_after_recovery_failure(current, &error.to_string());
             }
-            return Err((error, session_lock));
+            return Err((Box::new(error), session_lock));
         }
         if let Some(provider) = provider {
             startup_model_slot.install(provider.model, provider.provider);
@@ -5410,6 +5416,7 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
         percentage: limit.percentage,
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
+        ui_shortname_hint: limit.ui_shortname_hint,
     }
 }
 
@@ -6245,15 +6252,7 @@ end })
             assert!(matches!(kind, SessionOpKind::ModeChanged));
             let config = actor.effective_config().unwrap();
             let plan = config.mode.plan_path().unwrap();
-            assert!(
-                plan.starts_with(
-                    temp_dir
-                        .path()
-                        .canonicalize()
-                        .unwrap()
-                        .join(makima_storage::plans::PLANS_DIR)
-                )
-            );
+            assert!(plan.starts_with(storage.path().join(makima_storage::plans::PLANS_DIR)));
             assert_eq!(
                 config.mode_def,
                 EventHandle::disconnected_for_test()
@@ -8084,7 +8083,7 @@ end })
         assert_eq!(durable.messages()[0].user_text(), Some(PERSISTED));
         let manager_generation = runtime.handles.manager_and_root().0.generation();
         let runtime_generation = runtime.generation;
-        let source_root = harness._temp_dir.path().canonicalize().unwrap();
+        let source_root = harness.ctx().storage.path().to_path_buf();
         let store = runtime.handles.offload.as_ref().unwrap();
         let artifact = store.put(ARTIFACT).unwrap();
         let artifact_path = store.path_of(&artifact);

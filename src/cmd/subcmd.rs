@@ -282,7 +282,7 @@ pub fn provider_host(
             .context("initialize lua plugin host")?;
     let mut warnings: Vec<String> = trust.warning.clone().into_iter().collect();
     let config = load_effective_config(&host, no_plugins, &trust.project_config, &mut warnings)?;
-    host.load_builtins(&config.plugins)
+    host.load_configured_builtins(&config)
         .context("load builtin plugins")?;
     let providers = host
         .provider_registry(Timeouts::from(&config.provider))
@@ -365,7 +365,7 @@ pub fn index(
     config.permissions = load_permissions(&trust.project_config)?;
     config.validate()?;
 
-    host.load_builtins(&config.plugins)
+    host.load_configured_builtins(&config)
         .context("load builtin plugins")?;
 
     let abs_path = Path::new(path)
@@ -464,7 +464,7 @@ pub fn prompt(
         .context("invalid config")?;
     makima_lua::set_allowed_private_hosts(&config.net.allowed_private_hosts);
     config.validate()?;
-    host.load_builtins(&config.plugins)
+    host.load_configured_builtins(&config)
         .context("load builtin plugins")?;
 
     if tools {
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn registered_status_and_logout_use_the_shared_functions() {
         let state = TempDir::new().unwrap();
-        makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        makima_storage::paths::init_shared_for_test();
         let storage = StateDir::from_path(state.path().to_path_buf());
         let host = PluginHost::with_session_provider_preparer(
             Arc::new(ToolRegistry::new()),

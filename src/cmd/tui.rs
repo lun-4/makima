@@ -138,7 +138,7 @@ fn build_stack(
         &mut warnings,
     )?;
 
-    if let Err(e) = plugin_host.load_builtins(&config.plugins) {
+    if let Err(e) = plugin_host.load_configured_builtins(&config) {
         let e = color_eyre::eyre::Report::from(e).wrap_err("load builtin plugins");
         if reloading {
             warnings.push(format!("{e:#}"));
@@ -711,7 +711,7 @@ mod tests {
         );
 
         plugin_host
-            .load_builtins(&config.plugins)
+            .load_configured_builtins(&config)
             .expect("builtins load on the live host under --no-plugins");
 
         plugin_host.begin_shutdown();

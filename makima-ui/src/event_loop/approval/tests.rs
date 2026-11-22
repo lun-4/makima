@@ -65,9 +65,9 @@ const CHILD_PROMPT: &str = "gated managed child";
 const RESET_COMMAND: &str = "/approval-reset";
 const START_COMMAND_PREFIX: &str = "/approval-start-";
 const MODE_COMMAND_PREFIX: &str = "/approval-mode-";
-const CHILD_TOOL_NAME: &str = "approval_child";
+const CHILD_TOOL_PREFIX: &str = "approval_child";
+const CHILD_NAME: &str = "approval child";
 const CHILD_CALL_ID: &str = "approval-child-call";
-const CHILD_PLUGIN: &str = "approval-child";
 const OBSERVER_PLUGIN: &str = "approval-observer";
 const PLAN_FILE: &str = "approval-plan.md";
 const RELATIVE_PLAN_FILE: &str = "relative-plan.md";
@@ -152,12 +152,30 @@ fn assert_actor_selection(actor: &AgentActorHandle, spec: &str, options: Request
     assert_eq!(config.mode, AgentMode::Build);
 }
 
-fn child_tool(auto_deliver: bool) -> String {
+/// A plugin and tool name no other test in this process has used. Tests share
+/// the global tool registry, and loading a plugin replaces everything that
+/// plugin registered, so a fixed name would let one test pull the tool out
+/// from under another's pinned bindings.
+struct ChildNames {
+    plugin: String,
+    tool: String,
+}
+
+fn child_names() -> ChildNames {
+    static SERIAL: AtomicUsize = AtomicUsize::new(0);
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    ChildNames {
+        plugin: format!("approval-child-{serial}"),
+        tool: format!("{CHILD_TOOL_PREFIX}_{serial}"),
+    }
+}
+
+fn child_tool(tool: &str, auto_deliver: bool) -> String {
     format!(
         r#"
     local sessions = {{}}
     makima.api.register_tool({{
-        name = "{CHILD_TOOL_NAME}", description = "start test child", kind = "read",
+        name = "{tool}", description = "start test child", kind = "read",
         schema = {{ type = "object", properties = {{}} }},
         audiences = {{ "main" }},
         handler = function(_, ctx)
@@ -238,6 +256,7 @@ impl Provider for RecordingProvider {
 }
 
 struct ChildProvider {
+    tool: String,
     entered: flume::Sender<()>,
     release: flume::Receiver<()>,
     root_requests: AtomicUsize,
@@ -268,7 +287,7 @@ impl Provider for ChildProvider {
             } else if self.root_requests.fetch_add(1, Ordering::SeqCst) == 0 {
                 ContentBlock::ToolUse {
                     id: CHILD_CALL_ID.into(),
-                    name: CHILD_TOOL_NAME.into(),
+                    name: self.tool.clone(),
                     input: serde_json::json!({}),
                     thought_signature: None,
                 }
@@ -301,8 +320,9 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
     with_event_loop(|event_loop| {
         let (index, path, requests, host) =
             setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
+        let names = child_names();
         host.load_source(
-            CHILD_PLUGIN,
+            &names.plugin,
             &format!(
                 r#"
             local sessions = {{}}
@@ -334,6 +354,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let actor = manager.actor(root).unwrap();
         let provider = Arc::new(ChildProvider {
+            tool: names.tool,
             entered,
             release: gate,
             root_requests: AtomicUsize::new(1),
@@ -569,7 +590,9 @@ fn managed_child_approval(
     with_event_loop(|event_loop| {
         let (index, path, requests, host) =
             setup_with_registry(event_loop, Arc::clone(ToolRegistry::global_arc()));
-        host.load_source(CHILD_PLUGIN, &child_tool(false)).unwrap();
+        let names = child_names();
+        host.load_source(&names.plugin, &child_tool(&names.tool, false))
+            .unwrap();
         event_loop.sessions[index]
             .app
             .permissions
@@ -592,6 +615,7 @@ fn managed_child_approval(
             model_patch(
                 SOURCE_MODEL,
                 Arc::new(ChildProvider {
+                    tool: names.tool,
                     entered,
                     release: gate,
                     root_requests: AtomicUsize::new(0),
@@ -658,7 +682,7 @@ fn managed_child_approval(
             agent_id: child_id,
             parent_agent_id: Some(root),
             parent_tool_use_id: child_key.clone(),
-            name: CHILD_TOOL_NAME.into(),
+            name: CHILD_NAME.into(),
             prompt: None,
             model: None,
             opts: None,

@@ -322,8 +322,23 @@ makima.api.register_command({
             elseif input.kind == "recovery_read_only" then
                 assert(result.text == input.reply)
             elseif input.kind ~= "mcp" and input.kind ~= "permissions" then
-                local history = makima.json.encode(assert(agent:transcript(ctx, { last_messages = 100, max_bytes = 65536 })).messages)
-                assert(history:find(input.model, 1, true) and history:find(input.cwd, 1, true) and history:find(input.mode or "plan", 1, true))
+                local messages = assert(agent:transcript(ctx, { last_messages = 100, max_bytes = 65536 })).messages
+                local echo
+                for i = #messages, 1, -1 do
+                    for _, block in ipairs(messages[i].content) do
+                        if block.type == "tool_result" and not block.is_error then
+                            local value = makima.json.decode(block.content)
+                            if type(value) == "table" and type(value.cwd) == "string" then
+                                echo = value
+                                break
+                            end
+                        end
+                    end
+                    if echo then break end
+                end
+                assert(echo, "missing restart_echo result")
+                assert(echo.model == input.model and echo.mode == (input.mode or "plan"))
+                assert((echo.cwd:gsub("[\\/]%.$", "")) == input.cwd, echo.cwd)
             end
         elseif input.action == "reject" then
             local agent = inspect(ctx, input, input.closed)

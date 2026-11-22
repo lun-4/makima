@@ -352,6 +352,7 @@ mod tests {
     const STRONG: &str = "strong";
     const STRONG_FIRST: &str = "strong-first";
     const STRONG_SECOND: &str = "strong-second";
+    const OVERRIDE_HOLDER: &str = "override-holder";
     const WEAK: &str = "weak-only";
     const DISCOVERED: &str = "discovered";
     const CONTEXT_WINDOW: u32 = 42_000;
@@ -496,15 +497,18 @@ mod tests {
     fn first_descriptor_is_tier_default_and_override_wins() {
         let (registry, _) = registry_with(FAKE, None);
         let first = format!("{FAKE}/{STRONG_FIRST}");
-        let second = format!("{FAKE}/{STRONG_SECOND}");
+        // Tier overrides are process-global, so the assigned model must be one
+        // no other test resolves, or a test running beside this one would see
+        // its declared tier replaced.
+        let claimed = format!("{FAKE}/{OVERRIDE_HOLDER}");
         assert_eq!(registry.spec_for_tier(FAKE, ModelTier::Strong), Some(first));
 
         let state = tempfile::tempdir().unwrap();
         let dir = makima_storage::StateDir::from_path(state.path().to_path_buf());
-        model_registry::set_and_persist(second.clone(), ModelTier::Compaction, &dir);
+        model_registry::set_and_persist(claimed.clone(), ModelTier::Compaction, &dir);
         let compaction = registry.spec_for_tier(FAKE, ModelTier::Compaction);
-        model_registry::unset_and_persist(&second, ModelTier::Compaction, &dir);
-        assert_eq!(compaction, Some(second));
+        model_registry::unset_and_persist(&claimed, ModelTier::Compaction, &dir);
+        assert_eq!(compaction, Some(claimed));
     }
 
     #[test_case(&[], STRONG_FIRST ; "default when allowed")]

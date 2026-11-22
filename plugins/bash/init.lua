@@ -19,12 +19,10 @@ local RTK_UNSUPPORTED_FLAGS = {
   " -fprintf ",
 }
 local SEPARATOR = "──────"
+local SHELL = makima.env.shell()
+local IS_BASH = SHELL == "bash"
 
 local rtk_available
-
-local function shell_quote(s)
-  return "'" .. s:gsub("'", "'\\''") .. "'"
-end
 
 local function unquote(s)
   local q = s:sub(1, 1)
@@ -107,12 +105,16 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and not config.rtk then
+  if not IS_BASH or (config and not config.rtk) then
     return nil
   end
 
   if rtk_available == nil then
-    local id = makima.fn.jobstart("rtk --version")
+    local ok, id = pcall(makima.fn.jobstart, { "rtk", "--version" })
+    if not ok then
+      rtk_available = false
+      return nil
+    end
     local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
     if result then
       rtk_available = (result.exit_code == 0)
@@ -131,7 +133,7 @@ local function rtk_rewrite(command, ctx)
     return nil
   end
 
-  local id = makima.fn.jobstart("rtk rewrite " .. shell_quote(command))
+  local id = makima.fn.jobstart({ "rtk", "rewrite", command })
   local result = makima.fn.jobwait(id, RTK_REWRITE_TIMEOUT_MS)
   if not result then
     makima.fn.jobstop(id)
@@ -255,8 +257,12 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+local description = [[Execute a ]]
+  .. SHELL
+  .. [[ command.
+Commands run in ]]
+  .. cwd
+  .. [[ by default.
 
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
@@ -365,6 +371,15 @@ local function command_scopes(command)
     return nil
   end
 
+  if not IS_BASH then
+    local scopes = { scopes = { command }, force_prompt = not bh.is_simple_windows_command(SHELL, command) }
+    if SHELL == "powershell" and not scopes.force_prompt then
+      local target = bh.qualify_powershell_command(command)
+      scopes.deny_scopes = { target, target:match("^[^\\]+\\(.+)$") }
+    end
+    return scopes
+  end
+
   local parser = makima.treesitter.get_parser(command, "bash")
   if not parser then
     return { scopes = { command }, force_prompt = true }
@@ -402,6 +417,13 @@ makima.api.register_tool({
   },
   permission_scopes = function(input, ctx)
     if ctx and ctx.session_id and auto_mode_enabled(ctx.options) then
+      if SHELL == "powershell" then
+        local scopes = command_scopes(input.command)
+        if scopes and scopes.deny_scopes then
+          table.insert(scopes.deny_scopes, 1, input.command)
+          return { scopes = {}, deny_scopes = scopes.deny_scopes }
+        end
+      end
       return nil
     end
     return command_scopes(input.command)
@@ -494,6 +516,7 @@ makima.api.register_tool({
         local ok, perr = makima.agent.permission_prompt(ctx, {
           tool = "bash",
           scopes = scopes.scopes,
+          deny_scopes = scopes.deny_scopes,
           force_prompt = scopes.force_prompt,
         })
         if ok then
@@ -562,7 +585,9 @@ makima.api.register_tool({
     ctx:set_deadline(timeout_secs, {
       expire = opts.background_on_timeout and "background" or "timeout",
     })
-    makima.fn.jobstart(command, {
+    local script = SHELL == "powershell" and command == input.command and bh.qualify_powershell_command(command)
+      or command
+    makima.fn.jobstart(script, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)

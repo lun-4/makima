@@ -3,13 +3,18 @@ use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use makima_agent::shell::{ResolvedShell, command};
+#[cfg(test)]
+use makima_config::Shell;
+use makima_domain::LockExt;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::api::env::resolved_shell;
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
@@ -44,12 +49,18 @@ struct JobMeta {
 pub(crate) struct JobStore {
     jobs: HashMap<u32, JobMeta>,
     next_id: u32,
+    released: ReleasedReceivers,
 }
 
-struct CheckedOutReceiver {
-    lua: Lua,
+/// Receivers whose `jobwait` future died. A `Drop` can run inside a Luau GC
+/// sweep, where any call into the VM aborts, so the receiver parks here and
+/// the next safe point gives it back to the store.
+type ReleasedReceivers = Arc<Mutex<Vec<(u32, flume::Receiver<JobEvent>)>>>;
+
+pub(crate) struct CheckedOutReceiver {
     job_id: u32,
     receiver: Option<flume::Receiver<JobEvent>>,
+    released: ReleasedReceivers,
 }
 
 #[derive(Clone, Debug)]
@@ -59,9 +70,9 @@ pub(crate) enum JobCommand {
 }
 
 impl JobCommand {
-    fn build(&self) -> Command {
+    fn build(&self, shell: impl Into<ResolvedShell>) -> Command {
         match self {
-            Self::Shell(cmd) => shell_command(cmd),
+            Self::Shell(cmd) => command(shell, cmd),
             Self::Argv(argv) => {
                 let mut command = Command::new(&argv[0]);
                 command.args(&argv[1..]);
@@ -106,6 +117,7 @@ impl JobStore {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
+            released: Arc::default(),
         }
     }
 
@@ -119,9 +131,10 @@ impl JobStore {
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
+        shell: impl Into<ResolvedShell>,
     ) -> Result<u32, String> {
         let cmd = cmd.into();
-        let mut command = cmd.build();
+        let mut command = cmd.build(shell);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -234,10 +247,24 @@ impl JobStore {
         job_id: u32,
         task_id: Option<u64>,
         plugin: &str,
-    ) -> Option<flume::Receiver<JobEvent>> {
+    ) -> Option<CheckedOutReceiver> {
+        self.reclaim_released();
         let job = self.jobs.get_mut(&job_id)?;
-        job.can_access(task_id, plugin)
-            .then(|| job.event_rx.take())?
+        if !job.can_access(task_id, plugin) {
+            return None;
+        }
+        Some(CheckedOutReceiver {
+            job_id,
+            receiver: Some(job.event_rx.take()?),
+            released: Arc::clone(&self.released),
+        })
+    }
+
+    pub(crate) fn reclaim_released(&mut self) {
+        let released = std::mem::take(&mut *self.released.lock_unpoisoned());
+        for (job_id, receiver) in released {
+            self.restore_receiver(job_id, receiver);
+        }
     }
 
     pub fn restore_receiver(&mut self, job_id: u32, receiver: flume::Receiver<JobEvent>) {
@@ -347,14 +374,6 @@ impl Drop for JobStore {
 }
 
 impl CheckedOutReceiver {
-    fn new(lua: &Lua, job_id: u32, receiver: flume::Receiver<JobEvent>) -> Self {
-        Self {
-            lua: lua.clone(),
-            job_id,
-            receiver: Some(receiver),
-        }
-    }
-
     fn get(&self) -> &flume::Receiver<JobEvent> {
         self.receiver.as_ref().expect("receiver is checked out")
     }
@@ -363,9 +382,9 @@ impl CheckedOutReceiver {
 impl Drop for CheckedOutReceiver {
     fn drop(&mut self) {
         if let Some(receiver) = self.receiver.take() {
-            with_jobs(&self.lua, |store| {
-                store.restore_receiver(self.job_id, receiver);
-            });
+            self.released
+                .lock_unpoisoned()
+                .push((self.job_id, receiver));
         }
     }
 }
@@ -380,21 +399,6 @@ impl JobMeta {
                 ..
             } => owner_plugin.as_ref() == plugin,
         }
-    }
-}
-
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    }
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
     }
 }
 
@@ -439,8 +443,9 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 }
 
 /// Run a shell command in the background. The command runs through
-/// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-/// that you can pass to `jobstop` or `jobwait` to control the process.
+/// `bash -c` on Unix, and on Windows through whatever `agent.shell` selects
+/// (Git Bash by default). You get back a job id that you can pass to
+/// `jobstop` or `jobwait` to control the process.
 ///
 /// @param cmd string|string[] Shell command to run, or array of arguments.
 /// @param opts table? Optional settings:
@@ -511,8 +516,9 @@ fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>)
         None => (None, None, None, None, None),
     };
 
+    let shell = resolved_shell(lua);
     with_jobs(lua, |store| {
-        store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)
+        store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit, shell)
     })
     .map_err(mlua::Error::runtime)
 }
@@ -558,7 +564,6 @@ async fn jobwait(
     let task_id = active_task_id(&lua);
     let receiver = with_jobs(&lua, |store| store.take_receiver(job_id, task_id, &plugin))
         .ok_or_else(|| mlua::Error::runtime("unknown job id or already waited"))?;
-    let receiver = CheckedOutReceiver::new(&lua, job_id, receiver);
 
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let deadline = smol::Timer::after(timeout);
@@ -742,7 +747,16 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start(task_owner(1), "echo hello", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "echo hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap()
     }
 
@@ -768,7 +782,16 @@ mod tests {
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .expect("job started");
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");
@@ -792,8 +815,19 @@ mod tests {
             None,
             None,
             None,
+            Shell::default(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dropped_receiver_returns_at_the_next_safe_point() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+        let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_none());
+        drop(receiver);
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
     }
 
     #[test]
@@ -807,7 +841,7 @@ mod tests {
         assert!(!store.is_empty(&owner));
         let receiver = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receiver.get().recv_timeout(Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -833,18 +867,29 @@ mod tests {
             store.take_receiver(id, Some(2), TEST_PLUGIN).is_none(),
             "another task must not access the job"
         );
-        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
+        let lease = store.take_receiver(id, Some(1), TEST_PLUGIN).unwrap();
         assert!(
             store.take_receiver(id, Some(1), TEST_PLUGIN).is_none(),
-            "second take should fail (receiver already moved)"
+            "second take should fail while the lease is held"
         );
+        drop(lease);
+        assert!(store.take_receiver(id, Some(1), TEST_PLUGIN).is_some());
     }
 
     #[test]
     fn plugin_owner_can_be_accessed_only_by_its_plugin() {
         let mut store = make_store();
         let id = store
-            .start(plugin_owner(), "echo hello", None, None, None, None, None)
+            .start(
+                plugin_owner(),
+                "echo hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
 
         assert!(store.take_receiver(id, Some(1), "other-plugin").is_none());
@@ -857,7 +902,16 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let pid = store.jobs[&id].pid;
 
@@ -877,10 +931,28 @@ mod tests {
         let task = task_owner(1);
         let plugin = plugin_owner();
         let task_id = store
-            .start(task.clone(), "sleep 30", None, None, None, None, None)
+            .start(
+                task.clone(),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let plugin_id = store
-            .start(plugin.clone(), "sleep 30", None, None, None, None, None)
+            .start(
+                plugin.clone(),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let task_pid = store.jobs[&task_id].pid;
         let plugin_pid = store.jobs[&plugin_id].pid;
@@ -921,7 +993,7 @@ mod tests {
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.get().recv_timeout(Duration::from_millis(200)) {
                 Ok(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
@@ -939,7 +1011,16 @@ mod tests {
         let mut store = make_store();
         let id = start_echo(&mut store);
         let plugin_id = store
-            .start(plugin_owner(), "echo plugin", None, None, None, None, None)
+            .start(
+                plugin_owner(),
+                "echo plugin",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
 
         let mut buf = Vec::new();

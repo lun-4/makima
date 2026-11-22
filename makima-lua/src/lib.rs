@@ -51,6 +51,8 @@ pub use api::net::set_allowed_private_hosts;
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
+    use std::path::PathBuf;
+
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
@@ -380,6 +382,14 @@ pub mod test_support {
     /// Synthetic state dir for hosts booted by [`spawn_host_for_tests`].
     /// Never created on the real disk; hosts run on the in-memory backend.
     pub const TEST_STATE_DIR: &str = "/makima-test-state";
+
+    /// Resolves [`TEST_STATE_DIR`] against the current drive on Windows so test seeds match paths resolved by the fs API.
+    pub fn test_state_path(rel: &str) -> PathBuf {
+        std::env::current_dir()
+            .expect("test process has a current directory")
+            .join(TEST_STATE_DIR)
+            .join(rel)
+    }
 
     pub use crate::api::fs::{
         FsBackend, FsError, FsMeta, InMemoryFs, InMemoryOffloadBackend, RealFs,

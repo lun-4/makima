@@ -1652,8 +1652,8 @@ pub(crate) mod tests {
     use makima_storage::test_util::test_record;
     use std::collections::BTreeMap;
     use std::io;
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Barrier, LazyLock};
     use std::thread;
     use test_case::test_case;
 
@@ -1664,7 +1664,8 @@ pub(crate) mod tests {
     const FIRST: &str = "first provider";
     const SECOND: &str = "second provider";
     const TEST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
-    const TEST_CWD: &str = "/tmp";
+    static TEST_CWD: LazyLock<String> =
+        LazyLock::new(|| std::env::temp_dir().to_string_lossy().into_owned());
     const ORIGINAL_RECOVERY_INPUT: &str = "interrupted input";
     const MISSING_PROMPT: &str = "srv.missing";
     const TERMINAL_CHECKPOINT_GATE: &str = "terminal checkpoint entered";
@@ -2021,7 +2022,7 @@ pub(crate) mod tests {
             prompt_slots: PromptSlotSource::default(),
             excluded_tools: Vec::new(),
             mcp_handle: None,
-            initial_wd: PathBuf::from(TEST_CWD),
+            initial_wd: PathBuf::from(TEST_CWD.as_str()),
             session_id: Some(SessionRef::from(session_id)),
             root_id: None,
             journal: None,
@@ -2034,7 +2035,7 @@ pub(crate) mod tests {
             modes: Arc::new(ModeRegistry::builtin()),
             question_mode: crate::tools::QuestionMode::Headless,
             plugin_rules: Arc::default(),
-            project_config: ProjectConfig::for_project(Path::new(TEST_CWD)),
+            project_config: ProjectConfig::for_project(Path::new(TEST_CWD.as_str())),
             local_tools: Arc::default(),
             state_dir: None,
             answers: true,
@@ -2180,13 +2181,14 @@ pub(crate) mod tests {
             let plan_path = blocker.join(SAVED_OUTPUT);
             let mut definition = crate::ModeDef::default_for(crate::ModeId::Plan);
             definition.restrict_write_to = Some(plan_path.clone());
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let cwd = directory.path().to_string_lossy();
+            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &cwd);
             let root_id = AgentId::generate();
             session.bind_root_id(root_id).unwrap();
             session
                 .resolve_legacy_config(makima_storage::session_state::StoredAgentConfig {
                     model: TEST_MODEL.into(),
-                    cwd: TEST_CWD.into(),
+                    cwd: cwd.into_owned(),
                     mode: definition.stored_snapshot(&AgentMode::Plan(plan_path)),
                     thinking: None,
                     fast: false,
@@ -2287,7 +2289,8 @@ pub(crate) mod tests {
         const RULE_SCOPE: &str = "blocked *";
         smol::block_on(async {
             let root_id = AgentId::generate();
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             session.bind_root_id(root_id).unwrap();
             let rules = vec![makima_storage::sessions::StoredRule {
                 tool: RULE_TOOL.into(),
@@ -2373,7 +2376,8 @@ pub(crate) mod tests {
             let directory = tempfile::tempdir().unwrap();
             let cwd = directory.path().to_path_buf();
             let root_id = AgentId::generate();
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             session.bind_root_id(root_id).unwrap();
             let definition = crate::ModeDef {
                 id: crate::ModeId::parse(MODE_NAME),
@@ -2434,7 +2438,8 @@ pub(crate) mod tests {
     #[test_case(true; "hidden_root_initializer")]
     fn cancelled_recovered_startup_settles_readiness_without_running_provider(initialize: bool) {
         smol::block_on(async {
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             let root_id = AgentId::generate();
             session.bind_root_id(root_id).unwrap();
             let mut params = interactive_params(session.id, Vec::new());
@@ -2492,7 +2497,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             let root_id = AgentId::generate();
             session.bind_root_id(root_id).unwrap();
             let mut params = interactive_params(session.id, Vec::new());
@@ -2542,7 +2548,7 @@ pub(crate) mod tests {
             let root_id = AgentId::generate();
             let turn = TurnId::generate();
             let mut session = Session::<Message, makima_providers::TokenUsage, ToolOutput>::new(
-                TEST_MODEL, TEST_CWD,
+                TEST_MODEL, &TEST_CWD,
             );
             session.bind_root_id(root_id).unwrap();
             session.push_message(Message::user(ORIGINAL_RECOVERY_INPUT.into()));
@@ -2637,7 +2643,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             let session_id = session.id;
             let provider: Arc<dyn Provider> = Arc::new(OversizedPrintProvider);
             let coordinator = coordinator(session_id, checkpoint());
@@ -2864,7 +2871,7 @@ pub(crate) mod tests {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
-            let session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             let mut params = interactive_params(session.id, Vec::new());
             params.yolo = seed;
             let (provider, requests) = recording();
@@ -2978,7 +2985,8 @@ pub(crate) mod tests {
         smol::block_on(async {
             let state = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(state.path().to_path_buf());
-            let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+            let mut session =
+                Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
             let root_id = AgentId::generate();
             let initial = restored.then(|| {
                 let mut history = History::new(vec![Message::user(SAVED_OUTPUT.into())]);
@@ -3849,7 +3857,7 @@ pub(crate) mod tests {
             params.root_id = Some(root_id);
             if restored {
                 let mut session =
-                    Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+                    Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
                 session.id = session_id;
                 session.bind_root_id(root_id).unwrap();
                 params.journal = Some(Arc::new(SessionJournal::from_session(&session).unwrap()));
@@ -3879,7 +3887,7 @@ pub(crate) mod tests {
                         );
                         assert_eq!(template.mode, AgentMode::Build);
                         assert_eq!(template.execution_agent_id, Some(root.id()));
-                        assert_eq!(template.cwd, PathBuf::from(TEST_CWD));
+                        assert_eq!(template.cwd, PathBuf::from(TEST_CWD.as_str()));
                         assert!(template.managed_turn.is_none());
                         bound.send_async(root.id()).await.unwrap();
                         bind_actor(manager, root, template, initialization).await
@@ -3970,7 +3978,7 @@ pub(crate) mod tests {
         };
         let stored = result.to_stored(session_id, Some(&store)).unwrap();
         assert!(matches!(&stored.text, StoredPayload::Offloaded(_)));
-        let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, TEST_CWD);
+        let mut session = Session::<Message, TokenUsage, ToolOutput>::new(TEST_MODEL, &TEST_CWD);
         session.id = session_id;
         if persistent {
             manager.journal().bind_session(session_id).unwrap();

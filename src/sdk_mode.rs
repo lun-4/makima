@@ -2659,7 +2659,6 @@ mod tests {
     const RESET_MODEL: &str = "sdk-reset/offline";
     const RESET_STATE_KEY: &str = "sdk/reset-state";
     const RESET_STATE_VALUE: &str = "previous session state";
-    const RESET_BACKUP: &str = "sessions-before-reset";
     const RESET_TOOL: &str = "sdk_reset_active_tool";
     const RESET_REJECTED: &str = "active reset rejected";
     const LEGACY_PLAN_FILE: &str = "legacy-sdk-plan.md";
@@ -2721,6 +2720,9 @@ mod tests {
         scope: StateScope,
         fail: bool,
     ) {
+        use clap::Parser;
+        use makima_storage::plans::PLANS_DIR;
+
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let storage = StateDir::from_path(directory.path().to_path_buf());
@@ -2729,7 +2731,11 @@ mod tests {
                 smol::unblock({
                     let storage = storage.clone();
                     let cwd = directory.path().to_path_buf();
-                    move || SdkSession::new(reset_sdk_params(cwd), storage, out_tx).unwrap()
+                    move || {
+                        let mut params = reset_sdk_params(cwd);
+                        params.cli = Cli::parse_from(["makima", "--permission-mode", "plan"]);
+                        SdkSession::new(params, storage, out_tx).unwrap()
+                    }
                 }),
                 async {
                     smol::Timer::after(SDK_GATE_TIMEOUT).await;
@@ -2755,11 +2761,10 @@ mod tests {
             slot.set(&access, RESET_STATE_VALUE.into(), Some(StateRevision(0)))
                 .unwrap();
             previous.checkpoint.drain().await.unwrap();
-            let sessions = storage.path().join(SESSIONS_DIR);
-            let backup = storage.path().join(RESET_BACKUP);
+            let plans = storage.path().join(PLANS_DIR);
             if fail {
-                std::fs::rename(&sessions, &backup).unwrap();
-                std::fs::write(&sessions, RESET_STATE_VALUE).unwrap();
+                std::fs::remove_dir(&plans).unwrap();
+                std::fs::write(&plans, RESET_STATE_VALUE).unwrap();
             }
             let (user_tx, dispatcher) = session.spawn_dispatcher();
             let send = |prompt: &str| {
@@ -2795,8 +2800,8 @@ mod tests {
                     )
                     .await,
                 );
-                std::fs::remove_file(&sessions).unwrap();
-                std::fs::rename(&backup, &sessions).unwrap();
+                std::fs::remove_file(&plans).unwrap();
+                std::fs::create_dir(&plans).unwrap();
             }
             send("/yolo");
             drop(user_tx);
@@ -4683,7 +4688,8 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         const STORED_CONVERSATION: &str = "stored-conversation";
         const STORED_SENT: usize = 2;
-        let mut session = StoredSession::new(STARTUP_MODEL, THIS_CWD);
+        let cwd = tmp.path().to_string_lossy();
+        let mut session = StoredSession::new(STARTUP_MODEL, &cwd);
         session.adopt_history(&makima_storage::sessions::HistorySnapshot::new(vec![
             Message::user("first".into()),
             Message::user("second".into()),
@@ -4714,7 +4720,7 @@ mod tests {
         if legacy {
             let header = serde_json::json!({
                 "t": "header", "v": 2, "id": session.id,
-                "model": STARTUP_MODEL, "cwd": THIS_CWD, "created_at": 1,
+                "model": STARTUP_MODEL, "cwd": cwd, "created_at": 1,
             });
             let mut records = vec![header];
             records.extend(session.messages().iter().enumerate().map(|(index, message)| {
@@ -4758,7 +4764,7 @@ mod tests {
             args.push("--fork-session".to_owned());
         }
         let cli = Cli::parse_from(args);
-        let opening = open_test_session(&cli, THIS_CWD, &storage).unwrap();
+        let opening = open_test_session(&cli, &cwd, &storage).unwrap();
         assert_eq!(opening.resumed, !fork);
         let opened_history = opening.session.history_snapshot();
         assert!(opened_history.compacted);
@@ -4798,7 +4804,7 @@ mod tests {
                 release: released,
             });
             let mut params = idle_params();
-            params.initial_wd = PathBuf::from(THIS_CWD);
+            params.initial_wd = tmp.path().to_path_buf();
             params.session_id = Some(SessionRef::from(opening.session.id));
             params.model = opening.model.clone();
             let (writer, lease, recovered) =
@@ -4895,7 +4901,7 @@ mod tests {
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
             drop(lease);
-            let resumed = open_test_session(&resumed_cli, THIS_CWD, &storage).unwrap();
+            let resumed = open_test_session(&resumed_cli, &cwd, &storage).unwrap();
             assert_eq!(resumed.session.root_agent_id(), Some(root.id()));
         });
     }
@@ -5102,8 +5108,15 @@ mod tests {
             makima_lua::ui_sink::HostUi::Sink(Box::new(ui)),
         )
         .unwrap();
-        host.load_source("sdk_bundled_task", include_str!("../plugins/task/init.lua"))
-            .unwrap();
+        // The global registry outlives every test in this process, so a
+        // fixed tool name would collide with the other test that loads the
+        // bundled task plugin.
+        let task_source = include_str!("../plugins/task/init.lua")
+            .replace("task_spawn", "sdk_task_spawn")
+            .replace("task_wait", "sdk_task_wait")
+            .replace("task_send", "sdk_task_send")
+            .replace("task_despawn", "sdk_task_despawn");
+        host.load_source("sdk_bundled_task", &task_source).unwrap();
         host.load_source(
             "sdk_command_spawn",
             &format!(
@@ -5146,12 +5159,12 @@ mod tests {
                         assert(captured.fast == inherited.fast)
                     end
                     local prompt = input.child and "{SDK_GRANDCHILD_PROMPT}" or "{SDK_CHILD_PROMPT}"
-                    local spawned, err = makima.agent.call_tool(ctx, "task_spawn", {{
+                    local spawned, err = makima.agent.call_tool(ctx, "sdk_task_spawn", {{
                         description = prompt, prompt = prompt, subagent_type = "general",
                     }})
                     assert(not err, err)
                     local task = makima.json.decode(spawned)
-                    local joined, wait_err = makima.agent.call_tool(ctx, "task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
+                    local joined, wait_err = makima.agent.call_tool(ctx, "sdk_task_wait", {{ task_id = task.task_id, turn_id = task.turn_id }})
                     assert(not wait_err, wait_err)
                     local result = makima.json.decode(joined)
                     local expected = input.child and "{SDK_GRANDCHILD_RESPONSE}" or "{SDK_CHILD_RESPONSE}"

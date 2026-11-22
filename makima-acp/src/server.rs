@@ -2720,7 +2720,6 @@ mod tests {
     };
     use makima_storage::sessions::{Effort, Session, StoredThinking};
     use smol::future::poll_once;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -5147,12 +5146,7 @@ mod tests {
     const GHOST_MODE: &str = "ghost";
 
     fn configure_test_paths() {
-        static ROOT: OnceLock<TempDir> = OnceLock::new();
-        ROOT.get_or_init(|| {
-            let root = TempDir::new().unwrap();
-            makima_storage::paths::init_at(root.path().to_path_buf()).unwrap();
-            root
-        });
+        makima_storage::paths::init_shared_for_test();
     }
 
     fn test_providers(models: Arc<Mutex<Vec<ModelInfo>>>) -> Arc<ProviderRegistry> {
@@ -5345,14 +5339,7 @@ mod tests {
             let config = root.effective_config().unwrap().unwrap();
             if !invalid {
                 let plan = config.mode.plan_path().unwrap();
-                assert!(
-                    plan.starts_with(
-                        cwd.path()
-                            .canonicalize()
-                            .unwrap()
-                            .join(makima_storage::plans::PLANS_DIR)
-                    )
-                );
+                assert!(plan.starts_with(cwd.path().join(makima_storage::plans::PLANS_DIR)));
                 assert_eq!(
                     config.mode_def,
                     params
@@ -7195,13 +7182,14 @@ mod tests {
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
             let providers = spawn_test_providers(Arc::new(EndTurnProvider));
             let model = providers.model(SPAWN_TEST_SPEC).unwrap();
-            let mut params = test_params(model.clone(), storage.path().to_path_buf());
+            let cwd = storage.path().to_path_buf();
+            let mut params = test_params(model.clone(), cwd.clone());
             params.providers = providers;
             let (handle, root_target) = spawn_session(
                 &params,
                 SpawnSession {
                     model,
-                    cwd: PathBuf::from("/project"),
+                    cwd: cwd.clone(),
                     session_id: Some(session_id),
                     root_id: None,
                     journal: None,
@@ -7210,7 +7198,7 @@ mod tests {
                     elicitation: false,
                     yolo: false,
                     defaults: SessionDefaults::default(),
-                    project_config: ProjectConfig::for_project(Path::new("/project")),
+                    project_config: ProjectConfig::for_project(&cwd),
                     permissions: PermissionsConfig::default(),
                 },
             );

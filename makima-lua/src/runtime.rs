@@ -20,6 +20,7 @@ use makima_agent::cancel::{CancelMap, CancelToken, CancelTrigger, PublicationReg
 use makima_agent::manager::AgentIncarnation;
 use makima_agent::permissions::PluginRuleStore;
 use makima_agent::prompt::{PromptId, PromptSource, ResolvedSlots, Slot};
+use makima_agent::shell::ResolvedShell;
 use makima_agent::tools::hook::{Authority, Verdict};
 use makima_agent::tools::offload::OutputLimits;
 use makima_agent::tools::{
@@ -47,7 +48,7 @@ use makima_commands::{
     Producer, ProducerPrecedence, Registration, RegistrationError, TargetCapabilities,
     TargetCapability,
 };
-use makima_config::RawConfig;
+use makima_config::{RawConfig, Shell};
 use makima_storage::id::{MakimaId, SessionRef};
 
 use crate::api::autocmd::{self, AutocmdStore};
@@ -227,6 +228,7 @@ pub enum Request {
     /// Print saves nothing, saved preferences included.
     SaveNoPreferences,
     SetClockFormat(makima_config::ClockFormat),
+    SetShell(ResolvedShell),
     LoadSource {
         name: Arc<str>,
         source: String,
@@ -1552,6 +1554,7 @@ pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     let mut store = lua
         .app_data_mut::<JobStore>()
         .expect("job store was just installed");
+    store.reclaim_released();
     f(&mut store)
 }
 
@@ -2221,8 +2224,7 @@ fn spawn_deferred_callback(
         let run = async {
             bind_plugin_owner(&lua, cb.plugin.clone(), owner)?;
             let func: Function = lua.registry_value(&cb.func)?;
-            let thread = lua.create_thread(func)?;
-            thread.into_async::<()>(())?.await
+            func.call_async::<()>(()).await
         };
         if let Err(e) = run_detached(&lua, run).await {
             tracing::warn!(plugin = %cb.plugin, error = %strip_traceback(&e), "defer_fn callback failed");
@@ -2289,10 +2291,9 @@ async fn run_work_fn(
     call: &TaskCall,
 ) -> Result<LuaValue, mlua::Error> {
     let func: Function = lua.registry_value(work_fn)?;
-    let thread = lua.create_thread(func)?;
     let fut = match call {
-        TaskCall::Plain => thread.into_async::<LuaValue>(())?,
-        TaskCall::Timer(id) => thread.into_async::<LuaValue>((*id,))?,
+        TaskCall::Plain => func.call_async::<LuaValue>(()),
+        TaskCall::Timer(id) => func.call_async::<LuaValue>((*id,)),
         TaskCall::Event {
             plugin,
             incarnation,
@@ -2309,7 +2310,7 @@ async fn run_work_fn(
                         .unwrap_or_else(|| Err(INVOCATION_EXPIRED.into())),
                 )
             });
-            thread.into_async::<LuaValue>(ctx)?
+            func.call_async::<LuaValue>(ctx)
         }
     };
     until_abandoned(fut, handle)
@@ -2959,6 +2960,7 @@ impl LuaRuntime {
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(crate::api::usage::UsageMirror::default());
         lua.set_app_data(makima_config::ClockFormat::default());
+        lua.set_app_data(ResolvedShell::from(Shell::default()));
         lua.set_app_data(TimerStore::new());
         lua.set_app_data(Store::default());
         lua.set_app_data(crate::api::state::StateStore::default());
@@ -3206,11 +3208,8 @@ impl LuaRuntime {
     }
 
     async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
-        let result: mlua::Result<LuaValue> = run_detached(&self.lua, async {
-            let thread = self.lua.create_thread(func)?;
-            thread.into_async::<LuaValue>(())?.await
-        })
-        .await;
+        let result: mlua::Result<LuaValue> =
+            run_detached(&self.lua, func.call_async::<LuaValue>(())).await;
         match result {
             Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
             Ok(LuaValue::Nil) => None,
@@ -4205,13 +4204,22 @@ impl LuaRuntime {
         for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
             scopes.push(s);
         }
-        if scopes.is_empty() {
+        let deny_scopes = match table.get::<Option<Vec<String>>>("deny_scopes") {
+            Ok(scopes) => scopes.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!(plugin, tool, %error, "invalid deny scopes");
+                return Some(PermissionScopes::force_prompt(input.to_string()));
+            }
+        };
+        if scopes.is_empty() && deny_scopes.is_empty() {
             return None;
         }
         let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
         Some(PermissionScopes {
             scopes,
+            deny_scopes,
             force_prompt,
+            ignore_command_head_case: crate::api::env::uses_native_windows_shell(&self.lua, tool),
         })
     }
 
@@ -4285,8 +4293,7 @@ async fn compute_mutable_path(
         let input = json_to_lua(lua, &input)?;
         let context = lua.create_table()?;
         context.set("cwd", cwd.to_string_lossy().as_ref())?;
-        let thread = lua.create_thread(func)?;
-        thread.into_async::<LuaValue>((input, context))?.await
+        func.call_async::<LuaValue>((input, context)).await
     };
     let stopped = async {
         futures_lite::future::or(
@@ -4401,7 +4408,6 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         (lua.registry_value::<Function>(key).ok()?, pname)
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
-    let thread = lua.create_thread(func).ok()?;
 
     let (dummy_tx, _) = flume::unbounded();
     let cell = TaskCell::new(
@@ -4417,9 +4423,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let mut ctx = LuaCtx::restore(item.tool_output_lines, item.state, item.state_target);
     ctx.bind_origin(scope.handle());
     let ctx = lua.create_userdata(ctx).ok()?;
-    let inner = thread
-        .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
-        .ok()?;
+    let inner = func.call_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx));
     lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
     let ret = scope
         .scope_future(inner)
@@ -4846,8 +4850,7 @@ async fn run_tool_start(
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
-        let thread = lua.create_thread(func)?;
-        thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
+        func.call_async::<LuaValue>((input_lua, ctx_ud)).await
     };
     if let Err(e) = scope.scope_future(run).await {
         tracing::warn!(tool, error = %e, "start callback failed");
@@ -4906,10 +4909,6 @@ async fn run_tool_call(
     let output_limits = OutputLimits::from_config(&agent.config);
     let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
     let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
-    let thread = match lua.create_thread(handler) {
-        Ok(t) => t,
-        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
-    };
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.worker_cancel = Some(worker_cancel);
@@ -4928,10 +4927,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
 
-    let async_thread = match thread.into_async::<LuaValue>((input_lua, ctx_ud)) {
-        Ok(at) => at,
-        Err(e) => return ToolCallReply::err(strip_traceback(&e)),
-    };
+    let async_thread = handler.call_async::<LuaValue>((input_lua, ctx_ud));
     if let Some(id) = &live_id {
         live_tasks
             .borrow_mut()
@@ -5552,8 +5548,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                                 &lua, target, plugin.clone(),
                                                 incarnation.unwrap_or_else(|| Err(INVOCATION_EXPIRED.into())),
                                             ));
-                                        let thread = lua.create_thread(func)?;
-                                        thread.into_async::<()>((opts, ctx))?.await
+                                        func.call_async::<()>((opts, ctx)).await
                                     };
                                     let result = run_command_scoped(&lua, invocation, pinned, run)
                                         .await
@@ -5654,6 +5649,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         }
                         Request::SetClockFormat(format) => {
                             rt.lua.set_app_data(format);
+                        }
+                        Request::SetShell(shell) => {
+                            rt.lua.set_app_data(shell);
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
@@ -6857,10 +6855,28 @@ mod tests {
         let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
         with_jobs(&lua, |store| {
             store
-                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    task_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Shell::default(),
+                )
                 .unwrap();
             store
-                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(
+                    plugin_owner.clone(),
+                    "exit 0",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Shell::default(),
+                )
                 .unwrap();
         });
 
@@ -8017,7 +8033,16 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
             with_jobs(&lua, |store| {
-                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+                store.start(
+                    owner,
+                    DISPATCH_TEST_JOB,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Shell::default(),
+                )
             })
             .unwrap();
             let (finish_tx, finish_rx) = flume::bounded(1);

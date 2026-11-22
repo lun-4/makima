@@ -16,7 +16,7 @@ use makima_lua::{CommandArgumentContext, CommandArgumentItem, CommandArgumentLif
 const NOTE_PATH: &str = "note.md";
 const NOTE_BODY: &str = "hello-makima";
 const WROTE_PREFIX: &str = "wrote note.md";
-const PROJECTS_PREFIX: &str = "/makima-test-state/projects/";
+const PROJECTS_DIR: &str = "projects";
 const SPLASH_DEADLINE: Duration = Duration::from_secs(30);
 const SPLASH_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -38,7 +38,7 @@ fn exec(reg: &Arc<ToolRegistry>, tool: &str, input: serde_json::Value) -> String
 
 #[test]
 fn memory_write_read_roundtrip_stays_in_memory() {
-    let state = std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR);
+    let state = makima_lua::test_support::test_state_path("");
     assert!(
         !state.exists(),
         "precondition: TEST_STATE_DIR must not exist on disk"
@@ -71,7 +71,7 @@ fn memory_write_read_roundtrip_stays_in_memory() {
         .backend()
         .files()
         .into_iter()
-        .filter(|(p, _)| p.to_string_lossy().starts_with(PROJECTS_PREFIX))
+        .filter(|(p, _)| p.starts_with(makima_lua::test_support::test_state_path(PROJECTS_DIR)))
         .collect();
     assert_eq!(notes.len(), 1, "exactly one note file in the backend");
     let (path, bytes) = &notes[0];
@@ -94,7 +94,7 @@ fn memory_write_read_roundtrip_stays_in_memory() {
 
 #[test]
 fn splash_host_boots_disk_free() {
-    let state = std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR);
+    let state = makima_lua::test_support::test_state_path("");
     assert!(
         !state.exists(),
         "precondition: TEST_STATE_DIR must not exist on disk"
@@ -148,7 +148,7 @@ makima.store.register("splash", "vortex", {
 "##;
 
 fn selection_path() -> std::path::PathBuf {
-    std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR).join(SELECTION_REL)
+    makima_lua::test_support::test_state_path(SELECTION_REL)
 }
 
 fn selection_content(guard: &makima_lua::test_support::PluginHostGuard) -> Option<String> {
@@ -239,7 +239,7 @@ fn lifecycle_item() -> CommandArgumentItem {
 
 #[test]
 fn splash_picker_repairs_unknown_selection() {
-    let state = std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR);
+    let state = makima_lua::test_support::test_state_path("");
     assert!(
         !state.exists(),
         "precondition: TEST_STATE_DIR must not exist on disk"
@@ -345,7 +345,7 @@ fn splash_picker_command_persists_selection() {
 
 #[test]
 fn splash_picker_accept_survives_late_highlight() {
-    let state = std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR);
+    let state = makima_lua::test_support::test_state_path("");
     assert!(
         !state.exists(),
         "precondition: TEST_STATE_DIR must not exist on disk"
@@ -810,7 +810,7 @@ end)
 "##;
 
 fn ticks_file(guard: &makima_lua::test_support::PluginHostGuard, rel: &str) -> Option<u64> {
-    let path = std::path::Path::new(makima_lua::test_support::TEST_STATE_DIR).join(rel);
+    let path = makima_lua::test_support::test_state_path(rel);
     guard
         .backend()
         .files()

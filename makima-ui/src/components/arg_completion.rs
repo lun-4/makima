@@ -5,7 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::components::file_completion::PathDiscovery;
+use crate::components::file_completion::{DIRECTORY_SUFFIX, PathDiscovery};
 use crate::theme::{ThemesProvider, apply_theme};
 use arc_swap::ArcSwapOption;
 use makima_commands::{
@@ -125,7 +125,7 @@ impl CommandCompletion for PathArgSource {
         _context: &CompletionContext,
         item: &CompletionItem,
     ) -> CompletionItemNavigation {
-        if item.insertion.ends_with(std::path::MAIN_SEPARATOR) {
+        if item.insertion.ends_with(['/', std::path::MAIN_SEPARATOR]) {
             CompletionItemNavigation::Directory
         } else {
             CompletionItemNavigation::Terminal
@@ -185,7 +185,7 @@ impl CommandCompletion for PathArgSource {
 
 fn path_completion_item((mut insertion, is_directory): (String, bool)) -> CompletionItem {
     if is_directory {
-        insertion.push(std::path::MAIN_SEPARATOR);
+        insertion.push(DIRECTORY_SUFFIX);
     }
     CompletionItem {
         label: Arc::from(insertion.as_str()),

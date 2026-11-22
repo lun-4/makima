@@ -23,6 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 use tracing::warn;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
 
 use crate::id::MakimaId;
 
@@ -286,12 +288,35 @@ impl Drop for ClaimedSessionLock {
     }
 }
 
+// Windows can report lock contention as a raw lock or sharing violation.
+fn is_contended(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.kind() == io::ErrorKind::WouldBlock
+            || matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_LOCK_VIOLATION as i32 || code == ERROR_SHARING_VIOLATION as i32
+            )
+    }
+    #[cfg(not(windows))]
+    {
+        error.kind() == io::ErrorKind::WouldBlock
+    }
+}
+
 fn open_existing_locked(path: &Path) -> io::Result<Option<File>> {
     let file = open_lock_file(path)?;
     let Some(file) = file else {
         return Ok(None);
     };
-    file.try_lock_exclusive()?;
+    if let Err(error) = file.try_lock_exclusive() {
+        return Err(if is_contended(&error) {
+            io::Error::new(io::ErrorKind::WouldBlock, error)
+        } else {
+            error
+        });
+    }
     Ok(Some(file))
 }
 
@@ -406,7 +431,7 @@ pub fn claim(dir: &Path, id: &MakimaId) -> io::Result<Option<ClaimedSessionLock>
         .truncate(false)
         .open(&path)?;
     if let Err(error) = file.try_lock_exclusive() {
-        if error.kind() == io::ErrorKind::WouldBlock {
+        if is_contended(&error) {
             return Ok(None);
         }
         return Err(error);
@@ -535,7 +560,8 @@ mod tests {
     fn legacy_claim(path: &Path, pid: u32) -> io::Result<LockBeat> {
         let mut file = File::options().read(true).write(true).open(path)?;
         file.try_lock_exclusive()?;
-        let holder = legacy_holder_pid(path);
+        // A second handle cannot read the region this one locked on Windows.
+        let holder = read_pid(&mut file)?;
         let foreign = holder.is_some_and(|holder| holder != pid);
         if foreign
             && fs::metadata(path)
@@ -714,6 +740,7 @@ mod tests {
         let blocker = File::options().read(true).write(true).open(path).unwrap();
         blocker.lock_exclusive().unwrap();
 
+        assert!(claim(dir.path(), &id).unwrap().is_none());
         assert_eq!(
             lease.heartbeat().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -829,7 +856,7 @@ mod tests {
         let lease = claim(dir.path(), &id).unwrap().unwrap();
         let publication = File::options().read(true).write(true).open(&path).unwrap();
         publication.lock_exclusive().unwrap();
-        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
         std::thread::spawn(move || released_tx.send(lease.release()).unwrap());
         assert!(
             released_rx

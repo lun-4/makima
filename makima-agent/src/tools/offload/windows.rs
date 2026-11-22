@@ -119,6 +119,7 @@ mod tests {
     use super::{
         RelativeOpen, create_in, open_read, open_relative, publish, total_bytes, walk_dir,
     };
+    use crate::test_util::test_symlink;
     use crate::tools::offload::{DiskBackend, OffloadError, OffloadStore};
     use std::ffi::OsStr;
     use std::io::Write;
@@ -139,7 +140,9 @@ mod tests {
         fs::write(external_leaf.join(SLOT), BODY).unwrap();
         let link = root.path().join(parent);
         fs::create_dir_all(link.parent().unwrap()).unwrap();
-        symlink_dir(&external, &link).unwrap();
+        if !test_symlink(|target, path| symlink_dir(target, path), &external, &link) {
+            return;
+        }
         let store = OffloadStore::for_session(root.path(), &session);
         assert!(matches!(store.put("new output"), Err(OffloadError::Io(_))));
         assert!(store.close_and_remove().is_err());
@@ -162,7 +165,13 @@ mod tests {
         fs::rename(&backend.dir, &moved).unwrap();
         let external = root.path().join("outside");
         fs::create_dir(&external).unwrap();
-        symlink_dir(&external, &backend.dir).unwrap();
+        if !test_symlink(
+            |target, path| symlink_dir(target, path),
+            &external,
+            &backend.dir,
+        ) {
+            return;
+        }
         let remaining = if parent == "sessions" {
             "offload/session"
         } else {
@@ -217,7 +226,14 @@ mod tests {
         );
         fs::create_dir(backend.dir.join("nested")).unwrap();
         fs::write(backend.dir.join("nested").join(SLOT), BODY).unwrap();
-        symlink_dir(&external, backend.dir.join("nested/link")).unwrap();
+        assert_eq!(total_bytes(&dir).unwrap(), BODY.len() as u64);
+        if !test_symlink(
+            |target, path| symlink_dir(target, path),
+            &external,
+            &backend.dir.join("nested/link"),
+        ) {
+            return;
+        }
         assert_eq!(total_bytes(&dir).unwrap(), BODY.len() as u64);
         drop(dir);
         remove_offload_dir_from(backend.root.as_ref().unwrap(), &backend.relative).unwrap();

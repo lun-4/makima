@@ -11,6 +11,39 @@ local M = {}
 
 local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
+local WINDOWS_COMMAND_HEADS = {
+  cmd = { dir = true, echo = true, type = true, ver = true },
+  powershell = {
+    ["get-childitem"] = "Microsoft.PowerShell.Management\\Get-ChildItem",
+    ["get-content"] = "Microsoft.PowerShell.Management\\Get-Content",
+    ["get-location"] = "Microsoft.PowerShell.Management\\Get-Location",
+    ["write-output"] = "Microsoft.PowerShell.Utility\\Write-Output",
+    echo = "Microsoft.PowerShell.Utility\\Write-Output",
+  },
+}
+
+local function simple_windows_command(shell, command)
+  local heads = WINDOWS_COMMAND_HEADS[shell]
+  local head, rest = command:match("^([A-Za-z][A-Za-z0-9-]*)(.*)$")
+  local resolved = heads and head and heads[head:lower()]
+  if
+    resolved
+    and (rest == "" or (rest:match("^ [A-Za-z0-9_./\\: -]+$") and not rest:find("  ", 1, true) and rest:sub(-1) ~= " "))
+  then
+    return resolved, rest
+  end
+  return nil, nil
+end
+
+function M.is_simple_windows_command(shell, command)
+  local resolved = simple_windows_command(shell, command)
+  return resolved ~= nil
+end
+
+function M.qualify_powershell_command(command)
+  local resolved, rest = simple_windows_command("powershell", command)
+  return resolved and resolved .. rest or command
+end
 
 -- Strict tri-state decoder: anything that is not `{approved: boolean}` (with an
 -- optional string `reason`) is "error" (never silently approve or deny).

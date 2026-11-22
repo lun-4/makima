@@ -868,6 +868,9 @@ mod tests {
         ));
     }
 
+    /// Windows rejects a control character while opening the path, before any
+    /// check of ours runs, so only Unix can reach this one.
+    #[cfg(unix)]
     #[test]
     fn control_character_paths_are_refused() {
         let dir = tempfile::tempdir().unwrap();

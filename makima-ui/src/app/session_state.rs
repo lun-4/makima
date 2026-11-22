@@ -455,8 +455,9 @@ mod tests {
     }
 
     fn stored_config(model: &Model) -> StoredAgentConfig {
+        let cwd = std::env::temp_dir().join("durable-cwd");
         StoredAgentConfig {
-            cwd: "/durable-cwd".into(),
+            cwd: cwd.to_string_lossy().into_owned(),
             model: model.spec(),
             thinking: Some(StoredThinking::Off),
             fast: false,

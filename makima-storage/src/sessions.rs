@@ -6,14 +6,22 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+#[cfg(windows)]
+use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
+use tempfile::NamedTempFile;
 use tracing::warn;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FileBasicInfo,
+    SetFileInformationByHandle,
+};
 
 use crate::conversation::ConversationState;
 use crate::id::{AgentId, MakimaId};
@@ -32,7 +40,10 @@ pub use makima_domain::{
     Effort, MIN_THINKING_BUDGET, Post, PostLevel, StoredThinking, ThinkingParseError,
 };
 
-use crate::{StateDir, StorageError, atomic_write, now_epoch, session_lock, sync_directory};
+use crate::{
+    StateDir, StorageError, atomic_destination, atomic_write, now_epoch, session_lock,
+    sync_directory,
+};
 
 const LOG_FORMAT_VERSION: u32 = 3;
 const LEGACY_LOG_FORMAT_VERSION: u32 = 2;
@@ -592,8 +603,8 @@ fn initialize_empty_log<M: Serialize, U: Serialize, T: Serialize>(
     fs::create_dir_all(directory).map_err(StorageError::from)?;
     let mut bytes = Vec::new();
     write_full_session(&mut bytes, session)?;
-    atomic_write(&jsonl_path(directory, session.id), &bytes)?;
     update_cwd_index(directory, &session.cwd, session.id)?;
+    publish_once(&jsonl_path(directory, session.id), &bytes)?;
     sync_dir_and_ancestors(directory)?;
     Ok(())
 }
@@ -620,28 +631,25 @@ pub fn migrate_v2_before_append<M: Serialize, U: Serialize, T: Serialize>(
     let archive = directory.join(ARCHIVE_DIR).join(session.id.to_string());
     fs::create_dir_all(&archive).map_err(StorageError::from)?;
     let archive_path = archive.join("v2.jsonl");
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&archive_path)
-    {
-        Ok(mut archived) => archived
-            .write_all(&existing)
-            .and_then(|()| archived.sync_all())
-            .map_err(StorageError::from)?,
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            if fs::read(&archive_path).map_err(StorageError::from)? != existing {
-                return Err(SessionError::LogDiverged {
-                    reason: FILE_CHANGED_UNDERNEATH,
-                });
-            }
+    match fs::read(&archive_path) {
+        Ok(archived) if archived == existing => {}
+        Ok(_) => {
+            return Err(SessionError::LogDiverged {
+                reason: FILE_CHANGED_UNDERNEATH,
+            });
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            stage_log(&archive_path, &existing)?
+                .into_temp_path()
+                .persist_noclobber(&archive_path)
+                .map_err(|error| StorageError::from(error.error))?;
         }
         Err(error) => return Err(StorageError::from(error).into()),
     }
     sync_dir_and_ancestors(&archive)?;
     let mut bytes = Vec::new();
     write_full_session(&mut bytes, session)?;
-    atomic_write(&path, &bytes)?;
+    publish_once(&path, &bytes)?;
     sync_dir_and_ancestors(directory)?;
     Ok(())
 }
@@ -768,6 +776,60 @@ pub fn context_message_ids(events: &[serde_json::Value], agent: AgentId) -> Vec<
     context_entries(events, agent)
         .map(|entries| entries.iter().map(ContextEntry::id).collect())
         .unwrap_or_default()
+}
+
+fn stage_log(path: &Path, bytes: &[u8]) -> Result<NamedTempFile, StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(temporary.path(), metadata.permissions())?;
+    }
+    #[cfg(windows)]
+    clear_temporary_attribute(temporary.as_file())?;
+    temporary.as_file().sync_all()?;
+    Ok(temporary)
+}
+
+// Close the temporary handle before rename. The writer retries outside the lease lock.
+fn publish_once(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let path = atomic_destination(path)?;
+    let mut temporary = stage_log(&path, bytes)?.into_temp_path();
+    fs::rename(&temporary, &path)?;
+    temporary.disable_cleanup(true);
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn clear_temporary_attribute(file: &File) -> io::Result<()> {
+    let attributes = file.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_TEMPORARY == 0 {
+        return Ok(());
+    }
+    let remaining = attributes & !FILE_ATTRIBUTE_TEMPORARY;
+    let info = FILE_BASIC_INFO {
+        FileAttributes: if remaining == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            remaining
+        },
+        ..Default::default()
+    };
+    let success = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn meta_record<M, U, T>(session: &Session<M, U, T>) -> Result<Vec<u8>, SessionError>
@@ -1476,7 +1538,7 @@ fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakimaId) -> Result<(), S
     }
     index.retain(|key, value| key == cwd || *value != id_str);
     index.insert(cwd.to_string(), id_str);
-    atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
+    publish_once(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
 }
 
 pub fn offload_dir(sessions_dir: &Path, id: MakimaId) -> PathBuf {
@@ -3208,12 +3270,16 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink as symlink_dir;
     #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt, symlink_dir};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use tempfile::TempDir;
     use test_case::test_case;
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TEMPORARY, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     type TestSession = Session<Value, Value, Value>;
 
@@ -4423,6 +4489,55 @@ mod tests {
                 .all(|child| child.name == POST_AGENT)
         );
         assert_eq!(loaded.subagents(), session.subagents());
+    }
+
+    #[cfg(windows)]
+    #[test_case(false; "unblocked")]
+    #[test_case(true; "sharing_violation")]
+    fn v2_migration_publishes_durable_files(blocked: bool) {
+        let dir = TempDir::new().unwrap();
+        let dir = dir.path();
+        let mut session = TestSession::new("model", "/project");
+        session.save_to(dir).unwrap();
+        let path = jsonl_path(dir, session.id);
+        let original = fs::read(&path).unwrap();
+        let mut records: Vec<Value> = original
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        records[0]["v"] = Value::from(super::LEGACY_LOG_FORMAT_VERSION);
+        let legacy = encode_records(&records).unwrap();
+        fs::write(&path, &legacy).unwrap();
+        let lease = session_lock::claim(dir, &session.id).unwrap().unwrap();
+        let guard = lease.publication_guard();
+        let entry_count = fs::read_dir(dir).unwrap().count();
+        let archive = archive_dir_for(dir, session.id).join("v2.jsonl");
+        let migrate = || guard.publish(|| super::initialize_session_log(dir, &session));
+        if blocked {
+            let _blocker = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&path)
+                .unwrap();
+            assert!(matches!(
+                migrate().unwrap().unwrap(),
+                Err(SessionError::Storage(StorageError::Io(_)))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), legacy);
+            assert_eq!(fs::read_dir(dir).unwrap().count(), entry_count + 1);
+            assert_eq!(fs::read(&archive).unwrap(), legacy);
+        }
+
+        migrate().unwrap().unwrap().unwrap();
+        assert_eq!(fs::read_dir(dir).unwrap().count(), entry_count + 1);
+        assert_eq!(fs::read_dir(archive.parent().unwrap()).unwrap().count(), 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&archive).unwrap(), legacy);
+        for path in [&path, &archive] {
+            let attributes = fs::metadata(path).unwrap().file_attributes();
+            assert_eq!(attributes & FILE_ATTRIBUTE_TEMPORARY, 0);
+        }
     }
 
     #[test]

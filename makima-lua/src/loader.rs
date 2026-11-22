@@ -12,7 +12,7 @@ use makima_agent::session_coordinator::SessionOptionCatalog;
 use makima_agent::tools::{ToolRegistry, ToolSource};
 use makima_agent::{AgentManagerHandle, AgentRef, CancelToken};
 use makima_commands::{CommandBehavior, CommandRegistry};
-use makima_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use makima_config::{Config, GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
 
@@ -493,6 +493,14 @@ impl PluginHost {
             warnings.push(warning);
         }
         Ok(())
+    }
+
+    pub fn load_configured_builtins(&mut self, config: &Config) -> Result<(), PluginError> {
+        self.inner
+            .tx
+            .send(Request::SetShell(config.agent.shell.into()))
+            .map_err(|_| PluginError::HostDead)?;
+        self.load_builtins(&config.plugins)
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {

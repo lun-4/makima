@@ -66,6 +66,7 @@ pub use state::{
     StateRevision, StateScope, StateSlot, StateSlotSpec, StateSnapshot,
 };
 pub mod rewind;
+pub mod shell;
 mod subagents;
 pub mod template;
 #[cfg(any(test, feature = "test-util"))]

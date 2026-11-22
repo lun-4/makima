@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn print_root_starts_on_its_discovered_provider() {
         let state = tempfile::tempdir().unwrap();
-        makima_storage::paths::init_at(state.path().to_path_buf()).unwrap();
+        makima_storage::paths::init_shared_for_test();
         let models = Arc::<std::sync::Mutex<Vec<ModelInfo>>>::default();
         let providers =
             makima_lua::test_support::offline_registry(DISCOVERY_PROVIDER, Arc::clone(&models));
@@ -1674,7 +1674,10 @@ mod tests {
                     end,
                 }})
             "#,
-                cwd = std::env::temp_dir().display()
+                cwd = std::env::temp_dir()
+                    .display()
+                    .to_string()
+                    .replace('\\', "\\\\")
             ),
         )
         .unwrap();

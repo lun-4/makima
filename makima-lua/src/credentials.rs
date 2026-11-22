@@ -61,6 +61,7 @@ fn location(lua: &Lua, this: &Store) -> Result<(StateDir, Arc<str>), String> {
 #[lua_fn]
 async fn read(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<LuaValue>> {
     let (dir, name) = try_pair!(location(&lua, &this));
+    drop(this);
     match unblock(move || load_credentials(&dir, &name)).await {
         Some(value) => Ok((Some(lua.to_value_with(&value, serialize_options())?), None)),
         None => Ok((None, None)),
@@ -78,6 +79,7 @@ async fn read(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<LuaValue>> {
 async fn write(lua: Lua, this: UserDataRef<Store>, value: LuaValue) -> LuaResult<Pair<bool>> {
     let value: Value = lua.from_value(value)?;
     let (dir, name) = try_pair!(location(&lua, &this));
+    drop(this);
     Ok(pair(
         unblock(move || save_credentials(&dir, &name, &value).map(|()| true)).await,
     ))
@@ -91,6 +93,7 @@ async fn write(lua: Lua, this: UserDataRef<Store>, value: LuaValue) -> LuaResult
 #[lua_fn]
 async fn delete(lua: Lua, this: UserDataRef<Store>) -> LuaResult<Pair<bool>> {
     let (dir, name) = try_pair!(location(&lua, &this));
+    drop(this);
     Ok(pair(unblock(move || delete_credentials(&dir, &name)).await))
 }
 

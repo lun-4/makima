@@ -179,21 +179,27 @@ impl Future for HeaderFuture {
 #[derive(Clone)]
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
+    pub deny_scopes: Vec<String>,
     pub force_prompt: bool,
+    pub ignore_command_head_case: bool,
 }
 
 impl PermissionScopes {
     pub fn single(scope: String) -> Self {
         Self {
             scopes: vec![scope],
+            deny_scopes: Vec::new(),
             force_prompt: false,
+            ignore_command_head_case: false,
         }
     }
 
     pub fn force_prompt(scope: String) -> Self {
         Self {
             scopes: vec![scope],
+            deny_scopes: Vec::new(),
             force_prompt: true,
+            ignore_command_head_case: false,
         }
     }
 }

@@ -48,7 +48,7 @@ pub fn run(
     }
 
     plugin_host
-        .load_builtins(&config.plugins)
+        .load_configured_builtins(&config)
         .context("load builtin plugins")?;
 
     let timeouts = makima_providers::Timeouts::from(&config.provider);

@@ -494,13 +494,13 @@ fn prepare_restore_for_agent_with(
 #[cfg(test)]
 mod tests {
     use super::{content_sha256, plan_entries, restore_plan_file};
-    #[cfg(windows)]
-    use crate::journal::SessionJournalSnapshot;
     use crate::{
         ToolOutput,
         journal::{JournalCommit, SessionJournal},
         state::StateError,
     };
+    #[cfg(windows)]
+    use crate::{journal::SessionJournalSnapshot, test_util::test_symlink};
     use makima_domain::{ModelSelection, ThinkingConfig};
     use makima_providers::{Message, TokenUsage};
     use makima_storage::session_state::StoredAgentConfig;
@@ -675,11 +675,18 @@ mod tests {
         fs::write(&sentinel, MUTATED_CONTENT).unwrap();
         let destination = base.join("plans");
         let path = destination.join("plan.md");
-        if parent {
-            symlink_dir(&outside, &destination).unwrap();
+        let linked = if parent {
+            test_symlink(
+                |target, path| symlink_dir(target, path),
+                &outside,
+                &destination,
+            )
         } else {
             fs::create_dir(&destination).unwrap();
-            symlink_file(&sentinel, &path).unwrap();
+            test_symlink(|target, path| symlink_file(target, path), &sentinel, &path)
+        };
+        if !linked {
+            return;
         }
         let (snapshot, agent) = approved_plan_snapshot(&path);
         let view = snapshot.fold().unwrap();

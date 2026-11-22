@@ -28,6 +28,7 @@ use makima_providers::{
     provider::{BoxFuture, Provider},
 };
 use makima_storage::id::{MakimaId, SessionRef};
+use makima_storage::paths::canonicalize_clean;
 use serde_json::{Value, json};
 
 mod common;
@@ -55,6 +56,9 @@ const TASK_DESPAWN: &str = "task_despawn";
 const ECHO_TOOL: &str = "alignment_echo";
 const ECHO_REPLY: &str = "alignment tool complete";
 const CONTEXT_TOOL: &str = "alignment_context";
+/// Written by the tool's own process, so the test checks which directory that
+/// process ran in rather than how a shell spells it.
+const MARKER: &str = "alignment_cwd_marker";
 const CHILD_CONTEXT: &str = "alignment inherited cwd";
 const AUTHORITY_TOOL: &str = "alignment_authority";
 const TRUSTED_MESSAGE: &str = "alignment trusted sender";
@@ -112,22 +116,20 @@ makima.api.register_tool({
 })
 makima.api.register_tool({
     name = "alignment_context", description = "read admitted cwd and inherit it",
-    schema = { type = "object", properties = { spawn_child = { type = "boolean" } } },
+    schema = { type = "object", properties = { spawn_child = { type = "boolean" }, marker = { type = "string" } } },
     audiences = { "main", "general_sub" },
     handler = function(input, ctx)
         local cwd = assert(ctx:resolve_path("."))
-        local job = makima.fn.jobstart({ "sh", "-c", "pwd; printf '%s\\n' \"$PWD\"" }, { cwd = cwd })
+        local job = makima.fn.jobstart({ "sh", "-c", "printf x > " .. input.marker }, { cwd = cwd })
         local process = assert(makima.fn.jobwait(job))
         assert(process.exit_code == 0)
-        local output = {}
-        for line in process.stdout:gmatch("[^\n]+") do output[#output + 1] = line end
         local child_reply
         if input.spawn_child then
             local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
             child_reply = assert(assert(child:send(ctx, "alignment inherited cwd", { when = "idle" })):wait(ctx)).text
             assert(child:close(ctx))
         end
-        return makima.json.encode({ cwd = cwd, output = output, child = child_reply })
+        return makima.json.encode({ cwd = cwd, child = child_reply })
     end,
 })
 makima.api.register_tool({
@@ -562,8 +564,8 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
     smol::block_on(async {
         let old_dir = tempfile::tempdir().unwrap();
         let new_dir = tempfile::tempdir().unwrap();
-        let old = old_dir.path().canonicalize().unwrap();
-        let new = new_dir.path().canonicalize().unwrap();
+        let old = canonicalize_clean(old_dir.path());
+        let new = canonicalize_clean(new_dir.path());
         let fixture = Fixture::with_context(None, Some(old.as_path()));
         let task = fixture.spawn(INITIAL);
         let first = fixture.request().await;
@@ -601,7 +603,7 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
             );
             request.respond(common::canned_tool_use(
                 CONTEXT_TOOL,
-                json!({ "spawn_child": spawn_child }),
+                json!({ "spawn_child": spawn_child, "marker": MARKER }),
             ));
             if spawn_child {
                 let child = fixture.request().await;
@@ -621,7 +623,11 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
             let followup = fixture.request_for(prompt).await;
             let context = followup.last_tool_result();
             assert_eq!(PathBuf::from(context["cwd"].as_str().unwrap()), cwd);
-            assert_eq!(context["output"], json!([cwd, cwd]));
+            assert!(
+                cwd.join(MARKER).is_file(),
+                "the tool's process must run in {cwd:?}"
+            );
+            std::fs::remove_file(cwd.join(MARKER)).unwrap();
             if spawn_child {
                 assert_eq!(context["child"], REPLY);
             }
