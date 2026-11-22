@@ -1005,6 +1005,7 @@ async fn permission_prompt(
         )));
     }
     let scopes: Vec<String> = opts.get("scopes")?;
+    let deny_scopes: Vec<String> = opts.get::<Option<_>>("deny_scopes")?.unwrap_or_default();
     let force_prompt: bool = opts.get::<Option<bool>>("force_prompt")?.unwrap_or(false);
     // Clone the ToolContext and drop the ctx borrow before awaiting: the
     // prompt wait must not hold the LuaCtx userdata's shared lock, or a
@@ -1016,6 +1017,7 @@ async fn permission_prompt(
     let tool_key = ToolKey::native(&tool);
     let perm_scopes = PermissionScopes {
         scopes,
+        deny_scopes,
         force_prompt,
         ignore_command_head_case: crate::api::env::uses_native_windows_shell(&lua, &tool),
     };

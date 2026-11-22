@@ -4616,7 +4616,7 @@ fn configured_shell_is_used_when_builtins_load(
     let allow_simple = format!("{allow_head} *");
     let deny_simple = format!("{allow_head} {SHELL_PROBE_OUTPUT}");
     let other_arg_case = format!("{allow_head} {}", SHELL_PROBE_OUTPUT.to_ascii_lowercase());
-    for (command, allow, deny, force_prompt, yolo, runs) in [
+    let mut cases = vec![
         (simple, None, None, false, false, false),
         (
             simple,
@@ -4645,7 +4645,27 @@ fn configured_shell_is_used_when_builtins_load(
         (simple, None, Some(deny_simple.as_str()), false, true, false),
         (complex, Some(complex), None, true, false, false),
         (complex, None, None, true, true, true),
-    ] {
+    ];
+    const ALIAS: &str = "echo Ready";
+    const BARE_TARGET: &str = "WRITE-OUTPUT *";
+    const QUALIFIED_TARGET: &str = r"Microsoft.PowerShell.Utility\Write-Output Ready";
+    if shell == "powershell" {
+        cases.extend([
+            (ALIAS, Some(ALIAS), None, false, false, true),
+            (ALIAS, Some(ALIAS), Some(BARE_TARGET), false, false, false),
+            (
+                ALIAS,
+                Some(ALIAS),
+                Some(QUALIFIED_TARGET),
+                false,
+                false,
+                false,
+            ),
+            (ALIAS, None, Some(QUALIFIED_TARGET), false, true, false),
+            (ALIAS, Some(QUALIFIED_TARGET), None, false, false, false),
+        ]);
+    }
+    for (command, allow, deny, force_prompt, yolo, runs) in cases {
         let input = json!({ "command": command });
         let inv = entry.tool.parse(&input).expect("parse failed");
         let scopes = smol::block_on(inv.permission_scopes(None)).expect("permission scopes");
@@ -4689,6 +4709,38 @@ fn configured_shell_is_used_when_builtins_load(
             assert!(output.contains(PERMISSION_DENIED_PREFIX), "{output}");
             assert!(output.contains(command), "{output}");
         }
+    }
+
+    if shell == "powershell" {
+        let session = test_session(&host);
+        smol::block_on(session.set_option("bash.auto_mode", "enabled")).unwrap();
+        ctx.session_id = Some(SessionRef::from(session.read().session_id()));
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some(QUALIFIED_TARGET.to_owned()),
+                    effect: Effect::Deny,
+                }],
+                yolo: true,
+                ..Default::default()
+            },
+            ctx.cwd.clone(),
+            ProjectConfig::for_project(&ctx.cwd),
+            Arc::default(),
+        ));
+        let done = smol::block_on(tool_dispatch::run(
+            SHELL_PROBE_ID.to_owned(),
+            "bash",
+            &json!({ "command": ALIAS }),
+            &ctx,
+            CallOrigin::Model,
+        ));
+        let output = done.output.as_text();
+        assert!(done.is_error, "{output}");
+        assert!(output.contains(PERMISSION_DENIED_PREFIX), "{output}");
+        assert!(output.contains(ALIAS), "{output}");
+        smol::block_on(session.close()).unwrap();
     }
 }
 

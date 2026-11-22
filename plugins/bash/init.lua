@@ -372,7 +372,12 @@ local function command_scopes(command)
   end
 
   if not IS_BASH then
-    return { scopes = { command }, force_prompt = not bh.is_simple_windows_command(SHELL, command) }
+    local scopes = { scopes = { command }, force_prompt = not bh.is_simple_windows_command(SHELL, command) }
+    if SHELL == "powershell" and not scopes.force_prompt then
+      local target = bh.qualify_powershell_command(command)
+      scopes.deny_scopes = { target, target:match("^[^\\]+\\(.+)$") }
+    end
+    return scopes
   end
 
   local parser = makima.treesitter.get_parser(command, "bash")
@@ -412,6 +417,13 @@ makima.api.register_tool({
   },
   permission_scopes = function(input, ctx)
     if ctx and ctx.session_id and auto_mode_enabled(ctx.options) then
+      if SHELL == "powershell" then
+        local scopes = command_scopes(input.command)
+        if scopes and scopes.deny_scopes then
+          table.insert(scopes.deny_scopes, 1, input.command)
+          return { scopes = {}, deny_scopes = scopes.deny_scopes }
+        end
+      end
       return nil
     end
     return command_scopes(input.command)
@@ -504,6 +516,7 @@ makima.api.register_tool({
         local ok, perr = makima.agent.permission_prompt(ctx, {
           tool = "bash",
           scopes = scopes.scopes,
+          deny_scopes = scopes.deny_scopes,
           force_prompt = scopes.force_prompt,
         })
         if ok then

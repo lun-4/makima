@@ -362,6 +362,7 @@ impl PermissionManager {
         &self,
         tool: &ToolKey,
         scopes: &[&str],
+        deny_scopes: &[String],
         force_prompt: bool,
         ignore_command_head_case: bool,
         plan_path: Option<&Path>,
@@ -373,6 +374,25 @@ impl PermissionManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
+        let rules = || {
+            session
+                .iter()
+                .chain(&self.config_rules)
+                .chain(builtin.iter())
+                .chain(&plugin)
+        };
+        for scope in deny_scopes {
+            let folded_scope = ignore_command_head_case.then(|| fold_command_head(scope));
+            if rules().any(|rule| {
+                rule.effect == Effect::Deny
+                    && rule_matches_tool(&rule.tool, tool)
+                    && rule_matches_scope(rule, scope, folded_scope.as_deref())
+            }) {
+                info!(tool = %tool, %scope, "permission denied");
+                return PermissionCheck::Denied;
+            }
+        }
+
         let mut unclaimed_scopes: Vec<&str> = if force_prompt {
             Vec::new()
         } else {
@@ -382,12 +402,7 @@ impl PermissionManager {
         for scope in scopes {
             let folded_scope = ignore_command_head_case.then(|| fold_command_head(scope));
             let mut has_allow = false;
-            for r in session
-                .iter()
-                .chain(&self.config_rules)
-                .chain(builtin.iter())
-                .chain(&plugin)
-            {
+            for r in rules() {
                 if !rule_matches_tool(&r.tool, tool)
                     || !rule_matches_scope(r, scope, folded_scope.as_deref())
                 {
@@ -474,7 +489,7 @@ impl PermissionManager {
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, false, plan_path)
+        self.check_inner(tool, &[scope], &[], false, false, plan_path)
     }
 
     pub fn check_multi(
@@ -484,7 +499,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, false, plan_path)
+        self.check_inner(tool, scopes, &[], force_prompt, false, plan_path)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -657,7 +672,13 @@ impl PermissionManager {
     ) -> Result<(), PermissionError> {
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
-        let scope_display = || scopes.scopes.join("; ");
+        let scope_display = || {
+            if scopes.scopes.is_empty() {
+                scopes.deny_scopes.first().cloned().unwrap_or_default()
+            } else {
+                scopes.scopes.join("; ")
+            }
+        };
         let deny = |guidance: Option<String>| match guidance {
             Some(g) => PermissionError::with_guidance(&tool_string, &scope_display(), g),
             None => PermissionError::new(&tool_string, &scope_display()),
@@ -666,6 +687,7 @@ impl PermissionManager {
         let (pt, ps, force_prompt) = match self.check_inner(
             tool,
             &scope_refs,
+            &scopes.deny_scopes,
             scopes.force_prompt,
             scopes.ignore_command_head_case,
             plan_path,
@@ -689,6 +711,7 @@ impl PermissionManager {
         let (t2, s2) = match self.check_inner(
             &pt,
             &refs,
+            &scopes.deny_scopes,
             force_prompt,
             scopes.ignore_command_head_case,
             plan_path,
@@ -1360,10 +1383,39 @@ mod tests {
         outcome(mgr.check_inner(
             &ToolKey::native(BASH_TOOL),
             &[command],
+            &[],
             force_prompt,
             ignore_command_head_case,
             None,
         ))
+    }
+
+    #[test_case(Effect::Deny, false => DENIED ; "target_deny_wins_over_raw_allow")]
+    #[test_case(Effect::Deny, true => DENIED ; "target_deny_wins_over_yolo")]
+    #[test_case(Effect::Allow, false => PROMPTS ; "target_allow_does_not_claim_raw_scope")]
+    fn supplemental_scopes_only_apply_deny_rules(effect: Effect, yolo: bool) -> &'static str {
+        const INPUT: &str = "echo Ready";
+        const TARGET: &str = "Microsoft.PowerShell.Utility\\Write-Output Ready";
+        let mut rule = deny_rule(TARGET);
+        rule.effect = effect;
+        let mut config = make_config(vec![rule]);
+        if effect == Effect::Deny {
+            config.rules.push(allow_rule(INPUT));
+        }
+        config.yolo = yolo;
+        let mgr = mgr_with(config, PathBuf::from(TEST_CWD));
+        let check = mgr.check_inner(
+            &ToolKey::native(BASH_TOOL),
+            &[INPUT],
+            &[TARGET.into()],
+            false,
+            true,
+            None,
+        );
+        if let PermissionCheck::NeedsPrompt { scopes, .. } = &check {
+            assert_eq!(scopes, &[INPUT]);
+        }
+        outcome(check)
     }
 
     #[test]

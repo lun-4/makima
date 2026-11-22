@@ -4105,12 +4105,20 @@ impl LuaRuntime {
         for (_, s) in scopes_table.pairs::<usize, String>().flatten() {
             scopes.push(s);
         }
-        if scopes.is_empty() {
+        let deny_scopes = match table.get::<Option<Vec<String>>>("deny_scopes") {
+            Ok(scopes) => scopes.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!(plugin, tool, %error, "invalid deny scopes");
+                return Some(PermissionScopes::force_prompt(input.to_string()));
+            }
+        };
+        if scopes.is_empty() && deny_scopes.is_empty() {
             return None;
         }
         let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
         Some(PermissionScopes {
             scopes,
+            deny_scopes,
             force_prompt,
             ignore_command_head_case: crate::api::env::uses_native_windows_shell(&self.lua, tool),
         })
