@@ -7,12 +7,12 @@ description: Design and build visually striking makima splash screens (the anima
 
 Makima's home screen is a pull-driven canvas of terminal cells. A splash is
 a single Lua file that, given `(w, h, t, fade)`, returns `h` rows of styled
-glyph segments covering exactly `w` cells each. This skill is about makimang
+glyph segments covering exactly `w` cells each. This skill is about making
 those frames beautiful, not just correct.
 
 ## What makes a splash look good
 
-These come from building 17 splashes and watching what worked:
+These come from building many splashes and watching what worked:
 
 - **One clear idea per splash.** A spinning pentagram, rain with ripples, a Doom
   fire. The moment a splash has two ideas it reads as noise. Pick one effect and
@@ -39,7 +39,8 @@ These come from building 17 splashes and watching what worked:
   faster than ~2 Hz it competes with the user's attention instead of
   decorating the screen.
 - **A bottom-center label and top-right version** give every splash the same
-  furniture, so the cycle feels like one gallery rather than 17 apps.
+  furniture, so the cycle feels like one gallery rather than a pile of
+  unrelated screens.
 
 ## The contract (short version)
 
@@ -58,14 +59,15 @@ end)
   `{ fg = "#rrggbb", bold = bool }`. `fg` is optional: an omitted foreground
   degrades to the host theme's foreground, and the cell background is always
   the host theme's background. Cache style tables and
-  reuse them by identity: the renderer coalesces runs of the *same table* into
-  one segment, so fresh tables per cell explode the segment count.
+  reuse them by identity: the template's row builder merges a run of cells
+  that share a style table into one segment, so fresh tables per cell explode
+  the segment count (and every segment costs a parse in Rust).
 - Rendering is pull-driven: be pure in `t`, never block, never sleep.
   `makima.ui.theme_color` and `makima.version()` are fine to call.
 - Stateful effects (cellular automata) keep per-size buffers, step by
   accumulated `dt` from `t`, and reset on
   `makima.api.create_autocmd("SplashShown", { callback = ... })`. See
-  `fire.lua`/`life.lua` in the live config for the pattern.
+  `plugins/splashes_default/splash/matrix.lua` for the pattern.
 - Every file also returns `M` with `M.render(w, h, t, fade)`, so a cycler in
   `init.lua` can call splashes directly. Keep the `set_slot` call too; the
   cycler's later `set_slot` wins.
@@ -90,16 +92,19 @@ end)
    needed; it runs under stock lua5.1 with a stubbed `makima`):
 
    ```bash
-   lua5.1 scripts/smoke_test.lua --dir ~/.config/makima/lua kaleidoscope voronoi
+   lua5.1 .agents/skills/aesthetic-splash-screens/scripts/smoke_test.lua \
+     --dir plugins/splashes_default/splash aurora matrix
    ```
 
    It asserts `rows == h`, exact per-row cell width (UTF-8 aware), no blank
    frames across sizes and time steps, and reports ms/frame.
-4. **Bench it before and after perf work**: `lua5.1 scripts/bench.lua --dir
-   <dir> <name>...` for a quick gut check (no build; same lua5.1 stub, it
-   reports ms/frame at 80x24 and 200x79 and estimates luau at lua5.1/5). For
-   real numbers on the exact runtime VM, run the same driver on Luau with
-   native codegen (same CLI, safeenv envs like runtime.rs `build_env`):
+4. **Bench it before and after perf work**: `lua5.1
+   .agents/skills/aesthetic-splash-screens/scripts/bench.lua --dir
+   plugins/splashes_default/splash aurora` gives a quick gut check (no build;
+   same lua5.1 stub, it reports ms/frame at 80x24 and 200x79 and estimates
+   Luau codegen at lua5.1/5). For real numbers on the exact runtime VM, run
+   the same driver on Luau with native codegen (same CLI, safeenv envs like
+   runtime.rs `build_env`):
 
    ```bash
    cargo run -p makima-lua --example splash_bench -- --dir <dir> <name>...
@@ -128,13 +133,14 @@ end)
 5. **Look at it as text** before running makima:
 
    ```bash
-   lua5.1 scripts/dump_frame.lua ~/.config/makima/lua/voronoi.lua 60 20 2.0
+   lua5.1 .agents/skills/aesthetic-splash-screens/scripts/dump_frame.lua \
+     plugins/splashes_default/splash/aurora.lua 60 20 2.0
    ```
 
    Glyph-only dumps catch structural problems (asymmetry, clipping, label
    collisions) that unit checks miss. Background-color effects (fire) look
    blank in text dumps; inspect `seg.style.fg` values instead.
-5. **Run makima and watch the cycle.** Color balance, quantization banding, and
+6. **Run makima and watch the cycle.** Color balance, quantization banding, and
    pacing are only judgeable live. Iterate on the one effect until it's
    unmistakable.
 
@@ -164,12 +170,10 @@ Checklist (using `mysplash` as the example):
      bundled renderers, checks the slot default, overrides, and error paths).
    `just ci` covers all of it on a full run.
 
-Build-env gotchas (homura VM): export `OPENSSL_NO_VENDOR=1` (system
-libssl-dev exists; the vendored build fails), and if `include_dir!` claims a
-file that exists does not, the 9p dentry cache is stale —
-`sync && echo 3 > /proc/sys/vm/drop_caches` and retry.
+Build-env gotcha: if the vendored OpenSSL build fails and the host has system
+`libssl-dev`, export `OPENSSL_NO_VENDOR=1`.
 
-## Makimang frame tests non-flaky
+## Making frame tests non-flaky
 
 Frame-asserting tests (the splash tests in `makima-lua/tests/plugin_host.rs`)
 assert things about frames, and stateful or RNG-driven splashes make naive
@@ -206,7 +210,7 @@ thresholds flaky. Rules learned the expensive way:
   frequency ratio, wavebanner phase) should move with slow sines of `t`,
   period >= ~8 s, so the viewer sees evolution, not flicker.
 - **Performance budget.** Established full-cell splashes run 2-3 ms/frame at
-  80x24 on stock lua5.1 (slower than makima's luau-jit by ~5x). Up to ~20 ms on
+  80x24 on stock lua5.1 (slower than makima's Luau codegen by ~5x). Up to ~20 ms on
   lua5.1 is acceptable. If a shader port is too slow, hoist terms that depend
   on only one axis into per-column or per-row precomputes (aurora went from
   33 ms to 9 ms this way), and memoize hashes.
@@ -215,8 +219,8 @@ thresholds flaky. Rules learned the expensive way:
 
 ## Porting shaders (WGSL / GLSL / shadertoy)
 
-Read `references/shader-porting.md` when porting from shader-gallery.html,
-shadertoy, or any fragment shader. It covers the coordinate mapping table,
+Read `references/shader-porting.md` when porting from shadertoy or any
+fragment shader. It covers the coordinate mapping table,
 hash/noise functions in float-safe Lua, uniforms without a host (`u_mouse`
 becomes a slow sine orbit), and the quantization + hoisting playbook.
 
@@ -226,14 +230,12 @@ For scenes with regions, horizons, or perspective floors, read
 `references/recipes.md` — it has the horizon split, perspective grid, and
 striped-sun math ready to adapt, plus palette guidance for lit scenes.
 
-Genres already shipped, for contrast — orbital geometry (pentagram,
-lissajous), weather (rain, comets), cellular (fire, life), full-field shader
-ports (plasma, metaballs), typography (wavebanner, printer), perspective
-(tunnel, warp), nature (flowers). Six of the best are promoted to the
-bundled splashes (`plugins/splashes_default/splash/`): kaleidoscope, voronoi,
-caustics, metaballs, aurora (shader ports) and matrix (falling-code rain).
-Treat the gallery sources as canonical worked examples — they are the
-current bar for what ships.
+Genres worth trying: orbital geometry (pentagram, lissajous), weather (rain,
+comets), cellular automata, full-field shader ports (plasma, metaballs),
+typography (wavebanner), perspective (tunnel, warp), nature (flowers). The
+six bundled splashes (`plugins/splashes_default/splash/`) are the canonical
+worked examples for what ships: kaleidoscope, voronoi, caustics, metaballs,
+aurora (shader ports) and matrix (stateful falling-code rain).
 
 Directions still open, roughly from safe to spicy:
 

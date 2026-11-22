@@ -300,6 +300,7 @@ makima.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `plugin_dev` | boolean | `true` | - | Offer the builtin makima-plugin-dev skill for writing makima plugins. |
+| `skill_creator` | boolean | `true` | - | Offer the builtin skill-creator skill for writing and testing skills. |
 
 ### `plugins.splashes`
 

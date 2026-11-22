@@ -12,7 +12,7 @@
 --   * each row's seg.glyphs concatenate to exactly w terminal cells
 --     (UTF-8 aware: multi-byte glyphs count once)
 --   * the frame is not entirely blank
--- Then prints ms/frame at 80x24 (lua5.1, no jit: makima's luau-jit is ~5x
+-- Then prints ms/frame at 80x24 (lua5.1, no jit: makima's Luau codegen is ~5x
 -- faster, so treat this as a pessimistic bound; 2-3 ms is the norm for
 -- full-cell splashes, up to ~20 ms is tolerable).
 
