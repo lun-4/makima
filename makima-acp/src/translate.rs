@@ -287,11 +287,23 @@ fn as_number(v: &serde_json::Value) -> Option<u32> {
 }
 
 fn location(path: PathBuf, line: Option<u32>) -> ToolCallLocation {
-    let mut loc = ToolCallLocation::new(path);
+    let mut loc = ToolCallLocation::new(prompt_path(&path));
     if let Some(l) = line {
         loc = loc.line(l);
     }
     loc
+}
+
+/// ACP locations reach a client that may be on another machine, so they carry
+/// `/` on every platform, as the paths prompt completion inserts do.
+fn prompt_path(path: &Path) -> PathBuf {
+    if std::path::MAIN_SEPARATOR == '/' {
+        return path.to_path_buf();
+    }
+    PathBuf::from(
+        path.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
 }
 
 /// A finished call's location comes from what it wrote. File tools already

@@ -3001,7 +3001,9 @@ mod tests {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
+                    deny_scopes: Vec::new(),
                     force_prompt: false,
+                    ignore_command_head_case: false,
                 }));
             }
         });

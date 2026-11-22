@@ -230,6 +230,17 @@ pub fn init_at(root: PathBuf) -> Result<(), PathsInitError> {
     )
 }
 
+/// A state root that lives as long as the test binary, for tests that need
+/// the process's paths initialized. One test binary runs many such tests in
+/// one process, so the first picks the root and the rest share it.
+#[cfg(feature = "test-util")]
+pub fn init_shared_for_test() -> &'static Path {
+    static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let root = ROOT.get_or_init(|| tempfile::tempdir().expect("test state dir"));
+    let _ = init_at(root.path().to_path_buf());
+    root.path()
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("storage paths were already initialized with a different strategy")]
 pub struct PathsInitError;

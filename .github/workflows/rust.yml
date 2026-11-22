@@ -159,7 +159,14 @@ jobs:
             Remove-Item -LiteralPath $root -Recurse -Force
           }
       - run: cargo test -p makima-agent --lib tools::offload
+      - run: cargo test -p makima-agent --lib shell::tests
       - run: cargo test -p makima-storage --lib sessions::tests::delete
+      - run: cargo test -p makima-storage --lib staged_checkpoint_publishes_over_an_open_log_cursor
+      - run: cargo test -p makima-lua --lib shell_reflects_platform_and_config
+      - run: cargo test -p makima-lua --test plugin_host configured_shell_is_used_when_builtins_load
+      - run: cargo test -p makima-ui --lib staged_checkpoint_handles_cursor_and_temp_on_failure
+      - run: cargo test -p makima-ui --lib project_file_queries_match_on_open_and_update
+      - run: cargo test -p makima-ui --lib picker_matches_path_without_rewriting_search
       - run: just lint
       - run: just build
 

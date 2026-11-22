@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use makima_agent::shell::ResolvedShell;
+use makima_config::Shell;
 use makima_lua_macro::{lua_fn, lua_table};
 use makima_storage::StateDir;
 use mlua::Lua;
@@ -84,6 +86,37 @@ fn no_project(lua: &Lua) -> mlua::Result<bool> {
     Ok(lua.app_data_ref::<NoProject>().is_some())
 }
 
+/// Which shell `makima.fn.jobstart` and the `bash` tool run on Windows:
+/// `"bash"`, `"cmd"` or `"powershell"`. Always `"bash"` elsewhere.
+///
+/// A plugin that builds command text should match this: quoting, syntax
+/// highlighting and command parsing all follow the shell that will run it.
+///
+/// @return (string) The shell name.
+/// @example
+/// if makima.env.shell() ~= "bash" then
+///   return { llm_output = "this tool needs bash", is_error = true }
+/// end
+#[lua_fn(guard = Env)]
+fn shell(lua: &Lua) -> mlua::Result<&'static str> {
+    Ok(resolved_shell(lua).name())
+}
+
+pub(crate) fn uses_native_windows_shell(lua: &Lua, tool: &str) -> bool {
+    tool == "bash" && matches!(resolved_shell(lua).name(), "cmd" | "powershell")
+}
+
+pub(crate) fn resolved_shell(lua: &Lua) -> ResolvedShell {
+    lua.app_data_ref::<ResolvedShell>()
+        .map(|shell| shell.clone())
+        .unwrap_or_else(|| {
+            lua.app_data_ref::<Shell>()
+                .map(|shell| *shell)
+                .unwrap_or_default()
+                .into()
+        })
+}
+
 lua_table! {
     /// Paths to makima's own directories (config, state, logs, cache), and whether
     /// the project's `.makima` directory is off limits.
@@ -95,6 +128,23 @@ lua_table! {
     /// ```
     "makima.env" => pub(crate) fn create_env_table(perms: &PluginPermissions), DOCS [
         state_dir(perms), config_dir(perms), logs_dir(perms), cache_dir(perms),
-        no_project(perms),
+        no_project(perms), shell(perms),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell;
+    use makima_config::Shell;
+    use mlua::Lua;
+    use test_case::test_case;
+
+    #[test_case(Shell::Cmd, "cmd"; "cmd")]
+    #[test_case(Shell::Powershell, "powershell"; "powershell")]
+    fn shell_reflects_platform_and_config(configured: Shell, windows_shell: &str) {
+        let lua = Lua::new();
+        lua.set_app_data(configured);
+        let expected = if cfg!(windows) { windows_shell } else { "bash" };
+        assert_eq!(shell(&lua).unwrap(), expected);
+    }
 }

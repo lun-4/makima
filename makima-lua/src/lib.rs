@@ -381,6 +381,16 @@ pub mod test_support {
     /// Never created on the real disk; hosts run on the in-memory backend.
     pub const TEST_STATE_DIR: &str = "/makima-test-state";
 
+    /// A path under [`TEST_STATE_DIR`] as the fs API resolves it: the backend
+    /// makes a rooted path without a drive absolute against the cwd, so the
+    /// two must be spelled the same way for a seed to land where a tool looks.
+    pub fn test_state_path(rel: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .expect("test process has a current directory")
+            .join(TEST_STATE_DIR)
+            .join(rel)
+    }
+
     pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
 
     /// Boots a real `PluginHost` (background Lua thread) pre-loading the given

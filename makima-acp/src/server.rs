@@ -4039,10 +4039,8 @@ mod tests {
 
     const GHOST_MODE: &str = "ghost";
 
-    fn configure_test_provider() -> TempDir {
-        let root = TempDir::new().unwrap();
-        makima_storage::paths::init_at(root.path().to_path_buf()).unwrap();
-        root
+    fn configure_test_paths() {
+        makima_storage::paths::init_shared_for_test();
     }
 
     fn test_providers(models: Arc<Mutex<Vec<ModelInfo>>>) -> Arc<ProviderRegistry> {
@@ -4055,7 +4053,7 @@ mod tests {
 
     #[test]
     fn closing_a_session_releases_its_orchestration() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let host =
@@ -4098,7 +4096,7 @@ mod tests {
     /// session is closed, so the client keeps the session it had.
     #[test]
     fn broken_permissions_keep_the_live_session() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let (mut srv, _, _, turns) = server_awaiting_answer();
             let live = srv.session.as_ref().unwrap().handle.session_id.to_string();
@@ -4126,7 +4124,7 @@ mod tests {
     #[test_case("plan", false ; "plan_lands_in_the_state_dir")]
     #[test_case(GHOST_MODE, true ; "unknown_mode_is_invalid_params")]
     fn set_mode_commits_through_the_shared_setter(mode: &str, invalid: bool) {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         smol::block_on(async {
             let cwd = TempDir::new().unwrap();
             let params = test_params(test_model(SPAWN_TEST_SPEC), cwd.path().to_path_buf());
@@ -4180,7 +4178,7 @@ mod tests {
 
     #[test]
     fn acp_rejects_stale_session_ids_for_prompt_set_option_mode_and_cancel() {
-        let _providers = configure_test_provider();
+        configure_test_paths();
         let (mut srv, answer_rx, _, turns) = server_awaiting_answer();
         let stale = MakimaId::generate().to_string();
         let prompt_error = smol::block_on(handle_prompt(
@@ -6001,7 +5999,7 @@ mod tests {
     #[test]
     fn spawned_primary_turn_end_turn_releases_pending_operation() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let session_id = srv.session.as_ref().unwrap().handle.session_id.clone();
             let model = test_model(SPAWN_TEST_SPEC);
@@ -6378,7 +6376,7 @@ mod tests {
     #[test]
     fn prompt_immediately_after_new_session_is_queued() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -6461,7 +6459,7 @@ mod tests {
     #[test]
     fn discovery_reaches_the_root_its_catalog_and_the_client() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
@@ -6550,7 +6548,7 @@ mod tests {
     #[test]
     fn completed_then_cancelled_session_can_be_replaced_and_prompted() {
         smol::block_on(async {
-            let _providers = configure_test_provider();
+            configure_test_paths();
             let temp = TempDir::new().unwrap();
             let cwd = temp.path().to_path_buf();
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
@@ -7169,7 +7167,7 @@ mod tests {
     fn load_restores_saved_mode_and_thinking_over_config() {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
-            makima_storage::paths::init_at(tmp.path().to_path_buf()).unwrap();
+            makima_storage::paths::init_shared_for_test();
             let plan = tmp.path().join(SAVED_PLAN_FILE);
             std::fs::write(&plan, "").unwrap();
             let providers = test_providers(Arc::new(Mutex::new(vec![ModelInfo {

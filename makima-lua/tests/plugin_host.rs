@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use makima_agent::agent::tool_dispatch;
+use makima_agent::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
 use makima_agent::template::Vars;
 use makima_agent::tools::hook::{
     HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
@@ -20,7 +21,8 @@ use makima_agent::tools::{
 use makima_agent::{AgentMode, CallScope, CancelToken, SessionMailbox, SharedBuf, ToolOutput};
 use makima_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use makima_config::{
-    AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PluginsConfig, ToolKey, ToolOutputLines,
+    AlwaysThinking, DEFAULT_AUTOCOMPLETE_HEIGHT, Effect, PermissionRule, PermissionsConfig,
+    PluginsConfig, ProjectConfig, ToolKey, ToolOutputLines,
 };
 use makima_lua::agent_errors::{
     DELEGATED_FOREIGN_SESSION, DELEGATED_SESSION_LIFECYCLE, SESSION_REQUIRED_ERR,
@@ -57,6 +59,8 @@ const REPLACEMENT_DESC: &str = "took the builtin name over";
 const ZERO_LINES_OPTION: &str = "max_output_lines";
 const BASH_PROBE_COMMAND: &str = "printf '%s%s\\n' X Y";
 const ZERO_BASH_TIMEOUT_SECS: u64 = 10;
+const SHELL_PROBE_OUTPUT: &str = "Ready";
+const SHELL_PROBE_ID: &str = "headless-shell-probe";
 
 struct FakeCommandHost;
 
@@ -4565,6 +4569,179 @@ fn restore_rebuilds_body_from_input_content(
         !text.contains(summary),
         "restored body should show content, not the summary: {text}"
     );
+}
+
+#[cfg_attr(not(windows), test_case::test_case("auto", "bash", "echo Ready", "echo $(echo Ready)"; "bash"))]
+#[cfg_attr(windows, test_case::test_case("cmd", "cmd", "echo Ready", "if 1==1 echo Ready"; "cmd"))]
+#[cfg_attr(windows, test_case::test_case("powershell", "powershell", "Write-Output Ready", "Write-Output Ready; exit 0"; "powershell"))]
+fn configured_shell_is_used_when_builtins_load(
+    setting: &str,
+    shell: &str,
+    simple: &str,
+    complex: &str,
+) {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("makima.setup({{ agent = {{ shell = '{setting}' }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config().unwrap();
+    host.load_configured_builtins(&config).unwrap();
+
+    let description = tool_description(&reg, &config.agent, "bash");
+    assert!(
+        description.starts_with(&format!("Execute a {shell} command.")),
+        "{description}"
+    );
+
+    let entry = reg.get("bash").expect("bash registered");
+    let mut ctx = makima_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.config.rtk = false;
+    ctx.registry = Arc::clone(&reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
+    assert!(ctx.user_response_rx.is_none());
+
+    let native_windows_shell = shell != "bash";
+    let (head, _) = simple.split_once(' ').unwrap();
+    let allow_head = if native_windows_shell {
+        head.to_ascii_uppercase()
+    } else {
+        head.to_owned()
+    };
+    let allow_simple = format!("{allow_head} *");
+    let deny_simple = format!("{allow_head} {SHELL_PROBE_OUTPUT}");
+    let other_arg_case = format!("{allow_head} {}", SHELL_PROBE_OUTPUT.to_ascii_lowercase());
+    let mut cases = vec![
+        (simple, None, None, false, false, false),
+        (
+            simple,
+            Some(allow_simple.as_str()),
+            None,
+            false,
+            false,
+            true,
+        ),
+        (
+            simple,
+            Some("*"),
+            Some(deny_simple.as_str()),
+            false,
+            false,
+            false,
+        ),
+        (
+            simple,
+            Some("*"),
+            Some(other_arg_case.as_str()),
+            false,
+            false,
+            true,
+        ),
+        (simple, None, Some(deny_simple.as_str()), false, true, false),
+        (complex, Some(complex), None, true, false, false),
+        (complex, None, None, true, true, true),
+    ];
+    const ALIAS: &str = "echo Ready";
+    const BARE_TARGET: &str = "WRITE-OUTPUT *";
+    const QUALIFIED_TARGET: &str = r"Microsoft.PowerShell.Utility\Write-Output Ready";
+    if shell == "powershell" {
+        cases.extend([
+            (ALIAS, Some(ALIAS), None, false, false, true),
+            (ALIAS, Some(ALIAS), Some(BARE_TARGET), false, false, false),
+            (
+                ALIAS,
+                Some(ALIAS),
+                Some(QUALIFIED_TARGET),
+                false,
+                false,
+                false,
+            ),
+            (ALIAS, None, Some(QUALIFIED_TARGET), false, true, false),
+            (ALIAS, Some(QUALIFIED_TARGET), None, false, false, false),
+        ]);
+    }
+    for (command, allow, deny, force_prompt, yolo, runs) in cases {
+        let input = json!({ "command": command });
+        let inv = entry.tool.parse(&input).expect("parse failed");
+        let scopes = smol::block_on(inv.permission_scopes(None)).expect("permission scopes");
+        assert_eq!(scopes.force_prompt, force_prompt, "{command}");
+        assert_eq!(scopes.scopes, [command]);
+
+        assert_eq!(scopes.ignore_command_head_case, native_windows_shell);
+
+        let rules = [(allow, Effect::Allow), (deny, Effect::Deny)]
+            .into_iter()
+            .filter_map(|(pattern, effect)| {
+                pattern.map(|pattern| PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some(pattern.to_owned()),
+                    effect,
+                })
+            })
+            .collect();
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules,
+                yolo,
+                ..Default::default()
+            },
+            ctx.cwd.clone(),
+            ProjectConfig::for_project(&ctx.cwd),
+            Arc::default(),
+        ));
+        let done = smol::block_on(tool_dispatch::run(
+            SHELL_PROBE_ID.to_owned(),
+            "bash",
+            &input,
+            &ctx,
+            CallOrigin::Model,
+        ));
+        let output = done.output.as_text();
+        assert_eq!(done.is_error, !runs, "{command}: {output}");
+        if runs {
+            assert_eq!(output.trim(), SHELL_PROBE_OUTPUT);
+        } else {
+            assert!(output.contains(PERMISSION_DENIED_PREFIX), "{output}");
+            assert!(output.contains(command), "{output}");
+        }
+    }
+
+    if shell == "powershell" {
+        let session = test_session(&host);
+        smol::block_on(session.set_option("bash.auto_mode", "enabled")).unwrap();
+        ctx.session_id = Some(SessionRef::from(session.read().session_id()));
+        ctx.permissions = Arc::new(PermissionManager::new(
+            PermissionsConfig {
+                rules: vec![PermissionRule {
+                    tool: ToolKey::native("bash"),
+                    scope: Some(QUALIFIED_TARGET.to_owned()),
+                    effect: Effect::Deny,
+                }],
+                yolo: true,
+                ..Default::default()
+            },
+            ctx.cwd.clone(),
+            ProjectConfig::for_project(&ctx.cwd),
+            Arc::default(),
+        ));
+        let done = smol::block_on(tool_dispatch::run(
+            SHELL_PROBE_ID.to_owned(),
+            "bash",
+            &json!({ "command": ALIAS }),
+            &ctx,
+            CallOrigin::Model,
+        ));
+        let output = done.output.as_text();
+        assert!(done.is_error, "{output}");
+        assert!(output.contains(PERMISSION_DENIED_PREFIX), "{output}");
+        assert!(output.contains(ALIAS), "{output}");
+        smol::block_on(session.close()).unwrap();
+    }
 }
 
 /// Guards the stale-cancelled-handle bug: `permission_scopes` must call

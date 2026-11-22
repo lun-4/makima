@@ -188,7 +188,7 @@ pub mod atomic_test_hook {
 /// File handle closed (Windows can't rename an open file) and tempfile's
 /// `persist()` doesn't support the fibonacci backoff retry that Windows
 /// virus scanners require. On failure, we manually clean up the temp file.
-fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
+pub(crate) fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageError> {
     let (_, tmp_path) = tmp.into_parts();
     retry_rename(&tmp_path, path).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);

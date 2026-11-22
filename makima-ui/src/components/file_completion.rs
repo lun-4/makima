@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::click::{ClickTarget, CompletionGrid, HitTarget, Surface};
 use crate::components::coherent_completion::{CoherentCompletion, Publication};
+use crate::components::file_picker::normalize_file_query;
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -35,7 +37,10 @@ const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
 const FILE_KIND: &str = "file";
 const DIRECTORY_KIND: &str = "directory";
-const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
+/// The separator completion inserts into a prompt, not the one the filesystem
+/// uses: the same text then means the same path wherever the agent runs, and
+/// every platform accepts `/`.
+pub(crate) const DIRECTORY_SUFFIX: char = '/';
 
 fn ends_with_path_separator(value: &str) -> bool {
     value.ends_with(std::path::is_separator)
@@ -224,7 +229,7 @@ impl CompletionItem {
     }
 
     fn path(mut path: String, directory: bool) -> Self {
-        if directory && !path.ends_with(DIRECTORY_SUFFIX) {
+        if directory && !ends_with_path_separator(&path) {
             path.push(DIRECTORY_SUFFIX);
         }
         let kind = if directory { DIRECTORY_KIND } else { FILE_KIND };
@@ -639,7 +644,7 @@ impl FileCompletionMenu {
     ) {
         self.close();
         let root = PathBuf::from(cwd);
-        let explicit = query.starts_with(['~', '/', '.']);
+        let explicit = is_explicit_path(query);
         let (discovery, walking) = if explicit {
             (
                 Discovery::Explicit {
@@ -755,7 +760,7 @@ impl FileCompletionMenu {
         let Some(session) = &mut self.session else {
             return;
         };
-        let explicit = query.starts_with(['~', '/', '.']);
+        let explicit = is_explicit_path(query);
         session.intent = parse_query(query);
         let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
         if explicit {
@@ -804,7 +809,7 @@ impl FileCompletionMenu {
             if let Discovery::Project { nucleo, .. } = &mut session.discovery {
                 nucleo.pattern.reparse(
                     0,
-                    &query.to_lowercase(),
+                    &normalize_file_query(query).to_lowercase(),
                     CaseMatching::Smart,
                     Normalization::Smart,
                     false,
@@ -1012,6 +1017,21 @@ impl FileCompletionMenu {
 
 /// Character indices of `query` fuzzy-matched within `label`, for
 /// highlighting. `None` when the query does not match.
+/// Whether the query names a path rather than a fuzzy fragment: `~`, `/`,
+/// `.`, a drive letter or a UNC share. Without the Windows spellings an
+/// absolute path is searched for as if it were part of the project.
+fn is_explicit_path(query: &str) -> bool {
+    if query.starts_with(['~', '/', '.']) {
+        return true;
+    }
+    let bytes = query.as_bytes();
+    bytes.starts_with(b"\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
 fn parse_query(query: &str) -> QueryIntent {
     let lowered = query.to_lowercase();
     for (aliases, kind) in [
@@ -1139,14 +1159,25 @@ fn refresh_file_matches(s: &mut Session) {
     s.materialized_count = materialized_count;
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
+    let file_intent;
+    let intent = match normalize_file_query(&s.intent.payload) {
+        Cow::Borrowed(_) => &s.intent,
+        Cow::Owned(payload) => {
+            file_intent = QueryIntent {
+                payload,
+                ..s.intent
+            };
+            &file_intent
+        }
+    };
     for (order, path) in paths.into_iter().enumerate() {
-        let directory = path.ends_with(DIRECTORY_SUFFIX);
+        let directory = ends_with_path_separator(&path);
         let item = if directory {
             CompletionItem::directory(path)
         } else {
             CompletionItem::file(path)
         };
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, directory) {
+        if let Some(candidate) = match_candidate(item, intent, 0, order, directory) {
             s.file_matches.push(candidate);
         }
     }
@@ -1385,6 +1416,7 @@ fn cell_line<'a>(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1401,9 +1433,26 @@ mod tests {
     use makima_lua::ItemSpec;
 
     use super::*;
+    use tempfile::tempdir;
     use test_case::test_case;
 
     const MATCHER_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+    const PROJECT_MATCHES_MISSING: &str = "project matcher did not settle";
+    const PROJECT_PATHS: [&str; 2] = ["src/main.rs", "src/math.rs"];
+    const BACKSLASH_PATHS: [&str; 2] = [r"src\main.rs", r"src\math.rs"];
+
+    #[test_case(r"C:\Users\me\notes.md", true; "drive_backslash")]
+    #[test_case("C:/Users/me/notes.md", true; "drive_slash")]
+    #[test_case(r"\\server\share\notes.md", true; "unc")]
+    #[test_case("~/notes.md", true; "home")]
+    #[test_case("./notes.md", true; "relative")]
+    #[test_case("/notes.md", true; "rooted")]
+    #[test_case("notes.md", false; "fragment")]
+    #[test_case("C", false; "drive_letter_alone")]
+    #[test_case("a: b", false; "colon_without_slash")]
+    fn explicit_path_recognises_platform_spellings(query: &str, explicit: bool) {
+        assert_eq!(is_explicit_path(query), explicit, "{query}");
+    }
 
     fn wait_for_matcher(
         menu: &mut FileCompletionMenu,
@@ -3074,6 +3123,64 @@ mod tests {
                 assert_eq!(rect.width, input_area.width);
             })
             .unwrap();
+    }
+
+    #[test_case(PROJECT_PATHS; "forward_slashes")]
+    #[test_case(BACKSLASH_PATHS; "backslashes")]
+    fn project_file_queries_match_on_open_and_update(queries: [&str; 2]) {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        for path in PROJECT_PATHS {
+            fs::write(root.path().join(path), []).unwrap();
+        }
+        #[cfg(not(windows))]
+        for path in BACKSLASH_PATHS {
+            fs::write(root.path().join(path), []).unwrap();
+        }
+
+        let references = queries.map(|query| item(query, "skill", &format!("@skill:{query}")));
+        let mut menu = FileCompletionMenu::new();
+        menu.open(
+            root.path().to_str().unwrap(),
+            references.to_vec(),
+            queries[0],
+            (0, queries[0].len() + 1),
+        );
+
+        for (index, query) in queries.into_iter().enumerate() {
+            if index > 0 {
+                menu.sync_query(query);
+            }
+            let path = if cfg!(windows) {
+                PROJECT_PATHS[index]
+            } else {
+                query
+            };
+            wait_for_matcher(
+                &mut menu,
+                |menu| {
+                    let session = menu.session.as_ref().unwrap();
+                    let Discovery::Project { nucleo, .. } = &session.discovery else {
+                        return false;
+                    };
+                    !session.walking
+                        && !session.matching
+                        && session.publication.ready()
+                        && nucleo.snapshot().item_count() == nucleo.injector().injected_items()
+                },
+                PROJECT_MATCHES_MISSING,
+            );
+            let session = menu.session.as_ref().unwrap();
+            assert_eq!(session.query, query);
+            assert_eq!(session.file_matches.len(), 1);
+            let file = &session.file_matches[0];
+            assert_eq!(file.item.label, path);
+            assert_eq!(file.item.insertion, format!("@{path}"));
+            assert_eq!(session.ref_matches.len(), 1);
+            let reference = &session.ref_matches[0];
+            assert_eq!(reference.item.label, references[index].label);
+            assert_eq!(reference.item.insertion, references[index].insertion);
+        }
     }
 
     #[test]

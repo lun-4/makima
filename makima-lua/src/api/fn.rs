@@ -7,9 +7,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use makima_agent::shell::{ResolvedShell, command};
+#[cfg(test)]
+use makima_config::Shell;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
+use crate::api::env::resolved_shell;
 use crate::api::fs::expand_tilde;
 use crate::api::util::command::{UiAction, ui_roundtrip, ui_send};
 use crate::api::util::pair::{Pair, try_pair};
@@ -65,9 +69,9 @@ pub(crate) enum JobCommand {
 }
 
 impl JobCommand {
-    fn build(&self) -> Command {
+    fn build(&self, shell: impl Into<ResolvedShell>) -> Command {
         match self {
-            Self::Shell(cmd) => shell_command(cmd),
+            Self::Shell(cmd) => command(shell, cmd),
             Self::Argv(argv) => {
                 let mut command = Command::new(&argv[0]);
                 command.args(&argv[1..]);
@@ -126,9 +130,10 @@ impl JobStore {
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
+        shell: impl Into<ResolvedShell>,
     ) -> Result<u32, String> {
         let cmd = cmd.into();
-        let mut command = cmd.build();
+        let mut command = cmd.build(shell);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -402,21 +407,6 @@ impl JobMeta {
     }
 }
 
-fn shell_command(cmd: &str) -> Command {
-    #[cfg(unix)]
-    {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    }
-    #[cfg(windows)]
-    {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/C").arg(cmd);
-        c
-    }
-}
-
 fn kill_job(meta: &mut JobMeta) {
     let pid = meta.pid;
     #[cfg(unix)]
@@ -458,8 +448,9 @@ fn parse_command(cmd: Value) -> LuaResult<JobCommand> {
 }
 
 /// Run a shell command in the background. The command runs through
-/// `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
-/// that you can pass to `jobstop` or `jobwait` to control the process.
+/// `bash -c` on Unix, and on Windows through whatever `agent.shell` selects
+/// (Git Bash by default). You get back a job id that you can pass to
+/// `jobstop` or `jobwait` to control the process.
 ///
 /// @param cmd string|string[] Shell command to run, or array of arguments.
 /// @param opts table? Optional settings:
@@ -530,8 +521,9 @@ fn jobstart(lua: &Lua, #[ctx] plugin: Arc<str>, cmd: Value, opts: Option<Table>)
         None => (None, None, None, None, None),
     };
 
+    let shell = resolved_shell(lua);
     with_jobs(lua, |store| {
-        store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit)
+        store.start(owner, &cmd, cwd, env, on_stdout, on_stderr, on_exit, shell)
     })
     .map_err(mlua::Error::runtime)
 }
@@ -760,7 +752,16 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start(task_owner(1), "echo hello", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "echo hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap()
     }
 
@@ -786,7 +787,16 @@ mod tests {
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .expect("job started");
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");
@@ -810,6 +820,7 @@ mod tests {
             None,
             None,
             None,
+            Shell::default(),
         );
         assert!(result.is_err());
     }
@@ -874,7 +885,16 @@ mod tests {
     fn plugin_owner_can_be_accessed_only_by_its_plugin() {
         let mut store = make_store();
         let id = store
-            .start(plugin_owner(), "echo hello", None, None, None, None, None)
+            .start(
+                plugin_owner(),
+                "echo hello",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
 
         assert!(store.take_receiver(id, Some(1), "other-plugin").is_none());
@@ -887,7 +907,16 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let id = store
-            .start(task_owner(1), "sleep 30", None, None, None, None, None)
+            .start(
+                task_owner(1),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let pid = store.jobs[&id].pid;
 
@@ -907,10 +936,28 @@ mod tests {
         let task = task_owner(1);
         let plugin = plugin_owner();
         let task_id = store
-            .start(task.clone(), "sleep 30", None, None, None, None, None)
+            .start(
+                task.clone(),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let plugin_id = store
-            .start(plugin.clone(), "sleep 30", None, None, None, None, None)
+            .start(
+                plugin.clone(),
+                "sleep 30",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
         let task_pid = store.jobs[&task_id].pid;
         let plugin_pid = store.jobs[&plugin_id].pid;
@@ -969,7 +1016,16 @@ mod tests {
         let mut store = make_store();
         let id = start_echo(&mut store);
         let plugin_id = store
-            .start(plugin_owner(), "echo plugin", None, None, None, None, None)
+            .start(
+                plugin_owner(),
+                "echo plugin",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Shell::default(),
+            )
             .unwrap();
 
         let mut buf = Vec::new();

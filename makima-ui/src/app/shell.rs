@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -219,16 +218,7 @@ pub(crate) fn spawn_shell(
             command: command.clone(),
         });
 
-        let result = run_command(
-            &command,
-            &id,
-            &tx,
-            &cancel,
-            config.max_output_lines,
-            config.max_output_bytes,
-            &cwd,
-        )
-        .await;
+        let result = run_command(&command, &id, &tx, &cancel, &config, &cwd).await;
 
         let (output, is_error) = match result {
             Ok(out) => (out, false),
@@ -251,16 +241,11 @@ async fn run_command(
     id: &str,
     tx: &flume::Sender<ShellEvent>,
     cancel: &CancelToken,
-    max_output_lines: usize,
-    max_output_bytes: usize,
+    config: &AgentConfig,
     cwd: &Path,
 ) -> Result<String, String> {
-    let mut std_cmd = StdCommand::new("bash");
-    std_cmd
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut std_cmd = makima_agent::shell::command(config.shell, command);
+    std_cmd.current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0");
 
     #[cfg(unix)]
     unsafe {
@@ -322,7 +307,9 @@ async fn run_command(
                     }
                     output.push_str(&line);
                     line_count += 1;
-                    if output.len() > max_output_bytes || line_count >= max_output_lines {
+                    if output.len() > config.max_output_bytes
+                        || line_count >= config.max_output_lines
+                    {
                         truncated = true;
                     }
                 }

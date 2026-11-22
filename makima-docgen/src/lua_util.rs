@@ -737,7 +737,7 @@ fn load_plugin_commands(plugin_dir: &Path) -> Result<Vec<LuaPluginCommand>> {
     let entries = fs::read_dir(plugin_dir).wrap_err_with(|| {
         format!(
             "could not enumerate plugin directory {}",
-            plugin_dir.display()
+            slashed(plugin_dir)
         )
     })?;
     let mut commands = Vec::new();
@@ -745,11 +745,11 @@ fn load_plugin_commands(plugin_dir: &Path) -> Result<Vec<LuaPluginCommand>> {
         let entry = entry.wrap_err_with(|| {
             format!(
                 "could not read an entry in plugin directory {}",
-                plugin_dir.display()
+                slashed(plugin_dir)
             )
         })?;
         let file_type = entry.file_type().wrap_err_with(|| {
-            format!("could not inspect plugin path {}", entry.path().display())
+            format!("could not inspect plugin path {}", slashed(&entry.path()))
         })?;
         if !file_type.is_dir() {
             continue;
@@ -759,16 +759,22 @@ fn load_plugin_commands(plugin_dir: &Path) -> Result<Vec<LuaPluginCommand>> {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(error).wrap_err_with(|| format!("could not read {}", path.display()));
+                return Err(error).wrap_err_with(|| format!("could not read {}", slashed(&path)));
             }
         };
         commands.extend(
             parse_lua_commands(&source)
-                .wrap_err_with(|| format!("could not parse {}", path.display()))?,
+                .wrap_err_with(|| format!("could not parse {}", slashed(&path)))?,
         );
     }
     commands.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(commands)
+}
+
+/// Error text spells paths with `/`, so a plugin name reads the same on every
+/// platform.
+fn slashed(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]
