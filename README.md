@@ -27,7 +27,7 @@ cargo build --release
 ## inspirations
 
 - [maki](https://github.com/tontinton/maki) as its the core codebase we've hardforked from. _maki is good! i just have different opinions that i dont think are upstreamable!_
-- [polytoken](https://polytoken.dev)'s play mode which we've copied.
+- [polytoken](https://polytoken.dev)'s plan mode which we've copied.
 
 ## supported providers
 
@@ -59,4 +59,4 @@ nix run github:lun-4/makima
 
 ## documentation
 
-more info at the [official docs](https://makima.ln4.net/docs).
+more info at the [official docs](https://lun-4.github.io/makima/docs).
