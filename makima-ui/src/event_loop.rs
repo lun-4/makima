@@ -10337,8 +10337,8 @@ end })
         release_runtime(runtime);
     }
 
-    #[test_case((); "unavailable")]
-    fn replacement_with_unavailable_saved_model_uses_startup(_: ()) {
+    #[test]
+    fn replacement_with_unavailable_saved_model_uses_startup() {
         const INVALID_MODEL: &str = "unsupported-provider/test-model";
 
         with_event_loop(|event_loop| {

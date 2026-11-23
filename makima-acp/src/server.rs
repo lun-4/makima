@@ -6432,8 +6432,8 @@ mod tests {
         });
     }
 
-    #[test_case((); "late_reply_queued_before_the_next_ask")]
-    fn expired_waiter_cannot_answer_the_next_ask_in_the_same_turn(_: ()) {
+    #[test]
+    fn expired_waiter_cannot_answer_the_next_ask_in_the_same_turn() {
         smol::block_on(async {
             let registry = Arc::new(ToolRegistry::new());
             let host = PluginHost::new(Arc::clone(&registry)).unwrap();
