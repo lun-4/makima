@@ -1,7 +1,7 @@
 use crate::{
     AgentId, AgentMode, ModeId, ModeRegistry, ToolOutput,
     agent::UNAVAILABLE_RESULT,
-    journal::{SessionJournal, SessionJournalSnapshot},
+    journal::{DeliveryInboxUsage, SessionJournal, SessionJournalSnapshot, restored_preview_bytes},
     modes, plan_state,
     session_coordinator::SessionCoordinatorHandle,
     session_writer::{SessionWriter, WriterError},
@@ -449,6 +449,7 @@ impl RecoveryCandidate {
                 .then(|| ((*child, *turn), delivery.result.clone()))
             })
             .collect();
+        let mut inbox_usage = BTreeMap::new();
         for (&agent, scope) in &view.scopes {
             let Some(agent) = agent else { continue };
             for (&turn, origin) in &scope.admitted {
@@ -505,28 +506,43 @@ impl RecoveryCandidate {
                             .as_ref()
                             .is_some_and(|spec| spec.auto_deliver && !spec.silent)
                     {
-                        seq = seq
-                            .checked_add(1)
-                            .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
-                        let delivery = StoredStateRecord {
-                            seq,
-                            agent: Some(parent),
-                            generation: view
-                                .scopes
-                                .get(&Some(parent))
-                                .map_or(0, |scope| scope.generation),
-                            change: StateChange::Delivery {
-                                id: (agent, turn),
-                                op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                                    label: child.label.clone(),
-                                    result: result.clone(),
-                                    held: false,
-                                    preview_bytes: None,
-                                })),
-                            },
+                        let parent_scope = view.scopes.get(&Some(parent));
+                        let usage = inbox_usage.entry(parent).or_insert_with(|| {
+                            DeliveryInboxUsage::from_sizes(parent_scope.into_iter().flat_map(
+                                |scope| {
+                                    scope.deliveries.values().filter_map(|op| match op {
+                                        StoredDeliveryOp::Queued(delivery) => {
+                                            Some(restored_preview_bytes(delivery))
+                                        }
+                                        _ => None,
+                                    })
+                                },
+                            ))
+                        });
+                        let mut report = StoredDelivery {
+                            label: child.label.clone(),
+                            result: result.clone(),
+                            held: false,
+                            preview_bytes: None,
                         };
-                        session.push_state(delivery.clone());
-                        records.push(SessionRecord::State { d: delivery });
+                        let bytes = restored_preview_bytes(&report);
+                        if usage.admit(bytes).is_ok() {
+                            report.preview_bytes = Some(bytes);
+                            seq = seq
+                                .checked_add(1)
+                                .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                            let delivery = StoredStateRecord {
+                                seq,
+                                agent: Some(parent),
+                                generation: parent_scope.map_or(0, |scope| scope.generation),
+                                change: StateChange::Delivery {
+                                    id: (agent, turn),
+                                    op: StoredDeliveryOp::Queued(Box::new(report)),
+                                },
+                            };
+                            session.push_state(delivery.clone());
+                            records.push(SessionRecord::State { d: delivery });
+                        }
                     }
                     result
                 };

@@ -6,8 +6,8 @@ use crate::{
     DoneReason, History, ModeDef, ModeId, RunSettings, ToolOutput, TurnContext, TurnId,
     TurnOutcome, WorkKind,
     actor::{
-        ActorHistory, ChildDelivery, EffectiveAgentConfig, MAX_PENDING_DELIVERIES, TurnProvenance,
-        TurnResult, graph_quiescence_barrier,
+        ActorHistory, ChildDelivery, EffectiveAgentConfig, MAX_DELIVERY_PREVIEW_BYTES,
+        MAX_PENDING_DELIVERIES, MAX_PENDING_PREVIEW_BYTES, TurnProvenance, TurnResult,
     },
     journal::{JournalChange, JournalCommit, SessionJournal},
     session_recovery::{CONTINUATION_DISABLED, RecoveredSession, RecoveryCandidate},
@@ -20,7 +20,7 @@ use makima_storage::{
     checkpoint::CheckpointPublication,
     session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
-        StoredDeliveryOp, StoredModeCeiling, StoredStateRecord, StoredTurnOrigin,
+        StoredDeliveryOp, StoredModeCeiling, StoredStateRecord, StoredTurnOrigin, StoredTurnStatus,
     },
     sessions::Session,
     test_util::test_record,
@@ -31,7 +31,6 @@ use std::{
     future::Future,
     path::Path,
     pin::Pin,
-    slice,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -326,12 +325,6 @@ fn report_count(session: &StoredSession, child: AgentId, turn: TurnId) -> usize 
         .filter(|message| message.observation_source.as_ref() == Some(&source))
         .count()
 }
-async fn settled(actor: &AgentActorHandle) {
-    let probes = graph_quiescence_barrier(slice::from_ref(actor))
-        .await
-        .unwrap();
-    assert!(probes[0].is_quiescent());
-}
 #[test_case(false, false; "dormant_consumed")]
 #[test_case(true, false; "resident_consumed")]
 #[test_case(false, true; "dormant_withdrawn")]
@@ -416,7 +409,7 @@ async fn scenario(resident: bool, withdraw: bool) {
             .await
             .unwrap();
     }
-    settled(&actor).await;
+    manager.wait_settled().await;
     let terminal = if withdraw {
         StoredDeliveryOp::Withdrawn
     } else {
@@ -456,12 +449,12 @@ async fn scenario(resident: bool, withdraw: bool) {
             .push_control(SUMMARY.into(), SUMMARY.into(), None)
             .unwrap();
         assert_eq!(events.recv_async().await.unwrap(), Progress::Controlled);
-        settled(&actor).await;
+        manager.wait_settled().await;
         if compact {
             let epoch = journal.snapshot().histories[&parent].epoch;
             actor.push_compact(PRESENTATION_ID, None).unwrap();
             assert_eq!(events.recv_async().await.unwrap(), Progress::Compacted);
-            settled(&actor).await;
+            manager.wait_settled().await;
             assert_ne!(journal.snapshot().histories[&parent].epoch, epoch);
             let saved = publish(&journal, &mut session, directory.path()).await;
             assert!(saved.history_snapshot().compacted);
@@ -576,7 +569,7 @@ async fn disabled_continuation_scenario(prefix: FailurePrefix) {
         let manager = restore(&journal);
         let actor = activate_parent(&manager).await;
         wait_for_report(&journal, parent, &events).await;
-        settled(&actor).await;
+        manager.wait_settled().await;
         journal.flush().await.unwrap();
         drop(actor);
         crash(manager, &events, true).await;
@@ -597,7 +590,7 @@ async fn disabled_continuation_scenario(prefix: FailurePrefix) {
     if !already_consumed {
         wait_for_report(&journal, parent, &events).await;
     }
-    settled(&actor).await;
+    manager.wait_settled().await;
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     journal.flush().await.unwrap();
     let saved = StoredSession::load_from(id, directory).unwrap();
@@ -725,7 +718,7 @@ async fn recover(
 
 async fn assert_child_does_not_rerun(manager: &AgentManagerHandle, child: AgentId) {
     let child_executions = Arc::new(AtomicUsize::new(0));
-    let child_actor = manager
+    manager
         .ensure_resident_with(child, |_| {
             let child_executions = Arc::clone(&child_executions);
             async move {
@@ -745,10 +738,8 @@ async fn assert_child_does_not_rerun(manager: &AgentManagerHandle, child: AgentI
             }
         })
         .await
-        .unwrap()
-        .actor()
         .unwrap();
-    settled(&child_actor).await;
+    manager.wait_settled().await;
     assert_eq!(child_executions.load(Ordering::SeqCst), 0);
 }
 
@@ -793,7 +784,7 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
     let actor = if resident {
         let (actor, start) = activate_parent(&manager).await;
         start.send(()).unwrap();
-        settled(&actor).await;
+        manager.wait_settled().await;
         Some(actor)
     } else {
         None
@@ -881,7 +872,7 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         result: ticket.peek_result().unwrap(),
     });
     manager.deliver(parent, Arc::clone(&delivery)).unwrap();
-    settled(&actor).await;
+    manager.wait_settled().await;
     assert_eq!(manager.active_child_count(parent), 0);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     let saved = if terminal_on_disk.is_some() {
@@ -904,6 +895,89 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
     }
 }
 
+fn inbox_delivery(child: AgentId, text: String) -> ChildDelivery {
+    ChildDelivery {
+        label: None,
+        result: TurnResult {
+            outcome: TurnOutcome::completed(
+                child,
+                TurnId::generate(),
+                TokenUsage::default(),
+                0,
+                DoneReason::EndTurn,
+            ),
+            text,
+            output: Vec::new(),
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        },
+    }
+}
+
+#[test_case(false; "count_limit")]
+#[test_case(true; "byte_limit")]
+fn disabled_continuation_does_not_overflow_parent_inbox(byte_limit: bool) {
+    smol::block_on(async {
+        let directory = TempDir::new().unwrap();
+        let directory = directory.path();
+        let (mut session, child, turn) = seed_recovery_failure(directory).await;
+        let id = session.id;
+        let parent = session.root_agent_id().unwrap();
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        let manager = restore(&journal);
+        let target_bytes = MAX_DELIVERY_PREVIEW_BYTES / 2;
+        let count = if byte_limit {
+            MAX_PENDING_PREVIEW_BYTES / target_bytes
+        } else {
+            MAX_PENDING_DELIVERIES
+        };
+        for _ in 0..count {
+            let mut delivery = inbox_delivery(child, String::new());
+            delivery.result.text = if byte_limit {
+                let overhead = delivery.input().preamble[0]
+                    .first_text_content()
+                    .unwrap()
+                    .len();
+                "x".repeat(target_bytes - overhead)
+            } else {
+                REPORT.into()
+            };
+            manager.deliver(parent, Arc::new(delivery)).unwrap();
+        }
+        let session = publish(&journal, &mut session, directory).await;
+        let view = session.latest_state().unwrap();
+        let original_inbox = &view.scopes[&Some(parent)].deliveries;
+        assert_eq!(original_inbox.len(), count);
+        if byte_limit {
+            let bytes: usize = original_inbox
+                .values()
+                .map(|op| {
+                    let StoredDeliveryOp::Queued(delivery) = op else {
+                        panic!("{QUEUED_RECORD_MISSING}");
+                    };
+                    delivery.preview_bytes.unwrap()
+                })
+                .sum();
+            assert_eq!(bytes, MAX_PENDING_PREVIEW_BYTES);
+        }
+        drop(manager);
+        drop(journal);
+        let recovered = recover(directory, session, false).await;
+        let saved = StoredSession::load_from(id, directory).unwrap();
+        let view = saved.latest_state().unwrap();
+        assert_eq!(&view.scopes[&Some(parent)].deliveries, original_inbox);
+        let scope = &view.scopes[&Some(child)];
+        assert!(!scope.admitted.contains_key(&turn));
+        assert!(scope.results.iter().any(|(id, result)| {
+            *id == turn
+                && matches!(&result.outcome.status, StoredTurnStatus::Failed { failure }
+                if failure.diagnostic == CONTINUATION_DISABLED)
+        }));
+        drop(recovered);
+        forget(directory, id).unwrap();
+    });
+}
+
 #[test_case(true; "resident")]
 #[test_case(false; "dormant")]
 fn restored_child_failure_does_not_overflow_parent_inbox(resident: bool) {
@@ -921,23 +995,9 @@ fn restored_child_failure_does_not_overflow_parent_inbox(resident: bool) {
             None
         };
         for _ in 0..MAX_PENDING_DELIVERIES {
-            let delivery = Arc::new(ChildDelivery {
-                label: None,
-                result: TurnResult {
-                    outcome: TurnOutcome::completed(
-                        child,
-                        TurnId::generate(),
-                        TokenUsage::default(),
-                        0,
-                        DoneReason::EndTurn,
-                    ),
-                    text: REPORT.into(),
-                    output: Vec::new(),
-                    provenance: TurnProvenance::default(),
-                    duration_ms: 0,
-                },
-            });
-            manager.deliver(parent, delivery).unwrap();
+            manager
+                .deliver(parent, Arc::new(inbox_delivery(child, REPORT.into())))
+                .unwrap();
         }
         assert_eq!(
             manager

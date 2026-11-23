@@ -72,7 +72,39 @@ pub(crate) fn take_history_changes() -> Vec<JournalChange> {
     HISTORY_CHANGES.with(|slot| slot.take())
 }
 
-fn restored_preview_bytes(delivery: &StoredDelivery) -> usize {
+#[derive(Default)]
+pub(crate) struct DeliveryInboxUsage {
+    count: usize,
+    bytes: usize,
+}
+
+impl DeliveryInboxUsage {
+    pub(crate) fn from_sizes(sizes: impl IntoIterator<Item = usize>) -> Self {
+        let mut usage = Self::default();
+        for bytes in sizes {
+            usage.add(bytes);
+        }
+        usage
+    }
+
+    fn add(&mut self, bytes: usize) {
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    pub(crate) fn admit(&mut self, bytes: usize) -> Result<(), DeliveryRejection> {
+        if bytes > MAX_DELIVERY_PREVIEW_BYTES
+            || self.count >= MAX_PENDING_DELIVERIES
+            || self.bytes.saturating_add(bytes) > MAX_PENDING_PREVIEW_BYTES
+        {
+            return Err(DeliveryRejection::Overflow);
+        }
+        self.add(bytes);
+        Ok(())
+    }
+}
+
+pub(crate) fn restored_preview_bytes(delivery: &StoredDelivery) -> usize {
     if let Some(bytes) = delivery.preview_bytes {
         return bytes;
     }
@@ -1280,22 +1312,14 @@ impl SessionJournal {
                     .or_insert_with(|| restored_preview_bytes(delivery));
             }
         }
-        let (count, bytes) = sizes
-            .iter()
-            .filter(|((_, source, id), _)| {
-                !reduced
-                    .delivery(parent, (*source, *id))
-                    .is_some_and(|op| !matches!(op, StoredDeliveryOp::Queued(_)))
-            })
-            .fold((0usize, 0usize), |(count, bytes), (_, size)| {
-                (count + 1, bytes.saturating_add(*size))
-            });
-        if preview_bytes > MAX_DELIVERY_PREVIEW_BYTES
-            || count >= MAX_PENDING_DELIVERIES
-            || bytes.saturating_add(preview_bytes) > MAX_PENDING_PREVIEW_BYTES
-        {
-            return Err(DeliveryRejection::Overflow);
-        }
+        DeliveryInboxUsage::from_sizes(sizes.into_iter().filter_map(|((_, source, id), size)| {
+            matches!(
+                reduced.delivery(parent, (source, id)),
+                None | Some(StoredDeliveryOp::Queued(_))
+            )
+            .then_some(size)
+        }))
+        .admit(preview_bytes)?;
         let pending = Self::stage_locked(&mut state, JournalCommit::default(), 1)
             .map_err(|_| DeliveryRejection::ParentUnavailable)?;
         let spawn;
