@@ -558,7 +558,7 @@ impl<'h> Agent<'h> {
             Err(AgentError::Cancelled) => {
                 if !self.is_suspended() {
                     self.history.sanitize_cancelled(self.rollback_len).await;
-                    if let Some(ended) = self.history.continue_conversation() {
+                    if let Some(ended) = self.history.continue_cancelled_conversation() {
                         end_conversation_detached(
                             &self.provider,
                             ended,
@@ -3494,6 +3494,7 @@ mod tests {
                     id: original,
                     relation: ConversationRelation::Continues,
                     shared: *sent,
+                    cancelled: true,
                 })
             );
         });
@@ -3937,7 +3938,7 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
         assert!(agent.mode_def.is_none());
         assert_eq!(agent.history.conversation().sent, None);
-        assert_eq!(agent.history.continue_conversation(), None);
+        assert_eq!(agent.history.continue_cancelled_conversation(), None);
         assert_eq!(agent.history.conversation().previous, None);
     }
 

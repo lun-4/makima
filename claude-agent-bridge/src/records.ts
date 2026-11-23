@@ -3,6 +3,8 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import type { Message } from "./protocol.ts"
 
+const EMPTY_RESPONSE_MARKER = "(empty)"
+
 // A point in an SDK session where Claude's transcript holds exactly the
 // first {count} Makima messages, ending with a finished reply. A fork from it
 // needs only the messages after {count}.
@@ -10,7 +12,7 @@ export interface Boundary {
   readonly count: number
   readonly session: string
   readonly uuid: string
-  readonly replyHash?: string
+  readonly replyHash?: string | null
 }
 
 export interface Record {
@@ -34,15 +36,20 @@ export function freshRecord(): Record {
   return { seen: 0, boundaries: [] }
 }
 
-export function replyHash(message: Message): string | undefined {
+export function replyHash(message: Message): string | null {
   const text = message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
-  // Makima writes a placeholder when a reply has no visible text.
-  if (!text.some((part) => part.trim() !== "")) return undefined
-  return createHash("sha256").update(JSON.stringify(text)).digest("hex")
+  if (text.some((part) => part.trim() !== "")) return createHash("sha256").update(JSON.stringify(text)).digest("hex")
+  const tools = message.content.flatMap((block) => (block.type === "tool_use" ? [block.id] : []))
+  return tools.length > 0 ? createHash("sha256").update(JSON.stringify({ tools })).digest("hex") : null
 }
 
-export function hasReply(message: Message | undefined, hash?: string): boolean {
-  return message?.role === "assistant" && (hash === undefined || replyHash(message) === hash)
+export function hasReply(message: Message | undefined, hash?: string | null): boolean {
+  if (message?.role !== "assistant") return false
+  if (hash === null) {
+    const [block] = message.content
+    return message.content.length === 1 && block?.type === "text" && block.text === EMPTY_RESPONSE_MARKER
+  }
+  return hash === undefined || replyHash(message) === hash
 }
 
 export function forkPoint(record: Record, messages: readonly Message[], shared = messages.length): Boundary | undefined {

@@ -216,7 +216,9 @@ export class Conversations {
         source.live = undefined
         this.active.delete(previous.id)
       }
-      conversation.record = record
+      conversation.record = source?.record ?? record
+      const interrupted = conversation.record.interrupted
+      if (previous.cancelled && interrupted) interrupted.cancelled = true
       await this.records.remove(previous.id)
       return
     }

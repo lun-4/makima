@@ -227,10 +227,15 @@ impl History {
     /// Starts a new conversation that carries on from the current one over
     /// the messages it still holds. Returns the outgoing id when a request
     /// under it was delivered, the only case that leaves remote state to end.
-    pub fn continue_conversation(&mut self) -> Option<Arc<str>> {
-        let previous = self
+    pub fn continue_conversation(&mut self, cancelled: bool) -> Option<Arc<str>> {
+        let mut previous = self
             .conversation
             .link(ConversationRelation::Continues, self.len());
+        if self.conversation.sent.is_some()
+            && let Some(link) = &mut previous
+        {
+            link.cancelled = cancelled;
+        }
         self.rotate(previous)
     }
 
@@ -1052,7 +1057,7 @@ mod tests {
         history.mark_sent();
         let sent = history.conversation().clone();
         assert_eq!(mirror_conversation(&mirror), sent);
-        let ended = history.continue_conversation().unwrap();
+        let ended = history.continue_conversation(false).unwrap();
         assert_eq!(ended.as_ref(), STORED);
         let current = history.conversation().clone();
         assert_eq!(mirror_conversation(&mirror), current);
@@ -1080,23 +1085,25 @@ mod tests {
         history
     }
 
-    #[test_case(3, 5, 5, 3 ; "cancel_keeps_the_sent_request")]
-    #[test_case(4, 4, 2, 2 ; "rewind_keeps_its_cut")]
+    #[test_case(3, 5, 5, 3, true ; "cancel_keeps_the_sent_request")]
+    #[test_case(4, 4, 2, 2, false ; "rewind_keeps_its_cut")]
     fn continue_conversation_links_to_the_last_request(
         sent: usize,
         total: usize,
         kept: usize,
         shared: usize,
+        cancelled: bool,
     ) {
         let mut history = sent_history(sent, total);
         history.truncate(kept);
-        let ended = history.continue_conversation().unwrap();
+        let ended = history.continue_conversation(cancelled).unwrap();
         assert_eq!(
             history.conversation().previous,
             Some(ConversationLink {
                 id: ended,
                 relation: ConversationRelation::Continues,
                 shared,
+                cancelled,
             })
         );
         assert_eq!(history.conversation().sent, None);
@@ -1105,15 +1112,16 @@ mod tests {
     #[test]
     fn a_conversation_that_never_sent_passes_its_link_on() {
         let mut history = sent_history(3, 3);
-        let first = history.continue_conversation().unwrap();
+        let first = history.continue_conversation(true).unwrap();
         history.truncate(1);
-        assert_eq!(history.continue_conversation(), None);
+        assert_eq!(history.continue_conversation(false), None);
         assert_eq!(
             history.conversation().previous,
             Some(ConversationLink {
                 id: first,
                 relation: ConversationRelation::Continues,
                 shared: 1,
+                cancelled: true,
             })
         );
         assert_eq!(
@@ -1148,7 +1156,7 @@ mod tests {
     #[test]
     fn restart_drops_the_link() {
         let mut history = sent_history(2, 2);
-        history.continue_conversation();
+        history.continue_conversation(false);
         history.restart_conversation();
         assert_eq!(history.conversation().previous, None);
     }

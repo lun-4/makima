@@ -30,6 +30,7 @@ export interface Previous {
   id: string
   relation: Relation
   shared: number
+  cancelled?: boolean
 }
 
 export interface Invocation {
@@ -201,7 +202,7 @@ function previous(value: unknown): Previous | undefined {
   const raw = value as Record<string, unknown>
   if (raw.relation !== "continues" && raw.relation !== "branches") throw invalid("previous.relation must be continues or branches")
   if (!Number.isSafeInteger(raw.shared) || (raw.shared as number) < 0) throw invalid("previous.shared must be a count")
-  return { id: text(raw.id, "previous.id"), relation: raw.relation, shared: raw.shared as number }
+  return { id: text(raw.id, "previous.id"), relation: raw.relation, shared: raw.shared as number, cancelled: raw.cancelled === true }
 }
 
 function thinking(value: unknown): Thinking {

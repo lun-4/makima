@@ -265,6 +265,7 @@ mod tests {
             id: SOURCE_CONVERSATION.into(),
             relation: ConversationRelation::Branches,
             shared: SOURCE_SHARED,
+            cancelled: false,
         }
     }
 

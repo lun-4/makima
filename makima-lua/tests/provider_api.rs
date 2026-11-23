@@ -154,7 +154,8 @@ const ECHO_INSTANCE: &str = r#"
                 request.system, request.messages[1].content[1].text,
                 inv.conversation_id, inv.operation_id, tostring(inv.attempt),
                 inv.purpose, inv.agent_id, inv.previous.id, inv.previous.relation,
-                tostring(inv.previous.shared), tostring(request.fast),
+                tostring(inv.previous.shared), tostring(inv.previous.cancelled),
+                tostring(request.fast),
                 tostring(request.session_id), tostring(type(ctx.send)),
             }, "|")
             return {
@@ -203,6 +204,7 @@ fn invocation() -> Invocation {
             id: PREVIOUS.into(),
             relation: ConversationRelation::Continues,
             shared: SHARED,
+            cancelled: true,
         }),
     }
 }
@@ -469,6 +471,7 @@ fn stream_delivers_events_response_and_request_fields() {
         PREVIOUS,
         "continues",
         &SHARED.to_string(),
+        "true",
         "false",
         "nil",
         "function",

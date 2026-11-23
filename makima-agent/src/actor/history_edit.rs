@@ -167,7 +167,10 @@ impl HistoryEditWork {
                     let (ended, reason) = if history.is_empty() {
                         (history.restart_conversation(), ConversationEnd::Closed)
                     } else {
-                        (history.continue_conversation(), ConversationEnd::Rewound)
+                        (
+                            history.continue_conversation(false),
+                            ConversationEnd::Rewound,
+                        )
                     };
                     if let Some(policy) = &state.policy
                         && let Some(ended) = ended

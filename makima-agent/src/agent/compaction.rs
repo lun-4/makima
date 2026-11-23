@@ -672,6 +672,7 @@ mod tests {
                     id: Arc::clone(&original),
                     relation: ConversationRelation::Branches,
                     shared: 1,
+                    cancelled: false,
                 })
             );
             assert_eq!(

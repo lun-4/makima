@@ -4777,6 +4777,7 @@ mod tests {
             id: STORED_CONVERSATION.into(),
             relation: ConversationRelation::Branches,
             shared: STORED_SENT,
+            cancelled: false,
         });
         assert_eq!(history.conversation().previous, link);
         let expected_root = opening.session.root_agent_id();

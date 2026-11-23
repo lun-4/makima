@@ -1642,8 +1642,8 @@ impl<'a> ActorHistory<'a> {
     pub fn mark_sent(&mut self) {
         self.history.mark_sent();
     }
-    pub fn continue_conversation(&mut self) -> Option<Arc<str>> {
-        self.history.continue_conversation()
+    pub fn continue_cancelled_conversation(&mut self) -> Option<Arc<str>> {
+        self.history.continue_conversation(true)
     }
 }
 

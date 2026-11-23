@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { BridgeError } from "../src/protocol.ts"
+import { BridgeError, parseStep, PROTOCOL_VERSION } from "../src/protocol.ts"
 import { SERVER_NAME } from "../src/tools.ts"
 import type { StepRequest } from "../src/protocol.ts"
 import { assistant, harness, READ, request, result, sdk, SESSION, text, textTurn, toolTurn, user } from "./fake.ts"
@@ -90,19 +90,46 @@ test("a successor that continues takes over the process", async () => {
   assert.equal(h.records.saved.get("c2")!.seen, 4)
 })
 
-test("after a cancel, Claude keeps its partial reply and Makima's copy is left out", async () => {
-  const h = harness([[[sdk.start("m")], textTurn("ok")]])
-  const abort = new AbortController()
-  const running = h.step(request("c1", [GO]), abort.signal)
-  await new Promise((resolve) => setImmediate(resolve))
-  abort.abort()
-  await assert.rejects(running)
-  assert.equal(h.sessions[0]!.interrupts, 1)
-  await h.conversations.end("c1", "cancelled")
-  const partial = assistant(text("half a rep"))
-  await h.step(request("c2", [GO, partial, user(text("go on"))], { previous: { id: "c1", relation: "continues", shared: 1 } }))
-  assert.deepEqual(texts(h.sessions[0]!.sent[1]!.content), ["go on"])
-})
+for (const endFirst of [true, false]) {
+  test(`a successor does not replay a cancelled step (${endFirst ? "end first" : "successor first"})`, async () => {
+    const partial = assistant(text("half a reply"))
+    const h = harness([[[sdk.assistant("cut-off", partial.content)], textTurn("ok")], [textTurn("replayed")]])
+    const abort = new AbortController()
+    const running = h.conversations.step(request("c1", [GO]), { open() {}, event: () => abort.abort() }, abort.signal)
+    await assert.rejects(running, { name: "AbortError" })
+    assert.equal(h.sessions[0]!.interrupts, 1)
+
+    if (endFirst) await h.conversations.end("c1", "cancelled")
+    const next = request("c2", [GO, partial, user(text("go on"))], {
+      previous: { id: "c1", relation: "continues", shared: 1, ...(endFirst ? {} : { cancelled: true }) },
+    })
+    await h.step(parseStep({ protocol_version: PROTOCOL_VERSION, request: next }))
+    if (!endFirst) await h.conversations.end("c1", "cancelled")
+    assert.equal(h.sessions.length, 1)
+    assert.deepEqual(texts(h.sessions[0]!.sent[1]!.content), ["go on"])
+  })
+}
+
+for (const [description, retained, expected] of [
+  ["empty placeholder", assistant(text("(empty)")), true],
+  ["different text", assistant(text("unrelated")), false],
+  ["tool call", CALL, false],
+] as const) {
+  test(`a finished textless reply checks retained history (${description})`, async () => {
+    const h = harness([[textTurn(" "), textTurn("ok")], [textTurn("replayed")]])
+    await h.step(request("c", [GO]))
+    const followUp = user(text("go on"))
+    await h.step(request("c", [GO, retained, followUp]))
+    if (expected) {
+      assert.equal(h.sessions.length, 1)
+      assert.deepEqual(h.sessions[0]!.sent[1]!.content, followUp.content)
+    } else {
+      assert.equal(h.sessions.length, 2)
+      assert.equal(h.sessions[1]!.options.resumeSessionAt, undefined)
+      assert.match(texts(h.sessions[1]!.sent[0]!.content)[0]!, CHECKPOINT)
+    }
+  })
+}
 
 for (const [hasBoundary, hasFollowUp] of [
   [false, false],
