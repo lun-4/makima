@@ -2614,7 +2614,7 @@ mod tests {
         AgentError, AgentId, AgentRef, ModeDef, ModeRegistry, ModelSource, PreparedModel,
     };
     use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
-    use makima_lua::orchestration::OrchestrationServices;
+    use makima_lua::{PluginHost, orchestration::OrchestrationServices};
     use makima_providers::login::{AuthStatus, InteractionService};
     use makima_providers::model::FastSupport;
     use makima_providers::provider::{BoxFuture, Provider};
@@ -2628,10 +2628,16 @@ mod tests {
     };
     use makima_storage::sessions::{Prefs, SessionMeta, StoredEffect, StoredRule, StoredThinking};
     use std::collections::BTreeMap;
+    use std::iter::from_fn;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use test_case::test_case;
 
+    const SDK_UNAUTHORIZED_STATUS: u16 = 401;
+    const SDK_AUTH_FAILURE: &str =
+        "authentication failed, run `makima auth login` or check your API key";
+    const SDK_AUTH_RESULT_TIMEOUT: &str = "SDK did not report a result after HTTP 401";
+    const SDK_ERROR_RESULT_SUBTYPE: &str = "error_during_execution";
     const SDK_GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const SDK_NESTED_TOOL: &str = "sdk_nested_task";
     const SDK_ROOT_PROMPT: &str = "sdk root request";
@@ -4108,6 +4114,52 @@ mod tests {
             assert_eq!(result, Err(failure.to_string()));
         }
         assert_eq!(session.end_input().len(), 1);
+    }
+
+    #[test]
+    fn protocol_reports_auth_failure_without_an_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let mut params = reset_sdk_params(directory.path().to_path_buf());
+        let model_id = &params.model.id;
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = format!(
+            r#"
+            makima.api.register_provider({{
+                id = "{RESET_PROVIDER}",
+                display_name = "{RESET_PROVIDER}",
+                models = {{{{ id = "{model_id}" }}}},
+                prepare = function()
+                    return {{ stream = function()
+                        return nil, {{ status = {SDK_UNAUTHORIZED_STATUS} }}
+                    end }}
+                end,
+            }})
+            "#
+        );
+        host.load_source(RESET_PROVIDER, &source).unwrap();
+        params.providers = host.provider_registry(params.timeouts).unwrap();
+
+        let (out_tx, out_rx) = flume::unbounded();
+        let session = SdkSession::new(params, storage, out_tx).unwrap();
+        let (user_tx, dispatcher) = session.spawn_dispatcher();
+        let prompt = serde_json::json!({"type": "user", "message": {"content": SDK_ROOT_PROMPT}});
+        assert!(
+            handle_sdk_message(&session, &user_tx, serde_json::from_value(prompt).unwrap())
+                .unwrap()
+        );
+
+        let deadline = Instant::now() + SDK_GATE_TIMEOUT;
+        let result = from_fn(|| out_rx.recv_deadline(deadline).ok())
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .find(|message| message["type"] == "result");
+        drop(user_tx);
+        smol::block_on(dispatcher).unwrap();
+        smol::block_on(session.current().close()).unwrap();
+        let result = result.expect(SDK_AUTH_RESULT_TIMEOUT);
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["subtype"], SDK_ERROR_RESULT_SUBTYPE);
+        assert_eq!(result["result"], SDK_AUTH_FAILURE);
     }
 
     #[test]

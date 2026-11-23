@@ -467,6 +467,7 @@ pub struct ToolContext {
     pub mode: AgentMode,
     pub mode_def: Option<Arc<crate::ModeDef>>,
     pub question_mode: QuestionMode,
+    pub interactive_reauth: bool,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `makima index` one-shot.
@@ -881,6 +882,7 @@ pub fn interpreter_ctx(
             _ => Some(Arc::new(modes.current(mode))),
         },
         question_mode: QuestionMode::Headless,
+        interactive_reauth: false,
         session_id: None,
         cwd,
         tool_use_id: None,

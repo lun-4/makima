@@ -186,6 +186,7 @@ pub struct AgentParams {
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
+    pub interactive_reauth: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub providers: Arc<ProviderRegistry>,
     /// Same-process per-path mutation locks, cloned from the parent context
@@ -232,6 +233,7 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
+    interactive_reauth: bool,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -336,6 +338,7 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
+            interactive_reauth: params.interactive_reauth,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
@@ -829,7 +832,7 @@ impl<'h> Agent<'h> {
                 }
                 return Err(AgentError::Cancelled);
             }
-            Err(StreamError::Other(e)) if e.is_auth_error() => {
+            Err(StreamError::Other(e)) if self.interactive_reauth && e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
             }
             Err(StreamError::Other(e)) => {
@@ -1034,6 +1037,7 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             mode_def: self.mode_def.clone(),
             question_mode: self.question_mode,
+            interactive_reauth: self.interactive_reauth,
             session_id: self.session_id.clone(),
             cwd,
             tool_use_id: None,
@@ -1369,6 +1373,8 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use async_lock::Mutex as AsyncMutex;
+
     use crate::actor::{
         AgentContextSnapshot, EffectiveAgentConfig, PendingSubmission, SubmissionId,
     };
@@ -2037,6 +2043,38 @@ mod tests {
                     .filter(|event| { matches!(event.event, AgentEvent::TurnOutcome(_)) })
                     .count(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn interactive_reauth_ignores_nonempty_answers() {
+        smol::block_on(async {
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([
+                    Err(api_error(401, None)),
+                    Ok(text_response(StopReason::EndTurn)),
+                ])),
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            let (answers, rx) = flume::unbounded();
+            answers
+                .send(String::from("not an auth acknowledgement"))
+                .unwrap();
+            answers.send(String::new()).unwrap();
+            drop(answers);
+            let mut agent =
+                agent.with_user_response_rx(Some(Arc::new(AsyncMutex::new(rx.clone()))));
+            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            assert!(rx.is_empty());
+            assert_eq!(
+                events
+                    .drain()
+                    .filter(|event| matches!(event.event, AgentEvent::AuthRequired))
+                    .count(),
+                1,
             );
         });
     }
@@ -2798,6 +2836,7 @@ mod tests {
             registry: Arc::new(crate::tools::ToolRegistry::new()),
             audience: ToolAudience::MAIN,
             question_mode: crate::tools::QuestionMode::Tui,
+            interactive_reauth: true,
             model_policy: Arc::new(ModelPolicy::default()),
             providers: Arc::default(),
             file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),

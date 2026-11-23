@@ -34,8 +34,8 @@ use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::{AgentEvent, encode_ask_answer};
 use makima_agent::{
-    AgentId, AgentInput, AgentRef, Envelope, ImageMediaType, ImageSource, ModeError, TurnId,
-    TurnTicket,
+    AgentId, AgentInput, AgentRef, Envelope, ImageMediaType, ImageSource, ModeError,
+    TurnFailureKind, TurnId, TurnOutcome, TurnTicket,
 };
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
@@ -2051,6 +2051,7 @@ fn answer(operation: PendingOperation, respond: impl FnMut(RequestId)) {
     requests.into_iter().for_each(respond);
 }
 
+#[cfg(test)]
 fn finish_active_operation(
     pending: &PendingState,
     kind: OperationKind,
@@ -2479,27 +2480,6 @@ fn start_event_pump(
                     }
                     continue;
                 }
-                AgentEvent::AuthRequired => {
-                    tool_inputs.clear();
-                    let cancel = pending
-                        .lock()
-                        .unwrap()
-                        .operation
-                        .as_mut()
-                        .and_then(|operation| operation.cancel.take());
-                    finish_active_operation(&pending, OperationKind::PrimaryTurn, |request_id| {
-                        let error =
-                            AcpError::auth_required().data(Value::String(AUTH_FAILED_MSG.into()));
-                        send(
-                            &out_tx,
-                            Response::<AgentResponse>::new(request_id, Err(error)),
-                        );
-                    });
-                    if let Some(cancel) = cancel {
-                        cancel.cancel();
-                    }
-                    continue;
-                }
                 AgentEvent::Question {
                     id,
                     ask_id,
@@ -2567,19 +2547,23 @@ fn start_event_pump(
                         }
                     }
                     finish_primary_run(&pending, run_id, |request_id| match &outcome {
-                        makima_agent::TurnOutcome::Completed { reason, .. } => {
+                        TurnOutcome::Completed { reason, .. } => {
                             let resp = PromptResponse::new(translate::map_done_reason(*reason));
                             send(
                                 &out_tx,
                                 Response::new(request_id, Ok(AgentResponse::PromptResponse(resp))),
                             );
                         }
-                        makima_agent::TurnOutcome::Cancelled { .. } => {
+                        TurnOutcome::Cancelled { .. } => {
                             respond_prompt(&out_tx, request_id, StopReason::Cancelled);
                         }
-                        makima_agent::TurnOutcome::Failed { failure, .. } => {
-                            let error = AcpError::internal_error()
-                                .data(Value::String(failure.user_message.clone()));
+                        TurnOutcome::Failed { failure, .. } => {
+                            let error = if failure.kind == TurnFailureKind::Authentication {
+                                AcpError::auth_required()
+                                    .data(Value::String(AUTH_FAILED_MSG.into()))
+                            } else {
+                                AcpError::internal_error().data(json_str(&failure.user_message))
+                            };
                             send(
                                 &out_tx,
                                 Response::<AgentResponse>::new(request_id, Err(error)),
@@ -2745,11 +2729,11 @@ mod tests {
     use makima_lua::orchestration::{OrchestrationServices, TurnCompletion};
     use makima_providers::login::{AuthSpec, AuthStatus, InteractionService};
     use makima_providers::provider::{BoxFuture, Provider};
+    use makima_providers::{AgentError, PreparedProvider, ProviderBackend, RegisteredProvider};
     use makima_providers::{
         ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, RequestDelivery, Role,
         TokenUsage,
     };
-    use makima_providers::{PreparedProvider, ProviderBackend, RegisteredProvider};
     use makima_storage::StateDir;
     use makima_storage::checkpoint::{ClaimingWriter, accept_all};
     use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
@@ -2818,6 +2802,8 @@ mod tests {
     const ACP_TURN_END: &str = "turn end ";
     const PARKED_THOUGHT: &str = "parked thought";
     const PARKED_REPLY: &str = "parked reply";
+    const TEST_AUTH_ERROR: &str = "test provider rejected credentials";
+    const TEST_AUTH_STATUS: u16 = 401;
     const SAVE_FAILED: &str = "save failed";
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYIIA";
 
@@ -3339,11 +3325,11 @@ mod tests {
         }
     }
 
-    /// Records the last user message of every request and parks it until
-    /// the test releases it, then thinks and answers.
+    /// Records the last user message and waits for either a provider error
+    /// or permission to reply.
     struct ParkedProvider {
         requests: Sender<Message>,
-        release: Receiver<()>,
+        release: Receiver<Result<(), AgentError>>,
     }
 
     impl makima_providers::provider::Provider for ParkedProvider {
@@ -3370,7 +3356,7 @@ mod tests {
                     .cloned()
                     .unwrap_or_default();
                 let _ = self.requests.send(asked);
-                let _ = self.release.recv_async().await;
+                self.release.recv_async().await.unwrap_or(Ok(()))?;
                 for event in [
                     makima_providers::ProviderEvent::ThinkingDelta {
                         text: PARKED_THOUGHT.into(),
@@ -3400,7 +3386,7 @@ mod tests {
     struct RootTurns {
         actor: makima_agent::AgentActorHandle,
         requests: Receiver<Message>,
-        release: Sender<()>,
+        release: Sender<Result<(), AgentError>>,
     }
 
     impl RootTurns {
@@ -3419,7 +3405,13 @@ mod tests {
 
         /// Lets the oldest parked request answer.
         fn release(&self) {
-            self.release.send(()).unwrap();
+            self.release.send(Ok(())).unwrap();
+        }
+
+        fn reject_auth(&self) {
+            self.release
+                .send(Err(AgentError::api(TEST_AUTH_STATUS, TEST_AUTH_ERROR)))
+                .unwrap();
         }
 
         fn latest(&self) -> TurnTicket {
@@ -3442,6 +3434,18 @@ mod tests {
                 "{outcome:?}"
             );
         }
+    }
+
+    async fn assert_auth_failure(ticket: &TurnTicket) {
+        let outcome = within(ticket.wait(), "the turn parked on authentication").await;
+        assert!(
+            matches!(
+                &outcome,
+                TurnOutcome::Failed { failure, .. }
+                    if failure.kind == TurnFailureKind::Authentication
+            ),
+            "{outcome:?}"
+        );
     }
 
     fn images_of(message: &Message) -> Vec<&ImageSource> {
@@ -3732,6 +3736,8 @@ mod tests {
         CancelWhileQueued,
         CancelWhileParked,
         CancelWhileAsking,
+        AuthWithoutPrompt,
+        AuthWithQueuedPrompt,
         EmitImmediately,
     }
 
@@ -3739,13 +3745,15 @@ mod tests {
     #[test_case(RestoredRootScenario::CancelWhileParked; "cancel_parked_root_before_prompt")]
     #[test_case(RestoredRootScenario::EmitImmediately; "replay_before_immediate_resumed_output")]
     #[test_case(RestoredRootScenario::CancelWhileAsking; "cancel_restored_question_before_prompt")]
+    #[test_case(RestoredRootScenario::AuthWithoutPrompt; "auth_failure_without_prompt")]
+    #[test_case(RestoredRootScenario::AuthWithQueuedPrompt; "auth_failure_with_queued_prompt")]
     fn acp_restored_root_protocol(scenario: RestoredRootScenario) {
         const LOAD_ID: i64 = 1;
         const PROMPT_ID: i64 = 2;
         const OLD_PROMPT: &str = "previous prompt";
         const OLD_REPLY: &str = "previous reply";
         const RESTORED_PROMPT: &str = "interrupted prompt";
-        const NEW_PROMPT: &str = "prompt after cancellation";
+        const NEW_PROMPT: &str = "new prompt after load";
         const NEXT_ANSWER: &str = "next answer";
 
         smol::block_on(async {
@@ -3754,7 +3762,7 @@ mod tests {
             let (requests, received) = flume::unbounded();
             let (release, permits) = flume::unbounded();
             if scenario == RestoredRootScenario::EmitImmediately {
-                release.send(()).unwrap();
+                release.send(Ok(())).unwrap();
             }
             let providers = spawn_test_providers(Arc::new(ParkedProvider {
                 requests,
@@ -3961,6 +3969,56 @@ mod tests {
                     turns.release();
                     let response = prompt_terminal(&out_rx, PROMPT_ID).await;
                     assert_eq!(response["result"]["stopReason"], END_TURN, "{response}");
+                }
+                RestoredRootScenario::AuthWithoutPrompt
+                | RestoredRootScenario::AuthWithQueuedPrompt => {
+                    let response = prompt_terminal(&out_rx, LOAD_ID).await;
+                    assert!(response.get("result").is_some(), "{response}");
+                    let session = server.session.as_ref().unwrap();
+                    let root = session.handle.initialized_root().await.unwrap();
+                    let turns = RootTurns {
+                        actor: root.actor().unwrap(),
+                        requests: received,
+                        release,
+                    };
+                    assert_eq!(turns.next_text().await, RESTORED_PROMPT);
+                    let restored = root.turn_ticket(turn).unwrap();
+                    let request_id = RequestId::Number(PROMPT_ID);
+                    let queued = scenario == RestoredRootScenario::AuthWithQueuedPrompt;
+                    if queued {
+                        const QUEUE_BOUNDARY: &str = "separate restored and new prompts";
+                        // Prevent the new prompt from joining the restored turn.
+                        turns
+                            .actor
+                            .push_control(QUEUE_BOUNDARY.into(), QUEUE_BOUNDARY.into(), None)
+                            .unwrap();
+                        within(
+                            dispatch_prompt(&mut server, NEW_PROMPT, false, &request_id),
+                            "ACP did not admit a prompt behind the restored turn",
+                        )
+                        .await
+                        .unwrap();
+                        assert_ne!(turns.latest().turn_id(), restored.turn_id());
+                        assert_eq!(turns.actor.snapshot().queued, 1);
+                    }
+
+                    turns.reject_auth();
+                    assert_auth_failure(&restored).await;
+
+                    if !queued {
+                        within(
+                            dispatch_prompt(&mut server, NEW_PROMPT, false, &request_id),
+                            "ACP did not admit a prompt after the restored auth failure",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    assert_eq!(turns.next_text().await, NEW_PROMPT);
+                    turns.release();
+                    let response = prompt_terminal(&out_rx, PROMPT_ID).await;
+                    assert_eq!(response["result"]["stopReason"], END_TURN, "{response}");
+                    let pending = &server.session.as_ref().unwrap().pending;
+                    assert!(!pending.lock().unwrap().continuing_root.contains(&turn));
                 }
                 RestoredRootScenario::EmitImmediately => {
                     let expected = [
@@ -5823,6 +5881,169 @@ mod tests {
                     .is_none_or(|session| session.handle.session_id.to_string() != old_session_id),
                 "the cancelled session must be closed even if replacement setup fails: {response}"
             );
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn child_authentication_failure_does_not_fail_parent_prompt() {
+        use makima_lua::ui_sink::{HeadlessUi, HostUi};
+        use makima_providers::{ProviderEvent, RequestOptions, StopReason, StreamResponse};
+
+        const CHILD_PROMPT: &str = "Check child authentication";
+        const SPAWN_ID: &str = "spawn-auth-child";
+        const WAIT_ID: &str = "wait-auth-child";
+        const PROMPT_ID: i64 = 41;
+        const FAILED: &str = "failed";
+
+        struct ChildAuthProvider;
+
+        impl Provider for ChildAuthProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _: &'a Model,
+                messages: &'a [Message],
+                _: &'a str,
+                _: &'a Value,
+                _: &'a Sender<ProviderEvent>,
+                _: RequestOptions,
+                _: Option<&'a SessionRef>,
+                _: &'a Invocation,
+                _: RequestDelivery,
+            ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+                Box::pin(async move {
+                    if messages.iter().any(|message| {
+                        message.role == Role::User && text_of(message) == CHILD_PROMPT
+                    }) {
+                        return Err(AgentError::api(TEST_AUTH_STATUS, TEST_AUTH_ERROR));
+                    }
+
+                    let result = messages
+                        .iter()
+                        .rev()
+                        .flat_map(|message| &message.content)
+                        .find_map(|block| match block {
+                            MsgBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } if tool_use_id == SPAWN_ID || tool_use_id == WAIT_ID => {
+                                assert!(!is_error, "{tool_use_id}: {content}");
+                                let result = serde_json::from_str::<Value>(content).unwrap();
+                                Some((tool_use_id.as_str(), result))
+                            }
+                            _ => None,
+                        });
+                    let block = match result {
+                        None => MsgBlock::tool_use(
+                            SPAWN_ID,
+                            "task_spawn",
+                            serde_json::json!({
+                                "description": CHILD_PROMPT,
+                                "prompt": CHILD_PROMPT,
+                                "subagent_type": "general",
+                            }),
+                        ),
+                        Some((SPAWN_ID, spawned)) => MsgBlock::tool_use(
+                            WAIT_ID,
+                            "task_wait",
+                            serde_json::json!({
+                                "task_id": spawned["task_id"].as_str().unwrap(),
+                                "turn_id": spawned["turn_id"].as_str().unwrap(),
+                            }),
+                        ),
+                        Some((_, waited)) => {
+                            assert_eq!(waited["result"]["status"], FAILED, "{waited}");
+                            assert!(
+                                waited["error"].as_str().unwrap().contains(TEST_AUTH_ERROR),
+                                "{waited}"
+                            );
+                            MsgBlock::Text {
+                                text: "Parent continued".into(),
+                            }
+                        }
+                    };
+                    let stop_reason = if matches!(block, MsgBlock::ToolUse { .. }) {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    };
+                    Ok(StreamResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![block],
+                            ..Default::default()
+                        },
+                        usage: TokenUsage::default(),
+                        stop_reason: Some(stop_reason),
+                    })
+                })
+            }
+        }
+
+        let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
+        configure_test_paths();
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let host = PluginHost::with_jit(
+                Arc::clone(ToolRegistry::global_arc()),
+                true,
+                HostUi::Sink(Box::new(HeadlessUi)),
+            )
+            .unwrap();
+            host.load_source(
+                "acp_bundled_task",
+                include_str!("../../plugins/task/init.lua"),
+            )
+            .unwrap();
+            let providers = spawn_test_providers(Arc::new(ChildAuthProvider));
+            let mut params =
+                test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.path().into());
+            params.providers = providers;
+            params.lua_event_handle = host.event_handle();
+            params.command_registry = host.command_registry();
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut srv = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: host.event_handle(),
+                dispatch: None,
+            };
+            new_session(
+                &mut srv,
+                &serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] } }),
+                &params,
+            )
+            .await
+            .unwrap();
+            within(
+                dispatch_prompt(
+                    &mut srv,
+                    "Run the child",
+                    false,
+                    &RequestId::Number(PROMPT_ID),
+                ),
+                "ACP did not admit the parent prompt",
+            )
+            .await
+            .unwrap();
+            let response = prompt_terminal(&out_rx, PROMPT_ID).await;
+            assert_eq!(response["result"]["stopReason"], END_TURN, "{response}");
+
+            let manager = &srv.session.as_ref().unwrap().handle.manager;
+            let children = manager
+                .list()
+                .into_iter()
+                .filter(|agent| agent.snapshot().unwrap().depth == 1)
+                .collect::<Vec<_>>();
+            let [child] = children.as_slice() else {
+                panic!("expected one spawned child, got {children:?}");
+            };
+            let ticket = manager.latest_retained_turn_ticket(child).unwrap().unwrap();
+            assert_auth_failure(&ticket).await;
             close_session(&mut srv).await;
         });
     }
@@ -9058,72 +9279,77 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_ends_the_prompt_instead_of_parking_the_session() {
-        smol::block_on(async {
-            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
-            let (event_tx, event_rx) = flume::unbounded::<Envelope>();
-            let (session_id, pending) = {
-                let session = srv.session.as_mut().unwrap();
-                session.pending.lock().unwrap().permissions.clear();
-                (
-                    session.handle.session_id.clone(),
-                    Arc::clone(&session.pending),
-                )
-            };
-            start_event_pump(
-                event_rx,
-                session_id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(&pending),
-                false,
-                srv.session.as_ref().unwrap().handle.answer_tx.clone(),
-                srv.session
-                    .as_ref()
-                    .unwrap()
-                    .coordinator
-                    .as_ref()
-                    .unwrap()
-                    .read(),
-                None,
-                PUMP_TRUSTED,
-                None,
-                test_observer(),
-            )
-            .detach();
-            let session_id_str = session_id.to_string();
-            let request_id = RequestId::Number(41);
+    fn provider_auth_failure_returns_auth_required_for_its_prompt() {
+        const NEW_ID: i64 = 40;
+        const PROMPT_ID: i64 = 41;
+        const PROMPT: &str = "prompt needing credentials";
 
-            handle_prompt(
-                &mut srv,
-                &prompt_request(&session_id_str, "first", false),
-                &request_id,
+        smol::block_on(async {
+            let directory = TempDir::new().unwrap();
+            let cwd = directory.path();
+            let (requests, received) = flume::unbounded();
+            let (release, permits) = flume::unbounded();
+            let providers = spawn_test_providers(Arc::new(ParkedProvider {
+                requests,
+                release: permits,
+            }));
+            let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.into());
+            params.providers = providers;
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut server = Server {
+                out_tx,
+                catalog: ModelCatalog::default(),
+                session: None,
+                elicitation: false,
+                supports_boolean: false,
+                lua_event_handle: params.lua_event_handle.clone(),
+                dispatch: None,
+            };
+            within(
+                handle_request(
+                    &mut server,
+                    "session/new",
+                    RequestId::Number(NEW_ID),
+                    &serde_json::json!({ "params": { "cwd": cwd, "mcpServers": [] } }),
+                    &params,
+                ),
+                "ACP session/new did not return",
+            )
+            .await;
+            let response = prompt_terminal(&out_rx, NEW_ID).await;
+            assert!(response.get("result").is_some(), "{response}");
+            let root = server
+                .session
+                .as_ref()
+                .unwrap()
+                .handle
+                .initialized_root()
+                .await
+                .unwrap();
+            let turns = RootTurns {
+                actor: root.actor().unwrap(),
+                requests: received,
+                release,
+            };
+            within(
+                dispatch_prompt(&mut server, PROMPT, false, &RequestId::Number(PROMPT_ID)),
+                "ACP did not admit the prompt",
             )
             .await
             .unwrap();
-            turns.next().await;
-            let first = turns.latest();
+            assert_eq!(turns.next_text().await, PROMPT);
+            turns.reject_auth();
+            assert_auth_failure(&turns.latest()).await;
 
-            event_tx
-                .send_async(Envelope {
-                    event: AgentEvent::AuthRequired,
-                    subagent: None,
-                    identity: None,
-                })
-                .await
-                .unwrap();
-
-            let response = out_rx.recv_async().await.unwrap();
-            assert_eq!(response["id"], 41);
+            let response = prompt_terminal(&out_rx, PROMPT_ID).await;
             assert_eq!(
                 response["error"]["code"],
                 i32::from(AcpError::auth_required().code)
             );
-            assert_eq!(
-                response["error"]["data"], AUTH_FAILED_MSG,
-                "the client is told why the turn ended: {response}"
-            );
-            turns.assert_cancelled(&first).await;
+            assert_eq!(response["error"]["data"], AUTH_FAILED_MSG, "{response}");
+            let pending = &server.session.as_ref().unwrap().pending;
             assert!(pending.lock().unwrap().operation.is_none());
+            close_session(&mut server).await;
         });
     }
 
