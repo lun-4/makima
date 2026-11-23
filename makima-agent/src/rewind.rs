@@ -182,19 +182,7 @@ impl RewindGuard {
         );
         let conversation = ConversationState::fresh(None);
         let root = self.agent.id();
-        let queue = self.journal.snapshot().fold().map_err(JournalError::from)?;
-        let cleared_turns: Vec<_> = queue
-            .scopes
-            .get(&Some(root))
-            .into_iter()
-            .flat_map(|scope| {
-                scope
-                    .admitted
-                    .keys()
-                    .filter(|turn| scope.turn_inputs.contains_key(turn))
-                    .copied()
-            })
-            .collect();
+        let cleared_turns = self.idle.cut_rewind_queue(&self.journal)?;
         let record: SessionRecord<Message, TokenUsage, ToolOutput> = SessionRecord::Fork {
             target: predecessor,
             note_id: MakimaId::generate(),
@@ -270,6 +258,7 @@ mod tests {
     use crate::{
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
         TurnCancellationReason, TurnOutcome,
+        actor::TurnAdmissionOptions,
         journal::{JournalChange, JournalCommit, SessionJournal},
         session_writer::{Record, SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
@@ -298,7 +287,7 @@ mod tests {
     const FORK: &str = "fork";
     const TORN_DRAFT: &[u8] = br#"{"t":"draft","text":"incomplete"#;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-    const LATE_PROMPT_CANCELLED: &str = "prompt admitted during fork write did not run";
+    const LATE_PROMPT_CANCELLED: &str = "prompt submitted during fork write did not run";
 
     struct ForkGateIo {
         file: File,
@@ -322,8 +311,8 @@ mod tests {
         }
     }
 
-    #[test_case((); "durable_queue_cut")]
-    fn prompt_admitted_during_fork_write_survives_rewind(_: ()) {
+    #[test]
+    fn batchable_prompt_submitted_during_fork_write_survives_rewind() {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let session = StoredSession::new("test", "/");
@@ -369,22 +358,24 @@ mod tests {
             let actor = root.actor().unwrap();
             let target = journal.snapshot().histories[&root.id()].ids[0];
             let guard = root.begin_rewind(&session).unwrap();
-            let admit = |prompt: &str| {
+            let submit = |prompt: &str| {
                 actor
-                    .admit_turn(
+                    .submit(
                         AgentInput::new(prompt.into(), Vec::new()),
                         None,
                         String::new(),
+                        TurnAdmissionOptions::default(),
                     )
                     .unwrap()
             };
-            let old = admit(OLD_QUEUE);
+            let old = submit(OLD_QUEUE);
             let fork = smol::spawn(guard.commit(RewindTargetId::Message(target)));
             writing.recv_async().await.unwrap();
-            let late = admit(REPLACEMENT);
+            let late = submit(REPLACEMENT);
             assert!(late.peek().is_none());
             release.send(()).unwrap();
             fork.await.unwrap();
+            assert_ne!(old.turn_id(), late.turn_id());
             assert!(matches!(
                 old.wait().await,
                 TurnOutcome::Cancelled {
@@ -402,9 +393,12 @@ mod tests {
             writer.append(Vec::new()).await.unwrap();
             let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
             let state = reopened.latest_state().unwrap();
-            let admitted = &state.scopes[&Some(root.id())].admitted;
-            assert!(!admitted.contains_key(&old.turn_id()));
-            assert!(admitted.contains_key(&late.turn_id()));
+            let scope = &state.scopes[&Some(root.id())];
+            assert!(!scope.admitted.contains_key(&old.turn_id()));
+            assert!(scope.admitted.contains_key(&active.0));
+            let replayed: AgentInput =
+                serde_json::from_value(scope.turn_inputs[&active.0].clone()).unwrap();
+            assert_eq!(replayed.message, active.1);
 
             finish.send(()).unwrap();
             late.wait().await;

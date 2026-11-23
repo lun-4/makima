@@ -9,7 +9,10 @@ use super::{
     ConfigCommit, HistoryEditWork, PreparedOperationTicket, PreparedTurn, TurnTicket,
     lifecycle_error,
 };
-use crate::{AgentId, TurnId};
+use crate::{
+    AgentId, TurnId,
+    journal::{JournalError, SessionJournal},
+};
 
 #[derive(Clone)]
 pub struct ActorSourceSnapshot {
@@ -67,6 +70,33 @@ impl ActorIdleGuard {
             },
             history: self.actor.inner.history.load_full().as_ref().clone(),
         })
+    }
+
+    pub(crate) fn cut_rewind_queue(
+        &self,
+        journal: &SessionJournal,
+    ) -> Result<Vec<TurnId>, JournalError> {
+        let mut state = self.actor.inner.state.lock_unpoisoned();
+        let queue = journal.snapshot().fold().map_err(JournalError::from)?;
+        let Some(scope) = queue.scopes.get(&Some(self.actor.agent_id())) else {
+            return Ok(Vec::new());
+        };
+        let cleared_turns: Vec<_> = scope
+            .admitted
+            .keys()
+            .filter(|turn| scope.turn_inputs.contains_key(turn))
+            .copied()
+            .collect();
+        if cleared_turns.iter().any(|turn| {
+            state
+                .instructions
+                .get(turn)
+                .is_some_and(|inbox| inbox.submit_operation == Some(state.next_operation_id))
+        }) {
+            // Advance the batch boundary without closing an inbox the fork might leave intact.
+            state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        }
+        Ok(cleared_turns)
     }
 
     pub(crate) fn rewind_history(&self) -> HistorySnapshot<Message> {
