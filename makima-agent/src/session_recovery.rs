@@ -31,7 +31,8 @@ use std::{
     sync::Arc,
 };
 
-const CONTINUATION_DISABLED: &str = "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
+pub(crate) const CONTINUATION_DISABLED: &str =
+    "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
 const CONTINUE_ALL_AGENTS_ENV: &str = "MAKIMA_CONTINUE_ALL_AGENTS";
 const SEQUENCE_EXHAUSTED: &str = "session recovery exhausted the state sequence";
 const DRAFT_SEPARATOR: &str = "\n\n";
@@ -426,7 +427,8 @@ impl RecoveryCandidate {
                 records.push(SessionRecord::State { d: record });
             }
         }
-        // A parent can consume a report before the child's terminal record reaches disk.
+        // Queue failure reports before terminal results. Read historical queue records here
+        // because a parent can consume its report before the child's turn is settled.
         let mut reported: BTreeMap<_, _> = session
             .state()
             .iter()
@@ -450,109 +452,95 @@ impl RecoveryCandidate {
         for (&agent, scope) in &view.scopes {
             let Some(agent) = agent else { continue };
             for (&turn, origin) in &scope.admitted {
-                let reported_result = reported.remove(&(agent, turn));
-                if continue_turns && reported_result.is_none() {
+                let result = if let Some(result) = reported.remove(&(agent, turn)) {
+                    result
+                } else if continue_turns {
                     continue;
-                }
+                } else {
+                    let child = view
+                        .agents
+                        .get(&agent)
+                        .filter(|record| record.parent.is_some());
+                    let status = if child.is_some() {
+                        StoredTurnStatus::Failed {
+                            failure: StoredTurnFailure {
+                                kind: StoredTurnFailureKind::Internal,
+                                diagnostic: CONTINUATION_DISABLED.into(),
+                                user_message: CONTINUATION_DISABLED.into(),
+                                retryable: false,
+                            },
+                        }
+                    } else {
+                        StoredTurnStatus::Cancelled {
+                            reason: StoredCancellationReason::Interrupted,
+                        }
+                    };
+                    let result = StoredTurnResult {
+                        outcome: StoredTurnOutcome {
+                            agent_id: agent,
+                            turn_id: turn,
+                            usage: Default::default(),
+                            num_turns: 0,
+                            cost: None,
+                            list_cost: None,
+                            context_size: 0,
+                            context_window: 0,
+                            status,
+                        },
+                        text: StoredPayload::Inline(String::new()),
+                        output: StoredPayload::Inline(Vec::new()),
+                        provenance: StoredTurnProvenance {
+                            origin: origin.clone(),
+                            plugin: None,
+                            plugin_generation: None,
+                            source_agent: None,
+                            source_turn: None,
+                        },
+                        duration_ms: 0,
+                    };
+                    if let Some(child) = child
+                        && let Some(parent) = child.parent
+                        && child
+                            .spec
+                            .as_ref()
+                            .is_some_and(|spec| spec.auto_deliver && !spec.silent)
+                    {
+                        seq = seq
+                            .checked_add(1)
+                            .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                        let delivery = StoredStateRecord {
+                            seq,
+                            agent: Some(parent),
+                            generation: view
+                                .scopes
+                                .get(&Some(parent))
+                                .map_or(0, |scope| scope.generation),
+                            change: StateChange::Delivery {
+                                id: (agent, turn),
+                                op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                                    label: child.label.clone(),
+                                    result: result.clone(),
+                                    held: false,
+                                    preview_bytes: None,
+                                })),
+                            },
+                        };
+                        session.push_state(delivery.clone());
+                        records.push(SessionRecord::State { d: delivery });
+                    }
+                    result
+                };
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
-                if let Some(result) = reported_result {
-                    let record = StoredStateRecord {
-                        seq,
-                        agent: Some(agent),
-                        generation: scope.generation,
-                        change: StateChange::Turn { turn, result },
-                    };
-                    session.push_state(record.clone());
-                    records.push(SessionRecord::State { d: record });
-                    continue;
-                }
-                let child = view
-                    .agents
-                    .get(&agent)
-                    .filter(|record| record.parent.is_some());
-                let status = if child.is_some() {
-                    StoredTurnStatus::Failed {
-                        failure: StoredTurnFailure {
-                            kind: StoredTurnFailureKind::Internal,
-                            diagnostic: CONTINUATION_DISABLED.into(),
-                            user_message: CONTINUATION_DISABLED.into(),
-                            retryable: false,
-                        },
-                    }
-                } else {
-                    StoredTurnStatus::Cancelled {
-                        reason: StoredCancellationReason::Interrupted,
-                    }
-                };
                 let record = StoredStateRecord {
                     seq,
                     agent: Some(agent),
                     generation: scope.generation,
-                    change: StateChange::Turn {
-                        turn,
-                        result: StoredTurnResult {
-                            outcome: StoredTurnOutcome {
-                                agent_id: agent,
-                                turn_id: turn,
-                                usage: Default::default(),
-                                num_turns: 0,
-                                cost: None,
-                                list_cost: None,
-                                context_size: 0,
-                                context_window: 0,
-                                status,
-                            },
-                            text: StoredPayload::Inline(String::new()),
-                            output: StoredPayload::Inline(Vec::new()),
-                            provenance: StoredTurnProvenance {
-                                origin: origin.clone(),
-                                plugin: None,
-                                plugin_generation: None,
-                                source_agent: None,
-                                source_turn: None,
-                            },
-                            duration_ms: 0,
-                        },
-                    },
+                    change: StateChange::Turn { turn, result },
                 };
-                if let Some(child) = child
-                    && let Some(parent) = child.parent
-                    && child
-                        .spec
-                        .as_ref()
-                        .is_some_and(|spec| spec.auto_deliver && !spec.silent)
-                    && let StateChange::Turn { result, .. } = &record.change
-                {
-                    seq = seq
-                        .checked_add(1)
-                        .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
-                    let delivery = StoredStateRecord {
-                        seq,
-                        agent: Some(parent),
-                        generation: view
-                            .scopes
-                            .get(&Some(parent))
-                            .map_or(0, |scope| scope.generation),
-                        change: StateChange::Delivery {
-                            id: (agent, turn),
-                            op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                                label: child.label.clone(),
-                                result: result.clone(),
-                                held: false,
-                                preview_bytes: None,
-                            })),
-                        },
-                    };
-                    session.push_state(record.clone());
-                    records.push(SessionRecord::State { d: record });
-                    session.push_state(delivery.clone());
-                    records.push(SessionRecord::State { d: delivery });
-                } else {
-                    session.push_state(record.clone());
-                    records.push(SessionRecord::State { d: record });
-                }
+                session.push_state(record.clone());
+                records.push(SessionRecord::State { d: record });
             }
         }
         if restore_draft {

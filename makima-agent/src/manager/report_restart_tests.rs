@@ -10,7 +10,7 @@ use crate::{
         TurnResult, graph_quiescence_barrier,
     },
     journal::{JournalChange, JournalCommit, SessionJournal},
-    session_recovery::RecoveryCandidate,
+    session_recovery::{CONTINUATION_DISABLED, RecoveredSession, RecoveryCandidate},
     session_writer::{Record, SessionWriter, forget},
     test_util::MockBackend,
 };
@@ -20,7 +20,7 @@ use makima_storage::{
     checkpoint::CheckpointPublication,
     session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
-        StoredDeliveryOp, StoredModeCeiling, StoredTurnOrigin,
+        StoredDeliveryOp, StoredModeCeiling, StoredStateRecord, StoredTurnOrigin,
     },
     sessions::Session,
     test_util::test_record,
@@ -53,6 +53,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const FAILURE_REPORT_TIMEOUT: &str = "restored child failure report did not settle";
 const FAILURE_REPORT_MISSING: &str = "restored child failure report did not execute";
 const TERMINAL_RECORD_MISSING: &str = "recovery terminal record is missing from the log";
+const QUEUED_RECORD_MISSING: &str = "recovery report record is missing from the log";
 const PUBLICATION_REJECTED: &str = "recovery publication rejected";
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -314,10 +315,10 @@ async fn crash(manager: AgentManagerHandle, events: &flume::Receiver<Progress>, 
     }
     drop(manager);
 }
-fn report_count(session: &StoredSession, delivery: &ChildDelivery) -> usize {
+fn report_count(session: &StoredSession, child: AgentId, turn: TurnId) -> usize {
     let source = ObservationSource::ChildResult {
-        agent_id: delivery.result.outcome.agent_id().to_string(),
-        turn_id: delivery.result.outcome.turn_id().to_string(),
+        agent_id: child.to_string(),
+        turn_id: turn.to_string(),
     };
     session
         .messages()
@@ -369,7 +370,7 @@ async fn scenario(resident: bool, withdraw: bool) {
         &queued.scopes[&Some(parent)].deliveries[&identity],
         StoredDeliveryOp::Queued(_)
     ));
-    assert_eq!(report_count(&saved, &delivery), 0);
+    assert_eq!(report_count(&saved, identity.0, identity.1), 0);
     journal
         .commit(JournalCommit {
             changes: vec![JournalChange {
@@ -427,7 +428,7 @@ async fn scenario(resident: bool, withdraw: bool) {
         saved.latest_state().unwrap().scopes[&Some(parent)].deliveries[&identity],
         terminal
     );
-    assert_eq!(report_count(&saved, &delivery), expected);
+    assert_eq!(report_count(&saved, identity.0, identity.1), expected);
     assert_eq!(executions.load(Ordering::SeqCst), expected);
     drop(actor);
     crash(manager, &events, true).await;
@@ -441,7 +442,7 @@ async fn scenario(resident: bool, withdraw: bool) {
             terminal
         );
         assert_eq!(
-            report_count(&session, &delivery),
+            report_count(&session, identity.0, identity.1),
             if compact { expected } else { 0 }
         );
         let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
@@ -465,7 +466,7 @@ async fn scenario(resident: bool, withdraw: bool) {
             let saved = publish(&journal, &mut session, directory.path()).await;
             assert!(saved.history_snapshot().compacted);
             assert_eq!(saved.messages()[0].first_text_content(), Some(SUMMARY));
-            assert_eq!(report_count(&saved, &delivery), 0);
+            assert_eq!(report_count(&saved, identity.0, identity.1), 0);
             assert_eq!(
                 saved.latest_state().unwrap().scopes[&Some(parent)].deliveries[&identity],
                 terminal
@@ -493,6 +494,141 @@ fn restored_child_failure_reaches_parent_exactly_once(
             panic!("{FAILURE_REPORT_TIMEOUT}");
         },
     ));
+}
+
+#[derive(PartialEq, Eq)]
+enum FailurePrefix {
+    Queued,
+    Terminal,
+    Consumed,
+}
+
+#[test_case(FailurePrefix::Queued; "after_queue")]
+#[test_case(FailurePrefix::Terminal; "after_terminal")]
+#[test_case(FailurePrefix::Consumed; "after_consumption")]
+fn disabled_continuation_failure_reaches_parent_exactly_once(prefix: FailurePrefix) {
+    smol::block_on(or(disabled_continuation_scenario(prefix), async {
+        smol::Timer::after(TIMEOUT).await;
+        panic!("{FAILURE_REPORT_TIMEOUT}");
+    }));
+}
+
+async fn disabled_continuation_scenario(prefix: FailurePrefix) {
+    let directory = TempDir::new().unwrap();
+    let directory = directory.path();
+    let (session, child, turn) = seed_recovery_failure(directory).await;
+    let id = session.id;
+    let parent = session.root_agent_id().unwrap();
+    recover(directory, session, false).await;
+    forget(directory, id).unwrap();
+    let path = directory.join(format!("{id}.jsonl"));
+    let is_report = |record: &StoredStateRecord| {
+        record.agent == Some(parent)
+            && matches!(record.change, StateChange::Delivery {
+                id, op: StoredDeliveryOp::Queued(_)
+            } if id == (child, turn))
+    };
+    let terminal_on_disk = prefix == FailurePrefix::Terminal;
+    if terminal_on_disk {
+        truncate_log(
+            &path,
+            true,
+            |record| {
+                record.agent == Some(child)
+                    && matches!(record.change, StateChange::Turn { turn: terminal, .. } if terminal == turn)
+            },
+            TERMINAL_RECORD_MISSING,
+        );
+    } else {
+        truncate_log(&path, true, is_report, QUEUED_RECORD_MISSING);
+    }
+    let mut session = StoredSession::load_from(id, directory).unwrap();
+    let view = session.latest_state().unwrap();
+    assert_eq!(
+        view.scopes[&Some(child)].admitted.contains_key(&turn),
+        !terminal_on_disk
+    );
+    let Some(StoredDeliveryOp::Queued(report)) =
+        view.scopes[&Some(parent)].deliveries.get(&(child, turn))
+    else {
+        panic!("{QUEUED_RECORD_MISSING}");
+    };
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (progress, events) = flume::unbounded();
+    let activate_parent = async |manager: &AgentManagerHandle| {
+        let (actor, start) = activate(
+            manager,
+            parent,
+            &executions,
+            &progress,
+            Some(CONTINUATION_DISABLED),
+        )
+        .await;
+        start.send(()).unwrap();
+        actor
+    };
+    let already_consumed = prefix == FailurePrefix::Consumed;
+    if already_consumed {
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        journal
+            .bind_writer(SessionWriter::open_session(directory, &session).unwrap())
+            .unwrap();
+        let manager = restore(&journal);
+        let actor = activate_parent(&manager).await;
+        wait_for_report(&journal, parent, &events).await;
+        settled(&actor).await;
+        journal.flush().await.unwrap();
+        drop(actor);
+        crash(manager, &events, true).await;
+        forget(directory, id).unwrap();
+        session = StoredSession::load_from(id, directory).unwrap();
+        let view = session.latest_state().unwrap();
+        assert!(view.scopes[&Some(child)].admitted.contains_key(&turn));
+        assert_eq!(
+            view.scopes[&Some(parent)].deliveries[&(child, turn)],
+            StoredDeliveryOp::Consumed
+        );
+    }
+    let recovered = recover(directory, session, true).await;
+    let journal = recovered.journal();
+    let manager = restore(&journal);
+    assert_child_does_not_rerun(&manager, child).await;
+    let actor = activate_parent(&manager).await;
+    if !already_consumed {
+        wait_for_report(&journal, parent, &events).await;
+    }
+    settled(&actor).await;
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    journal.flush().await.unwrap();
+    let saved = StoredSession::load_from(id, directory).unwrap();
+    let view = saved.latest_state().unwrap();
+    let child_scope = &view.scopes[&Some(child)];
+    assert!(child_scope.admitted.is_empty());
+    assert!(child_scope.results.contains(&(turn, report.result.clone())));
+    assert_eq!(
+        child_scope
+            .results
+            .iter()
+            .filter(|(id, _)| *id == turn)
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.scopes[&Some(parent)].deliveries[&(child, turn)],
+        StoredDeliveryOp::Consumed
+    );
+    assert_eq!(
+        saved
+            .state()
+            .iter()
+            .filter(|record| is_report(record))
+            .count(),
+        1
+    );
+    assert_eq!(report_count(&saved, child, turn), 1);
+    drop(actor);
+    crash(manager, &events, true).await;
+    forget(directory, id).unwrap();
 }
 
 async fn seed_recovery_failure(directory: &Path) -> (StoredSession, AgentId, TurnId) {
@@ -534,6 +670,100 @@ async fn seed_recovery_failure(directory: &Path) -> (StoredSession, AgentId, Tur
         .unwrap();
     let session = publish(&journal, &mut session, directory).await;
     (session, child, turn)
+}
+
+fn truncate_log(
+    path: &Path,
+    keep_record: bool,
+    matches: impl Fn(&StoredStateRecord) -> bool,
+    missing: &str,
+) {
+    let log = read(path).unwrap();
+    let mut offset = 0;
+    let boundary = log
+        .split_inclusive(|byte| *byte == b'\n')
+        .find_map(|line| {
+            let start = offset;
+            offset += line.len();
+            match serde_json::from_slice::<Record>(line).unwrap() {
+                Record::State { d } if matches(&d) => {
+                    Some(if keep_record { offset } else { start })
+                }
+                _ => None,
+            }
+        })
+        .expect(missing);
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(boundary as u64)
+        .unwrap();
+}
+
+async fn recover(
+    directory: &Path,
+    session: StoredSession,
+    continue_turns: bool,
+) -> RecoveredSession {
+    let writer = SessionWriter::open_session(directory, &session).unwrap();
+    RecoveryCandidate::prepare_with_continuation(session, continue_turns)
+        .unwrap()
+        .publish(
+            &writer,
+            CheckpointPublication::default(),
+            Arc::new(|publication| {
+                publication
+                    .try_publish()
+                    .then_some(())
+                    .ok_or_else(|| Arc::from(PUBLICATION_REJECTED))
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+async fn assert_child_does_not_rerun(manager: &AgentManagerHandle, child: AgentId) {
+    let child_executions = Arc::new(AtomicUsize::new(0));
+    let child_actor = manager
+        .ensure_resident_with(child, |_| {
+            let child_executions = Arc::clone(&child_executions);
+            async move {
+                let backend = MockBackend::STRICT.with_turn(move |_, context, _, _| {
+                    child_executions.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        BackendResult::EnteredRun(TurnOutcome::completed(
+                            context.agent_id,
+                            context.turn_id.unwrap(),
+                            TokenUsage::default(),
+                            0,
+                            DoneReason::EndTurn,
+                        ))
+                    })
+                });
+                Ok(resident_agent(backend, None))
+            }
+        })
+        .await
+        .unwrap()
+        .actor()
+        .unwrap();
+    settled(&child_actor).await;
+    assert_eq!(child_executions.load(Ordering::SeqCst), 0);
+}
+
+async fn wait_for_report(
+    journal: &SessionJournal,
+    parent: AgentId,
+    events: &flume::Receiver<Progress>,
+) {
+    let Progress::Turn(parent_turn) = events.recv_async().await.unwrap() else {
+        panic!("{FAILURE_REPORT_MISSING}");
+    };
+    journal
+        .wait_terminal_conversion(parent, parent_turn)
+        .await
+        .unwrap();
 }
 
 async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Option<bool>) {
@@ -594,31 +824,15 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         crash(manager, &events, false).await;
         forget(directory, session.id).unwrap();
         let path = directory.join(format!("{}.jsonl", session.id));
-        let log = read(&path).unwrap();
-        let mut offset = 0;
-        let boundary = log
-            .split_inclusive(|byte| *byte == b'\n')
-            .find_map(|line| {
-                let start = offset;
-                offset += line.len();
-                match serde_json::from_slice::<Record>(line).unwrap() {
-                    Record::State { d }
-                        if d.agent == Some(child)
-                            && matches!(d.change,
-                    StateChange::Turn { turn: terminal, .. } if terminal == turn) =>
-                    {
-                        Some(if terminal_on_disk { offset } else { start })
-                    }
-                    _ => None,
-                }
-            })
-            .expect(TERMINAL_RECORD_MISSING);
-        File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_len(boundary as u64)
-            .unwrap();
+        truncate_log(
+            &path,
+            terminal_on_disk,
+            |record| {
+                record.agent == Some(child)
+                    && matches!(record.change, StateChange::Turn { turn: terminal, .. } if terminal == turn)
+            },
+            TERMINAL_RECORD_MISSING,
+        );
         session = StoredSession::load_from(session.id, directory).unwrap();
         let view = session.latest_state().unwrap();
         assert_eq!(
@@ -630,50 +844,11 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         else {
             panic!("{FAILURE_REPORT_MISSING}");
         };
-        let writer = SessionWriter::open_session(directory, &session).unwrap();
-        let recovered = RecoveryCandidate::prepare_with_continuation(session, true)
-            .unwrap()
-            .publish(
-                &writer,
-                CheckpointPublication::default(),
-                Arc::new(|publication| {
-                    publication
-                        .try_publish()
-                        .then_some(())
-                        .ok_or_else(|| Arc::from(PUBLICATION_REJECTED))
-                }),
-            )
-            .await
-            .unwrap();
+        let recovered = recover(directory, session, true).await;
         session = StoredSession::load_from(recovered.session().id, directory).unwrap();
         journal = recovered.journal();
         manager = restore(&journal);
-        let child_executions = Arc::new(AtomicUsize::new(0));
-        let child_actor = manager
-            .ensure_resident_with(child, |_| {
-                let child_executions = Arc::clone(&child_executions);
-                async move {
-                    let backend = MockBackend::STRICT.with_turn(move |_, context, _, _| {
-                        child_executions.fetch_add(1, Ordering::SeqCst);
-                        Box::pin(async move {
-                            BackendResult::EnteredRun(TurnOutcome::completed(
-                                context.agent_id,
-                                context.turn_id.unwrap(),
-                                TokenUsage::default(),
-                                0,
-                                DoneReason::EndTurn,
-                            ))
-                        })
-                    });
-                    Ok(resident_agent(backend, None))
-                }
-            })
-            .await
-            .unwrap()
-            .actor()
-            .unwrap();
-        settled(&child_actor).await;
-        assert_eq!(child_executions.load(Ordering::SeqCst), 0);
+        assert_child_does_not_rerun(&manager, child).await;
         let view = session.latest_state().unwrap();
         assert!(
             view.scopes[&Some(child)]
@@ -697,13 +872,7 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         start.send(()).unwrap();
         actor
     };
-    let Progress::Turn(parent_turn) = events.recv_async().await.unwrap() else {
-        panic!("{FAILURE_REPORT_MISSING}");
-    };
-    journal
-        .wait_terminal_conversion(parent, parent_turn)
-        .await
-        .unwrap();
+    wait_for_report(&journal, parent, &events).await;
     let ticket = manager
         .retained_turn_ticket(&manager.reference(child), turn)
         .unwrap();
@@ -727,7 +896,7 @@ async fn restored_child_failure_scenario(resident: bool, terminal_on_disk: Optio
         view.scopes[&Some(parent)].deliveries[&(child, turn)],
         StoredDeliveryOp::Consumed
     );
-    assert_eq!(report_count(&saved, &delivery), 1);
+    assert_eq!(report_count(&saved, child, turn), 1);
     drop(actor);
     crash(manager, &events, true).await;
     if terminal_on_disk.is_some() {
