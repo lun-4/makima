@@ -1273,8 +1273,8 @@ fn bundled_commands_project_complete_metadata() {
             ),
             (
                 "/goal".into(),
-                "Goal tracking (not available yet)".into(),
-                None,
+                "Show, set, pause, resume, or clear the root session goal".into(),
+                Some("[<objective>|pause|resume|clear]".into()),
                 None,
                 true
             ),
