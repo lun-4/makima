@@ -12,6 +12,7 @@ use crate::api::session_option::ensure_validation_not_in_progress;
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::pair::{err_pair, try_pair};
+use crate::docs::{FnDoc, ParamDoc};
 use crate::runtime::{active_task_id, current_plugin, in_delegated_tool, validate_plugin_effect};
 
 struct RecordAccess {
@@ -79,6 +80,71 @@ struct IdleWake {
     revoke: CancelToken,
 }
 impl UserData for IdleWake {}
+
+#[allow(non_upper_case_globals)]
+pub(super) const tool_transition__doc: FnDoc = FnDoc {
+    name: "tool_transition",
+    args: "{ctx}, {name}, {reduce}",
+    desc: "Reduce actor-ordered facts for your opt-in tool on a pinned TUI root with a live session lease. The synchronous reducer must not yield. It receives {facts, latest, plan, faulted, closing, record}; facts are exposed {turn, scope}, settled {turn, outcome}, or stopped {reason}. latest is the latest settled turn ID. record:read(key) and record:write(key, table) are bounded, lease-checked sidecar operations valid only inside the reducer. A missing record returns nil without an error. Return {revision, scope} to publish an active revision, or nil to disarm and detach. This does not attach a detached tool. A failed reducer disarms the attachment.",
+    params: &[
+        ParamDoc {
+            name: "{ctx}",
+            ty: "LuaCtx",
+            desc: "Trusted invocation pinned to this exact root.",
+        },
+        ParamDoc {
+            name: "{name}",
+            ty: "string",
+            desc: "An opt-in tool owned by the invoking plugin, with a lifecycle controller.",
+        },
+        ParamDoc {
+            name: "{reduce}",
+            ty: "function",
+            desc: "Synchronous reducer. Use opaque IDs from new_revision_id() for activation revisions and counter scopes.",
+        },
+    ],
+    returns: "(table?, string?) On success, may carry an opaque wake fence in wake when the revision is active and there is a settled turn.",
+    example: "",
+    guard: None,
+};
+
+#[allow(non_upper_case_globals)]
+pub(super) const wake_with_tool__doc: FnDoc = FnDoc {
+    name: "wake_with_tool",
+    args: "{ctx}, {wake}, {message}",
+    desc: "Ask the TUI to admit an idle turn for a lifecycle-controlled attachment. The host first gives ordinary input and child delivery priority, then checks the exact settled turn, attachment, policy, and history fence. Busy or stale wakes are dropped, not queued. A successful return means only that the TUI received the request for consideration.",
+    params: &[
+        ParamDoc {
+            name: "{ctx}",
+            ty: "LuaCtx",
+            desc: "Trusted invocation pinned to the same root.",
+        },
+        ParamDoc {
+            name: "{wake}",
+            ty: "userdata",
+            desc: "Fence returned by tool_transition.",
+        },
+        ParamDoc {
+            name: "{message}",
+            ty: "string",
+            desc: "User-role text for the new turn.",
+        },
+    ],
+    returns: "(boolean?, string?) Success or a routing error.",
+    example: "",
+    guard: None,
+};
+
+#[allow(non_upper_case_globals)]
+pub(super) const new_revision_id__doc: FnDoc = FnDoc {
+    name: "new_revision_id",
+    args: "",
+    desc: "Generate a fresh opaque ID for a lifecycle controller revision or scope.",
+    params: &[],
+    returns: "(string) Opaque ID.",
+    example: "",
+    guard: None,
+};
 
 pub(crate) fn register_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
     methods.add_method(

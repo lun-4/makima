@@ -766,6 +766,10 @@ fn agent_msg_with_run_id(event: AgentEvent, presentation: u64) -> Msg {
     }))
 }
 
+pub(crate) fn hold_recovery_text(app: &mut App, text: String) {
+    app.recoverable_queue.push(text);
+}
+
 pub(crate) fn work_identity(presentation: u64) -> makima_agent::ActorWorkIdentity {
     makima_agent::ActorWorkIdentity::new(
         AgentId::generate(),

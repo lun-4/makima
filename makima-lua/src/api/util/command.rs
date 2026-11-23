@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use makima_agent::{AgentRef, SharedBuf};
+use makima_agent::{AgentId, AgentRef, SharedBuf};
 use makima_commands::{CommandArguments, PositionalArgument};
 use makima_storage::id::MakimaId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
@@ -24,11 +24,23 @@ pub struct StatusEntry {
 
 pub type StatusContent = Vec<StatusEntry>;
 pub type StatusContentEntries = Vec<(Arc<str>, StatusContent)>;
+pub type RootStatusContent = Vec<(AgentId, StatusContent)>;
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct StatusContentSnapshot {
     pub entries: StatusContentEntries,
+    pub roots: RootStatusContent,
     pub generation: u64,
+}
+
+impl StatusContentSnapshot {
+    pub fn for_agent(&self, displayed: Option<AgentId>) -> impl Iterator<Item = &StatusContent> {
+        self.entries.iter().map(|(_, content)| content).chain(
+            self.roots
+                .iter()
+                .filter_map(move |(root, content)| (Some(*root) == displayed).then_some(content)),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -67,15 +79,13 @@ impl StatusContentWriter {
         self.generation.load(Ordering::Acquire)
     }
 
-    pub fn publish(&self, entries: StatusContentEntries) -> bool {
-        if self.store.load().entries == entries {
+    pub fn publish(&self, mut snapshot: StatusContentSnapshot) -> bool {
+        let current = self.store.load();
+        if current.entries == snapshot.entries && current.roots == snapshot.roots {
             return false;
         }
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(StatusContentSnapshot {
-            entries,
-            generation,
-        }));
+        snapshot.generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.store(Arc::new(snapshot));
         true
     }
 }
@@ -795,11 +805,15 @@ mod tests {
             }],
         )];
 
-        assert!(writer.publish(entries.clone()));
+        let snapshot = StatusContentSnapshot {
+            entries,
+            ..Default::default()
+        };
+        assert!(writer.publish(snapshot.clone()));
         assert_eq!(reader.load_full().generation, 1);
-        assert!(!writer.publish(entries));
+        assert!(!writer.publish(snapshot));
         assert_eq!(reader.load_full().generation, 1);
-        assert!(writer.publish(Vec::new()));
+        assert!(writer.publish(StatusContentSnapshot::default()));
         assert_eq!(reader.load_full().generation, 2);
     }
 

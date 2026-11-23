@@ -162,6 +162,12 @@ impl ActorState {
         self.policy_generation == fence.policy_generation
             && epoch == fence.history_epoch
             && self
+                .tool_attachments
+                .get(&fence.name)
+                .is_some_and(|activation| {
+                    activation.id == fence.revision && !activation.owner.is_cancelled()
+                })
+            && self
                 .tool_mailboxes
                 .get(&fence.name)
                 .is_some_and(|mailbox| mailbox.accepts(fence.revision) && mailbox.facts.is_empty())

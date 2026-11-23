@@ -5522,14 +5522,30 @@ fn goal_fixture() -> (
         .unwrap();
     let sidecar =
         makima_storage::plugin_session::PluginSession::new(id, lease.publication_guard()).unwrap();
+    let (manager, root, target, requests, events) = open_goal_root(&host, sidecar.clone());
+    (
+        host, dir, lease, sidecar, manager, root, target, requests, events,
+    )
+}
+
+fn open_goal_root(
+    host: &PluginHost,
+    sidecar: makima_storage::plugin_session::PluginSession,
+) -> (
+    AgentManagerHandle,
+    makima_agent::AgentRef,
+    TrustedTarget,
+    flume::Receiver<CapturedRequest>,
+    flume::Receiver<makima_agent::Envelope>,
+) {
     let manager = AgentManagerHandle::new_tui(Default::default()).unwrap();
     manager.bind_plugin_session(sidecar.clone());
     let (requests_tx, requests) = flume::unbounded();
     let (mut context, events, _cancel) = common::ctx_with_provider(Arc::new(ScriptedProvider {
         requests: requests_tx,
     }));
-    context.registry = registry;
-    context.session_id = Some(SessionRef::from_id(id));
+    context.registry = host.registry();
+    context.session_id = Some(SessionRef::from_id(sidecar.id()));
     let config = common::effective_config(&context)
         .with_context(makima_agent::AgentContextSnapshot::new(context.cwd.clone()));
     let root = manager
@@ -5537,10 +5553,80 @@ fn goal_fixture() -> (
             Ok::<_, String>(Box::new(AttachmentBackend(context.clone())) as Box<dyn ActorBackend>)
         })
         .unwrap();
-    let target = common::install_root(&host, root.clone(), context);
-    (
-        host, dir, lease, sidecar, manager, root, target, requests, events,
-    )
+    let target = common::install_root(host, root.clone(), context);
+    (manager, root, target, requests, events)
+}
+
+#[test]
+fn goal_reopen_pauses_committed_activation_without_replaying_announcement() {
+    smol::block_on(async {
+        let (host, dir, lease, sidecar, manager, _, target, requests, _) = goal_fixture();
+        let registry = host.command_registry();
+        assert_eq!(
+            bounded(
+                run_command(&registry, "/goal Verify release", 0, Some(target)).recv_async(),
+                "set goal"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        let old_request = bounded(requests.recv_async(), "original announcement")
+            .await
+            .unwrap();
+        assert_eq!(common::tool_names(&old_request.tools), ["goal"]);
+        let id = sidecar.id();
+        // Skip the graceful Lua drain, as an abrupt process exit would.
+        manager.retire_plugin_session();
+        shutdown_manager(&manager).await;
+        lease.release().unwrap();
+
+        let lease = makima_storage::session_lock::claim(&dir.path().join("sessions"), &id)
+            .unwrap()
+            .unwrap();
+        let sidecar =
+            makima_storage::plugin_session::PluginSession::new(id, lease.publication_guard())
+                .unwrap();
+        assert_eq!(
+            sidecar.read("goal", "goal").unwrap().unwrap()["state"],
+            "active"
+        );
+        let (manager, root, target, requests, _) = open_goal_root(&host, sidecar.clone());
+        let actor = root.actor().unwrap();
+        assert!(actor.latest_ticket().is_none());
+        assert_eq!(
+            bounded(
+                run_command(&registry, "/goal", 0, Some(target)).recv_async(),
+                "inspect reopened goal"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        let record = sidecar.read("goal", "goal").unwrap().unwrap();
+        assert_eq!(record["state"], "paused");
+        assert_eq!(record["objective"], "Verify release");
+        assert_eq!(record["count"], 0);
+        assert!(actor.latest_ticket().is_none());
+        let user = actor
+            .admit_turn(
+                AgentInput::new("ordinary input".into(), Vec::new()),
+                None,
+                String::new(),
+            )
+            .unwrap();
+        let request = bounded(requests.recv_async(), "ordinary input after reopen")
+            .await
+            .unwrap();
+        assert!(common::tool_names(&request.tools).is_empty());
+        assert_eq!(
+            request.messages.last().unwrap().first_text_content(),
+            Some("ordinary input")
+        );
+        request.reply.send(common::canned_reply("done")).unwrap();
+        bounded(user.wait(), "settle ordinary input").await;
+        shutdown_manager(&manager).await;
+    });
 }
 
 #[test_case::test_case(false; "cap")]

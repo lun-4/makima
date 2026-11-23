@@ -28,6 +28,22 @@ local function describe(record)
   return status
 end
 
+local function update_badge(ctx, state)
+  local record = state and state.record
+  local spans = {}
+  if record and record.state == "active" then
+    local progress = reducer.progress(record)
+    if state.exposed and state.exposed.scope == record.scope then
+      progress = progress + 1
+    end
+    spans[1] = { string.format("goal:%d/10", progress), "#FFD700" }
+  end
+  local ok, err = makima.ui.set_root_status_content(ctx, spans)
+  if not ok then
+    makima.log.warn("Goal status: " .. tostring(err))
+  end
+end
+
 local function reconcile(root, ctx, trigger, argument)
   local root_id = root:id()
   local state = sessions[root_id] or {}
@@ -102,11 +118,16 @@ local function reconcile(root, ctx, trigger, argument)
     -- A durable write may already have committed; the next inspection must
     -- recover the authoritative record, not reuse a potentially older cache.
     sessions[root_id] = nil
+    update_badge(ctx, nil)
     return nil, err
   end
   if trigger == "closing" then
     sessions[root_id] = nil
-  elseif trigger == "idle" and result.wake and state.eligible and state.eligible == boundary_turn then
+    update_badge(ctx, nil)
+  elseif not verb then
+    update_badge(ctx, state)
+  end
+  if trigger == "idle" and result.wake and state.eligible and state.eligible == boundary_turn then
     state.eligible = nil
     root:wake_with_tool(
       ctx,
@@ -175,7 +196,7 @@ makima.api.register_tool({
 })
 
 makima.api.register_command({
-  name = "goal",
+  name = "/goal",
   description = "Show, set, pause, resume, or clear the root session goal",
   argument_hint = "[<objective>|pause|resume|clear]",
   arguments = { raw = true },
@@ -215,6 +236,7 @@ makima.api.register_command({
     else
       root:remove_tool(ctx, KEY)
     end
+    update_badge(ctx, state)
     local announcement = "[system: goal " .. verb .. " to " .. string.format("%q", record.objective)
     if record.state == "active" then
       announcement = announcement .. "; use the goal tool]"

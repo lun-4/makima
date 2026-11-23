@@ -22,6 +22,7 @@ use super::subscriptions::{
     on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
+use super::tool_lifecycle::{new_revision_id__doc, tool_transition__doc, wake_with_tool__doc};
 use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
 use crate::agent_errors::{
     AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
@@ -702,6 +703,7 @@ lua_class! {
         agent_transcript, agent_ref, agent_send, agent_add_tool, agent_remove_tool, agent_set_model,
         agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
+        manual tool_transition, manual wake_with_tool, manual new_revision_id,
     ]
     extra agent_internal_methods
 }

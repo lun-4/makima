@@ -4137,12 +4137,9 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<StatusContentStore>() {
             let changed = store.clear_plugin(plugin);
-            let entries = changed.then(|| store.snapshot_entries());
             drop(store);
-            if let Some(entries) = entries
-                && let Some(writer) = self.lua.app_data_ref::<StatusContentWriter>()
-            {
-                writer.publish(entries);
+            if changed {
+                crate::api::ui::publish_status_content_snapshot(&self.lua);
             }
         }
         completion::clear_plugin(&self.lua, plugin);
@@ -5660,6 +5657,15 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             crate::agent_autocmd::observe(&rt.lua, &manager);
                         }
                         Request::FireAutocmd { event, data, agent } => {
+                            if event == crate::agent_autocmd::AGENT_CLOSED_EVENT
+                                && let Some(agent) = &agent
+                            {
+                                let changed = rt.lua.app_data_mut::<StatusContentStore>()
+                                    .is_some_and(|mut store| store.clear_root(agent.id()));
+                                if changed {
+                                    crate::api::ui::publish_status_content_snapshot(&rt.lua);
+                                }
+                            }
                             let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
                             crate::api::autocmd::dispatch(&rt.lua, &event, None, data, agent.as_ref());
                             let root = agent.as_ref().is_none_or(|agent| {

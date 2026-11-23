@@ -9,7 +9,7 @@ makima.api.register_tool = function(spec)
   register_tool(spec)
 end
 load_plugin()
-assert(command.name == "goal" and command.tui_only and command.arguments.raw)
+assert(command.name == "/goal" and command.tui_only and command.arguments.raw)
 assert(tool.name == "goal" and not tool.enabled_by_default and tool.audiences[1] == "main")
 
 local n = 0

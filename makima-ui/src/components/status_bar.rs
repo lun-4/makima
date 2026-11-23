@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
+use makima_agent::AgentId;
 use makima_lua::StatusContentSnapshot;
 #[cfg(test)]
 use makima_lua::StatusEntry;
@@ -70,6 +71,7 @@ pub struct StatusBarContext<'a> {
     pub restricted: bool,
     pub restoring: bool,
     pub status_content: Option<&'a StatusContentSnapshot>,
+    pub displayed_agent: Option<AgentId>,
     pub suppress_status_content: bool,
     pub hover: Option<ClickTarget>,
     pub thinking_supported: bool,
@@ -343,6 +345,7 @@ impl StatusBar {
                         .map(|snapshot| {
                             status_content_spans(
                                 snapshot,
+                                ctx.displayed_agent,
                                 available.saturating_sub(model_min_width),
                             )
                         })
@@ -460,13 +463,14 @@ fn span_rect(area: Rect, spans: &[Span], index: usize) -> Option<Rect> {
 
 fn status_content_spans(
     snapshot: &StatusContentSnapshot,
+    displayed: Option<AgentId>,
     max_width: usize,
 ) -> (Vec<Span<'static>>, Vec<(usize, u32)>) {
     let mut remaining = max_width;
     let mut spans = Vec::new();
     let mut clicks = Vec::new();
     let mut has_content = false;
-    for (_, entries) in &snapshot.entries {
+    for entries in snapshot.for_agent(displayed) {
         let mut owner_has_content = false;
         for entry in entries {
             if entry.text.is_empty() {
@@ -675,6 +679,7 @@ mod tests {
             restricted: false,
             restoring: false,
             status_content,
+            displayed_agent: None,
             suppress_status_content: false,
             hover: None,
             thinking_supported: false,
@@ -699,6 +704,7 @@ mod tests {
                 }],
             )],
             generation: 1,
+            ..Default::default()
         };
         let text = render_context(Some(&snapshot), 120);
         let model = text.find(MODEL_ID).unwrap();
@@ -739,6 +745,7 @@ mod tests {
                 }],
             )],
             generation: 1,
+            ..Default::default()
         };
         let text = render_context(Some(&snapshot), 56);
         assert!(text.contains("PLUGIN"), "{text}");
@@ -769,8 +776,9 @@ mod tests {
                 ],
             )],
             generation: 1,
+            ..Default::default()
         };
-        let (spans, _) = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, None, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "5h30% w90%");
     }
@@ -797,8 +805,9 @@ mod tests {
                 ),
             ],
             generation: 1,
+            ..Default::default()
         };
-        let (spans, _) = status_content_spans(&snapshot, 32);
+        let (spans, _) = status_content_spans(&snapshot, None, 32);
         let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(text, "a b");
     }
@@ -829,6 +838,7 @@ mod tests {
             restricted: false,
             restoring: false,
             status_content: None,
+            displayed_agent: None,
             suppress_status_content: false,
             hover: None,
             thinking_supported: false,
@@ -872,6 +882,7 @@ mod tests {
             restricted,
             restoring: false,
             status_content: None,
+            displayed_agent: None,
             suppress_status_content: false,
             hover: None,
             thinking_supported: false,
@@ -923,6 +934,7 @@ mod tests {
             restricted: false,
             restoring: false,
             status_content: None,
+            displayed_agent: None,
             suppress_status_content: false,
             hover: hover.then_some(ClickTarget::PermissionChip),
             thinking_supported: false,
@@ -1179,6 +1191,7 @@ mod tests {
             restricted: false,
             restoring: false,
             status_content: None,
+            displayed_agent: None,
             suppress_status_content: false,
             hover: None,
             thinking_supported: false,

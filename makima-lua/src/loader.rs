@@ -975,6 +975,10 @@ impl EventHandle {
         Arc::clone(&self.modes)
     }
 
+    pub fn tool_registry(&self) -> &Arc<ToolRegistry> {
+        &self.tools
+    }
+
     pub fn has_native_tool(&self, name: &str) -> bool {
         self.tools.has(name)
     }

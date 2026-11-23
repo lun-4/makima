@@ -10,7 +10,7 @@ use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Table, UserDataRef};
 use strum::VariantNames;
 
-use makima_agent::{POST_LEVELS, Post, PostLevel};
+use makima_agent::{AgentId, POST_LEVELS, Post, PostLevel};
 
 use crate::agent_errors::{
     BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION, UNLINKABLE_POST_AGENT,
@@ -18,8 +18,8 @@ use crate::agent_errors::{
 use crate::api::agent::{LuaAgent, LuaAgentRef, focused_agent_ref, send_post};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
-    StatusContent, StatusContentEntries, StatusContentWriter, TitlePos, UiAction, WinCommand,
-    WinEvent, ui_send,
+    StatusContent, StatusContentEntries, StatusContentSnapshot, StatusContentWriter, StatusEntry,
+    TitlePos, UiAction, WinCommand, WinEvent, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::ctx::LuaCtx;
@@ -39,12 +39,14 @@ const POST_OPTIONS: &[&str] = &["agent", "level"];
 
 pub(crate) struct StatusContentStore {
     content: BTreeMap<Arc<str>, StatusContent>,
+    roots: BTreeMap<(String, Arc<str>), (AgentId, StatusContent)>,
 }
 
 impl StatusContentStore {
     pub fn new() -> Self {
         Self {
             content: BTreeMap::new(),
+            roots: BTreeMap::new(),
         }
     }
 
@@ -63,19 +65,44 @@ impl StatusContentStore {
         true
     }
 
+    fn set_root(&mut self, root: AgentId, plugin: Arc<str>, content: StatusContent) {
+        let key = (root.to_string(), plugin);
+        if content.is_empty() {
+            self.roots.remove(&key);
+        } else {
+            self.roots.insert(key, (root, content));
+        }
+    }
+
+    pub fn clear_root(&mut self, root: AgentId) -> bool {
+        let len = self.roots.len();
+        self.roots.retain(|_, (id, _)| *id != root);
+        self.roots.len() != len
+    }
+
     pub fn clear_plugin(&mut self, plugin: &str) -> bool {
-        self.content.remove(plugin).is_some()
+        let len = self.roots.len();
+        self.roots.retain(|(_, owner), _| owner.as_ref() != plugin);
+        self.content.remove(plugin).is_some() || self.roots.len() != len
     }
 
     pub fn has_plugin_content(&self, plugin: &str) -> bool {
         self.content.contains_key(plugin)
     }
 
-    pub fn snapshot_entries(&self) -> StatusContentEntries {
+    fn snapshot_entries(&self) -> StatusContentEntries {
         self.content
             .iter()
             .map(|(plugin, content)| (Arc::clone(plugin), content.clone()))
             .collect()
+    }
+
+    pub fn snapshot(&self) -> StatusContentSnapshot {
+        StatusContentSnapshot {
+            entries: self.snapshot_entries(),
+            roots: self.roots.values().cloned().collect(),
+            ..Default::default()
+        }
     }
 }
 
@@ -182,12 +209,11 @@ fn publish_hint_snapshot(lua: &Lua) {
     }
 }
 
-fn publish_status_content_snapshot(lua: &Lua) {
-    if let Some(store) = lua.app_data_ref::<StatusContentStore>() {
-        let entries = store.snapshot_entries();
-        if let Some(writer) = lua.app_data_ref::<StatusContentWriter>() {
-            writer.publish(entries);
-        }
+pub(crate) fn publish_status_content_snapshot(lua: &Lua) {
+    if let Some(store) = lua.app_data_ref::<StatusContentStore>()
+        && let Some(writer) = lua.app_data_ref::<StatusContentWriter>()
+    {
+        writer.publish(store.snapshot());
     }
 }
 
@@ -775,6 +801,52 @@ pub(crate) const set_status_content__doc: FnDoc = FnDoc {
     example: "makima.ui.set_status_content({ {\"connected\", \"success\"}, {\" readonly\", \"muted\"} })\n-- clickable entry:\nmakima.ui.set_status_content({ {\"refresh\", \"accent\", function() makima.ui.flash(\"refreshing\") end} })",
 };
 
+/// Set your plugin's status spans for the root pinned to this trusted TUI invocation.
+/// They appear only when this exact root's chat is displayed, not on other roots
+/// or children. The spans coexist with global status and are removed on root close
+/// or plugin unload. Unlike global status, root spans are not clickable.
+/// @param ctx LuaCtx Trusted context pinned to a live TUI root.
+/// @param spans table Sequence of {text, style_name} pairs. Styles may be semantic names or #RRGGBB foreground colors. Pass {} to clear.
+/// @return (boolean?, string?) Success or an authority error.
+#[lua_fn]
+fn set_root_status_content(
+    lua: &Lua,
+    ctx: UserDataRef<LuaCtx>,
+    spans: Table,
+) -> LuaResult<Pair<bool>> {
+    if in_delegated_tool(lua) {
+        return Ok(err_pair("root status requires trusted authority"));
+    }
+    let trusted = try_pair!(ctx.trusted(lua));
+    try_pair!(trusted.validate_target(lua, &trusted.target));
+    let root = trusted.target.id();
+    if trusted.template.question_mode != makima_agent::tools::QuestionMode::Tui
+        || trusted.target.manager().root_id().ok() != Some(root)
+    {
+        return Ok(err_pair("root status requires the pinned TUI root"));
+    }
+    let mut content = Vec::new();
+    for entry in spans.sequence_values::<Table>() {
+        let entry = entry?;
+        let text: String = entry.get(1)?;
+        if !text.is_empty() {
+            content.push(StatusEntry {
+                text,
+                style: entry.get(2)?,
+                click: None,
+            });
+        }
+    }
+    let mut store = try_pair!(
+        lua.app_data_mut::<StatusContentStore>()
+            .ok_or("status content unavailable")
+    );
+    store.set_root(root, Arc::clone(&trusted.plugin), content);
+    drop(store);
+    publish_status_content_snapshot(lua);
+    Ok((Some(true), None))
+}
+
 #[allow(non_upper_case_globals)]
 pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     name: "set_status_hint",
@@ -887,7 +959,8 @@ lua_table! {
         buf, theme_color, format_time, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text, focused_agent, post,
         manual flash, manual action, manual open_editor, manual open_list_picker, manual open_win,
-        manual set_status_content, manual set_status_hint, manual set_window_title,
+        manual set_status_content, set_root_status_content, manual set_status_hint,
+        manual set_window_title,
     ]
 }
 

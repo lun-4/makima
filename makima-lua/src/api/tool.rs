@@ -850,6 +850,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   enabled_by_default (boolean) Default true. When false, the tool is hidden and cannot dispatch unless the answering request advertised its exact binding. Its owning plugin may attach it to a pinned TUI root with `Agent:add_tool`; mode, audience, and permissions still apply.
+///   lifecycle       (function) Optional synchronous controller for an opt-in tool. Receives `(trigger, ctx)` for request reconciliation, pending facts, idle admission, or graceful closure (`"request"`, `"facts"`, `"idle"`, `"closing"`). Use `Agent:tool_transition` to reconcile the root. This callback must not yield.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
