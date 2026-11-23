@@ -15,7 +15,7 @@ use crate::selection::Selection;
 use makima_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use makima_agent::{
     AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, PostLevel, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    ToolStartEvent, TurnId,
 };
 use makima_config::{ToolKey, ToolOutputLines, UiConfig};
 use makima_lua::WinView;
@@ -28,7 +28,7 @@ use ratatui::style::Color;
 
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::ThemesProvider;
-use std::time::Instant;
+use std::time::SystemTime;
 
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
@@ -76,7 +76,8 @@ pub struct Chat {
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
-    started_at: Option<Instant>,
+    started_at: Option<SystemTime>,
+    turn: Option<TurnId>,
 }
 
 impl Chat {
@@ -100,15 +101,16 @@ impl Chat {
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
             finished: false,
             started_at: None,
+            turn: None,
         }
     }
 
-    pub fn started_at(&self) -> Option<Instant> {
+    pub fn started_at(&self) -> Option<SystemTime> {
         self.started_at
     }
 
     pub(crate) fn set_started_at_now(&mut self) {
-        self.started_at = Some(Instant::now());
+        self.started_at = Some(SystemTime::now());
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -454,9 +456,18 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
-    pub fn reopen(&mut self) {
+    /// Marks the chat running for {turn}. The age restarts only for a new
+    /// turn or a finished chat, and a turn's age counts from its admission.
+    pub fn reopen(&mut self, turn: Option<TurnId>) {
+        let new_turn = turn.is_some() && turn != self.turn;
+        if self.finished || new_turn || self.started_at.is_none() {
+            self.started_at = Some(
+                turn.and_then(|turn| turn.created_at())
+                    .unwrap_or_else(SystemTime::now),
+            );
+        }
+        self.turn = turn.or(self.turn);
         self.finished = false;
-        self.started_at = Some(Instant::now());
     }
 
     pub fn mark_finished(&mut self, role: DisplayRole, text: &str) {

@@ -43,7 +43,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -3317,13 +3317,16 @@ fn task_picker_preview_tracks_selected_chat_across_concurrent_reorder() {
     assert_eq!(app.resolve_render_chat(), 1);
 }
 
+fn clock_at(time: SystemTime) -> ClockSample {
+    ClockSample {
+        unix: time.duration_since(UNIX_EPOCH).unwrap(),
+    }
+}
+
 #[test]
-fn task_age_uses_monotonic_start() {
-    let now = Instant::now();
-    let clock = ClockSample {
-        monotonic: now,
-        unix: Duration::ZERO,
-    };
+fn task_age_uses_wall_clock_start() {
+    let now = SystemTime::now();
+    let clock = clock_at(now);
     let entry = |started_at| TaskEntry {
         name: "task".into(),
         finished: Some(true),
@@ -3390,14 +3393,8 @@ fn task_picker_finished_ages_advance_without_row_refresh() {
     finish_subagent_task(&mut app, false);
     app.open_tasks();
     let started = app.chats[1].started_at().unwrap();
-    let first = ClockSample {
-        monotonic: started + Duration::from_secs(5),
-        unix: Duration::ZERO,
-    };
-    let second = ClockSample {
-        monotonic: first.monotonic + crate::repaint::AGE_FRAME,
-        unix: Duration::ZERO,
-    };
+    let first = clock_at(started + Duration::from_secs(5));
+    let second = clock_at(started + Duration::from_secs(5) + crate::repaint::AGE_FRAME);
 
     let rows = picker_rows(&mut app.task_picker, &first);
     assert!(rows.iter().any(|row| row.contains("5s")));
@@ -3434,23 +3431,56 @@ fn task_picker_preserves_missing_and_completed_age_semantics() {
     let mut app = app_with_subagent();
     finish_subagent_task(&mut app, false);
     let started = app.chats[1].started_at().unwrap();
-    let clock = ClockSample {
-        monotonic: started + Duration::from_secs(5),
-        unix: Duration::ZERO,
-    };
+    let clock = clock_at(started + Duration::from_secs(5));
     let entries = app.task_entries();
     let sub = entries.iter().find(|entry| entry.chat_index == 1).unwrap();
     assert_eq!(sub.age(&clock), Some(Duration::from_secs(5)));
     assert!(entries[0].age(&clock).is_none(), "the main chat has no age");
-    let later = ClockSample {
-        monotonic: clock.monotonic + Duration::from_secs(1),
-        unix: Duration::ZERO,
-    };
+    let later = clock_at(started + Duration::from_secs(6));
     assert_eq!(
         sub.age(&later),
         Some(Duration::from_secs(6)),
         "completed tasks keep aging instead of freezing their runtime"
     );
+}
+
+fn turn_delta(agent_id: AgentId, turn_id: TurnId) -> Msg {
+    Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(subagent_info_for_agent(
+            agent_id, TASK_ID, TASK_ID, None, None,
+        )),
+        identity: Some(makima_agent::ActorWorkIdentity::new(
+            agent_id,
+            makima_agent::ActorWorkKind::Turn {
+                operation_id: 1,
+                turn_id,
+            },
+            1,
+        )),
+    }))
+}
+
+#[test]
+fn task_age_counts_from_turn_admission_across_events() {
+    const OLD_TURN: &str = "CNK1hV6GWoysH3KQMm5wu";
+    let mut app = streaming_app();
+    let agent = AgentId::generate();
+    let old_turn: TurnId = OLD_TURN.parse().unwrap();
+    app.update(turn_delta(agent, old_turn));
+    let chat = app.agent_chat_index[&agent];
+    assert_eq!(app.chats[chat].started_at(), old_turn.created_at());
+
+    app.update(turn_delta(agent, old_turn));
+    assert_eq!(
+        app.chats[chat].started_at(),
+        old_turn.created_at(),
+        "later events of the same turn keep its age"
+    );
+
+    let next_turn = TurnId::generate();
+    app.update(turn_delta(agent, next_turn));
+    assert_eq!(app.chats[chat].started_at(), next_turn.created_at());
 }
 
 #[test]
@@ -3505,10 +3535,7 @@ fn task_entry_shows_context_and_age() {
     app.chats[1].context_size = 5000;
     let entries = app.task_entries();
 
-    let clock = ClockSample {
-        monotonic: Instant::now(),
-        unix: Duration::ZERO,
-    };
+    let clock = clock_at(SystemTime::now());
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert_eq!(sub.context_str(), Some("5.0k"));
     assert!(sub.age(&clock).is_some());
@@ -4444,13 +4471,7 @@ fn restored_subagents_have_no_ago_and_are_finished() {
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(sub.is_finished());
-    assert_eq!(
-        sub.age(&ClockSample {
-            monotonic: Instant::now(),
-            unix: Duration::ZERO,
-        }),
-        None
-    );
+    assert_eq!(sub.age(&clock_at(SystemTime::now())), None);
     assert_eq!(sub.depth(), 1);
     assert_eq!(sub.parent_chat_index, Some(0));
 

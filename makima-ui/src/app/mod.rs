@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::AppSession;
 use crate::chat::Chat;
@@ -274,7 +274,7 @@ pub(super) struct BackgroundCallView {
     chat_index: usize,
     tool: String,
     summary: String,
-    started_at: Instant,
+    started_at: SystemTime,
     /// `None` while the work runs, `Some(is_error)` once it settled.
     finished: Option<bool>,
 }
@@ -290,7 +290,7 @@ pub(super) struct TaskEntry {
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
-    started_at: Option<Instant>,
+    started_at: Option<SystemTime>,
 }
 
 impl PickerItem for TaskEntry {
@@ -313,8 +313,8 @@ impl PickerItem for TaskEntry {
         (!self.context.is_empty()).then_some(self.context.as_str())
     }
     fn age(&self, now: &ClockSample) -> Option<Duration> {
-        self.started_at
-            .map(|started| now.monotonic.saturating_duration_since(started))
+        let started = self.started_at?.duration_since(UNIX_EPOCH).ok()?;
+        Some(now.unix.saturating_sub(started))
     }
     fn is_finished(&self) -> bool {
         matches!(self.finished, Some(true))
@@ -1762,7 +1762,7 @@ impl App {
             chat_index,
             tool: tool.to_string(),
             summary: summary.to_owned(),
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
             finished: None,
         });
     }
@@ -3087,7 +3087,7 @@ impl App {
                 AgentEvent::TurnOutcome(_) | AgentEvent::SubagentHistory { .. }
             )
         {
-            self.chats[chat_idx].reopen();
+            self.chats[chat_idx].reopen(envelope.identity.and_then(|identity| identity.turn_id()));
             self.sync_task_picker();
         }
 
@@ -3375,7 +3375,7 @@ impl App {
             chat.model_id = subagent.model.clone();
             chat.opts = subagent.opts;
             chat.parent_agent_id = subagent.parent_agent_id;
-            chat.reopen();
+            chat.reopen(None);
             self.sync_task_picker();
             self.sync_subagents();
             return idx;

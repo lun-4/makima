@@ -102,6 +102,11 @@ impl TurnId {
     pub fn generate() -> Self {
         Self(MakimaId::generate())
     }
+
+    /// When the turn was admitted.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        self.0.created_at()
+    }
 }
 
 impl fmt::Display for TurnId {
