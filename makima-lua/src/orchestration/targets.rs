@@ -147,6 +147,10 @@ impl AgentOrchestration {
 }
 
 impl OrchestrationServices for AgentOrchestration {
+    fn roots_for_lifecycle(&self) -> Vec<AgentRef> {
+        self.roots().into_iter().map(|root| root.target).collect()
+    }
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,

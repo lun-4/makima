@@ -1198,10 +1198,12 @@ fn goal_bundled_command_metadata_and_disable(enabled: bool) {
         );
     }
     let (registry, host) = builtins_host_with(&PluginsConfig::from_plugins(plugins));
-    assert!(
-        !registry.has("goal"),
-        "the scaffold must not expose a model tool"
-    );
+    let entry = registry.get("goal");
+    assert_eq!(entry.is_some(), enabled);
+    if let Some(entry) = entry {
+        assert!(!entry.tool.enabled_by_default());
+        assert!(entry.tool.has_lifecycle_controller());
+    }
     let snapshot = command_snapshot(&host);
     let goal = snapshot
         .commands()

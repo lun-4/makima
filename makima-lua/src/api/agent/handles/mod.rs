@@ -4,6 +4,7 @@ mod module_fns;
 pub(super) mod projection;
 mod subscriptions;
 mod tickets;
+mod tool_lifecycle;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};

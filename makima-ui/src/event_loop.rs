@@ -23,7 +23,7 @@ use crossterm::event::{
 };
 use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange, PreparedModel,
-    PreparedTransaction,
+    PreparedTransaction, ToolLifecycleTrigger, TurnAdmissionOptions,
 };
 use makima_agent::command::CustomCommand;
 use makima_agent::config_change::{
@@ -44,8 +44,8 @@ use makima_agent::session_options::{
 };
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::{
-    AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, mcp,
+    AgentConfig, AgentEvent, AgentInput, AgentRef, CancelToken, Envelope, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, TurnOrigin, TurnProvenance, mcp,
 };
 use makima_commands::{BuiltinOperation, CommandError, HostResponse};
 use makima_config::project::TrustQuestion;
@@ -72,6 +72,7 @@ use makima_storage::StateDir;
 use makima_storage::StorageError;
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
+use makima_storage::plugin_session::PluginSession;
 use makima_storage::session_lock::{self, ClaimedSessionLock};
 use makima_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
 use serde_json::json;
@@ -420,6 +421,7 @@ impl Drop for HeartbeatCompletion {
 }
 
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
+    runtime.handles.manager_and_root().0.retire_plugin_session();
     runtime.session_lock = None;
     runtime.lock_lost = true;
     runtime.end_plan_approval();
@@ -857,6 +859,12 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
+        if let Some(SessionLockState::Held(lock)) = &session_lock
+            && let Some(binding) =
+                PluginSession::new(app.state.session.id, lock.publication_guard())
+        {
+            handles.manager_and_root().0.bind_plugin_session(binding);
+        }
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let config_commits = match observe_config_commits(
@@ -935,6 +943,12 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
+        if let Some(SessionLockState::Held(lock)) = &session_lock
+            && let Some(binding) =
+                PluginSession::new(app.state.session.id, lock.publication_guard())
+        {
+            handles.manager_and_root().0.bind_plugin_session(binding);
+        }
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let config_commits = match observe_config_commits(
@@ -2728,10 +2742,27 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-        // These two only fire Lua autocmds. Anything a handler does comes back
-        // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
+        for runtime in &self.sessions {
+            let (manager, id) = runtime.handles.manager_and_root();
+            let idle = runtime.quiescent() && runtime.app.exit_request == ExitRequest::None;
+            let notifications = manager.tool_lifecycle_notifications(id, idle);
+            if !notifications.is_empty()
+                && let Ok(root) = manager.lookup(id)
+            {
+                for (entry, trigger) in notifications {
+                    let (root, manager) = (root.clone(), manager.clone());
+                    smol::spawn(async move {
+                        if let Err(error) = entry.tool.reconcile(root, trigger).await {
+                            warn!(tool = entry.name(), %error, "conditional tool callback failed");
+                            manager.fail_tool_lifecycle(id, &entry);
+                        }
+                    })
+                    .detach();
+                }
+            }
+        }
         self.emit_status_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on the settled notification; a dead agent
@@ -3295,6 +3326,7 @@ impl<'t> EventLoop<'t> {
     /// non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         let mut rt = self.sessions.remove(idx);
+        rt.handles.manager_and_root().0.retire_plugin_session();
         if let Err(error) = release_lock_state(rt.session_lock.take()) {
             warn!(id = %rt.id(), %error, "session lock release failed");
         }
@@ -3544,6 +3576,8 @@ impl<'t> EventLoop<'t> {
             session_lock,
             ..
         } = old;
+        drain_session_tool_lifecycles(std::iter::once(&handles));
+        handles.manager_and_root().0.retire_plugin_session();
         let retired_id = app.state.session.id;
         let replaced_session = retired_id != self.sessions[idx].id();
         let ended_conversation = replaced_session
@@ -4607,6 +4641,10 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        drain_session_tool_lifecycles(self.sessions.iter().map(|rt| &rt.handles));
+        for rt in &self.sessions {
+            rt.handles.manager_and_root().0.retire_plugin_session();
+        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -4720,6 +4758,48 @@ impl UiSink for EventLoop<'_> {
 
     fn render(&mut self, action: UiAction) {
         match action {
+            UiAction::ToolWake {
+                root,
+                message,
+                fence,
+                after,
+                plugin,
+                generation,
+            } => {
+                // The regular mailbox is consulted before plugin continuations.
+                let _ = self.start_mailbox_runs();
+                if let Some(rt) = self.sessions.iter().find(|rt| {
+                    let (manager, id) = rt.handles.manager_and_root();
+                    root.id() == id && manager.same_manager(&root.manager())
+                }) && rt.quiescent()
+                    && !rt.lock_lost
+                    && rt.app.exit_request == ExitRequest::None
+                    && let Ok(actor) = root.manager().actor(root.id())
+                {
+                    let _ = actor.admit_turn_with_options(
+                        AgentInput {
+                            message,
+                            images: Vec::new(),
+                            preamble: Vec::new(),
+                            prompt: None,
+                        },
+                        None,
+                        String::new(),
+                        TurnAdmissionOptions {
+                            idle_only: true,
+                            after_turn: Some(after),
+                            tool_fence: Some(fence),
+                            provenance: TurnProvenance {
+                                origin: TurnOrigin::Plugin,
+                                plugin: Some(plugin.to_string()),
+                                plugin_generation: Some(generation),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
             UiAction::Flash(text) => self.notify(text),
             UiAction::SetWindowTitle(title) => {
                 if let Err(error) = terminal::set_window_title(&title) {
@@ -4824,6 +4904,32 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
         ui_shortname_hint: limit.ui_shortname_hint,
+    }
+}
+
+fn drain_session_tool_lifecycles<'a>(sessions: impl IntoIterator<Item = &'a AgentHandles>) {
+    // Cut every root before waiting on the first Lua writer.
+    let mut drains = Vec::new();
+    for handles in sessions {
+        let (manager, id) = handles.manager_and_root();
+        if let Ok(root) = manager.lookup(id) {
+            for entry in manager.close_tool_lifecycles(id, None) {
+                drains.push((root.clone(), entry));
+            }
+        }
+    }
+    let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+    for (root, entry) in drains {
+        let result = smol::block_on(futures_lite::future::or(
+            entry.tool.reconcile(root, ToolLifecycleTrigger::Closing),
+            async {
+                smol::Timer::at(deadline).await;
+                Err("tool lifecycle drain timed out".into())
+            },
+        ));
+        if let Err(error) = result {
+            warn!(tool = entry.name(), %error, "conditional tool drain failed");
+        }
     }
 }
 

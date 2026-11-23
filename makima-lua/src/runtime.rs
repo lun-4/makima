@@ -98,6 +98,7 @@ const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
+const TOOL_LIFECYCLE_BUDGET: Duration = Duration::from_secs(2);
 const HANDLER_TIMEOUT_MSG: &str = "timeout";
 pub const MAX_INFLIGHT_TOOLS: usize = 64;
 /// Finished tools kept clickable without a restore round-trip. Purely a
@@ -225,6 +226,14 @@ pub enum Request {
         permissions: PluginPermissions,
         opts: PluginOpts,
         reply: flume::Sender<LoadResult>,
+    },
+    ToolLifecycle {
+        plugin: Arc<str>,
+        tool: Arc<str>,
+        generation: u64,
+        root: makima_agent::AgentRef,
+        trigger: makima_agent::actor::ToolLifecycleTrigger,
+        reply: flume::Sender<Result<(), String>>,
     },
     CallTool {
         plugin: Arc<str>,
@@ -2313,6 +2322,7 @@ struct ToolKeys {
     permission_scopes: Option<RegistryKey>,
     mutable_path: Option<RegistryKey>,
     describe: Option<RegistryKey>,
+    lifecycle: Option<RegistryKey>,
 }
 
 struct PluginOwner {
@@ -2811,6 +2821,9 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(RequestTx(tx.clone()));
+        if let Some(sender) = &ui_action_tx {
+            lua.set_app_data(sender.clone());
+        }
         lua.set_app_data(HostId(NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed)));
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(crate::api::util::command::RetiredCommandHandlerMap::new());
@@ -2958,6 +2971,84 @@ impl LuaRuntime {
         });
     }
 
+    fn tool_lifecycle(
+        &self,
+        plugin: Arc<str>,
+        tool: &str,
+        generation: u64,
+        root: makima_agent::AgentRef,
+        trigger: makima_agent::actor::ToolLifecycleTrigger,
+    ) -> Result<(), String> {
+        let callback: Function = {
+            let plugins = self.plugins.borrow();
+            let key = plugins
+                .get(&plugin)
+                .and_then(|entry| entry.tools.get(tool))
+                .filter(|keys| keys.generation == generation)
+                .and_then(|keys| keys.lifecycle.as_ref())
+                .ok_or("tool lifecycle generation is unavailable")?;
+            self.lua.registry_value(key).map_err(|e| e.to_string())?
+        };
+        let services =
+            crate::orchestration::services(&self.lua).ok_or("tool lifecycle has no host")?;
+        let template = services.template(&root)?;
+        let _scope = TaskScope::new(
+            &self.lua,
+            TaskCell::new(
+                CancelToken::none(),
+                Some(Instant::now() + TOOL_LIFECYCLE_BUDGET),
+                None,
+            ),
+        );
+        let ctx = LuaCtx::trusted_context(
+            &self.lua,
+            TrustedTarget {
+                target: root,
+                template,
+            },
+            plugin,
+        );
+        smol::block_on(futures_lite::future::poll_once(
+            callback.call_async::<()>((trigger.as_str(), ctx)),
+        ))
+        .ok_or("tool lifecycle callback cannot yield")?
+        .map_err(|e| e.to_string())
+    }
+
+    fn drain_tool_lifecycles(&self, plugin: &Arc<str>) {
+        let Some(services) = crate::orchestration::services(&self.lua) else {
+            return;
+        };
+        let mut drains = Vec::new();
+        for root in services.roots_for_lifecycle() {
+            for entry in root
+                .manager()
+                .close_tool_lifecycles(root.id(), Some(plugin))
+            {
+                drains.push((root.clone(), entry));
+            }
+        }
+        for (root, entry) in drains {
+            let generation = self
+                .plugins
+                .borrow()
+                .get(plugin)
+                .and_then(|owner| owner.tools.get(entry.name()))
+                .map(|keys| keys.generation);
+            if let Some(generation) = generation
+                && let Err(error) = self.tool_lifecycle(
+                    plugin.clone(),
+                    entry.name(),
+                    generation,
+                    root,
+                    makima_agent::actor::ToolLifecycleTrigger::Closing,
+                )
+            {
+                tracing::warn!(tool = entry.name(), %error, "conditional tool drain failed");
+            }
+        }
+    }
+
     fn drop_plugin_keys(&mut self, name: &str) {
         crate::orchestration::revoke_plugin(&self.lua, name);
         if let Some(producer) = self
@@ -3059,6 +3150,9 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
+                }
+                if let Some(key) = tk.lifecycle {
+                    let _ = self.lua.remove_registry_value(key);
                 }
                 if let Some(sk) = tk.describe
                     && let Err(e) = self.lua.remove_registry_value(sk)
@@ -3463,6 +3557,9 @@ impl LuaRuntime {
             {
                 tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
             }
+            if let Some(sk) = t.lifecycle_key {
+                let _ = self.lua.remove_registry_value(sk);
+            }
             if let Some(sk) = t.describe_key
                 && let Err(e) = self.lua.remove_registry_value(sk)
             {
@@ -3707,6 +3804,7 @@ impl LuaRuntime {
                     start_annotation: t.start_annotation.clone(),
                     examples: t.examples.clone(),
                     has_describe_fn: t.describe_key.is_some(),
+                    has_lifecycle_controller: t.lifecycle_key.is_some(),
                 });
                 (
                     tool,
@@ -3846,6 +3944,9 @@ impl LuaRuntime {
                 source: mlua::Error::runtime(format!("invalid command registration: {error}")),
             });
         }
+        // Drain before swapping registries: the old writer still owns its
+        // request binding and session lease at this cutoff.
+        self.drain_tool_lifecycles(&name);
         if let Err(error) = self.registry.replace_plugin(&name, registry_entries) {
             self.abort_candidate_jobs(&name, generation);
             if let Err(restore_error) = replace_command_producer(
@@ -3965,6 +4066,7 @@ impl LuaRuntime {
                             _ => None,
                         },
                         describe: t.describe_key,
+                        lifecycle: t.lifecycle_key,
                     },
                 )
             })
@@ -5266,7 +5368,13 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             })
                             .detach();
                         }
+                        Request::ToolLifecycle { plugin, tool, generation, root, trigger, reply } => {
+                            if reply.is_disconnected() { continue; }
+                            let result = rt.tool_lifecycle(plugin, &tool, generation, root, trigger);
+                            let _ = reply.send(result);
+                        }
                         Request::ClearPlugin { plugin, reply } => {
+                            rt.drain_tool_lifecycles(&plugin);
                             crate::orchestration::revoke_plugin(&rt.lua, &plugin);
                             drain_barrier(&rt.lua, &ex, &gate, &callbacks, &spawn_rx).await;
                             let result = rt.clear_plugin(&plugin).await;

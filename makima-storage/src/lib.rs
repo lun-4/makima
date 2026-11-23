@@ -14,6 +14,7 @@ pub mod model;
 mod offload_cleanup;
 pub mod paths;
 pub mod plans;
+pub mod plugin_session;
 pub mod session_lock;
 pub mod sessions;
 pub mod theme;

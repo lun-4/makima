@@ -5126,7 +5126,7 @@ impl ActorBackend for AttachmentBackend {
                 config: ctx.config.clone(),
                 tool_output_lines: ctx.tool_output_lines,
                 permissions: ctx.permissions.clone(),
-                session_id: None,
+                session_id: ctx.session_id.clone(),
                 mailbox: None,
                 timeouts: ctx.timeouts,
                 file_tracker: ctx.file_tracker.clone(),
@@ -5490,6 +5490,177 @@ fn conditional_tool_uses_answering_request_and_strips_nested_claims() {
             bounded(ticket.wait(), "settle attachment test").await,
             TurnOutcome::Completed { .. }
         ));
+        shutdown_manager(&manager).await;
+    });
+}
+
+fn goal_fixture() -> (
+    PluginHost,
+    tempfile::TempDir,
+    makima_storage::session_lock::ClaimedSessionLock,
+    makima_storage::plugin_session::PluginSession,
+    AgentManagerHandle,
+    makima_agent::AgentRef,
+    makima_lua::orchestration::TrustedTarget,
+    flume::Receiver<CapturedRequest>,
+    flume::Receiver<makima_agent::Envelope>,
+) {
+    let registry = Arc::new(ToolRegistry::new());
+    let source = format!(
+        "local function build_reducer()\n{}\nend\nlocal reducer = build_reducer()\nlocal function require(_) return reducer end\n{}",
+        include_str!("../../plugins/goal/goal_reducer.lua"),
+        include_str!("../../plugins/goal/init.lua")
+    );
+    let host = PluginHost::new(registry.clone()).unwrap();
+    host.load_source("goal", &source).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let id = MakimaId::generate();
+    let lease = makima_storage::session_lock::claim(&sessions, &id)
+        .unwrap()
+        .unwrap();
+    let sidecar =
+        makima_storage::plugin_session::PluginSession::new(id, lease.publication_guard()).unwrap();
+    let manager = AgentManagerHandle::new_tui(Default::default()).unwrap();
+    manager.bind_plugin_session(sidecar.clone());
+    let (requests_tx, requests) = flume::unbounded();
+    let (mut context, events, _cancel) = common::ctx_with_provider(Arc::new(ScriptedProvider {
+        requests: requests_tx,
+    }));
+    context.registry = registry;
+    context.session_id = Some(SessionRef::from_id(id));
+    let config = common::effective_config(&context)
+        .with_context(makima_agent::AgentContextSnapshot::new(context.cwd.clone()));
+    let root = manager
+        .create_root_with_config(Some(config), Vec::new(), None, |_| {
+            Ok::<_, String>(Box::new(AttachmentBackend(context.clone())) as Box<dyn ActorBackend>)
+        })
+        .unwrap();
+    let target = common::install_root(&host, root.clone(), context);
+    (
+        host, dir, lease, sidecar, manager, root, target, requests, events,
+    )
+}
+
+#[test_case::test_case(false; "cap")]
+#[test_case::test_case(true; "tenth_claim")]
+fn goal_queued_successor_observes_authoritative_tenth_settlement(claim: bool) {
+    smol::block_on(async {
+        let (host, _dir, _lease, sidecar, manager, root, target, requests, _events) =
+            goal_fixture();
+        let command = |cmd| run_command(&host.command_registry(), cmd, 0, Some(target.clone()));
+        let actor = root.actor().unwrap();
+        assert_eq!(
+            bounded(command("/goal Run tests").recv_async(), "set goal")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        let request = || bounded(requests.recv_async(), "goal provider request");
+        let mut current = request().await.unwrap();
+        for i in 1..=10 {
+            assert_eq!(common::tool_names(&current.tools), ["goal"], "turn {i}");
+            let prior = actor.latest_ticket().unwrap();
+            let queued = actor
+                .admit_turn(
+                    AgentInput::new(format!("ordinary {i}"), Vec::new()),
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            if i == 1 {
+                current
+                    .reply
+                    .send(common::canned_tool_use("goal", json!({"op": "status"})))
+                    .unwrap();
+                current = request().await.unwrap();
+                assert!(current.messages.iter().flat_map(|msg| &msg.content).any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: false, .. } if content.contains("Run tests"))), "{:?}", current.messages);
+            }
+            if i == 10 && claim {
+                current
+                    .reply
+                    .send(common::canned_tool_use(
+                        "goal",
+                        json!({"op": "complete", "evidence": "Passed"}),
+                    ))
+                    .unwrap();
+                current = request().await.unwrap();
+                assert!(last_attachment_output(&current).0.contains("Provisional"));
+            }
+            current.reply.send(common::canned_reply("done")).unwrap();
+            current = request().await.unwrap();
+            assert_ne!(prior.turn_id(), queued.turn_id());
+        }
+        assert!(common::tool_names(&current.tools).is_empty());
+        let saved = sidecar.read("goal", "goal").unwrap().unwrap();
+        assert_eq!(saved["state"], if claim { "complete" } else { "capped" });
+        assert_eq!(saved["count"], 10);
+        current.reply.send(common::canned_reply("done")).unwrap();
+        shutdown_manager(&manager).await;
+    });
+}
+
+#[test]
+fn goal_replacement_rejects_same_turn_old_request_and_unload_drains_new_claim() {
+    smol::block_on(async {
+        let (host, _dir, _lease, sidecar, manager, root, target, requests, _events) =
+            goal_fixture();
+        let command = |cmd| run_command(&host.command_registry(), cmd, 0, Some(target.clone()));
+        assert_eq!(
+            bounded(command("/goal First objective").recv_async(), "set goal")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        let request = || bounded(requests.recv_async(), "goal provider request");
+        let old_request = request().await.unwrap();
+        let ticket = root.actor().unwrap().latest_ticket().unwrap();
+        assert_eq!(
+            bounded(
+                command("/goal Second objective").recv_async(),
+                "replace goal"
+            )
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        let report = |call, evidence| {
+            let mut report =
+                common::canned_tool_use("goal", json!({"op": "complete", "evidence": evidence}));
+            report.message.content[0] = ContentBlock::tool_use(
+                call,
+                "goal",
+                json!({"op": "complete", "evidence": evidence}),
+            );
+            report
+        };
+        old_request
+            .reply
+            .send(report("old_goal", "Old evidence"))
+            .unwrap();
+        let next =
+            futures_lite::future::race(async { requests.recv_async().await.unwrap() }, async {
+                panic!("old turn settled: {:?}", ticket.wait().await)
+            })
+            .await;
+        assert!(next.messages.iter().flat_map(|msg| &msg.content).any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("not offered the current goal"))));
+        next.reply.send(report("new_goal", "Passed")).unwrap();
+        let finish = bounded(requests.recv_async(), "final request after new report")
+            .await
+            .unwrap();
+        assert!(last_attachment_output(&finish).0.contains("Provisional"));
+        finish.reply.send(common::canned_reply("done")).unwrap();
+        assert!(matches!(
+            bounded(ticket.wait(), "settle revised goal").await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(sidecar.read("goal", "goal").unwrap().unwrap()["count"], 0);
+        host.unload("goal").unwrap();
+        let stored = sidecar.read("goal", "goal").unwrap().unwrap();
+        assert_eq!(stored["state"], "complete");
+        assert_eq!(stored["objective"], "Second objective");
+        assert_eq!(stored["count"], 1);
         shutdown_manager(&manager).await;
     });
 }

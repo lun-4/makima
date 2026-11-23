@@ -249,6 +249,16 @@ pub trait Tool: Send + Sync + 'static {
     fn enabled_by_default(&self) -> bool {
         true
     }
+    fn has_lifecycle_controller(&self) -> bool {
+        false
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _root: crate::AgentRef,
+        _trigger: crate::actor::ToolLifecycleTrigger,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     fn examples(&self) -> Option<Value> {
         None
     }

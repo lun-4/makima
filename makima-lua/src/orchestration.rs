@@ -556,6 +556,10 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
 }
 
 pub trait OrchestrationServices: Send + Sync + 'static {
+    fn roots_for_lifecycle(&self) -> Vec<AgentRef> {
+        Vec::new()
+    }
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,

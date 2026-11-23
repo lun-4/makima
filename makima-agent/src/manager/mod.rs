@@ -32,14 +32,19 @@ use makima_providers::Message;
 use tracing::{info, warn};
 
 use crate::CancelToken;
-use crate::actor::{ActorCloseCut, ActorIdleGuard, ActorState, ManagedTurnAdmission};
+use crate::actor::{
+    ActorCloseCut, ActorIdleGuard, ActorState, ManagedTurnAdmission, ToolFact, ToolIdleFence,
+    ToolLifecycleTrigger, ToolMailbox, ToolTransition,
+};
 use crate::tools::{RegisteredTool, ToolActivation, ToolRegistry, ToolSource};
 use crate::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorStatus, AgentActorHandle, AgentId,
     ReasonedCancelTrigger, SharedMessages, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use makima_storage::id::MakimaId;
+use makima_storage::plugin_session::PluginSession;
 
+const TOOL_RECONCILE_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(test, feature = "test-util"))]
 const MAX_GRAPH_DRAIN_PASSES: usize = 256;
@@ -175,6 +180,7 @@ struct TestGate {
 pub(crate) struct ManagerInner {
     generation: u64,
     tui: bool,
+    plugin_session: Mutex<Option<PluginSession>>,
     limits: AgentLimits,
     graph: Mutex<GraphState>,
     limiter: Arc<Semaphore>,
@@ -218,6 +224,7 @@ impl AgentManagerHandle {
         Ok(AgentManagerHandle(Arc::new(ManagerInner {
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
             tui,
+            plugin_session: Mutex::new(None),
             limiter: Arc::new(Semaphore::new(limits.max_concurrent_agent_turns)),
             limits,
             watchers: Mutex::new(WatcherRegistry::default()),
@@ -248,6 +255,41 @@ impl AgentManagerHandle {
 }
 
 impl AgentManagerHandle {
+    pub fn bind_plugin_session(&self, session: PluginSession) {
+        let old = self
+            .0
+            .plugin_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(session);
+        if let Some(old) = old {
+            old.retire();
+        }
+    }
+
+    pub fn plugin_session(&self) -> Option<PluginSession> {
+        self.0
+            .plugin_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn retire_plugin_session(&self) {
+        if let Some(session) = self
+            .0
+            .plugin_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            session.retire();
+        }
+        if let Ok(root) = self.root_id() {
+            self.close_tool_lifecycles(root, None);
+        }
+    }
+
     /// Change an opt-in binding for the pinned root. The host must supply
     /// the caller's validated plugin identity and revocation token.
     pub fn set_tool_attachment(
@@ -270,9 +312,23 @@ impl AgentManagerHandle {
                 return Err(format!("not an opt-in tool owned by this plugin: {name}"));
             }
             if attach {
+                let controller = entry.tool.has_lifecycle_controller();
+                let id = if controller {
+                    let mailbox = state.tool_mailboxes.get(name)
+                        .ok_or("tool lifecycle controller has not committed a revision")?;
+                    let revision = mailbox.revision.ok_or("tool lifecycle revision is inactive")?;
+                    if !mailbox.accepts(revision) || !mailbox.entry.tool.has_lifecycle_controller()
+                        || !Arc::ptr_eq(&mailbox.entry.tool, &entry.tool)
+                    {
+                        return Err("tool lifecycle revision is inactive".into());
+                    }
+                    revision
+                } else {
+                    MakimaId::generate()
+                };
                 if !state.tool_attachments.get(name).is_some_and(|current| current.matches(&entry)) {
                     state.tool_attachments.insert(name.into(), ToolActivation {
-                        id: MakimaId::generate(),
+                        id,
                         entry,
                         owner: owner.clone(),
                     });
@@ -288,6 +344,14 @@ impl AgentManagerHandle {
         &self,
         agent_id: AgentId,
         f: impl FnOnce(&mut ActorState) -> R,
+    ) -> Result<R, &'static str> {
+        self.with_tool_actor(agent_id, |state, _| f(state))
+    }
+
+    fn with_tool_actor<R>(
+        &self,
+        agent_id: AgentId,
+        f: impl FnOnce(&mut ActorState, &AgentActorHandle) -> R,
     ) -> Result<R, &'static str> {
         const ROOT_REQUIRED: &str = "tool attachments require a live TUI root";
         if !self.0.tui {
@@ -312,7 +376,7 @@ impl AgentManagerHandle {
         if state.lifecycle != ActorLifecycle::Open {
             return Err(ROOT_REQUIRED);
         }
-        Ok(f(&mut state))
+        Ok(f(&mut state, actor))
     }
 
     pub(crate) fn tool_attachments(
@@ -329,9 +393,15 @@ impl AgentManagerHandle {
                 .filter_map(|(entry, _)| {
                     let name = entry.name();
                     let activation = state.tool_attachments.get(name)?;
-                    activation
-                        .matches(entry)
-                        .then(|| (name.to_owned(), activation.clone()))
+                    (activation.matches(entry)
+                        && state.tool_mailboxes.get(name).is_none_or(|mailbox| {
+                            mailbox.accepts(activation.id)
+                                && mailbox
+                                    .facts
+                                    .iter()
+                                    .all(|fact| matches!(fact, ToolFact::Exposed { .. }))
+                        }))
+                    .then(|| (name.to_owned(), activation.clone()))
                 })
                 .collect()
         })
@@ -352,9 +422,283 @@ impl AgentManagerHandle {
                         current.id == activation
                             && !current.owner.is_cancelled()
                             && registry.is_current(&current.entry)
+                            && state
+                                .tool_mailboxes
+                                .get(name)
+                                .is_none_or(|mailbox| mailbox.accepts(activation))
                     })
                 })
                 .unwrap_or(false)
+    }
+
+    /// Close exposure while the owner reduces the facts that precede this cut.
+    /// No actor or graph lock is held by the returned reservation.
+    pub fn begin_tool_transition(
+        &self,
+        agent_id: AgentId,
+        entry: RegisteredTool,
+        owner: &CancelToken,
+    ) -> Result<ToolTransition, String> {
+        self.with_tool_actor(agent_id, |state, actor| {
+            if owner.is_cancelled() || !entry.tool.has_lifecycle_controller() {
+                return Err("tool lifecycle controller is unavailable".into());
+            }
+            let name = entry.name().to_owned();
+            let mailbox = state
+                .tool_mailboxes
+                .entry(name)
+                .or_insert_with(|| ToolMailbox::new(entry.clone(), owner.clone()));
+            if mailbox.owner.is_cancelled() {
+                *mailbox = ToolMailbox::new(entry.clone(), owner.clone());
+            }
+            if !Arc::ptr_eq(&mailbox.entry.tool, &entry.tool) || mailbox.reservation.is_some() {
+                return Err("tool lifecycle transition is busy".into());
+            }
+            let reservation = MakimaId::generate();
+            mailbox.reservation = Some(reservation);
+            mailbox.nudged = mailbox.faulted;
+            Ok(ToolTransition {
+                reservation,
+                facts: mailbox.facts.drain(..).collect(),
+                latest: state.latest.as_ref().map(TurnOutcome::turn_id),
+                plan: state
+                    .policy
+                    .as_ref()
+                    .is_some_and(|config| matches!(config.mode, crate::AgentMode::Plan(_))),
+                faulted: mailbox.faulted,
+                closing: mailbox.closing,
+                policy_generation: state.policy_generation,
+                history_epoch: actor.history_epoch(),
+            })
+        })?
+    }
+
+    pub fn finish_tool_transition(
+        &self,
+        agent_id: AgentId,
+        name: &str,
+        transition: &ToolTransition,
+        active: Option<(MakimaId, MakimaId)>,
+    ) -> Result<Option<ToolIdleFence>, String> {
+        self.with_tool_actor(agent_id, |state, actor| {
+            let mailbox = state
+                .tool_mailboxes
+                .get_mut(name)
+                .ok_or("tool lifecycle was closed")?;
+            if mailbox.reservation != Some(transition.reservation) || mailbox.owner.is_cancelled() {
+                return Err("tool lifecycle transition is stale".into());
+            }
+            mailbox.reservation = None;
+            let previous = mailbox.revision;
+            mailbox.revision = active.map(|(revision, _)| revision);
+            mailbox.scope = active.map(|(_, scope)| scope);
+            mailbox.open = active.is_some()
+                && !mailbox.closing
+                && !mailbox.faulted
+                && !mailbox
+                    .facts
+                    .iter()
+                    .any(|fact| matches!(fact, ToolFact::Stopped { .. }));
+            if previous != mailbox.revision {
+                mailbox.idle_notified = None;
+            }
+            if let Some(activation) = state.tool_attachments.get_mut(name) {
+                if let Some(revision) = mailbox.revision {
+                    activation.id = revision;
+                } else {
+                    state.tool_attachments.remove(name);
+                }
+            }
+            Ok(active
+                .filter(|_| {
+                    state.policy_generation == transition.policy_generation
+                        && actor.history_epoch() == transition.history_epoch
+                })
+                .map(|(revision, _)| ToolIdleFence {
+                    name: name.into(),
+                    revision,
+                    policy_generation: transition.policy_generation,
+                    history_epoch: transition.history_epoch,
+                }))
+        })?
+    }
+
+    pub fn abandon_tool_transition(
+        &self,
+        agent_id: AgentId,
+        name: &str,
+        transition: &ToolTransition,
+    ) {
+        let _ = self.with_tool_root(agent_id, |state| {
+            if let Some(mailbox) = state.tool_mailboxes.get_mut(name)
+                && mailbox.reservation == Some(transition.reservation)
+            {
+                mailbox.reservation = None;
+                mailbox.open = false;
+                mailbox.faulted = true;
+                state.tool_attachments.remove(name);
+            }
+        });
+    }
+
+    /// Select and acknowledge frontend notifications under the actor lock.
+    /// An idle attempt belongs to one exact settled turn, not an idle event.
+    pub fn tool_lifecycle_notifications(
+        &self,
+        agent_id: AgentId,
+        idle: bool,
+    ) -> Vec<(RegisteredTool, ToolLifecycleTrigger)> {
+        self.with_tool_actor(agent_id, |state, actor| {
+            let idle = idle
+                && !state.tool_mailboxes.is_empty()
+                && state.tool_wake_ready(&actor.inner.queue);
+            let latest = state.latest.as_ref().map(TurnOutcome::turn_id);
+            state
+                .tool_mailboxes
+                .values_mut()
+                .filter_map(|mailbox| {
+                    if mailbox.owner.is_cancelled()
+                        || mailbox.closing
+                        || mailbox.reservation.is_some()
+                    {
+                        return None;
+                    }
+                    if (mailbox.faulted || !mailbox.facts.is_empty()) && !mailbox.nudged {
+                        mailbox.nudged = true;
+                        return Some((mailbox.entry.clone(), ToolLifecycleTrigger::Facts));
+                    }
+                    if idle
+                        && mailbox.open
+                        && mailbox.facts.is_empty()
+                        && latest.is_some()
+                        && mailbox.idle_notified != latest
+                    {
+                        mailbox.idle_notified = latest;
+                        return Some((mailbox.entry.clone(), ToolLifecycleTrigger::Idle));
+                    }
+                    None
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Cut off admission and observation of late retirements before a graceful
+    /// drain. When reloading one plugin, leave other controllers untouched.
+    pub fn close_tool_lifecycles(
+        &self,
+        agent_id: AgentId,
+        plugin: Option<&str>,
+    ) -> Vec<RegisteredTool> {
+        self.with_tool_root(agent_id, |state| {
+            let mut controllers = Vec::new();
+            for (name, mailbox) in &mut state.tool_mailboxes {
+                if plugin.is_some_and(|owner| !matches!(&mailbox.entry.source, ToolSource::Lua { plugin } if plugin.as_ref() == owner)) {
+                    continue;
+                }
+                state.tool_attachments.remove(name);
+                mailbox.open = false;
+                mailbox.closing = true;
+                if !mailbox.owner.is_cancelled() {
+                    controllers.push(mailbox.entry.clone());
+                }
+            }
+            controllers
+        }).unwrap_or_default()
+    }
+
+    pub fn fail_tool_lifecycle(&self, agent_id: AgentId, entry: &RegisteredTool) {
+        let _ = self.with_tool_root(agent_id, |state| {
+            if let Some(mailbox) = state.tool_mailboxes.get_mut(entry.name())
+                && Arc::ptr_eq(&mailbox.entry.tool, &entry.tool)
+            {
+                mailbox.open = false;
+                mailbox.faulted = true;
+                state.tool_attachments.remove(entry.name());
+            }
+        });
+    }
+
+    pub(crate) async fn reconcile_request_tools(&self, turn: &CurrentManagedTurn) {
+        let entries: Vec<_> = self
+            .with_tool_root(turn.agent_id(), |state| {
+                state
+                    .tool_mailboxes
+                    .values()
+                    .filter(|mailbox| {
+                        !mailbox.closing
+                            && !mailbox.faulted
+                            && !mailbox.owner.is_cancelled()
+                            && (mailbox
+                                .facts
+                                .iter()
+                                .any(|fact| !matches!(fact, ToolFact::Exposed { .. }))
+                                || mailbox.reservation.is_some())
+                    })
+                    .map(|mailbox| mailbox.entry.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        let Ok(root) = self.lookup(turn.agent_id()) else {
+            return;
+        };
+        for entry in entries {
+            if let Err(error) = futures_lite::future::or(
+                entry
+                    .tool
+                    .reconcile(root.clone(), ToolLifecycleTrigger::Request),
+                async {
+                    smol::Timer::after(TOOL_RECONCILE_TIMEOUT).await;
+                    Err("tool lifecycle controller timed out".into())
+                },
+            )
+            .await
+            {
+                tracing::warn!(tool = entry.name(), %error, "failed to reconcile conditional tool");
+                self.fail_tool_lifecycle(turn.agent_id(), &entry);
+            }
+        }
+    }
+
+    /// Final publication point for actual advertised bindings after all
+    /// filters. An intervening cut removes the schema from this request.
+    pub(crate) fn record_tool_exposure(
+        &self,
+        turn: &CurrentManagedTurn,
+        name: &str,
+        activation: &ToolActivation,
+    ) -> bool {
+        self.with_tool_root(turn.agent_id(), |state| {
+            if !state.tool_attachments.get(name).is_some_and(|current| {
+                current.id == activation.id && current.matches(&activation.entry)
+            }) {
+                return false;
+            }
+            if let Some(mailbox) = state.tool_mailboxes.get_mut(name) {
+                if !mailbox.accepts(activation.id)
+                    || mailbox
+                        .facts
+                        .iter()
+                        .any(|fact| !matches!(fact, ToolFact::Exposed { .. }))
+                {
+                    return false;
+                }
+                if let Some(scope) = mailbox.scope {
+                    let turn = turn.turn_id();
+                    if mailbox.last_exposure != Some((turn, scope)) {
+                        mailbox.push(ToolFact::Exposed { turn, scope });
+                        mailbox.last_exposure = Some((turn, scope));
+                    }
+                }
+                !mailbox.faulted
+            } else {
+                true
+            }
+        })
+        .unwrap_or(false)
     }
 
     pub fn same_manager(&self, other: &Self) -> bool {

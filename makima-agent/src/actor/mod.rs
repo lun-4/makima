@@ -41,7 +41,10 @@ mod context;
 mod types;
 pub use context::AgentContextSnapshot;
 mod history_edit;
+mod tool_lifecycle;
 pub use history_edit::{HistoryBoundary, HistoryChange, HistoryEditWork};
+pub(crate) use tool_lifecycle::ToolMailbox;
+pub use tool_lifecycle::{ToolFact, ToolIdleFence, ToolLifecycleTrigger, ToolTransition};
 
 #[cfg(test)]
 mod tests;
@@ -105,6 +108,7 @@ pub struct TurnAdmissionOptions {
     pub idle_only: bool,
     pub existing_only: bool,
     pub after_turn: Option<TurnId>,
+    pub tool_fence: Option<ToolIdleFence>,
     pub provenance: TurnProvenance,
     pub policy_constraint: Option<AdmissionPolicyConstraint>,
     pub already_displayed: bool,
@@ -323,6 +327,7 @@ pub(crate) struct ActorState {
 
     pub(crate) lifecycle: ActorLifecycle,
     pub(crate) tool_attachments: HashMap<String, ToolActivation>,
+    pub(crate) tool_mailboxes: HashMap<String, ToolMailbox>,
     close_pending: bool,
     pending_publications: usize,
     idle_pending: bool,
@@ -337,7 +342,7 @@ pub(crate) struct ActorState {
     pub(crate) cancellation_generation: u64,
     pub(crate) policy_generation: u64,
     pub(crate) policy: Option<Arc<EffectiveAgentConfig>>,
-    latest: Option<TurnOutcome>,
+    pub(crate) latest: Option<TurnOutcome>,
     latest_history_turn: Option<(TurnId, u64, usize)>,
     retained_order: VecDeque<TurnId>,
     presentation: u64,
@@ -922,6 +927,7 @@ impl ActorState {
             parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
             tool_attachments: HashMap::new(),
+            tool_mailboxes: HashMap::new(),
             close_pending: false,
             pending_publications: 0,
             idle_pending: false,
@@ -1057,6 +1063,7 @@ fn retire_turn(
     };
     let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
     vacant.insert(outcome.clone());
+    state.tool_settled(turn_id, outcome, settle_runner);
     if state.release_idle_permission(turn_id) {
         inner.queue.notify();
         inner.policy_changed.notify(usize::MAX);
@@ -1486,6 +1493,7 @@ impl AgentActorHandle {
         state: &mut ActorState,
         displayed: u64,
     ) -> LocalCancellationCut {
+        state.stop_tools("cancelled");
         state.cancel_prepared_where(|turn| turn.is_some());
         let turn_id = state
             .processing
@@ -1783,6 +1791,10 @@ impl AgentActorHandle {
 
     /// The ticket of the most recently admitted turn, whatever admitted it,
     /// while it is live or retained.
+    pub(crate) fn history_epoch(&self) -> u64 {
+        self.inner.history.load().epoch
+    }
+
     pub fn latest_ticket(&self) -> Option<TurnTicket> {
         let turn_id = (*self
             .inner
@@ -2153,6 +2165,14 @@ impl AgentActorHandle {
         {
             return Err(ActorError::Busy);
         }
+        if let Some(fence) = &options.tool_fence
+            && (!options.idle_only
+                || options.after_turn.is_none()
+                || (!state.delivery_suspended && !state.deliveries.is_empty())
+                || !state.matches_tool_idle_fence(fence, self.inner.history.load().epoch))
+        {
+            return Err(ActorError::StaleTurn);
+        }
         if let Some(after) = options.after_turn
             && state.latest.as_ref().map(TurnOutcome::turn_id) != Some(after)
         {
@@ -2278,6 +2298,9 @@ impl AgentActorHandle {
             ));
         }
         let config = Arc::new(config);
+        if matches!(config.mode, crate::AgentMode::Plan(_)) {
+            state.stop_tools("plan mode");
+        }
         state.policy = Some(Arc::clone(&config));
         let generation = state.policy_generation;
         state.emit(ActorEvent::Config(ConfigCommit {
@@ -2442,6 +2465,7 @@ impl AgentActorHandle {
     pub fn cancel_existing(&self) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.cancel_prepared_where(|turn| turn.is_some());
+        state.stop_tools("cancelled");
         state.instructions.clear();
         state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
         if let Some(processing) = &mut state.processing {
@@ -2497,6 +2521,15 @@ impl AgentActorHandle {
             && (running || processing.turn_id == Some(turn_id))
         {
             processing.cancellation_reason.get_or_insert(reason);
+        }
+        if reason == TurnCancellationReason::User
+            && (running
+                || state
+                    .processing
+                    .as_ref()
+                    .is_some_and(|work| work.turn_id == Some(turn_id)))
+        {
+            state.stop_tools("cancelled");
         }
         if running && let Some(active) = state.active.take() {
             active.fire(reason);
@@ -2570,6 +2603,16 @@ impl AgentActorHandle {
             processing.cancellation_reason.get_or_insert(reason);
             true
         });
+        if reason == TurnCancellationReason::User
+            && (active_turn.is_some()
+                || (matched_processing
+                    && state
+                        .processing
+                        .as_ref()
+                        .is_some_and(|work| work.turn_id.is_some())))
+        {
+            state.stop_tools("cancelled");
+        }
         // Scan the queue under the state lock so the request linearizes with
         // admission/close; turn out the matching items.
         let joined: HashSet<_> = state
@@ -2771,6 +2814,7 @@ impl AgentActorHandle {
             let deliveries = delivery::take_pending(&mut state);
             state.lifecycle = lifecycle;
             state.tool_attachments.clear();
+            state.tool_mailboxes.clear();
             state.close_pending = true;
             state.preparing = None;
             for entry in &state.operations {

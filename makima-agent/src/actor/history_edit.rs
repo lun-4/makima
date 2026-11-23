@@ -232,6 +232,7 @@ impl HistoryEditWork {
             Ok(finalize) => {
                 let mut state = actor.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 let change = replacement.map(|snapshot| {
+                    state.stop_tools("history rewound");
                     history.replace_snapshot(snapshot.clone());
                     // Nothing kept is a fresh start, not a rewind to build on.
                     let (ended, reason) = if history.is_empty() {

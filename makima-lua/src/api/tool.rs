@@ -225,6 +225,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) lifecycle_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -256,9 +257,38 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) has_lifecycle_controller: bool,
 }
 
 impl Tool for LuaTool {
+    fn has_lifecycle_controller(&self) -> bool {
+        self.has_lifecycle_controller
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        root: makima_agent::AgentRef,
+        trigger: makima_agent::actor::ToolLifecycleTrigger,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            self.tx
+                .send_async(Request::ToolLifecycle {
+                    plugin: self.plugin.clone(),
+                    tool: self.name.clone(),
+                    generation: self.generation,
+                    root,
+                    trigger,
+                    reply,
+                })
+                .await
+                .map_err(|_| "tool lifecycle host is unavailable".to_owned())?;
+            rx.recv_async()
+                .await
+                .map_err(|_| "tool lifecycle host is unavailable".to_owned())?
+        })
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1767,6 +1797,15 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             ));
         }
     };
+    let lifecycle_key = spec
+        .get::<Option<Function>>("lifecycle")?
+        .map(|callback| lua.create_registry_value(callback))
+        .transpose()?;
+    if lifecycle_key.is_some() && enabled_by_default {
+        return Err(mlua::Error::runtime(
+            "tool lifecycle requires enabled_by_default = false",
+        ));
+    }
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1812,6 +1851,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             start_annotation,
             examples,
             describe_key,
+            lifecycle_key,
         });
 
     Ok(())
@@ -2869,6 +2909,7 @@ mod tests {
             has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            has_lifecycle_controller: false,
         }
     }
 

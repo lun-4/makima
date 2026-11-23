@@ -71,6 +71,14 @@ fn plugin_spec(name: &str, spec: &str) {
         || spec.to_owned(),
         |source| format!("local function load_plugin()\n{source}\nend\n{spec}"),
     );
+    let spec = if name == "goal" {
+        let reducer = include_str!("../../plugins/goal/goal_reducer.lua");
+        format!(
+            "local function make_reducer()\n{reducer}\nend\nlocal reducer = make_reducer()\nlocal function require(name) assert(name == 'goal_reducer'); return reducer end\n{spec}"
+        )
+    } else {
+        spec
+    };
     host.load_source(&format!("{name}_spec"), &spec)
         .unwrap_or_else(|e| panic!("{name} spec failed:\n{e}"));
 }

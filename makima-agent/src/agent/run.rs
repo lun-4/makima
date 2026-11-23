@@ -83,6 +83,29 @@ struct ModelRequestTools {
     attachments: Option<Arc<HashMap<String, ToolActivation>>>,
 }
 
+impl ModelRequestTools {
+    fn publish(&mut self, turn: Option<&crate::CurrentManagedTurn>) -> &Value {
+        if let (Some(turn), Some(attachments)) = (turn, &mut self.attachments) {
+            let attachments = Arc::make_mut(attachments);
+            if let Some(definitions) = self.definitions.as_array_mut() {
+                definitions.retain(|definition| {
+                    let Some(name) = definition["name"].as_str() else {
+                        return true;
+                    };
+                    if let Some(activation) = attachments.get(name)
+                        && !turn.manager().record_tool_exposure(turn, name, activation)
+                    {
+                        attachments.remove(name);
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
+        &self.definitions
+    }
+}
+
 enum TurnProgress {
     Continue,
     Done(DoneReason),
@@ -753,13 +776,18 @@ impl<'h> Agent<'h> {
         }
         self.consume_turn_inbox()?;
         self.pending_instruction_request = false;
-        let tools = self.model_request_tools()?;
+        if let Some(turn) = &self.managed_turn {
+            turn.manager().reconcile_request_tools(turn).await;
+        }
+        let mut tools = self.model_request_tools()?;
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
         }
         let messages = Arc::clone(&self.history.snapshot().messages);
         let delivery = RequestDeliveryTracker::new();
         let result = {
+            let managed = self.managed_turn.as_ref();
+            let request_tools = &mut tools;
             let mut stream = pin!(stream_with_retry(
                 &*self.provider,
                 Conversation {
@@ -771,7 +799,7 @@ impl<'h> Agent<'h> {
                 &self.model,
                 &messages,
                 &self.system,
-                &tools.definitions,
+                move || request_tools.publish(managed),
                 &self.event_tx,
                 &self.cancel,
                 self.opts,

@@ -134,7 +134,7 @@ async fn summarize(
             model,
             &compaction_history,
             crate::prompt::COMPACTION_SYSTEM,
-            &empty_tools,
+            || &empty_tools,
             event_tx,
             cancel,
             RequestOptions::default(),

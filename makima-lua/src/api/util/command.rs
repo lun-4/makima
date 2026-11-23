@@ -545,6 +545,14 @@ pub enum BuiltinAction {
 }
 
 pub enum UiAction {
+    ToolWake {
+        root: AgentRef,
+        message: String,
+        fence: makima_agent::actor::ToolIdleFence,
+        after: makima_agent::TurnId,
+        plugin: Arc<str>,
+        generation: u64,
+    },
     OpenWin {
         buf: Arc<SharedBuf>,
         config: FloatConfig,

@@ -683,6 +683,7 @@ fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
             })
         },
     );
+    super::tool_lifecycle::register_methods(methods);
     methods.add_method("_makima_session_id", |_, this, ()| {
         Ok(this
             .state
