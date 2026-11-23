@@ -1009,6 +1009,22 @@ impl SessionJournal {
         self.lock().ready.clone()
     }
 
+    pub(crate) fn admitted_input_turns(&self, agent: AgentId) -> Result<Vec<TurnId>, JournalError> {
+        let snapshot = self.lock().snapshot.clone();
+        let view = snapshot.fold()?;
+        Ok(view
+            .scopes
+            .get(&Some(agent))
+            .map_or_else(Vec::new, |scope| {
+                scope
+                    .admitted
+                    .keys()
+                    .filter(|turn| scope.turn_inputs.contains_key(turn))
+                    .copied()
+                    .collect()
+            }))
+    }
+
     pub fn checkpoint_snapshot(&self) -> Result<SessionJournalSnapshot, String> {
         let state = self.lock();
         if let Some(error) = state.conversion_errors.values().next() {

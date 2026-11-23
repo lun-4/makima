@@ -257,12 +257,13 @@ mod tests {
     use super::{RewindError, RewindOutcome, RewindTargetId};
     use crate::{
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
-        TurnCancellationReason, TurnOutcome,
+        TurnCancellationReason, TurnOutcome, TurnProvenance, TurnResult,
         actor::TurnAdmissionOptions,
         journal::{JournalChange, JournalCommit, SessionJournal},
         session_writer::{Record, SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
     };
+    use futures_lite::future::poll_once;
     use makima_providers::{Message, TokenUsage};
     use makima_storage::{
         id::{AgentId, MakimaId, TurnId},
@@ -311,8 +312,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn batchable_prompt_submitted_during_fork_write_survives_rewind() {
+    #[test_case(false; "ready_admission")]
+    #[test_case(true; "staged_admission")]
+    fn batchable_prompt_submitted_during_fork_write_survives_rewind(block_conversion: bool) {
         smol::block_on(async {
             let directory = tempfile::tempdir().unwrap();
             let session = StoredSession::new("test", "/");
@@ -368,11 +370,43 @@ mod tests {
                     )
                     .unwrap()
             };
+            let conversion = block_conversion.then(|| {
+                journal
+                    .record_terminal(
+                        TurnResult {
+                            outcome: TurnOutcome::cancelled(
+                                AgentId::generate(),
+                                TurnId::generate(),
+                                TokenUsage::default(),
+                                0,
+                                TurnCancellationReason::User,
+                            ),
+                            text: String::new(),
+                            output: Vec::new(),
+                            provenance: TurnProvenance::default(),
+                            duration_ms: 0,
+                        },
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap()
+            });
             let old = submit(OLD_QUEUE);
-            let fork = smol::spawn(guard.commit(RewindTargetId::Message(target)));
+            let mut fork = Box::pin(guard.commit(RewindTargetId::Message(target)));
+            if let Some(conversion) = conversion {
+                let ready = journal.snapshot().fold().unwrap();
+                assert!(
+                    !ready
+                        .scopes
+                        .get(&Some(root.id()))
+                        .is_some_and(|scope| { scope.admitted.contains_key(&old.turn_id()) })
+                );
+                assert!(poll_once(fork.as_mut()).await.is_none());
+                drop(conversion);
+            }
+            let fork = smol::spawn(fork);
             writing.recv_async().await.unwrap();
             let late = submit(REPLACEMENT);
-            assert!(late.peek().is_none());
             release.send(()).unwrap();
             fork.await.unwrap();
             assert_ne!(old.turn_id(), late.turn_id());
@@ -392,9 +426,16 @@ mod tests {
 
             writer.append(Vec::new()).await.unwrap();
             let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+            let fork = reopened
+                .context_events()
+                .iter()
+                .find(|event| event["t"] == FORK)
+                .unwrap();
+            assert_eq!(fork["cleared_turns"], serde_json::json!([old.turn_id()]));
             let state = reopened.latest_state().unwrap();
             let scope = &state.scopes[&Some(root.id())];
             assert!(!scope.admitted.contains_key(&old.turn_id()));
+            assert!(!scope.turn_inputs.contains_key(&old.turn_id()));
             assert!(scope.admitted.contains_key(&active.0));
             let replayed: AgentInput =
                 serde_json::from_value(scope.turn_inputs[&active.0].clone()).unwrap();

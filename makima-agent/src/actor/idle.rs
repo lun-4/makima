@@ -77,16 +77,7 @@ impl ActorIdleGuard {
         journal: &SessionJournal,
     ) -> Result<Vec<TurnId>, JournalError> {
         let mut state = self.actor.inner.state.lock_unpoisoned();
-        let queue = journal.snapshot().fold().map_err(JournalError::from)?;
-        let Some(scope) = queue.scopes.get(&Some(self.actor.agent_id())) else {
-            return Ok(Vec::new());
-        };
-        let cleared_turns: Vec<_> = scope
-            .admitted
-            .keys()
-            .filter(|turn| scope.turn_inputs.contains_key(turn))
-            .copied()
-            .collect();
+        let cleared_turns = journal.admitted_input_turns(self.actor.agent_id())?;
         if cleared_turns.iter().any(|turn| {
             state
                 .instructions
