@@ -400,10 +400,25 @@ impl App {
             if let Some(id) = chat.agent_id {
                 self.agent_chat_index.insert(id, idx);
             }
-            if let Some(config) = record
-                .and_then(|record| view.scopes.get(&Some(record.id)))
-                .and_then(|scope| scope.config.as_ref())
-            {
+            let scope = record.and_then(|record| view.scopes.get(&Some(record.id)));
+            if let Some(record) = record {
+                let last_turn = scope.and_then(|scope| {
+                    scope
+                        .admitted
+                        .keys()
+                        .chain(scope.results.iter().map(|(turn, _)| turn))
+                        .max()
+                        .copied()
+                });
+                let started_at = last_turn
+                    .and_then(|turn| turn.created_at())
+                    .or_else(|| record.id.created_at());
+                chat.restore_turn(last_turn, started_at);
+                chat.context_size = scope
+                    .and_then(|scope| scope.results.back())
+                    .map_or(0, |(_, result)| result.outcome.context_size);
+            }
+            if let Some(config) = scope.and_then(|scope| scope.config.as_ref()) {
                 chat.model_id = Some(config.model.clone());
                 chat.opts = Some(RequestOptions {
                     thinking: config.thinking.map(Into::into).unwrap_or_default(),

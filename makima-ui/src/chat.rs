@@ -113,6 +113,11 @@ impl Chat {
         self.started_at = Some(SystemTime::now());
     }
 
+    pub(crate) fn restore_turn(&mut self, turn: Option<TurnId>, started_at: Option<SystemTime>) {
+        self.turn = turn;
+        self.started_at = started_at;
+    }
+
     pub fn set_pending_turn_usage(&mut self, usage: String) {
         self.pending_turn_usage = Some(usage);
     }

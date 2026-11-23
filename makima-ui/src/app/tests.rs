@@ -36,7 +36,10 @@ use makima_providers::{
     ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
     TokenUsage,
 };
-use makima_storage::session_state::StoredAgentLifecycle;
+use makima_storage::session_state::{
+    StateChange, StoredAgentLifecycle, StoredDoneReason, StoredPayload, StoredStateRecord,
+    StoredTurnOrigin, StoredTurnOutcome, StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
+};
 use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
@@ -4444,11 +4447,58 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
     );
 }
 
-#[test]
-fn restored_subagents_have_no_ago_and_are_finished() {
+fn push_turn_result(app: &mut App, agent_id: AgentId, turn_id: TurnId, context_size: u32) {
+    let session = app.state.session_mut();
+    let result = StoredTurnResult {
+        outcome: StoredTurnOutcome {
+            agent_id,
+            turn_id,
+            usage: Default::default(),
+            num_turns: 1,
+            cost: None,
+            list_cost: None,
+            context_size,
+            context_window: 0,
+            status: StoredTurnStatus::Completed {
+                reason: StoredDoneReason::EndTurn,
+            },
+        },
+        text: StoredPayload::Inline(String::new()),
+        output: StoredPayload::Inline(Vec::new()),
+        provenance: StoredTurnProvenance {
+            origin: StoredTurnOrigin::User,
+            plugin: None,
+            plugin_generation: None,
+            source_agent: None,
+            source_turn: None,
+        },
+        duration_ms: 0,
+    };
+    let seq = session.next_state_seq();
+    session.push_state(StoredStateRecord {
+        seq,
+        agent: Some(agent_id),
+        generation: 0,
+        change: StateChange::Turn {
+            turn: turn_id,
+            result,
+        },
+    });
+}
+
+#[test_case(false; "ages_from_agent_without_turns")]
+#[test_case(true; "ages_from_last_turn")]
+fn restored_subagents_keep_age_and_context_and_are_finished(with_turn: bool) {
+    const OLD_TURN: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const CONTEXT_SIZE: u32 = 4200;
     let mut app = test_app();
     let id = "restored-sub".to_string();
-    register_restored_child(&mut app, AgentId::generate(), id.as_str());
+    let child_id = AgentId::generate();
+    register_restored_child(&mut app, child_id, id.as_str());
+    let turn: TurnId = OLD_TURN.parse().unwrap();
+    if with_turn {
+        push_turn_result(&mut app, child_id, turn, CONTEXT_SIZE);
+    }
     app.state.session_mut().set_subagents(vec![StoredSubagent {
         tool_use_id: id.clone(),
         agent_id: None,
@@ -4465,13 +4515,19 @@ fn restored_subagents_have_no_ago_and_are_finished() {
 
     assert_eq!(app.chats.len(), 2);
     assert!(app.chats[1].is_finished());
-    assert_eq!(app.chats[1].started_at(), None);
+    let (started_at, context_size) = if with_turn {
+        (turn.created_at(), CONTEXT_SIZE)
+    } else {
+        (child_id.created_at(), 0)
+    };
+    assert_eq!(app.chats[1].started_at(), started_at);
+    assert_eq!(app.chats[1].context_size, context_size);
     assert_eq!(app.chats[1].subagent_id.as_deref(), Some(id.as_str()));
 
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
     assert!(sub.is_finished());
-    assert_eq!(sub.age(&clock_at(SystemTime::now())), None);
+    assert!(sub.age(&clock_at(SystemTime::now())).is_some());
     assert_eq!(sub.depth(), 1);
     assert_eq!(sub.parent_chat_index, Some(0));
 
