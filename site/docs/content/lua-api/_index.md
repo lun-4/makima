@@ -5549,6 +5549,31 @@ print(makima.time.ago(makima.time.at(session.updated_at)))
 
 ---
 
+### `makima.time.of_id()` {#makima-time-of_id}
+
+```lua
+makima.time.of_id({id})
+```
+
+Read when a makima id (agent, turn, session, ...) was created, as a
+timestamp object readable by `makima.time.ago`. Ids embed their creation
+time with millisecond precision; a turn id's time is when the turn was
+admitted, so its age includes time spent queued.
+
+**Parameters:**
+
+- `{id}` (`string`) Any makima id, e.g. from `agent:id()` or `turn:id()`.
+
+**Returns:** (`table?`, `string?`) `{secs, nanosecs}` timestamp, or nil and an error for an invalid id.
+
+**Example:**
+
+```lua
+print(makima.time.ago(makima.time.of_id(turn:id())))
+```
+
+---
+
 ### `makima.time.ago()` {#makima-time-ago}
 
 ```lua

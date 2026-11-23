@@ -1,5 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -41,6 +42,13 @@ impl MakimaId {
 
     pub fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
+    }
+
+    /// The wall-clock time embedded at generation, with millisecond
+    /// precision. `None` for ids that are not UUIDv7.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        let (secs, nanos) = Uuid::from_bytes(self.0).get_timestamp()?.to_unix();
+        Some(UNIX_EPOCH + Duration::new(secs, nanos))
     }
 }
 
@@ -230,12 +238,22 @@ mod tests {
 
     const SAMPLE_HEX: &str = "01965087-4c71-7f00-8000-000000000000";
     const SAMPLE_BASE58: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const SAMPLE_MILLIS: u64 = 0x0196_5087_4c71;
+    const V4_HEX: &str = "01965087-4c71-4f00-8000-000000000000";
 
     #[test]
     fn generate_is_v7() {
         let id = MakimaId::generate();
         let uuid = Uuid::from_bytes(id.0);
         assert_eq!(uuid.get_version(), Some(uuid::Version::SortRand));
+    }
+
+    #[test_case(SAMPLE_HEX => Some(Duration::from_millis(SAMPLE_MILLIS)) ; "v7")]
+    #[test_case(V4_HEX => None ; "v4")]
+    fn created_at_reads_the_v7_timestamp(hex: &str) -> Option<Duration> {
+        let id = MakimaId(Uuid::parse_str(hex).unwrap().into_bytes());
+        id.created_at()
+            .map(|time| time.duration_since(UNIX_EPOCH).unwrap())
     }
 
     #[test]
