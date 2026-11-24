@@ -267,6 +267,14 @@ impl Chat {
         ChatEventResult::Continue
     }
 
+    pub(crate) fn show_all_thinking(&mut self) {
+        self.messages_panel.show_all_thinking();
+    }
+
+    pub(crate) fn collapse_all_thinking(&mut self) {
+        self.messages_panel.collapse_all_thinking();
+    }
+
     pub fn scroll(&mut self, delta: i32) {
         self.messages_panel.scroll(delta);
     }

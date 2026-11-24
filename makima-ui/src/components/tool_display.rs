@@ -101,21 +101,13 @@ pub fn thinking_style(names: &RoleNames) -> RoleStyle {
     }
 }
 
-/// Two-line thinking indicator: a header (`thinking> ...`) followed by a
-/// `(N lines) (click to expand)` footer. Shared by the streaming and cached
-/// views when `show_thinking` is off.
 pub fn thinking_indicator(line_count: usize, names: &RoleNames) -> Vec<Line<'static>> {
     let theme = theme::current();
-    vec![
-        Line::from(Span::styled(
-            format!("{}...", names.thinking),
-            theme.thinking,
-        )),
-        Line::from(vec![
-            Span::styled(format!("({line_count} lines) "), theme.tool_dim),
-            Span::styled(THINKING_EXPAND_HINT, theme.thinking),
-        ]),
-    ]
+    vec![Line::from(vec![
+        Span::styled(format!("{}... ", names.thinking), theme.thinking),
+        Span::styled(format!("({line_count} lines) "), theme.tool_dim),
+        Span::styled(THINKING_EXPAND_HINT, theme.thinking),
+    ])]
 }
 
 pub fn error_style() -> RoleStyle {

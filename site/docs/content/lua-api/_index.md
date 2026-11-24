@@ -7036,7 +7036,9 @@ and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"plan_submit"`, `"edit_input"`,
-`"pop_queue"`, `"prev_chat"`, `"next_chat"`.
+`"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
+`"show_all_thinking"`, `"collapse_all_thinking"`. The thinking actions
+affect the focused chat's transcript.
 
 For slash commands rather than keybound actions, see
 `makima.api.run_command`.

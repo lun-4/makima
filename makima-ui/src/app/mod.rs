@@ -2245,6 +2245,8 @@ impl App {
                 self.open_model_picker(ModelPickerPurpose::Session);
                 return vec![Action::RefreshModels];
             }
+            BuiltinAction::ShowAllThinking => self.active_chat().show_all_thinking(),
+            BuiltinAction::CollapseAllThinking => self.active_chat().collapse_all_thinking(),
         }
         vec![]
     }
@@ -2293,6 +2295,12 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::SHOW_ALL_THINKING.matches(key) {
+            return self.run_builtin(BuiltinAction::ShowAllThinking);
+        }
+        if key::COLLAPSE_ALL_THINKING.matches(key) {
+            return self.run_builtin(BuiltinAction::CollapseAllThinking);
+        }
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
