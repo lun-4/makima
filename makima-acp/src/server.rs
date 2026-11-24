@@ -5506,7 +5506,9 @@ mod tests {
             let config = root.effective_config().unwrap().unwrap();
             if !invalid {
                 let plan = config.mode.plan_path().unwrap();
-                assert!(plan.starts_with(cwd.path().join(makima_storage::plans::PLANS_DIR)));
+                assert!(
+                    plan.starts_with(params.storage.path().join(makima_storage::plans::PLANS_DIR))
+                );
                 assert_eq!(
                     config.mode_def,
                     params
