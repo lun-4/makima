@@ -39,6 +39,8 @@ pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 pub const DEFAULT_AUTOCOMPLETE_HEIGHT: f64 = 0.7;
+pub const DEFAULT_THINKING_LINES: i64 = 3;
+pub const MIN_THINKING_LINES: i64 = -1;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
@@ -342,6 +344,12 @@ pub enum ConfigError {
         "invalid config: ui.autocomplete_height = {value} must be finite and in the range (0, 1]"
     )]
     InvalidAutocompleteHeight { value: f64 },
+    #[error("invalid config: ui.thinking_lines = {value} is below minimum ({MIN_THINKING_LINES})")]
+    InvalidThinkingLines { value: i64 },
+    #[error(
+        "invalid config: ui.thinking_lines and ui.show_thinking cannot both be set; use ui.thinking_lines"
+    )]
+    ConflictingThinkingSettings,
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -489,7 +497,7 @@ impl RawConfig {
                     .map(AlwaysThinking::resolve)
                     .transpose()?,
             },
-            ui: UiConfig::from_file(self.ui),
+            ui: UiConfig::from_file(self.ui)?,
             agent: AgentConfig::from_file(self.agent),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
@@ -553,6 +561,7 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
+    pub thinking_lines: Option<i64>,
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
     pub clock_format: Option<ClockFormat>,
@@ -564,6 +573,10 @@ pub struct UiFileConfig {
 
 impl UiFileConfig {
     fn merge(&mut self, overlay: UiFileConfig) {
+        if overlay.thinking_lines.is_some() || overlay.show_thinking.is_some() {
+            self.thinking_lines = None;
+            self.show_thinking = None;
+        }
         merge_option!(
             self,
             overlay,
@@ -574,6 +587,7 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
+            thinking_lines,
             show_thinking,
             theme,
             clock_format,
@@ -1353,10 +1367,12 @@ pub struct UiConfig {
     pub autocomplete_height: f64,
 
     #[config(
-        default = true,
-        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+        default = DEFAULT_THINKING_LINES,
+        ty = "integer",
+        default_doc = "3",
+        desc = "Thinking display: -1 shows all lines, 0 shows only the header, and positive values show that many trailing rows. Legacy show_thinking values true and false map to -1 and 0; do not set both keys"
     )]
-    pub show_thinking: bool,
+    pub thinking_lines: i64,
 
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
@@ -1376,8 +1392,15 @@ impl UiConfig {
         Duration::from_millis(self.flash_duration_ms)
     }
 
-    fn from_file(f: UiFileConfig) -> Self {
-        Self {
+    fn from_file(f: UiFileConfig) -> Result<Self, ConfigError> {
+        let thinking_lines = match (f.thinking_lines, f.show_thinking) {
+            (Some(_), Some(_)) => return Err(ConfigError::ConflictingThinkingSettings),
+            (Some(lines), None) => lines,
+            (None, Some(true)) => -1,
+            (None, Some(false)) => 0,
+            (None, None) => DEFAULT_THINKING_LINES,
+        };
+        Ok(Self {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
             inline_images: f.inline_images.unwrap_or(true),
@@ -1389,16 +1412,21 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             autocomplete_height: f.autocomplete_height.unwrap_or(DEFAULT_AUTOCOMPLETE_HEIGHT),
-            show_thinking: f.show_thinking.unwrap_or(true),
+            thinking_lines,
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             bell: BellConfig::from_file(f.bell),
-        }
+        })
     }
 
     pub fn validate_all(&self) -> Result<(), ConfigError> {
         self.validate()?;
+        if self.thinking_lines < MIN_THINKING_LINES {
+            return Err(ConfigError::InvalidThinkingLines {
+                value: self.thinking_lines,
+            });
+        }
         if !self.autocomplete_height.is_finite()
             || !(0.0..=1.0).contains(&self.autocomplete_height)
             || self.autocomplete_height == 0.0
@@ -3214,23 +3242,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn show_thinking_deserializes_true() {
-        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
-        assert!(raw.ui.show_thinking.unwrap());
-    }
-
-    #[test]
-    fn show_thinking_deserializes_false() {
-        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
-        assert!(!raw.ui.show_thinking.unwrap());
-    }
-
-    #[test]
-    fn show_thinking_missing_defaults_true() {
-        let raw: RawConfig = toml::from_str("").unwrap();
+    #[test_case("", DEFAULT_THINKING_LINES ; "default")]
+    #[test_case("thinking_lines = -1", -1 ; "full")]
+    #[test_case("thinking_lines = 0", 0 ; "header_only")]
+    #[test_case("thinking_lines = 5", 5 ; "tail")]
+    #[test_case("show_thinking = true", -1 ; "legacy_true")]
+    #[test_case("show_thinking = false", 0 ; "legacy_false")]
+    fn thinking_lines_parses_and_validates(setting: &str, expected: i64) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\n{setting}\n")).unwrap();
         let config = raw.into_config().unwrap();
-        assert!(config.ui.show_thinking);
+        config.validate().unwrap();
+        assert_eq!(config.ui.thinking_lines, expected);
+    }
+
+    #[test_case(-2 ; "below_minimum")]
+    #[test_case(i64::MIN ; "minimum_integer")]
+    fn thinking_lines_rejects_invalid_values(value: i64) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nthinking_lines = {value}\n")).unwrap();
+        let config = raw.into_config().unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidThinkingLines { value: actual }) if actual == value
+        ));
+    }
+
+    #[test_case("true" ; "boolean")]
+    #[test_case("1.5" ; "float")]
+    #[test_case("\"3\"" ; "string")]
+    fn thinking_lines_rejects_non_integer_values(value: &str) {
+        assert!(toml::from_str::<RawConfig>(&format!("[ui]\nthinking_lines = {value}\n")).is_err());
+    }
+
+    #[test]
+    fn thinking_lines_rejects_both_keys() {
+        let raw: RawConfig =
+            toml::from_str("[ui]\nthinking_lines = 3\nshow_thinking = true\n").unwrap();
+        let error = raw.into_config().err().unwrap();
+        assert!(matches!(error, ConfigError::ConflictingThinkingSettings));
+        assert!(
+            error
+                .to_string()
+                .contains("ui.thinking_lines and ui.show_thinking")
+        );
+    }
+
+    #[test_case("thinking_lines = 1", "show_thinking = false", 0 ; "legacy_overrides_new")]
+    #[test_case("show_thinking = false", "thinking_lines = 2", 2 ; "new_overrides_legacy")]
+    #[test_case("thinking_lines = 1", "thinking_lines = 2", 2 ; "new_overrides_new")]
+    #[test_case("show_thinking = true", "show_thinking = false", 0 ; "legacy_overrides_legacy")]
+    #[test_case("thinking_lines = 1", "scrollbar = false", 1 ; "unrelated_overlay")]
+    fn thinking_lines_merge_respects_overlay(base: &str, overlay: &str, expected: i64) {
+        let mut base: RawConfig = toml::from_str(&format!("[ui]\n{base}\n")).unwrap();
+        base.merge(toml::from_str(&format!("[ui]\n{overlay}\n")).unwrap());
+        assert_eq!(base.into_config().unwrap().ui.thinking_lines, expected);
+    }
+
+    #[test]
+    fn thinking_lines_merge_preserves_overlay_conflict() {
+        let mut base: RawConfig = toml::from_str("[ui]\nthinking_lines = 1\n").unwrap();
+        base.merge(toml::from_str("[ui]\nthinking_lines = 2\nshow_thinking = false\n").unwrap());
+        assert!(matches!(
+            base.into_config(),
+            Err(ConfigError::ConflictingThinkingSettings)
+        ));
+    }
+
+    #[test]
+    fn thinking_lines_metadata() {
+        let field = UiConfig::FIELDS
+            .iter()
+            .find(|field| field.name == "thinking_lines")
+            .unwrap();
+        assert_eq!(field.ty, "integer");
+        assert_eq!(
+            field.default.format_default(),
+            DEFAULT_THINKING_LINES.to_string()
+        );
+        assert!(
+            !UiConfig::FIELDS
+                .iter()
+                .any(|field| field.name == "show_thinking")
+        );
     }
 
     #[test]

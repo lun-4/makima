@@ -542,6 +542,8 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    ShowAllThinking,
+    CollapseAllThinking,
 }
 
 pub enum UiAction {
@@ -626,12 +628,11 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    #[test]
-    fn plan_submit_parses_from_lua_name() {
-        assert_eq!(
-            "plan_submit".parse::<BuiltinAction>(),
-            Ok(BuiltinAction::PlanSubmit)
-        );
+    #[test_case("plan_submit", BuiltinAction::PlanSubmit ; "plan_submit")]
+    #[test_case("show_all_thinking", BuiltinAction::ShowAllThinking ; "show_all_thinking")]
+    #[test_case("collapse_all_thinking", BuiltinAction::CollapseAllThinking ; "collapse_all_thinking")]
+    fn builtin_action_parses_from_lua_name(name: &str, expected: BuiltinAction) {
+        assert_eq!(name.parse::<BuiltinAction>(), Ok(expected));
     }
 
     #[test]

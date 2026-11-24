@@ -159,6 +159,16 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
+    pub const SHOW_ALL_THINKING: Bind = Bind {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+S",
+    };
+    pub const COLLAPSE_ALL_THINKING: Bind = Bind {
+        code: KeyCode::Char('h'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+H",
+    };
     pub const DEFER_INPUT: Bind = Bind {
         code: KeyCode::Char('m'),
         modifiers: KeyModifiers::ALT,
@@ -357,6 +367,18 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::MODEL_PICKER.label),
         description: "Model picker",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SHOW_ALL_THINKING.label),
+        description: "Show all thinking",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::COLLAPSE_ALL_THINKING.label),
+        description: "Collapse all thinking",
         context: KeybindContext::General,
         platform: Platform::All,
     },
