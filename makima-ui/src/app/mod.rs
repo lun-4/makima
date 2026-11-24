@@ -1842,7 +1842,7 @@ impl App {
                 finished: Some(call.finished.is_some()),
                 chat_index: call.chat_index,
                 identity: TaskIdentity::Background(call.id.clone()),
-                parent_chat_index: None,
+                parent_chat_index: Some(call.chat_index),
                 depth: 0,
                 snippet: String::new(),
                 context: match call.finished {
@@ -1864,7 +1864,11 @@ impl App {
         ) {
             entry.depth = depth;
             let parent = entry.chat_index;
+            let leaf = matches!(entry.identity, TaskIdentity::Background(_));
             ordered.push(entry);
+            if leaf {
+                return;
+            }
             while let Some(index) = remaining
                 .iter()
                 .position(|entry| entry.parent_chat_index == Some(parent))

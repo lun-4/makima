@@ -14479,6 +14479,48 @@ fn a_lost_background_call_reads_as_failed() {
 }
 
 #[test]
+fn background_calls_nest_under_their_agent() {
+    const CHILD: &str = "child";
+    const GRANDCHILD: &str = "grandchild";
+    const COMMANDS: [&str; 2] = ["cargo test", "cargo build"];
+    let mut app = test_app();
+    let root = AgentId::generate();
+    app.chats[0].agent_id = Some(root);
+    let child = AgentId::generate();
+    add_picker_agent(&mut app, child, root, CHILD);
+    for (index, command) in COMMANDS.into_iter().enumerate() {
+        let mut info = subagent_info_for_agent(child, CHILD, CHILD, None, None);
+        info.parent_agent_id = Some(root);
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::ToolMoved {
+                id: format!("call_{index}"),
+                tool: "bash".into(),
+                summary: command.into(),
+            },
+            subagent: Some(info),
+            identity: Some(work_identity(1)),
+        })));
+    }
+    add_picker_agent(&mut app, AgentId::generate(), child, GRANDCHILD);
+
+    let rows: Vec<_> = app
+        .task_entries()
+        .into_iter()
+        .skip(1)
+        .map(|entry| (entry.name, entry.depth))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (CHILD.to_owned(), 1),
+            (GRANDCHILD.to_owned(), 2),
+            (COMMANDS[0].to_owned(), 2),
+            (COMMANDS[1].to_owned(), 2),
+        ]
+    );
+}
+
+#[test]
 fn selecting_a_background_task_row_renders_its_chat() {
     let mut app = test_app();
     app.update(agent_msg(AgentEvent::ToolMoved {
