@@ -1644,6 +1644,11 @@ pub(crate) struct EventLoop<'t> {
     internal_tx: flume::Sender<InternalEvent>,
     internal_rx: flume::Receiver<InternalEvent>,
     model_discovery: Discovery,
+    /// Discovery answers one batch per provider; a drain folds them into one
+    /// refresh so an open picker is not rebuilt once per provider.
+    models_discovered: bool,
+    #[cfg(test)]
+    models_refreshed: usize,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -1989,6 +1994,9 @@ impl<'t> EventLoop<'t> {
             internal_tx,
             internal_rx,
             model_discovery,
+            models_discovered: false,
+            #[cfg(test)]
+            models_refreshed: 0,
         })
     }
 
@@ -2243,6 +2251,19 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
+    /// Folds the batches discovery answered during a drain into one refresh.
+    fn flush_model_discovery(&mut self) {
+        if !std::mem::take(&mut self.models_discovered) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.models_refreshed += 1;
+        }
+        self.ctx.model_capabilities.clear();
+        self.refresh_discovered_models();
+    }
+
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
             InternalEvent::PlanApprovalReady {
@@ -2261,10 +2282,7 @@ impl<'t> EventLoop<'t> {
                     self.complete_plan_approval(idx, result);
                 }
             }
-            InternalEvent::ModelsDiscovered => {
-                self.ctx.model_capabilities.clear();
-                self.refresh_discovered_models();
-            }
+            InternalEvent::ModelsDiscovered => self.models_discovered = true,
             InternalEvent::ModelCapabilitiesResolved => {
                 for runtime in &mut self.sessions {
                     if runtime.app.model_picker.is_open() {
@@ -2727,6 +2745,8 @@ impl<'t> EventLoop<'t> {
                 None => break,
             }
         }
+
+        self.flush_model_discovery();
 
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
@@ -5875,6 +5895,7 @@ end })
                         .apply(Vec::new(), Some(DISCOVERY_PROVIDER.into())),
                 );
                 event_loop.handle_internal(InternalEvent::ModelsDiscovered);
+                event_loop.flush_model_discovery();
                 let mut awaiting = refreshed;
                 while awaiting {
                     let event = event_loop.internal_rx.recv().unwrap();
@@ -6220,6 +6241,9 @@ end })
             internal_tx,
             internal_rx,
             model_discovery: Discovery::idle(),
+            models_discovered: false,
+            #[cfg(test)]
+            models_refreshed: 0,
         };
         test(&mut event_loop);
         smol::block_on(
