@@ -377,6 +377,7 @@ impl History {
                         turn,
                         input: None,
                         promoted: None,
+                        preambles: Vec::new(),
                     },
                 },
             });

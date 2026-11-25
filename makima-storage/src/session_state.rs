@@ -32,6 +32,10 @@ pub enum StateChange {
     InputHold {
         held: bool,
     },
+    Preamble {
+        id: MakimaId,
+        message: String,
+    },
     Admitted {
         turn: TurnId,
         origin: StoredTurnOrigin,
@@ -41,6 +45,8 @@ pub enum StateChange {
         input: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         promoted: Option<MakimaId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preambles: Vec<MakimaId>,
     },
     JoinedInput {
         turn: TurnId,
@@ -305,6 +311,7 @@ pub struct StoredJoinedInput {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredScopeState {
     pub input_held: bool,
+    pub preambles: Vec<(MakimaId, String)>,
     pub generation: u64,
     pub config: Option<StoredAgentConfig>,
     pub rules: Vec<StoredRule>,
@@ -343,6 +350,7 @@ pub struct SessionStateReducer {
 #[derive(Debug, Clone, Default)]
 struct ReducedScope {
     input_held: bool,
+    preambles: Arc<Vec<(MakimaId, String)>>,
     generation: u64,
     config: Option<Arc<StoredAgentConfig>>,
     rules: Arc<Vec<StoredRule>>,
@@ -370,6 +378,7 @@ impl ReducedScope {
     fn materialize(&self) -> StoredScopeState {
         StoredScopeState {
             input_held: self.input_held,
+            preambles: self.preambles.as_ref().clone(),
             generation: self.generation,
             config: self.config.as_deref().cloned(),
             rules: self.rules.as_ref().clone(),
@@ -545,6 +554,9 @@ impl SessionStateReducer {
         scope.generation = record.generation;
         match &record.change {
             StateChange::InputHold { held } => scope.input_held = *held,
+            StateChange::Preamble { id, message } => {
+                Arc::make_mut(&mut scope.preambles).push((*id, message.clone()));
+            }
             StateChange::Admitted { turn, origin } => {
                 if !scope.results.iter().any(|(id, _)| id == turn) {
                     scope.admitted.insert(*turn, Arc::new(origin.clone()));
@@ -554,12 +566,22 @@ impl SessionStateReducer {
                 turn,
                 input,
                 promoted,
+                preambles,
             } => {
+                if !preambles.is_empty() {
+                    Arc::make_mut(&mut scope.preambles).retain(|(id, _)| !preambles.contains(id));
+                    scope.input_held = false;
+                }
                 if let Some(id) = promoted {
                     scope.remove_joined_input(turn, id);
                 }
                 if let Some(input) = input {
                     if !scope.results.iter().any(|(id, _)| id == turn) {
+                        if !preambles.is_empty() {
+                            scope
+                                .admitted
+                                .insert(*turn, Arc::new(StoredTurnOrigin::User));
+                        }
                         scope.turn_inputs.insert(*turn, Arc::new(input.clone()));
                     }
                 } else {
@@ -651,6 +673,8 @@ pub enum StateFoldError {
     DuplicateSequence { seq: u64 },
     #[error("agent revision at sequence {seq} has invalid creation/update sequences")]
     InvalidAgentRevision { seq: u64 },
+    #[error("preamble at sequence {seq} requires an agent")]
+    MissingPreambleAgent { seq: u64 },
     #[error("compaction at sequence {seq} requires an agent")]
     MissingCompactionAgent { seq: u64 },
     #[error("turn result at sequence {seq} does not match its agent and turn identity")]
@@ -692,6 +716,9 @@ pub fn validate_record(record: &StoredStateRecord) -> Result<(), StateFoldError>
         ) != *id =>
         {
             Err(StateFoldError::DeliveryIdentityMismatch { seq })
+        }
+        StateChange::Preamble { .. } if record.agent.is_none() => {
+            Err(StateFoldError::MissingPreambleAgent { seq })
         }
         StateChange::Compaction { .. } if record.agent.is_none() => {
             Err(StateFoldError::MissingCompactionAgent { seq })

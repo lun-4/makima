@@ -19,13 +19,11 @@ use super::{
     AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
     SessionRequest, UiAction,
 };
-use crate::app::shell::ShellEvent;
 use crate::chat::Chat;
 use crate::components::Action;
 
 const RESTORED_CHAT: &str = "restored task";
 const PROMPT: &str = "session prompt";
-const SHELL_OUTPUT: &str = "shell output";
 const EXPANDER_PLUGIN: &str = "session_prompt_expanders";
 const EXPANDER_FAILURE: &str = "reference expansion rejected";
 const EXPANDED_PROMPT: &str = "expanded task";
@@ -504,19 +502,9 @@ fn session_prompt_expands_once_and_busy_submission_is_queued() {
 
 #[test_case(false; "expander_failure")]
 #[test_case(true; "admission_failure")]
-fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
+fn rejected_session_prompt_leaves_queue_empty(oversized: bool) {
     with_event_loop(|event_loop| {
         let _host = install_expanders(event_loop);
-        let id = event_loop.sessions[0].app.shell.reserve_for(None);
-        event_loop.sessions[0]
-            .app
-            .handle_shell_event(ShellEvent::Done {
-                id,
-                command: PROMPT.into(),
-                output: SHELL_OUTPUT.into(),
-                is_error: false,
-                visible: true,
-            });
         let prompt = if oversized {
             "x".repeat(OVERSIZED_PROMPT_BYTES)
         } else {
@@ -526,13 +514,6 @@ fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
         if !oversized {
             assert_eq!(error, EXPANDER_FAILURE);
         }
-        assert!(
-            !event_loop.sessions[0]
-                .app
-                .shell
-                .results_for(None)
-                .is_empty()
-        );
         assert!(event_loop.sessions[0].handles.queue.is_empty());
     });
 }

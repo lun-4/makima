@@ -1081,6 +1081,7 @@ impl AgentManagerHandle {
         let restoration = ActorRestoration {
             admitted,
             input_held: scope.is_some_and(|scope| scope.input_held),
+            preambles: scope.map_or_else(Vec::new, |scope| scope.preambles.clone()),
             history,
             results,
             deliveries,

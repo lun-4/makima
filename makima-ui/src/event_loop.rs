@@ -104,7 +104,7 @@ use crate::agent::{
 };
 use crate::app::EMPTY_PROMPT_ERR;
 use crate::app::session_state::SessionState;
-use crate::app::shell::{ShellEvent, spawn_shell};
+use crate::app::shell::ShellEvent;
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
 };
@@ -319,11 +319,6 @@ impl SessionStatus {
             Self::Idle => STATUS_IDLE,
         }
     }
-}
-
-fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
-    leading.append(preamble);
-    *preamble = leading;
 }
 
 fn is_current_top_level(current_run_id: u64, envelope: &Envelope) -> bool {
@@ -1297,22 +1292,13 @@ impl SessionRuntime {
         let snapshot = actor.snapshot();
         let starting =
             snapshot.active_turn.is_none() && snapshot.queued == 0 && !actor.input_held();
-        let mut preamble = self.app.shell.results_for(Some(root)).to_vec();
-        preamble.extend_from_slice(self.app.shell.results_for(None));
-        let input = makima_agent::AgentInput {
-            message: text,
-            images: Vec::new(),
-            preamble,
-            prompt: None,
-        };
+        let input = makima_agent::AgentInput::new(text, Vec::new());
         if let Err(error) = self.handles.queue.try_push(QueueItem {
             input,
             displayed: None,
         }) {
             return Err(error.to_string());
         }
-        self.app.shell.drain_results_for(Some(root));
-        self.app.shell.drain_results();
         self.reset_run_notifications();
         Ok(if starting {
             SubmitOutcome::Started(Vec::new())
@@ -4285,11 +4271,9 @@ impl<'t> EventLoop<'t> {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
-                let mut input = *input;
-                prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem {
-                    input,
+                rt.handles.queue.push_mailbox(QueueItem {
+                    input: *input,
                     displayed: Some(run_id),
                 });
             }
@@ -4455,32 +4439,41 @@ impl<'t> EventLoop<'t> {
                 command,
                 visible,
             } => {
-                let validation = self
-                    .selected_target(idx)
-                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                    .and_then(|target| self.target_actor(idx, &target).map(|_| target.id()));
-                let rt = &mut self.sessions[idx];
-                let target = match validation {
-                    Ok(target) => target,
-                    Err(error) => {
-                        rt.app.flash(error);
-                        return;
-                    }
+                let Some(target) = self.selected_target(idx) else {
+                    self.sessions[idx].app.flash(CLOSED_TARGET_ERR.into());
+                    return;
                 };
-                let cwd = rt.app.focused_cwd();
-                let id = rt.app.shell.reserve_for(Some(target));
+                let rt = &mut self.sessions[idx];
+                let id = rt.app.shell.reserve_for(target.id());
                 rt.app.accept_shell_command(&submission, &command, visible);
                 let (trigger, cancel) = CancelToken::new();
                 rt.app.shell.add_trigger_for(id.clone(), trigger);
-                spawn_shell(
-                    command,
-                    id,
-                    visible,
-                    rt.shell_tx.clone(),
-                    cancel,
-                    self.ctx.config.clone(),
-                    cwd,
-                );
+                let tx = rt.shell_tx.clone();
+                let config = self.ctx.config.clone();
+                smol::spawn(async move {
+                    let _ = tx.send(ShellEvent::Start {
+                        id: id.clone(),
+                        command: command.clone(),
+                    });
+                    let result = target
+                        .run_shell(&command, visible, &config, &cancel, |content| {
+                            let _ = tx.send(ShellEvent::Output {
+                                id: id.clone(),
+                                content: content.into(),
+                            });
+                        })
+                        .await;
+                    let (output, is_error) = match result {
+                        Ok(result) => (result.output, result.is_error),
+                        Err(error) => (error.to_string(), true),
+                    };
+                    let _ = tx.send(ShellEvent::Done {
+                        id,
+                        output,
+                        is_error,
+                    });
+                })
+                .detach();
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
@@ -7326,7 +7319,6 @@ end })
         }
     }
 
-    const SHELL_RESULT: &str = "command finished";
     const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
     const PUMP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -13625,19 +13617,6 @@ end })
         assert!(terminal_input_proves_focus(&Event::Paste("text".into())));
         assert!(!terminal_input_proves_focus(&Event::Key(release)));
         assert!(!terminal_input_proves_focus(&Event::Resize(80, 24)));
-    }
-
-    #[test]
-    fn shell_results_do_not_replace_existing_preamble() {
-        let mut preamble = vec![Message::observation(OBSERVATION.into())];
-
-        prepend_preamble(
-            &mut preamble,
-            vec![Message::observation(SHELL_RESULT.into())],
-        );
-
-        let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
-        assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
     }
 
     #[test_case("high", true ; "enabled_options")]

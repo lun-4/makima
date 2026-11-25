@@ -1,3 +1,12 @@
+#[cfg(unix)]
+use crate::{
+    ActorError, AgentConfig, CancelToken,
+    actor::{AgentContextSnapshot, MAX_PENDING_INSTRUCTION_BYTES},
+    session_writer::SessionWriter,
+};
+
+#[cfg(unix)]
+use std::fs::write;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -2531,6 +2540,172 @@ fn restored_held_input_waits_for_user_submit() {
             crate::TurnOutcome::Completed { .. }
         ));
         assert!(!journal.snapshot().fold().unwrap().scopes[&Some(id)].input_held);
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[cfg(unix)]
+#[test_case(false, SubmitWhen::Join; "root")]
+#[test_case(true, SubmitWhen::Queue; "child")]
+fn shell_preamble_survives_reopen_and_is_consumed_once(child: bool, when: SubmitWhen) {
+    const COMMAND: &str = "cat shell-fixture";
+    const OUTPUT: &str = "agent working directory";
+    const PREAMBLE: &str = "I ran: $ cat shell-fixture\n\nOutput:\nagent working directory";
+    const OBSERVATION: &str = "existing preamble";
+
+    smol::block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path().join("shell-fixture"), OUTPUT).unwrap();
+        let records = records();
+        let target = records[usize::from(child)].id;
+        let other = records[usize::from(!child)].id;
+        let fixture = journal(&records);
+        let mut stored = StoredSession::new(MODEL, ".");
+        stored.bind_root_id(records[0].id).unwrap();
+        fixture
+            .checkpoint_snapshot()
+            .unwrap()
+            .apply_to(&mut stored)
+            .unwrap();
+        let reopen = || {
+            let journal = Arc::new(SessionJournal::from_session(&stored).unwrap());
+            journal
+                .bind_writer(SessionWriter::open_session(directory.path(), &stored).unwrap())
+                .unwrap();
+            let manager = restore(&journal, AgentLimits::default()).unwrap();
+            (journal, manager)
+        };
+        let (journal, manager) = reopen();
+        let agent = manager
+            .ensure_resident_with(target, |_| async {
+                Ok(ResidentAgent {
+                    config: config()
+                        .with_context(AgentContextSnapshot::new(directory.path().into())),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        for visible in [false, true] {
+            let result = agent
+                .run_shell(
+                    COMMAND,
+                    visible,
+                    &AgentConfig::default(),
+                    &CancelToken::none(),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+            assert_eq!(result.output, OUTPUT);
+        }
+        let held = TurnId::generate();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Admitted {
+                        turn: held,
+                        origin: StoredTurnOrigin::User,
+                    },
+                    StateChange::InputHold { held: true },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(target),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal.flush().await.unwrap();
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        drop(agent);
+        drop(manager);
+        drop(journal);
+
+        let stored = StoredSession::load_from(stored.id, directory.path()).unwrap();
+        let journal = Arc::new(SessionJournal::from_session(&stored).unwrap());
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::unbounded();
+        for id in [target, other] {
+            let tx = tx.clone();
+            manager
+                .ensure_resident_with(id, |_| async {
+                    let backend = MockBackend::STRICT.with_noop_controls().with_turn(
+                        move |_, context, input, _| {
+                            tx.send((context.agent_id, input.preamble)).unwrap();
+                            Box::pin(async move {
+                                BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                                    context.agent_id,
+                                    context.turn_id.unwrap(),
+                                    TokenUsage::default(),
+                                    0,
+                                    crate::DoneReason::EndTurn,
+                                ))
+                            })
+                        },
+                    );
+                    Ok(ResidentAgent {
+                        backend: Box::new(backend),
+                        ..resident()
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        let agent = manager.lookup(target).unwrap();
+        let submit = |id, input| {
+            manager.lookup(id).unwrap().submit(
+                input,
+                SubmitOptions {
+                    when,
+                    admission: TurnAdmissionOptions {
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::User,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let input = || AgentInput::new(OBSERVATION.into(), Vec::new());
+        assert!(agent.input_held());
+        submit(other, input()).unwrap().0.wait().await;
+        let mut rejected = input();
+        rejected.message = "x".repeat(MAX_PENDING_INSTRUCTION_BYTES + 1);
+        assert!(matches!(
+            submit(target, rejected),
+            Err(SubmitError::Admission(ActorError::InstructionOverflow))
+        ));
+        assert!(agent.input_held());
+        let mut next = input();
+        next.preamble.push(Message::observation(OBSERVATION.into()));
+        submit(target, next).unwrap().0.wait().await;
+        submit(target, input()).unwrap().0.wait().await;
+        for (id, expected) in [
+            (other, &[][..]),
+            (target, &[][..]),
+            (target, &[PREAMBLE, OBSERVATION][..]),
+            (target, &[][..]),
+        ] {
+            let (agent_id, preamble) = rx.try_recv().unwrap();
+            assert_eq!(agent_id, id);
+            assert_eq!(
+                preamble
+                    .iter()
+                    .filter_map(Message::user_text)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let view = journal.snapshot().fold().unwrap();
+        assert!(view.scopes[&Some(target)].preambles.is_empty());
+        assert!(!view.scopes[&Some(target)].input_held);
         manager.shutdown(SHUTDOWN_TIMEOUT).await;
     });
 }

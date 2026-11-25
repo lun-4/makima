@@ -2508,9 +2508,13 @@ impl SessionJournal {
                 records.sort_by_key(|(seq, _)| *seq);
                 let mut consumed_input = match records.last() {
                     Some((_, SessionRecord::State { d }))
-                        if matches!(d.change, StateChange::JoinedInput { input: None, .. })
-                            && d.agent
-                                .is_some_and(|agent| entry.histories.contains(&agent)) =>
+                        if matches!(
+                            d.change,
+                            StateChange::JoinedInput { input: None, .. }
+                                | StateChange::TurnInput { input: None, .. }
+                        ) && d
+                            .agent
+                            .is_some_and(|agent| entry.histories.contains(&agent)) =>
                     {
                         let d = d.clone();
                         records.pop();

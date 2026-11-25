@@ -2812,7 +2812,7 @@ impl App {
                 return Vec::new();
             }
         };
-        self.shell.cancel_for(Some(target.id()));
+        self.shell.cancel_for(target.id());
         self.active_chat().flush();
         self.active_chat().cancel_in_progress();
         self.active_chat().retry_info = None;

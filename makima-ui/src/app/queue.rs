@@ -319,19 +319,13 @@ impl App {
         &mut self,
         target: &AgentRef,
         actor: AgentActorHandle,
-        mut input: AgentInput,
+        input: AgentInput,
         display: Option<String>,
     ) -> Result<bool, String> {
         if self.restore_in_progress {
             return Err(RESTORE_IN_PROGRESS.into());
         }
         let root = self.chats[0].agent_id == Some(target.id());
-        input.preamble = self.shell.results_for(Some(target.id())).to_vec();
-        if root {
-            input
-                .preamble
-                .extend_from_slice(self.shell.results_for(None));
-        }
         let starting = root && self.status != Status::Streaming && !actor.input_held();
         let reserved = starting.then(|| actor.reserve_presentation(self.run_id));
         let images = input.images.clone();
@@ -358,10 +352,6 @@ impl App {
                 },
             )
             .map_err(|error| error.to_string())?;
-        self.shell.drain_results_for(Some(target.id()));
-        if root {
-            self.shell.drain_results();
-        }
         if reserved.is_some() {
             self.record_run_start(presentation);
             if let Some(text) = display {

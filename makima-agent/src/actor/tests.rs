@@ -689,6 +689,7 @@ fn restored_actor_hydrates_exact_history_and_tickets_before_start() {
             agent,
             super::ActorRestoration {
                 input_held: false,
+                preambles: Vec::new(),
                 admitted: Vec::new(),
                 history: history.clone(),
                 results: vec![result.clone()],

@@ -380,6 +380,10 @@ impl ActorInner {
         {
             tracing::warn!(%error, agent_id = %self.agent_id, %turn_id, "turn admission could not be journaled");
         }
+        self.register_ticket(turn_id, ticket);
+    }
+
+    fn register_ticket(&self, turn_id: TurnId, ticket: TurnTicket) {
         self.tickets.lock_unpoisoned().insert(turn_id, ticket);
         *self.latest_admitted.lock_unpoisoned() = Some(turn_id);
     }
@@ -415,6 +419,7 @@ impl ActorInner {
                         turn: turn_id,
                         input: Some(input),
                         promoted: None,
+                        preambles: Vec::new(),
                     },
                 }))
                 .chain(release_input.then_some(JournalChange {
@@ -427,6 +432,47 @@ impl ActorInner {
             })
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn admit_input(
+        &self,
+        state: &mut ActorState,
+        ticket: TurnTicket,
+        input: &mut AgentInput,
+        eligible: bool,
+    ) -> Result<usize, ActorError> {
+        let turn = ticket.turn_id();
+        let user = eligible && ticket.provenance().origin == TurnOrigin::User;
+        let release = user && state.input_held;
+        let pending = user && !state.preambles.is_empty();
+        if pending {
+            input.preamble.splice(
+                ..0,
+                state
+                    .preambles
+                    .iter()
+                    .map(|(_, text)| Message::user(text.clone())),
+            );
+        }
+        let bytes = submission_bytes(input)?;
+        state.check_instruction_capacity(bytes)?;
+        if pending {
+            self.record_input_change(StateChange::TurnInput {
+                turn,
+                input: Some(
+                    serde_json::to_value(input).map_err(|_| ActorError::InvalidInstruction)?,
+                ),
+                promoted: None,
+                preambles: state.preambles.iter().map(|(id, _)| *id).collect(),
+            })?;
+            state.preambles.clear();
+            self.register_ticket(turn, ticket);
+            state.input_held = false;
+        } else {
+            self.admit_ticket(turn, ticket, Some(input), release);
+            state.input_held &= !release;
+        }
+        Ok(bytes)
     }
 
     fn record_input_change(&self, change: StateChange) -> Result<(), ActorError> {
@@ -488,6 +534,7 @@ pub(crate) struct ActorState {
     pub(super) delivery_runs: HashMap<TurnId, Vec<TurnId>>,
     pub(super) delivery_suspended: bool,
     input_held: bool,
+    preambles: Vec<(MakimaId, String)>,
     pub(super) delivery_held: bool,
     pub(super) parent_delivery_policy: Option<delivery::ParentDeliveryPolicy>,
 
@@ -1174,6 +1221,7 @@ impl ActorState {
             delivery_runs: HashMap::new(),
             delivery_suspended: false,
             input_held: false,
+            preambles: Vec::new(),
             delivery_held: false,
             parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
@@ -1734,6 +1782,7 @@ pub struct RestoredTurnAdmission {
 pub struct ActorRestoration {
     pub admitted: Vec<RestoredTurnAdmission>,
     pub input_held: bool,
+    pub preambles: Vec<(MakimaId, String)>,
     pub history: HistorySnapshot,
     pub results: Vec<TurnResult>,
     pub deliveries: Vec<Arc<ChildDelivery>>,
@@ -1949,6 +1998,7 @@ impl AgentActorHandle {
             let mut state = inner.state.lock_unpoisoned();
             state.usage = restoration.usage;
             state.input_held = restoration.input_held;
+            state.preambles = restoration.preambles;
             state.policy_generation = restoration.generation;
             state.delivery_seen = restoration.delivery_seen.into();
             let latest_continuation = restoration
@@ -2348,6 +2398,20 @@ impl AgentActorHandle {
         self.inner.queue.remove_compact(operation_id)
     }
 
+    pub(crate) fn record_preamble(&self, message: String) -> Result<(), ActorError> {
+        let mut state = self.inner.state.lock_unpoisoned();
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle));
+        }
+        let id = MakimaId::generate();
+        self.inner.record_input_change(StateChange::Preamble {
+            id,
+            message: message.clone(),
+        })?;
+        state.preambles.push((id, message));
+        Ok(())
+    }
+
     pub fn input_held(&self) -> bool {
         self.inner.state.lock_unpoisoned().input_held
     }
@@ -2423,6 +2487,7 @@ impl AgentActorHandle {
                     turn: turn_id,
                     input: Some(serde_json::to_value(&entry.input).ok()?),
                     promoted: Some(id),
+                    preambles: Vec::new(),
                 })
                 .ok()?;
         }
@@ -2641,7 +2706,7 @@ impl AgentActorHandle {
     /// open turn it folded into, or the new turn's.
     pub fn submit_presented(
         &self,
-        input: AgentInput,
+        mut input: AgentInput,
         event_sender: Option<EventSender>,
         correlation: String,
         options: TurnAdmissionOptions,
@@ -2695,7 +2760,9 @@ impl AgentActorHandle {
                         .then_some(*id)
                     })
                 });
-            if let Some(target) = target {
+            if let Some(target) = target.filter(|_| {
+                options.provenance.origin != TurnOrigin::User || state.preambles.is_empty()
+            }) {
                 if options.idle_only || options.after_turn.is_some() {
                     return Err(ActorError::Busy);
                 }
@@ -2717,6 +2784,8 @@ impl AgentActorHandle {
                     constraint(&policy).map_err(ActorError::InvalidConfig)?;
                     state = self.inner.state.lock_unpoisoned();
                     if state.input_held
+                        || (options.provenance.origin == TurnOrigin::User
+                            && !state.preambles.is_empty())
                         || state.policy_generation != generation
                         || state.next_operation_id != operation_boundary
                         || state.cancelled_correlations.contains_key(&correlation)
@@ -2821,15 +2890,18 @@ impl AgentActorHandle {
             {
                 return Err(ActorError::StaleTurn);
             }
-            state.check_instruction_capacity(bytes)?;
             if self.inner.tickets.lock_unpoisoned().len() >= MAX_STORED_TURN_RESULTS {
                 return Err(ActorError::InstructionOverflow);
             }
             let work = self.inner.reserve_turn_work(&state)?;
             let turn_id = TurnId::generate();
-            state.turn_work.insert(turn_id, work);
             let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity))
                 .with_provenance(options.provenance);
+            let reason = state.cancelled_correlations.get(&correlation).copied();
+            let bytes =
+                self.inner
+                    .admit_input(&mut state, ticket.clone(), &mut input, reason.is_none())?;
+            state.turn_work.insert(turn_id, work);
             state.next_operation_id = state.next_operation_id.wrapping_add(1);
             let id = state.next_operation_id;
             let presentation_id = state.adopt_presentation(options.displayed_presentation);
@@ -2854,13 +2926,6 @@ impl AgentActorHandle {
             ));
             state.delivery_suspended = false;
             state.instructions.insert(turn_id, inbox);
-            let reason = state.cancelled_correlations.get(&correlation).copied();
-            let release = reason.is_none()
-                && state.input_held
-                && ticket.provenance().origin == TurnOrigin::User;
-            self.inner
-                .admit_ticket(turn_id, ticket.clone(), Some(&input), release);
-            state.input_held &= !release;
             let work = ActorOperation::Turn {
                 id,
                 input: Box::new(input),
@@ -2895,14 +2960,12 @@ impl AgentActorHandle {
 
     pub(crate) fn admit_turn_presented(
         &self,
-        input: AgentInput,
+        mut input: AgentInput,
         event_sender: Option<EventSender>,
         correlation: String,
         options: TurnAdmissionOptions,
     ) -> Result<(TurnTicket, u64), ActorError> {
-        let bytes = submission_bytes(&input)?;
         let mut state = self.inner.state.lock_unpoisoned();
-        state.check_instruction_capacity(bytes)?;
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -2921,9 +2984,13 @@ impl AgentActorHandle {
         }
         let work = self.inner.reserve_turn_work(&state)?;
         let turn_id = TurnId::generate();
-        state.turn_work.insert(turn_id, work);
         let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity))
             .with_provenance(options.provenance);
+        let reason = state.cancelled_correlations.get(&correlation).copied();
+        let bytes =
+            self.inner
+                .admit_input(&mut state, ticket.clone(), &mut input, reason.is_none())?;
+        state.turn_work.insert(turn_id, work);
         state.delivery_suspended = false;
         state.next_operation_id = state.next_operation_id.wrapping_add(1);
         let after = state.next_operation_id;
@@ -2951,12 +3018,6 @@ impl AgentActorHandle {
             inbox.drained.push((ticket.provenance().clone(), bytes));
             inbox.operation = after;
         }
-        let reason = state.cancelled_correlations.get(&correlation).copied();
-        let release =
-            reason.is_none() && state.input_held && ticket.provenance().origin == TurnOrigin::User;
-        self.inner
-            .admit_ticket(turn_id, ticket.clone(), Some(&input), release);
-        state.input_held &= !release;
         let work = ActorOperation::Turn {
             id: after,
             input: Box::new(input),

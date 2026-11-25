@@ -1,5 +1,4 @@
 use super::rewind::{PLANNING_WARNING, REWIND_WARNING, RewindEntry};
-use super::shell::ShellEvent;
 use super::*;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
 use crate::click::{ClickTarget, PickerId, ScrollOwner, Surface};
@@ -73,8 +72,6 @@ const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
     "command failed: local commands cannot include non-text content";
-const REJECTED_COMMAND_SHELL_COMMAND: &str = "pwd";
-const REJECTED_COMMAND_SHELL_OUTPUT: &str = "command shell cwd";
 const RUNNING_TURN_TEXT: &str = "running turn";
 const FOLDED_TEXT: &str = "folded into the running turn";
 const PLAN_OPTIONS_MODEL: &str = "anthropic/claude-opus-4-6";
@@ -7232,37 +7229,9 @@ fn focused_plan_state_is_isolated() {
     );
 }
 
-#[test]
-fn rejected_focused_submission_retains_pending_shell_results() {
-    const SHELL_COMMAND: &str = "pwd";
-    const SHELL_OUTPUT: &str = "shell cwd";
-    let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
-    let target = app.selected_agent_id().unwrap();
-    let id = app.shell.reserve_for(Some(target));
-    app.handle_shell_event(ShellEvent::Done {
-        id,
-        command: SHELL_COMMAND.into(),
-        output: SHELL_OUTPUT.into(),
-        is_error: false,
-        visible: true,
-    });
-    let before = serde_json::to_value(app.shell.results_for(Some(target))).unwrap();
-    let message_count = app.chats[app.active_chat].message_count();
-    assert!(!app.shell.results_for(Some(target)).is_empty());
-    let result = app.submit_prompt(queued_msg(&"x".repeat(256 * 1024 + 1)));
-    assert!(matches!(result, super::queue::SubmitOutcome::Rejected(_)));
-    assert_eq!(app.chats[app.active_chat].message_count(), message_count);
-    assert!(app.queue.text_messages().is_empty());
-    assert!(input_rx.is_empty());
-    assert_eq!(
-        serde_json::to_value(app.shell.results_for(Some(target))).unwrap(),
-        before
-    );
-}
-
 #[test_case(false; "child")]
 #[test_case(true; "main")]
-fn rejected_command_turn_retains_pending_shell_results(root: bool) {
+fn rejected_command_turn_flashes_error(root: bool) {
     let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
     let target = app
         .command_runtime
@@ -7271,21 +7240,6 @@ fn rejected_command_turn_retains_pending_shell_results(root: bool) {
     if root {
         app.chats[0].agent_id = Some(target.id());
     }
-    for scope in [Some(target.id()), None]
-        .into_iter()
-        .take(if root { 2 } else { 1 })
-    {
-        let id = app.shell.reserve_for(scope);
-        app.handle_shell_event(ShellEvent::Done {
-            id,
-            command: REJECTED_COMMAND_SHELL_COMMAND.into(),
-            output: REJECTED_COMMAND_SHELL_OUTPUT.into(),
-            is_error: false,
-            visible: true,
-        });
-    }
-    let target_before = serde_json::to_value(app.shell.results_for(Some(target.id()))).unwrap();
-    let root_before = serde_json::to_value(app.shell.results_for(None)).unwrap();
     let admission = makima_lua::orchestration::PinnedCommandTarget::pin(
         makima_lua::orchestration::TrustedTarget {
             target: target.clone(),
@@ -7301,14 +7255,6 @@ fn rejected_command_turn_retains_pending_shell_results(root: bool) {
         prompt: None,
     };
     app.submit_command_turn(turn, Some(&admission));
-    assert_eq!(
-        serde_json::to_value(app.shell.results_for(Some(target.id()))).unwrap(),
-        target_before
-    );
-    assert_eq!(
-        serde_json::to_value(app.shell.results_for(None)).unwrap(),
-        root_before
-    );
     assert!(app.status_bar.flash_text().is_some());
 }
 
@@ -8099,7 +8045,7 @@ fn parent_error_preserves_running_and_completed_children() {
 #[test]
 fn reserved_shell_survives_parent_done_until_shell_done() {
     let mut app = streaming_app_with_history();
-    let id = app.shell.reserve_for(None);
+    let id = app.shell.reserve_for(app.chats[0].agent_id.unwrap());
 
     app.update(done_event());
     assert!(app.shell.active_ids().contains(&id));
@@ -8111,10 +8057,8 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     assert_eq!(app.chats[0].in_progress_count(), 1);
     app.handle_shell_event(shell::ShellEvent::Done {
         id: id.clone(),
-        command: "true".into(),
         output: String::new(),
         is_error: false,
-        visible: false,
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&id));
@@ -8123,7 +8067,7 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
 #[test]
 fn agent_error_preserves_shell_and_child_tools() {
     let mut app = streaming_app_with_history();
-    let shell_id = app.shell.reserve_for(None);
+    let shell_id = app.shell.reserve_for(app.chats[0].agent_id.unwrap());
     app.handle_shell_event(shell::ShellEvent::Start {
         id: shell_id.clone(),
         command: "true".into(),
@@ -8163,10 +8107,8 @@ fn agent_error_preserves_shell_and_child_tools() {
 
     app.handle_shell_event(shell::ShellEvent::Done {
         id: shell_id.clone(),
-        command: "true".into(),
         output: String::new(),
         is_error: false,
-        visible: false,
     });
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert!(!app.shell.active_ids().contains(&shell_id));
@@ -8175,7 +8117,7 @@ fn agent_error_preserves_shell_and_child_tools() {
 #[test]
 fn parent_done_preserves_shell_and_same_id_child_tool() {
     let mut app = streaming_app_with_history();
-    let id = app.shell.reserve_for(None);
+    let id = app.shell.reserve_for(app.chats[0].agent_id.unwrap());
     app.handle_shell_event(shell::ShellEvent::Start {
         id: id.clone(),
         command: "true".into(),
@@ -10508,9 +10450,10 @@ fn child_consumption_renders_user_bubble() {
 }
 
 #[test]
-fn shell_results_stay_with_original_agent_after_focus_switch() {
+fn shell_output_renders_in_original_agent_after_focus_switch() {
+    const OUTPUT: &str = "shell output after focus switch";
     let mut app = app_with_active_subagent();
-    let target = app.selected_agent_id();
+    let target = app.selected_agent_id().unwrap();
     let id = app.shell.reserve_for(target);
     app.active_chat = 0;
     app.handle_shell_event(shell::ShellEvent::Start {
@@ -10520,13 +10463,14 @@ fn shell_results_stay_with_original_agent_after_focus_switch() {
     assert_eq!(app.chats[1].in_progress_count(), 1);
     app.handle_shell_event(shell::ShellEvent::Done {
         id,
-        command: "true".into(),
-        output: "output".into(),
+        output: OUTPUT.into(),
         is_error: false,
-        visible: true,
     });
-    assert!(app.shell.drain_results().is_empty());
-    assert_eq!(app.shell.drain_results_for(target).len(), 1);
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+    assert!(app.shell.active_ids().is_empty());
+    assert!(!rendered_rows(&mut app, 100, 30).join("\n").contains(OUTPUT));
+    app.active_chat = 1;
+    assert!(rendered_rows(&mut app, 100, 30).join("\n").contains(OUTPUT));
 }
 
 #[test]
@@ -12205,10 +12149,8 @@ fn submit_in_subagent_chat_routes_to_subagent_queue() {
 
 #[test_case(false; "main")]
 #[test_case(true; "child")]
-fn shared_submission_preserves_images_and_preamble(child: bool) {
+fn shared_submission_preserves_images(child: bool) {
     const IMAGE_BYTES: usize = 300 * 1024;
-    const SHELL_COMMAND: &str = "pwd";
-    const SHELL_OUTPUT: &str = "attachment cwd";
     let (mut app, input_rx) = if child {
         app_with_subagent_actor(TASK_ID)
     } else {
@@ -12223,16 +12165,6 @@ fn shared_submission_preserves_images_and_preamble(child: bool) {
             .unwrap();
         (app_with_root(root), rx)
     };
-    let target = app.selected_agent_id().unwrap();
-    let id = app.shell.reserve_for(Some(target));
-    app.handle_shell_event(ShellEvent::Done {
-        id,
-        command: SHELL_COMMAND.into(),
-        output: SHELL_OUTPUT.into(),
-        is_error: false,
-        visible: true,
-    });
-    let expected_preamble = serde_json::to_value(app.shell.results_for(Some(target))).unwrap();
     let data: Arc<str> = Arc::from("A".repeat(IMAGE_BYTES));
     let mut msg = queued_msg("hi");
     msg.images
@@ -12246,11 +12178,6 @@ fn shared_submission_preserves_images_and_preamble(child: bool) {
     let input = received_input(&input_rx);
     assert_eq!(input.images.len(), 1);
     assert_eq!(input.images[0].data, data);
-    assert_eq!(
-        serde_json::to_value(input.preamble).unwrap(),
-        expected_preamble
-    );
-    assert!(app.shell.results_for(Some(target)).is_empty());
 }
 
 #[test]

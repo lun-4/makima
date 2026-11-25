@@ -74,15 +74,27 @@ impl QueueSender {
         self.actor.reserve_presentation(displayed)
     }
 
+    #[cfg(test)]
     pub(crate) fn push(&self, entry: QueueItem) {
         if let Err(error) = self.try_push(entry) {
             warn!(error = %error, "agent queue push failed");
         }
     }
 
-    pub(crate) fn try_push(
+    pub(crate) fn push_mailbox(&self, entry: QueueItem) {
+        if let Err(error) = self.submit(entry, TurnOrigin::Internal) {
+            warn!(%error, "mailbox wake failed");
+        }
+    }
+
+    pub(crate) fn try_push(&self, entry: QueueItem) -> Result<(), ActorError> {
+        self.submit(entry, TurnOrigin::User)
+    }
+
+    fn submit(
         &self,
         QueueItem { input, displayed }: QueueItem,
+        origin: TurnOrigin,
     ) -> Result<(), ActorError> {
         self.actor.submit(
             input,
@@ -90,7 +102,7 @@ impl QueueSender {
             String::new(),
             TurnAdmissionOptions {
                 provenance: TurnProvenance {
-                    origin: TurnOrigin::User,
+                    origin,
                     ..Default::default()
                 },
                 already_displayed: displayed.is_some(),

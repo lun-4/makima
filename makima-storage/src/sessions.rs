@@ -1366,7 +1366,14 @@ where
         })
         .unwrap_or_else(|| id.to_string().parse().expect("matching id representation"));
     if !cleared_turns.is_empty() {
-        state.retain(|record| {
+        state.retain_mut(|record| {
+            if let StateChange::TurnInput { turn, input, preambles, .. } = &mut record.change
+                && !preambles.is_empty()
+                && cleared_turns.contains(&(record.agent, *turn))
+            {
+                *input = None;
+                return true;
+            }
             !matches!(record.change,
                 StateChange::Admitted { turn, .. } | StateChange::TurnInput { turn, .. }
                     | StateChange::JoinedInput { turn, .. } if cleared_turns.contains(&(record.agent, turn)))
