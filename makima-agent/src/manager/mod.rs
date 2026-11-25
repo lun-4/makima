@@ -291,17 +291,24 @@ struct TestGate {
 }
 
 /// Reactivates a dormant agent through `ensure_resident_with` in the same manager.
-/// The hook should hold a weak reference to the manager to avoid a reference cycle.
 pub trait AgentReactivator: Send + Sync {
-    fn reactivate(&self, agent_id: AgentId) -> BoxFuture<'static, Result<(), WakeError>>;
+    fn reactivate(
+        &self,
+        manager: AgentManagerHandle,
+        agent_id: AgentId,
+    ) -> BoxFuture<'static, Result<(), WakeError>>;
 }
 
 impl<F> AgentReactivator for F
 where
-    F: Fn(AgentId) -> BoxFuture<'static, Result<(), WakeError>> + Send + Sync,
+    F: Fn(AgentManagerHandle, AgentId) -> BoxFuture<'static, Result<(), WakeError>> + Send + Sync,
 {
-    fn reactivate(&self, agent_id: AgentId) -> BoxFuture<'static, Result<(), WakeError>> {
-        self(agent_id)
+    fn reactivate(
+        &self,
+        manager: AgentManagerHandle,
+        agent_id: AgentId,
+    ) -> BoxFuture<'static, Result<(), WakeError>> {
+        self(manager, agent_id)
     }
 }
 
@@ -748,7 +755,7 @@ impl AgentManagerHandle {
         } else {
             let reactivator = self.0.reactivator.lock_unpoisoned().clone();
             let reactivator = reactivator.ok_or(WakeError::ReactivatorUnavailable(agent_id))?;
-            reactivator.reactivate(agent_id).await?;
+            reactivator.reactivate(self.clone(), agent_id).await?;
         }
         self.resident_actor(agent_id)?;
         Ok(())

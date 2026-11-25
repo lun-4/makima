@@ -54,6 +54,7 @@ use makima_agent::{
     AgentParams, AgentRef, AgentRunParams, CurrentManagedTurn, Envelope, EventSender, History,
     HistorySnapshot, McpSession, ModeDef, Post, RunSettings, SubagentCancel, SubagentInfo,
     ToolDoneEvent, TurnCancellationReason, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    WakeError,
 };
 use makima_config::ToolKey;
 use makima_lua_macro::{lua_fn, lua_table};
@@ -2219,14 +2220,16 @@ pub(crate) async fn reactivate_agent(
     lua: &Lua,
     manager: AgentManagerHandle,
     agent_id: AgentId,
-) -> Result<(), ManagerError> {
-    let services = crate::orchestration::services(lua)
-        .ok_or_else(|| ReactivationError::Initialization("agent host is unavailable".into()))?;
+) -> Result<(), WakeError> {
+    let services =
+        crate::orchestration::services(lua).ok_or(WakeError::ReactivatorUnavailable(agent_id))?;
     let template = services
         .template(&manager.root()?)
-        .map_err(ReactivationError::Initialization)?;
+        .map_err(|error| ManagerError::from(ReactivationError::Initialization(error)))?;
     let context = LuaCtx::handler(&template);
-    activate_agent_with_guard(lua, &context, manager, agent_id, None).await
+    activate_agent_with_guard(lua, &context, manager, agent_id, None)
+        .await
+        .map_err(WakeError::from)
 }
 
 async fn activate_agent_with_guard(

@@ -77,19 +77,18 @@ fn agent_ref_wake_is_shared_and_submit_requires_residency() {
             Err(WakeError::ReactivatorUnavailable(agent.id()))
         );
 
-        let weak = manager.downgrade();
         let failure = ReactivationError::Initialization(INITIALIZATION_ERROR.into());
         let expected_failure = failure.clone();
-        let reactivate = move |id| -> BoxFuture<'static, Result<(), WakeError>> {
-            let manager = weak.upgrade().unwrap();
-            let failure = failure.clone();
-            Box::pin(async move {
-                manager
-                    .ensure_resident_with(id, |_| async { Err(failure) })
-                    .await?;
-                Ok(())
-            })
-        };
+        let reactivate =
+            move |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                let failure = failure.clone();
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async { Err(failure) })
+                        .await?;
+                    Ok(())
+                })
+            };
         manager.set_reactivator(Some(Arc::new(reactivate)));
         assert_eq!(
             agent.wake().await,
@@ -105,29 +104,28 @@ fn agent_ref_wake_is_shared_and_submit_requires_residency() {
                 .is_none()
         );
 
-        let weak = manager.downgrade();
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let calls = hook_calls.clone();
         let (release_activation, activation_gate) = flume::bounded(1);
         let (_hold_start, start_gate) = flume::bounded(1);
-        let reactivate = move |id| -> BoxFuture<'static, Result<(), WakeError>> {
-            calls.fetch_add(1, Ordering::Relaxed);
-            let manager = weak.upgrade().unwrap();
-            let activation_gate = activation_gate.clone();
-            let start_gate = start_gate.clone();
-            Box::pin(async move {
-                manager
-                    .ensure_resident_with(id, |_| async move {
-                        activation_gate.recv_async().await.unwrap();
-                        Ok(ResidentAgent {
-                            start: Some(start_gate),
-                            ..resident()
+        let reactivate =
+            move |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let activation_gate = activation_gate.clone();
+                let start_gate = start_gate.clone();
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async move {
+                            activation_gate.recv_async().await.unwrap();
+                            Ok(ResidentAgent {
+                                start: Some(start_gate),
+                                ..resident()
+                            })
                         })
-                    })
-                    .await?;
-                Ok(())
-            })
-        };
+                        .await?;
+                    Ok(())
+                })
+            };
         manager.set_reactivator(Some(Arc::new(reactivate)));
         let mut first = Box::pin(agent.wake());
         assert!(poll_once(first.as_mut()).await.is_none());

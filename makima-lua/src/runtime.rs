@@ -28,8 +28,8 @@ use makima_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use makima_agent::{
-    AgentId, AgentManagerHandle, BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf,
-    SnapshotLine, SnapshotSpan, SpanStyle, WakeError, WeakAgentManagerHandle,
+    AgentId, AgentManagerHandle, AgentReactivator, BufferSnapshot, CurrentManagedTurn, MovedBy,
+    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, WakeError,
 };
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
@@ -224,7 +224,6 @@ pub enum Request {
     ReactivateAgent {
         manager: AgentManagerHandle,
         agent_id: AgentId,
-        binding: CancelToken,
         reply: flume::Sender<Result<(), WakeError>>,
     },
     StateChanged {
@@ -5112,72 +5111,6 @@ pub struct SpawnConfig {
     pub orchestration_services: crate::orchestration::OrchestrationServicesSlot,
 }
 
-#[derive(Default)]
-struct ReactivatorBindings {
-    managers: HashMap<u64, WeakAgentManagerHandle>,
-    lifetime: Option<(CancelTrigger, CancelToken)>,
-}
-
-impl ReactivatorBindings {
-    fn install(&mut self, manager: AgentManagerHandle, tx: &flume::Sender<Request>) {
-        let weak = manager.downgrade();
-        if self
-            .managers
-            .insert(manager.generation(), weak.clone())
-            .is_some()
-        {
-            return;
-        }
-        let (_, binding) = self.lifetime.get_or_insert_with(CancelToken::new);
-        let binding = binding.clone();
-        let tx = tx.clone();
-        manager.set_reactivator(Some(Arc::new(move |agent_id| -> BoxFuture<'static, _> {
-            let manager = weak.upgrade();
-            let binding = binding.clone();
-            let tx = tx.clone();
-            Box::pin(async move {
-                let unavailable = || WakeError::ReactivatorUnavailable(agent_id);
-                let manager = manager.ok_or_else(unavailable)?;
-                let (reply, result) = flume::bounded(1);
-                let request = Request::ReactivateAgent {
-                    manager,
-                    agent_id,
-                    binding: binding.clone(),
-                    reply,
-                };
-                binding
-                    .race(async {
-                        tx.send(request).map_err(|_| unavailable())?;
-                        result.recv_async().await.map_err(|_| unavailable())?
-                    })
-                    .await
-                    .map_err(|_| unavailable())?
-            })
-        })));
-    }
-
-    fn clear(&mut self) {
-        self.lifetime.take();
-        for manager in self.managers.drain().filter_map(|(_, weak)| weak.upgrade()) {
-            manager.set_reactivator(None);
-        }
-    }
-}
-
-fn observe_reactivation_roots(
-    lua: &Lua,
-    bindings: &Arc<Mutex<ReactivatorBindings>>,
-    tx: &flume::Sender<Request>,
-) {
-    if let Some(services) = crate::orchestration::services(lua) {
-        let bindings = Arc::clone(bindings);
-        let tx = tx.clone();
-        services.observe_roots(Some(Arc::new(move |root| {
-            bindings.lock_unpoisoned().install(root.manager(), &tx);
-        })));
-    }
-}
-
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
 /// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThread, PluginError> {
@@ -5215,7 +5148,23 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         })
     };
     let tx_clone = tx.clone();
-    let reactivation_tx = tx.clone();
+    let (reactivation_tx, reactivation_rx) = flume::bounded(0);
+    let reactivator: Arc<dyn AgentReactivator> =
+        Arc::new(move |manager, agent_id| -> BoxFuture<'static, _> {
+            let tx = reactivation_tx.clone();
+            Box::pin(async move {
+                let unavailable = || WakeError::ReactivatorUnavailable(agent_id);
+                let (reply, result) = flume::bounded(1);
+                tx.send_async(Request::ReactivateAgent {
+                    manager,
+                    agent_id,
+                    reply,
+                })
+                .await
+                .map_err(|_| unavailable())?;
+                result.recv_async().await.map_err(|_| unavailable())?
+            })
+        });
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let modes_thread = Arc::clone(&modes);
@@ -5254,6 +5203,9 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                 fs,
             ) {
                 Ok(r) => {
+                    if let Some(services) = &orchestration_services.0 {
+                        services.set_reactivator(reactivator.clone());
+                    }
                     r.lua.set_app_data(orchestration_services);
                     if let Some(prepare) = session_provider_preparer {
                         r.lua.set_app_data(prepare);
@@ -5315,11 +5267,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             let timer_wake_rx = timer::wake_rx(&rt.lua);
 
             let mut codegen_armed = false;
-            let reactivators = Arc::new(Mutex::new(ReactivatorBindings::default()));
-            observe_reactivation_roots(&rt.lua, &reactivators, &reactivation_tx);
-            if let Ok(Some(target)) = crate::orchestration::resolve_target(&rt.lua, None) {
-                reactivators.lock_unpoisoned().install(target.target.manager(), &reactivation_tx);
-            }
 
             smol::block_on(ex.run(async {
                 loop {
@@ -5328,18 +5275,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     }
                     while let Ok(cb) = defer_rx.try_recv() {
                         spawn_deferred_callback(&rt.lua, &ex, &gate, cb);
-                    }
-                    // Nothing to serve, so spend the lull on native codegen.
-                    // One chunk per pass with a yield in between, so no request
-                    // or spawned task ever waits for more than a single chunk.
-                    if codegen_armed
-                        && prio_rx.is_empty()
-                        && rx.is_empty()
-                        && spawn_rx.is_empty()
-                        && rt.codegen_step()
-                    {
-                        smol::future::yield_now().await;
-                        continue;
                     }
                     // Biased: user-initiated requests (commands, keybinds) jump
                     // ahead of bulk work like session restores so the UI stays
@@ -5362,34 +5297,40 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                     Ok(None)
                                 },
                                 smol::future::or(
-                                    async { rx.recv_async().await.map(Some) },
+                                    smol::future::or(
+                                        async { rx.recv_async().await.map(Some) },
+                                        async { reactivation_rx.recv_async().await.map(Some) },
+                                    ),
                                     async {
-                                    // A task may register a timer with a
-                                    // deadline earlier than the one being
-                                    // slept on; `set` pokes the wake channel
-                                    // so the loop re-picks without the delay.
-                                    if let Some(deadline) = timer_deadline {
-                                        let _ = futures_lite::future::or(
-                                            async { smol::Timer::at(deadline).await; },
-                                            async {
-                                                let _ =
-                                                    timer_wake_rx.recv_async().await;
-                                            },
-                                        )
-                                        .await;
-                                    } else {
-                                        let _ = timer_wake_rx.recv_async().await;
-                                    }
-                                    for task in timer::due_tasks(&rt.lua) {
-                                        spawn_async_task(&rt.lua, &ex, &gate, &callbacks, task);
-                                    }
-                                    Ok(None)
-                                },
+                                        if codegen_armed && rt.codegen_step() {
+                                            return Ok(None);
+                                        }
+                                        // A task may register a timer with a
+                                        // deadline earlier than the one being
+                                        // slept on; `set` pokes the wake channel
+                                        // so the loop re-picks without the delay.
+                                        if let Some(deadline) = timer_deadline {
+                                            let _ = futures_lite::future::or(
+                                                async { smol::Timer::at(deadline).await; },
+                                                async {
+                                                    let _ =
+                                                        timer_wake_rx.recv_async().await;
+                                                },
+                                            )
+                                            .await;
+                                        } else {
+                                            let _ = timer_wake_rx.recv_async().await;
+                                        }
+                                        for task in timer::due_tasks(&rt.lua) {
+                                            spawn_async_task(&rt.lua, &ex, &gate, &callbacks, task);
+                                        }
+                                        Ok(None)
+                                    },
+                                ),
                             ),
                         ),
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                     let msg = match next {
                         Ok(Some(m)) => m,
                         Ok(None) => {
@@ -5403,9 +5344,6 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::WarmJit => codegen_armed = true,
                         Request::NotifyStateRestored(target) => {
                             let manager = target.manager();
-                            if crate::orchestration::services(&rt.lua).is_some() {
-                                reactivators.lock_unpoisoned().install(manager.clone(), &reactivation_tx);
-                            }
                             let journal = manager.journal();
                             crate::api::state::observe(&rt.lua, &journal, &target);
                             journal.notify_state_transition(makima_agent::state::StateChangeReason::Resume);
@@ -5416,19 +5354,15 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 run_detached(&lua, crate::api::agent::wake_restored_children(&lua, target)).await;
                             }).detach();
                         }
-                        Request::ReactivateAgent { manager, agent_id, binding, reply } => {
+                        Request::ReactivateAgent { manager, agent_id, reply } => {
                             let lua = rt.lua.clone();
                             let callback = GateGuard::new(&callbacks);
                             ex.spawn(async move {
                                 let _callback = callback;
-                                let result = binding.race(run_detached(
+                                let result = run_detached(
                                     &lua,
                                     crate::api::agent::reactivate_agent(&lua, manager, agent_id),
-                                )).await;
-                                let result = match result {
-                                    Ok(result) => result.map_err(WakeError::from),
-                                    Err(_) => Err(WakeError::ReactivatorUnavailable(agent_id)),
-                                };
+                                ).await;
                                 let _ = reply.send(result);
                             }).detach();
                         }
@@ -5438,14 +5372,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             }
                         }
                         Request::InstallOrchestrationServices(services) => {
-                            if let Some(previous) = crate::orchestration::services(&rt.lua) {
-                                previous.observe_roots(None);
+                            if let Some(services) = &services.0 {
+                                services.set_reactivator(reactivator.clone());
                             }
-                            reactivators.lock_unpoisoned().clear();
                             rt.lua.set_app_data(services);
-                            observe_reactivation_roots(&rt.lua, &reactivators, &reactivation_tx);
                             if let Ok(Some(target)) = crate::orchestration::resolve_target(&rt.lua, None) {
-                                reactivators.lock_unpoisoned().install(target.target.manager(), &reactivation_tx);
                                 crate::api::state::observe(&rt.lua, &target.target.manager().journal(), &target.target);
                                 let lua = rt.lua.clone();
                                 let callback = GateGuard::new(&callbacks);
@@ -6141,10 +6072,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     }
                 }
                 rt.shutdown.store(true, Ordering::Release);
-                if let Some(services) = crate::orchestration::services(&rt.lua) {
-                    services.observe_roots(None);
-                }
-                reactivators.lock_unpoisoned().clear();
+                // Flume retains queued requests after disconnecting its last receiver.
+                // A rendezvous channel lets us drain without accepting more requests.
+                drop(reactivation_rx.drain());
+                drop(reactivation_rx);
                 tool_cancels.cancel_all();
                 mutable_cancels.cancel_all();
                 mutable_gate.drain().await;

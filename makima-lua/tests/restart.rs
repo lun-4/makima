@@ -800,9 +800,9 @@ fn runtime_shutdown_detaches_children_without_closing_durable_records() {
     assert_eq!(provider.request_count(), 2);
 }
 
-#[test_case(false; "without_restore_notification")]
-#[test_case(true; "restore_notified_before_install")]
-fn wake_restored_child_after_late_root_registration_without_focus(notify_restore: bool) {
+#[test_case(false; "root_registered_after_install")]
+#[test_case(true; "root_registered_before_install")]
+fn wake_restored_child_without_focus(register_first: bool) {
     let dir = tempfile::tempdir().unwrap();
     let provider = RestartProvider::new(vec![common::canned_reply(REPLY)]);
     let host = agent_host(dir.path(), provider.clone());
@@ -825,14 +825,15 @@ fn wake_restored_child_after_late_root_registration_without_focus(notify_restore
         Err(WakeError::ReactivatorUnavailable(child_id)),
     );
 
-    if notify_restore {
-        events.notify_state_restored(host.root.target.clone());
-        host.host.wait_for_worker_barrier_for_test();
-    }
     let services = Arc::new(AgentOrchestration::new(Arc::default()));
+    if register_first {
+        services.register_root(host.root.clone(), None);
+    }
     events.install_orchestration_services(services.clone());
     host.host.wait_for_worker_barrier_for_test();
-    services.register_root(host.root.clone(), None);
+    if !register_first {
+        services.register_root(host.root.clone(), None);
+    }
     assert!(services.resolve_target(None).unwrap().is_none());
 
     smol::block_on(common::bounded(child.wake())).unwrap();

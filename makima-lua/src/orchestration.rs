@@ -13,8 +13,8 @@ use makima_agent::session_coordinator::{
 };
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::{
-    AgentActorHandle, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance,
-    tools::ToolContext,
+    AgentActorHandle, AgentReactivator, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin,
+    TurnProvenance, tools::ToolContext,
 };
 use makima_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
@@ -563,10 +563,8 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
     })
 }
 
-pub type RootObserver = Arc<dyn Fn(&AgentRef) + Send + Sync>;
-
 pub trait OrchestrationServices: Send + Sync + 'static {
-    fn observe_roots(&self, _observe: Option<RootObserver>) {}
+    fn set_reactivator(&self, _reactivator: Arc<dyn AgentReactivator>) {}
 
     fn resolve_target(
         &self,

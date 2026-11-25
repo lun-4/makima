@@ -3,7 +3,7 @@ use makima_agent::config_change::ConfigChangeError;
 use makima_agent::manager::AgentIncarnation;
 use makima_agent::session_coordinator::ConfigMutation;
 use makima_agent::{
-    AgentActorHandle, AgentRef,
+    AgentActorHandle, AgentReactivator, AgentRef,
     agent::LoadedInstructions,
     cancel::CancelToken,
     tools::{Deadline, ToolContext, TurnToolBindings},
@@ -16,8 +16,8 @@ use makima_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    CommandRunner, ConfigMutationReserver, OrchestrationServices, RootObserver, TrustedTarget,
-    TurnCompletion, TurnCompletionFuture, default_config_mutation,
+    CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
+    TurnCompletionFuture, default_config_mutation,
 };
 
 const CHILD_HISTORY_KEY_UNAVAILABLE: &str = "child agent history key is unavailable";
@@ -41,7 +41,7 @@ struct Targets {
     roots: Vec<RootTarget>,
     children: Vec<ChildTarget>,
     selected: Option<AgentRef>,
-    root_observer: Option<RootObserver>,
+    reactivator: Option<Arc<dyn AgentReactivator>>,
 }
 
 pub struct AgentOrchestration {
@@ -86,16 +86,17 @@ impl AgentOrchestration {
             entry.target.target.validate_live().is_ok()
                 && !entry.target.target.same_manager(&target.target)
         });
+        if let Some(reactivator) = &targets.reactivator {
+            target
+                .target
+                .manager()
+                .set_reactivator(Some(reactivator.clone()));
+        }
         targets.roots.push(RootTarget {
             target,
             config_mutations,
             commands: None,
         });
-        if let Some(observe) = &targets.root_observer
-            && let Some(root) = targets.roots.last()
-        {
-            observe(&root.target.target);
-        }
     }
 
     /// Runs plugin-requested commands for {root}'s graph through {runner},
@@ -162,14 +163,15 @@ impl AgentOrchestration {
 }
 
 impl OrchestrationServices for AgentOrchestration {
-    fn observe_roots(&self, observe: Option<RootObserver>) {
+    fn set_reactivator(&self, reactivator: Arc<dyn AgentReactivator>) {
         let mut targets = self.targets.lock_unpoisoned();
-        if let Some(observe) = &observe {
-            for root in &targets.roots {
-                observe(&root.target.target);
-            }
+        for root in &targets.roots {
+            root.target
+                .target
+                .manager()
+                .set_reactivator(Some(reactivator.clone()));
         }
-        targets.root_observer = observe;
+        targets.reactivator = Some(reactivator);
     }
 
     fn resolve_target(
