@@ -753,16 +753,8 @@ fn managed_child_approval(
         .unwrap();
         let config = child.effective_config().unwrap();
         let child_epoch = history_epoch(&child);
-        assert!(
-            event_loop.sessions[index]
-                .app
-                .state
-                .session
-                .subagents()
-                .iter()
-                .any(|stored| stored.tool_use_id == child_key),
-            "selected child metadata missing from app snapshot"
-        );
+        let record = manager.journal().agent(child_id).unwrap();
+        assert_eq!(record.transcript_key, child_key);
         event_loop.sessions[index].app.checkpoint_now();
         let root_config = root_actor.effective_config().unwrap();
         let root_history = root_actor.committed_history();
@@ -1196,12 +1188,7 @@ fn managed_child_approval(
             pump_until(event_loop, |_| child.snapshot().status == ActorStatus::Idle);
             checkpoint(event_loop, index);
             let restored = AppSession::load(session, &event_loop.ctx.storage).unwrap();
-            assert!(
-                restored
-                    .subagents()
-                    .iter()
-                    .any(|stored| stored.tool_use_id == child_key)
-            );
+            assert_eq!(restored.agents()[&child_id].transcript_key, child_key);
             let view = restored.latest_state().unwrap();
             let config = view.scopes[&Some(child_id)].config.as_ref().unwrap();
             assert_eq!(config.model, TARGET_MODEL);

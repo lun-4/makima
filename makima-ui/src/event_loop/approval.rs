@@ -19,7 +19,7 @@ use makima_storage::sessions::{HistorySnapshot, StoredRule};
 
 use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
-    bounded_session_op,
+    bounded_session_op, project_session_journal,
 };
 use crate::AppSession;
 use crate::components::{SessionReplacementKind, SessionReplacementRequest};
@@ -413,12 +413,18 @@ impl EventLoop<'_> {
             }
             return;
         }
+        let (_, root) = runtime.handles.manager_and_root();
         if let Some(history) = history {
             let draft = runtime.app.input_box.buffer.value().to_owned();
             runtime.app.apply_history_change(history);
             runtime.app.input_box.set_input(draft);
+            if target.id() != root
+                && let Err(error) =
+                    project_session_journal(runtime.app.state.session_mut(), &runtime.handles)
+            {
+                runtime.app.flash(error);
+            }
         }
-        let (_, root) = runtime.handles.manager_and_root();
         if target.id() == root {
             runtime.project_config(&config);
             runtime.reset_run_notifications();

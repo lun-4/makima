@@ -1139,8 +1139,6 @@ mod tests {
                     updated_at: session.updated_at,
                     sequence_high_water: None,
                     history_epochs: BTreeMap::new(),
-                    subagents: Vec::new(),
-                    subagent_conversations: HashMap::new(),
                     usage_by_model: HashMap::new(),
                     legacy_config: None,
                     meta: Box::new(SessionMeta {

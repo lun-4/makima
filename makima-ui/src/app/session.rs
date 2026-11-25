@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::chat::{Chat, DONE_TEXT, history_to_display_with_notes, history_to_display_with_target};
+use crate::chat::{Chat, history_to_display_with_notes, history_to_display_with_target};
 use crate::components::DisplayRole;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
 use crate::repaint::Dirty;
@@ -15,11 +15,8 @@ use makima_providers::Model;
 use makima_storage::id::MakimaId;
 use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::{
-    ContextEntry, SessionMeta, SessionRecord, StoredMode, StoredPost, StoredSubagent,
-    context_entries,
+    ContextEntry, SessionMeta, SessionRecord, StoredMode, StoredPost, context_entries,
 };
-
-use serde_json::Value;
 
 use crate::AppSession;
 use makima_providers::RequestOptions;
@@ -102,20 +99,6 @@ impl App {
         self.checkpoint();
     }
 
-    fn live_child_keys(&self) -> Vec<String> {
-        self.chats
-            .iter()
-            .filter(|chat| {
-                chat.agent_id.is_some_and(|id| {
-                    self.subagent_channels
-                        .get(&id)
-                        .is_some_and(|channels| !channels.closed)
-                })
-            })
-            .filter_map(|chat| chat.subagent_id.clone())
-            .collect()
-    }
-
     pub(crate) fn sync_writer_warning(&mut self) -> crate::repaint::Dirty {
         let warning = self
             .session_writer
@@ -186,68 +169,6 @@ impl App {
         }
     }
 
-    /// Called where the set of subagent tabs changes, not at checkpoint time:
-    /// the turn-end path clears `chat_index` right after pruning it, so a later
-    /// rebuild would only ever find an empty map.
-    pub(super) fn sync_subagents(&mut self) {
-        let view = self.state.session.latest_state().unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not fold child configuration");
-            Default::default()
-        });
-        let mut ordered: Vec<_> = self.chat_index.iter().collect();
-        ordered.sort_by_key(|&(_, chat_index)| chat_index);
-        let subagents = ordered
-            .into_iter()
-            .map(|(tool_id, &chat_index)| {
-                let chat = &self.chats[chat_index];
-                let previous = self
-                    .state
-                    .session
-                    .subagents()
-                    .iter()
-                    .find(|sa| sa.tool_use_id == *tool_id);
-                let current_id = chat.agent_id.map(|id| id.to_string());
-                let ambiguous = previous.is_some_and(|sa| {
-                    sa.ambiguous
-                        || (current_id.is_some()
-                            && sa.agent_id != current_id
-                            && (sa.agent_id.is_some()
-                                || self.state.session.subagent_messages().contains_key(tool_id)))
-                }) || self
-                    .chats
-                    .iter()
-                    .filter(|chat| chat.subagent_id.as_deref() == Some(tool_id))
-                    .count()
-                    != 1;
-                let agent_id = if ambiguous {
-                    None
-                } else {
-                    current_id.or_else(|| previous.and_then(|sa| sa.agent_id.clone()))
-                };
-                let journal_backed = self.state.session.agents().values().any(|record| {
-                    record.parent.is_some()
-                        && record.transcript_key == *tool_id
-                        && (!record.legacy
-                            || view
-                                .scopes
-                                .get(&Some(record.id))
-                                .is_some_and(|scope| scope.config.is_some()))
-                });
-                let legacy = previous.filter(|_| !journal_backed);
-                StoredSubagent {
-                    tool_use_id: tool_id.clone(),
-                    agent_id,
-                    ambiguous,
-                    name: chat.name.clone(),
-                    model: legacy.and_then(|sa| sa.model.clone()),
-                    thinking: legacy.and_then(|sa| sa.thinking),
-                    fast: legacy.is_some_and(|sa| sa.fast),
-                }
-            })
-            .collect();
-        self.state.session_mut().set_subagents(subagents);
-    }
-
     pub(super) fn save_input_history(&self) {
         if let Err(e) = self.input_box.history().save(&self.storage) {
             tracing::warn!(error = %e, "input history save failed");
@@ -314,7 +235,6 @@ impl App {
         agent: AgentRef,
         history: HistorySnapshot,
         draft: String,
-        events: Vec<Value>,
     ) {
         self.finish_rewind_input(draft);
         let id = agent.id();
@@ -324,11 +244,6 @@ impl App {
         let Some(key) = self.chats[index].subagent_id.clone() else {
             return;
         };
-        let session = self.state.session_mut();
-        if !session.adopt_subagent_history(key.clone(), &history) {
-            return;
-        }
-        session.replace_context_events(events);
         let notes = self.fork_notes(Some(id));
         let (display, items) = history_to_display_with_notes(
             &history.messages,
@@ -389,98 +304,67 @@ impl App {
             self.input_box.buffer.move_to_end();
         }
 
-        // Read, not taken: the live chats below are the source `sync_subagents`
-        // mirrors back, so emptying the session here would only make the next
-        // checkpoint write the same list again.
         let view = self.state.session.latest_state().unwrap_or_else(|error| {
             tracing::warn!(%error, "could not fold restored child configuration");
             Default::default()
         });
-        let mut subagents = self.state.session.subagents().to_vec();
-        for record in self
+        let mut children: Vec<_> = self
             .state
             .session
             .agents()
             .values()
             .filter(|record| record.parent.is_some())
-        {
-            if !subagents
-                .iter()
-                .any(|entry| entry.tool_use_id == record.transcript_key)
-            {
-                subagents.push(StoredSubagent {
-                    tool_use_id: record.transcript_key.clone(),
-                    agent_id: Some(record.id.to_string()),
-                    ambiguous: false,
-                    name: record
-                        .label
-                        .clone()
-                        .unwrap_or_else(|| record.id.to_string()),
-                    model: None,
-                    thinking: None,
-                    fast: false,
-                });
-            }
-        }
-        for sa in subagents {
+            .collect();
+        children.sort_by_key(|record| record.created_seq);
+        for record in children {
             let idx = self.chats.len();
-            self.chat_index.insert(sa.tool_use_id.clone(), idx);
+            self.chat_index.insert(record.transcript_key.clone(), idx);
+            self.agent_chat_index.insert(record.id, idx);
             let mut chat = Chat::new(
-                sa.name,
+                record
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| record.id.to_string()),
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
                 Arc::clone(&self.theme_provider),
             );
             chat.set_restore_channel(self.restore_event_tx.clone());
-            chat.subagent_id = Some(sa.tool_use_id.clone());
-            let mut records = self.state.session.agents().values().filter(|record| {
-                record.parent.is_some() && record.transcript_key == sa.tool_use_id
+            chat.subagent_id = Some(record.transcript_key.clone());
+            chat.agent_id = Some(record.id);
+            chat.parent_agent_id = record.parent;
+            let scope = view.scopes.get(&Some(record.id));
+            let last_turn = scope.and_then(|scope| {
+                scope
+                    .admitted
+                    .keys()
+                    .chain(scope.results.iter().map(|(turn, _)| turn))
+                    .max()
+                    .copied()
             });
-            let record = records.next().filter(|_| records.next().is_none());
-            chat.agent_id = record.map(|record| record.id).or_else(|| {
-                (!sa.ambiguous)
-                    .then(|| sa.agent_id.as_deref().and_then(|id| id.parse().ok()))
-                    .flatten()
-            });
-            chat.parent_agent_id = record.and_then(|record| record.parent);
-            if let Some(id) = chat.agent_id {
-                self.agent_chat_index.insert(id, idx);
-            }
-            let scope = record.and_then(|record| view.scopes.get(&Some(record.id)));
-            if let Some(record) = record {
-                let last_turn = scope.and_then(|scope| {
-                    scope
-                        .admitted
-                        .keys()
-                        .chain(scope.results.iter().map(|(turn, _)| turn))
-                        .max()
-                        .copied()
-                });
-                let started_at = last_turn
-                    .and_then(|turn| turn.created_at())
-                    .or_else(|| record.id.created_at());
-                chat.restore_turn(last_turn, started_at);
-                chat.context_size = scope
-                    .and_then(|scope| scope.results.back())
-                    .map_or(0, |(_, result)| result.outcome.context_size);
-            }
+            let started_at = last_turn
+                .and_then(|turn| turn.created_at())
+                .or_else(|| record.id.created_at());
+            chat.restore_turn(last_turn, started_at);
+            chat.context_size = scope
+                .and_then(|scope| scope.results.back())
+                .map_or(0, |(_, result)| result.outcome.context_size);
             if let Some(config) = scope.and_then(|scope| scope.config.as_ref()) {
                 chat.model_id = Some(config.model.clone());
                 chat.opts = Some(RequestOptions {
                     thinking: config.thinking.map(Into::into).unwrap_or_default(),
                     fast: config.fast,
                 });
-            } else {
-                chat.model_id = sa.model;
-                chat.opts = sa.thinking.map(|thinking| RequestOptions {
-                    thinking: thinking.into(),
-                    fast: sa.fast,
+            } else if let Some(spec) = &record.spec {
+                chat.model_id = spec.model.spec.as_ref().map(ToString::to_string);
+                chat.opts = spec.model.thinking.map(|thinking| RequestOptions {
+                    thinking,
+                    fast: spec.model.fast.unwrap_or_default(),
                 });
             }
             self.chats.push(chat);
         }
 
-        self.sync_subagents();
         for chat in &mut self.chats {
             let target = chat.agent_id.and_then(|id| {
                 self.root_agent
@@ -531,7 +415,7 @@ impl App {
             let status = self.chats[index]
                 .agent_id
                 .and_then(|id| self.state.session.agents().get(&id))
-                .map_or(DONE_TEXT, |record| match record.lifecycle {
+                .map_or(CLOSED_AGENT_TEXT, |record| match record.lifecycle {
                     StoredAgentLifecycle::Open => DORMANT_AGENT_TEXT,
                     StoredAgentLifecycle::Closed => CLOSED_AGENT_TEXT,
                     StoredAgentLifecycle::Retired => RETIRED_AGENT_TEXT,
@@ -615,61 +499,20 @@ impl App {
                 .replace_shared_messages(Arc::clone(&change.messages));
             self.state.context_size =
                 baseline.saturating_add(estimate_message_tokens(&change.messages));
-        } else if let Some(key) = self.chats[index].subagent_id.clone() {
-            let mut previous = self
-                .state
-                .session
-                .subagent_history_snapshot(&key)
-                .unwrap_or_default();
-            if previous.epoch != change.epoch || previous.messages != change.messages {
-                previous.ids = Arc::new(
-                    change
-                        .messages
-                        .iter()
-                        .map(|_| MakimaId::generate())
-                        .collect(),
-                );
-            }
-            let snapshot = HistorySnapshot {
-                epoch: change.epoch,
-                compacted: false,
-                conversation: None,
-                messages: Arc::clone(&change.messages),
-                ..previous
-            };
-            if !self
-                .state
-                .session_mut()
-                .adopt_subagent_history(key, &snapshot)
-            {
-                return;
-            }
         }
-        let chat = self.chats[index].subagent_id.clone();
-        if index == 0 {
-            let live_children = self.live_child_keys();
-            self.state.session_mut().prune_orphans_preserving(
-                |message| {
-                    message
-                        .tool_uses()
-                        .map(|(id, _, _)| id.to_owned())
-                        .collect()
-                },
-                &live_children,
-            );
-        }
+        let chat = self.chats[index].subagent_id.as_deref();
+        let target = self
+            .root_agent
+            .as_ref()
+            .map(|root| root.manager().reference(change.agent_id));
         let posts = self.state.session.posts();
         let (display, items) = history_to_display_with_target(
             &change.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(posts, chat.as_deref()),
-            self.chats[index].agent_id.and_then(|id| {
-                self.root_agent
-                    .as_ref()
-                    .map(|root| root.manager().reference(id))
-            }),
-            &self.state.session.chat_message_ids(chat.as_deref()),
+            &posts_in(posts, chat),
+            target,
+            &self.state.session.chat_message_ids(chat),
         );
         self.chats[index].load_messages(display);
         self.chats[index].context_size = context_size;
@@ -734,7 +577,7 @@ fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPo
 mod tests {
     use makima_agent::actor::{ConfigChange, ConfigPatch, HistoryChange};
     use makima_agent::permissions::PermissionSnapshot;
-    use makima_agent::{AgentId, SubagentInfo};
+    use makima_agent::{AgentId, HistorySnapshot, SubagentInfo};
     use makima_domain::{Post, PostLevel};
     use makima_providers::{Effort, Message, ModelSelection, RequestOptions, ThinkingConfig};
 
@@ -742,15 +585,12 @@ mod tests {
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentSpec, StoredModeCeiling,
         StoredModeSnapshot, StoredStateRecord,
     };
-    use makima_storage::sessions::{
-        StoredEffect, StoredPost, StoredRule, StoredSubagent, StoredThinking,
-    };
+    use makima_storage::sessions::{StoredEffect, StoredPost, StoredRule};
 
     use super::{CLOSED_AGENT_TEXT, DORMANT_AGENT_TEXT, RETIRED_AGENT_TEXT, session_has_content};
 
     const TRANSCRIPT: &str = "configured-child";
     const CONFIG_MODEL: &str = "provider/committed";
-    const CACHE_MODEL: &str = "provider/cache";
     const SPAWN_MODEL: &str = "provider/spawn";
 
     #[test_case::test_case(false; "root")]
@@ -774,7 +614,13 @@ mod tests {
             record.created_seq = seq;
             record.updated_seq = seq;
             session.push_agent_revision(seq, record);
-            session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(PROMPT.into())]);
+            session.replace_journal_histories(
+                &[(
+                    child_id,
+                    HistorySnapshot::new(vec![Message::user(PROMPT.into())]),
+                )]
+                .into(),
+            );
         } else {
             session.push_message(Message::user(PROMPT.into()));
         }
@@ -890,10 +736,9 @@ mod tests {
         assert_eq!(app.permissions.snapshot().yolo, Some(true));
     }
 
-    #[test_case::test_case(false, false; "folded_config")]
-    #[test_case::test_case(false, true; "folded_default_thinking")]
-    #[test_case::test_case(true, false; "ambiguous_cache")]
-    fn restored_child_config_beats_cache_and_spawn(ambiguous: bool, default_thinking: bool) {
+    #[test_case::test_case(false; "folded_config")]
+    #[test_case::test_case(true; "folded_default_thinking")]
+    fn restored_child_config_beats_spawn(default_thinking: bool) {
         let mut app = super::super::tests::test_app();
         let root = app
             .state
@@ -942,16 +787,6 @@ mod tests {
             generation: 0,
             change: StateChange::Config(config.clone()),
         });
-        session.set_subagents(vec![StoredSubagent {
-            tool_use_id: TRANSCRIPT.into(),
-            agent_id: Some(child.to_string()),
-            ambiguous,
-            name: TRANSCRIPT.into(),
-            model: Some(CACHE_MODEL.into()),
-            thinking: Some(StoredThinking::Off),
-            fast: false,
-        }]);
-        session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(TRANSCRIPT.into())]);
         app.restore_display();
         let chat = &app.chats[1];
         assert_eq!(chat.agent_id, Some(child));
@@ -966,22 +801,6 @@ mod tests {
                 },
                 fast: true,
             })
-        );
-        app.chats[1].model_id = Some(SPAWN_MODEL.into());
-        app.chats[1].opts = Some(RequestOptions {
-            thinking: ThinkingConfig::Off,
-            fast: false,
-        });
-        app.sync_subagents();
-        let cache = &app.state.session.subagents()[0];
-        assert_eq!(cache.model.as_deref(), Some(CONFIG_MODEL));
-        assert_eq!(cache.thinking, config.thinking);
-        assert!(cache.fast);
-        assert_eq!(
-            app.state.session.latest_state().unwrap().scopes[&Some(child)]
-                .config
-                .as_ref(),
-            Some(&config)
         );
     }
 
@@ -1017,7 +836,15 @@ mod tests {
         });
         session.meta.mode = Some(super::StoredMode::Plan);
         assert!(!session_has_content(&session));
-        session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(TRANSCRIPT.into())]);
+        let seq = session.next_state_seq();
+        let mut child = session.agents()[&root].clone();
+        child.id = AgentId::generate();
+        child.parent = Some(root);
+        child.depth = 1;
+        child.transcript_key = TRANSCRIPT.into();
+        child.created_seq = seq;
+        child.updated_seq = seq;
+        session.push_agent_revision(seq, child);
         assert!(session_has_content(&session));
     }
 
@@ -1043,7 +870,6 @@ mod tests {
         record.created_seq = seq;
         record.updated_seq = seq;
         session.push_agent_revision(seq, record);
-        session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(TRANSCRIPT.into())]);
         app.restore_display();
         let index = app.agent_chat_index[&child];
         let chat_count = app.chats.len();
@@ -1093,7 +919,13 @@ mod tests {
         record.created_seq = seq;
         record.updated_seq = seq;
         session.push_agent_revision(seq, record);
-        session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(CHILD_TEXT.into())]);
+        session.replace_journal_histories(
+            &[(
+                child,
+                HistorySnapshot::new(vec![Message::user(CHILD_TEXT.into())]),
+            )]
+            .into(),
+        );
         app.restore_display();
         assert_eq!(app.chats[0].agent_id, Some(root));
         let index = app.agent_chat_index[&child];

@@ -1340,22 +1340,24 @@ fn restart_folded_config_and_shared_rules_override_legacy_metadata(yolo: bool) {
             rule
         })
         .collect();
-    let mut subagents = stored.subagents().to_vec();
-    for child in &mut subagents {
-        child.model = Some(UPDATED_CHILD_MODEL.into());
-        child.thinking = Some(ThinkingConfig::Effort(Effort::Low).into());
-        child.fast = false;
-    }
-    stored.set_subagents(subagents);
+    let mut child = stored.agents()[&child_id].clone();
+    let spawn_model = &mut child.spec.as_mut().unwrap().model;
+    spawn_model.spec = Some(UPDATED_CHILD_MODEL.into());
+    spawn_model.thinking = Some(ThinkingConfig::Effort(Effort::Low));
+    spawn_model.fast = Some(false);
+    child.updated_seq = stored.next_state_seq();
+    stored.push_agent_revision(child.updated_seq, child.clone());
     stored.save(&state_dir).unwrap();
     let reloaded = TestSession::load(session_id, &state_dir).unwrap();
+    let mut expected = folded;
+    expected.agents.insert(child_id, child);
     assert_eq!(
         SessionStateView::fold(
             &common::normalized_history_epoch_state(reloaded.state()),
             reloaded.agent_revisions(),
         )
         .unwrap(),
-        folded
+        expected
     );
     let fs = Arc::new(InMemoryFs::new());
     for (path, bytes) in files {

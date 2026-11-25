@@ -2655,18 +2655,19 @@ impl<'t> EventLoop<'t> {
                             draft,
                             warning,
                         }) => {
-                            let events = manager.journal().context_events();
+                            let session = rt.app.state.session_mut();
+                            if let Err(error) = project_session_journal(session, &rt.handles) {
+                                rt.app.flash(format!("Failed to project rewind: {error}"));
+                                return;
+                            }
+                            session.replace_context_events(manager.journal().context_events());
                             if agent == root {
-                                let session = rt.app.state.session_mut();
-                                session.adopt_history(&history);
-                                session.replace_context_events(events);
                                 rt.app.finish_root_rewind(draft);
                             } else {
                                 rt.app.finish_child_rewind(
                                     manager.reference(agent),
                                     history,
                                     draft,
-                                    events,
                                 );
                             }
                             if let Some(warning) = warning {
@@ -5779,6 +5780,7 @@ mod tests {
     use makima_domain::ThinkingConfig as DomainThinkingConfig;
     use makima_providers::{Invocation, RequestDelivery};
     use makima_storage::checkpoint::ClaimingWriter;
+    use makima_storage::sessions::HistorySnapshot;
 
     /// A preparer for tests, from a blocking one over the resolved model,
     /// run off the executor as a real prepare may block.
@@ -8335,6 +8337,73 @@ end })
     }
 
     #[test]
+    fn journal_spawn_preserves_child_tab_label_after_save_and_reload() {
+        const CHILD_LABEL: &str = "journal child";
+        const CHILD_KEY: &str = "journal-child-transcript";
+
+        with_event_loop(|event_loop| {
+            let runtime = &event_loop.sessions[0];
+            let (manager, root_id) = runtime.handles.manager_and_root();
+            let root = manager.lookup(root_id).unwrap();
+            let config = (*root.actor().unwrap().effective_config().unwrap()).clone();
+            let child = manager
+                .spawn_child_trusted_with_config(
+                    &root,
+                    config,
+                    AgentMetadata {
+                        label: Some(CHILD_LABEL.into()),
+                        transcript_key: Some(CHILD_KEY.into()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                )
+                .unwrap();
+            let child_id = child.id();
+            event_loop.sync_orchestration();
+            assert!(
+                !event_loop.sessions[0]
+                    .app
+                    .agent_chat_index
+                    .contains_key(&child_id)
+            );
+            select_child_chat(event_loop, child_id, CHILD_LABEL);
+            let runtime = event_loop.sessions.pop().unwrap();
+            assert_eq!(runtime.app.chats[runtime.app.active_chat].name, CHILD_LABEL);
+
+            let mut session = (*runtime.app.state.session).clone();
+            project_session_journal(&mut session, &runtime.handles).unwrap();
+            let journal_child = manager.journal().agent(child_id).unwrap();
+            assert_eq!(
+                session
+                    .agents()
+                    .values()
+                    .filter(|record| record.parent.is_some())
+                    .collect::<Vec<_>>(),
+                [&journal_child]
+            );
+            release_runtime(runtime);
+            let storage = &event_loop.ctx.storage;
+            session.save(storage).unwrap();
+            let loaded = AppSession::load(session.id, storage).unwrap();
+            assert_eq!(
+                loaded.agents()[&child_id].label.as_deref(),
+                Some(CHILD_LABEL)
+            );
+
+            let mut runtime = event_loop.ctx.spawn_runtime(loaded).unwrap();
+            runtime.activate_deferred();
+            let app = &runtime.app;
+            assert_eq!(app.chats.len(), 2);
+            let tab = &app.chats[app.agent_chat_index[&child_id]];
+            assert_eq!(tab.name, CHILD_LABEL);
+            assert_eq!(tab.subagent_id.as_deref(), Some(CHILD_KEY));
+            event_loop.sessions.push(runtime);
+        });
+    }
+
+    #[test]
     fn snapshot_crash_reopens_only_durable_history_and_files() {
         const PERSISTED: &str = "published history";
         const UNSAVED: &str = "unpublished history";
@@ -9737,7 +9806,7 @@ end })
             ..Default::default()
         };
         session.replace_messages(vec![tool_call.clone()]);
-        session.set_subagent_messages(CHILD_KEY.into(), vec![tool_call]);
+        session.replace_journal_histories(&[(child, HistorySnapshot::new(vec![tool_call]))].into());
         let root_turn = TurnId::generate();
         let child_turn = TurnId::generate();
         for (offset, agent, turn) in [(1, root, root_turn), (2, child, child_turn)] {
@@ -9802,7 +9871,10 @@ end })
         );
         let child_key = &loaded.agents()[&child].transcript_key;
         assert_eq!(
-            loaded.subagent_messages()[child_key]
+            loaded
+                .subagent_history_snapshot(child_key)
+                .unwrap()
+                .messages
                 .last()
                 .unwrap()
                 .content

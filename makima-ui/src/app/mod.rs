@@ -29,7 +29,6 @@ use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwn
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use crate::model_capabilities::ModelCapabilityCache;
-use makima_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
 #[cfg(test)]
@@ -98,7 +97,6 @@ use makima_providers::{
     ThinkingConfig, add_cost, format_tokens,
 };
 use makima_storage::StateDir;
-use makima_storage::conversation::ConversationState;
 use makima_storage::input_history::InputHistory;
 use makima_storage::model::persist_model;
 use makima_storage::session_state::StoredAgentLifecycle;
@@ -2986,30 +2984,9 @@ impl App {
 
         if let Some(subagent) = &envelope.subagent {
             if self.terminal_subagents.contains(&subagent.agent_id) {
-                match envelope.event {
-                    AgentEvent::SubagentHistory {
-                        tool_use_id,
-                        history_epoch,
-                        conversation_id,
-                        messages,
-                    } => {
-                        let history = self.state.session.subagent_history_snapshot(&tool_use_id);
-                        self.state.session_mut().adopt_subagent_history(
-                            tool_use_id,
-                            &HistorySnapshot {
-                                epoch: history_epoch,
-                                compacted: false,
-                                conversation: conversation_id.map(ConversationState::new),
-                                messages: Arc::new(messages),
-                                ..history.unwrap_or_default()
-                            },
-                        );
-                    }
-                    AgentEvent::TurnComplete(turn) => {
-                        let chat_idx = self.agent_chat_index.get(&subagent.agent_id).copied();
-                        self.account_turn_complete(chat_idx, &turn);
-                    }
-                    _ => {}
+                if let AgentEvent::TurnComplete(turn) = envelope.event {
+                    let chat_idx = self.agent_chat_index.get(&subagent.agent_id).copied();
+                    self.account_turn_complete(chat_idx, &turn);
                 }
                 return vec![];
             }
@@ -3072,13 +3049,7 @@ impl App {
         }
 
         let subagent_agent_id = envelope.subagent.as_ref().map(|subagent| subagent.agent_id);
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            history_epoch,
-            conversation_id,
-            messages,
-        } = envelope.event
-        {
+        if let AgentEvent::SubagentHistory { tool_use_id, .. } = envelope.event {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
             let subagent_chat = envelope
@@ -3093,17 +3064,6 @@ impl App {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             self.sync_task_picker();
-            let history = self.state.session.subagent_history_snapshot(&tool_use_id);
-            self.state.session_mut().adopt_subagent_history(
-                tool_use_id,
-                &HistorySnapshot {
-                    epoch: history_epoch,
-                    compacted: false,
-                    conversation: conversation_id.map(ConversationState::new),
-                    messages: Arc::new(messages),
-                    ..history.unwrap_or_default()
-                },
-            );
             return vec![];
         }
 
@@ -3397,6 +3357,15 @@ impl App {
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
+        let name = || {
+            self.root_agent
+                .as_ref()
+                .and_then(|root| root.manager().journal().agent(subagent.agent_id))
+                .map_or_else(
+                    || subagent.name.clone(),
+                    |record| record.label.unwrap_or_else(|| record.id.to_string()),
+                )
+        };
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.agent_chat_index.get(&subagent.agent_id) {
             if self.subagent_channels.contains_key(&subagent.agent_id) {
@@ -3409,14 +3378,14 @@ impl App {
                     closed: false,
                 },
             );
+            let name = name();
             let chat = &mut self.chats[idx];
-            chat.name = subagent.name.clone();
+            chat.name = name;
             chat.model_id = subagent.model.clone();
             chat.opts = subagent.opts;
             chat.parent_agent_id = subagent.parent_agent_id;
             chat.reopen(None);
             self.sync_task_picker();
-            self.sync_subagents();
             return idx;
         }
         let idx = self.chats.len();
@@ -3429,12 +3398,13 @@ impl App {
                 closed: false,
             },
         );
-        self.chats[0].update_tool_summary(id, &subagent.name);
+        let name = name();
+        self.chats[0].update_tool_summary(id, &name);
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
         let mut chat = Chat::new(
-            subagent.name.clone(),
+            name,
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
             Arc::clone(&self.theme_provider),
@@ -3456,7 +3426,6 @@ impl App {
         }
         self.chats.push(chat);
         self.sync_task_picker();
-        self.sync_subagents();
         idx
     }
 
@@ -4269,7 +4238,6 @@ impl App {
     /// Finishes only the main turn's tools; descendants own their terminal events.
     fn terminalize_turn(&mut self, message: &str) {
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        self.sync_subagents();
         self.sync_task_picker();
     }
 

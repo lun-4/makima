@@ -2741,7 +2741,7 @@ mod tests {
         StateChange, StoredCancellationReason, StoredStateRecord, StoredTurnOrigin,
         StoredTurnStatus,
     };
-    use makima_storage::sessions::{Effort, Session, StoredThinking};
+    use makima_storage::sessions::{Effort, HistorySnapshot, Session, StoredThinking};
     use smol::future::poll_once;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -4094,10 +4094,10 @@ mod tests {
             record.created_seq = 2;
             record.updated_seq = 2;
             session.push_agent_revision(2, record);
-            session.set_subagent_messages(
+            assert!(session.adopt_subagent_history(
                 PARKED_THOUGHT.into(),
-                vec![Message::user(PARKED_THOUGHT.into())],
-            );
+                &HistorySnapshot::new(vec![Message::user(PARKED_THOUGHT.into())]),
+            ));
             for (seq, agent, turn) in [(3, root_id, root_turn), (4, child_id, child_turn)] {
                 session.push_state(StoredStateRecord {
                     seq,

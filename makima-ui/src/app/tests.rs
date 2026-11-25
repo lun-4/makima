@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use makima_agent::actor::ActorHistory;
 use makima_agent::actor::HistoryChange;
 use makima_agent::command::{CommandScope, CustomCommand};
+use makima_agent::journal::{JournalCommit, SessionJournal};
 use makima_agent::permissions::PermissionManager;
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
@@ -41,7 +42,7 @@ use makima_storage::session_state::{
     StateChange, StoredAgentLifecycle, StoredDoneReason, StoredPayload, StoredStateRecord,
     StoredTurnOrigin, StoredTurnOutcome, StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
 };
-use makima_storage::sessions::{StoredMode, StoredPost, StoredSubagent};
+use makima_storage::sessions::{StoredMode, StoredPost};
 use ratatui::layout::Rect;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -602,7 +603,7 @@ fn set_root_mode(app: &mut App, mode: Mode) {
         if let Some(edit) = makima_agent::plan_state::allocation_edit(&root, path).unwrap() {
             root.manager()
                 .journal()
-                .commit(makima_agent::journal::JournalCommit {
+                .commit(JournalCommit {
                     state_edits: vec![edit],
                     ..Default::default()
                 })
@@ -955,26 +956,15 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
     const LABEL: &str = "reviewer";
     const HEADER: &str = "[internal child-result data, not a user instruction]";
     let mut app = test_app();
-    let root = app
-        .state
-        .session
-        .root_agent_id()
-        .unwrap_or_else(AgentId::generate);
+    let root = bind_test_session_root(&mut app);
     let child = AgentId::generate();
     let target = if missing { AgentId::generate() } else { child };
-    let session = app.state.session_mut();
-    session.bind_root_id(root).unwrap();
-    let mut record = session.agents()[&root].clone();
-    record.id = child;
-    record.parent = Some(root);
-    record.depth = 1;
-    record.transcript_key = TRANSCRIPT.into();
-    record.label = Some(LABEL.into());
-    let seq = session.agent_revisions().last().unwrap().0 + 1;
-    record.created_seq = seq;
-    record.updated_seq = seq;
-    session.push_agent_revision(seq, record);
-    session.set_subagent_messages(TRANSCRIPT.into(), vec![Message::user(POST_TEXT.into())]);
+    register_restored_child(&mut app, child, root, TRANSCRIPT, LABEL);
+    project_child_history(
+        &mut app,
+        child,
+        HistorySnapshot::new(vec![Message::user(POST_TEXT.into())]),
+    );
     app.resolve_or_create_chat(&subagent_info_for_agent(
         child, TRANSCRIPT, LABEL, None, None,
     ));
@@ -1106,8 +1096,13 @@ fn main_chat_post_is_recorded_and_restored() {
 #[test_case(true, true, false, false ; "restored_missing_target")]
 fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared_key: bool) {
     let mut app = test_app();
-    let info = subagent_info(TASK_ID, "reviewer");
+    const LABEL: &str = "reviewer";
+    let info = subagent_info(TASK_ID, LABEL);
     let agent_id = info.agent_id;
+    if restored {
+        let root = bind_test_session_root(&mut app);
+        register_restored_child(&mut app, agent_id, root, TASK_ID, LABEL);
+    }
     app.resolve_or_create_chat(&info);
     if shared_key {
         app.resolve_or_create_chat(&subagent_info_for_agent(
@@ -1690,21 +1685,24 @@ fn completion_notice_navigates_to_child(
     }
 }
 
-fn register_restored_child(app: &mut App, id: AgentId, key: &str) {
+fn bind_test_session_root(app: &mut App) -> AgentId {
+    let root = app
+        .state
+        .session
+        .root_agent_id()
+        .unwrap_or_else(|| app.chats[0].agent_id.unwrap_or_else(AgentId::generate));
+    app.state.session_mut().bind_root_id(root).unwrap();
+    root
+}
+
+fn register_restored_child(app: &mut App, id: AgentId, parent: AgentId, key: &str, label: &str) {
     let session = app.state.session_mut();
-    let root = session.root_agent_id().unwrap_or_else(AgentId::generate);
-    session.bind_root_id(root).unwrap();
-    let mut record = session.agents()[&root].clone();
+    let mut record = session.agents()[&parent].clone();
     record.id = id;
-    record.parent = Some(root);
-    record.depth = 1;
+    record.parent = Some(parent);
+    record.depth += 1;
     record.transcript_key = key.into();
-    record.label = session
-        .agents()
-        .values()
-        .find(|record| record.transcript_key == key)
-        .and_then(|record| record.label.clone())
-        .or_else(|| Some(key.into()));
+    record.label = Some(label.into());
     record.lifecycle = StoredAgentLifecycle::Closed;
     let seq = session.next_state_seq();
     record.created_seq = seq;
@@ -1712,13 +1710,26 @@ fn register_restored_child(app: &mut App, id: AgentId, key: &str) {
     session.push_agent_revision(seq, record);
 }
 
-#[test_case(false, "available"; "main_available")]
-#[test_case(true, "available"; "nested_available")]
-#[test_case(false, "ambiguous"; "main_ambiguous")]
-#[test_case(true, "ambiguous"; "nested_ambiguous")]
-#[test_case(false, "missing"; "main_missing")]
-#[test_case(true, "missing"; "nested_missing")]
-fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
+fn project_child_history(app: &mut App, agent_id: AgentId, history: HistorySnapshot) {
+    let journal = SessionJournal::from_session(&app.state.session).unwrap();
+    journal
+        .commit(JournalCommit {
+            histories: [(agent_id, history)].into(),
+            managed_histories: [agent_id].into(),
+            ..Default::default()
+        })
+        .unwrap();
+    journal
+        .snapshot()
+        .apply_to(app.state.session_mut())
+        .unwrap();
+}
+
+#[test_case(false, false; "main_available")]
+#[test_case(true, false; "nested_available")]
+#[test_case(false, true; "main_missing")]
+#[test_case(true, true; "nested_missing")]
+fn restored_notice_keeps_durable_target(nested: bool, missing: bool) {
     use makima_providers::ObservationSource;
     const KEY: &str = "target-task";
     const PARENT: &str = "parent-task";
@@ -1734,41 +1745,22 @@ fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
         }),
         ..Message::observation(format!("{HEADER}\n{envelope}"))
     };
-    let entry = |key: &str, id: Option<String>, ambiguous| StoredSubagent {
-        tool_use_id: key.into(),
-        agent_id: id,
-        ambiguous,
-        name: key.into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    };
-    register_restored_child(&mut app, AgentId::generate(), PARENT);
-    if case != "missing" {
-        register_restored_child(&mut app, agent_id, KEY);
-    }
-    let mut entries = vec![entry(PARENT, None, false)];
-    if case != "missing" {
-        entries.push(entry(KEY, Some(agent_id.to_string()), case == "ambiguous"));
-        app.state
-            .session_mut()
-            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
-    }
-    app.state.session_mut().set_subagents(entries);
-    if nested {
-        app.state
-            .session_mut()
-            .set_subagent_messages(PARENT.into(), vec![observation]);
+    let root = bind_test_session_root(&mut app);
+    let parent = if nested {
+        let parent = AgentId::generate();
+        register_restored_child(&mut app, parent, root, PARENT, PARENT);
+        project_child_history(&mut app, parent, HistorySnapshot::new(vec![observation]));
+        parent
     } else {
         app.state.session_mut().push_message(observation);
-        app.state
-            .session_mut()
-            .set_subagent_messages(PARENT.into(), vec![Message::user(PARENT.into())]);
+        root
+    };
+    if !missing {
+        register_restored_child(&mut app, agent_id, parent, KEY, KEY);
     }
     app.restore_display();
     let chat_index = if nested { app.chat_index[PARENT] } else { 0 };
     let notice = app.chats[chat_index].message_at(0).unwrap();
-    let available = case != "missing";
     assert_eq!(notice.result_agent, Some(agent_id));
     assert!(notice.text.contains("[View child transcript]"));
     assert!(
@@ -1790,72 +1782,12 @@ fn restored_notice_keeps_durable_target(nested: bool, case: &str) {
     ] {
         app.update(mouse_event(kind, area.x, row));
     }
-    if available {
+    if !missing {
         assert_eq!(app.active_chat, app.agent_chat_index[&agent_id]);
     } else {
         assert_eq!(app.active_chat, chat_index);
         assert_eq!(app.status_bar.flash_text(), Some(FLASH_NO_AGENT_CHAT));
     }
-}
-
-#[test_case(false; "duplicate_key")]
-#[test_case(true; "duplicate_agent_id")]
-fn restored_durable_identity_is_not_replaced_by_legacy_duplicates(duplicate_id: bool) {
-    const KEY: &str = "duplicate-task";
-    const OTHER: &str = "other-task";
-    let mut app = test_app();
-    let agent_id = AgentId::generate();
-    let entry = StoredSubagent {
-        tool_use_id: KEY.into(),
-        agent_id: Some(agent_id.to_string()),
-        ambiguous: false,
-        name: KEY.into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    };
-    let mut other = entry.clone();
-    if duplicate_id {
-        other.tool_use_id = OTHER.into();
-    } else {
-        other.agent_id = Some(AgentId::generate().to_string());
-    }
-    register_restored_child(&mut app, agent_id, KEY);
-    app.state
-        .session_mut()
-        .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
-    app.state.session_mut().set_subagents(vec![entry, other]);
-    app.restore_display();
-    let index = app.chat_index[KEY];
-    assert_eq!(app.chats[index].agent_id, Some(agent_id));
-    assert_eq!(app.agent_chat_index[&agent_id], index);
-}
-
-#[test_case(false; "legacy_without_history")]
-#[test_case(true; "legacy_with_unidentified_history")]
-fn sync_subagents_legacy_identity_depends_on_history(has_history: bool) {
-    const KEY: &str = "legacy-task";
-    let mut app = test_app();
-    let agent_id = AgentId::generate();
-    app.state.session_mut().set_subagents(vec![StoredSubagent {
-        tool_use_id: KEY.into(),
-        agent_id: None,
-        ambiguous: false,
-        name: KEY.into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    }]);
-    if has_history {
-        app.state
-            .session_mut()
-            .set_subagent_messages(KEY.into(), vec![Message::user(KEY.into())]);
-    }
-    let canonical_id = app.state.session.subagents()[0].agent_id.clone();
-    app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
-    let entry = &app.state.session.subagents()[0];
-    assert!(!entry.ambiguous);
-    assert_eq!(entry.agent_id, canonical_id);
 }
 
 #[test_case(false; "deferred_input_drawn_on_consumption")]
@@ -4402,21 +4334,11 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
     const INPUT: &str = "hi this is a test";
     const TASK: &str = "restored-task";
     let mut app = test_app();
-    register_restored_child(&mut app, AgentId::generate(), TASK);
-    app.state.session_mut().set_subagents(vec![StoredSubagent {
-        tool_use_id: TASK.into(),
-        agent_id: None,
-        ambiguous: false,
-        name: "old task".into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    }]);
-    app.state
-        .session_mut()
-        .set_subagent_messages(TASK.into(), vec![Message::user("prior work".into())]);
+    let root = bind_test_session_root(&mut app);
+    register_restored_child(&mut app, AgentId::generate(), root, TASK, "old task");
     app.restore_display();
     if missing_identity {
+        app.chats[1].agent_id = None;
         app.chats[1].subagent_id = None;
     }
     app.update(Msg::Key(kb::TASKS.to_key_event()));
@@ -4490,26 +4412,16 @@ fn push_turn_result(app: &mut App, agent_id: AgentId, turn_id: TurnId, context_s
 fn restored_subagents_keep_age_and_context_and_are_finished(with_turn: bool) {
     const OLD_TURN: &str = "CNK1hV6GWoysH3KQMm5wu";
     const CONTEXT_SIZE: u32 = 4200;
+    const KEY: &str = "restored-sub";
+    const LABEL: &str = "old task";
     let mut app = test_app();
-    let id = "restored-sub".to_string();
+    let root = bind_test_session_root(&mut app);
     let child_id = AgentId::generate();
-    register_restored_child(&mut app, child_id, id.as_str());
+    register_restored_child(&mut app, child_id, root, KEY, LABEL);
     let turn: TurnId = OLD_TURN.parse().unwrap();
     if with_turn {
         push_turn_result(&mut app, child_id, turn, CONTEXT_SIZE);
     }
-    app.state.session_mut().set_subagents(vec![StoredSubagent {
-        tool_use_id: id.clone(),
-        agent_id: None,
-        ambiguous: false,
-        name: "old task".into(),
-        model: None,
-        thinking: None,
-        fast: false,
-    }]);
-    app.state
-        .session_mut()
-        .set_subagent_messages(id.clone(), vec![Message::user("hi".into())]);
     app.restore_display();
 
     assert_eq!(app.chats.len(), 2);
@@ -4521,7 +4433,7 @@ fn restored_subagents_keep_age_and_context_and_are_finished(with_turn: bool) {
     };
     assert_eq!(app.chats[1].started_at(), started_at);
     assert_eq!(app.chats[1].context_size, context_size);
-    assert_eq!(app.chats[1].subagent_id.as_deref(), Some(id.as_str()));
+    assert_eq!(app.chats[1].subagent_id.as_deref(), Some(KEY));
 
     let entries = app.task_entries();
     let sub = entries.iter().find(|e| e.chat_index == 1).unwrap();
@@ -4892,28 +4804,6 @@ fn open_task_picker_refreshes_after_subagent_history() {
 
     assert!(app.task_picker.is_open());
     assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
-}
-
-#[test]
-fn subagent_history_stores_the_child_conversation_id() {
-    const CHILD_KEY: &str = "session-abc";
-    const CHILD_CONVERSATION: &str = "child-conversation";
-    let mut app = app_with_subagent_id(CHILD_KEY);
-    app.update(agent_msg(AgentEvent::SubagentHistory {
-        history_epoch: 0,
-        conversation_id: Some(CHILD_CONVERSATION.into()),
-        tool_use_id: CHILD_KEY.into(),
-        messages: vec![Message::user("child".into())],
-    }));
-
-    let stored = app.state.session.subagent_history_snapshot(CHILD_KEY);
-    assert_eq!(
-        stored
-            .and_then(|history| history.conversation)
-            .map(|conversation| conversation.id)
-            .as_deref(),
-        Some(CHILD_CONVERSATION)
-    );
 }
 
 #[test]
@@ -7677,25 +7567,23 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     const REMOVED_POST: &str = "removed review";
     const OTHER_POST: &str = "other chat review";
     const UNANCHORED_POST: &str = "session notice";
-    let (mut app, _rx) = app_with_subagent_actor(TASK_ID);
-    if !child {
-        bind_history_actor(&mut app, Vec::new());
-    }
-    app.sync_subagents();
+    let mut app = test_app();
+    let root = bind_test_session_root(&mut app);
+    let child_id = AgentId::generate();
     let index = usize::from(child);
-    let messages = vec![Message::user("kept prompt".into())];
     let chat = child.then_some(TASK_ID.to_owned());
     let other_chat = (!child).then_some(TASK_ID.to_owned());
+    let messages = vec![Message::user("kept prompt".into())];
     let mut original = messages.clone();
     original.push(Message::user(REMOVED_POST.into()));
     let original = HistorySnapshot::new(original);
-    if let Some(key) = &chat {
-        app.state
-            .session_mut()
-            .adopt_subagent_history(key.clone(), &original);
+    register_restored_child(&mut app, child_id, root, TASK_ID, "research");
+    if child {
+        project_child_history(&mut app, child_id, original);
     } else {
         app.state.session_mut().adopt_history(&original);
     }
+    app.restore_display();
     let message_ids = app.state.session.chat_message_ids(chat.as_deref());
     let retained = StoredPost {
         chat: chat.clone(),
@@ -7741,6 +7629,9 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
         app.state.session_mut().push_post(post.clone());
     }
     let snapshot = HistorySnapshot::new(messages);
+    if child {
+        project_child_history(&mut app, child_id, snapshot.clone());
+    }
     app.apply_history_change(HistoryChange {
         agent_id: app.chats[index].agent_id.unwrap(),
         epoch: snapshot.epoch,
@@ -8286,7 +8177,6 @@ fn parent_done_preserves_unresolved_children_and_reconciles_own_tools() {
             .contains(MISSING_TOOL_COMPLETION)
     );
     app.checkpoint();
-    assert_eq!(app.state.session.subagents().len(), 1);
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
     assert_eq!(app.chat_index.get("task1"), Some(&1));
@@ -8332,28 +8222,6 @@ fn parent_error_preserves_running_and_completed_children() {
         .find(|entry| entry.chat_index == 2)
         .unwrap();
     assert_eq!(running.finished, Some(false));
-    app.checkpoint();
-    let saved: Vec<_> = app
-        .state
-        .session
-        .subagents()
-        .iter()
-        .map(|subagent| {
-            (
-                subagent.tool_use_id.as_str(),
-                subagent.name.as_str(),
-                subagent.model.as_deref(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        saved,
-        vec![
-            ("task1", "first", None),
-            ("task2", "second", None),
-            ("task3", "third", None),
-        ]
-    );
     for (index, (id, model, finished)) in [
         ("task1", "model-a", true),
         ("task2", "model-b", false),
@@ -8641,7 +8509,7 @@ fn commit_target_plan_path(app: &mut App, target: &AgentRef, path: &str, root: b
         target
             .manager()
             .journal()
-            .commit(makima_agent::journal::JournalCommit {
+            .commit(JournalCommit {
                 state_edits: vec![edit],
                 ..Default::default()
             })
@@ -11148,9 +11016,6 @@ fn tool_output_mutations_both_reach_disk() {
     }
 }
 
-/// The `Done` path clears `chat_index` right after pruning it, so nothing can
-/// rebuild the tabs later. Only the `sync_subagents` call inside
-/// `retain_resolved_subagents` carries the survivors over.
 #[test]
 fn turn_end_keeps_running_and_finished_subagents() {
     let mut app = streaming_app();
@@ -11165,21 +11030,14 @@ fn turn_end_keeps_running_and_finished_subagents() {
         ));
     }
     finish_subagent(&mut app, FINISHED_TASK_ID, false);
-    assert_eq!(app.state.session.subagents().len(), 2);
 
     app.update(done_event());
-    assert_eq!(app.chat_index.len(), 2);
-    assert!(!app.chats[2].is_finished());
-    app.checkpoint();
 
-    let ids: Vec<_> = app
-        .state
-        .session
-        .subagents()
-        .iter()
-        .map(|sa| sa.tool_use_id.as_str())
-        .collect();
-    assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID]);
+    let finished = app.chat_index[FINISHED_TASK_ID];
+    let running = app.chat_index[UNFINISHED_TASK_ID];
+    assert_ne!(finished, running);
+    assert!(app.chats[finished].is_finished());
+    assert!(!app.chats[running].is_finished());
 }
 
 #[test]
@@ -12865,7 +12723,7 @@ fn subagent_closed_preserves_terminal_status(
 }
 
 #[test]
-fn final_history_after_subagent_closed_only_persists_messages() {
+fn final_history_after_subagent_closed_leaves_chat_closed() {
     const FINAL_REPLY: &str = "final reply";
 
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
@@ -12892,16 +12750,13 @@ fn final_history_after_subagent_closed_only_persists_messages() {
             history_epoch: 0,
             conversation_id: None,
             tool_use_id: TASK_ID.into(),
-            messages: messages.clone(),
+            messages,
         },
         subagent: Some(info),
         identity: Some(work_identity(1)),
     })));
 
-    assert_eq!(
-        serde_json::to_value(app.state.session.subagent_messages()[TASK_ID].as_ref()).unwrap(),
-        serde_json::to_value(&messages).unwrap()
-    );
+    assert!(!app.state.session.subagent_messages().contains_key(TASK_ID));
     assert_eq!(app.chats.len(), chat_count);
     assert_eq!(app.agent_chat_index.get(&agent_id), Some(&chat_idx));
     assert!(app.chats[chat_idx].is_finished());
@@ -12989,49 +12844,42 @@ fn turn_complete_after_root_cancel_preserves_child() {
     assert!(app.queue.text_messages().is_empty());
 }
 
-#[test_case::test_case(false; "live_child")]
-#[test_case::test_case(true; "closed_child")]
-fn reconstructed_subagent_history_cannot_resurrect_rewound_history(closed: bool) {
-    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
-    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
-    let earlier = HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
-    let latest = HistorySnapshot::new(Vec::new());
-    assert!(
-        app.state
-            .session_mut()
-            .adopt_subagent_history(TASK_ID.into(), &earlier)
-    );
+#[test_case(false; "root_history_change")]
+#[test_case(true; "child_history_change")]
+fn history_change_does_not_rewrite_stored_child_history(child: bool) {
+    const REPLACEMENT: &str = "replacement prompt";
+    let mut app = test_app();
+    let root = bind_test_session_root(&mut app);
+    if !child {
+        app.restore_display();
+    }
+    let child_id = AgentId::generate();
+    register_restored_child(&mut app, child_id, root, TASK_ID, "research");
+    let original = HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
+    project_child_history(&mut app, child_id, original.clone());
+    if child {
+        app.restore_display();
+    }
+    let change = HistorySnapshot::new(vec![Message::user(REPLACEMENT.into())]);
     app.apply_history_change(HistoryChange {
-        agent_id,
-        epoch: latest.epoch,
-        messages: Arc::clone(&latest.messages),
+        agent_id: if child { child_id } else { root },
+        epoch: change.epoch,
+        messages: change.messages,
         draft: Message::user(String::new()),
     });
-    if closed {
-        app.update(Msg::Agent(Box::new(Envelope {
-            event: AgentEvent::SubagentClosed,
-            subagent: Some(info.clone()),
-            identity: Some(work_identity(1)),
-        })));
-    }
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::SubagentHistory {
-            tool_use_id: TASK_ID.into(),
-            history_epoch: earlier.epoch,
-            conversation_id: None,
-            messages: earlier.messages.as_ref().clone(),
-        },
-        subagent: Some(info),
-        identity: Some(work_identity(1)),
-    })));
-    let projected = app
+
+    assert_eq!(
+        app.chats[usize::from(child)].last_message_text(),
+        REPLACEMENT
+    );
+    let stored = app
         .state
         .session
         .subagent_history_snapshot(TASK_ID)
         .unwrap();
-    assert_eq!(projected.epoch, latest.epoch);
-    assert!(projected.messages.is_empty());
+    assert_eq!(stored.epoch, original.epoch);
+    assert_eq!(stored.ids, original.ids);
+    assert_eq!(stored.messages, original.messages);
 }
 
 #[test]
@@ -13148,47 +12996,6 @@ fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(received_input(&input_rx).message, PASTED);
     assert!(app.chats[0].message_count() == 0);
-}
-
-#[test]
-fn subagent_history_updates_storage_without_queuing_parent_work() {
-    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
-    let message = |text: &str| Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::Text { text: text.into() }],
-        ..Default::default()
-    };
-    let history_event = |messages| {
-        subagent_msg(
-            AgentEvent::SubagentHistory {
-                history_epoch: 0,
-                conversation_id: None,
-                tool_use_id: TASK_ID.to_string(),
-                messages,
-            },
-            TASK_ID,
-            None,
-        )
-    };
-    let first_messages = vec![message("the answer")];
-    app.update(history_event(first_messages.clone()));
-    app.update(history_event(first_messages));
-
-    assert!(app.queue.text_messages().is_empty());
-
-    let changed_messages = vec![message("revised answer")];
-    app.update(history_event(changed_messages.clone()));
-    app.update(history_event(changed_messages.clone()));
-    assert!(app.queue.text_messages().is_empty());
-
-    let mut grown_messages = changed_messages;
-    grown_messages.push(message("the follow-up"));
-    app.update(history_event(grown_messages.clone()));
-    assert!(app.queue.text_messages().is_empty());
-    assert_eq!(
-        serde_json::to_value(app.state.session.subagent_messages()[TASK_ID].as_ref()).unwrap(),
-        serde_json::to_value(&grown_messages).unwrap()
-    );
 }
 
 #[test]

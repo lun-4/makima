@@ -18,6 +18,7 @@ use makima_storage::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -254,6 +255,20 @@ fn restored_request(
     ))
 }
 
+fn child_transcripts(session: &TestSession) -> BTreeMap<&str, Arc<Vec<Message>>> {
+    session
+        .agents()
+        .values()
+        .filter(|agent| agent.parent.is_some())
+        .filter_map(|agent| {
+            let key = agent.transcript_key.as_str();
+            session
+                .subagent_history_snapshot(key)
+                .map(|history| (key, history.messages))
+        })
+        .collect()
+}
+
 fn contains(request: &Request, text: &str) -> bool {
     serde_json::to_string(&request.messages)
         .unwrap()
@@ -371,11 +386,8 @@ fn published_crash_prefix_continues_exact_lua_tickets(continuation: bool) {
         assert!(requests.is_empty());
         assert_eq!(ids(&host), saved);
         let recovered = TestSession::load(session_id, &state).unwrap();
-        assert!(
-            !serde_json::to_string(recovered.subagent_messages())
-                .unwrap()
-                .contains(PARTIAL)
-        );
+        let children = child_transcripts(&recovered);
+        assert!(!serde_json::to_string(&children).unwrap().contains(PARTIAL));
         for entry in saved["turns"].as_array().unwrap() {
             let turn: TurnId = entry["turn"].as_str().unwrap().parse().unwrap();
             let results: Vec<_> = recovered
@@ -401,8 +413,7 @@ fn published_crash_prefix_continues_exact_lua_tickets(continuation: bool) {
             "state": state,
             "agents": recovered.agent_revisions(),
             "messages": recovered.messages(),
-            "children": recovered.subagent_messages(),
-            "metadata": recovered.subagents(),
+            "children": children,
             "conversation": recovered.meta.conversation,
         });
         if let Some(previous) = &recovered_state {
@@ -588,7 +599,7 @@ register({{
     let saved_ids = ids(&host);
     let prefix = TestSession::load(session_id, &state).unwrap();
     assert!(
-        serde_json::to_string(prefix.subagent_messages())
+        serde_json::to_string(&child_transcripts(&prefix))
             .unwrap()
             .contains(TASK_WAIT)
     );
@@ -609,10 +620,10 @@ register({{
         ))
         .unwrap();
         let suspended = TestSession::load(session_id, &state).unwrap();
-        let messages = serde_json::to_string(suspended.subagent_messages()).unwrap();
+        let children = child_transcripts(&suspended);
+        let messages = serde_json::to_string(&children).unwrap();
         assert!(!messages.contains(CANCEL_MARKER));
-        let saved_results: Vec<_> = suspended
-            .subagent_messages()
+        let saved_results: Vec<_> = children
             .values()
             .flat_map(|messages| messages.iter())
             .flat_map(|message| &message.content)
@@ -719,7 +730,7 @@ register({{
     assert_eq!(ids(&host), saved_ids);
     let recovered = TestSession::load(session_id, &state).unwrap();
     assert!(
-        !serde_json::to_string(recovered.subagent_messages())
+        !serde_json::to_string(&child_transcripts(&recovered))
             .unwrap()
             .contains(PARTIAL)
     );
@@ -730,8 +741,9 @@ register({{
     if graceful {
         let parent: AgentId = saved_ids["parent"].as_str().unwrap().parse().unwrap();
         let transcript_key = &recovered.latest_state().unwrap().agents[&parent].transcript_key;
-        let transcript = &recovered.subagent_messages()[transcript_key];
+        let transcript = recovered.subagent_history_snapshot(transcript_key).unwrap();
         let stored_batch: Vec<_> = transcript
+            .messages
             .iter()
             .filter(|message| {
                 message.content.iter().any(|block| {

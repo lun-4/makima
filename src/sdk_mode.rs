@@ -2624,9 +2624,12 @@ mod tests {
     };
     use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use makima_storage::session_state::{
-        StateChange, StoredAgentConfig, StoredStateRecord, StoredTurnOrigin,
+        StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredStateRecord,
+        StoredTurnOrigin,
     };
-    use makima_storage::sessions::{Prefs, SessionMeta, StoredEffect, StoredRule, StoredThinking};
+    use makima_storage::sessions::{
+        HistorySnapshot, Prefs, SessionMeta, StoredEffect, StoredRule, StoredThinking,
+    };
     use std::collections::BTreeMap;
     use std::iter::from_fn;
     use std::path::PathBuf;
@@ -3166,10 +3169,10 @@ mod tests {
         child.created_seq = source.next_state_seq();
         child.updated_seq = child.created_seq;
         source.push_agent_revision(child.created_seq, child);
-        source.set_subagent_messages(
+        assert!(source.adopt_subagent_history(
             SDK_CHILD_PROMPT.into(),
-            vec![Message::user(SDK_CHILD_PROMPT.into())],
-        );
+            &HistorySnapshot::new(vec![Message::user(SDK_CHILD_PROMPT.into())]),
+        ));
         source.save(&storage).unwrap();
         let source_path = storage
             .path()
@@ -4587,10 +4590,10 @@ mod tests {
             record.created_seq = 2;
             record.updated_seq = 2;
             session.push_agent_revision(2, record);
-            session.set_subagent_messages(
+            assert!(session.adopt_subagent_history(
                 SDK_CHILD_PROMPT.into(),
-                vec![Message::user(SDK_CHILD_PROMPT.into())],
-            );
+                &HistorySnapshot::new(vec![Message::user(SDK_CHILD_PROMPT.into())]),
+            ));
             for (seq, agent, turn) in [(3, root_id, root_turn), (4, child_id, child_turn)] {
                 session.push_state(StoredStateRecord {
                     seq,
@@ -4740,23 +4743,36 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         const STORED_CONVERSATION: &str = "stored-conversation";
         const STORED_SENT: usize = 2;
+        const NO_SPAWN_SPEC: &str = "legacy child has no stored spawn specification";
         let cwd = tmp.path().to_string_lossy();
         let mut session = StoredSession::new(STARTUP_MODEL, &cwd);
-        session.adopt_history(&makima_storage::sessions::HistorySnapshot::new(vec![
+        session.adopt_history(&HistorySnapshot::new(vec![
             Message::user("first".into()),
             Message::user("second".into()),
             Message::user("third".into()),
         ]));
-        session.bind_root_id(AgentId::generate()).unwrap();
-        session.set_subagents(vec![makima_storage::sessions::StoredSubagent {
-            tool_use_id: SDK_NESTED_TOOL.into(),
-            agent_id: None,
-            ambiguous: false,
-            name: SDK_NESTED_TOOL.into(),
-            model: None,
-            thinking: None,
-            fast: false,
-        }]);
+        let root_id = AgentId::generate();
+        session.bind_root_id(root_id).unwrap();
+        let seq = session.next_state_seq();
+        session.push_agent_revision(
+            seq,
+            StoredAgentRecord {
+                id: AgentId::generate(),
+                parent: Some(root_id),
+                depth: 1,
+                transcript_key: SDK_NESTED_TOOL.into(),
+                lifecycle: StoredAgentLifecycle::Closed,
+                ancestry_unknown: true,
+                label: Some(SDK_NESTED_TOOL.into()),
+                spawned_by_tool_use_id: Some(SDK_NESTED_TOOL.into()),
+                spec: None,
+                restorable: Err(NO_SPAWN_SPEC.into()),
+                usage: Default::default(),
+                created_seq: seq,
+                updated_seq: seq,
+                legacy: true,
+            },
+        );
         let mut compacted = session.history_snapshot();
         compacted.compacted = true;
         compacted.conversation = Some(ConversationState {
