@@ -4432,6 +4432,7 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
         );
     }
     assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(app.input_box.buffer.value(), INPUT);
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.chats[0].message_count(), main_messages);
     assert!(app.queue.root_text_messages().is_empty());
@@ -4439,13 +4440,10 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
         app.submit_prompt(queued_msg(INPUT)),
         SubmitOutcome::Rejected(error) if error == queue::NO_SUBAGENT_ERR
     ));
-    assert!(
-        app.handle_submit(Submission {
-            text: "!pwd".into(),
-            images: Vec::new(),
-        })
-        .is_empty()
-    );
+    const SHELL_INPUT: &str = "!pwd";
+    app.input_box.set_input(SHELL_INPUT.into());
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(app.input_box.buffer.value(), SHELL_INPUT);
 }
 
 fn push_turn_result(app: &mut App, agent_id: AgentId, turn_id: TurnId, context_size: u32) {

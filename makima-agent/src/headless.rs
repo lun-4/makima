@@ -33,7 +33,7 @@ use crate::config_change::{ConfigChangeError, reserve_in_turn_for_actor, unresol
 use crate::context::{ContextPolicy, RootContext, root_context};
 use crate::journal::{JournalChange, JournalCommit, JournalIncarnation, SessionJournal};
 use crate::manager::{
-    ReactivationError, ResidentAgent, ResidentInitialization, ResidentInitializer,
+    ReactivationError, ResidentAgent, ResidentInitialization, ResidentInitializer, SubmitOptions,
 };
 use crate::permissions::{PermissionManager, PermissionSnapshot, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
@@ -422,6 +422,7 @@ impl TurnAdmitter {
     /// record the turn under its own lock before the turn's events reach it.
     pub async fn ready(&self) -> Result<RootSubmission, String> {
         let root = self.root.get().await?;
+        root.wake().await.map_err(|error| error.to_string())?;
         Ok(self.for_actor(root.actor().map_err(|error| error.to_string())?))
     }
 
@@ -445,18 +446,19 @@ impl RootSubmission {
     /// Joins the root's compatible turn in flight, or starts one, and returns
     /// the ticket and presentation of the turn that carries {input}.
     pub fn submit(self, input: AgentInput) -> Result<(TurnTicket, u64), ActorError> {
-        self.actor.submit_presented(
-            input,
-            Some(EventSender::new(self.events)),
-            format!("run:{}", self.run),
-            TurnAdmissionOptions {
+        SubmitOptions {
+            presentation: Some(EventSender::new(self.events)),
+            correlation: format!("run:{}", self.run),
+            admission: TurnAdmissionOptions {
                 provenance: TurnProvenance {
                     origin: TurnOrigin::User,
                     ..Default::default()
                 },
                 ..Default::default()
             },
-        )
+            ..Default::default()
+        }
+        .submit_to(&self.actor, input)
     }
 }
 

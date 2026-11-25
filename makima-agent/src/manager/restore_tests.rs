@@ -5,14 +5,14 @@ use std::{
     slice,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use futures_lite::future::{or, poll_once, yield_now};
-use makima_providers::TokenUsage;
 use makima_providers::{Message, Model, ObservationSource, provider::unconfigured};
+use makima_providers::{TokenUsage, provider::BoxFuture};
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::session_state::{
     StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
@@ -24,7 +24,8 @@ use test_case::test_case;
 
 use super::{
     AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
-    ReactivationError, ResidentAgent, ResidentInitialization, RetainedTurn,
+    ReactivationError, ResidentAgent, ResidentInitialization, RetainedTurn, SubmitError,
+    SubmitOptions, SubmitWhen, WakeError,
 };
 use crate::{
     ActorBackend, AgentId, AgentInput, AgentMode, BackendResult, ControlWork, History,
@@ -52,6 +53,144 @@ const PUBLICATION_PLUGIN: &str = "detach-publication";
 const PUBLICATION_VERSION: u32 = 2;
 const PUBLICATION_VALUE: &str = "published candidate";
 const INITIALIZATION_CONTROL: &str = "initialization-publication";
+
+#[test]
+fn agent_ref_wake_is_shared_and_submit_requires_residency() {
+    smol::block_on(async {
+        let records = records();
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let agent = manager.root().unwrap();
+        let input = || AgentInput {
+            message: HISTORY_TEXT.into(),
+            images: Vec::new(),
+            preamble: Vec::new(),
+            prompt: None,
+        };
+        assert!(matches!(
+            agent.submit(input(), SubmitOptions::default()),
+            Err(SubmitError::Manager(ManagerError::NonLiveAgent(id))) if id == agent.id()
+        ));
+
+        assert_eq!(
+            agent.wake().await,
+            Err(WakeError::ReactivatorUnavailable(agent.id()))
+        );
+
+        let weak = manager.downgrade();
+        let failure = ReactivationError::Initialization(INITIALIZATION_ERROR.into());
+        let expected_failure = failure.clone();
+        let reactivate = move |id| -> BoxFuture<'static, Result<(), WakeError>> {
+            let manager = weak.upgrade().unwrap();
+            let failure = failure.clone();
+            Box::pin(async move {
+                manager
+                    .ensure_resident_with(id, |_| async { Err(failure) })
+                    .await?;
+                Ok(())
+            })
+        };
+        manager.set_reactivator(Some(Arc::new(reactivate)));
+        assert_eq!(
+            agent.wake().await,
+            Err(WakeError::Manager(ManagerError::Reactivation(
+                expected_failure
+            )))
+        );
+        assert_eq!(agent.snapshot().unwrap().residency, AgentResidency::Dormant);
+        assert!(
+            manager
+                .latest_retained_turn_ticket(&agent)
+                .unwrap()
+                .is_none()
+        );
+
+        let weak = manager.downgrade();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = hook_calls.clone();
+        let (release_activation, activation_gate) = flume::bounded(1);
+        let (_hold_start, start_gate) = flume::bounded(1);
+        let reactivate = move |id| -> BoxFuture<'static, Result<(), WakeError>> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            let manager = weak.upgrade().unwrap();
+            let activation_gate = activation_gate.clone();
+            let start_gate = start_gate.clone();
+            Box::pin(async move {
+                manager
+                    .ensure_resident_with(id, |_| async move {
+                        activation_gate.recv_async().await.unwrap();
+                        Ok(ResidentAgent {
+                            start: Some(start_gate),
+                            ..resident()
+                        })
+                    })
+                    .await?;
+                Ok(())
+            })
+        };
+        manager.set_reactivator(Some(Arc::new(reactivate)));
+        let mut first = Box::pin(agent.wake());
+        assert!(poll_once(first.as_mut()).await.is_none());
+        assert!(matches!(
+            agent.submit(input(), SubmitOptions::default()),
+            Err(SubmitError::Manager(ManagerError::NonLiveAgent(id))) if id == agent.id()
+        ));
+        let mut sibling = Box::pin(agent.wake());
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        release_activation.send(()).unwrap();
+        first.await.unwrap();
+        sibling.await.unwrap();
+        agent.wake().await.unwrap();
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+
+        let (first, first_presentation) = agent.submit(input(), SubmitOptions::default()).unwrap();
+        let (joined, joined_presentation) =
+            agent.submit(input(), SubmitOptions::default()).unwrap();
+        assert_eq!(joined.turn_id(), first.turn_id());
+        assert_eq!(joined_presentation, first_presentation);
+        let (queued, queued_presentation) = agent
+            .submit(
+                input(),
+                SubmitOptions {
+                    when: SubmitWhen::Queue,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(queued.turn_id(), first.turn_id());
+        assert_ne!(queued_presentation, first_presentation);
+        let idle = SubmitOptions {
+            when: SubmitWhen::Idle,
+            ..Default::default()
+        };
+        assert!(matches!(
+            agent.submit(input(), idle),
+            Err(SubmitError::Admission(crate::ActorError::Busy))
+        ));
+
+        for (record, error) in [
+            (&records[2], ManagerError::NonLiveAgent(records[2].id)),
+            (&records[3], ManagerError::Retired(records[3].id)),
+        ] {
+            assert_eq!(manager.reference(record.id).wake().await, Err(error.into()));
+        }
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+        manager.set_reactivator(None);
+        let child = manager.lookup(records[1].id).unwrap();
+        assert_eq!(
+            child.wake().await,
+            Err(WakeError::ReactivatorUnavailable(child.id()))
+        );
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert_eq!(agent.wake().await, Err(ManagerError::GraphShutdown.into()));
+    });
+}
 
 #[test]
 fn deferred_close_cannot_close_replacement_incarnation() {

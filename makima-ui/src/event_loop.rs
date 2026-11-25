@@ -695,11 +695,13 @@ fn dispatch_mode_commit(
     .detach();
 }
 
-/// The agent a session's commands and keymaps address: the selected chat's
-/// agent. A closed agent addresses nothing; there is no fallback to the root.
-fn selected_agent(runtime: &SessionRuntime) -> Option<AgentRef> {
+fn selected_graph_agent(runtime: &SessionRuntime) -> Option<AgentRef> {
     let (manager, _) = runtime.handles.manager_and_root();
-    let target = manager.lookup(runtime.app.selected_agent_id()?).ok()?;
+    manager.lookup(runtime.app.selected_agent_id()?).ok()
+}
+
+fn selected_agent(runtime: &SessionRuntime) -> Option<AgentRef> {
+    let target = selected_graph_agent(runtime)?;
     target.validate_live().ok()?;
     Some(target)
 }
@@ -1787,6 +1789,12 @@ impl SpawnCtx {
 }
 
 enum InternalEvent {
+    AgentWoken {
+        runtime: Arc<()>,
+        agent: AgentId,
+        operation: WakeOperation,
+        result: Result<(), String>,
+    },
     RewindCommitted {
         runtime: Arc<()>,
         agent: AgentId,
@@ -1834,6 +1842,11 @@ enum InternalEvent {
         result: Result<PreparedProvider, String>,
     },
     SessionHeartbeat(u64),
+}
+
+enum WakeOperation {
+    Input(Submission),
+    Rewind,
 }
 
 /// The event loop must never await a coordinator operation on its own thread:
@@ -2555,6 +2568,35 @@ impl<'t> EventLoop<'t> {
 
     fn handle_internal(&mut self, event: InternalEvent) {
         match event {
+            InternalEvent::AgentWoken {
+                runtime,
+                agent,
+                operation,
+                result,
+            } => {
+                let Some(idx) = self.runtime_position(&runtime) else {
+                    return;
+                };
+                self.sync_orchestration();
+                let app = &mut self.sessions[idx].app;
+                match operation {
+                    WakeOperation::Input(_) => app.input_wake_pending = false,
+                    WakeOperation::Rewind => app.rewind_pending = false,
+                }
+                if let Err(error) = result {
+                    app.flash(error);
+                } else if app.selected_agent_id() != Some(agent) {
+                    app.flash(CLOSED_TARGET_ERR.into());
+                } else {
+                    match operation {
+                        WakeOperation::Input(submission) => {
+                            let actions = app.handle_submit(submission);
+                            self.dispatch(idx, actions);
+                        }
+                        WakeOperation::Rewind => self.handle_action(idx, Action::BeginRewind),
+                    }
+                }
+            }
             InternalEvent::PlanApprovalReady {
                 session,
                 runtime,
@@ -4291,8 +4333,20 @@ impl<'t> EventLoop<'t> {
                 };
                 self.sessions[idx].app.flash(message);
             }
+            Action::WakeForInput { target, submission } => {
+                self.wake_agent(idx, target, WakeOperation::Input(submission));
+            }
             Action::BeginRewind => {
-                let target = self.selected_target(idx);
+                let target = selected_graph_agent(&self.sessions[idx]);
+                if let Some(target) = target.as_ref()
+                    && target
+                        .snapshot()
+                        .is_ok_and(|node| node.graph_lifecycle == GraphLifecycle::Dormant)
+                {
+                    self.wake_agent(idx, target.clone(), WakeOperation::Rewind);
+                    return;
+                }
+                let target = target.filter(|target| target.validate_live().is_ok());
                 let rt = &mut self.sessions[idx];
                 let result =
                     target
@@ -4416,25 +4470,25 @@ impl<'t> EventLoop<'t> {
                 });
             }
             Action::ShellCommand {
-                target,
-                cwd,
-                id,
+                submission,
                 command,
                 visible,
             } => {
-                let (manager, _) = self.sessions[idx].handles.manager_and_root();
-                let validation = target
-                    .map(|id| manager.lookup(id).map_err(|error| error.to_string()))
-                    .unwrap_or_else(|| {
-                        self.selected_target(idx)
-                            .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                    })
-                    .and_then(|target| self.target_actor(idx, &target).map(|_| ()));
-                if let Err(error) = validation {
-                    self.sessions[idx].app.flash(error);
-                    return;
-                }
+                let validation = self
+                    .selected_target(idx)
+                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                    .and_then(|target| self.target_actor(idx, &target).map(|_| target.id()));
                 let rt = &mut self.sessions[idx];
+                let target = match validation {
+                    Ok(target) => target,
+                    Err(error) => {
+                        rt.app.flash(error);
+                        return;
+                    }
+                };
+                let cwd = rt.app.focused_cwd();
+                let id = rt.app.shell.reserve_for(Some(target));
+                rt.app.accept_shell_command(&submission, &command, visible);
                 let (trigger, cancel) = CancelToken::new();
                 rt.app.shell.add_trigger_for(id.clone(), trigger);
                 spawn_shell(
@@ -4623,6 +4677,21 @@ impl<'t> EventLoop<'t> {
                     .collect(),
             ),
         ))
+    }
+
+    fn wake_agent(&self, idx: usize, target: AgentRef, operation: WakeOperation) {
+        let runtime = self.sessions[idx].handles.identity();
+        let tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = target.wake().await.map_err(|error| error.to_string());
+            let _ = tx.send(InternalEvent::AgentWoken {
+                runtime,
+                agent: target.id(),
+                operation,
+                result,
+            });
+        })
+        .detach();
     }
 
     fn selected_target(&self, idx: usize) -> Option<AgentRef> {
@@ -10801,8 +10870,9 @@ end })
         release_runtime(runtime);
     }
 
-    #[test]
-    fn lua_reactivation_persists_plan_fallback_before_first_provider_call() {
+    #[test_case(false; "lua_send")]
+    #[test_case(true; "typed_input")]
+    fn reactivation_persists_plan_fallback_before_first_provider_call(typed: bool) {
         use makima_agent::manager::{AgentResidency, GraphLifecycle};
         use makima_agent::tools::ToolAudience;
         use makima_agent::{AgentMode, ModeDef, ModeId};
@@ -10816,6 +10886,7 @@ end })
         const OBSERVED: &str = "reactivated child exposes read-only";
         const READ_ONLY: &str = "recovery_read_only";
         const PLAN: &str = "plan";
+        const INPUT: &str = "continue the saved child";
 
         struct DiskConfigProvider {
             storage: StateDir,
@@ -10965,7 +11036,7 @@ end })
                                 local child = assert(makima.agent.get(ctx, "{child}"))
                                 assert(not child:is_live())
                                 assert(assert(child:config(ctx)).mode == "{PLAN}")
-                                local ticket, err = child:send(ctx, "resume the saved child", {{ when = "idle" }})
+                                local ticket, err = child:send(ctx, "{INPUT}", {{ when = "idle" }})
                                 assert(ticket, err)
                                 assert(child:is_live())
                                 assert(assert(child:config(ctx)).mode == "{READ_ONLY}")
@@ -10978,32 +11049,60 @@ end })
                 .unwrap();
                 event_loop.sync_orchestration();
                 assert!(received.is_empty());
-                let outcome = smol::block_on(bounded_session_op(
-                    async {
-                        Ok(command_runtime
-                            .registry
-                            .dispatch_input(
-                                &event_loop.sessions[0].app.command_target,
-                                COMMAND.into(),
+                if typed {
+                    let app = &mut event_loop.sessions[0].app;
+                    app.active_chat = app.agent_chat_index[&child];
+                    event_loop.handle_input(Event::Paste(INPUT.into()));
+                    event_loop.handle_input(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    )));
+                    assert_eq!(event_loop.sessions[0].app.input_box.buffer.value(), INPUT);
+                    loop {
+                        let completion = event_loop.internal_rx.recv_timeout(PUMP_TIMEOUT).unwrap();
+                        let woke =
+                            if let InternalEvent::AgentWoken { agent, result, .. } = &completion {
+                                assert_eq!(*agent, child);
+                                result.as_ref().unwrap();
+                                true
+                            } else {
+                                false
+                            };
+                        event_loop.handle_internal(completion);
+                        if woke {
+                            break;
+                        }
+                    }
+                    let app = &event_loop.sessions[0].app;
+                    assert!(app.input_box.is_empty(), "{:?}", app.flash_text());
+                } else {
+                    let outcome = smol::block_on(bounded_session_op(
+                        async {
+                            Ok(command_runtime
+                                .registry
+                                .dispatch_input(
+                                    &event_loop.sessions[0].app.command_target,
+                                    COMMAND.into(),
+                                )
+                                .await)
+                        },
+                        PUMP_TIMEOUT,
+                    ))
+                    .unwrap();
+                    assert!(
+                        matches!(
+                            outcome,
+                            makima_commands::InputDispatch::Dispatched(
+                                makima_commands::CommandOutcome::Completed
                             )
-                            .await)
-                    },
-                    PUMP_TIMEOUT,
-                ))
-                .unwrap();
-                assert!(
-                    matches!(
-                        outcome,
-                        makima_commands::InputDispatch::Dispatched(
-                            makima_commands::CommandOutcome::Completed
-                        )
-                    ),
-                    "{outcome:?}"
-                );
-                assert!(matches!(
-                    host.ui_action_rx().recv_timeout(PUMP_TIMEOUT).unwrap(),
-                    UiAction::Flash(text) if text == OBSERVED
-                ));
+                        ),
+                        "{outcome:?}"
+                    );
+                    assert!(matches!(
+                        host.ui_action_rx().recv_timeout(PUMP_TIMEOUT).unwrap(),
+                        UiAction::Flash(text) if text == OBSERVED
+                    ));
+                }
                 let saved = received.recv_timeout(PUMP_TIMEOUT).unwrap().unwrap();
                 let child_config = saved.scopes[&Some(child)].config.as_ref().unwrap();
                 assert_eq!(child_config.mode.id, READ_ONLY);
@@ -11026,7 +11125,10 @@ end })
                     &root_config,
                     &event_loop.sessions[0].config().unwrap()
                 ));
-                assert_eq!(event_loop.sessions[0].app.selected_agent_id(), Some(root));
+                assert_eq!(
+                    event_loop.sessions[0].app.selected_agent_id(),
+                    Some(if typed { child } else { root })
+                );
                 manager.close_subtree(child).unwrap();
             },
         );

@@ -35,7 +35,9 @@ use makima_agent::config_change::{
 };
 use makima_agent::context::root_context;
 use makima_agent::headless::default_model_preparer;
-use makima_agent::manager::{AgentIncarnation, ReactivationError, ResidentAgent, SpawnRestoration};
+use makima_agent::manager::{
+    AgentIncarnation, ManagerError, ReactivationError, ResidentAgent, SpawnRestoration,
+};
 use makima_agent::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use makima_agent::template::env_vars_for;
 use makima_agent::tools::interpreter_bridge;
@@ -2210,6 +2212,21 @@ async fn activate_agent(
         Some(InvocationGuard::capture(lua)?),
     )
     .await
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn reactivate_agent(
+    lua: &Lua,
+    manager: AgentManagerHandle,
+    agent_id: AgentId,
+) -> Result<(), ManagerError> {
+    let services = crate::orchestration::services(lua)
+        .ok_or_else(|| ReactivationError::Initialization("agent host is unavailable".into()))?;
+    let template = services
+        .template(&manager.root()?)
+        .map_err(ReactivationError::Initialization)?;
+    let context = LuaCtx::handler(&template);
+    activate_agent_with_guard(lua, &context, manager, agent_id, None).await
 }
 
 async fn activate_agent_with_guard(
@@ -2218,7 +2235,7 @@ async fn activate_agent_with_guard(
     manager: AgentManagerHandle,
     agent_id: AgentId,
     guard: Option<InvocationGuard>,
-) -> Result<(), String> {
+) -> Result<(), ManagerError> {
     let activation_ctx = ctx.clone();
     let activation_manager = manager.clone();
     let activation_lua = lua.clone();
@@ -2475,8 +2492,7 @@ async fn activate_agent_with_guard(
                 })),
             })
         })
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     Ok(())
 }
 
@@ -2512,7 +2528,7 @@ pub(crate) async fn wake_restored_children(lua: &Lua, root: AgentRef) {
                 Ok(()) => tracing::info!(agent_id = %child.id, "restored child admissions activated"),
                 Err(error) => {
                     warn!(agent_id = %child.id, %error, "restored child activation failed");
-                    if let Err(error) = manager.fail_restored_turns(child.id, error).await {
+                    if let Err(error) = manager.fail_restored_turns(child.id, error.to_string()).await {
                         warn!(agent_id = %child.id, %error, "failed to terminalize restored child admissions");
                     }
                 }

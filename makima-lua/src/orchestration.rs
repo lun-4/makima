@@ -563,7 +563,11 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
     })
 }
 
+pub type RootObserver = Arc<dyn Fn(&AgentRef) + Send + Sync>;
+
 pub trait OrchestrationServices: Send + Sync + 'static {
+    fn observe_roots(&self, _observe: Option<RootObserver>) {}
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,

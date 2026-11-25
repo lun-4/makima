@@ -9,8 +9,8 @@ use makima_agent::session_options::{
     THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
 };
 use makima_agent::{
-    AgentInput, AgentRef, CurrentManagedTurn, GraphLifecycle, TranscriptRequest,
-    TurnAdmissionOptions, TurnId, TurnOrigin, TurnProvenance,
+    AgentInput, AgentRef, CurrentManagedTurn, GraphLifecycle, SubmitError, SubmitOptions,
+    SubmitWhen, TranscriptRequest, TurnAdmissionOptions, TurnId, TurnOrigin, TurnProvenance,
 };
 use makima_lua_macro::{lua_class, lua_fn};
 use makima_providers::CompleteModelSelection;
@@ -386,15 +386,16 @@ fn admit(
     agent: &LuaAgent,
     ctx: &LuaCtx,
     message: String,
-    options: TurnAdmissionOptions,
-    submit: bool,
+    when: SubmitWhen,
+    admission: TurnAdmissionOptions,
 ) -> Result<LuaAgentTurn, String> {
     authorize(lua, ctx, agent)?;
-    let actor = agent
-        .manager
-        .actor(agent.id)
-        .map_err(|error| error.to_string())?;
-    actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE)?;
+    let target = agent.manager.reference(agent.id);
+    target
+        .actor()
+        .map_err(|error| error.to_string())?
+        .effective_config()
+        .ok_or(AGENT_CONFIG_UNAVAILABLE)?;
     let input = AgentInput {
         message,
         images: Vec::new(),
@@ -419,39 +420,28 @@ fn admit(
             source_turn: current.as_ref().map(CurrentManagedTurn::turn_id),
         }
     };
-    let options = TurnAdmissionOptions {
-        provenance,
-        ..options
+    let options = SubmitOptions {
+        when,
+        admission: TurnAdmissionOptions {
+            provenance,
+            ..admission
+        },
+        ..Default::default()
     };
-    let ticket = if submit {
-        actor.submit(input, None, String::new(), options)
-    } else {
-        actor.admit_turn_with_options(input, None, String::new(), options)
-    }
-    .map_err(|error| match error {
-        ActorError::Busy => AGENT_BUSY.to_owned(),
-        ActorError::StaleTurn => STALE_TURN.to_owned(),
+    let (ticket, _) = target.submit(input, options).map_err(|error| match error {
+        SubmitError::Admission(ActorError::Busy) => AGENT_BUSY.to_owned(),
+        SubmitError::Admission(ActorError::StaleTurn) => STALE_TURN.to_owned(),
         other => other.to_string(),
     })?;
     Ok(LuaAgentTurn::new(agent, RetainedTurn::Ticket(ticket)))
 }
 
-/// When a turn a plugin sends starts.
-enum When {
-    /// Only when the agent has no active, preparing or queued work.
-    Idle,
-    /// Join compatible admitted work, or start a turn when there is none.
-    Join,
-    /// A distinct FIFO turn behind already admitted work.
-    Queue,
-}
-
 /// Reads `send`'s options; a malformed table is a programmer error.
-fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
+fn send_options(opts: &Table) -> mlua::Result<(SubmitWhen, TurnAdmissionOptions)> {
     let when = match opts.get::<Option<String>>("when")?.as_deref() {
-        Some("idle") => When::Idle,
-        Some("join") => When::Join,
-        Some("queue") => When::Queue,
+        Some("idle") => SubmitWhen::Idle,
+        Some("join") => SubmitWhen::Join,
+        Some("queue") => SubmitWhen::Queue,
         _ => return Err(mlua::Error::runtime(SEND_WHEN_REQUIRED)),
     };
     let existing_only = opts.get::<Option<bool>>("existing_only")?;
@@ -459,14 +449,13 @@ fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
         .get::<Option<String>>("after_turn")?
         .map(|id| id.parse::<TurnId>().map_err(mlua::Error::runtime))
         .transpose()?;
-    if existing_only.is_some() && !matches!(when, When::Join) {
+    if existing_only.is_some() && !matches!(when, SubmitWhen::Join) {
         return Err(mlua::Error::runtime(EXISTING_ONLY_NEEDS_JOIN));
     }
-    if after_turn.is_some() && !matches!(when, When::Idle) {
+    if after_turn.is_some() && !matches!(when, SubmitWhen::Idle) {
         return Err(mlua::Error::runtime(AFTER_TURN_NEEDS_IDLE));
     }
     let options = TurnAdmissionOptions {
-        idle_only: matches!(when, When::Idle),
         existing_only: existing_only.unwrap_or_default(),
         after_turn,
         ..Default::default()
@@ -505,14 +494,7 @@ async fn agent_send(
     let context = (*ctx).clone();
     drop(ctx);
     try_pair!(ensure_agent_resident(&lua, &context, &agent).await);
-    let turn = try_pair!(admit(
-        &lua,
-        &agent,
-        &context,
-        message,
-        options,
-        matches!(when, When::Join),
-    ));
+    let turn = try_pair!(admit(&lua, &agent, &context, message, when, options));
     Ok((Some(turn), None))
 }
 

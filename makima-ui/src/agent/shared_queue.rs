@@ -12,20 +12,9 @@ use makima_agent::actor::{
 use makima_agent::{AgentInput, EffectiveAgentConfig, ImageSource};
 use tracing::warn;
 
-use crate::components::input::Submission;
-
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
-}
-
-impl From<Submission> for QueuedMessage {
-    fn from(sub: Submission) -> Self {
-        Self {
-            text: sub.text,
-            images: sub.images,
-        }
-    }
 }
 
 pub(crate) struct QueueItem {

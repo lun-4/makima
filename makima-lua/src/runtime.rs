@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use event_listener::Event;
 
+use futures::future::BoxFuture;
 use include_dir::Dir;
 use makima_agent::cancel::{CancelMap, CancelToken, CancelTrigger, PublicationRegistration};
 use makima_agent::manager::AgentIncarnation;
@@ -27,7 +28,8 @@ use makima_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use makima_agent::{
-    BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    AgentId, AgentManagerHandle, BufferSnapshot, CurrentManagedTurn, MovedBy, SharedBuf,
+    SnapshotLine, SnapshotSpan, SpanStyle, WakeError, WeakAgentManagerHandle,
 };
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
@@ -219,6 +221,12 @@ pub enum Request {
     },
     InstallOrchestrationServices(crate::orchestration::OrchestrationServicesSlot),
     NotifyStateRestored(makima_agent::AgentRef),
+    ReactivateAgent {
+        manager: AgentManagerHandle,
+        agent_id: AgentId,
+        binding: CancelToken,
+        reply: flume::Sender<Result<(), WakeError>>,
+    },
     StateChanged {
         target: makima_agent::AgentRef,
         event: makima_agent::state::StateChangeEvent,
@@ -5104,6 +5112,72 @@ pub struct SpawnConfig {
     pub orchestration_services: crate::orchestration::OrchestrationServicesSlot,
 }
 
+#[derive(Default)]
+struct ReactivatorBindings {
+    managers: HashMap<u64, WeakAgentManagerHandle>,
+    lifetime: Option<(CancelTrigger, CancelToken)>,
+}
+
+impl ReactivatorBindings {
+    fn install(&mut self, manager: AgentManagerHandle, tx: &flume::Sender<Request>) {
+        let weak = manager.downgrade();
+        if self
+            .managers
+            .insert(manager.generation(), weak.clone())
+            .is_some()
+        {
+            return;
+        }
+        let (_, binding) = self.lifetime.get_or_insert_with(CancelToken::new);
+        let binding = binding.clone();
+        let tx = tx.clone();
+        manager.set_reactivator(Some(Arc::new(move |agent_id| -> BoxFuture<'static, _> {
+            let manager = weak.upgrade();
+            let binding = binding.clone();
+            let tx = tx.clone();
+            Box::pin(async move {
+                let unavailable = || WakeError::ReactivatorUnavailable(agent_id);
+                let manager = manager.ok_or_else(unavailable)?;
+                let (reply, result) = flume::bounded(1);
+                let request = Request::ReactivateAgent {
+                    manager,
+                    agent_id,
+                    binding: binding.clone(),
+                    reply,
+                };
+                binding
+                    .race(async {
+                        tx.send(request).map_err(|_| unavailable())?;
+                        result.recv_async().await.map_err(|_| unavailable())?
+                    })
+                    .await
+                    .map_err(|_| unavailable())?
+            })
+        })));
+    }
+
+    fn clear(&mut self) {
+        self.lifetime.take();
+        for manager in self.managers.drain().filter_map(|(_, weak)| weak.upgrade()) {
+            manager.set_reactivator(None);
+        }
+    }
+}
+
+fn observe_reactivation_roots(
+    lua: &Lua,
+    bindings: &Arc<Mutex<ReactivatorBindings>>,
+    tx: &flume::Sender<Request>,
+) {
+    if let Some(services) = crate::orchestration::services(lua) {
+        let bindings = Arc::clone(bindings);
+        let tx = tx.clone();
+        services.observe_roots(Some(Arc::new(move |root| {
+            bindings.lock_unpoisoned().install(root.manager(), &tx);
+        })));
+    }
+}
+
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
 /// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThread, PluginError> {
@@ -5141,6 +5215,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
         })
     };
     let tx_clone = tx.clone();
+    let reactivation_tx = tx.clone();
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let modes_thread = Arc::clone(&modes);
@@ -5240,6 +5315,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
             let timer_wake_rx = timer::wake_rx(&rt.lua);
 
             let mut codegen_armed = false;
+            let reactivators = Arc::new(Mutex::new(ReactivatorBindings::default()));
+            observe_reactivation_roots(&rt.lua, &reactivators, &reactivation_tx);
+            if let Ok(Some(target)) = crate::orchestration::resolve_target(&rt.lua, None) {
+                reactivators.lock_unpoisoned().install(target.target.manager(), &reactivation_tx);
+            }
 
             smol::block_on(ex.run(async {
                 loop {
@@ -5322,7 +5402,11 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                         Request::Shutdown => break,
                         Request::WarmJit => codegen_armed = true,
                         Request::NotifyStateRestored(target) => {
-                            let journal = target.manager().journal();
+                            let manager = target.manager();
+                            if crate::orchestration::services(&rt.lua).is_some() {
+                                reactivators.lock_unpoisoned().install(manager.clone(), &reactivation_tx);
+                            }
+                            let journal = manager.journal();
                             crate::api::state::observe(&rt.lua, &journal, &target);
                             journal.notify_state_transition(makima_agent::state::StateChangeReason::Resume);
                             let lua = rt.lua.clone();
@@ -5332,14 +5416,36 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                                 run_detached(&lua, crate::api::agent::wake_restored_children(&lua, target)).await;
                             }).detach();
                         }
+                        Request::ReactivateAgent { manager, agent_id, binding, reply } => {
+                            let lua = rt.lua.clone();
+                            let callback = GateGuard::new(&callbacks);
+                            ex.spawn(async move {
+                                let _callback = callback;
+                                let result = binding.race(run_detached(
+                                    &lua,
+                                    crate::api::agent::reactivate_agent(&lua, manager, agent_id),
+                                )).await;
+                                let result = match result {
+                                    Ok(result) => result.map_err(WakeError::from),
+                                    Err(_) => Err(WakeError::ReactivatorUnavailable(agent_id)),
+                                };
+                                let _ = reply.send(result);
+                            }).detach();
+                        }
                         Request::StateChanged { target, event } => {
                             if let Err(error) = crate::api::state::dispatch(&rt.lua, target, event) {
                                 tracing::warn!(%error, "state notification failed");
                             }
                         }
                         Request::InstallOrchestrationServices(services) => {
+                            if let Some(previous) = crate::orchestration::services(&rt.lua) {
+                                previous.observe_roots(None);
+                            }
+                            reactivators.lock_unpoisoned().clear();
                             rt.lua.set_app_data(services);
+                            observe_reactivation_roots(&rt.lua, &reactivators, &reactivation_tx);
                             if let Ok(Some(target)) = crate::orchestration::resolve_target(&rt.lua, None) {
+                                reactivators.lock_unpoisoned().install(target.target.manager(), &reactivation_tx);
                                 crate::api::state::observe(&rt.lua, &target.target.manager().journal(), &target.target);
                                 let lua = rt.lua.clone();
                                 let callback = GateGuard::new(&callbacks);
@@ -6035,6 +6141,10 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                     }
                 }
                 rt.shutdown.store(true, Ordering::Release);
+                if let Some(services) = crate::orchestration::services(&rt.lua) {
+                    services.observe_roots(None);
+                }
+                reactivators.lock_unpoisoned().clear();
                 tool_cancels.cancel_all();
                 mutable_cancels.cancel_all();
                 mutable_gate.drain().await;

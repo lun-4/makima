@@ -7,7 +7,7 @@ use std::{
 
 use common::{CannedProvider, RestartHost, TestSession};
 use makima_agent::{
-    AgentActorHandle, AgentId, AgentRef, McpSession,
+    AgentActorHandle, AgentId, AgentRef, McpSession, WakeError,
     manager::{AgentIncarnation, ReactivationError},
     mcp::{TOOL_SEARCH_TOOL_NAME, test_support::stub_session_with_result},
     permissions::{PermissionCheck, PermissionSnapshot},
@@ -17,7 +17,7 @@ use makima_agent::{
 use makima_commands::CommandInvocation;
 use makima_config::ToolKey;
 use makima_lua::{
-    orchestration::{OrchestrationServices, TrustedTarget},
+    orchestration::{AgentOrchestration, OrchestrationServices, TrustedTarget},
     test_support::{InMemoryFs, run_command},
 };
 use makima_providers::{
@@ -798,6 +798,48 @@ fn runtime_shutdown_detaches_children_without_closing_durable_records() {
         StoredAgentLifecycle::Open,
     );
     assert_eq!(provider.request_count(), 2);
+}
+
+#[test_case(false; "without_restore_notification")]
+#[test_case(true; "restore_notified_before_install")]
+fn wake_restored_child_after_late_root_registration_without_focus(notify_restore: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RestartProvider::new(vec![common::canned_reply(REPLY)]);
+    let host = agent_host(dir.path(), provider.clone());
+    let path = dir.path().join(SAVED_IDS);
+    command(
+        &host,
+        json!({ "action": "create", "model": CHILD_MODEL, "path": path }),
+    );
+    let ids = saved(&host, &path);
+    let child_id = ids["agent_id"].as_str().unwrap().parse().unwrap();
+    let host = host.restart_host(dir.path());
+    let child = host.manager.lookup(child_id).unwrap();
+    assert!(!child.is_live());
+
+    let events = host.host.event_handle();
+    events.clear_orchestration_services();
+    host.host.wait_for_worker_barrier_for_test();
+    assert_eq!(
+        smol::block_on(common::bounded(child.wake())),
+        Err(WakeError::ReactivatorUnavailable(child_id)),
+    );
+
+    if notify_restore {
+        events.notify_state_restored(host.root.target.clone());
+        host.host.wait_for_worker_barrier_for_test();
+    }
+    let services = Arc::new(AgentOrchestration::new(Arc::default()));
+    events.install_orchestration_services(services.clone());
+    host.host.wait_for_worker_barrier_for_test();
+    services.register_root(host.root.clone(), None);
+    assert!(services.resolve_target(None).unwrap().is_none());
+
+    smol::block_on(common::bounded(child.wake())).unwrap();
+    assert!(child.is_live());
+    assert_eq!(provider.request_count(), 1);
+    let view = host.manager.journal().snapshot().fold().unwrap();
+    assert!(view.scopes[&Some(child_id)].admitted.is_empty());
 }
 
 #[test]

@@ -76,9 +76,9 @@ use makima_agent::permissions::PermissionSnapshot;
 use makima_agent::rewind::RewindGuard;
 use makima_agent::tools::ToolFilter;
 use makima_agent::{
-    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, Envelope,
-    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
-    SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput, TurnCompleteEvent,
+    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    GraphLifecycle, ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader,
+    Post, SharedBuf, SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput, TurnCompleteEvent,
 };
 use makima_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -403,6 +403,7 @@ pub struct App {
     pub(super) rewind_picker: ListPicker<rewind::RewindEntry>,
     pub(crate) rewind_guard: Option<RewindGuard>,
     pub(crate) rewind_pending: bool,
+    pub(crate) input_wake_pending: bool,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) background_calls: Vec<BackgroundCallView>,
@@ -618,6 +619,7 @@ impl App {
             rewind_picker: ListPicker::new().with_picker(PickerId::Rewind),
             rewind_guard: None,
             rewind_pending: false,
+            input_wake_pending: false,
             task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
             background_calls: Vec::new(),
@@ -1226,17 +1228,16 @@ impl App {
         {
             return true;
         }
-        let target = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| target.id() == id)
-            .or_else(|| {
-                self.root_agent
-                    .as_ref()
-                    .and_then(|root| root.manager().lookup(id).ok())
-            });
-        if let Some(actor) = target.and_then(|target| target.actor().ok()) {
-            return actor.snapshot().lifecycle != ActorLifecycle::Open;
+        if let Some(target) = self.focused_input_target() {
+            if let Ok(actor) = target.actor() {
+                return actor.snapshot().lifecycle != ActorLifecycle::Open;
+            }
+            if target
+                .snapshot()
+                .is_ok_and(|node| node.graph_lifecycle == GraphLifecycle::Dormant)
+            {
+                return false;
+            }
         }
         self.subagent_channels.get(&id).map_or_else(
             || {
@@ -1248,6 +1249,14 @@ impl App {
             },
             |channels| channels.closed,
         )
+    }
+
+    fn focused_input_target(&self) -> Option<AgentRef> {
+        let id = self.selected_agent_id()?;
+        self.command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| target.id() == id)
+            .or_else(|| self.root_agent.as_ref()?.manager().lookup(id).ok())
     }
 
     fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
@@ -2402,6 +2411,9 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if self.input_wake_pending {
+            return vec![];
+        }
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
@@ -2715,13 +2727,19 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    pub(crate) fn handle_submit(&mut self, mut sub: Submission) -> Vec<Action> {
+    pub(crate) fn accept_submission(&mut self, sub: &Submission) {
+        self.input_box.accept_submission(sub);
+        self.persist_input();
+    }
+
+    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         // Any main-input submit releases a manual Alt+M hold, so the deferred
         // panel re-promotes once the user has placed their message.
         self.submit_released = true;
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { agent_id } => {
                 self.send_to_agent(agent_id, String::new());
+                self.accept_submission(&sub);
                 return vec![];
             }
             PendingInput::None => {}
@@ -2729,37 +2747,45 @@ impl App {
         if sub.is_empty() {
             return vec![];
         }
+        if self.restore_in_progress {
+            self.flash(RESTORE_IN_PROGRESS.into());
+            return vec![];
+        }
         if sub.text.trim() == "exit" {
+            self.accept_submission(&sub);
             return self.quit();
         }
-
-        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+        if self.input_wake_pending {
+            return vec![];
+        }
+        let class = classify_input(&sub.text);
+        if !matches!(class, SlashClass::Command(_)) {
             if self.active_subagent_closed() {
                 self.flash(queue::NO_SUBAGENT_ERR.into());
                 return vec![];
             }
-            let cmd = prefix.command.trim();
-            if cmd == "cd" || cmd.starts_with("cd ") {
-                self.flash("Only /cd can change the working directory".into());
+            if let Some(target) = self.focused_input_target()
+                && target
+                    .snapshot()
+                    .is_ok_and(|node| node.graph_lifecycle == GraphLifecycle::Dormant)
+            {
+                self.input_wake_pending = true;
+                return vec![Action::WakeForInput {
+                    target,
+                    submission: sub,
+                }];
             }
-            let id = self.shell.reserve_for(self.selected_agent_id());
-            let sigil = if prefix.visible { "!" } else { "!!" };
-            let display = format!("{sigil} {}", prefix.command);
-            self.active_chat().show_user_message(display, Vec::new());
+        }
+        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
             return vec![Action::ShellCommand {
-                target: self.selected_agent_id(),
-                cwd: self.focused_cwd(),
-                id,
+                submission: sub,
                 command: prefix.command,
                 visible: prefix.visible,
             }];
         }
-        match classify_input(&sub.text) {
-            SlashClass::Plain => self.submit_or_queue(sub.into()),
-            SlashClass::EscapedLiteral(literal) => {
-                sub.text = literal.to_owned();
-                self.submit_or_queue(sub.into())
-            }
+        match class {
+            SlashClass::Plain => self.submit_or_queue(&sub, sub.text.clone()),
+            SlashClass::EscapedLiteral(literal) => self.submit_or_queue(&sub, literal.to_owned()),
             SlashClass::Command(_) => {
                 let attachments = sub
                     .images
@@ -2776,9 +2802,20 @@ impl App {
                         attachments,
                     },
                 );
+                self.accept_submission(&sub);
                 vec![]
             }
         }
+    }
+
+    pub(crate) fn accept_shell_command(&mut self, sub: &Submission, command: &str, visible: bool) {
+        if command == "cd" || command.starts_with("cd ") {
+            self.flash("Only /cd can change the working directory".into());
+        }
+        let sigil = if visible { "!" } else { "!!" };
+        self.active_chat()
+            .show_user_message(format!("{sigil} {command}"), Vec::new());
+        self.accept_submission(sub);
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -4295,7 +4332,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if self.attach_pasted_images(text) {
+        if self.input_wake_pending || self.attach_pasted_images(text) {
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {

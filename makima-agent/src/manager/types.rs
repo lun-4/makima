@@ -7,14 +7,17 @@ use std::time::Duration;
 use futures_lite::future::or;
 use makima_storage::session_state::{StoredAgentConfig, StoredAgentRecord, StoredAgentSpec};
 
-use crate::actor::{EffectiveAgentConfig, TranscriptRequest, TranscriptSnapshot};
+use crate::actor::{
+    EffectiveAgentConfig, TranscriptRequest, TranscriptSnapshot, TurnAdmissionOptions,
+};
 use crate::state::StateAccess;
 use crate::{
-    ActorBackend, ActorSnapshot, AgentActorHandle, AgentId, CallScope, HistorySnapshot,
-    ReasonedCancelTrigger, SharedMessages, TurnId, TurnOutcome, TurnTicket,
+    ActorBackend, ActorError, ActorSnapshot, AgentActorHandle, AgentId, AgentInput, CallScope,
+    EventSender, HistorySnapshot, ReasonedCancelTrigger, SharedMessages, TurnId, TurnOutcome,
+    TurnTicket,
 };
 
-use super::ReactivationError;
+use super::{ReactivationError, SubmitError, WakeError};
 
 #[derive(Clone)]
 pub enum RetainedTurn {
@@ -150,6 +153,51 @@ pub struct AgentNodeSnapshot {
     pub metadata: AgentMetadata,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmitWhen {
+    /// Joins compatible work or admits a new turn.
+    #[default]
+    Join,
+    /// Admits a distinct turn behind existing work.
+    Queue,
+    /// Admits a distinct turn only when the actor is idle.
+    Idle,
+}
+
+#[derive(Clone, Default)]
+pub struct SubmitOptions {
+    pub when: SubmitWhen,
+    pub admission: TurnAdmissionOptions,
+    pub presentation: Option<EventSender>,
+    pub correlation: String,
+}
+
+impl SubmitOptions {
+    pub(crate) fn submit_to(
+        mut self,
+        actor: &AgentActorHandle,
+        input: AgentInput,
+    ) -> Result<(TurnTicket, u64), ActorError> {
+        match self.when {
+            SubmitWhen::Join => {
+                actor.submit_presented(input, self.presentation, self.correlation, self.admission)
+            }
+            SubmitWhen::Queue | SubmitWhen::Idle => {
+                if self.admission.existing_only {
+                    return Err(ActorError::Busy);
+                }
+                self.admission.idle_only |= self.when == SubmitWhen::Idle;
+                actor.admit_turn_presented(
+                    input,
+                    self.presentation,
+                    self.correlation,
+                    self.admission,
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentRef {
     pub(crate) manager: super::AgentManagerHandle,
@@ -211,6 +259,21 @@ impl AgentRef {
 
     pub fn actor(&self) -> Result<AgentActorHandle, super::ManagerError> {
         self.manager.actor(self.agent_id)
+    }
+
+    /// Ensures the agent has a resident actor, reactivating it if needed.
+    pub async fn wake(&self) -> Result<(), WakeError> {
+        self.manager.wake_agent(self.agent_id).await
+    }
+
+    /// Admits input on the resident actor without starting reactivation.
+    pub fn submit(
+        &self,
+        input: AgentInput,
+        options: SubmitOptions,
+    ) -> Result<(TurnTicket, u64), SubmitError> {
+        let actor = self.manager.resident_actor(self.agent_id)?;
+        Ok(options.submit_to(&actor, input)?)
     }
 
     pub fn snapshot(&self) -> Result<AgentNodeSnapshot, super::ManagerError> {

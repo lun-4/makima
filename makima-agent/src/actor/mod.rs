@@ -2831,6 +2831,17 @@ impl AgentActorHandle {
         correlation: String,
         options: TurnAdmissionOptions,
     ) -> Result<TurnTicket, ActorError> {
+        self.admit_turn_presented(input, event_sender, correlation, options)
+            .map(|(ticket, _)| ticket)
+    }
+
+    pub(crate) fn admit_turn_presented(
+        &self,
+        input: AgentInput,
+        event_sender: Option<EventSender>,
+        correlation: String,
+        options: TurnAdmissionOptions,
+    ) -> Result<(TurnTicket, u64), ActorError> {
         let bytes = submission_bytes(&input)?;
         let mut state = self.inner.state.lock_unpoisoned();
         state.check_instruction_capacity(bytes)?;
@@ -2901,7 +2912,7 @@ impl AgentActorHandle {
             state.operations.push_back(work);
             drive_operations(&self.inner, &mut state);
         }
-        Ok(ticket)
+        Ok((ticket, presentation_id))
     }
 
     /// Installs a policy snapshot for subsequent admissions.

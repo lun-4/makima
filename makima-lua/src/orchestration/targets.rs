@@ -16,8 +16,8 @@ use makima_storage::sessions::HistorySnapshot;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
-    TurnCompletionFuture, default_config_mutation,
+    CommandRunner, ConfigMutationReserver, OrchestrationServices, RootObserver, TrustedTarget,
+    TurnCompletion, TurnCompletionFuture, default_config_mutation,
 };
 
 const CHILD_HISTORY_KEY_UNAVAILABLE: &str = "child agent history key is unavailable";
@@ -41,6 +41,7 @@ struct Targets {
     roots: Vec<RootTarget>,
     children: Vec<ChildTarget>,
     selected: Option<AgentRef>,
+    root_observer: Option<RootObserver>,
 }
 
 pub struct AgentOrchestration {
@@ -90,6 +91,11 @@ impl AgentOrchestration {
             config_mutations,
             commands: None,
         });
+        if let Some(observe) = &targets.root_observer
+            && let Some(root) = targets.roots.last()
+        {
+            observe(&root.target.target);
+        }
     }
 
     /// Runs plugin-requested commands for {root}'s graph through {runner},
@@ -156,6 +162,16 @@ impl AgentOrchestration {
 }
 
 impl OrchestrationServices for AgentOrchestration {
+    fn observe_roots(&self, observe: Option<RootObserver>) {
+        let mut targets = self.targets.lock_unpoisoned();
+        if let Some(observe) = &observe {
+            for root in &targets.roots {
+                observe(&root.target.target);
+            }
+        }
+        targets.root_observer = observe;
+    }
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,

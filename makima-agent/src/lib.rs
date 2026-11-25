@@ -37,9 +37,10 @@ pub use mailbox::{
 };
 pub use makima_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use manager::{
-    AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentReactivator, AgentRef,
     CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
-    PromptWaitError, ShutdownReport, TurnPermitLease, WeakAgentManagerHandle,
+    PromptWaitError, ShutdownReport, SubmitError, SubmitOptions, SubmitWhen, TurnPermitLease,
+    WakeError, WeakAgentManagerHandle,
 };
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,

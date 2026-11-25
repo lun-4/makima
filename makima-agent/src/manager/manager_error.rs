@@ -1,6 +1,22 @@
 use thiserror::Error;
 
-use crate::{AgentId, TurnId};
+use crate::{ActorError, AgentId, TurnId};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum WakeError {
+    #[error("no reactivator is installed for dormant agent {0}")]
+    ReactivatorUnavailable(AgentId),
+    #[error(transparent)]
+    Manager(#[from] ManagerError),
+}
+
+#[derive(Debug, Error, Clone, PartialEq)]
+pub enum SubmitError {
+    #[error(transparent)]
+    Manager(#[from] ManagerError),
+    #[error(transparent)]
+    Admission(#[from] ActorError),
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ReactivationError {

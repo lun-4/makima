@@ -19,12 +19,12 @@ mod types;
 mod work;
 pub(crate) use work::{WorkAdmission, WorkLedger, WorkReservation};
 
-pub use manager_error::{ManagerError, ReactivationError};
+pub use manager_error::{ManagerError, ReactivationError, SubmitError, WakeError};
 pub use types::{
     AgentIncarnation, AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, AgentResidency,
     CurrentManagedTurn, GraphLifecycle, ManagedPromptWait, PromptWaitError, ReactivationInput,
     ResidentAgent, ResidentInitialization, ResidentInitializer, RetainedTurn, ShutdownReport,
-    SpawnRestoration, TurnPermitLease,
+    SpawnRestoration, SubmitOptions, SubmitWhen, TurnPermitLease,
 };
 
 use makima_domain::LockExt;
@@ -41,7 +41,7 @@ use std::time::Duration;
 use async_lock::{RwLock, RwLockWriteGuardArc, Semaphore, SemaphoreGuardArc};
 use event_listener::Event;
 use futures_lite::FutureExt;
-use makima_providers::{Message, TokenUsage};
+use makima_providers::{Message, TokenUsage, provider::BoxFuture};
 use tracing::{info, warn};
 
 use crate::actor::delivery::{ChildDelivery, DeliveryRejection, admit_delivery_bound};
@@ -290,6 +290,21 @@ struct TestGate {
     release: flume::Receiver<()>,
 }
 
+/// Reactivates a dormant agent through `ensure_resident_with` in the same manager.
+/// The hook should hold a weak reference to the manager to avoid a reference cycle.
+pub trait AgentReactivator: Send + Sync {
+    fn reactivate(&self, agent_id: AgentId) -> BoxFuture<'static, Result<(), WakeError>>;
+}
+
+impl<F> AgentReactivator for F
+where
+    F: Fn(AgentId) -> BoxFuture<'static, Result<(), WakeError>> + Send + Sync,
+{
+    fn reactivate(&self, agent_id: AgentId) -> BoxFuture<'static, Result<(), WakeError>> {
+        self(agent_id)
+    }
+}
+
 pub(crate) struct ManagerInner {
     generation: u64,
     limits: AgentLimits,
@@ -298,6 +313,7 @@ pub(crate) struct ManagerInner {
     pub(crate) work: Arc<WorkLedger>,
     restored_delivery_work: DeliveryWork,
     result_store: Mutex<Option<Arc<OffloadStore>>>,
+    reactivator: Mutex<Option<Arc<dyn AgentReactivator>>>,
     activation_completion: Arc<RwLock<()>>,
     cleanup_tasks: Mutex<Vec<RetainedTask>>,
     tool_completions: Mutex<Vec<(AgentId, RetainedTask)>>,
@@ -359,6 +375,7 @@ impl AgentManagerHandle {
             work: WorkLedger::new(limits),
             restored_delivery_work: Mutex::new(HashMap::new()),
             result_store: Mutex::new(None),
+            reactivator: Mutex::new(None),
             activation_completion: Arc::new(RwLock::new(())),
             cleanup_tasks: Mutex::new(Vec::new()),
             tool_completions: Mutex::new(Vec::new()),
@@ -704,6 +721,65 @@ impl AgentManagerHandle {
             self.0.reaped.notify(usize::MAX);
         }
         Ok(count)
+    }
+
+    pub fn set_reactivator(&self, reactivator: Option<Arc<dyn AgentReactivator>>) {
+        let previous = std::mem::replace(&mut *self.0.reactivator.lock_unpoisoned(), reactivator);
+        drop(previous);
+    }
+
+    pub(crate) fn resident_actor(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<AgentActorHandle, ManagerError> {
+        Self::wake_target(&self.lock_graph(), agent_id)?.ok_or(ManagerError::NonLiveAgent(agent_id))
+    }
+
+    pub(crate) async fn wake_agent(&self, agent_id: AgentId) -> Result<(), WakeError> {
+        let attempt = {
+            let graph = self.lock_graph();
+            if Self::wake_target(&graph, agent_id)?.is_some() {
+                return Ok(());
+            }
+            graph.nodes[&agent_id].activation.clone()
+        };
+        if let Some(attempt) = attempt {
+            attempt.wait().await?;
+        } else {
+            let reactivator = self.0.reactivator.lock_unpoisoned().clone();
+            let reactivator = reactivator.ok_or(WakeError::ReactivatorUnavailable(agent_id))?;
+            reactivator.reactivate(agent_id).await?;
+        }
+        self.resident_actor(agent_id)?;
+        Ok(())
+    }
+
+    fn wake_target(
+        graph: &GraphState,
+        agent_id: AgentId,
+    ) -> Result<Option<AgentActorHandle>, ManagerError> {
+        if graph.shutting_down {
+            return Err(ManagerError::GraphShutdown);
+        }
+        let node = graph
+            .nodes
+            .get(&agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?;
+        if node.detach_pending {
+            return Err(ReactivationError::Cancelled.into());
+        }
+        match node.lifecycle {
+            GraphLifecycle::Retired => Err(ManagerError::Retired(agent_id)),
+            GraphLifecycle::Dormant => Ok(None),
+            GraphLifecycle::Live if node.residency == AgentResidency::Resident => node
+                .actor
+                .as_ref()
+                .filter(|actor| actor.lifecycle() == ActorLifecycle::Open)
+                .cloned()
+                .map(Some)
+                .ok_or(ManagerError::NonLiveAgent(agent_id)),
+            _ => Err(ManagerError::NonLiveAgent(agent_id)),
+        }
     }
 
     pub async fn ensure_resident_with<F, Fut>(

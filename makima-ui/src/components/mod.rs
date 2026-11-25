@@ -35,10 +35,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use makima_agent::{AgentId, AgentInput, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId};
+use makima_agent::{
+    AgentId, AgentInput, AgentRef, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId,
+};
 use makima_lua::orchestration::PinnedCommandTarget;
 use makima_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
+
+use self::input::Submission;
 
 pub(crate) use makima_providers::IMAGE_PLACEHOLDER;
 
@@ -214,10 +218,12 @@ pub enum Action {
     SendMessage(Box<AgentInput>),
     RunKeybind(u64),
     ManualExit,
+    WakeForInput {
+        target: AgentRef,
+        submission: Submission,
+    },
     ShellCommand {
-        target: Option<AgentId>,
-        cwd: PathBuf,
-        id: String,
+        submission: Submission,
         command: String,
         visible: bool,
     },

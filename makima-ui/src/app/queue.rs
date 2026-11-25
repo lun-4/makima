@@ -5,7 +5,9 @@ use makima_agent::actor::{
     AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use makima_agent::{AgentId, AgentInput, AgentRef, EffectiveAgentConfig};
+use makima_agent::{
+    AgentId, AgentInput, AgentRef, EffectiveAgentConfig, SubmitOptions, SubmitWhen,
+};
 use makima_commands::COMPACT_COMMAND_NAME;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use super::{Action, App, Status};
 #[cfg(test)]
 use crate::agent::shared_queue::QueueItem;
 use crate::agent::shared_queue::{QueueSender, visible_pending};
+use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
@@ -260,28 +263,27 @@ impl App {
         self.submit_to_focused_actor(msg)
     }
 
-    /// Keyboard path: nobody is around to receive an `Err`, so
-    /// rejections flash on screen instead.
-    pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
-        match self.submit_prompt(msg) {
+    pub(super) fn submit_or_queue(&mut self, sub: &Submission, text: String) -> Vec<Action> {
+        let actions = match self.submit_prompt(QueuedMessage {
+            text,
+            images: sub.images.clone(),
+        }) {
             SubmitOutcome::Started(actions) => actions,
             SubmitOutcome::Queued => vec![],
-            SubmitOutcome::Rejected(e) => {
-                self.flash(e);
-                vec![]
+            SubmitOutcome::Rejected(error) => {
+                self.flash(error);
+                return vec![];
             }
-        }
+        };
+        self.accept_submission(sub);
+        actions
     }
 
     fn submit_to_focused_actor(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if self.active_subagent_closed() {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         }
-        let Some(target) = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| Some(target.id()) == self.selected_agent_id())
-        else {
+        let Some(target) = self.focused_input_target() else {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
         let input = self.build_agent_input(&msg);
@@ -340,22 +342,26 @@ impl App {
             displayed_presentation: reserved,
             ..Default::default()
         };
-        let landed = if display.is_some() {
-            actor
-                .submit_presented(input, None, String::new(), options)
-                .map(|(_, presentation)| reserved.and(Some(presentation)))
-        } else {
-            actor
-                .admit_turn_with_options(input, None, String::new(), options)
-                .map(|_| reserved)
-        }
-        .map_err(|error| error.to_string())?;
+        let (_, presentation) = target
+            .submit(
+                input,
+                SubmitOptions {
+                    when: if display.is_some() {
+                        SubmitWhen::Join
+                    } else {
+                        SubmitWhen::Queue
+                    },
+                    admission: options,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| error.to_string())?;
         self.shell.drain_results_for(Some(target.id()));
         if root {
             self.shell.drain_results();
         }
-        if let Some(run_id) = landed {
-            self.record_run_start(run_id);
+        if reserved.is_some() {
+            self.record_run_start(presentation);
             if let Some(text) = display {
                 self.main_chat().show_user_message(text, images);
             }
