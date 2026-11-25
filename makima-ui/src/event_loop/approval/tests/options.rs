@@ -58,7 +58,7 @@ pub(super) fn implementation_index(
             runtime
                 .app
                 .state
-                .session
+                .projection
                 .parent()
                 .is_some_and(|parent| parent.session == source)
         } else {
@@ -76,7 +76,7 @@ pub(super) fn assert_linked_parent(
 ) {
     let runtime = &event_loop.sessions[implementation];
     assert_ne!(runtime.id(), source);
-    let parent = runtime.app.state.session.parent().unwrap();
+    let parent = runtime.app.state.projection.parent().unwrap();
     assert_eq!(parent.session, source);
     assert_eq!(source_actor.committed_message_count(), message_count);
     let saved = AppSession::load(source, &event_loop.ctx.storage).unwrap();

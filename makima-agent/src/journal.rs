@@ -15,14 +15,15 @@ use imbl::{OrdMap, OrdSet};
 use makima_providers::{Message, TokenUsage, add_cost};
 use makima_storage::conversation::ConversationState;
 use makima_storage::id::{AgentId, MakimaId, TurnId};
+use makima_storage::now_epoch;
 use makima_storage::session_state::{
-    SessionStateReducer, SessionStateView, StateChange, StateFoldError, StoredAgentConfig,
-    StoredAgentRecord, StoredDelivery, StoredDeliveryOp, StoredPayload, StoredPluginValue,
-    StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
-    StoredTurnResult, StoredTurnStatus,
+    ParentLink, SessionStateReducer, SessionStateView, StateChange, StateFoldError,
+    StoredAgentConfig, StoredAgentRecord, StoredDelivery, StoredDeliveryOp, StoredPayload,
+    StoredPluginValue, StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind,
+    StoredTurnOutcome, StoredTurnResult, StoredTurnStatus,
 };
 use makima_storage::sessions::{
-    DEFAULT_TITLE, Session, SessionRecord, StoredPost, StoredRule, StoredTokenUsage,
+    DEFAULT_TITLE, Session, SessionMeta, SessionRecord, StoredPost, StoredRule, StoredTokenUsage,
     append_context_events, generate_title, normalize_title,
 };
 use thiserror::Error;
@@ -215,6 +216,8 @@ impl SessionUsage {
 
 #[derive(Debug, Clone)]
 pub struct SessionJournalSnapshot {
+    pub id: MakimaId,
+    pub updated_at: u64,
     pub epoch: MakimaId,
     pub revision: u64,
     pub seq: u64,
@@ -226,6 +229,15 @@ pub struct SessionJournalSnapshot {
     pub tool_outputs: Arc<HashMap<String, Arc<ToolOutput>>>,
     pub posts: Arc<Vec<StoredPost>>,
     title: Option<Arc<str>>,
+    cwd: Arc<str>,
+    model: Arc<str>,
+    parent: Option<ParentLink>,
+    root: Option<AgentId>,
+    rootless_history: Option<HistorySnapshot>,
+    context_events: Arc<Vec<serde_json::Value>>,
+    seed_meta: Arc<SessionMeta>,
+    draft: Option<Arc<str>>,
+    draft_changed: bool,
     usage: Arc<SessionUsage>,
     reducer: Option<ReducerCache>,
     prepared_installed: Option<Arc<AtomicBool>>,
@@ -239,6 +251,93 @@ struct ReducerCache {
 }
 
 impl SessionJournalSnapshot {
+    pub fn title(&self) -> &str {
+        self.title.as_deref().unwrap_or(DEFAULT_TITLE)
+    }
+
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn parent(&self) -> Option<&ParentLink> {
+        self.parent.as_ref()
+    }
+
+    pub fn root_agent_id(&self) -> Option<AgentId> {
+        self.root
+    }
+
+    pub fn root_history(&self) -> Option<&HistorySnapshot> {
+        self.root
+            .and_then(|root| self.histories.get(&root))
+            .or(self.rootless_history.as_ref())
+    }
+
+    pub fn context_events(&self) -> &[serde_json::Value] {
+        &self.context_events
+    }
+
+    pub fn seed_meta(&self) -> &SessionMeta {
+        &self.seed_meta
+    }
+
+    pub fn draft(&self) -> Option<&str> {
+        self.draft.as_deref()
+    }
+
+    fn update_draft(&mut self, draft: Option<&str>) {
+        self.draft = draft.map(Arc::from);
+        self.draft_changed = true;
+    }
+
+    pub fn usage(&self) -> &SessionUsage {
+        &self.usage
+    }
+
+    fn seed_session_fields(&mut self, session: &StoredSession) {
+        self.id = session.id;
+        self.updated_at = session.updated_at;
+        self.title = (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
+        self.cwd = Arc::from(session.cwd.as_str());
+        self.model = Arc::from(session.model.as_str());
+        self.parent = session.parent().cloned();
+        self.root = session.root_agent_id();
+        self.rootless_history = self.root.is_none().then(|| session.history_snapshot());
+        self.context_events = Arc::new(session.context_events().to_vec());
+        self.seed_meta = Arc::new(session.meta.clone());
+        self.draft = session.meta.input_draft.as_deref().map(Arc::from);
+        self.draft_changed = false;
+        self.usage = Arc::new(SessionUsage::from_session(session));
+        self.tool_outputs = Arc::new(session.tool_outputs().clone());
+        self.posts = Arc::new(session.posts().to_vec());
+        self.refresh_root_header();
+    }
+
+    fn refresh_root_header(&mut self) {
+        let Some(root) = self.root else { return };
+        if let Some(config) = self
+            .state
+            .iter()
+            .rev()
+            .find_map(|record| match &record.change {
+                StateChange::Config(config) if record.agent == Some(root) => Some(config),
+                _ => None,
+            })
+        {
+            self.cwd = Arc::from(config.cwd.as_str());
+            self.model = Arc::from(config.model.as_str());
+        }
+    }
+
+    fn set_root_header(&mut self, config: &StoredAgentConfig) {
+        self.cwd = Arc::from(config.cwd.as_str());
+        self.model = Arc::from(config.model.as_str());
+    }
+
     fn reduced(&self) -> Result<SessionStateReducer, StateFoldError> {
         if let Some(cache) = &self.reducer
             && self.state.same_root(&cache.state)
@@ -304,8 +403,11 @@ impl SessionJournalSnapshot {
     }
 
     fn empty() -> Self {
+        let epoch = MakimaId::generate();
         Self {
-            epoch: MakimaId::generate(),
+            id: epoch,
+            updated_at: now_epoch(),
+            epoch,
             revision: 0,
             seq: 0,
             state: JournalRecords::default(),
@@ -316,6 +418,15 @@ impl SessionJournalSnapshot {
             tool_outputs: Arc::default(),
             posts: Arc::default(),
             title: None,
+            cwd: Arc::default(),
+            model: Arc::default(),
+            parent: None,
+            root: None,
+            rootless_history: None,
+            context_events: Arc::default(),
+            seed_meta: Arc::default(),
+            draft: None,
+            draft_changed: false,
             usage: Arc::default(),
             reducer: None,
             prepared_installed: None,
@@ -400,6 +511,9 @@ impl SessionJournalSnapshot {
         if let Some(title) = &self.title {
             session.set_title(title.to_string());
         }
+        if self.draft_changed {
+            session.meta.input_draft = self.draft().map(str::to_owned);
+        }
     }
 }
 
@@ -447,7 +561,7 @@ struct PendingResult {
 pub(crate) struct JournalState {
     pub(crate) snapshot: SessionJournalSnapshot,
     pub(crate) plugin_state: StateRuntime,
-    ready: SessionJournalSnapshot,
+    ready: Arc<SessionJournalSnapshot>,
     staged: VecDeque<StagedCommit>,
     published_revision: u64,
     session_id: Option<MakimaId>,
@@ -462,7 +576,6 @@ pub(crate) struct JournalState {
     writer: Option<SessionWriter>,
     unwritten: Vec<JournalSessionRecord>,
     emitted_histories: BTreeMap<AgentId, EmittedHistory>,
-    context_events: Vec<serde_json::Value>,
     captured_unwritten: usize,
 }
 
@@ -644,7 +757,11 @@ impl JournalPrepared {
         }
         if let Some((agent, event)) = &self.fork {
             let history = &self.commit.histories[agent];
-            state.context_events.push(event.clone());
+            let snapshot = Arc::make_mut(&mut state.ready);
+            Arc::make_mut(&mut snapshot.context_events).push(event.clone());
+            if let Some(draft) = event["input_draft"].as_str() {
+                snapshot.update_draft(Some(draft).filter(|draft| !draft.is_empty()));
+            }
             state.staged[index].histories.remove(agent);
             state.emitted_histories.insert(
                 *agent,
@@ -720,7 +837,7 @@ impl Default for SessionJournal {
             state: Mutex::new(JournalState {
                 snapshot: snapshot.clone(),
                 plugin_state: StateRuntime::default(),
-                ready: snapshot,
+                ready: Arc::new(snapshot),
                 staged: VecDeque::new(),
                 published_revision: 0,
                 session_id: None,
@@ -735,7 +852,6 @@ impl Default for SessionJournal {
                 writer: None,
                 unwritten: Vec::new(),
                 emitted_histories: BTreeMap::new(),
-                context_events: Vec::new(),
                 captured_unwritten: 0,
             }),
             conversion_changed: Event::new(),
@@ -751,6 +867,12 @@ impl SessionJournal {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_nonpersistent(mut self) -> Self {
+        self.persistent = false;
+        self
+    }
+
     pub fn is_persistent(&self) -> bool {
         self.persistent
     }
@@ -760,11 +882,6 @@ impl SessionJournal {
         {
             let mut state = journal.lock();
             let snapshot = &mut state.snapshot;
-            snapshot.title =
-                (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
-            snapshot.usage = Arc::new(SessionUsage::from_session(session));
-            snapshot.tool_outputs = Arc::new(session.tool_outputs().clone());
-            snapshot.posts = Arc::new(session.posts().to_vec());
             snapshot.state =
                 JournalRecords::try_from_ordered(session.state().iter().cloned(), "state")?;
             snapshot.agent_revisions = JournalRecords::try_from_ordered(
@@ -790,10 +907,10 @@ impl SessionJournal {
                 };
                 snapshot.histories.insert(record.id, history);
             }
+            snapshot.seed_session_fields(session);
             state.emitted_histories = Self::history_baseline(&state.snapshot);
-            state.ready = state.snapshot.clone();
+            state.ready = Arc::new(state.snapshot.clone());
             state.session_id = Some(session.id);
-            state.context_events = session.context_events().to_vec();
         }
         Ok(journal)
     }
@@ -849,16 +966,11 @@ impl SessionJournal {
         let journal = Self::default();
         {
             let mut state = journal.lock();
-            snapshot.title =
-                (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
-            snapshot.usage = Arc::new(SessionUsage::from_session(session));
-            snapshot.tool_outputs = Arc::new(session.tool_outputs().clone());
-            snapshot.posts = Arc::new(session.posts().to_vec());
+            snapshot.seed_session_fields(session);
             state.emitted_histories = Self::history_baseline(&snapshot);
             state.snapshot = snapshot.clone();
-            state.ready = snapshot;
+            state.ready = Arc::new(snapshot);
             state.session_id = Some(session.id);
-            state.context_events = session.context_events().to_vec();
         }
         Ok(journal)
     }
@@ -958,7 +1070,7 @@ impl SessionJournal {
         if state.session_id.is_some_and(|id| id != session) {
             return Err(JournalError::StaleCheckpoint);
         }
-        state.session_id = Some(session);
+        Self::set_session_id(&mut state, session);
         Ok(())
     }
 
@@ -967,10 +1079,18 @@ impl SessionJournal {
         if state.session_id.is_some_and(|id| id != writer.session_id()) {
             return Err(JournalError::StaleCheckpoint);
         }
-        state.session_id = Some(writer.session_id());
+        Self::set_session_id(&mut state, writer.session_id());
         state.writer.get_or_insert(writer);
         Self::emit_unwritten(&mut state);
         Ok(())
+    }
+
+    fn set_session_id(state: &mut JournalState, id: MakimaId) {
+        if state.session_id.is_none() {
+            state.session_id = Some(id);
+            state.snapshot.id = id;
+            Arc::make_mut(&mut state.ready).id = id;
+        }
     }
 
     pub fn has_writer(&self) -> bool {
@@ -1054,7 +1174,7 @@ impl SessionJournal {
     }
 
     pub fn context_events(&self) -> Vec<serde_json::Value> {
-        self.lock().context_events.clone()
+        self.projection().context_events().to_vec()
     }
 
     pub(crate) fn writer(&self) -> Option<SessionWriter> {
@@ -1066,20 +1186,32 @@ impl SessionJournal {
     }
 
     pub fn title(&self) -> String {
-        self.lock()
-            .ready
-            .title
-            .as_deref()
-            .unwrap_or(DEFAULT_TITLE)
-            .to_owned()
+        self.projection().title().to_owned()
     }
 
     pub fn set_title(&self, title: String) {
         let title = normalize_title(&title);
         let mut state = self.lock();
         if state.ready.title.as_deref() != Some(&title) {
-            state.ready.title = Some(Arc::from(title.as_str()));
+            let snapshot = Arc::make_mut(&mut state.ready);
+            snapshot.title = Some(Arc::from(title.as_str()));
+            snapshot.updated_at = now_epoch();
             state.unwritten.push(SessionRecord::Title { title });
+            Self::emit_unwritten(&mut state);
+        }
+    }
+
+    pub fn set_draft(&self, draft: Option<String>) {
+        let draft = draft.filter(|text| !text.is_empty());
+        let mut state = self.lock();
+        if state.ready.draft() == draft.as_deref() {
+            return;
+        }
+        let snapshot = Arc::make_mut(&mut state.ready);
+        snapshot.update_draft(draft.as_deref());
+        snapshot.updated_at = now_epoch();
+        if self.persistent {
+            state.unwritten.push(SessionRecord::Draft { text: draft });
             Self::emit_unwritten(&mut state);
         }
     }
@@ -1094,7 +1226,9 @@ impl SessionJournal {
 
     pub(crate) fn record_usage(&self, model: &str, tokens: TokenUsage, cost: Option<f64>) {
         let mut state = self.lock();
-        let usage = Arc::make_mut(&mut state.ready.usage);
+        let snapshot = Arc::make_mut(&mut state.ready);
+        snapshot.updated_at = now_epoch();
+        let usage = Arc::make_mut(&mut snapshot.usage);
         usage.tokens += tokens;
         add_cost(&mut usage.cost, cost);
         *usage.by_model.entry(model.to_owned()).or_default() += tokens.billed(cost);
@@ -1113,8 +1247,9 @@ impl SessionJournal {
         if state.ready.tool_outputs.contains_key(id) {
             return;
         }
-        Arc::make_mut(&mut state.ready.tool_outputs)
-            .insert(id.to_owned(), Arc::new(output.clone()));
+        let snapshot = Arc::make_mut(&mut state.ready);
+        snapshot.updated_at = now_epoch();
+        Arc::make_mut(&mut snapshot.tool_outputs).insert(id.to_owned(), Arc::new(output.clone()));
         if self.persistent {
             state.unwritten.push(SessionRecord::Out {
                 id: id.to_owned(),
@@ -1140,15 +1275,21 @@ impl SessionJournal {
             after_message,
             post,
         };
-        Arc::make_mut(&mut state.ready.posts).push(stored.clone());
+        let snapshot = Arc::make_mut(&mut state.ready);
+        snapshot.updated_at = now_epoch();
+        Arc::make_mut(&mut snapshot.posts).push(stored.clone());
         if self.persistent {
             state.unwritten.push(SessionRecord::Post { d: stored });
             Self::emit_unwritten(&mut state);
         }
     }
 
+    pub fn projection(&self) -> Arc<SessionJournalSnapshot> {
+        Arc::clone(&self.lock().ready)
+    }
+
     pub fn snapshot(&self) -> SessionJournalSnapshot {
-        self.lock().ready.clone()
+        self.projection().as_ref().clone()
     }
 
     pub(crate) fn admitted_input_turns(&self, agent: AgentId) -> Result<Vec<TurnId>, JournalError> {
@@ -1172,7 +1313,7 @@ impl SessionJournal {
         if let Some(error) = state.conversion_errors.values().next() {
             return Err(error.clone());
         }
-        Ok(state.ready.clone())
+        Ok(state.ready.as_ref().clone())
     }
 
     pub fn persistence_error(&self) -> Option<String> {
@@ -2465,7 +2606,8 @@ impl SessionJournal {
                     | SessionRecord::Input { .. }
             ) && let Ok(event) = serde_json::to_value(record)
             {
-                append_context_events(&mut state.context_events, event);
+                let snapshot = Arc::make_mut(&mut state.ready);
+                append_context_events(Arc::make_mut(&mut snapshot.context_events), event);
             }
         }
         state.captured_unwritten = state.unwritten.len();
@@ -2484,7 +2626,15 @@ impl SessionJournal {
             .is_some_and(|entry| entry.pending.is_none())
         {
             if let Some(mut entry) = state.staged.pop_front() {
+                entry.snapshot.id = state.ready.id;
+                entry.snapshot.updated_at = now_epoch();
+                entry.snapshot.draft.clone_from(&state.ready.draft);
+                entry.snapshot.draft_changed = state.ready.draft_changed;
+                entry.snapshot.context_events = Arc::clone(&state.ready.context_events);
                 entry.snapshot.title = state.ready.title.clone();
+                entry.snapshot.cwd = Arc::clone(&state.ready.cwd);
+                entry.snapshot.model = Arc::clone(&state.ready.model);
+                entry.snapshot.root = state.ready.root;
                 entry.snapshot.usage = Arc::clone(&state.ready.usage);
                 entry.snapshot.tool_outputs = Arc::clone(&state.ready.tool_outputs);
                 entry.snapshot.posts = Arc::clone(&state.ready.posts);
@@ -2506,6 +2656,28 @@ impl SessionJournal {
                     ))
                     .collect();
                 records.sort_by_key(|(seq, _)| *seq);
+                if let Some(root) = records.iter().rev().find_map(|(_, record)| match record {
+                    SessionRecord::Agent { d, .. } if d.parent.is_none() => Some(d.id),
+                    _ => None,
+                }) && Some(root) != entry.snapshot.root
+                {
+                    entry.snapshot.root = Some(root);
+                    entry.snapshot.refresh_root_header();
+                } else if let Some(config) =
+                    records.iter().rev().find_map(|(_, record)| match record {
+                        SessionRecord::State { d }
+                            if d.agent.is_some() && d.agent == entry.snapshot.root =>
+                        {
+                            match &d.change {
+                                StateChange::Config(config) => Some(config),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                {
+                    entry.snapshot.set_root_header(config);
+                }
                 let mut consumed_input = match records.last() {
                     Some((_, SessionRecord::State { d }))
                         if matches!(
@@ -2598,7 +2770,7 @@ impl SessionJournal {
                 state
                     .unwritten
                     .extend(consumed_input.map(|d| SessionRecord::State { d }));
-                state.ready = entry.snapshot;
+                state.ready = Arc::new(entry.snapshot);
             }
         }
     }
@@ -2691,12 +2863,12 @@ mod tests {
     use crate::tools::offload::OffloadStore;
     use crate::{HistorySnapshot, Post, ToolOutput, TurnCancellationReason, TurnOutcome};
     use makima_providers::{Message, TokenUsage};
-    use makima_storage::id::{AgentId, TurnId};
+    use makima_storage::id::{AgentId, MakimaId, TurnId};
     use makima_storage::session_state::{
-        MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentConfig, StoredDelivery,
+        MAX_INLINE_TURN_RESULT_BYTES, ParentLink, StateChange, StoredAgentConfig, StoredDelivery,
         StoredDeliveryOp, StoredModeSnapshot, StoredPayload, StoredTurnOrigin,
     };
-    use makima_storage::sessions::{DEFAULT_TITLE, Session};
+    use makima_storage::sessions::{DEFAULT_TITLE, Session, context_entries};
     use makima_storage::test_util::test_record;
     use serde_json::json;
     use std::fs::read_to_string;
@@ -2710,6 +2882,132 @@ mod tests {
     use std::collections::BTreeMap;
 
     const CHILD_POST: &str = "child update";
+
+    #[test_case(false; "retained_draft")]
+    #[test_case(true; "cleared_draft")]
+    fn live_projection_matches_log_replay(clear_draft: bool) {
+        const MODEL: &str = "test/changed";
+        const CWD: &str = "/changed";
+        const OUTPUT: &str = "tool_result";
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = AgentId::generate();
+            let mut stored = StoredSession::new("test/seed", "/seed");
+            stored.bind_root_id(root).unwrap();
+            stored.set_parent(Some(ParentLink {
+                session: MakimaId::generate(),
+                message: None,
+            }));
+            let writer = SessionWriter::open_session(dir.path(), &stored).unwrap();
+            let journal = SessionJournal::from_session(&stored).unwrap();
+            journal.bind_writer(writer).unwrap();
+            let before = journal.projection();
+            journal.set_draft(Some(FIRST.into()));
+            let typed = journal.projection();
+            assert!(before.draft().is_none());
+            journal.set_draft(Some(FIRST.into()));
+            assert!(Arc::ptr_eq(&typed, &journal.projection()));
+            let mut history = before.root_history().unwrap().clone();
+            history.messages = Arc::new(vec![Message::user(SECOND.into())]);
+            history.ids = Arc::new(vec![MakimaId::generate()]);
+            let preamble = MakimaId::generate();
+            journal
+                .commit(JournalCommit {
+                    histories: [(root, history)].into(),
+                    changes: [
+                        StateChange::Config(StoredAgentConfig {
+                            cwd: CWD.into(),
+                            model: MODEL.into(),
+                            thinking: None,
+                            fast: false,
+                            workflow: false,
+                            mode: StoredModeSnapshot {
+                                id: "build".into(),
+                                label: "Build".into(),
+                                system_prompt: None,
+                                restrict_write_to: None,
+                                tools: None,
+                            },
+                            options: BTreeMap::new(),
+                        }),
+                        StateChange::InputHold { held: true },
+                        StateChange::Preamble {
+                            id: preamble,
+                            message: OUTPUT.into(),
+                        },
+                    ]
+                    .into_iter()
+                    .map(|change| JournalChange {
+                        agent: Some(root),
+                        generation: 1,
+                        change,
+                    })
+                    .collect(),
+                    ..Default::default()
+                })
+                .unwrap();
+            journal.set_title(SECOND.into());
+            journal.record_usage(
+                MODEL,
+                TokenUsage {
+                    input: 2,
+                    ..Default::default()
+                },
+                Some(0.5),
+            );
+            journal.record_tool_output(OUTPUT, &ToolOutput::TodoList(Vec::new()));
+            journal.record_post(
+                root,
+                Post {
+                    text: CHILD_POST.into(),
+                    level: Default::default(),
+                    agent: None,
+                },
+            );
+            if clear_draft {
+                journal.set_draft(None);
+            }
+            let live = journal.projection();
+            assert_eq!(live.draft(), if clear_draft { None } else { Some(FIRST) });
+            journal.flush().await.unwrap();
+            let loaded = StoredSession::load_from(stored.id, dir.path()).unwrap();
+            let replayed = SessionJournal::from_session(&loaded).unwrap().projection();
+            assert_eq!(live.id, replayed.id);
+            assert_eq!(live.parent(), replayed.parent());
+            assert_eq!(live.root_agent_id(), replayed.root_agent_id());
+            assert_eq!(live.title(), replayed.title());
+            assert_eq!(live.cwd(), CWD);
+            assert_eq!(live.cwd(), replayed.cwd());
+            assert_eq!(live.model(), MODEL);
+            assert_eq!(live.model(), replayed.model());
+            let view = live.fold().unwrap();
+            assert!(view.scopes[&Some(root)].input_held);
+            assert_eq!(
+                view.scopes[&Some(root)].preambles.as_slice(),
+                &[(preamble, OUTPUT.into())]
+            );
+            assert_eq!(view, replayed.fold().unwrap());
+            assert_eq!(
+                context_entries(live.context_events(), root).unwrap(),
+                context_entries(replayed.context_events(), root).unwrap()
+            );
+            assert_eq!(
+                live.root_history().unwrap().ids,
+                replayed.root_history().unwrap().ids
+            );
+            assert_eq!(
+                live.root_history().unwrap().messages,
+                replayed.root_history().unwrap().messages
+            );
+            assert_eq!(live.draft(), replayed.draft());
+            assert_eq!(live.usage(), replayed.usage());
+            assert_eq!(live.posts, replayed.posts);
+            assert_eq!(
+                serde_json::to_value(&*live.tool_outputs).unwrap(),
+                serde_json::to_value(&*replayed.tool_outputs).unwrap()
+            );
+        });
+    }
 
     #[test]
     fn child_post_uses_its_last_committed_message() {
@@ -3683,9 +3981,7 @@ mod tests {
             .record_terminal_for(Some(journal.incarnation(agent)), result.clone(), None)
             .unwrap();
         let expected = Arc::clone(&journal.lock().results[&(agent, turn)].conversion);
-        let stored = result
-            .to_stored(makima_storage::id::MakimaId::generate(), None)
-            .unwrap();
+        let stored = result.to_stored(MakimaId::generate(), None).unwrap();
         journal.set_incarnation(agent, 2);
         assert!(!journal.record_conversion_error(
             (agent, turn),

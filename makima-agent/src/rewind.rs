@@ -1,7 +1,7 @@
 use crate::{
     AgentRef, History, HistorySnapshot, ToolOutput,
     actor::{ActorError, ActorIdleGuard},
-    journal::{JournalCommit, JournalError, SessionJournal},
+    journal::{JournalCommit, JournalError, SessionJournal, SessionJournalSnapshot},
     session_writer::WriterError,
     subagents::format_subagents,
 };
@@ -10,7 +10,7 @@ use makima_storage::{
     conversation::ConversationState,
     id::{AgentId, MakimaId},
     session_state::ParentLink,
-    sessions::{ContextEntry, Session, SessionRecord, context_entries, next_epoch},
+    sessions::{ContextEntry, SessionRecord, context_entries, next_epoch},
 };
 use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
@@ -37,8 +37,6 @@ pub enum RewindError {
     Busy,
     #[error("the rewind target is not available")]
     InvalidTarget,
-    #[error("session does not belong to this agent")]
-    WrongSession,
     #[error(transparent)]
     Actor(#[from] ActorError),
     #[error(transparent)]
@@ -62,20 +60,14 @@ pub struct RewindGuard {
     agent: AgentRef,
     idle: ActorIdleGuard,
     journal: Arc<SessionJournal>,
-    events: Vec<serde_json::Value>,
+    projection: Arc<SessionJournalSnapshot>,
     targets: Vec<RewindTarget>,
     parent: Option<ParentLink>,
 }
 
 impl AgentRef {
-    pub fn begin_rewind(
-        &self,
-        session: &Session<Message, TokenUsage, ToolOutput>,
-    ) -> Result<RewindGuard, RewindError> {
+    pub fn begin_rewind(&self) -> Result<RewindGuard, RewindError> {
         let journal = self.manager().journal();
-        if journal.session_id().is_some_and(|id| id != session.id) {
-            return Err(RewindError::WrongSession);
-        }
         let actor = self
             .actor()
             .map_err(|error| RewindError::Context(error.to_string()))?;
@@ -83,16 +75,14 @@ impl AgentRef {
             ActorError::Busy => RewindError::Busy,
             error => RewindError::Actor(error),
         })?;
-        let mut events = journal.context_events();
-        if events.is_empty() {
-            events = session.context_events().to_vec();
-        }
-        let active = context_entries(&events, self.id())
+        let projection = journal.projection();
+        let events = projection.context_events();
+        let active = context_entries(events, self.id())
             .map_err(|error| RewindError::Context(error.to_string()))?;
         let active: HashSet<_> = active.iter().map(ContextEntry::id).collect();
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
-        for event in &events {
+        for event in events {
             if event["t"] != "msg" || event["agent"] != serde_json::json!(self.id()) {
                 continue;
             }
@@ -112,8 +102,8 @@ impl AgentRef {
                 });
             }
         }
-        let parent = (self.manager().root_id().ok() == Some(self.id()))
-            .then(|| session.parent().cloned())
+        let parent = (projection.root_agent_id() == Some(self.id()))
+            .then(|| projection.parent().cloned())
             .flatten();
         if parent.is_some() {
             targets.push(RewindTarget {
@@ -126,7 +116,7 @@ impl AgentRef {
             agent: self.clone(),
             idle,
             journal,
-            events,
+            projection,
             targets,
             parent,
         })
@@ -164,8 +154,8 @@ impl RewindGuard {
             .to_owned();
         let agent = self.agent.id();
         let agent_value = serde_json::json!(agent);
-        let position = self
-            .events
+        let events = self.projection.context_events();
+        let position = events
             .iter()
             .position(|event| {
                 event["t"] == "msg"
@@ -173,7 +163,7 @@ impl RewindGuard {
                     && event["id"] == serde_json::json!(prompt_id)
             })
             .ok_or(RewindError::InvalidTarget)?;
-        let before = context_entries(&self.events[..position], agent)
+        let before = context_entries(&events[..position], agent)
             .map_err(|error| RewindError::Context(error.to_string()))?;
         let predecessor = before.last().map(ContextEntry::id);
         let actor = self
@@ -201,10 +191,7 @@ impl RewindGuard {
         };
         let event = serde_json::to_value(&record)
             .map_err(|error| RewindError::Context(error.to_string()))?;
-        let mut events = self.journal.context_events();
-        if events.is_empty() {
-            events = self.events.clone();
-        }
+        let mut events = self.journal.projection().context_events().to_vec();
         events.push(event.clone());
         let entries = context_entries(&events, agent)
             .map_err(|error| RewindError::Context(error.to_string()))?;
@@ -262,13 +249,13 @@ impl RewindGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{REWIND_NOTE, RewindError, RewindOutcome, RewindTargetId};
+    use super::{REWIND_NOTE, RewindError, RewindOutcome, RewindTargetId, context_entries};
     use crate::{
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
         TurnCancellationReason, TurnOutcome, TurnProvenance, TurnResult,
         actor::TurnAdmissionOptions,
         journal::{JournalChange, JournalCommit, SessionJournal},
-        session_writer::{Record, SessionIo, SessionWriter, StoredSession},
+        session_writer::{SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
     };
     use futures_lite::future::poll_once;
@@ -367,7 +354,7 @@ mod tests {
                 .unwrap();
             let actor = root.actor().unwrap();
             let target = journal.snapshot().histories[&root.id()].ids[0];
-            let guard = root.begin_rewind(&session).unwrap();
+            let guard = root.begin_rewind().unwrap();
             let submit = |prompt: &str| {
                 actor
                     .submit(
@@ -471,15 +458,11 @@ mod tests {
             let session = StoredSession::new("test", "/");
             let path = directory.path().join(format!("{}.jsonl", session.id));
             let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
-            writer
-                .append(vec![Record::Draft {
-                    text: Some(OLD_DRAFT.into()),
-                }])
-                .await
-                .unwrap();
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let journal = manager.journal();
             journal.bind_writer(writer.clone()).unwrap();
+            journal.set_draft(Some(OLD_DRAFT.into()));
+            journal.flush().await.unwrap();
             let root = manager
                 .create_root(
                     vec![Message::user(FIRST.into()), Message::user(SECOND.into())],
@@ -509,7 +492,7 @@ mod tests {
                 .unwrap();
             let target = journal.snapshot().histories[&root.id()].ids[1];
             let RewindOutcome::Fork { mut history, .. } = root
-                .begin_rewind(&session)
+                .begin_rewind()
                 .unwrap()
                 .commit(RewindTargetId::Message(target))
                 .await
@@ -537,7 +520,7 @@ mod tests {
                 let RewindOutcome::Fork {
                     history: second, ..
                 } = root
-                    .begin_rewind(&session)
+                    .begin_rewind()
                     .unwrap()
                     .commit(RewindTargetId::Message(*replacement.ids.last().unwrap()))
                     .await
@@ -557,6 +540,14 @@ mod tests {
             assert_eq!(
                 reopened.meta.input_draft.as_deref(),
                 Some(if redo { REPLACEMENT } else { SECOND })
+            );
+            assert_eq!(
+                journal.projection().draft(),
+                reopened.meta.input_draft.as_deref()
+            );
+            assert_eq!(
+                context_entries(journal.projection().context_events(), root.id()).unwrap(),
+                context_entries(reopened.context_events(), root.id()).unwrap()
             );
             assert!(
                 manager
@@ -591,26 +582,32 @@ mod tests {
         });
     }
 
-    fn fixture() -> (AgentManagerHandle, crate::AgentRef, StoredSession) {
-        let journal = Arc::new(SessionJournal::nonpersistent());
-        let manager =
-            AgentManagerHandle::new_with_journal(AgentLimits::default(), journal).unwrap();
-        let root = manager
-            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
-            .unwrap();
+    fn fixture(parent: Option<ParentLink>) -> (AgentManagerHandle, crate::AgentRef, StoredSession) {
+        let root_id = AgentId::generate();
         let mut session = StoredSession::new("test", "/");
-        session.bind_root_id(root.id()).unwrap();
+        session.set_parent(parent);
+        session.bind_root_id(root_id).unwrap();
+        let journal = Arc::new(
+            SessionJournal::from_session(&session)
+                .unwrap()
+                .into_nonpersistent(),
+        );
         session.push_message(Message::user(FIRST.into()));
         session.push_message(Message::observation(REPORT.into()));
         session.push_message(Message::user(SECOND.into()));
+        let manager =
+            AgentManagerHandle::new_with_journal(AgentLimits::default(), journal).unwrap();
+        let root = manager
+            .create_root_with_id_and_config(root_id, None, Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(MockBackend::STRICT))
+            })
+            .unwrap();
         let mut history = session.history_snapshot();
-        if let Some(previous) = manager.journal().snapshot().histories.get(&root.id()) {
-            history.epoch = previous.epoch;
-        }
+        history.epoch = manager.journal().projection().histories[&root_id].epoch;
         manager
             .journal()
             .commit(JournalCommit {
-                histories: [(root.id(), history)].into(),
+                histories: [(root_id, history)].into(),
                 ..Default::default()
             })
             .unwrap();
@@ -620,25 +617,21 @@ mod tests {
     #[test]
     fn drop_and_planning_write_nothing() {
         smol::block_on(async {
-            let (manager, root, mut session) = fixture();
             let parent = ParentLink {
                 session: MakimaId::generate(),
                 message: None,
             };
-            session.set_parent(Some(parent.clone()));
+            let (manager, root, _) = fixture(Some(parent.clone()));
             let before = manager.journal().snapshot();
             let events = manager.journal().context_events();
-            let guard = root.begin_rewind(&session).unwrap();
+            let guard = root.begin_rewind().unwrap();
             assert_eq!(guard.targets().len(), 3);
-            assert!(matches!(
-                root.begin_rewind(&session),
-                Err(RewindError::Busy)
-            ));
+            assert!(matches!(root.begin_rewind(), Err(RewindError::Busy)));
             drop(guard);
             assert_eq!(manager.journal().snapshot().revision, before.revision);
             assert_eq!(manager.journal().context_events(), events);
             let outcome = root
-                .begin_rewind(&session)
+                .begin_rewind()
                 .unwrap()
                 .commit(RewindTargetId::PlanningSession)
                 .await
@@ -653,7 +646,7 @@ mod tests {
     #[test_case(2; "later_user_turn")]
     fn fork_cuts_before_prompt_preserves_state_and_supports_redo(index: usize) {
         smol::block_on(async {
-            let (manager, root, session) = fixture();
+            let (manager, root, session) = fixture(None);
             let child = AgentId::generate();
             let turn = TurnId::generate();
             manager
@@ -678,7 +671,7 @@ mod tests {
             let before = manager.journal().snapshot();
             let selected = session.message_id(index).unwrap();
             let outcome = root
-                .begin_rewind(&session)
+                .begin_rewind()
                 .unwrap()
                 .commit(RewindTargetId::Message(selected))
                 .await
@@ -714,7 +707,7 @@ mod tests {
                 before.histories[&child].messages,
                 after.histories[&child].messages
             );
-            let guard = root.begin_rewind(&session).unwrap();
+            let guard = root.begin_rewind().unwrap();
             assert!(
                 guard
                     .targets()
@@ -737,8 +730,8 @@ mod tests {
     #[test]
     fn queued_messages_wait_and_nonidle_rewind_fails() {
         smol::block_on(async {
-            let (_, root, session) = fixture();
-            let guard = root.begin_rewind(&session).unwrap();
+            let (_, root, _) = fixture(None);
+            let guard = root.begin_rewind().unwrap();
             let actor = root.actor().unwrap();
             let ticket = actor
                 .admit_turn(
@@ -750,10 +743,7 @@ mod tests {
             actor.runtime_barrier().await.unwrap();
             assert!(ticket.peek().is_none());
             assert_eq!(actor.snapshot().queued, 1);
-            assert!(matches!(
-                root.begin_rewind(&session),
-                Err(RewindError::Busy)
-            ));
+            assert!(matches!(root.begin_rewind(), Err(RewindError::Busy)));
             actor.close();
             drop(guard);
             ticket.wait().await;

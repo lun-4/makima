@@ -102,8 +102,10 @@ use makima_storage::model::persist_model;
 use makima_storage::session_state::StoredAgentLifecycle;
 
 use crate::theme::ThemesProvider;
+#[cfg(test)]
+use makima_agent::journal::SessionJournal;
+#[cfg(test)]
 use makima_agent::session_writer::SessionWriter;
-use makima_storage::session_lock::SessionPublicationGuard;
 use ratatui::layout::Position;
 
 const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
@@ -463,8 +465,8 @@ pub struct App {
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
-    pub(crate) session_writer: Option<SessionWriter>,
-    pub(crate) writer_guard: Option<SessionPublicationGuard>,
+    #[cfg(test)]
+    fixture_journal: Option<Arc<SessionJournal>>,
     pub(crate) restore_in_progress: bool,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
@@ -494,7 +496,7 @@ pub(crate) struct PreparedApp {
 
 impl PreparedApp {
     pub(crate) fn session_id(&self) -> makima_storage::id::MakimaId {
-        self.app.state.session.id
+        self.app.session_projection().id
     }
 
     #[cfg(test)]
@@ -554,7 +556,6 @@ impl App {
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         status_content_reader: StatusContentReader,
-        session_writer: Option<SessionWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
@@ -564,9 +565,8 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
         model_capabilities: Arc<ModelCapabilityCache>,
-    ) -> PreparedApp {
-        let mut state =
-            SessionState::from_session(session, &config.model, &model_policy, &providers);
+    ) -> color_eyre::Result<PreparedApp> {
+        let mut state = SessionState::from_session(&session)?;
         state.adopt(&config);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
@@ -600,7 +600,7 @@ impl App {
                 command_target,
                 prepared_command_target.snapshot(),
                 command_palette_defaults(&command_runtime),
-                Arc::from(state.session.cwd.as_str()),
+                Arc::from(config.context.cwd().to_string_lossy().as_ref()),
             ),
             rewind_picker: ListPicker::new().with_picker(PickerId::Rewind),
             rewind_guard: None,
@@ -669,8 +669,8 @@ impl App {
             shared_history: None,
             btw_system: None,
             image_paste_rx: vec![],
-            session_writer,
-            writer_guard: None,
+            #[cfg(test)]
+            fixture_journal: None,
             restore_in_progress: false,
             shell: shell::ShellState::default(),
             ui_config,
@@ -696,10 +696,10 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
-        PreparedApp {
+        Ok(PreparedApp {
             app,
             command_target: prepared_command_target,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -723,21 +723,17 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        let config = session_state::SessionState::from_session(
-            session.clone(),
-            model,
-            &model_policy,
-            &ProviderRegistry::default(),
-        )
-        .starting_config(
-            Arc::new(DetachedProvider),
-            model,
-            PathBuf::from(&session.cwd),
-            &lua_event_handle.mode_registry(),
-            &storage,
-            makima_config::SessionDefaults::default(),
-        )
-        .unwrap();
+        let config = SessionState::from_session(&session)
+            .unwrap()
+            .starting_config(
+                Arc::new(DetachedProvider),
+                model,
+                PathBuf::from(&session.cwd),
+                &lua_event_handle.mode_registry(),
+                &storage,
+                makima_config::SessionDefaults::default(),
+            )
+            .unwrap();
         let view = session.latest_state().unwrap();
         let snapshot = view
             .scopes
@@ -748,7 +744,11 @@ impl App {
             )
             .unwrap();
         permissions.restore(snapshot);
-        Self::prepare(
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        if let Some(writer) = session_writer {
+            journal.bind_writer(writer).unwrap();
+        }
+        let mut app = Self::prepare(
             config,
             &AgentConfig::default(),
             session,
@@ -759,7 +759,6 @@ impl App {
             keymap_reader,
             hint_reader,
             status_content_reader,
-            session_writer,
             ui_config,
             input_history_size,
             permissions,
@@ -770,7 +769,11 @@ impl App {
             command_runtime,
             ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
         )
-        .activate()
+        .unwrap()
+        .activate();
+        app.fixture_journal = Some(journal);
+        app.refresh_session_projection();
+        app
     }
 
     pub(crate) fn focused_config(&self) -> Option<Arc<makima_agent::EffectiveAgentConfig>> {
@@ -834,7 +837,7 @@ impl App {
     pub(crate) fn focused_cwd(&self) -> PathBuf {
         self.focused_config()
             .map(|config| config.context.cwd().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(&self.state.session.cwd))
+            .unwrap_or_else(|| PathBuf::from(self.state.projection.cwd()))
     }
 
     pub(crate) fn selected_agent_id(&self) -> Option<makima_agent::AgentId> {
@@ -1034,8 +1037,7 @@ impl App {
     }
 
     pub(crate) fn update_model(&mut self, model: &Model) {
-        self.state.update_model(model);
-        persist_model(&self.storage, &self.state.session.model);
+        persist_model(&self.storage, &model.spec());
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -1059,7 +1061,7 @@ impl App {
         if let Some(map) = data.as_object_mut() {
             map.insert(
                 "session_id".into(),
-                serde_json::Value::String(self.state.session.id.to_string()),
+                serde_json::Value::String(self.session_projection().id.to_string()),
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
@@ -1183,7 +1185,6 @@ impl App {
             }
             Msg::Agent(envelope) => self.handle_agent_event(*envelope),
         };
-        self.persist_input();
         self.sync_plan_form_target();
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
@@ -1229,9 +1230,11 @@ impl App {
             }
         }
         self.state
-            .session
-            .agents()
-            .get(&id)
+            .projection
+            .agent_revisions
+            .iter()
+            .rev()
+            .find_map(|(_, record)| (record.id == id).then_some(record))
             .is_some_and(|record| record.lifecycle != StoredAgentLifecycle::Open)
     }
 
@@ -1950,7 +1953,7 @@ impl App {
             self.command_runtime.registry.clone(),
             self.command_target.clone(),
             command_palette_defaults(&self.command_runtime),
-            Arc::from(self.state.session.cwd.as_str()),
+            Arc::from(self.focused_cwd().to_string_lossy().as_ref()),
         );
     }
 
@@ -2298,7 +2301,7 @@ impl App {
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
             BuiltinAction::FilePicker => {
-                self.file_picker.open(&self.state.session.cwd);
+                self.file_picker.open(&self.focused_cwd().to_string_lossy());
             }
             BuiltinAction::Search => {
                 let top = self.chats[self.active_chat].scroll_top();
@@ -2706,7 +2709,17 @@ impl App {
 
     pub(crate) fn accept_submission(&mut self, sub: &Submission) {
         self.input_box.accept_submission(sub);
-        self.persist_input();
+        if self
+            .input_box
+            .buffer
+            .lines()
+            .iter()
+            .map(String::as_str)
+            .eq([""])
+            && let Some(journal) = self.journal()
+        {
+            journal.set_draft(None);
+        }
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -3131,9 +3144,6 @@ impl App {
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
-            if chat_idx == 0 {
-                self.state.context_size = ctx_size;
-            }
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
@@ -3491,9 +3501,9 @@ impl App {
                     | HostContextRequest::FastModeSupported => {
                         return Err(CommandError::StaleTarget);
                     }
-                    HostContextRequest::SessionId => {
-                        HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
-                    }
+                    HostContextRequest::SessionId => HostContextResponse::SessionId(Arc::from(
+                        self.session_projection().id.to_string(),
+                    )),
                 };
                 return Ok((HostResponse::Context(response), vec![]));
             }
@@ -3705,9 +3715,7 @@ impl App {
     /// The app-side half of `/cd`, run once the coordinator has adopted the
     /// canonical path.
     pub(crate) fn apply_directory_change(&mut self, path: PathBuf) {
-        self.state
-            .session_mut()
-            .set_cwd(path.to_string_lossy().into_owned());
+        self.refresh_session_projection();
         self.status_bar.set_cwd(path.clone());
         self.fire_session_autocmd(
             SESSION_CWD_CHANGED_EVENT,

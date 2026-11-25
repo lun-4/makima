@@ -358,7 +358,6 @@ impl App {
                 self.main_chat().show_user_message(text, images);
             }
         }
-        self.persist_input();
         Ok(starting)
     }
 
@@ -371,14 +370,12 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        let queued = shared
+        shared
             .try_push(QueueItem {
                 input,
                 displayed: None,
             })
-            .is_ok();
-        self.persist_input();
-        queued
+            .is_ok()
     }
 
     pub(crate) fn start_mailbox_run(
@@ -413,7 +410,7 @@ impl App {
         self.status = Status::Streaming;
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.
-        self.run_model = Some(self.state.session.model.clone());
+        self.run_model = Some(self.root_config().model.spec());
         self.run_context_window = Some(self.root_config().model.context_window);
     }
 }

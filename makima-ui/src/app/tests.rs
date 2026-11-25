@@ -13,36 +13,45 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use makima_agent::actor::ActorHistory;
-use makima_agent::actor::HistoryChange;
+use makima_agent::actor::{ActorHistory, HistoryChange, PreparedModel};
 use makima_agent::command::{CommandScope, CustomCommand};
+use makima_agent::headless::{
+    InteractiveHandle, InteractiveParams, spawn_interactive_with_checkpoint,
+};
 use makima_agent::journal::{JournalCommit, SessionJournal};
 use makima_agent::permissions::PermissionManager;
+use makima_agent::session_recovery::{OpenModel, SessionSource, open_session};
 use makima_agent::session_writer::SessionWriter;
-use makima_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
+use makima_agent::tools::{
+    QuestionMode, TASK_SPAWN_TOOL_NAME, ToolAudience, ToolRegistry, cli_tool_ctx, local_tool,
+};
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
-    BufferSnapshot, DoneReason, EffectiveAgentConfig, History, HistorySnapshot, ImageMediaType,
+    BufferSnapshot, DoneReason, EffectiveAgentConfig, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec,
-    Post, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnContext,
-    TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    ModeRegistry, Post, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    TurnContext, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use makima_commands::ModelSelection;
-use makima_config::{PermissionsConfig, UiConfig};
+use makima_config::{PermissionsConfig, ProjectConfig, UiConfig};
 use makima_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use makima_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
 use makima_providers::model::FastSupport;
+use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::test_util::offline_ids;
 use makima_providers::{
-    ContentBlock, Effort, Message, ModelCapabilities, Role, ThinkingConfig, ThinkingSupport,
-    TokenUsage,
+    AgentError, ContentBlock, Effort, Invocation, Message, ModelCapabilities, ProviderEvent,
+    RequestDelivery, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig,
+    ThinkingSupport, TokenUsage,
 };
+use makima_storage::id::SessionRef;
 use makima_storage::session_state::{
     StateChange, StoredAgentLifecycle, StoredDoneReason, StoredPayload, StoredStateRecord,
     StoredTurnOrigin, StoredTurnOutcome, StoredTurnProvenance, StoredTurnResult, StoredTurnStatus,
 };
 use makima_storage::sessions::{StoredMode, StoredPost};
 use ratatui::layout::Rect;
+use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
@@ -355,6 +364,17 @@ fn build_app_with_full(
     handle: makima_lua::EventHandle,
     ui: UiConfig,
 ) -> App {
+    build_app_in(Path::new("/tmp/test"), dir, writer, registry, handle, ui)
+}
+
+fn build_app_in(
+    cwd: &Path,
+    dir: StateDir,
+    writer: Option<SessionWriter>,
+    registry: makima_commands::CommandRegistry,
+    handle: makima_lua::EventHandle,
+    ui: UiConfig,
+) -> App {
     let model = test_model();
     let command_runtime = Arc::new(crate::command_runtime::CommandRuntime::new_for_test(
         &[],
@@ -369,7 +389,7 @@ fn build_app_with_full(
     ));
     App::new(
         &model,
-        AppSession::new("test-model", "/tmp/test"),
+        AppSession::new("test-model", &cwd.to_string_lossy()),
         dir,
         Arc::new(ArcSwapOption::empty()),
         McpSnapshotReader::empty(),
@@ -754,14 +774,14 @@ fn tempdir_app() -> (TempDir, StateDir, SessionWriter, App) {
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let mut app = build_app(dir.clone(), None);
     let root = parked_root();
-    app.state.session_mut().bind_root_id(root.id()).unwrap();
+    app.edit_session_fixture(|session| session.bind_root_id(root.id()).unwrap());
     bind_root(&mut app, root);
     let writer = SessionWriter::open_session(
         &tmp.path().join(makima_storage::sessions::SESSIONS_DIR),
-        &app.state.session,
+        &app.session_fixture(),
     )
     .unwrap();
-    app.session_writer = Some(writer.clone());
+    app.journal().unwrap().bind_writer(writer.clone()).unwrap();
     (tmp, dir, writer, app)
 }
 
@@ -887,13 +907,195 @@ fn assert_last_is_post(chat: &Chat) {
     );
 }
 
+#[test]
+fn sdk_created_session_restores_title_tool_output_post_and_cost() {
+    const PROMPT: &str = "Inspect the SDK session";
+    const TOOL: &str = "sdk_projection_probe";
+    const TOOL_ID: &str = "sdk-output";
+    const OUTPUT: &str = "output from the SDK tool";
+    const POST: &str = "post from the SDK session";
+    const REPLY: &str = "SDK turn complete";
+    const INPUT_TOKENS: u32 = 1_000;
+    const COST: f64 = 0.006;
+    const DISPLAY_COST: &str = "$0.006";
+
+    struct ScriptedProvider;
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+            _: &'a Invocation,
+            _: RequestDelivery,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let tool_ran = messages.iter().flat_map(|message| &message.content).any(
+                    |block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_ID),
+                );
+                let (block, stop_reason) = if tool_ran {
+                    (
+                        ContentBlock::Text { text: REPLY.into() },
+                        StopReason::EndTurn,
+                    )
+                } else {
+                    (
+                        ContentBlock::ToolUse {
+                            id: TOOL_ID.into(),
+                            name: TOOL.into(),
+                            input: json!({}),
+                            thought_signature: None,
+                        },
+                        StopReason::ToolUse,
+                    )
+                };
+                Ok(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![block],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage {
+                        input: INPUT_TOKENS,
+                        ..Default::default()
+                    },
+                    stop_reason: Some(stop_reason),
+                })
+            })
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let storage = StateDir::from_path(dir.path().to_path_buf());
+    let model = test_model();
+    let providers = Arc::new(offline_ids(&[TEST_MODEL_PROVIDER]));
+    let modes = Arc::new(ModeRegistry::builtin());
+    let policy = Arc::new(ModelPolicy::default());
+    let cwd = dir.path().to_str().unwrap();
+    let seed = AppSession::new(&model.spec(), cwd);
+    let id = seed.id;
+    smol::block_on(futures_lite::future::race(
+        async {
+            let opened = open_session(
+                &storage,
+                SessionSource::Create(seed),
+                OpenModel {
+                    startup: &model,
+                    explicit: true,
+                    providers: &providers,
+                    policy: &policy,
+                },
+                Some(cwd),
+            )
+            .unwrap();
+            let selected = opened.model.clone();
+            let (writer, _lock, recovered) = opened.recover(&storage, &modes).await.unwrap();
+            let session = recovered.session();
+            let handle = spawn_interactive_with_checkpoint(
+                InteractiveParams {
+                    model: selected,
+                    config: Default::default(),
+                    permissions_config: Default::default(),
+                    timeouts: Default::default(),
+                    prompt_slots: Default::default(),
+                    excluded_tools: Vec::new(),
+                    mcp_handle: None,
+                    initial_wd: dir.path().to_path_buf(),
+                    session_id: Some(SessionRef::from(id)),
+                    root_id: session.root_agent_id(),
+                    journal: Some(recovered.journal()),
+                    initial_history: Vec::new(),
+                    yolo: false,
+                    system_prompt_override: None,
+                    append_system_prompt: None,
+                    defaults: Default::default(),
+                    model_policy: policy,
+                    providers,
+                    modes,
+                    question_mode: QuestionMode::Headless,
+                    plugin_rules: Arc::default(),
+                    project_config: ProjectConfig::for_project(dir.path()),
+                    local_tools: Arc::new(HashMap::from([(
+                        TOOL.into(),
+                        local_tool(ToolAudience::MAIN, |_, _| {
+                            Box::pin(async { Ok(OUTPUT.into()) })
+                        }),
+                    )])),
+                    state_dir: Some(dir.path().to_path_buf()),
+                    answers: false,
+                },
+                Box::new(|model| {
+                    Box::pin(async move {
+                        Ok(PreparedModel {
+                            model,
+                            provider: Arc::new(ScriptedProvider),
+                        })
+                    })
+                }),
+                Some(session.history_snapshot()),
+                None,
+                writer,
+            );
+            let ticket = handle
+                .input_tx
+                .admit(AgentInput::new(PROMPT.into(), Vec::new()))
+                .await
+                .unwrap();
+            let result = ticket.wait_result().await;
+            assert!(matches!(result.outcome, TurnOutcome::Completed { .. }));
+            assert_eq!(result.text, REPLY);
+            let journal = handle.manager.journal();
+            journal.record_post(
+                handle.initialized_root().await.unwrap().id(),
+                Post {
+                    text: POST.into(),
+                    level: PostLevel::Info,
+                    agent: None,
+                },
+            );
+            journal.flush().await.unwrap();
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            task.await;
+        },
+        async {
+            smol::Timer::after(SETTLE_TIMEOUT).await;
+            panic!("SDK session runtime did not finish");
+        },
+    ));
+
+    let loaded = AppSession::load(id, &storage).unwrap();
+    let mut app = build_app(storage, None);
+    app.apply_loaded_session(loaded, &model);
+    assert_eq!(app.title(), PROMPT);
+    assert_eq!(app.session_cost(), Some(COST));
+    let chat = app.main_chat();
+    assert!((0..chat.message_count()).any(|index| {
+        let message = chat.message_at(index).unwrap();
+        matches!(&message.role, DisplayRole::Tool(tool) if tool.id == TOOL_ID)
+            && message
+                .tool_output
+                .as_ref()
+                .is_some_and(|output| output.as_text() == OUTPUT)
+    }));
+    let screen = rendered(&mut app);
+    for text in [OUTPUT, POST, DISPLAY_COST] {
+        assert!(screen.contains(text), "missing {text:?} in {screen:?}");
+    }
+}
+
 #[test_case(false; "unique_legacy_link")]
 #[test_case(true; "ambiguous_legacy_link")]
 fn legacy_post_link_opens_migrated_chat_after_disk_restore(ambiguous: bool) {
     const TRANSCRIPT: &str = "legacy-linked-transcript";
     let tmp = TempDir::new().unwrap();
     let mut app = app_without_splash();
-    let id = app.state.session.id;
+    let id = app.session_projection().id;
     let header = serde_json::json!({"t":"header", "v":2, "id":id, "model":"m", "cwd":"/tmp", "created_at":1});
     let meta = serde_json::json!({"t":"meta", "title":"legacy", "token_usage":TokenUsage::default(), "updated_at":2,
         "subagents":[{"tool_use_id":TRANSCRIPT, "name":TRANSCRIPT, "ambiguous":ambiguous}]});
@@ -917,7 +1119,7 @@ fn legacy_post_link_opens_migrated_chat_after_disk_restore(ambiguous: bool) {
             .as_deref()
             .map(|id| id.parse::<AgentId>().unwrap());
         assert_eq!(target.is_some(), !ambiguous);
-        app.state.session = Arc::new(loaded);
+        app.set_session_fixture(&loaded);
         app.reset_ui_chrome();
         app.restore_display();
         render_app(&mut app, 100, 40);
@@ -957,7 +1159,7 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
     let child = AgentId::generate();
     let target = if missing { AgentId::generate() } else { child };
     register_restored_child(&mut app, child, root, TRANSCRIPT, LABEL);
-    project_child_history(
+    commit_fixture_history(
         &mut app,
         child,
         HistorySnapshot::new(vec![Message::user(POST_TEXT.into())]),
@@ -987,12 +1189,14 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
             parent_turn_id: TurnId::generate(),
         },
     }));
-    app.state.session_mut().push_message(Message {
-        observation_source: Some(ObservationSource::ChildResult {
-            agent_id: target.to_string(),
-            turn_id: delivery.result.outcome.turn_id().to_string(),
-        }),
-        ..Message::observation(format!("{HEADER}\n{}", delivery.to_json()))
+    app.edit_session_fixture(|session| {
+        session.push_message(Message {
+            observation_source: Some(ObservationSource::ChildResult {
+                agent_id: target.to_string(),
+                turn_id: delivery.result.outcome.turn_id().to_string(),
+            }),
+            ..Message::observation(format!("{HEADER}\n{}", delivery.to_json()))
+        })
     });
     let post = Post {
         text: POST_TEXT.into(),
@@ -1000,12 +1204,9 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
         agent: Some(target.to_string()),
     };
     app.display_post(None, &post);
-    let journal = SessionJournal::from_session(&app.state.session).unwrap();
+    let journal = app.journal().unwrap();
     journal.record_post(root, post);
-    journal
-        .snapshot()
-        .apply_to(app.state.session_mut())
-        .unwrap();
+    app.refresh_session_projection();
     let before: Vec<_> = (0..app.chats[0].message_count())
         .map(|index| app.chats[0].message_at(index).unwrap().clone())
         .collect();
@@ -1015,9 +1216,9 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
     let tmp = TempDir::new().unwrap();
     for restored in [false, true] {
         if restored {
-            app.state.session_mut().save_to(tmp.path()).unwrap();
-            let loaded = AppSession::load_from(app.state.session.id, tmp.path()).unwrap();
-            app.state.session = Arc::new(loaded);
+            app.session_fixture().save_to(tmp.path()).unwrap();
+            let loaded = AppSession::load_from(app.session_projection().id, tmp.path()).unwrap();
+            app.set_session_fixture(&loaded);
             app.reset_ui_chrome();
             app.restore_display();
         }
@@ -1073,7 +1274,7 @@ fn main_chat_post_ignores_the_stale_run_filter() {
     let mut app = test_app();
     app.update(post_msg(None));
     assert_last_is_post(&app.chats[0]);
-    assert!(app.state.session.posts().is_empty());
+    assert!(app.session_projection().posts.as_slice().is_empty());
 }
 
 #[test_case(false, false, false, false ; "live_link")]
@@ -1114,12 +1315,9 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared
         ),
     };
     if restored {
-        let journal = SessionJournal::from_session(&app.state.session).unwrap();
-        journal.record_post(app.state.session.root_agent_id().unwrap(), post);
-        journal
-            .snapshot()
-            .apply_to(app.state.session_mut())
-            .unwrap();
+        let journal = app.journal().unwrap();
+        journal.record_post(app.session_projection().root_agent_id().unwrap(), post);
+        app.refresh_session_projection();
         app.reset_ui_chrome();
         app.restore_display();
     } else {
@@ -1168,7 +1366,7 @@ fn subagent_post_lands_in_the_child_chat() {
     let chat_idx = app.chat_index[TASK_ID];
     assert_ne!(chat_idx, 0);
     assert_last_is_post(&app.chats[chat_idx]);
-    assert!(app.state.session.posts().is_empty());
+    assert!(app.session_projection().posts.as_slice().is_empty());
 }
 
 fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {
@@ -1671,16 +1869,15 @@ fn completion_notice_navigates_to_child(
 
 fn bind_test_session_root(app: &mut App) -> AgentId {
     let root = app
-        .state
-        .session
+        .session_projection()
         .root_agent_id()
         .unwrap_or_else(|| app.chats[0].agent_id.unwrap_or_else(AgentId::generate));
-    app.state.session_mut().bind_root_id(root).unwrap();
+    app.edit_session_fixture(|session| session.bind_root_id(root).unwrap());
     root
 }
 
 fn register_restored_child(app: &mut App, id: AgentId, parent: AgentId, key: &str, label: &str) {
-    let session = app.state.session_mut();
+    let mut session = app.session_fixture();
     let mut record = session.agents()[&parent].clone();
     record.id = id;
     record.parent = Some(parent);
@@ -1692,10 +1889,11 @@ fn register_restored_child(app: &mut App, id: AgentId, parent: AgentId, key: &st
     record.created_seq = seq;
     record.updated_seq = seq;
     session.push_agent_revision(seq, record);
+    app.set_session_fixture(&session);
 }
 
-fn project_child_history(app: &mut App, agent_id: AgentId, history: HistorySnapshot) {
-    let journal = SessionJournal::from_session(&app.state.session).unwrap();
+fn commit_fixture_history(app: &mut App, agent_id: AgentId, history: HistorySnapshot) {
+    let journal = app.journal().unwrap();
     journal
         .commit(JournalCommit {
             histories: [(agent_id, history)].into(),
@@ -1703,10 +1901,7 @@ fn project_child_history(app: &mut App, agent_id: AgentId, history: HistorySnaps
             ..Default::default()
         })
         .unwrap();
-    journal
-        .snapshot()
-        .apply_to(app.state.session_mut())
-        .unwrap();
+    app.refresh_session_projection();
 }
 
 #[test_case(false, false; "main_available")]
@@ -1733,10 +1928,10 @@ fn restored_notice_keeps_durable_target(nested: bool, missing: bool) {
     let parent = if nested {
         let parent = AgentId::generate();
         register_restored_child(&mut app, parent, root, PARENT, PARENT);
-        project_child_history(&mut app, parent, HistorySnapshot::new(vec![observation]));
+        commit_fixture_history(&mut app, parent, HistorySnapshot::new(vec![observation]));
         parent
     } else {
-        app.state.session_mut().push_message(observation);
+        app.edit_session_fixture(|session| session.push_message(observation));
         root
     };
     if !missing {
@@ -2395,12 +2590,12 @@ fn reset_session_request_defers_autocmd_and_names_ended_session() {
     let mut app = test_app();
     let (handle, probe) = makima_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    let ended_id = app.state.session.id;
+    let ended_id = app.session_projection().id;
 
     let actions = app.reset_session();
 
     assert!(probe.try_recv_autocmd().is_none());
-    assert_eq!(app.state.session.id, ended_id);
+    assert_eq!(app.session_projection().id, ended_id);
     let Action::ReplaceSession(request) = &actions[0] else {
         panic!("expected replacement request");
     };
@@ -2436,7 +2631,7 @@ fn reset_session_clears_plan() {
     app.help_modal.toggle();
     let (_tx, rx) = flume::bounded::<crate::components::btw_modal::BtwEvent>(1);
     app.btw_modal.open("q", rx);
-    let old_id = app.state.session.id;
+    let old_id = app.session_projection().id;
     let old_target = app.command_target.id();
     let actions = app.reset_session();
     let Action::ReplaceSession(request) = &actions[0] else {
@@ -2445,7 +2640,7 @@ fn reset_session_clears_plan() {
     assert_ne!(request.session.id, old_id);
     assert!(request.session.messages().is_empty());
     assert_eq!(request.session.meta.context_size, 0);
-    assert_eq!(app.state.session.id, old_id);
+    assert_eq!(app.session_projection().id, old_id);
     assert_eq!(app.command_target.id(), old_target);
     assert_eq!(app.chats[0].context_size, 1000);
     assert!(!app.queue.is_empty());
@@ -2496,11 +2691,9 @@ fn reset_session_clears_drafting_plan_in_build_mode() {
 #[test]
 fn load_session_clears_plan() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("test".into()));
-    app.state.session_mut().save(&app.storage).unwrap();
-    let id = app.state.session.id;
+    app.edit_session_fixture(|session| session.push_message(Message::user("test".into())));
+    app.session_fixture().save(&app.storage).unwrap();
+    let id = app.session_projection().id;
     set_root_mode(&mut app, Mode::Build);
     app.state.plan = PlanState::Ready(PathBuf::from("old-plan.md"));
     let actions = app.load_loaded_session(AppSession::load(id, &app.storage).unwrap());
@@ -4322,7 +4515,7 @@ fn restored_task_keyboard_submission_never_reaches_main(missing_identity: bool) 
 }
 
 fn push_turn_result(app: &mut App, agent_id: AgentId, turn_id: TurnId, context_size: u32) {
-    let session = app.state.session_mut();
+    let mut session = app.session_fixture();
     let result = StoredTurnResult {
         outcome: StoredTurnOutcome {
             agent_id,
@@ -4358,6 +4551,7 @@ fn push_turn_result(app: &mut App, agent_id: AgentId, turn_id: TurnId, context_s
             result,
         },
     });
+    app.set_session_fixture(&session);
 }
 
 #[test_case(false; "ages_from_agent_without_turns")]
@@ -5062,11 +5256,12 @@ fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
     const CUT: &str = "cut prompt";
     const NOTE: &str = "Files stay changed; tasks keep running.";
     let mut app = test_app();
-    let session = app.state.session_mut();
+    let mut session = app.session_fixture();
     session.push_message(Message::user(FIRST.into()));
     session.push_message(Message::user(CUT.into()));
     let target = session.chat_message_ids(None)[0];
     session.fork(Some(target), NOTE.into()).unwrap();
+    app.set_session_fixture(&session);
     app.main_chat().push_user_message(CUT);
     app.chats.push(Chat::new(
         "Child".into(),
@@ -6415,14 +6610,20 @@ fn submit_exit_quits() {
 #[test]
 fn session_has_content_covers_each_branch() {
     let mut session = AppSession::new("test-model", "/tmp/test");
-    assert!(!session_has_content(&session));
+    assert!(!session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
 
     session.meta.input_draft = Some("draft".into());
-    assert!(session_has_content(&session));
+    assert!(session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
     session.meta.input_draft = None;
 
     session.meta.mode = Some(StoredMode::Plan);
-    assert!(session_has_content(&session));
+    assert!(session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
     session.meta.mode = Some(StoredMode::Build);
     session.push_state(makima_storage::session_state::StoredStateRecord {
         seq: 0,
@@ -6434,7 +6635,9 @@ fn session_has_content_covers_each_branch() {
             value: Some(serde_json::json!({})),
         },
     });
-    assert!(session_has_content(&session));
+    assert!(session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
     session.push_state(makima_storage::session_state::StoredStateRecord {
         seq: 1,
         agent: None,
@@ -6445,26 +6648,28 @@ fn session_has_content_covers_each_branch() {
             value: None,
         },
     });
-    assert!(!session_has_content(&session));
+    assert!(!session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
 
     session.push_message(Message::user("hello".into()));
-    assert!(session_has_content(&session));
+    assert!(session_has_content(
+        &SessionJournal::from_session(&session).unwrap().projection()
+    ));
 }
 
 #[test]
-fn checkpoint_syncs_ephemeral_content_into_meta() {
+fn draft_and_committed_mode_count_as_content() {
     let mut app = test_app();
-    app.checkpoint();
-    assert!(!session_has_content(&app.state.session));
-
+    assert!(!app.has_content());
     app.update(Msg::Key(key(KeyCode::Char('x'))));
-    app.checkpoint();
-    assert!(session_has_content(&app.state.session));
-
+    app.persist_input();
+    app.refresh_session_projection();
+    assert!(app.has_content());
     app.update(Msg::Key(key(KeyCode::Backspace)));
-    app.checkpoint();
-    assert!(app.state.session.meta.input_draft.is_none());
-    assert!(!session_has_content(&app.state.session));
+    app.persist_input();
+    app.refresh_session_projection();
+    assert!(!app.has_content());
 
     set_root_mode(&mut app, Mode::from_id("plan"));
     let root = app
@@ -6472,39 +6677,24 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
         .target_agent(&app.command_target)
         .unwrap();
     let snapshot = root.manager().journal().snapshot();
-    let session = app.state.session_mut();
-    session.replace_state(snapshot.state.to_vec());
-    session.replace_agent_revisions(snapshot.agent_revisions.to_vec());
-    app.checkpoint();
-    assert!(app.state.session.meta.mode.is_none());
+    app.edit_session_fixture(|session| {
+        session.replace_state(snapshot.state.to_vec());
+        session.replace_agent_revisions(snapshot.agent_revisions.to_vec());
+    });
     assert!(app.state.plan.path().is_some());
-    assert!(app.state.session.meta.thinking.is_none());
-    assert!(session_has_content(&app.state.session));
+    assert!(app.has_content());
 }
 
 #[test]
-fn checkpoint_mirrors_observations_without_using_them_as_title() {
+fn observation_history_does_not_set_the_session_title() {
     let mut app = test_app();
-    let initial_title = app.state.session.title.clone();
-    let _history = attach_live_history(
-        &mut app,
-        vec![
-            Message::observation("build failed".into()),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "I will fix it".into(),
-                }],
-                ..Default::default()
-            },
-        ],
-    );
-
-    app.checkpoint();
-
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert!(app.state.session.messages()[0].is_observation());
-    assert_eq!(app.state.session.title, initial_title);
+    let root = bind_test_session_root(&mut app);
+    let initial_title = app.title();
+    let history = HistorySnapshot::new(vec![Message::observation("build failed".into())]);
+    commit_fixture_history(&mut app, root, history);
+    let projection = app.session_projection();
+    assert!(projection.root_history().unwrap().messages[0].is_observation());
+    assert_eq!(app.title(), initial_title);
 }
 
 fn drain_writer(app: App, writer: SessionWriter) {
@@ -6516,14 +6706,13 @@ fn drain_writer(app: App, writer: SessionWriter) {
 fn restore_resumed_session_keeps_recovered_draft_inactive() {
     const DRAFT: &str = "q1\n\nq2";
     let mut app = test_app();
-    app.state.session_mut().meta.input_draft = Some(DRAFT.into());
+    app.journal().unwrap().set_draft(Some(DRAFT.into()));
 
     app.restore_resumed_session();
     assert!(app.queue.is_empty());
     assert_eq!(app.input_box.buffer.value(), DRAFT);
 
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.input_draft.as_deref(), Some(DRAFT));
+    assert_eq!(app.session_projection().draft(), Some(DRAFT));
 }
 
 #[test]
@@ -6689,12 +6878,15 @@ fn copy_tui_fixture() -> CopyTuiFixture {
         .unwrap();
     let registry = host.host().command_registry();
     let dir = StateDir::from_path(env::temp_dir());
-    let mut app = build_app_with_full(dir.clone(), None, registry, handle, UiConfig::default());
-    Arc::get_mut(&mut app.state.session)
-        .unwrap()
-        .set_cwd(root.path().to_string_lossy().into_owned());
-    app.command_palette
-        .set_cwd(Arc::from(root.path().to_string_lossy().as_ref()));
+    let app = build_app_in(
+        root.path(),
+        dir,
+        None,
+        registry,
+        handle,
+        UiConfig::default(),
+    );
+    assert_eq!(app.focused_cwd(), root.path());
 
     let actions = host.host().ui_action_rx();
     CopyTuiFixture {
@@ -7121,7 +7313,7 @@ fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
         .unwrap();
     app.chats[0].agent_id = Some(target.id());
     app.shared_history = Some(shared);
-    app.state.session_mut().replace_messages(messages);
+    app.edit_session_fixture(|session| session.replace_messages(messages));
     bind_actor_target(app, target.clone());
     target
 }
@@ -7384,12 +7576,12 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     let original = HistorySnapshot::new(original);
     register_restored_child(&mut app, child_id, root, TASK_ID, "research");
     if child {
-        project_child_history(&mut app, child_id, original);
+        commit_fixture_history(&mut app, child_id, original);
     } else {
-        app.state.session_mut().adopt_history(&original);
+        app.edit_session_fixture(|session| session.adopt_history(&original));
     }
     app.restore_display();
-    let message_ids = app.state.session.chat_message_ids(chat.as_deref());
+    let message_ids = app.session_fixture().chat_message_ids(chat.as_deref());
     let retained = StoredPost {
         agent,
         after_message: Some(message_ids[0]),
@@ -7431,20 +7623,18 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
         },
     ];
     for post in &expected_posts {
-        app.state.session_mut().push_post(post.clone());
+        app.edit_session_fixture(|session| session.push_post(post.clone()));
     }
     let snapshot = HistorySnapshot::new(messages);
-    if child {
-        project_child_history(&mut app, child_id, snapshot.clone());
-    }
+    commit_fixture_history(&mut app, agent.unwrap_or(root), snapshot.clone());
     app.apply_history_change(HistoryChange {
         agent_id: app.chats[index].agent_id.unwrap(),
         epoch: snapshot.epoch,
         messages: snapshot.messages,
         draft: Message::user("next prompt".into()),
     });
-    assert_eq!(app.state.session.posts(), expected_posts);
-    let active_ids = app.state.session.chat_message_ids(chat.as_deref());
+    assert_eq!(app.session_projection().posts.as_slice(), expected_posts);
+    let active_ids = app.session_fixture().chat_message_ids(chat.as_deref());
     assert_eq!(active_ids.len(), 1);
     assert!(!active_ids.iter().any(|id| message_ids.contains(id)));
     let displayed: Vec<_> = (0..app.chats[index].message_count())
@@ -7458,12 +7648,12 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     assert!(displayed.iter().any(|text| text == UNANCHORED_POST));
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let id = app.state.session.id;
-    app.state.session_mut().save(&dir).unwrap();
+    let id = app.session_projection().id;
+    app.session_fixture().save(&dir).unwrap();
     let restored = AppSession::load(id, &dir).unwrap();
-    assert_eq!(restored.posts(), app.state.session.posts());
+    assert_eq!(restored.posts(), app.session_projection().posts.as_slice());
     assert_eq!(restored.chat_message_ids(chat.as_deref()), active_ids);
-    app.state.session = Arc::new(restored);
+    app.set_session_fixture(&restored);
     app.reset_ui_chrome();
     app.restore_display();
     assert!(
@@ -7910,28 +8100,23 @@ fn with_history(mut app: App) -> App {
             ..Default::default()
         },
     ];
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(
-        makima_agent::HistorySnapshot::new(history),
-    )));
+    app.edit_session_fixture(|session| session.replace_messages(history));
     app
 }
 
-/// The stale event is dropped, yet the cancelled turn still reaches disk: the
-/// next frame's checkpoint syncs the mirror whatever event arrived.
-#[test_case(done() ; "stale_done")]
-#[test_case(
-    AgentEvent::ControlError { message: "timeout".into() } ; "stale_error"
-)]
-fn checkpoint_after_cancel_persists_the_cancelled_turn(event: AgentEvent) {
+#[test_case(done(); "stale_done")]
+#[test_case(AgentEvent::ControlError { message: "timeout".into() }; "stale_error")]
+fn stale_terminal_does_not_change_cancelled_turn_projection(event: AgentEvent) {
     let mut app = streaming_app_with_history();
+    let before = app.session_projection();
     let old_run_id = app.run_id;
     cancel_app(&mut app);
     assert_ne!(app.run_id, old_run_id);
-    assert!(app.state.session.messages().is_empty());
 
     app.update(agent_msg_with_run_id(event, old_run_id));
-    app.checkpoint();
-    assert_eq!(app.state.session.messages().len(), 2);
+    app.refresh_session_projection();
+    assert!(Arc::ptr_eq(&before, &app.session_projection()));
+    assert_eq!(before.root_history().unwrap().messages.len(), 2);
 }
 
 #[test]
@@ -7981,9 +8166,15 @@ fn parent_done_preserves_unresolved_children_and_reconciles_own_tools() {
             .last_message_text()
             .contains(MISSING_TOOL_COMPLETION)
     );
-    app.checkpoint();
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert!(app.state.session.tool_outputs().is_empty());
+    assert_eq!(
+        app.session_projection()
+            .root_history()
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    assert!(app.session_projection().tool_outputs.is_empty());
     assert_eq!(app.chat_index.get("task1"), Some(&1));
 }
 
@@ -8465,9 +8656,10 @@ fn plan_submit_builtin_shows_form_marks_ready_pushes_message() {
     assert!(app.state.plan.is_ready());
     assert_eq!(app.main_chat().last_message_text(), PLAN_BODY);
     assert!(
-        !app.state
-            .session
-            .messages()
+        !app.session_projection()
+            .root_history()
+            .unwrap()
+            .messages
             .iter()
             .any(|m| m.content.iter().any(|c| matches!(
                 c,
@@ -10284,7 +10476,6 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                             spawn_input_child_with_mode(&mut app, TASK_ID, "matrix-agent", mode);
                         let config = target.effective_config().unwrap().unwrap();
                         commit_root_model(&app, config.model.clone());
-                        app.state.session_mut().model = config.model.spec();
                         if child {
                             bind_actor_target(&app, target.clone());
                         }
@@ -10567,20 +10758,11 @@ const STORED_SESSION_TEXT: &str = "other session talk";
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
 
-fn attach_live_history(app: &mut App, messages: Vec<Message>) -> History {
-    let mirror: makima_agent::SharedMessages =
-        Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
-    let history = History::new(messages).with_mirror(Arc::clone(&mirror));
-    app.shared_history = Some(mirror);
-    history
-}
-
 #[test]
 fn reset_session_requests_replacement_without_mutating_the_current_session() {
     let mut app = test_app();
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
-    app.checkpoint();
-    let old_id = app.state.session.id;
+    app.edit_session_fixture(|session| session.push_message(Message::user(LIVE_AGENT_TEXT.into())));
+    let old_id = app.session_projection().id;
 
     let actions = app.reset_session();
     let Action::ReplaceSession(request) = &actions[0] else {
@@ -10588,11 +10770,11 @@ fn reset_session_requests_replacement_without_mutating_the_current_session() {
     };
     let new_id = request.session.id;
     assert_ne!(new_id, old_id);
-    assert_eq!(app.state.session.id, old_id);
+    assert_eq!(app.session_projection().id, old_id);
 
     assert!(request.session.messages().is_empty());
     assert_eq!(
-        app.state.session.messages()[0].user_text(),
+        app.session_projection().root_history().unwrap().messages[0].user_text(),
         Some(LIVE_AGENT_TEXT)
     );
 }
@@ -10604,17 +10786,17 @@ fn load_session_requests_replacement_without_leaking_live_history() {
     stored.push_message(Message::user(STORED_SESSION_TEXT.into()));
     stored.save(&dir).unwrap();
 
-    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.edit_session_fixture(|session| session.push_message(Message::user(LIVE_AGENT_TEXT.into())));
     app.input_box.set_input(UNSENT_DRAFT.into());
-    app.checkpoint();
-    let (live_id, sent_revision) = (app.state.session.id, app.state.session.revision());
+    app.persist_input();
+    app.refresh_session_projection();
+    let live = app.session_projection();
 
     let actions = app.load_loaded_session(AppSession::load(stored.id, &dir).unwrap());
     let Action::ReplaceSession(request) = &actions[0] else {
         panic!("expected replacement request");
     };
-    assert_eq!(app.state.session.id, live_id);
-    assert_eq!(app.state.session.revision(), sent_revision);
+    assert!(Arc::ptr_eq(&app.session_projection(), &live));
     assert_eq!(request.session.id, stored.id);
     assert_eq!(request.session.messages().len(), 1);
     assert_eq!(
@@ -10622,29 +10804,29 @@ fn load_session_requests_replacement_without_leaking_live_history() {
         Some(STORED_SESSION_TEXT)
     );
 
+    assert_eq!(app.session_projection().draft(), Some(UNSENT_DRAFT));
     assert_eq!(
-        app.state.session.meta.input_draft.as_deref(),
-        Some(UNSENT_DRAFT)
-    );
-    assert_eq!(
-        app.state.session.messages()[0].user_text(),
+        app.session_projection().root_history().unwrap().messages[0].user_text(),
         Some(LIVE_AGENT_TEXT)
     );
 }
 
 #[test_case(false; "typed_draft")]
 #[test_case(true; "deleted_draft")]
-fn draft_mutations_reach_disk_without_checkpoint(delete: bool) {
+fn draft_mutations_reach_disk(delete: bool) {
     let (_tmp, dir, writer, mut app) = tempdir_app();
     for c in TYPED_DRAFT.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
+    app.persist_input();
+    app.refresh_session_projection();
     if delete {
         for _ in TYPED_DRAFT.chars() {
             app.update(Msg::Key(key(KeyCode::Backspace)));
         }
     }
-    let id = app.state.session.id;
+    app.persist_input();
+    let id = app.session_projection().id;
     drain_writer(app, writer);
     let loaded = AppSession::load(id, &dir).unwrap();
     assert_eq!(
@@ -10655,19 +10837,15 @@ fn draft_mutations_reach_disk_without_checkpoint(delete: bool) {
 }
 
 #[test]
-fn idle_checkpoint_changes_nothing() {
+fn unchanged_input_does_not_replace_projection() {
     let mut app = test_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("hello".into()));
-    app.checkpoint();
-    let (revision, updated_at) = (app.state.session.revision(), app.state.session.updated_at);
-
-    app.checkpoint();
-    app.checkpoint();
-
-    assert_eq!(app.state.session.revision(), revision);
-    assert_eq!(app.state.session.updated_at, updated_at);
+    app.input_box.set_input(TYPED_DRAFT.into());
+    app.persist_input();
+    assert!(app.refresh_session_projection());
+    let before = app.session_projection();
+    app.persist_input();
+    assert!(!app.refresh_session_projection());
+    assert!(Arc::ptr_eq(&before, &app.session_projection()));
 }
 
 #[test]
@@ -10711,11 +10889,22 @@ fn completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = makima_lua::test_support::event_handle_with_completion();
-    let mut app = build_app_with_handle(dir.clone(), None, handle);
-    std::sync::Arc::get_mut(&mut app.state.session)
-        .unwrap()
-        .set_cwd(tmp.path().to_string_lossy().into_owned());
+    let app = build_app_in(
+        tmp.path(),
+        dir,
+        None,
+        makima_commands::CommandRegistry::new(),
+        handle,
+        UiConfig::default(),
+    );
+    assert_eq!(app.focused_cwd(), tmp.path());
     (tmp, app, backend)
+}
+
+fn set_completion_cwd(app: &mut App, cwd: &Path) {
+    app.edit_session_fixture(|session| session.set_cwd(cwd.to_string_lossy().into_owned()));
+    app.apply_directory_change(cwd.to_path_buf());
+    assert_eq!(app.focused_cwd(), cwd);
 }
 
 fn streaming_completion_app() -> (TempDir, App, Arc<makima_lua::TestCompletionBackend>) {
@@ -10879,7 +11068,7 @@ fn at_completion_insertion_synchronizes_argument_completion() {
     let value = app.input_box.buffer.value();
     app.sync_command_arguments(&value, app.input_box.buffer.cursor_byte_offset());
     app.file_completion
-        .open(&app.state.session.cwd, Vec::new(), "rev", (8, 12));
+        .open(app.session_projection().cwd(), Vec::new(), "rev", (8, 12));
     let generation = app.command_palette.argument_generation();
 
     app.insert_completion(CompletionItem {
@@ -10968,9 +11157,7 @@ fn parent_path_completion_advances_then_finishes() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&sibling).unwrap();
     std::fs::write(sibling.join("outside.txt"), b"outside").unwrap();
-    std::sync::Arc::get_mut(&mut app.state.session)
-        .unwrap()
-        .set_cwd(project.to_string_lossy().into_owned());
+    set_completion_cwd(&mut app, &project);
 
     for character in "@../sib".chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
@@ -11026,9 +11213,7 @@ fn quoted_explicit_path_advances_then_closes_on_file() {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("final report!.md"), b"report").unwrap();
-    Arc::get_mut(&mut app.state.session)
-        .unwrap()
-        .set_cwd(project.to_string_lossy().into_owned());
+    set_completion_cwd(&mut app, &project);
 
     for character in "@\"../release".chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
@@ -11085,11 +11270,11 @@ fn cd_completion_filters_directories_and_accepts_before_execution() {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
     assert!(!app.command_palette.is_active());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test_case("release notes", "release" ; "spaces")]
@@ -11110,11 +11295,11 @@ fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
     };
     assert_eq!(app.input_box.buffer.value(), expected);
     assert!(!app.command_palette.is_active());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -11145,7 +11330,7 @@ fn quoted_directory_descent_keeps_cursor_inside_quotes() {
     app.update(Msg::Key(key(KeyCode::Enter)));
 
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test_case(KeyCode::Right, 1 ; "right")]
@@ -11220,7 +11405,7 @@ fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
         app.update(Msg::Key(key(KeyCode::Tab)));
         assert_eq!(app.input_box.buffer.value(), input);
         assert!(app.command_palette.is_active());
-        assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+        assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
         converge_completion(&mut app);
         let screen = rendered(&mut app);
         assert!(screen.contains(child));
@@ -11231,7 +11416,7 @@ fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
     assert!(!app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -11247,7 +11432,7 @@ fn cd_completion_escape_preserves_partial_for_execution() {
     assert!(!app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test_case(KeyCode::Esc, "/cd ./alpha"; "dismissed")]
@@ -11270,7 +11455,7 @@ fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expec
     assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test_case("./missing" ; "no_match")]
@@ -11291,7 +11476,7 @@ fn cd_completion_no_match_tab_preserves_input_enter_submits(query: &str) {
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
     assert!(!app.command_palette.is_active());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test_case(false ; "command_name_tab")]
@@ -11345,7 +11530,10 @@ fn cd_slash_completion_uses_child_cwd_before_argument_dispatch() {
     assert_eq!(labels, ["./alpha-child/"]);
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.input_box.buffer.value(), "/cd ./alpha-child/");
-    assert_eq!(app.state.session.cwd, root.path().to_string_lossy());
+    assert_eq!(
+        app.session_projection().cwd(),
+        root.path().to_string_lossy()
+    );
 }
 
 #[test]
@@ -11369,7 +11557,7 @@ fn cd_completion_does_not_hijack_plugin_override() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
     assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -11406,15 +11594,13 @@ fn cd_completion_cwd_change_refreshes_typed_popup(dismissed: bool) {
         app.update(Msg::Key(key(KeyCode::Esc)));
     }
 
-    app.apply_directory_change(next.path().canonicalize().unwrap());
+    let next = next.path().canonicalize().unwrap();
+    set_completion_cwd(&mut app, &next);
     if !dismissed {
         converge_completion(&mut app);
     }
 
-    assert_eq!(
-        app.state.session.cwd,
-        next.path().canonicalize().unwrap().to_string_lossy()
-    );
+    assert_eq!(app.session_projection().cwd(), next.to_string_lossy());
     assert_eq!(app.command_palette.is_active(), !dismissed);
     assert_eq!(app.input_box.buffer.value(), input);
     if !dismissed {
@@ -11440,16 +11626,17 @@ fn cd_completion_cwd_change_refreshes_reference_popup(dismissed: bool) {
         app.update(Msg::Key(key(KeyCode::Esc)));
     }
 
-    app.apply_directory_change(next.path().canonicalize().unwrap());
+    let next = next.path().canonicalize().unwrap();
+    set_completion_cwd(&mut app, &next);
 
-    assert_eq!(
-        app.state.session.cwd,
-        next.path().canonicalize().unwrap().to_string_lossy()
-    );
+    assert_eq!(app.session_projection().cwd(), next.to_string_lossy());
     assert_eq!(app.file_completion.is_active(), !dismissed);
     assert_eq!(app.input_box.buffer.value(), input);
     if !dismissed {
-        assert!(!app.file_completion.needs_reopen(&app.state.session.cwd));
+        assert!(
+            !app.file_completion
+                .needs_reopen(app.session_projection().cwd())
+        );
         assert_eq!(app.file_completion.match_items()[0].label, "./alpine/");
     }
     let _ = app.tick();
@@ -11470,7 +11657,7 @@ fn cd_completion_ctrl_a_enter_executes_original_partial() {
     assert!(!app.file_completion.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -11499,7 +11686,7 @@ fn cd_completion_click_command_name_closes_popup_before_enter() {
     assert!(!app.file_completion.is_active());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -11533,10 +11720,10 @@ fn cd_completion_ctrl_left_requeries_before_accepting() {
     app.command_palette.select_for_test(quoted);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "/cd \"./release apple/\"");
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(app.input_box.buffer.value().is_empty());
-    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert_eq!(app.session_projection().cwd(), tmp.path().to_string_lossy());
 }
 
 #[test]
@@ -12425,7 +12612,11 @@ fn final_history_after_subagent_closed_leaves_chat_closed() {
         identity: Some(work_identity(1)),
     })));
 
-    assert!(!app.state.session.subagent_messages().contains_key(TASK_ID));
+    assert!(
+        !app.session_fixture()
+            .subagent_messages()
+            .contains_key(TASK_ID)
+    );
     assert_eq!(app.chats.len(), chat_count);
     assert_eq!(app.agent_chat_index.get(&agent_id), Some(&chat_idx));
     assert!(app.chats[chat_idx].is_finished());
@@ -12514,7 +12705,7 @@ fn history_change_does_not_rewrite_stored_child_history(child: bool) {
     let child_id = AgentId::generate();
     register_restored_child(&mut app, child_id, root, TASK_ID, "research");
     let original = HistorySnapshot::new(vec![Message::user(TASK_ID.into())]);
-    project_child_history(&mut app, child_id, original.clone());
+    commit_fixture_history(&mut app, child_id, original.clone());
     if child {
         app.restore_display();
     }
@@ -12530,11 +12721,8 @@ fn history_change_does_not_rewrite_stored_child_history(child: bool) {
         app.chats[usize::from(child)].last_message_text(),
         REPLACEMENT
     );
-    let stored = app
-        .state
-        .session
-        .subagent_history_snapshot(TASK_ID)
-        .unwrap();
+    let projection = app.session_projection();
+    let stored = projection.histories.get(&child_id).unwrap();
     assert_eq!(stored.epoch, original.epoch);
     assert_eq!(stored.ids, original.ids);
     assert_eq!(stored.messages, original.messages);
@@ -12931,20 +13119,20 @@ fn test_splash_survives_reset_to_empty_session() {
     // Lua side sees the same traffic as production.
     handle.fire_autocmd(
         "SessionFocusChanged",
-        serde_json::json!({ "session_id": app.state.session.id }),
+        serde_json::json!({ "session_id": app.session_projection().id }),
     );
     handle.fire_autocmd(
         "SessionStatusChanged",
-        serde_json::json!({ "session_id": app.state.session.id, "status": "idle", "focused": true }),
+        serde_json::json!({ "session_id": app.session_projection().id, "status": "idle", "focused": true }),
     );
     app.reset_session();
     handle.fire_autocmd(
         "SessionFocusChanged",
-        serde_json::json!({ "session_id": app.state.session.id }),
+        serde_json::json!({ "session_id": app.session_projection().id }),
     );
     handle.fire_autocmd(
         "SessionStatusChanged",
-        serde_json::json!({ "session_id": app.state.session.id, "status": "idle", "focused": true }),
+        serde_json::json!({ "session_id": app.session_projection().id, "status": "idle", "focused": true }),
     );
     let reset_at = std::time::Instant::now();
     let mut timeline = Vec::new();

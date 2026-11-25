@@ -13,7 +13,6 @@ use makima_agent::config_change::ConfigChangeError;
 use makima_agent::journal::{JournalChange, JournalCommit};
 use makima_agent::manager::ManagerError;
 use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
-use makima_agent::session_writer::Record;
 use makima_agent::tools::ToolRegistry;
 use makima_agent::{AgentInput, AgentMode, ModeId};
 use makima_domain::{Effort, ModelSelection, ThinkingConfig as DomainThinkingConfig};
@@ -744,7 +743,7 @@ fn managed_child_approval(
         let child_epoch = history_epoch(&child);
         let record = manager.journal().agent(child_id).unwrap();
         assert_eq!(record.transcript_key, child_key);
-        event_loop.sessions[index].app.checkpoint_now();
+        checkpoint(event_loop, index);
         let root_config = root_actor.effective_config().unwrap();
         let root_history = root_actor.committed_history();
         let session = event_loop.sessions[index].id();
@@ -1418,17 +1417,11 @@ fn disable_fast() -> ConfigPatch {
 }
 
 fn checkpoint(event_loop: &mut EventLoop<'_>, index: usize) {
-    event_loop.sessions[index].app.checkpoint_now();
-    let runtime = &event_loop.sessions[index];
-    smol::block_on(
-        runtime
-            .app
-            .session_writer
-            .as_ref()
-            .unwrap()
-            .append(Vec::new()),
-    )
-    .unwrap();
+    let runtime = &mut event_loop.sessions[index];
+    runtime.app.persist_input();
+    let journal = runtime.handles.manager_and_root().0.journal();
+    smol::block_on(journal.flush()).unwrap();
+    runtime.app.refresh_session_projection();
 }
 
 fn history_epoch(actor: &AgentActorHandle) -> u64 {
@@ -1483,15 +1476,10 @@ fn assert_preserved_selection(
     assert_eq!(app.state.plan.path(), Some(path));
     assert_eq!(app.plan_form.implementation_selection(), selection);
     assert_eq!(app.run_id, run_id);
-    assert!(
-        app.state
-            .session
-            .messages()
-            .iter()
-            .any(|message| message.user_text() == Some(HISTORY))
-    );
+    let history = app.state.projection.root_history().unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].user_text(), Some(HISTORY));
     assert!(!app.plan_approval_pending);
-    assert_eq!(app.state.session.messages().len(), 1);
     assert!(observed(event_loop, host, index, START_COMMAND_PREFIX).is_empty());
 }
 
@@ -1624,7 +1612,7 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
         let runtime = &mut event_loop.sessions[index];
         assert_eq!(runtime.id() == original_id, !fresh);
         if fresh {
-            let link = runtime.app.state.session.parent().unwrap();
+            let link = runtime.app.state.projection.parent().unwrap();
             assert_eq!(link.session, original_id);
             let parent = AppSession::load(original_id, &event_loop.ctx.storage).unwrap();
             let parent_root = parent.root_agent_id().unwrap();
@@ -1660,7 +1648,6 @@ fn dispatch_uses_selected_provider_and_persists_completion(fresh: bool, prior_co
                 .mode,
             AgentMode::Build
         );
-        runtime.app.checkpoint_now();
         let id = runtime.id();
         checkpoint(event_loop, index);
         let restored = AppSession::load(id, &event_loop.ctx.storage).unwrap();
@@ -1772,7 +1759,7 @@ fn clear_context_links_new_runtime_and_preserves_planning_session() {
         assert!(!Arc::ptr_eq(&permissions, &runtime.app.permissions));
         assert_ne!(runtime.app.command_target.id(), command_target);
         assert_eq!(runtime.app.root_mode(), Mode::Build);
-        let link = runtime.app.state.session.parent().unwrap().clone();
+        let link = runtime.app.state.projection.parent().unwrap().clone();
         assert_eq!(link.session, source);
         requests.recv_timeout(WAIT).unwrap();
         assert!(requests.is_empty());
@@ -2055,8 +2042,9 @@ fn clear_uses_actor_source_and_captured_absolute_path() {
         let relative = PathBuf::from(RELATIVE_PLAN_FILE);
         let absolute = cwd.join(&relative);
         fs::rename(original_path, &absolute).unwrap();
-        Arc::make_mut(&mut event_loop.sessions[index].app.state.session).cwd =
-            cwd.display().to_string();
+        let app = &mut event_loop.sessions[index].app;
+        app.refresh_session_projection();
+        assert_eq!(app.state.projection.cwd(), cwd.to_string_lossy());
         event_loop.sessions[index].app.state.plan = PlanState::Ready(relative.clone());
         let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
         let mode = AgentMode::Plan(relative);
@@ -2312,14 +2300,13 @@ fn typed_draft_append_preserves_committed_selection(fresh: bool) {
         requests.recv_timeout(WAIT).unwrap();
         let id = event_loop.sessions[index].id();
         checkpoint_settled(event_loop, index);
-        let app = &event_loop.sessions[index].app;
-        smol::block_on(app.session_writer.as_ref().unwrap().append_owned(
-            vec![Record::Draft {
-                text: Some(DRAFT.into()),
-            }],
-            app.writer_guard.clone().unwrap(),
-        ))
-        .unwrap();
+        let app = &mut event_loop.sessions[index].app;
+        app.input_box.set_input(DRAFT.into());
+        checkpoint(event_loop, index);
+        assert_eq!(
+            event_loop.sessions[index].app.state.projection.draft(),
+            Some(DRAFT)
+        );
         assert_eq!(event_loop.sessions[index].id(), id);
         assert_eq!(
             event_loop.sessions[index].app.root_config().model.spec(),

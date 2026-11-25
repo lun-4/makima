@@ -8,15 +8,13 @@ use crate::components::{Action, SessionReplacementKind, SessionReplacementReques
 use crate::repaint::Dirty;
 use makima_agent::actor::HistoryChange;
 use makima_agent::agent::estimate_message_tokens;
-use makima_agent::session_writer::Record;
+use makima_agent::journal::{SessionJournal, SessionJournalSnapshot};
 use makima_agent::{AgentId, AgentRef, HistorySnapshot, ModeId};
 #[cfg(test)]
 use makima_providers::Model;
 use makima_storage::id::MakimaId;
 use makima_storage::session_state::StoredAgentLifecycle;
-use makima_storage::sessions::{
-    ContextEntry, SessionMeta, SessionRecord, StoredMode, StoredPost, context_entries,
-};
+use makima_storage::sessions::{ContextEntry, StoredMode, StoredPost, context_entries};
 
 use crate::AppSession;
 use makima_providers::RequestOptions;
@@ -33,22 +31,22 @@ const DORMANT_AGENT_TEXT: &str = "Dormant";
 const CLOSED_AGENT_TEXT: &str = "Closed";
 const RETIRED_AGENT_TEXT: &str = "Retired";
 
-pub(crate) fn session_has_content(session: &AppSession) -> bool {
-    !session.messages().is_empty()
-        || !session.posts().is_empty()
-        || session.meta.input_draft.is_some()
+pub(crate) fn session_has_content(session: &SessionJournalSnapshot) -> bool {
+    session
+        .root_history()
+        .is_some_and(|history| !history.messages.is_empty())
+        || !session.posts.is_empty()
+        || session.draft().is_some()
         || session
-            .subagent_messages()
+            .histories
             .values()
-            .any(|messages| !messages.is_empty())
-        || session
-            .agents()
-            .values()
-            .any(|record| record.parent.is_some())
-        || session.latest_state().is_ok_and(|view| {
-            view.scopes
-                .values()
-                .any(|scope| scope.plugins.values().any(|stored| stored.value.is_some()))
+            .any(|history| !history.messages.is_empty())
+        || session.fold().is_ok_and(|view| {
+            view.agents.values().any(|record| record.parent.is_some())
+                || view
+                    .scopes
+                    .values()
+                    .any(|scope| scope.plugins.values().any(|stored| stored.value.is_some()))
                 || session
                     .root_agent_id()
                     .and_then(|root| view.scopes.get(&Some(root)))
@@ -56,7 +54,7 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
                     .map_or_else(
                         || {
                             matches!(
-                                session.meta.mode,
+                                session.seed_meta().mode,
                                 Some(StoredMode::Plan | StoredMode::Custom(_))
                             )
                         },
@@ -66,98 +64,71 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
 }
 
 impl App {
-    pub(crate) fn has_content(&self) -> bool {
-        session_has_content(&self.state.session)
-    }
-
-    pub(crate) fn checkpoint(&mut self) {
-        if self.restore_in_progress {
-            return;
-        }
-        self.persist_input();
-        let snapshot = self
-            .shared_history
+    pub(crate) fn journal(&self) -> Option<Arc<SessionJournal>> {
+        let journal = self
+            .root_agent
             .as_ref()
-            .map(|history| history.load_full());
-        let meta = self.build_meta();
-        let token_usage = self.state.session.token_usage;
-        AppSession::checkpoint(
-            &mut self.state.session,
-            snapshot.as_deref(),
-            meta,
-            token_usage,
-        );
+            .map(|root| root.manager().journal());
+        #[cfg(test)]
+        let journal = journal
+            .filter(|journal| journal.session_id() == Some(self.state.projection.id))
+            .or_else(|| self.fixture_journal.clone());
+        journal
     }
 
-    pub(crate) fn checkpoint_now(&mut self) {
-        self.checkpoint();
+    pub(crate) fn session_projection(&self) -> Arc<SessionJournalSnapshot> {
+        Arc::clone(&self.state.projection)
+    }
+
+    pub(crate) fn refresh_session_projection(&mut self) -> bool {
+        let Some(journal) = self.journal() else {
+            return false;
+        };
+        let projection = journal.projection();
+        if Arc::ptr_eq(&self.state.projection, &projection) {
+            return false;
+        }
+        self.state.projection = projection;
+        true
+    }
+
+    pub(crate) fn has_content(&self) -> bool {
+        session_has_content(&self.state.projection)
     }
 
     pub(crate) fn sync_writer_warning(&mut self) -> crate::repaint::Dirty {
         let warning = self
-            .session_writer
-            .as_ref()
-            .and_then(|writer| writer.status().error.map(|error| error.to_string()));
+            .journal()
+            .and_then(|journal| journal.persistence_error());
         self.status_bar.set_writer_warning(warning)
-    }
-
-    pub(crate) fn append_ui_record(&self, record: Record) {
-        if let Some(writer) = &self.session_writer {
-            let receipt = match &self.writer_guard {
-                Some(guard) => writer.append_owned(vec![record], guard.clone()),
-                None => writer.append(vec![record]),
-            };
-            drop(receipt);
-        }
     }
 
     pub(crate) fn persist_input(&mut self) {
         if self.restore_in_progress || self.rewind_pending {
             return;
         }
-        let draft = self.input_box.buffer.value();
-        let draft = (!draft.is_empty()).then_some(draft);
-        if self.state.session.meta.input_draft != draft {
-            self.append_ui_record(SessionRecord::Draft {
-                text: draft.clone(),
-            });
-            self.state.session_mut().meta.input_draft = draft;
+        let lines = self.input_box.buffer.lines();
+        let draft = self.state.projection.draft().unwrap_or("");
+        if !draft.split('\n').eq(lines.iter().map(String::as_str))
+            && let Some(journal) = self.journal()
+        {
+            let draft = lines.join("\n");
+            journal.set_draft((!draft.is_empty()).then_some(draft));
         }
     }
 
     pub(super) fn session_cost(&self) -> Option<f64> {
-        self.root_agent.as_ref()?.manager().journal().cost()
+        self.state.projection.usage().cost
     }
 
     pub(crate) fn title(&self) -> String {
-        self.root_agent.as_ref().map_or_else(
-            || self.state.session.title.clone(),
-            |root| root.manager().journal().title(),
-        )
+        self.state.projection.title().to_owned()
     }
 
-    pub(crate) fn set_title(&self, title: String) {
-        if let Some(root) = &self.root_agent {
-            root.manager().journal().set_title(title);
-        }
-    }
-
-    /// Presentation metadata, with legacy Config and Rules fields left neutral.
-    pub(super) fn build_meta(&self) -> SessionMeta {
-        let state = &self.state;
-        let draft = self.input_box.buffer.value();
-        SessionMeta {
-            compacted: state.session.meta.compacted,
-            conversation: state.session.meta.conversation.clone(),
-            mode: None,
-            session_rules: Vec::new(),
-            context_size: state.context_size,
-            input_draft: (!draft.is_empty()).then_some(draft),
-            thinking: None,
-            fast: false,
-            workflow: false,
-            yolo: None,
-            session_options: Default::default(),
+    pub(crate) fn set_title(&mut self, title: String) {
+        if let Some(journal) = self.journal() {
+            journal.set_title(title);
+            self.refresh_session_projection();
         }
     }
 
@@ -201,7 +172,7 @@ impl App {
 
     fn fork_notes(&self, agent: Option<AgentId>) -> HashMap<MakimaId, String> {
         agent
-            .and_then(|agent| context_entries(self.state.session.context_events(), agent).ok())
+            .and_then(|agent| context_entries(self.state.projection.context_events(), agent).ok())
             .unwrap_or_default()
             .into_iter()
             .filter_map(|entry| match entry {
@@ -214,9 +185,9 @@ impl App {
     fn root_fork_notes(&self) -> HashMap<MakimaId, String> {
         self.fork_notes(
             self.state
-                .session
+                .projection
                 .root_agent_id()
-                .or_else(|| self.state.session.id.to_string().parse().ok()),
+                .or_else(|| self.state.projection.id.to_string().parse().ok()),
         )
     }
 
@@ -226,6 +197,7 @@ impl App {
         history: HistorySnapshot,
         draft: String,
     ) {
+        self.refresh_session_projection();
         self.finish_rewind_input(draft);
         let id = agent.id();
         let Some(&index) = self.agent_chat_index.get(&id) else {
@@ -234,9 +206,9 @@ impl App {
         let notes = self.fork_notes(Some(id));
         let (display, items) = history_to_display_with_notes(
             &history.messages,
-            self.state.session.tool_outputs(),
+            &self.state.projection.tool_outputs,
             &self.ui_config.tool_output_lines,
-            &posts_for(self.state.session.posts(), Some(id)),
+            &posts_for(&self.state.projection.posts, Some(id)),
             Some(agent),
             (&history.ids, &notes),
         );
@@ -246,15 +218,17 @@ impl App {
     }
 
     pub(crate) fn finish_root_rewind(&mut self, draft: String) {
+        self.refresh_session_projection();
         self.queue.unfocus_root();
         let notes = self.root_fork_notes();
+        let (messages, ids) = history_display_parts(self.state.projection.root_history());
         let (display, items) = history_to_display_with_notes(
-            self.state.session.messages(),
-            self.state.session.tool_outputs(),
+            messages,
+            &self.state.projection.tool_outputs,
             &self.ui_config.tool_output_lines,
-            &posts_for(self.state.session.posts(), None),
+            &posts_for(&self.state.projection.posts, None),
             self.root_agent.clone(),
-            (&self.state.session.chat_message_ids(None), &notes),
+            (ids, &notes),
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);
@@ -262,7 +236,6 @@ impl App {
     }
 
     fn finish_rewind_input(&mut self, draft: String) {
-        self.state.session_mut().meta.input_draft = (!draft.is_empty()).then(|| draft.clone());
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
@@ -270,12 +243,23 @@ impl App {
     }
 
     pub(crate) fn restore_display(&mut self) {
+        self.refresh_session_projection();
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
+        let view = self.state.projection.fold().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not fold restored child configuration");
+            Default::default()
+        });
         let cost = self.session_cost();
-        let context_size = self.state.context_size;
-        let root_id = self.state.session.root_agent_id();
+        let root_id = self.state.projection.root_agent_id();
+        let context_size = root_id
+            .and_then(|root| view.scopes.get(&Some(root)))
+            .and_then(|scope| scope.results.back())
+            .map_or(
+                self.state.projection.seed_meta().context_size,
+                |(_, result)| result.outcome.context_size,
+            );
         let main = self.main_chat();
         main.agent_id = root_id.or(main.agent_id);
         main.cost = cost;
@@ -283,20 +267,14 @@ impl App {
         if let Some(id) = main.agent_id {
             self.agent_chat_index.insert(id, 0);
         }
-        if let Some(draft) = self.state.session.meta.input_draft.clone() {
+        if let Some(draft) = self.state.projection.draft().map(str::to_owned) {
             self.refresh_at_ref_labels(&draft);
             self.input_box.set_input(draft);
             self.input_box.buffer.move_to_end();
         }
 
-        let view = self.state.session.latest_state().unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not fold restored child configuration");
-            Default::default()
-        });
-        let mut children: Vec<_> = self
-            .state
-            .session
-            .agents()
+        let mut children: Vec<_> = view
+            .agents
             .values()
             .filter(|record| record.parent.is_some())
             .collect();
@@ -359,11 +337,13 @@ impl App {
             chat.set_restore_target(target);
         }
 
-        let posts = self.state.session.posts();
+        let projection = self.session_projection();
+        let posts = &projection.posts;
         let notes = self.root_fork_notes();
+        let (messages, ids) = history_display_parts(self.state.projection.root_history());
         let (display, items) = history_to_display_with_notes(
-            self.state.session.messages(),
-            self.state.session.tool_outputs(),
+            messages,
+            &self.state.projection.tool_outputs,
             &self.ui_config.tool_output_lines,
             &posts_for(posts, None),
             self.chats[0].agent_id.and_then(|id| {
@@ -371,25 +351,20 @@ impl App {
                     .as_ref()
                     .map(|root| root.manager().reference(id))
             }),
-            (&self.state.session.chat_message_ids(None), &notes),
+            (ids, &notes),
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);
 
         for index in 1..self.chats.len() {
-            let Some(key) = self.chats[index].subagent_id.as_deref() else {
-                continue;
-            };
-            let messages = self
-                .state
-                .session
-                .subagent_messages()
-                .get(key)
-                .map_or(&[][..], |messages| messages.as_slice());
+            let history = self.chats[index]
+                .agent_id
+                .and_then(|id| self.state.projection.histories.get(&id));
+            let (messages, ids) = history_display_parts(history);
             let notes = self.fork_notes(self.chats[index].agent_id);
             let (display, items) = history_to_display_with_notes(
                 messages,
-                self.state.session.tool_outputs(),
+                &self.state.projection.tool_outputs,
                 &self.ui_config.tool_output_lines,
                 &posts_for(posts, self.chats[index].agent_id),
                 self.chats[index].agent_id.and_then(|id| {
@@ -397,13 +372,13 @@ impl App {
                         .as_ref()
                         .map(|root| root.manager().reference(id))
                 }),
-                (&self.state.session.chat_message_ids(Some(key)), &notes),
+                (ids, &notes),
             );
             self.chats[index].load_messages(display);
             self.fire_restore_items(items);
             let status = self.chats[index]
                 .agent_id
-                .and_then(|id| self.state.session.agents().get(&id))
+                .and_then(|id| view.agents.get(&id))
                 .map_or(CLOSED_AGENT_TEXT, |record| match record.lifecycle {
                     StoredAgentLifecycle::Open => DORMANT_AGENT_TEXT,
                     StoredAgentLifecycle::Closed => CLOSED_AGENT_TEXT,
@@ -441,8 +416,7 @@ impl App {
     }
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
-        self.checkpoint_now();
-        let ended_id = self.state.session.id;
+        let ended_id = self.state.projection.id;
         let config = self.root_config();
         let session = AppSession::new(
             &config.model.spec(),
@@ -466,53 +440,29 @@ impl App {
             return;
         };
         let draft = change.draft.user_text().unwrap_or("").to_owned();
-        let baseline = self.chats[index]
+        let previous_history = self.state.projection.histories.get(&change.agent_id);
+        let previous_tokens =
+            previous_history.map_or(0, |history| estimate_message_tokens(&history.messages));
+        let context_size = self.chats[index]
             .context_size
-            .saturating_sub(if index == 0 {
-                estimate_message_tokens(self.state.session.messages())
-            } else {
-                self.chats[index]
-                    .subagent_id
-                    .as_ref()
-                    .and_then(|key| self.state.session.subagent_messages().get(key))
-                    .map_or(0, |messages| estimate_message_tokens(messages))
-            });
-        let context_size = baseline.saturating_add(estimate_message_tokens(&change.messages));
-        if index == 0 {
-            let baseline = self
-                .state
-                .context_size
-                .saturating_sub(estimate_message_tokens(self.state.session.messages()));
-            self.state
-                .session_mut()
-                .replace_shared_messages(Arc::clone(&change.messages));
-            self.state.context_size =
-                baseline.saturating_add(estimate_message_tokens(&change.messages));
-        }
-        let chat = self.chats[index].subagent_id.as_deref();
+            .saturating_sub(previous_tokens)
+            .saturating_add(estimate_message_tokens(&change.messages));
+        self.refresh_session_projection();
         let target = self
             .root_agent
             .as_ref()
             .map(|root| root.manager().reference(change.agent_id));
-        let snapshot = target
-            .as_ref()
-            .map(|agent| agent.manager().journal().snapshot());
-        let session = &self.state.session;
-        let (outputs, posts) = snapshot.as_ref().map_or_else(
-            || (session.tool_outputs(), session.posts()),
-            |snapshot| (snapshot.tool_outputs.as_ref(), snapshot.posts.as_slice()),
-        );
-        let stored_ids = session.chat_message_ids(chat);
-        let ids = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.histories.get(&change.agent_id))
+        let projection = self.session_projection();
+        let ids = projection
+            .histories
+            .get(&change.agent_id)
             .filter(|history| history.epoch == change.epoch)
-            .map_or(stored_ids.as_slice(), |history| history.ids.as_slice());
+            .map_or(&[][..], |history| history.ids.as_slice());
         let (display, items) = history_to_display_with_target(
             &change.messages,
-            outputs,
+            &projection.tool_outputs,
             &self.ui_config.tool_output_lines,
-            &posts_for(posts, (index != 0).then_some(change.agent_id)),
+            &posts_for(&projection.posts, (index != 0).then_some(change.agent_id)),
             target,
             ids,
         );
@@ -522,12 +472,51 @@ impl App {
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
-        self.persist_input();
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_loaded_session(&mut self, session: AppSession, fallback_model: &Model) {
-        self.checkpoint_now();
+    pub(crate) fn set_session_fixture(&mut self, session: &AppSession) {
+        let journal = Arc::new(SessionJournal::from_session(session).unwrap());
+        self.state.projection = journal.projection();
+        self.fixture_journal = Some(journal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_fixture(&self) -> AppSession {
+        let snapshot = self.journal().unwrap().projection();
+        let mut session = AppSession::new(snapshot.model(), snapshot.cwd());
+        session.id = snapshot.id;
+        session.updated_at = snapshot.updated_at;
+        session.meta = snapshot.seed_meta().clone();
+        session.set_parent(snapshot.parent().cloned());
+        session.replace_agent_revisions(snapshot.agent_revisions.to_vec());
+        session.replace_state(snapshot.state.to_vec());
+        snapshot.apply_to(&mut session).unwrap();
+        if let Some(history) = snapshot.root_history() {
+            session.adopt_history(history);
+        }
+        for record in snapshot.fold().unwrap().agents.into_values() {
+            if record.parent.is_some()
+                && let Some(history) = snapshot.histories.get(&record.id)
+            {
+                session.adopt_subagent_history(record.transcript_key, history);
+            }
+        }
+        session.replace_context_events(snapshot.context_events().to_vec());
+        session.meta.input_draft = snapshot.draft().map(str::to_owned);
+        session
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edit_session_fixture<T>(&mut self, edit: impl FnOnce(&mut AppSession) -> T) -> T {
+        let mut session = self.session_fixture();
+        let result = edit(&mut session);
+        self.set_session_fixture(&session);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_loaded_session(&mut self, session: AppSession, _fallback_model: &Model) {
         self.rotate_command_target();
         let view = session.latest_state().unwrap();
         let snapshot = view
@@ -539,12 +528,8 @@ impl App {
             )
             .unwrap();
         self.permissions.restore(snapshot);
-        self.state = SessionState::from_session(
-            session,
-            fallback_model,
-            &self.model_policy,
-            &makima_providers::ProviderRegistry::default(),
-        );
+        self.fixture_journal = Some(Arc::new(SessionJournal::from_session(&session).unwrap()));
+        self.state = SessionState::from_session(&session).unwrap();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -557,7 +542,6 @@ impl App {
     /// themselves (e.g. to run their own checks first).
     #[cfg(test)]
     pub(crate) fn load_loaded_session(&mut self, session: AppSession) -> Vec<Action> {
-        self.checkpoint_now();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
                 session,
@@ -566,6 +550,12 @@ impl App {
             },
         ))]
     }
+}
+
+fn history_display_parts(
+    history: Option<&HistorySnapshot>,
+) -> (&[makima_providers::Message], &[MakimaId]) {
+    history.map_or((&[], &[]), |history| (&history.messages, &history.ids))
 }
 
 fn posts_for(posts: &[StoredPost], agent: Option<AgentId>) -> Vec<&StoredPost> {
@@ -609,7 +599,7 @@ mod tests {
         let mut app = super::super::tests::test_app();
         let root = AgentId::generate();
         let child_id = AgentId::generate();
-        let session = app.state.session_mut();
+        let mut session = app.session_fixture();
         session.bind_root_id(root).unwrap();
         if child {
             let mut record = session.agents()[&root].clone();
@@ -632,7 +622,7 @@ mod tests {
             session.push_message(Message::user(PROMPT.into()));
         }
         let agent = if child { child_id } else { root };
-        let journal = SessionJournal::from_session(session).unwrap();
+        let journal = SessionJournal::from_session(&session).unwrap();
         journal.record_post(
             agent,
             Post {
@@ -641,12 +631,13 @@ mod tests {
                 agent: None,
             },
         );
-        journal.snapshot().apply_to(session).unwrap();
+        journal.snapshot().apply_to(&mut session).unwrap();
         let history = if child {
             session.subagent_history_snapshot(TRANSCRIPT).unwrap()
         } else {
             session.history_snapshot()
         };
+        app.set_session_fixture(&session);
         app.restore_display();
         let index = app.agent_chat_index[&agent];
         assert_eq!(app.chats[index].message_at(0).unwrap().text, PROMPT);
@@ -665,7 +656,7 @@ mod tests {
         const TOOL_ID: &str = "restore-tool";
         const OUTPUT: &str = "complete output from the journal";
         let mut app = super::super::tests::test_app();
-        let session = app.state.session_mut();
+        let mut session = app.session_fixture();
         session.push_message(Message {
             role: Role::Assistant,
             content: vec![ContentBlock::tool_use(
@@ -684,10 +675,11 @@ mod tests {
             }],
             ..Default::default()
         });
-        let mut snapshot = SessionJournal::from_session(session).unwrap().snapshot();
+        let mut snapshot = SessionJournal::from_session(&session).unwrap().snapshot();
         Arc::make_mut(&mut snapshot.tool_outputs)
             .insert(TOOL_ID.into(), Arc::new(ToolOutput::Plain(OUTPUT.into())));
-        snapshot.apply_to(session).unwrap();
+        snapshot.apply_to(&mut session).unwrap();
+        app.set_session_fixture(&session);
         app.restore_display();
         let tool = app.chats[0].message_at(0).unwrap();
         assert!(matches!(&tool.role, DisplayRole::Tool(role) if role.id == TOOL_ID));
@@ -713,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn build_meta_leaves_live_config_and_rules_to_the_journal() {
+    fn persisting_draft_does_not_change_live_config_or_permissions() {
         let mut app = super::super::tests::test_app();
         app.state.plan = super::super::mode::PlanState::Drafting(TRANSCRIPT.into());
         let actor = app.queue.root_actor().unwrap();
@@ -736,17 +728,11 @@ mod tests {
         app.permissions
             .restore(PermissionSnapshot::from_stored(&rules, Some(true)).unwrap());
         app.input_box.set_input(TRANSCRIPT.into());
-        let before = app.state.session.state().to_vec();
-        let meta = app.build_meta();
-        assert!(meta.mode.is_none());
-        assert!(meta.thinking.is_none());
-        assert!(!meta.fast);
-        assert!(!meta.workflow);
-        assert!(meta.yolo.is_none());
-        assert!(meta.session_rules.is_empty());
-        assert!(meta.session_options.is_empty());
-        assert_eq!(meta.input_draft.as_deref(), Some(TRANSCRIPT));
-        assert_eq!(app.state.session.state(), before);
+        let before = app.session_projection().state.to_vec();
+        app.persist_input();
+        assert!(app.refresh_session_projection());
+        assert_eq!(app.session_projection().draft(), Some(TRANSCRIPT));
+        assert_eq!(app.session_projection().state.to_vec(), before);
         assert_eq!(
             app.root_config().thinking,
             ThinkingConfig::Effort(Effort::High)
@@ -761,12 +747,11 @@ mod tests {
     fn restored_child_config_beats_spawn(default_thinking: bool) {
         let mut app = super::super::tests::test_app();
         let root = app
-            .state
-            .session
+            .session_projection()
             .root_agent_id()
             .unwrap_or_else(AgentId::generate);
         let child = AgentId::generate();
-        let session = app.state.session_mut();
+        let mut session = app.session_fixture();
         session.bind_root_id(root).unwrap();
         let mut record = session.agents()[&root].clone();
         record.id = child;
@@ -807,6 +792,7 @@ mod tests {
             generation: 0,
             change: StateChange::Config(config.clone()),
         });
+        app.set_session_fixture(&session);
         app.restore_display();
         let chat = &app.chats[1];
         assert_eq!(chat.agent_id, Some(child));
@@ -828,7 +814,9 @@ mod tests {
     fn content_check_ignores_blank_root_but_keeps_folded_mode_and_children() {
         let mut session = crate::AppSession::new(CONFIG_MODEL, "/tmp");
         session.meta.mode = None;
-        assert!(!session_has_content(&session));
+        assert!(!session_has_content(
+            &SessionJournal::from_session(&session).unwrap().projection()
+        ));
         let root = AgentId::generate();
         session.bind_root_id(root).unwrap();
         let mut config = stored_config();
@@ -838,7 +826,9 @@ mod tests {
             generation: 0,
             change: StateChange::Config(config.clone()),
         });
-        assert!(!session_has_content(&session));
+        assert!(!session_has_content(
+            &SessionJournal::from_session(&session).unwrap().projection()
+        ));
         config.mode.id = "plan".into();
         session.push_state(StoredStateRecord {
             seq: 2,
@@ -846,7 +836,9 @@ mod tests {
             generation: 0,
             change: StateChange::Config(config.clone()),
         });
-        assert!(session_has_content(&session));
+        assert!(session_has_content(
+            &SessionJournal::from_session(&session).unwrap().projection()
+        ));
         config.mode.id = "build".into();
         session.push_state(StoredStateRecord {
             seq: 3,
@@ -855,7 +847,9 @@ mod tests {
             change: StateChange::Config(config),
         });
         session.meta.mode = Some(super::StoredMode::Plan);
-        assert!(!session_has_content(&session));
+        assert!(!session_has_content(
+            &SessionJournal::from_session(&session).unwrap().projection()
+        ));
         let seq = session.next_state_seq();
         let mut child = session.agents()[&root].clone();
         child.id = AgentId::generate();
@@ -865,7 +859,9 @@ mod tests {
         child.created_seq = seq;
         child.updated_seq = seq;
         session.push_agent_revision(seq, child);
-        assert!(session_has_content(&session));
+        assert!(session_has_content(
+            &SessionJournal::from_session(&session).unwrap().projection()
+        ));
     }
 
     #[test]
@@ -873,12 +869,11 @@ mod tests {
         const TRANSCRIPT: &str = "reactivated-child";
         let mut app = super::super::tests::test_app();
         let root = app
-            .state
-            .session
+            .session_projection()
             .root_agent_id()
             .unwrap_or_else(AgentId::generate);
         let child = AgentId::generate();
-        let session = app.state.session_mut();
+        let mut session = app.session_fixture();
         session.bind_root_id(root).unwrap();
         let mut record = session.agents()[&root].clone();
         record.id = child;
@@ -890,6 +885,7 @@ mod tests {
         record.created_seq = seq;
         record.updated_seq = seq;
         session.push_agent_revision(seq, record);
+        app.set_session_fixture(&session);
         app.restore_display();
         let index = app.agent_chat_index[&child];
         let chat_count = app.chats.len();
@@ -921,12 +917,11 @@ mod tests {
         const CHILD_TEXT: &str = "stored child history";
         let mut app = super::super::tests::test_app();
         let root = app
-            .state
-            .session
+            .session_projection()
             .root_agent_id()
             .unwrap_or_else(AgentId::generate);
         let child = AgentId::generate();
-        let session = app.state.session_mut();
+        let mut session = app.session_fixture();
         session.bind_root_id(root).unwrap();
         let mut record = session.agents()[&root].clone();
         record.id = child;
@@ -946,6 +941,7 @@ mod tests {
             )]
             .into(),
         );
+        app.set_session_fixture(&session);
         app.restore_display();
         assert_eq!(app.chats[0].agent_id, Some(root));
         let index = app.agent_chat_index[&child];
@@ -973,7 +969,7 @@ mod tests {
         );
         assert!(app.chats[index].is_finished());
         assert_eq!(app.chats[index].last_message_text(), CHILD_TEXT);
-        assert!(app.state.session.posts().is_empty());
+        assert!(app.session_projection().posts.is_empty());
         assert_eq!(app.agent_chat_index[&root], 0);
         assert!(app.queue.is_empty());
     }

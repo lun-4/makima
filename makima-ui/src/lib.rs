@@ -51,17 +51,15 @@ use makima_storage::id::MakimaId;
 pub type AppSession = makima_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use event_loop::EventLoopParams;
+pub use event_loop::{EventLoopParams, StartupSessions};
 
-/// How a UI generation ended. On `Reload`, each tab carries its in-memory
-/// session so the caller reopens everything without re-reading from disk.
 pub enum RunOutcome {
     Exit {
-        session_id: Option<MakimaId>,
+        session: Option<(MakimaId, String)>,
         code: i32,
     },
     Reload {
-        tabs: Vec<AppSession>,
+        tabs: Vec<MakimaId>,
         focused: usize,
     },
 }
@@ -75,15 +73,15 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
     };
     Ok(match report.exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
-            tabs: report.tabs,
+            tabs: report.tabs.iter().map(|session| session.id).collect(),
             focused: report.focused,
         },
         exit => {
-            let session_id = report
+            let session = report
                 .tabs
                 .get(report.focused)
                 .filter(|s| app::session_has_content(s))
-                .map(|s| s.id);
+                .map(|s| (s.id, s.title().to_owned()));
             let started = Instant::now();
             drop(report);
             tracing::info!(
@@ -91,7 +89,7 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
                 "session buffers dropped"
             );
             RunOutcome::Exit {
-                session_id,
+                session,
                 code: exit.code(),
             }
         }

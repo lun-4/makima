@@ -6676,7 +6676,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let mut session = StoredSession::new(MODEL, ".");
+        let session = StoredSession::new(MODEL, ".");
         let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
         manager.journal().bind_writer(writer).unwrap();
         let root_gate = Gate::new();
@@ -6694,14 +6694,10 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
                 },
             )
             .unwrap();
-        session.bind_root_id(root.id()).unwrap();
         let actor = root.actor().unwrap();
         let initial = actor.admit_turn(input(), None, String::new()).unwrap();
         root_rx.recv_async().await.unwrap();
-        assert!(matches!(
-            root.begin_rewind(&session),
-            Err(RewindError::Busy)
-        ));
+        assert!(matches!(root.begin_rewind(), Err(RewindError::Busy)));
         root_gate.release(1);
         initial.wait().await;
         manager.drain_graph_for_test().await.unwrap();
@@ -6773,7 +6769,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
             },
         });
         let report_id = (child.id(), envelope.result.outcome.turn_id());
-        let guard = root.begin_rewind(&session).unwrap();
+        let guard = root.begin_rewind().unwrap();
         manager.deliver(root.id(), Arc::clone(&envelope)).unwrap();
         let queued = actor.admit_turn(input(), None, String::new()).unwrap();
         actor.runtime_barrier().await.unwrap();
@@ -6837,7 +6833,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
                     .is_some_and(|text| text.contains(REPORT_TEXT)))
         );
 
-        let guard = root.begin_rewind(&session).unwrap();
+        let guard = root.begin_rewind().unwrap();
         manager.deliver(root.id(), Arc::clone(&envelope)).unwrap();
         assert!(
             manager
@@ -6911,7 +6907,7 @@ fn rewinding_a_child_preserves_root_history_and_reopens() {
         );
         let grandchild = spawn(&child, GRANDCHILD_LABEL, Vec::new());
         let before = journal.snapshot();
-        let guard = child.begin_rewind(&session).unwrap();
+        let guard = child.begin_rewind().unwrap();
         let target = RewindTargetId::Message(before.histories[&child.id()].ids[0]);
         assert_eq!(guard.targets().len(), 1);
         assert_eq!(guard.targets()[0].id, target);

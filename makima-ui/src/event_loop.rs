@@ -160,12 +160,15 @@ const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Tabs retain transient state for unsaved sessions; saved sessions reload
-/// their authoritative checkpoint after acquiring ownership.
 pub(crate) struct ShutdownReport {
     pub exit: ExitRequest,
-    pub tabs: Vec<AppSession>,
+    pub tabs: Vec<Arc<SessionJournalSnapshot>>,
     pub focused: usize,
+}
+
+pub enum StartupSessions {
+    Open(Box<AppSession>),
+    Reload(Vec<MakimaId>),
 }
 
 pub struct EventLoopParams {
@@ -174,7 +177,7 @@ pub struct EventLoopParams {
     pub needs_login: bool,
     pub explicit_model: bool,
     pub commands: Vec<CustomCommand>,
-    pub sessions: Vec<AppSession>,
+    pub sessions: StartupSessions,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
     pub storage: StateDir,
@@ -443,8 +446,6 @@ fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.cancel_background_work();
     runtime.session_lock = None;
     runtime.lock_lost = true;
-    runtime.app.writer_guard = None;
-    runtime.app.session_writer = None;
     runtime.end_plan_approval();
     runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
@@ -455,8 +456,6 @@ fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
 fn stop_runtime_after_recovery_failure(runtime: &mut SessionRuntime, error: &str) {
     runtime.cancel_background_work();
     runtime.lock_lost = true;
-    runtime.app.writer_guard = None;
-    runtime.app.session_writer = None;
     runtime.end_plan_approval();
     runtime.app.flash(error.to_owned());
     runtime.app.exit_request = ExitRequest::Error;
@@ -791,22 +790,6 @@ fn checkpoint_runtime_config(
     .map_err(ConfigChangeError::from)
 }
 
-fn project_session_journal(session: &mut AppSession, handles: &AgentHandles) -> Result<(), String> {
-    handles
-        .manager_and_root()
-        .0
-        .journal()
-        .checkpoint_snapshot()?
-        .apply_to(session)
-        .map_err(|error| error.to_string())
-}
-
-fn checkpoint_runtime(runtime: &mut SessionRuntime) {
-    if !runtime.lock_lost {
-        runtime.app.checkpoint();
-    }
-}
-
 fn rollback_startup_runtimes(mut runtimes: Vec<SessionRuntime>) {
     for runtime in &mut runtimes {
         runtime.cancel_background_work();
@@ -865,6 +848,7 @@ enum RuntimeTarget {
 
 enum RuntimeOwnership {
     Claim,
+    Reload,
     Reuse(SessionPublicationGuard),
 }
 
@@ -990,6 +974,7 @@ impl PreparedSessionRuntime {
         let handles = handles.activate();
         let mut app = app.activate();
         handles.apply_to_app(&mut app);
+        app.refresh_session_projection();
         app.coordinator = Some(coordinator.clone());
         let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
         Ok(SessionRuntime {
@@ -1128,6 +1113,7 @@ impl PreparedSessionRuntime {
         let handles = handles.activate();
         let mut app = app.activate();
         handles.apply_to_app(&mut app);
+        app.refresh_session_projection();
         app.coordinator = Some(coordinator.clone());
         let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
         Ok(SessionRuntime {
@@ -1256,6 +1242,7 @@ impl SessionRuntime {
             || self.app.seed_mode(),
             |projected| projected.config.mode.clone(),
         );
+        self.app.refresh_session_projection();
         self.app.update_model(&commit.config.model);
         self.app.project_root_mode(&previous, &commit.config.mode);
         self.settle_plan_approval();
@@ -1268,7 +1255,7 @@ impl SessionRuntime {
     }
 
     fn id(&self) -> MakimaId {
-        self.app.state.session.id
+        self.app.state.projection.id
     }
 
     fn update(&mut self, msg: Msg) -> Vec<Action> {
@@ -1537,7 +1524,7 @@ impl SpawnCtx {
     ) -> Result<PreparedSessionRuntime> {
         let startup = self.model_slot.load().model.clone();
         let (guard, renewing, selection) = match ownership {
-            RuntimeOwnership::Claim => {
+            RuntimeOwnership::Claim | RuntimeOwnership::Reload => {
                 let source = if session.checkpoint_required() {
                     SessionSource::Resume(session.id)
                 } else {
@@ -1547,7 +1534,8 @@ impl SpawnCtx {
                     &self.storage,
                     source,
                     self.open_model(&startup),
-                    Some(&self.workspace_cwd),
+                    matches!(ownership, RuntimeOwnership::Claim)
+                        .then_some(self.workspace_cwd.as_str()),
                 )?;
                 let selection = opened
                     .resumed
@@ -1591,11 +1579,6 @@ impl SpawnCtx {
             Some(lease) => Some(lease.into_claimed_lock().map_err(|error| eyre!(error))?),
             None => None,
         };
-        let resumed = session_has_content(&session)
-            || session
-                .agents()
-                .values()
-                .any(|record| record.parent.is_some());
         let session_id = session.id;
         let offload = offload.or_else(|| {
             Some(Arc::new(OffloadStore::for_session(
@@ -1620,6 +1603,8 @@ impl SpawnCtx {
             runtime_provider,
             self.model_slot.change_tx(),
         );
+        let mut state = SessionState::from_session(&session)?;
+        let resumed = session_has_content(&state.projection);
         let view = session.latest_state()?;
         let permission_snapshot = match (&effective_config, view.scopes.get(&None)) {
             (Some((_, snapshot)), _) => snapshot.clone(),
@@ -1642,12 +1627,6 @@ impl SpawnCtx {
         // workflow and thinking have one starting value: the one the agent is
         // seeded with. `effective_config` only carries a caller's explicit
         // override; everything else comes from the session being resumed.
-        let mut state = SessionState::from_session(
-            session.clone(),
-            &model,
-            &self.model_policy,
-            &self.providers,
-        );
         let config = guard
             .publish(|| -> Result<_> {
                 Ok(match effective_config {
@@ -1701,7 +1680,6 @@ impl SpawnCtx {
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             self.status_content_reader.clone(),
-            None,
             self.ui_config.clone(),
             self.input_history_size,
             Arc::clone(&permissions),
@@ -1711,7 +1689,7 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
             Arc::clone(&self.model_capabilities),
-        );
+        )?;
         app.app.state.warnings.extend(state.warnings);
         app.app.state.warnings.extend(model_warning);
         let handles = AgentHandles::prepare_recovered(
@@ -1732,8 +1710,6 @@ impl SpawnCtx {
             Arc::clone(&self.file_write_locks),
         );
         smol::block_on(checkpoint.append_owned(Vec::new(), guard.clone()))?;
-        app.app.session_writer = Some(checkpoint.as_ref().clone());
-        app.app.writer_guard = Some(guard.clone());
         let deps = self.coordinator_deps(checkpoint);
         let coordinator = prepare_coordinator(
             &deps,
@@ -2168,6 +2144,15 @@ impl<'t> EventLoop<'t> {
             trust_question,
         };
 
+        let (sessions, reloading) = match sessions {
+            StartupSessions::Open(session) => (vec![*session], false),
+            StartupSessions::Reload(ids) => (
+                ids.into_iter()
+                    .map(|id| AppSession::load(id, &ctx.storage))
+                    .collect::<Result<Vec<_>, _>>()?,
+                true,
+            ),
+        };
         let mut runtimes = Vec::with_capacity(sessions.len());
         let mut prepares = Vec::new();
         let mut on_startup_provider = Vec::new();
@@ -2192,7 +2177,24 @@ impl<'t> EventLoop<'t> {
                     model: model.clone(),
                     provider: Arc::clone(pending) as Arc<dyn Provider>,
                 });
-            let runtime = match ctx.spawn_runtime_with_provider(session, provider) {
+            let runtime = if reloading {
+                ctx.prepare_runtime_with_config(
+                    session,
+                    provider,
+                    &ctx.permissions,
+                    RuntimeOwnership::Reload,
+                    None,
+                    None,
+                )
+                .and_then(|prepared| {
+                    prepared
+                        .activate(&ctx.model_slot, None)
+                        .map_err(|error| eyre!(error))
+                })
+            } else {
+                ctx.spawn_runtime_with_provider(session, provider)
+            };
+            let runtime = match runtime {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     rollback_startup_runtimes(runtimes);
@@ -2444,7 +2446,13 @@ impl<'t> EventLoop<'t> {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
             }
-            self.checkpoint_all();
+            for (index, runtime) in self.sessions.iter_mut().enumerate() {
+                if !runtime.lock_lost {
+                    runtime.app.persist_input();
+                }
+                let changed = runtime.app.refresh_session_projection();
+                dirty |= Dirty::from(changed && index == self.focused);
+            }
             if dirty.take() {
                 paint_due = None;
                 let app = &mut self.sessions[self.focused].app;
@@ -2647,12 +2655,7 @@ impl<'t> EventLoop<'t> {
                             draft,
                             warning,
                         }) => {
-                            let session = rt.app.state.session_mut();
-                            if let Err(error) = project_session_journal(session, &rt.handles) {
-                                rt.app.flash(format!("Failed to project rewind: {error}"));
-                                return;
-                            }
-                            session.replace_context_events(manager.journal().context_events());
+                            rt.app.refresh_session_projection();
                             if agent == root {
                                 rt.app.finish_root_rewind(draft);
                             } else {
@@ -3000,12 +3003,6 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn checkpoint_all(&mut self) {
-        for runtime in &mut self.sessions {
-            checkpoint_runtime(runtime);
-        }
-    }
-
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. Background sessions
     /// still drain their floats, or a plugin writing to a window nobody is
@@ -3090,8 +3087,11 @@ impl<'t> EventLoop<'t> {
                     rt.app.clear_exit_request();
                 }
             }
-            AgentEvent::TurnComplete(turn) if current => {
-                rt.notifications.on_turn_complete(&turn.message);
+            AgentEvent::TurnComplete(turn) => {
+                rt.app.refresh_session_projection();
+                if current {
+                    rt.notifications.on_turn_complete(&turn.message);
+                }
             }
             event if current => rt.notifications.on_done(event),
             _ => {}
@@ -3589,7 +3589,7 @@ impl<'t> EventLoop<'t> {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, rt)| live_session_row(rt.id(), &rt.app, i == self.focused))
+                    .map(|(i, rt)| live_session_row(&rt.app, i == self.focused))
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
@@ -3631,7 +3631,7 @@ impl<'t> EventLoop<'t> {
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
-                        let runtime = &self.sessions[i];
+                        let runtime = &mut self.sessions[i];
                         if runtime.lock_lost {
                             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
                         }
@@ -3675,13 +3675,13 @@ impl<'t> EventLoop<'t> {
     fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
         let runtime = &self.sessions[idx];
         let app = &runtime.app;
-        let (manager, _) = runtime.handles.manager_and_root();
-        let usage = manager.journal().usage();
+        let projection = app.session_projection();
+        let usage = projection.usage();
         let snapshot = SessionSnapshot {
             id: runtime.id().to_string(),
-            title: Some(app.title()),
+            title: Some(projection.title().to_owned()),
             status: SessionStatus::of(app).as_str(),
-            updated_at: app.state.session.updated_at,
+            updated_at: projection.updated_at,
             usage: session_usage(&usage.tokens, usage.cost, &usage.by_model),
         };
         serde_json::to_value(snapshot).unwrap_or_default()
@@ -3881,7 +3881,7 @@ impl<'t> EventLoop<'t> {
         if let Some(message) = implementation {
             let runtime = &mut self.sessions[idx];
             runtime.app.input_box.set_input(String::new());
-            runtime.app.state.session_mut().meta.input_draft = None;
+            runtime.app.persist_input();
             match runtime.submit_text(message)? {
                 SubmitOutcome::Started(actions) => self.dispatch(idx, actions),
                 SubmitOutcome::Queued => {}
@@ -3990,13 +3990,17 @@ impl<'t> EventLoop<'t> {
     ) -> impl Future<Output = ()> + Send + 'static {
         old.cancel_background_work();
         let SessionRuntime {
-            app,
+            mut app,
             handles,
             coordinator,
             session_lock,
+            lock_lost,
             ..
         } = old;
-        let retired_id = app.state.session.id;
+        if !lock_lost {
+            app.persist_input();
+        }
+        let retired_id = app.state.projection.id;
         let replaced_session = retired_id != self.sessions[idx].id();
         let ended_conversation = replaced_session
             .then(|| handles.history.load().conversation.clone())
@@ -4033,7 +4037,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn back_to_planning(&mut self, idx: usize, id: MakimaId) {
-        self.sessions[idx].app.checkpoint_now();
+        self.sessions[idx].app.persist_input();
         if let Some(parent) = self.position(id) {
             self.set_focused(parent);
             let session_lock = self.sessions[idx].session_lock.take();
@@ -4066,18 +4070,12 @@ impl<'t> EventLoop<'t> {
 
     fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
         let SessionReplacementRequest {
-            mut session,
+            session,
             kind,
             provider,
         } = request;
         if let Err(error) = ensure_replacement_lock_available(&self.sessions[idx], session.id) {
             self.sessions[idx].app.flash(error.into());
-            return;
-        }
-        if session.id == self.sessions[idx].id()
-            && let Err(error) = project_session_journal(&mut session, &self.sessions[idx].handles)
-        {
-            self.sessions[idx].app.flash(error);
             return;
         }
         let target = RuntimeTarget::Replace {
@@ -4132,7 +4130,7 @@ impl<'t> EventLoop<'t> {
                 return Err(LOCK_LOST_REPLACEMENT_ERR.into());
             }
             let runtime = current.handles.identity();
-            self.sessions[self.focused].app.checkpoint_now();
+            self.sessions[self.focused].app.persist_input();
             RuntimeTarget::Replace {
                 runtime,
                 kind: None,
@@ -4313,14 +4311,9 @@ impl<'t> EventLoop<'t> {
                 }
                 let target = target.filter(|target| target.validate_live().is_ok());
                 let rt = &mut self.sessions[idx];
-                let result =
-                    target
-                        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
-                        .and_then(|target| {
-                            target
-                                .begin_rewind(&rt.app.state.session)
-                                .map_err(|error| error.to_string())
-                        });
+                let result = target
+                    .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                    .and_then(|target| target.begin_rewind().map_err(|error| error.to_string()));
                 rt.app.rewind_pending = false;
                 match result {
                     Ok(guard) => rt.app.show_rewind(guard),
@@ -5268,6 +5261,7 @@ impl<'t> EventLoop<'t> {
                 coordinator,
                 session_lock,
                 lock_lost,
+                checkpoint,
                 ..
             } = rt;
             let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
@@ -5275,27 +5269,20 @@ impl<'t> EventLoop<'t> {
             match settled_lock {
                 LockSettlement::Held(lease) => {
                     if !lock_lost {
-                        app.checkpoint_now();
+                        app.persist_input();
                     }
-                    let mut session = Arc::unwrap_or_clone(Arc::clone(&app.state.session));
-                    if let Err(error) = project_session_journal(&mut session, &handles) {
-                        warn!(%error, session_id = %session.id, "shutdown journal projection failed");
-                    }
-                    app.state.session = Arc::new(session);
-                    session_leases.push((app.state.session.id, lease));
+                    session_leases.push((app.state.projection.id, lease));
                 }
                 LockSettlement::TimedOut => {
-                    warn!(id = %app.state.session.id, "session lock heartbeat timed out during shutdown");
+                    warn!(id = %app.state.projection.id, "session lock heartbeat timed out during shutdown");
                 }
                 LockSettlement::Lost | LockSettlement::None => {}
             }
-            if let Some(writer) = app.session_writer.clone() {
-                writers.push(writer);
-            }
+            writers.push(checkpoint);
             coordinators.push(coordinator);
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
-            tabs.push(Arc::unwrap_or_clone(app.state.session));
+            tabs.push(handles.manager_and_root().0.journal());
             agent_tasks.push(handles.shutdown());
         }
         let save_sessions_ms = lap();
@@ -5346,32 +5333,22 @@ impl<'t> EventLoop<'t> {
         );
         ShutdownReport {
             exit,
-            tabs,
+            tabs: tabs.iter().map(|journal| journal.projection()).collect(),
             focused: self.focused,
         }
     }
 }
 
-fn live_session_row(id: MakimaId, app: &App, focused: bool) -> serde_json::Value {
+fn live_session_row(app: &App, focused: bool) -> serde_json::Value {
+    let projection = app.session_projection();
     json!({
-        "id": id,
-        "title": app.title(),
+        "id": projection.id,
+        "title": projection.title(),
         "status": SessionStatus::of(app).as_str(),
-        "updated_at": app.state.session.updated_at,
-        "message_count": live_message_count(app),
+        "updated_at": projection.updated_at,
+        "message_count": projection.root_history().map_or(0, |history| history.messages.len()),
         "focused": focused,
     })
-}
-
-/// The agent publishes its in-flight history to the mirror as it works, so a
-/// turn that has not reached a checkpoint yet is still visible there. The
-/// mirrored history is the main transcript only; subagent messages live
-/// elsewhere.
-fn live_message_count(app: &App) -> usize {
-    app.shared_history
-        .as_ref()
-        .map(|h| h.load().messages.len())
-        .unwrap_or_else(|| app.state.session.messages().len())
 }
 
 impl UiSink for EventLoop<'_> {
@@ -5886,7 +5863,7 @@ end })
             assert!(!initial.workflow);
             assert!(selected.workflow);
             assert_eq!(selected.model.id, runtime.model_slot.load().model.id);
-            assert_eq!(runtime.app.state.session.model, selected.model.spec());
+            assert_eq!(runtime.app.state.projection.model(), selected.model.spec());
             release_runtime(runtime);
         });
     }
@@ -5906,14 +5883,14 @@ end })
             let initial_actor_workflow = initial_actor_config.settings.workflow;
             wait_projected_option(&untouched, "model", &initial_actor_config.model.spec()).await;
             let initial_options = untouched.coordinator.read().options();
-            let initial_app_model = untouched.app.state.session.model.clone();
+            let initial_app_model = untouched.app.state.projection.model().to_owned();
 
             spawn_root_workflow_toggle(&changed).await.unwrap();
 
             assert!(changed.app.root_config().workflow);
             assert!(changed_actor.effective_config().unwrap().workflow);
             assert!(!untouched.app.root_config().workflow);
-            assert_eq!(untouched.app.state.session.model, initial_app_model);
+            assert_eq!(untouched.app.state.projection.model(), initial_app_model);
             let untouched_config = untouched_actor.effective_config().unwrap();
             assert_eq!(untouched_config.settings.model.spec(), initial_actor_model);
             assert_eq!(untouched_config.mode, initial_actor_mode);
@@ -6466,10 +6443,14 @@ end })
                 result.unwrap();
                 assert_eq!(committed.lock().unwrap().take(), Some(enabled));
             }
-            let mut session = (*runtime.app.state.session).clone();
-            project_session_journal(&mut session, &runtime.handles).unwrap();
+            let session = runtime.handles.manager_and_root().0.journal().snapshot();
             assert_eq!(
-                session.latest_state().unwrap().scopes[&None].yolo,
+                session
+                    .fold()
+                    .unwrap()
+                    .scopes
+                    .get(&None)
+                    .and_then(|scope| scope.yolo),
                 Some(enabled)
             );
             assert_eq!(
@@ -6871,13 +6852,14 @@ end })
                 let session = old.id();
                 commit_root_plan_mode(event_loop);
                 let completion = event_loop.internal_rx.recv_async().await.unwrap();
-                let mut replacement = test_runtime(model_named("replacement-model"));
+                event_loop.sessions[0].coordinator.retire();
+                let mut replacement =
+                    test_runtime_with_id(model_named("replacement-model"), session);
                 let replacement_thinking = replacement.app.root_config().thinking;
                 let (replacement_manager, replacement_root) =
                     replacement.handles.manager_and_root();
                 let replacement_actor = replacement_manager.actor(replacement_root).unwrap();
                 let initial_config = replacement_actor.config_snapshot().unwrap();
-                Arc::make_mut(&mut replacement.app.state.session).id = session;
                 let (queued_tx, queued_rx) = flume::unbounded();
                 replacement.config_commits = queued_rx;
                 let old = std::mem::replace(&mut event_loop.sessions[0], replacement);
@@ -6886,7 +6868,7 @@ end })
                 let _ = event_loop.tick();
                 let app = &event_loop.sessions[0].app;
                 assert_eq!(
-                    app.state.session.model,
+                    app.state.projection.model(),
                     model_named("replacement-model").spec()
                 );
                 assert_eq!(app.root_mode().id_key(), "build");
@@ -7178,7 +7160,12 @@ end })
 
     /// A runtime whose app and provider slot both start on `model`.
     fn test_runtime(model: Model) -> SessionRuntime {
-        let (model_slot, _change_rx) = ProviderSlot::new(model.clone(), Arc::new(StubProvider));
+        let id = MakimaId::generate();
+        test_runtime_with_id(model, id)
+    }
+
+    fn test_runtime_with_id(model: Model, id: MakimaId) -> SessionRuntime {
+        let (model_slot, _change_rx) = ProviderSlot::new(model, Arc::new(StubProvider));
         let permissions = Arc::new(PermissionManager::new(
             makima_config::PermissionsConfig::default(),
             PathBuf::from("/tmp"),
@@ -7186,7 +7173,6 @@ end })
             Arc::default(),
         ));
         let mut app = crate::app::tests::test_app();
-        app.update_model(&model);
         let handles = AgentHandles::spawn(
             &model_slot,
             Vec::new(),
@@ -7203,12 +7189,11 @@ end })
             SystemPromptOverride::default(),
         );
         handles.apply_to_app(&mut app);
-        let checkpoint = Arc::new(SessionWriter::with_io(
-            app.state.session.id,
-            TestSessionIo,
-            0,
-        ));
-        let coordinator = test_coordinator(app.state.session.id);
+        let journal = handles.manager_and_root().0.journal();
+        journal.bind_session(id).unwrap();
+        app.state.projection = journal.projection();
+        let checkpoint = Arc::new(SessionWriter::with_io(id, TestSessionIo, 0));
+        let coordinator = test_coordinator(id);
         let (shell_tx, shell_rx) = flume::unbounded();
         let config_commits = observe_config_commits(
             &handles,
@@ -7769,9 +7754,8 @@ end })
         }
 
         fn persist_runtime(&self, runtime: &mut SessionRuntime) {
-            runtime.app.checkpoint_now();
-            smol::block_on(runtime.checkpoint.drain()).unwrap();
-            smol::block_on(runtime.app.session_writer.as_ref().unwrap().drain()).unwrap();
+            runtime.app.persist_input();
+            smol::block_on(runtime.handles.manager_and_root().0.journal().flush()).unwrap();
         }
 
         fn restart(mut self, mut runtime: SessionRuntime) -> Self {
@@ -7902,15 +7886,14 @@ end })
         let ctx = harness.ctx();
         let mut prepared = ctx.prepare_runtime(session).unwrap();
         if let Some(failure) = failure {
-            let session = &prepared.app.app.state.session;
-            makima_storage::sessions::initialize_session_log(&ctx.sessions_dir, session).unwrap();
+            let id = prepared.snapshot().0;
             let log = fs::OpenOptions::new()
                 .read(true)
                 .append(true)
-                .open(ctx.sessions_dir.join(format!("{}.jsonl", session.id)))
+                .open(ctx.sessions_dir.join(format!("{id}.jsonl")))
                 .unwrap();
             let writer = SessionWriter::with_io(
-                session.id,
+                id,
                 FailingForkIo {
                     log,
                     failure,
@@ -7918,8 +7901,7 @@ end })
                 },
                 1,
             );
-            prepared.checkpoint = Arc::new(writer.clone());
-            prepared.app.app.session_writer = Some(writer);
+            prepared.checkpoint = Arc::new(writer);
         }
         let mut runtime = prepared.activate(&ctx.model_slot, None).unwrap();
         runtime.app.restore_display();
@@ -8011,10 +7993,7 @@ end })
                 let rt = &mut event_loop.sessions[0];
                 let app = &mut rt.app;
                 assert_eq!(app.main_chat().last_message_text(), REWIND_TARGET);
-                assert_eq!(
-                    app.state.session.meta.input_draft.as_deref(),
-                    Some(CHILD_PROMPT)
-                );
+                assert_eq!(app.state.projection.draft(), Some(CHILD_PROMPT));
                 assert!(ticket.peek_result().is_none());
                 assert!(child_ticket.peek_result().is_some());
                 assert!(child_actor.pending_queue().is_empty());
@@ -8057,6 +8036,7 @@ end })
                     .unwrap();
                 rt.app.input_box.set_input(REWIND_DRAFT.into());
                 rt.app.persist_input();
+                rt.app.refresh_session_projection();
                 rt.app.sync_focused_queue();
                 rt.app.queue.set_focus();
                 let events = journal.context_events();
@@ -8075,10 +8055,7 @@ end })
                 );
                 assert_eq!(rt.app.main_chat().last_message_text(), REWIND_TARGET);
                 assert_eq!(rt.app.input_box.buffer.value(), REWIND_DRAFT);
-                assert_eq!(
-                    rt.app.state.session.meta.input_draft.as_deref(),
-                    Some(REWIND_DRAFT)
-                );
+                assert_eq!(rt.app.state.projection.draft(), Some(REWIND_DRAFT));
                 assert_eq!(rt.app.queue.focus(), Some(0));
                 assert_eq!(rt.app.queue.text_messages(), [REWIND_QUEUED]);
                 assert_eq!(actor.snapshot().queued, 1);
@@ -8272,7 +8249,7 @@ end })
         let runtime_generation = runtime.generation;
         let manager_generation = runtime.handles.manager_and_root().0.generation();
         let root_id = runtime.handles.manager_and_root().1;
-        assert_eq!(runtime.app.state.session.root_agent_id(), Some(root_id));
+        assert_eq!(runtime.app.state.projection.root_agent_id(), Some(root_id));
         runtime.app.input_box.set_input(DRAFT.into());
 
         let restarted = harness.restart(runtime);
@@ -8284,16 +8261,33 @@ end })
                 runtime.handles.manager_and_root().0.generation(),
                 manager_generation
             );
-            assert_eq!(runtime.app.state.session.messages().len(), 1);
             assert_eq!(
-                runtime.app.state.session.messages()[0].user_text(),
+                runtime
+                    .app
+                    .state
+                    .projection
+                    .root_history()
+                    .unwrap()
+                    .messages
+                    .len(),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .app
+                    .state
+                    .projection
+                    .root_history()
+                    .unwrap()
+                    .messages[0]
+                    .user_text(),
                 Some(HISTORY)
             );
             let history = runtime.handles.history.load();
             assert_eq!(history.messages.len(), 1);
             assert_eq!(history.messages[0].user_text(), Some(HISTORY));
             assert_eq!(runtime.handles.manager_and_root().1, root_id);
-            assert_eq!(runtime.app.state.session.root_agent_id(), Some(root_id));
+            assert_eq!(runtime.app.state.projection.root_agent_id(), Some(root_id));
             assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
         });
     }
@@ -8334,12 +8328,14 @@ end })
             let runtime = event_loop.sessions.pop().unwrap();
             assert_eq!(runtime.app.chats[runtime.app.active_chat].name, CHILD_LABEL);
 
-            let mut session = (*runtime.app.state.session).clone();
-            project_session_journal(&mut session, &runtime.handles).unwrap();
-            let journal_child = manager.journal().agent(child_id).unwrap();
+            let id = runtime.id();
+            let journal = manager.journal();
+            smol::block_on(journal.flush()).unwrap();
+            let session = journal.snapshot().fold().unwrap();
+            let journal_child = journal.agent(child_id).unwrap();
             assert_eq!(
                 session
-                    .agents()
+                    .agents
                     .values()
                     .filter(|record| record.parent.is_some())
                     .collect::<Vec<_>>(),
@@ -8347,8 +8343,7 @@ end })
             );
             release_runtime(runtime);
             let storage = &event_loop.ctx.storage;
-            session.save(storage).unwrap();
-            let loaded = AppSession::load(session.id, storage).unwrap();
+            let loaded = AppSession::load(id, storage).unwrap();
             assert_eq!(
                 loaded.agents()[&child_id].label.as_deref(),
                 Some(CHILD_LABEL)
@@ -8392,20 +8387,24 @@ end })
             .unwrap()
             .to_path_buf();
 
-        runtime
-            .app
-            .state
-            .session_mut()
-            .push_message(Message::user(UNSAVED.into()));
+        let mut display_history = runtime.handles.history.load().messages.as_ref().clone();
+        display_history.push(Message::user(UNSAVED.into()));
         runtime
             .handles
             .history
-            .store(Arc::new(runtime.app.state.session.history_snapshot()));
+            .store(Arc::new(HistorySnapshot::new(display_history)));
         runtime.app.input_box.set_input(UNSAVED_DRAFT.into());
         assert_eq!(runtime.handles.history.load().messages.len(), 2);
         assert_eq!(
-            runtime.app.state.session.messages()[1].user_text(),
-            Some(UNSAVED)
+            runtime
+                .app
+                .state
+                .projection
+                .root_history()
+                .unwrap()
+                .messages
+                .len(),
+            1
         );
 
         let mut restarted = harness.snapshot_crash(runtime);
@@ -8428,9 +8427,26 @@ end })
                 runtime.handles.manager_and_root().0.generation(),
                 manager_generation
             );
-            assert_eq!(runtime.app.state.session.messages().len(), 1);
             assert_eq!(
-                runtime.app.state.session.messages()[0].user_text(),
+                runtime
+                    .app
+                    .state
+                    .projection
+                    .root_history()
+                    .unwrap()
+                    .messages
+                    .len(),
+                1
+            );
+            assert_eq!(
+                runtime
+                    .app
+                    .state
+                    .projection
+                    .root_history()
+                    .unwrap()
+                    .messages[0]
+                    .user_text(),
                 Some(PERSISTED)
             );
             let history = runtime.handles.history.load();
@@ -8447,8 +8463,8 @@ end })
         let mut session = harness.session();
         session.push_message(Message::user(BODY.into()));
         let id = session.id;
-        let mut runtime = harness.runtime(session);
-        checkpoint_runtime(&mut runtime);
+        let runtime = harness.runtime(session);
+        smol::block_on(runtime.handles.manager_and_root().0.journal().flush()).unwrap();
         let store = Arc::clone(runtime.handles.offload.as_ref().unwrap());
         let expected = makima_storage::sessions::offload_dir(&harness.ctx().sessions_dir, id);
         assert_eq!(store.dir(), expected);
@@ -8644,10 +8660,7 @@ end })
                 event_loop.set_focused(idx);
             }
             let id = event_loop.sessions[event_loop.focused].id();
-            let mut stored = Arc::unwrap_or_clone(Arc::clone(
-                &event_loop.sessions[event_loop.focused].app.state.session,
-            ));
-            stored.save(&event_loop.ctx.storage).unwrap();
+            assert!(AppSession::load(id, &event_loop.ctx.storage).is_ok());
 
             let (reply_tx, reply_rx) = flume::bounded(1);
             event_loop
@@ -9283,7 +9296,7 @@ end })
             let restored_index = event_loop.position(stored.id).unwrap();
             assert_eq!(event_loop.focused, restored_index);
             assert_eq!(event_loop.sessions.len(), 4);
-            assert_eq!(event_loop.sessions[2].app.state.session.model, FIRST);
+            assert_eq!(event_loop.sessions[2].app.state.projection.model(), FIRST);
             send(event_loop, restored_index);
             assert_eq!(
                 requests_rx.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(),
@@ -9588,9 +9601,8 @@ end })
             stored.save(&event_loop.ctx.storage).unwrap();
             event_loop.sessions[0]
                 .app
-                .state
-                .session_mut()
-                .push_message(Message::user(STARTUP_PROMPT.into()));
+                .input_box
+                .set_input(STARTUP_PROMPT.into());
 
             let (reply_tx, reply_rx) = flume::bounded(1);
             event_loop.handle_session_request(
@@ -9875,9 +9887,7 @@ end })
         assert!(policy.workflow);
         assert!(!policy.fast);
 
-        let mut reload = Arc::unwrap_or_clone(Arc::clone(&runtime.app.state.session));
-        project_session_journal(&mut reload, &runtime.handles).unwrap();
-        let view = reload.latest_state().unwrap();
+        let view = manager.journal().snapshot().fold().unwrap();
         assert_eq!(view.scopes[&None].yolo, Some(true));
         assert!(view.scopes[&Some(root)].config.as_ref().unwrap().workflow);
         release_runtime(runtime);
@@ -10576,7 +10586,7 @@ end })
             stored.mode
         );
         assert_eq!(*runtime.handles.cwd_slot().load_full(), cwd);
-        assert_eq!(runtime.app.state.session.cwd, stored.cwd);
+        assert_eq!(runtime.app.state.projection.cwd(), stored.cwd);
         let loaded = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
         stored.options = runtime.coordinator.read().options().config_values();
         assert_eq!(
@@ -10610,11 +10620,7 @@ end })
             smol::block_on(bounded_session_op(
                 async {
                     prepared
-                        .app
-                        .app
-                        .session_writer
-                        .as_ref()
-                        .unwrap()
+                        .checkpoint
                         .close()
                         .await
                         .map_err(|error| error.to_string())
@@ -10809,11 +10815,10 @@ end })
         runtime.activate_deferred();
         assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
 
-        runtime.app.checkpoint_now();
-        assert_eq!(
-            runtime.app.state.session.meta.input_draft.as_deref(),
-            Some(DRAFT)
-        );
+        assert_eq!(runtime.app.state.projection.draft(), Some(DRAFT));
+        smol::block_on(runtime.handles.manager_and_root().0.journal().flush()).unwrap();
+        let stored = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
+        assert_eq!(stored.meta.input_draft.as_deref(), Some(DRAFT));
 
         release_runtime(runtime);
     }
@@ -10920,13 +10925,12 @@ end })
     #[test]
     fn empty_replacement_loads_session_permission_rules_during_preparation() {
         let harness = RuntimeHarness::new();
-        let mut current = harness.runtime(harness.session());
+        let current = harness.runtime(harness.session());
         current.app.permissions.apply_decision(
             &makima_config::ToolKey::native("bash"),
             &["cargo test".into()],
             &PermissionAnswer::AllowSession,
         );
-        current.app.checkpoint();
         let mut replacement = harness.session();
         replacement.meta.session_rules = current.app.permissions.snapshot().stored_rules();
         assert!(replacement.messages().is_empty());
@@ -10988,10 +10992,16 @@ end })
 
         assert!(runtime.app.permissions.is_yolo());
         assert_eq!(runtime.app.permissions.snapshot().yolo, Some(true));
-        let mut session = (*runtime.app.state.session).clone();
-        project_session_journal(&mut session, &runtime.handles).unwrap();
         assert_eq!(
-            session.latest_state().unwrap().scopes[&None].yolo,
+            runtime
+                .app
+                .state
+                .projection
+                .fold()
+                .unwrap()
+                .scopes
+                .get(&None)
+                .and_then(|scope| scope.yolo),
             Some(true)
         );
         let stored = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
@@ -11021,13 +11031,24 @@ end })
             ..Default::default()
         });
 
-        let mut runtime = harness
+        let runtime = harness
             .prepare()
             .activate(&harness.ctx().model_slot, None)
             .unwrap();
 
         assert!(runtime.app.permissions.is_yolo());
-        assert_eq!(runtime.app.state.session.meta.yolo, None);
+        assert_eq!(
+            runtime
+                .app
+                .state
+                .projection
+                .fold()
+                .unwrap()
+                .scopes
+                .get(&None)
+                .and_then(|scope| scope.yolo),
+            None
+        );
         let options = runtime.coordinator.read().options();
         let yolo = options
             .options
@@ -11041,9 +11062,9 @@ end })
             makima_agent::session_options::ENABLED_VALUE
         );
 
-        checkpoint_runtime(&mut runtime);
-        assert!(runtime.app.permissions.is_yolo());
-        assert_eq!(runtime.app.state.session.meta.yolo, None);
+        smol::block_on(runtime.handles.manager_and_root().0.journal().flush()).unwrap();
+        let stored = AppSession::load(runtime.id(), &harness.ctx().storage).unwrap();
+        assert_eq!(stored.meta.yolo, None);
         release_runtime(runtime);
     }
 
@@ -11744,10 +11765,18 @@ end })
             dispatch_cd(event_loop, moved.clone());
             pump_directory_change(event_loop).unwrap();
             assert_eq!(observed_cwds(event_loop, &host), expected);
+            let runtime = &event_loop.sessions[0];
+            assert_eq!(runtime.app.state.projection.cwd(), expected[0]);
+            let stored = AppSession::load(runtime.id(), &event_loop.ctx.storage).unwrap();
+            assert_eq!(stored.cwd, expected[0]);
 
             dispatch_cd(event_loop, moved.join("missing"));
             assert!(pump_directory_change(event_loop).is_err());
             assert_eq!(observed_cwds(event_loop, &host), expected);
+            assert_eq!(
+                event_loop.sessions[0].app.state.projection.cwd(),
+                expected[0]
+            );
         });
     }
 
@@ -11843,7 +11872,7 @@ end })
             );
             assert!(Arc::ptr_eq(&original, &actor.effective_config().unwrap()));
             assert_eq!(
-                event_loop.sessions[0].app.state.session.cwd,
+                event_loop.sessions[0].app.state.projection.cwd(),
                 original.context.cwd().to_string_lossy()
             );
         });
@@ -12782,11 +12811,6 @@ end })
         };
         std::fs::write(&path, format!("{} replacement", std::process::id())).unwrap();
         runtime.lock_lost = true;
-        runtime
-            .app
-            .state
-            .session_mut()
-            .push_message(Message::user("must not save".into()));
         session.truncate_messages(1);
         session.model = runtime.app.root_config().model.spec();
         let error = harness
@@ -12797,7 +12821,6 @@ end })
         assert_eq!(error, LOCK_LOST_REPLACEMENT_ERR);
         assert!(runtime.lock_lost);
         assert!(runtime.session_lock.is_none());
-        checkpoint_runtime(&mut runtime);
         assert_eq!(
             serde_json::to_value(
                 AppSession::load(id, &harness.ctx().storage)
@@ -13052,9 +13075,9 @@ end })
         else {
             panic!("runtime must retain its held lease");
         };
-        runtime.app.checkpoint_now();
+        runtime.app.persist_input();
 
-        let writer = runtime.app.session_writer.clone().unwrap();
+        let writer = Arc::clone(&runtime.checkpoint);
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -13092,11 +13115,7 @@ end })
         session.push_message(Message::user(BASELINE.into()));
         session.save(&harness.ctx().storage).unwrap();
         let mut runtime = harness.runtime(session);
-        runtime
-            .app
-            .state
-            .session_mut()
-            .push_message(Message::user(UNSAVED.into()));
+        runtime.app.input_box.set_input(UNSAVED.into());
         let (internal_tx, _internal_rx) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
@@ -13122,7 +13141,7 @@ end })
         ));
         cleanup.join().unwrap();
 
-        let writer = runtime.app.session_writer.clone().unwrap();
+        let writer = Arc::clone(&runtime.checkpoint);
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -13134,6 +13153,7 @@ end })
         let stored = AppSession::load(id, &storage).unwrap();
         assert_eq!(stored.messages().len(), 1);
         assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
+        assert!(stored.meta.input_draft.is_none());
     }
 
     #[test]
@@ -13147,11 +13167,7 @@ end })
         session.push_message(Message::user(BASELINE.into()));
         session.save(&harness.ctx().storage).unwrap();
         let mut runtime = harness.runtime(session);
-        runtime
-            .app
-            .state
-            .session_mut()
-            .push_message(Message::user(UNSAVED.into()));
+        runtime.app.input_box.set_input(UNSAVED.into());
         let (internal_tx, _internal_rx) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
@@ -13171,7 +13187,7 @@ end })
             }
         });
 
-        let writer = runtime.app.session_writer.clone().unwrap();
+        let writer = Arc::clone(&runtime.checkpoint);
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -13183,6 +13199,7 @@ end })
         let stored = AppSession::load(id, &storage).unwrap();
         assert_eq!(stored.messages().len(), 1);
         assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
+        assert!(stored.meta.input_draft.is_none());
     }
 
     #[test]
@@ -13440,33 +13457,30 @@ end })
     }
 
     #[test]
-    fn live_session_response_includes_main_message_count() {
-        let mut app = crate::app::tests::test_app();
-        app.state
-            .session_mut()
-            .push_message(Message::observation("kept".into()));
-        let row = live_session_row(app.state.session.id, &app, true);
-        assert_eq!(
-            row["message_count"], 1,
-            "no mirror falls back to the session"
-        );
+    fn live_session_response_counts_committed_root_history() {
+        with_event_loop_runtime(
+            |harness| {
+                let mut session = harness.session();
+                session.push_message(Message::user(STARTUP_PROMPT.into()));
+                harness.runtime(session)
+            },
+            |event_loop| {
+                let runtime = &mut event_loop.sessions[0];
+                let row = live_session_row(&runtime.app, true);
+                assert_eq!(row["message_count"], 1);
+                assert_eq!(row["focused"], true);
+                assert_eq!(row["status"], "idle");
 
-        let messages = vec![
-            Message::observation("one".into()),
-            Message::observation("two".into()),
-        ];
-        let mirror: makima_agent::SharedMessages = Arc::new(arc_swap::ArcSwap::from_pointee(
-            makima_agent::HistorySnapshot::new(messages),
-        ));
-        let mut app = crate::app::tests::test_app();
-        app.shared_history = Some(mirror);
-        let row = live_session_row(app.state.session.id, &app, true);
-        assert_eq!(
-            row["message_count"], 2,
-            "the live mirror wins over the checkpoint"
+                runtime
+                    .handles
+                    .history
+                    .store(Arc::new(HistorySnapshot::new(vec![
+                        Message::user(STARTUP_PROMPT.into()),
+                        Message::observation(OBSERVATION.into()),
+                    ])));
+                assert_eq!(live_session_row(&runtime.app, true)["message_count"], 1);
+            },
         );
-        assert_eq!(row["focused"], true);
-        assert_eq!(row["status"], "idle");
     }
 
     struct FakeHost;
@@ -13744,12 +13758,25 @@ end })
             let after = actor.config_snapshot().unwrap();
             assert_eq!(after.generation, before.generation + 1);
             assert!(Arc::ptr_eq(&after.config.provider, &committed_provider));
+            let runtime = &event_loop.sessions[0];
+            let view = runtime.app.state.projection.fold().unwrap();
+            let projected = view.scopes[&Some(root)].config.as_ref().unwrap();
+            assert_eq!(runtime.app.state.projection.model(), MODEL);
+            assert_eq!(projected.model, MODEL);
+            let stored = AppSession::load(runtime.id(), &event_loop.ctx.storage).unwrap();
+            let stored_view = stored.latest_state().unwrap();
+            assert_eq!(
+                stored_view.scopes[&Some(root)].config.as_ref(),
+                Some(projected)
+            );
             assert_eq!(after.config.model.spec(), MODEL);
             let expected = RequestOptions {
                 thinking: expected_thinking,
                 fast,
             }
             .clamped(&after.config.model);
+            assert_eq!(projected.thinking, Some(expected.thinking.into()));
+            assert_eq!(projected.fast, expected.fast);
             assert_eq!(after.config.thinking, expected.thinking);
             assert_eq!(after.config.fast, expected.fast);
 

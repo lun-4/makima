@@ -22,19 +22,19 @@ impl App {
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
-        let snapshot = self
+        let projection = self.session_projection();
+        let live = self
             .shared_history
             .as_ref()
             .map(|history| history.load_full());
-        let previous = snapshot.as_ref().and_then(|snapshot| {
+        let snapshot = live.as_deref().or_else(|| projection.root_history());
+        let previous = snapshot.and_then(|snapshot| {
             snapshot
                 .conversation
                 .as_ref()?
                 .link(ConversationRelation::Branches, snapshot.messages.len())
         });
-        let history = snapshot
-            .map(|snapshot| Vec::clone(&snapshot.messages))
-            .unwrap_or_default();
+        let history = snapshot.map_or_else(Vec::new, |snapshot| Vec::clone(&snapshot.messages));
         let system = self
             .btw_system
             .as_ref()
@@ -49,7 +49,7 @@ impl App {
             system,
             question,
             images,
-            session_id: Some(SessionRef::from(self.state.session.id)),
+            session_id: Some(SessionRef::from(projection.id)),
             cancel: makima_agent::CancelToken::none(),
         });
     }

@@ -5,12 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig, PreparedModel};
+use makima_agent::journal::{SessionJournal, SessionJournalSnapshot};
 use makima_agent::{AgentMode, ModeId, ModeRegistry, RunSettings, SessionDefaults};
 use makima_agent::{modes, plan_state, session_defaults};
-use makima_config::ModelPolicy;
+use makima_providers::Model;
 use makima_providers::provider::Provider;
-use makima_providers::{Model, ProviderRegistry};
 use makima_storage::StateDir;
+#[cfg(test)]
 use makima_storage::session_state::StoredAgentConfig;
 use makima_storage::sessions::{StoredMode, read_prefs};
 
@@ -47,9 +48,7 @@ impl ConfigSource {
 }
 
 pub(crate) struct SessionState {
-    /// Shared with the writer thread, so a checkpoint is just a refcount bump.
-    pub session: Arc<AppSession>,
-    pub context_size: u32,
+    pub(crate) projection: Arc<SessionJournalSnapshot>,
     pub plan: PlanState,
     pub warnings: Vec<String>,
 }
@@ -57,39 +56,20 @@ pub(crate) struct SessionState {
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
 
 impl SessionState {
-    pub fn from_session(
-        mut session: AppSession,
-        fallback_model: &Model,
-        model_policy: &ModelPolicy,
-        providers: &ProviderRegistry,
-    ) -> Self {
-        let stored = match session.latest_state() {
-            Ok(view) => session
-                .root_agent_id()
-                .and_then(|root| view.scopes.get(&Some(root)))
-                .and_then(|scope| scope.config.clone()),
-            Err(error) => {
-                tracing::error!(%error, "could not fold session state for presentation");
-                None
-            }
-        };
-        let model = resumed_model(
-            &mut session,
-            stored.as_ref(),
-            fallback_model,
-            model_policy,
-            providers,
-        );
-        session.set_model(model.spec());
+    pub fn from_session(session: &AppSession) -> Result<Self> {
+        Self::from_projection(SessionJournal::from_session(session)?.projection())
+    }
 
+    fn from_projection(projection: Arc<SessionJournalSnapshot>) -> Result<Self> {
+        let view = projection.fold()?;
+        let root = projection.root_agent_id();
+        let stored = root
+            .and_then(|root| view.scopes.get(&Some(root)))
+            .and_then(|scope| scope.config.as_ref());
         let mut warnings = Vec::new();
-        let entries = session
-            .latest_state()
-            .ok()
-            .and_then(|view| plan_state::plan_entries(&view).ok())
-            .unwrap_or_default();
-        let entry = session.root_agent_id().and_then(|root| entries.get(&root));
-        let plan_path = stored.as_ref().map_or_else(
+        let entries = plan_state::plan_entries(&view).unwrap_or_default();
+        let entry = root.and_then(|root| entries.get(&root));
+        let plan_path = stored.map_or_else(
             || entry.map(|entry| entry.path.as_path()),
             |config| {
                 (ModeId::parse(&config.mode.id) == ModeId::Plan)
@@ -114,18 +94,11 @@ impl SessionState {
             None => PlanState::None,
         };
 
-        let context_size = session.meta.context_size;
-
-        Self {
-            session: Arc::new(session),
-            context_size,
+        Ok(Self {
+            projection,
             plan,
             warnings,
-        }
-    }
-
-    pub fn session_mut(&mut self) -> &mut AppSession {
-        Arc::make_mut(&mut self.session)
+        })
     }
 
     /// The configuration the agent is seeded with: the session being resumed,
@@ -140,13 +113,13 @@ impl SessionState {
         storage: &StateDir,
         defaults: SessionDefaults,
     ) -> Result<EffectiveAgentConfig> {
-        let view = self.session.latest_state()?;
-        let stored = self.session.root_agent_id().and_then(|root| {
+        let view = self.projection.fold()?;
+        let stored = self.projection.root_agent_id().and_then(|root| {
             view.scopes
                 .get(&Some(root))
                 .and_then(|scope| scope.config.as_ref())
         });
-        let root = self.session.root_agent_id();
+        let root = self.projection.root_agent_id();
         let (mode, mode_def) = match (stored, root) {
             (Some(config), Some(root)) => {
                 let restored =
@@ -160,7 +133,7 @@ impl SessionState {
                     .path()
                     .map(|path| AgentMode::Plan(path.to_path_buf()))
                     .unwrap_or(AgentMode::Build);
-                let restored = modes::saved(&self.session.meta).map_or_else(
+                let restored = modes::saved(self.projection.seed_meta()).map_or_else(
                     || Ok((AgentMode::Build, registry.current(&AgentMode::Build))),
                     |(key, _)| modes::resolve(registry, key, &current, storage),
                 );
@@ -188,8 +161,10 @@ impl SessionState {
         let settings = session_defaults::resolve(
             defaults,
             &read_prefs(storage),
-            &self.session.meta,
-            self.session.messages().is_empty(),
+            self.projection.seed_meta(),
+            self.projection
+                .root_history()
+                .is_none_or(|history| history.messages.is_empty()),
             model,
         );
         Ok(EffectiveAgentConfig::new(
@@ -210,8 +185,8 @@ impl SessionState {
     pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
         match config.mode.plan_path() {
             Some(path) if self.plan.path() != Some(path) => {
-                let ready = self.session.latest_state().ok().is_some_and(|view| {
-                    let Some(root) = self.session.root_agent_id() else {
+                let ready = self.projection.fold().ok().is_some_and(|view| {
+                    let Some(root) = self.projection.root_agent_id() else {
                         return false;
                     };
                     plan_state::plan_entries(&view)
@@ -231,43 +206,6 @@ impl SessionState {
             }
             None => self.plan = PlanState::None,
             Some(_) => {}
-        }
-    }
-
-    /// Updates the presentation header from the root's committed model.
-    pub fn update_model(&mut self, model: &Model) {
-        self.session_mut().set_model(model.spec());
-    }
-}
-
-/// The model a resumed session is accounted against.
-fn resumed_model(
-    session: &mut AppSession,
-    stored: Option<&StoredAgentConfig>,
-    fallback_model: &Model,
-    model_policy: &ModelPolicy,
-    providers: &ProviderRegistry,
-) -> Model {
-    // A caller that resolved the session's own model hands in a value that
-    // has already been through its provider, so it is richer than anything a
-    // rebuild from the spec could produce. Only a saved model the caller did
-    // not resolve gets rebuilt.
-    let spec = stored.map_or(session.model.as_str(), |config| config.model.as_str());
-    if model_policy.allows(spec) && fallback_model.spec() == spec {
-        fallback_model.clone()
-    } else {
-        match model_policy
-            .allows(spec)
-            .then(|| providers.model(spec))
-            .transpose()
-            .ok()
-            .flatten()
-        {
-            Some(model) => model,
-            None => {
-                session.model = fallback_model.spec();
-                fallback_model.clone()
-            }
         }
     }
 }
@@ -296,15 +234,8 @@ mod tests {
     use makima_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
     use test_case::test_case;
 
-    const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
-
-    fn resumed(session: AppSession, model: &Model) -> SessionState {
-        SessionState::from_session(
-            session,
-            model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        )
+    fn resumed(session: AppSession) -> SessionState {
+        SessionState::from_session(&session).unwrap()
     }
 
     fn make_plan_session(mode: Option<StoredMode>, plan_path: Option<String>) -> AppSession {
@@ -348,12 +279,7 @@ mod tests {
         model.fast_support = Some(support);
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let mut state = SessionState::from_session(
-            session,
-            &model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        );
+        let mut state = SessionState::from_session(&session).unwrap();
         let seeded = state
             .starting_config(
                 makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()).provider,
@@ -410,7 +336,7 @@ mod tests {
         session.meta.workflow = !enabled;
         session.meta.mode = Some(StoredMode::Plan);
         session.meta.thinking = Some(StoredThinking::Adaptive);
-        let mut state = resumed(session, &model);
+        let mut state = resumed(session);
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let config = state
@@ -455,7 +381,7 @@ mod tests {
         }
         session.resolve_legacy_config(stored).unwrap();
         session.meta.mode = Some(StoredMode::Plan);
-        let mut state = resumed(session, &model);
+        let mut state = resumed(session);
         let tmp = tempfile::tempdir().unwrap();
         let config = state.starting_config(
             makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
@@ -538,13 +464,13 @@ mod tests {
         assert!(!path.exists());
         assert!(!state.warnings.is_empty());
         assert_eq!(
-            plan_state::plan_entries(&state.session.latest_state().unwrap()).unwrap()[&root],
+            plan_state::plan_entries(&state.projection.fold().unwrap()).unwrap()[&root],
             entry
         );
     }
 
     #[test]
-    fn model_presentation_update_does_not_change_durable_fast_intent() {
+    fn model_projection_preserves_durable_fast_intent() {
         let model = test_model();
         let mut session = AppSession::new("test-model", "/tmp");
         let mut stored = stored_config(&model);
@@ -552,16 +478,13 @@ mod tests {
             .options
             .insert(FAST_PENDING_MODEL_OPTION_ID.into(), model.spec());
         session.resolve_legacy_config(stored.clone()).unwrap();
-        let mut state = resumed(session, &model);
-        let replacement = Model {
-            id: UNRESOLVABLE_MODEL.into(),
-            ..model
-        };
-        state.update_model(&replacement);
-        assert_eq!(state.session.model, replacement.spec());
-        let view = state.session.latest_state().unwrap();
+        let state = resumed(session);
+        assert_eq!(state.projection.model(), model.spec());
+        let view = state.projection.fold().unwrap();
         assert_eq!(
-            view.scopes[&state.session.root_agent_id()].config.as_ref(),
+            view.scopes[&state.projection.root_agent_id()]
+                .config
+                .as_ref(),
             Some(&stored)
         );
     }
@@ -572,12 +495,7 @@ mod tests {
     /// then let the app adopt it.
     fn restore(session: AppSession, storage: &StateDir) -> (SessionState, EffectiveAgentConfig) {
         let model = test_model();
-        let mut state = SessionState::from_session(
-            session,
-            &model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        );
+        let mut state = SessionState::from_session(&session).unwrap();
         let config = state
             .starting_config(
                 makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
@@ -610,7 +528,7 @@ mod tests {
         .unwrap();
         let mut model = test_model();
         model.thinking_support = None;
-        let mut state = resumed(AppSession::new("test-model", "/tmp"), &model);
+        let mut state = resumed(AppSession::new("test-model", "/tmp"));
         let config = state
             .starting_config(
                 makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
@@ -648,7 +566,7 @@ mod tests {
         assert!(modes::is_read_only_fallback(&config.mode));
         assert_eq!(config.mode_def.unwrap().tools, Some(Vec::new()));
         assert!(state.plan.path().is_none());
-        assert_eq!(state.session.meta.mode, mode);
+        assert_eq!(state.projection.seed_meta().mode, mode);
         assert_eq!(state.warnings.len(), 1);
     }
 
@@ -676,29 +594,6 @@ mod tests {
         );
         let (state, _) = restore(session, &storage);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
-    }
-
-    #[test]
-    fn disallowed_restored_model_uses_fallback() {
-        let fallback = test_model();
-        let mut session = make_plan_session(Some(StoredMode::Build), None);
-        session.model = "openai/gpt-5".into();
-        let raw: makima_config::RawConfig = serde_json::from_value(serde_json::json!({
-            "provider": {"allowed_models": [fallback.spec()]}
-        }))
-        .unwrap();
-        let policy = raw.into_config().unwrap().provider.model_policy;
-
-        let model = resumed_model(
-            &mut session,
-            None,
-            &fallback,
-            &policy,
-            &ProviderRegistry::default(),
-        );
-
-        assert_eq!(model.spec(), fallback.spec());
-        assert_eq!(session.model, fallback.spec());
     }
 
     #[test]

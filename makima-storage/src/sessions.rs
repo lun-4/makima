@@ -2508,13 +2508,6 @@ where
 
     fn touch(&mut self) {
         self.content_revision += 1;
-        self.touch_soft();
-    }
-
-    /// Only UI state moved, so the write can wait for company. Everything a
-    /// crash would lose for good goes through `touch`, which is the default a
-    /// new mutator gets by not thinking about it.
-    fn touch_soft(&mut self) {
         self.updated_at = now_epoch();
         self.revision += 1;
     }
@@ -2643,48 +2636,6 @@ where
         self.meta.compacted = snapshot.compacted;
         self.meta.conversation = snapshot.conversation.clone();
         self.touch();
-    }
-
-    /// Applies everything the owner mirrors from live state. It takes an `Arc`
-    /// and checks for a real change first because `Arc::make_mut` deep-copies
-    /// the whole session while the writer still holds the last snapshot, and an
-    /// idle session should not pay for that every frame.
-    pub fn checkpoint(
-        this: &mut Arc<Self>,
-        history: Option<&HistorySnapshot<M>>,
-        mut meta: SessionMeta,
-        token_usage: U,
-    ) where
-        M: Clone,
-        U: PartialEq + Clone,
-        T: Clone,
-    {
-        if let Some(snapshot) = history {
-            meta.compacted = snapshot.compacted;
-            meta.conversation = snapshot.conversation.clone();
-        } else {
-            meta.compacted = this.meta.compacted;
-            meta.conversation = this.meta.conversation.clone();
-        }
-        if let Some(legacy) = &this.legacy_config
-            && this.root_config().is_ok_and(|config| config.is_none())
-        {
-            legacy.restore(&mut meta);
-        }
-        let history = history.filter(|h| {
-            !Arc::ptr_eq(&this.messages, &h.messages)
-                || h.compacted != this.meta.compacted
-                || h.conversation != this.meta.conversation
-        });
-        if history.is_none() && this.meta == meta && this.token_usage == token_usage {
-            return;
-        }
-        let session = Arc::make_mut(this);
-        if let Some(snapshot) = history {
-            session.adopt_history(snapshot);
-        }
-        session.set_meta(meta);
-        session.set_token_usage(token_usage);
     }
 
     /// A change under an existing id is not expressible as an append, so it
@@ -2848,25 +2799,6 @@ where
             Arc::make_mut(&mut snapshot.ids)[..previous.ids.len()].copy_from_slice(&previous.ids);
         }
         assert!(self.adopt_subagent_history(id, &snapshot));
-    }
-
-    fn set_token_usage(&mut self, usage: U)
-    where
-        U: PartialEq,
-    {
-        if self.token_usage == usage {
-            return;
-        }
-        self.token_usage = usage;
-        self.touch();
-    }
-
-    fn set_meta(&mut self, meta: SessionMeta) {
-        if self.meta == meta {
-            return;
-        }
-        self.meta = meta;
-        self.touch_soft();
     }
 
     pub fn posts(&self) -> &[StoredPost] {
@@ -3870,18 +3802,10 @@ mod tests {
             "plan_path":"plan.md", "plan_written":true
         });
         fs::write(jsonl_path(tmp.path(), id), format!("{header}\n{meta}\n")).unwrap();
-        let mut session = Arc::new(TestSession::load_from(id, tmp.path()).unwrap());
+        let mut session = TestSession::load_from(id, tmp.path()).unwrap();
         let legacy = session.meta.clone();
-        TestSession::checkpoint(
-            &mut session,
-            None,
-            SessionMeta {
-                input_draft: Some(PENDING_DRAFT.into()),
-                ..Default::default()
-            },
-            Value::Null,
-        );
-        Arc::make_mut(&mut session).save_to(tmp.path()).unwrap();
+        session.meta.input_draft = Some(PENDING_DRAFT.into());
+        session.save_to(tmp.path()).unwrap();
         let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
         assert_eq!(loaded.meta.mode, legacy.mode);
         assert_eq!(loaded.meta.thinking, legacy.thinking);
@@ -4883,9 +4807,6 @@ mod tests {
         assert_eq!(session.revision(), revision);
     }
 
-    /// The mirror re-adopts the run's snapshot on every checkpoint; that must
-    /// not erase the void minted by a same-frame in-place replacement, or the
-    /// writer appends onto a stale prefix and persists a mixed transcript.
     #[test]
     fn bootstrap_history_uses_current_root_metadata_over_retained_events() {
         let directory = TempDir::new().unwrap();
@@ -4903,22 +4824,28 @@ mod tests {
     }
 
     #[test]
-    fn compacted_history_metadata_round_trips_and_survives_meta_checkpoint() {
+    fn compacted_history_metadata_round_trips_and_survives_draft_update() {
         let tmp = TempDir::new().unwrap();
-        let mut session: Arc<TestSession> = Arc::new(Session::new("m", "/project"));
+        let mut session = TestSession::new("m", "/project");
         let mut snapshot = HistorySnapshot::new(vec![user_message("summary")]);
         snapshot.compacted = true;
-        Session::checkpoint(
-            &mut session,
-            Some(&snapshot),
-            SessionMeta::default(),
-            Value::Null,
-        );
-        Session::checkpoint(&mut session, None, SessionMeta::default(), Value::Null);
+        session.adopt_history(&snapshot);
         assert!(session.history_snapshot().compacted);
-        Arc::make_mut(&mut session).save_to(tmp.path()).unwrap();
+        session.save_to(tmp.path()).unwrap();
+
+        let draft = SessionRecord::<Value, Value, Value>::Draft {
+            text: Some(PENDING_DRAFT.into()),
+        };
+        OpenOptions::new()
+            .append(true)
+            .open(jsonl_path(tmp.path(), session.id))
+            .unwrap()
+            .write_all(&encode_records(&[draft]).unwrap())
+            .unwrap();
+
         let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
         assert!(loaded.history_snapshot().compacted);
+        assert_eq!(loaded.meta.input_draft.as_deref(), Some(PENDING_DRAFT));
     }
 
     #[test]
@@ -5937,54 +5864,6 @@ mod tests {
             .unwrap(),
             "folded state"
         );
-    }
-
-    /// `Arc::make_mut` deep-copies the session while the writer holds the last
-    /// snapshot, and a checkpoint that changes nothing must not pay for it.
-    #[test]
-    fn unchanged_checkpoint_does_not_clone_the_session() {
-        let mut session: TestSession = Session::new("m", "/project");
-        session.push_message(user_message("hello"));
-        let snapshot = HistorySnapshot::new(session.messages().to_vec());
-        let mut session = Arc::new(session);
-        let meta = session.meta.clone();
-        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
-
-        let held = Arc::clone(&session);
-        Session::checkpoint(&mut session, Some(&snapshot), meta.clone(), Value::Null);
-        assert!(Arc::ptr_eq(&held, &session), "no change, no clone");
-
-        Session::checkpoint(
-            &mut session,
-            Some(&snapshot),
-            SessionMeta {
-                input_draft: Some("draft".into()),
-                ..meta
-            },
-            Value::Null,
-        );
-        assert!(!Arc::ptr_eq(&held, &session));
-        assert_eq!(session.meta.input_draft.as_deref(), Some("draft"));
-        assert!(session.revision() > held.revision());
-    }
-
-    /// What the owner types sits in `meta`, so `content_revision` is what tells
-    /// a keystroke, which can wait for the ones behind it, from a tool result,
-    /// which has to be on disk before the next crash.
-    #[test]
-    fn a_meta_only_change_leaves_content_revision_alone() {
-        let mut session: TestSession = Session::new("m", "/project");
-        let (revision, content) = (session.revision(), session.content_revision());
-
-        session.set_meta(SessionMeta {
-            input_draft: Some(PENDING_DRAFT.into()),
-            ..session.meta.clone()
-        });
-        assert!(session.revision() > revision, "still needs writing");
-        assert_eq!(session.content_revision(), content, "but it can wait");
-
-        session.push_message(user_message("hello"));
-        assert!(session.content_revision() > content);
     }
 
     #[test]

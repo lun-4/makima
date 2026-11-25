@@ -534,17 +534,15 @@ impl App {
         let (mode_label, mode_style) = self.mode_label();
         // A subagent chat names its own model. The main chat shows the model the
         // run is on, and marks a change the run has not reached yet.
+        let session_model = self.root_config().model.spec();
         let (model_id, model_switch_queued) = match chat.model_id.as_deref() {
             Some(model_id) => (model_id, false),
-            None => {
-                let session_model = self.state.session.model.as_str();
-                match self.run_model.as_deref() {
-                    Some(running) if self.status == Status::Streaming => {
-                        (running, running != session_model)
-                    }
-                    _ => (session_model, false),
+            None => match self.run_model.as_deref() {
+                Some(running) if self.status == Status::Streaming => {
+                    (running, running != session_model)
                 }
-            }
+                _ => (session_model.as_str(), false),
+            },
         };
         let config = self.focused_config();
         let model_switch_queued = render_chat == 0 && model_switch_queued;

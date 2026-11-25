@@ -19,7 +19,7 @@ use makima_providers::model::{Model, ModelTier};
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::StateDir;
 use makima_storage::id::MakimaId;
-use makima_ui::{AppSession, RunOutcome};
+use makima_ui::{AppSession, RunOutcome, StartupSessions};
 
 use super::load_config;
 use crate::cli::Cli;
@@ -407,7 +407,9 @@ pub fn run(mut cli: Cli, launch_cwd: PathBuf) -> Result<()> {
 
     let cwd_str = cwd.to_string_lossy().into_owned();
     let mut session_picker = session_picker_requested(&cli);
-    let mut tabs = vec![resumed.unwrap_or_else(|| AppSession::new(&stack.model.spec(), &cwd_str))];
+    let mut sessions = StartupSessions::Open(Box::new(
+        resumed.unwrap_or_else(|| AppSession::new(&stack.model.spec(), &cwd_str)),
+    ));
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut teardown = Teardown::default();
@@ -419,7 +421,7 @@ pub fn run(mut cli: Cli, launch_cwd: PathBuf) -> Result<()> {
                 needs_login: stack.needs_login,
                 explicit_model: apply_explicit_model,
                 commands: std::mem::take(&mut stack.commands),
-                sessions: std::mem::take(&mut tabs),
+                sessions,
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 storage: storage.clone(),
@@ -455,8 +457,9 @@ pub fn run(mut cli: Cli, launch_cwd: PathBuf) -> Result<()> {
         .context("run UI")?;
 
         match outcome {
-            RunOutcome::Exit { session_id, code } => {
-                if let Some(session_id) = session_id {
+            RunOutcome::Exit { session, code } => {
+                if let Some((session_id, title)) = session {
+                    tracing::info!(%session_id, %title, "session available to resume");
                     let colored = io::stderr().is_terminal();
                     eprintln!("{}", exit_resume_hint(&session_id.to_string(), colored));
                 }
@@ -503,16 +506,14 @@ pub fn run(mut cli: Cli, launch_cwd: PathBuf) -> Result<()> {
                 }
                 let (new_stack, new_warnings) =
                     build_stack(&cli, &cwd, &storage, &trust, Some(last_good))?;
-                tabs = reloaded;
-                if tabs.is_empty() {
-                    tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));
-                }
+                let tab_count = reloaded.len();
+                sessions = StartupSessions::Reload(reloaded);
                 stack = new_stack;
                 warnings = new_warnings;
-                focused = f.min(tabs.len() - 1);
+                focused = f;
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    tabs = tabs.len(),
+                    tabs = tab_count,
                     "reload: rebuilt plugins and config"
                 );
             }

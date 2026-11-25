@@ -19,7 +19,7 @@ use makima_storage::sessions::{HistorySnapshot, StoredRule};
 
 use super::{
     EventLoop, InternalEvent, SESSION_OP_TIMEOUT, SessionLockState, SessionRuntime,
-    bounded_session_op, project_session_journal,
+    bounded_session_op,
 };
 use crate::AppSession;
 use crate::components::{SessionReplacementKind, SessionReplacementRequest};
@@ -257,7 +257,11 @@ impl EventLoop<'_> {
             return self.sessions[idx].abort_plan_approval(error.to_string());
         }
         let runtime = &mut self.sessions[idx];
-        let parent_message = runtime.app.state.session.last_message_id();
+        runtime.app.refresh_session_projection();
+        let projection = runtime.app.session_projection();
+        let parent_message = projection
+            .root_history()
+            .and_then(|history| history.ids.last().copied());
         let Some(pending) = runtime.pending_approval.as_mut() else {
             return;
         };
@@ -392,7 +396,6 @@ impl EventLoop<'_> {
                             .map_err(|error| error.to_string())?,
                     )
                     .map_err(|error| error.to_string())?;
-                runtime.app.checkpoint_now();
                 Ok(session)
             })();
             match prepared {
@@ -418,12 +421,6 @@ impl EventLoop<'_> {
             let draft = runtime.app.input_box.buffer.value().to_owned();
             runtime.app.apply_history_change(history);
             runtime.app.input_box.set_input(draft);
-            if target.id() != root
-                && let Err(error) =
-                    project_session_journal(runtime.app.state.session_mut(), &runtime.handles)
-            {
-                runtime.app.flash(error);
-            }
         }
         if target.id() == root {
             runtime.project_config(&config);
