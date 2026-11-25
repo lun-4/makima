@@ -23,10 +23,10 @@ use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{TASK_SPAWN_TOOL_NAME, ToolRegistry, cli_tool_ctx};
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
-    DoneReason, EffectiveAgentConfig, History, HistorySnapshot, ImageMediaType, McpConfigErrors,
-    McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec, Post, PostLevel,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnContext, TurnFailure,
-    TurnFailureKind, TurnId, TurnOutcome,
+    BufferSnapshot, DoneReason, EffectiveAgentConfig, History, HistorySnapshot, ImageMediaType,
+    McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader, ModeDefSpec,
+    Post, PostLevel, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent, TurnContext,
+    TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
 };
 use makima_commands::ModelSelection;
 use makima_config::{PermissionsConfig, UiConfig};
@@ -3009,6 +3009,50 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
         app.chats[0].tool_turn_usage(TASK_ID),
         Some(expected.as_str())
     );
+}
+
+#[test]
+fn restore_snapshots_update_only_the_chat_with_the_tool_row() {
+    const HEADER: &str = "restored header";
+    const BODY: &str = "restored body";
+    const THEME_GEN: u64 = 5;
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(TASK_ID, TASK_SPAWN_TOOL_NAME)));
+    app.update(subagent_msg(
+        tool_start(SUB_TOOL_ID, "bash"),
+        TASK_ID,
+        Some(SUBAGENT_NAME),
+    ));
+    assert_eq!(app.chats.len(), 2);
+
+    let body = BufferSnapshot::plain_text(BODY.into());
+    let header = BufferSnapshot::plain_text(HEADER.into());
+    for event in [
+        AgentEvent::ToolSnapshot {
+            id: SUB_TOOL_ID.into(),
+            snapshot: body.clone(),
+            theme_gen: Some(THEME_GEN),
+        },
+        AgentEvent::ToolHeaderSnapshot {
+            id: SUB_TOOL_ID.into(),
+            snapshot: header.clone(),
+            theme_gen: Some(THEME_GEN),
+        },
+    ] {
+        app.update(agent_msg_with_run_id(event, RESTORE_PRESENTATION));
+    }
+
+    let child = app.chats[1].message_at(0).unwrap();
+    assert_eq!(child.text, HEADER);
+    assert_eq!(child.render_header.as_ref(), Some(&header));
+    assert_eq!(child.render_snapshot.as_ref(), Some(&body));
+    assert_eq!(child.snapshot_theme_gen, THEME_GEN);
+    assert_eq!(app.chats[0].message_count(), 1);
+    let root = app.chats[0].message_at(0).unwrap();
+    assert_eq!(root.text, SUBAGENT_NAME);
+    assert!(root.render_header.is_none());
+    assert!(root.render_snapshot.is_none());
+    assert_eq!(root.snapshot_theme_gen, 0);
 }
 
 #[test]

@@ -2894,12 +2894,17 @@ impl App {
                 } => (id, snapshot, theme_gen, true),
                 _ => return vec![],
             };
-            for chat in &mut self.chats {
+            if let Some(chat) = self.chats.iter_mut().find(|chat| chat.has_tool(&id)) {
                 if is_header {
-                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
+                    chat.tool_header_snapshot(&id, snapshot, theme_gen);
                 } else {
-                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
+                    chat.tool_snapshot(&id, snapshot, theme_gen);
                 }
+            } else {
+                tracing::warn!(
+                    tool_id = %id,
+                    is_header, "snapshot dropped: no tool message with this id"
+                );
             }
             return vec![];
         }
