@@ -10536,7 +10536,7 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
         for root_busy in [false, true] {
             for selected_busy in [false, true] {
                 for closed in [false, true] {
-                    if closed && selected_busy {
+                    if closed && (selected_busy || matches!(surface, RenderSurface::Plan)) {
                         continue;
                     }
                     let mut panels = Vec::new();
@@ -10553,7 +10553,7 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                         commit_root_model(&app, config.model.clone());
                         app.state.session_mut().model = config.model.spec();
                         if child {
-                            bind_actor_target(&app, target);
+                            bind_actor_target(&app, target.clone());
                         }
                         app.status = if if child { root_busy } else { selected_busy } {
                             Status::Streaming
@@ -10563,10 +10563,6 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                         app.active_chat = usize::from(child);
                         if !selected_busy {
                             app.chats[1].mark_finished(DisplayRole::Done, DONE_TEXT);
-                        }
-                        if closed {
-                            let id = app.chats[1].agent_id.unwrap();
-                            app.subagent_channels.get_mut(&id).unwrap().closed = true;
                         }
                         app.sync_focused_queue();
                         if child && selected_busy {
@@ -10611,6 +10607,10 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                                 app.plan_form.on_plan_ready();
                                 assert!(app.plan_form_active());
                             }
+                        }
+                        if closed {
+                            app.root_agent = Some(target.manager().root().unwrap());
+                            target.close_subtree().unwrap();
                         }
                         let rows = rendered_rows(&mut app, width, height);
                         let geometry = app.layout_geometry(Rect::new(0, 0, width, height));
@@ -10696,7 +10696,7 @@ fn viewed_agent_cancel_is_local() {
     app.handle_cancel();
     assert_eq!(app.chats[1].message_count(), child_count);
     assert!(!app.chats[1].is_finished());
-    assert!(app.subagent_channels.contains_key(&agent_id));
+    assert!(app.subagent_answers.contains_key(&agent_id));
 }
 
 #[test]
@@ -10774,13 +10774,13 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 #[test]
 fn cancel_subagent_retains_channel() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
-    assert!(!app.subagent_channels.is_empty());
+    assert!(!app.subagent_answers.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.subagent_channels.contains_key(&agent_id));
+    assert!(app.subagent_answers.contains_key(&agent_id));
 }
 
 #[test]
@@ -12546,6 +12546,35 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
     assert_eq!(received_input(&input_rx).message, "continue");
 }
 
+fn close_input_child(app: &mut App, info: &SubagentInfo) {
+    let target = app.focused_input_target().unwrap();
+    assert_eq!(target.id(), info.agent_id);
+    app.root_agent = Some(target.manager().root().unwrap());
+    target.close_subtree().unwrap();
+}
+
+#[test]
+fn dormant_child_submission_requests_wake() {
+    const INPUT: &str = "wake child";
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
+    let target = app.focused_input_target().unwrap();
+    let manager = target.manager();
+    app.root_agent = Some(manager.root().unwrap());
+    manager
+        .detach_incarnation(&target.incarnation().unwrap())
+        .unwrap();
+
+    let actions = app.handle_submit(Submission {
+        text: INPUT.into(),
+        images: Vec::new(),
+    });
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::WakeForInput { target: waking, submission }]
+            if waking.id() == target.id() && submission.text == INPUT
+    ));
+}
+
 #[test]
 fn subagent_closed_marks_despawned_and_rejects_input() {
     const LATE_FAILURE: &str = "late failure";
@@ -12557,6 +12586,8 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     app.open_tasks();
     assert!(!app.active_subagent_closed());
     assert!(app.task_picker.item(chat_idx).unwrap().is_spinning());
+    close_input_child(&mut app, &info);
+    assert!(app.active_subagent_closed());
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
@@ -12716,6 +12747,7 @@ fn final_history_after_subagent_closed_leaves_chat_closed() {
     }];
     app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
 
+    close_input_child(&mut app, &info);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
@@ -12758,6 +12790,7 @@ fn turn_complete_after_subagent_closed_only_updates_chat_cost() {
     };
     app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
 
+    close_input_child(&mut app, &info);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
         subagent: Some(info.clone()),
@@ -12770,6 +12803,7 @@ fn turn_complete_after_subagent_closed_only_updates_chat_cost() {
     })));
 
     assert_eq!(app.chats[chat_idx].cost, Some(COST));
+    assert_eq!(app.chats[chat_idx].context_size, 0);
     assert_eq!(app.chats.len(), chat_count);
     assert!(app.chats[chat_idx].is_finished());
     assert!(app.active_subagent_closed());
@@ -12855,6 +12889,7 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
     let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
     app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
 
+    close_input_child(&mut app, &info);
     for event in [
         AgentEvent::SubagentClosed,
         AgentEvent::TextDelta {
@@ -12871,6 +12906,10 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
     app.chats[chat_idx].flush();
     assert!(app.chats[chat_idx].is_finished());
     assert_eq!(app.chats[chat_idx].last_message_text(), DONE_TEXT);
+
+    app.update(post_msg(Some(info)).0);
+    assert_last_is_post(&app.chats[chat_idx]);
+    assert!(app.chats[chat_idx].is_finished());
 }
 
 #[test]
@@ -12889,6 +12928,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     })));
     assert!(!app.chats[app.active_chat].is_finished());
 
+    close_input_child(&mut app, &info);
     let child_index = app.active_chat;
     app.active_chat = 0;
     app.handle_cancel();
@@ -12904,7 +12944,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
     assert_eq!(app.chats.len(), chat_count);
     assert_eq!(app.agent_chat_index.get(&agent_id), Some(&child_index));
     assert!(app.chats[child_index].is_finished());
-    assert!(app.subagent_channels.get(&agent_id).unwrap().closed);
+    assert!(app.agent_closed(agent_id));
 }
 
 #[test]

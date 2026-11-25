@@ -67,7 +67,7 @@ pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
 };
-use makima_agent::actor::{ActorLifecycle, EffectiveAgentConfig, TranscriptRequest};
+use makima_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
 use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
 use makima_agent::permissions::PermissionManager;
 #[cfg(test)]
@@ -319,13 +319,6 @@ impl PickerItem for TaskEntry {
     }
 }
 
-/// Channels held for a live subagent tab.
-#[derive(Clone, Default)]
-struct SubagentChannels {
-    answer_tx: Option<flume::Sender<String>>,
-    closed: bool,
-}
-
 fn truncate_snippet(text: &str) -> String {
     let mut chars = text.chars();
     let truncated: String = chars.by_ref().take(SNIPPET_CHARS).collect();
@@ -393,7 +386,6 @@ pub struct App {
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
     pub(super) agent_chat_index: HashMap<makima_agent::AgentId, usize>,
-    terminal_subagents: HashSet<makima_agent::AgentId>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(crate) command_runtime: Arc<CommandRuntime>,
@@ -493,7 +485,7 @@ pub struct App {
     pub(crate) restore_event_tx: Option<makima_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     /// Per-live-agent channels for interrupt replies and background input.
-    subagent_channels: HashMap<makima_agent::AgentId, SubagentChannels>,
+    subagent_answers: HashMap<AgentId, Option<flume::Sender<String>>>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(makima_agent::AgentId, makima_agent::TurnId)>,
 }
@@ -603,7 +595,6 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             agent_chat_index: HashMap::new(),
-            terminal_subagents: HashSet::new(),
             input_box,
             command_runtime: Arc::clone(&command_runtime),
             command_target: command_target.clone(),
@@ -699,7 +690,7 @@ impl App {
             status_content_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
-            subagent_channels: HashMap::new(),
+            subagent_answers: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
             pending_dirty: Dirty::NO,
         };
@@ -1212,41 +1203,33 @@ impl App {
     }
 
     fn active_subagent_closed(&self) -> bool {
-        if self.is_main_chat() {
-            return false;
-        }
-        let Some(id) = self.selected_agent_id() else {
-            return true;
-        };
-        if self.terminal_subagents.contains(&id)
-            || self
-                .subagent_channels
-                .get(&id)
-                .is_some_and(|channels| channels.closed)
-        {
-            return true;
-        }
-        if let Some(target) = self.focused_input_target() {
-            if let Ok(actor) = target.actor() {
-                return actor.snapshot().lifecycle != ActorLifecycle::Open;
+        !self.is_main_chat()
+            && self
+                .selected_agent_id()
+                .is_none_or(|id| self.agent_closed(id))
+    }
+
+    fn agent_closed(&self, id: AgentId) -> bool {
+        if let Some(root) = &self.root_agent {
+            let manager = root.manager();
+            if let Ok(node) = manager.node(id) {
+                return matches!(
+                    node.graph_lifecycle,
+                    GraphLifecycle::Closing
+                        | GraphLifecycle::Closed
+                        | GraphLifecycle::Retired
+                        | GraphLifecycle::Removed
+                );
             }
-            if target
-                .snapshot()
-                .is_ok_and(|node| node.graph_lifecycle == GraphLifecycle::Dormant)
-            {
-                return false;
+            if let Some(record) = manager.journal().agent(id) {
+                return record.lifecycle != StoredAgentLifecycle::Open;
             }
         }
-        self.subagent_channels.get(&id).map_or_else(
-            || {
-                self.state
-                    .session
-                    .agents()
-                    .get(&id)
-                    .is_some_and(|record| record.lifecycle != StoredAgentLifecycle::Open)
-            },
-            |channels| channels.closed,
-        )
+        self.state
+            .session
+            .agents()
+            .get(&id)
+            .is_some_and(|record| record.lifecycle != StoredAgentLifecycle::Open)
     }
 
     fn focused_input_target(&self) -> Option<AgentRef> {
@@ -1259,8 +1242,8 @@ impl App {
 
     fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
         let routed = agent_id
-            .and_then(|id| self.subagent_channels.get(&id))
-            .and_then(|channels| channels.answer_tx.as_ref());
+            .and_then(|id| self.subagent_answers.get(&id))
+            .and_then(Option::as_ref);
         if let Some(tx) = routed {
             let _ = tx.try_send(answer);
         } else {
@@ -2988,14 +2971,6 @@ impl App {
         }
 
         if let Some(subagent) = &envelope.subagent {
-            if self.terminal_subagents.contains(&subagent.agent_id) {
-                if let AgentEvent::TurnComplete(turn) = envelope.event
-                    && let Some(&chat_idx) = self.agent_chat_index.get(&subagent.agent_id)
-                {
-                    add_cost(&mut self.chats[chat_idx].cost, turn.cost);
-                }
-                return vec![];
-            }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
                 self.finish_child_plan_approval(subagent.agent_id);
                 if self.plan_picker_edits(Some(subagent.agent_id))
@@ -3005,10 +2980,6 @@ impl App {
                         .is_some_and(|target| target.target.id() == subagent.agent_id)
                 {
                     self.close_model_picker();
-                }
-                self.terminal_subagents.insert(subagent.agent_id);
-                if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
-                    channels.closed = true;
                 }
                 self.stamped_subagent_outcomes
                     .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
@@ -3020,6 +2991,14 @@ impl App {
                         self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
                     }
                     self.sync_task_picker();
+                }
+                return vec![];
+            }
+            if self.agent_closed(subagent.agent_id) {
+                if let AgentEvent::TurnComplete(turn) = envelope.event
+                    && let Some(&chat_idx) = self.agent_chat_index.get(&subagent.agent_id)
+                {
+                    add_cost(&mut self.chats[chat_idx].cost, turn.cost);
                 }
                 return vec![];
             }
@@ -3360,16 +3339,11 @@ impl App {
         };
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.agent_chat_index.get(&subagent.agent_id) {
-            if self.subagent_channels.contains_key(&subagent.agent_id) {
+            if self.subagent_answers.contains_key(&subagent.agent_id) {
                 return idx;
             }
-            self.subagent_channels.insert(
-                subagent.agent_id,
-                SubagentChannels {
-                    answer_tx: subagent.answer_tx.clone(),
-                    closed: false,
-                },
-            );
+            self.subagent_answers
+                .insert(subagent.agent_id, subagent.answer_tx.clone());
             let name = name();
             let chat = &mut self.chats[idx];
             chat.name = name;
@@ -3383,13 +3357,8 @@ impl App {
         let idx = self.chats.len();
         self.chat_index.entry(id.clone()).or_insert(idx);
         self.agent_chat_index.insert(subagent.agent_id, idx);
-        self.subagent_channels.insert(
-            subagent.agent_id,
-            SubagentChannels {
-                answer_tx: subagent.answer_tx.clone(),
-                closed: false,
-            },
-        );
+        self.subagent_answers
+            .insert(subagent.agent_id, subagent.answer_tx.clone());
         let name = name();
         self.chats[0].update_tool_summary(id, &name);
         if let Some(ref model) = subagent.model {

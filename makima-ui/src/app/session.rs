@@ -197,7 +197,6 @@ impl App {
         self.active_chat = 0;
         self.chat_index.clear();
         self.agent_chat_index.clear();
-        self.terminal_subagents.clear();
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear_root_user_work();
