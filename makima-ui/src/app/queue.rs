@@ -147,6 +147,7 @@ impl MessageQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_root_user_work(&mut self) {
         if let Some(ref shared) = self.shared {
             shared.clear_user_work();
@@ -169,6 +170,7 @@ impl MessageQueue {
         self.shared.as_ref()?.effective_config()
     }
 
+    #[cfg(test)]
     pub(crate) fn root_text_messages(&self) -> Vec<String> {
         self.shared
             .as_ref()
@@ -330,7 +332,7 @@ impl App {
                 .preamble
                 .extend_from_slice(self.shell.results_for(None));
         }
-        let starting = root && self.status != Status::Streaming;
+        let starting = root && self.status != Status::Streaming && !actor.input_held();
         let reserved = starting.then(|| actor.reserve_presentation(self.run_id));
         let images = input.images.clone();
         let options = TurnAdmissionOptions {
@@ -414,11 +416,6 @@ impl App {
     }
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
-        self.recoverable_queue.clear();
-        self.record_presentation_start(run_id);
-    }
-
-    pub(super) fn record_presentation_start(&mut self, run_id: u64) {
         self.run_id = run_id;
         self.queue.set_run_id(run_id);
         self.clear_exit_request();

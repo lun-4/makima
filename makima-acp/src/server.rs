@@ -4095,7 +4095,6 @@ mod tests {
                 });
             }
             session.meta.input_draft = Some(PARKED_THOUGHT.into());
-            session.meta.queued_messages.push(PARKED_REPLY.into());
             session.save(&storage).unwrap();
             let writer = SessionWriter::open_session(
                 &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
@@ -4169,11 +4168,7 @@ mod tests {
                 assert!(received.is_empty());
                 let loaded = StoredSession::load(session.id, &storage).unwrap();
                 assert!(std::fs::read(&path).unwrap().starts_with(&before_recovery));
-                assert!(loaded.meta.queued_messages.is_empty());
-                assert_eq!(
-                    loaded.meta.input_draft.as_deref(),
-                    Some(format!("{PARKED_THOUGHT}\n\n{PARKED_REPLY}").as_str())
-                );
+                assert_eq!(loaded.meta.input_draft.as_deref(), Some(PARKED_THOUGHT));
                 let terminal: Vec<_> = loaded
                     .state()
                     .iter()

@@ -4603,7 +4603,6 @@ mod tests {
                 });
             }
             session.meta.input_draft = Some(SDK_ROOT_PROMPT.into());
-            session.meta.queued_messages.push(SDK_CHILD_PROMPT.into());
             session.save(&storage).unwrap();
             let writer = SessionWriter::open_session(
                 &storage.ensure_subdir(SESSIONS_DIR).unwrap(),
@@ -4645,10 +4644,9 @@ mod tests {
                 } else {
                     first_state = Some(state);
                 }
-                assert!(recovered.session().meta.queued_messages.is_empty());
                 assert_eq!(
                     recovered.session().meta.input_draft.as_deref(),
-                    Some(format!("{SDK_ROOT_PROMPT}\n\n{SDK_CHILD_PROMPT}").as_str())
+                    Some(SDK_ROOT_PROMPT)
                 );
                 let (entered, requests) = flume::unbounded();
                 let (_release, release) = flume::unbounded();

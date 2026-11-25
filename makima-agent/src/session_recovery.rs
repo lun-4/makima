@@ -28,7 +28,6 @@ use makima_storage::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
-    mem::take,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -37,7 +36,6 @@ pub(crate) const CONTINUATION_DISABLED: &str =
     "continuation_disabled: MAKIMA_CONTINUE_ALL_AGENTS=0";
 const CONTINUE_ALL_AGENTS_ENV: &str = "MAKIMA_CONTINUE_ALL_AGENTS";
 const SEQUENCE_EXHAUSTED: &str = "session recovery exhausted the state sequence";
-const DRAFT_SEPARATOR: &str = "\n\n";
 const RECOVERY_CANCELLED: &str = "session recovery publication cancelled";
 const WRONG_WRITER: &str = "recovery writer belongs to another session";
 
@@ -343,14 +341,6 @@ impl RecoveryCandidate {
             message: Arc::from(message),
         };
         let mut records = Vec::new();
-        let restore_draft = !session.meta.queued_messages.is_empty();
-        for queued in take(&mut session.meta.queued_messages) {
-            let draft = session.meta.input_draft.get_or_insert_with(String::new);
-            if !draft.is_empty() {
-                draft.push_str(DRAFT_SEPARATOR);
-            }
-            draft.push_str(&queued);
-        }
         let view = session
             .latest_state()
             .map_err(|error| failure(error.to_string()))?;
@@ -475,7 +465,7 @@ impl RecoveryCandidate {
             for (&turn, origin) in &scope.admitted {
                 let result = if let Some(result) = reported.remove(&(agent, turn)) {
                     result
-                } else if continue_turns {
+                } else if continue_turns || scope.holds_input(origin) {
                     continue;
                 } else {
                     let child = view
@@ -578,14 +568,6 @@ impl RecoveryCandidate {
                 session.push_state(record.clone());
                 records.push(SessionRecord::State { d: record });
             }
-        }
-        if restore_draft {
-            records.push(SessionRecord::Draft {
-                text: session.meta.input_draft.clone(),
-            });
-            records.push(SessionRecord::Queued {
-                messages: session.meta.queued_messages.clone(),
-            });
         }
         let journal = Arc::new(
             SessionJournal::from_session(&session).map_err(|error| failure(error.to_string()))?,
@@ -1211,8 +1193,7 @@ mod tests {
                 change: StateChange::Admitted { turn, origin },
             });
         }
-        session.meta.input_draft = Some(ORPHAN.into());
-        session.meta.queued_messages.push(DRAFT.into());
+        session.meta.input_draft = Some(DRAFT.into());
         (session, root, child, root_turn, child_turn)
     }
 
@@ -1278,6 +1259,7 @@ mod tests {
         let candidate =
             RecoveryCandidate::prepare_with_continuation(session, continue_turns).unwrap();
         let view = candidate.session().latest_state().unwrap();
+        assert_eq!(candidate.session().meta.input_draft.as_deref(), Some(DRAFT));
         for (agent, turn) in [(root, root_turn), (child, child_turn)] {
             let scope = &view.scopes[&Some(agent)];
             assert_eq!(scope.admitted.contains_key(&turn), continue_turns);
@@ -1291,11 +1273,51 @@ mod tests {
             assert_eq!(restored.messages, original.messages);
             assert_eq!(restored.epoch, original.epoch);
             assert_eq!(restored.ids, original.ids);
-            assert!(candidate.records.iter().all(|record| matches!(
-                record,
-                SessionRecord::Draft { .. } | SessionRecord::Queued { .. }
-            )));
+            assert!(candidate.records.is_empty());
         }
+    }
+
+    #[test_case(false; "continuation_disabled")]
+    #[test_case(true; "continuation_enabled")]
+    fn recovery_preserves_held_user_admission(continue_turns: bool) {
+        let (mut session, root, child, root_turn, child_turn) = fixture();
+        for agent in [root, child] {
+            session.push_state(StoredStateRecord {
+                seq: session.next_state_seq(),
+                agent: Some(agent),
+                generation: 0,
+                change: StateChange::InputHold { held: true },
+            });
+        }
+        let candidate =
+            RecoveryCandidate::prepare_with_continuation(session, continue_turns).unwrap();
+        let view = candidate.session().latest_state().unwrap();
+        let root_scope = &view.scopes[&Some(root)];
+        assert!(root_scope.holds_input(&StoredTurnOrigin::User));
+        assert_eq!(
+            root_scope.admitted.get(&root_turn),
+            Some(&StoredTurnOrigin::User)
+        );
+        assert!(
+            !root_scope
+                .results
+                .iter()
+                .any(|(turn, _)| *turn == root_turn)
+        );
+        assert_eq!(candidate.session().meta.input_draft.as_deref(), Some(DRAFT));
+
+        let child_scope = &view.scopes[&Some(child)];
+        assert_eq!(
+            child_scope.admitted.contains_key(&child_turn),
+            continue_turns
+        );
+        assert_eq!(
+            child_scope
+                .results
+                .iter()
+                .any(|(turn, _)| *turn == child_turn),
+            !continue_turns
+        );
     }
 
     #[test]

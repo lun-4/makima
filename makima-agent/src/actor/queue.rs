@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission};
+use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission, TurnOrigin};
 use crate::types::TurnId;
 use crate::{AgentInput, ExtractedCommand};
 
@@ -60,6 +60,14 @@ impl ActorQueue {
     /// Pops the front item, or `None` when the queue is empty.
     pub fn pop(&self) -> Option<ActorWork> {
         self.items.lock_unpoisoned().pop_front()
+    }
+
+    pub(super) fn pop_unheld(&self) -> Option<ActorWork> {
+        let mut items = self.items.lock_unpoisoned();
+        let index = items.iter().position(|work| {
+            !matches!(work, ActorWork::Turn(admission) if admission.ticket.provenance().origin == TurnOrigin::User)
+        })?;
+        items.remove(index)
     }
 
     /// Extracts the given admitted turn from anywhere in the queue without

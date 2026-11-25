@@ -260,6 +260,10 @@ pub type TerminalCheckpoint = Arc<
 >;
 
 pub trait ActorBackend: Send {
+    fn hold_input_after_failure(&self) -> bool {
+        false
+    }
+
     fn persist_turn_results(&self) -> bool {
         true
     }

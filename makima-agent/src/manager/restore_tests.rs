@@ -32,8 +32,8 @@ use crate::{
     HistorySnapshot, ModeDef, ModeId, ReasonedCancelToken, RunSettings, TurnContext, TurnId,
     WorkKind,
     actor::{
-        ActiveCancel, ActorHistory, ChildDelivery, EffectiveAgentConfig, TurnProvenance,
-        TurnResult, graph_quiescence_barrier,
+        ActiveCancel, ActorHistory, ChildDelivery, EffectiveAgentConfig, TurnAdmissionOptions,
+        TurnOrigin, TurnProvenance, TurnResult, graph_quiescence_barrier,
     },
     journal::{
         JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
@@ -2465,6 +2465,74 @@ fn continuation_backend() -> MockBackend {
                 ))
             })
         })
+}
+
+#[test]
+fn restored_held_input_waits_for_user_submit() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let turn = TurnId::generate();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Admitted {
+                        turn,
+                        origin: StoredTurnOrigin::User,
+                    },
+                    StateChange::InputHold { held: true },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(id),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert!(manager.pending_continuation_agents().unwrap().is_empty());
+        manager
+            .ensure_resident_with(id, |_| async {
+                Ok(ResidentAgent {
+                    backend: Box::new(continuation_backend()),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        let actor = manager.actor(id).unwrap();
+        assert!(actor.input_held());
+        assert_eq!(actor.runtime_barrier().await.unwrap().queued, 1);
+        let held = actor.turn_ticket(turn).unwrap();
+        let next = actor
+            .admit_turn_with_options(
+                AgentInput::new(String::new(), Vec::new()),
+                None,
+                String::new(),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            held.wait().await,
+            crate::TurnOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            next.wait().await,
+            crate::TurnOutcome::Completed { .. }
+        ));
+        assert!(!journal.snapshot().fold().unwrap().scopes[&Some(id)].input_held);
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
 }
 
 #[test_case(false; "root")]

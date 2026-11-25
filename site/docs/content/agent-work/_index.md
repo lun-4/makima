@@ -17,11 +17,11 @@ An open agent without a running instance is dormant. Loading a session restores 
 
 ### Restart
 
-When a saved session is reopened after a quit or crash, every unfinished turn continues by default, including the root turn and any subagent turns. Makima requests a reply again if it was cut off while streaming. A resumable tool call runs or waits again. For example, `question` asks again and `task_wait` resumes waiting. For other in-flight calls, Makima sends the model this result instead of retrying the call:
+When a saved session is reopened after a quit or crash, unfinished turns continue by default, including the root turn and any subagent turns. Messages held after an error stay in the queue until the user sends another message or cancels them. Makima requests a reply again if it was cut off while streaming. A resumable tool call runs or waits again. For example, `question` asks again and `task_wait` resumes waiting. For other in-flight calls, Makima sends the model this result instead of retrying the call:
 
 > This tool call was interrupted when makima stopped. It may have partly run. Check the current state before retrying, then continue your task.
 
-`MAKIMA_CONTINUE_ALL_AGENTS` defaults to `1`. Set it to `0` to record unfinished turns as `Interrupted` instead. When turns continue, Makima shows `continuing N interrupted turns (set MAKIMA_CONTINUE_ALL_AGENTS=0 to stop this)`. A subagent that cannot continue reports the reason to its parent. If the saved root mode cannot be restored, Makima warns, switches to read-only mode, and waits for input instead of resuming the root turn automatically.
+`MAKIMA_CONTINUE_ALL_AGENTS` defaults to `1`. Set it to `0` to record unfinished turns as `Interrupted` instead. This setting does not discard held messages. When turns continue, Makima shows `continuing N interrupted turns (set MAKIMA_CONTINUE_ALL_AGENTS=0 to stop this)`. A subagent that cannot continue reports the reason to its parent. If the saved root mode cannot be restored, Makima warns, switches to read-only mode, and waits for input instead of resuming the root turn automatically.
 
 Pending child reports keep their delivery state. A report the parent already read is not delivered again. Reading a saved transcript or result does not rerun its turn.
 
@@ -55,6 +55,8 @@ An ordinary message starts work on an idle agent or joins compatible work that s
 A queued configuration change, working-directory change, control operation, or explicitly queued turn keeps later messages from joining earlier work. Those messages receive a new turn ID. Messages and attachments stay separate. Instructions consumed after a turn starts use the `<user-interrupt>` wrapper; its initial input remains an ordinary user message.
 
 Acceptance does not mean the model has received the message. A pending message can be recalled or removed before consumption. Removing one message does not cancel its turn or other messages in that turn. A stale queue selection cannot remove a different message after consumption. Queue limits reject further input without cancelling accepted work.
+
+In the TUI, a failed turn or compaction holds the agent's queued user messages. They stay visible in the queue. The next message releases them in order and starts a separate turn behind them. Cancelling the agent discards the held messages.
 
 ## Focused controls
 

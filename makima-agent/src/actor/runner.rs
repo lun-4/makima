@@ -517,6 +517,9 @@ impl Runner {
             let mut state = self.inner.state.lock_unpoisoned();
             state.active = None;
             if let BackendResult::ControlCompacted(status) = result {
+                if status == CompactionStatus::Failed {
+                    state.hold_queued_input(&self.inner, None);
+                }
                 state.emit(ActorEvent::CompactionEnd(status));
                 return;
             }
@@ -599,6 +602,9 @@ impl Runner {
         };
         let mut state = self.inner.state.lock_unpoisoned();
         state.active = None;
+        if status == CompactionStatus::Failed {
+            state.hold_queued_input(&self.inner, None);
+        }
         state.emit(ActorEvent::CompactionEnd(status));
     }
 

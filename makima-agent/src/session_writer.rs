@@ -1143,7 +1143,6 @@ mod tests {
                     legacy_config: None,
                     meta: Box::new(SessionMeta {
                         input_draft: Some("draft".into()),
-                        queued_messages: vec!["queued".into()],
                         ..SessionMeta::default()
                     }),
                     legacy_plan: LegacyPlan::default(),
@@ -1174,7 +1173,6 @@ mod tests {
             assert_eq!(loaded.chat_message_ids(Some("child")), vec![child_message]);
             assert_eq!(loaded.posts()[0].after_message, Some(original));
             assert_eq!(loaded.meta.input_draft.as_deref(), Some("draft"));
-            assert_eq!(loaded.meta.queued_messages, ["queued"]);
             assert!(loaded.history_snapshot().compacted);
             assert_eq!(
                 loaded.history_snapshot().conversation.unwrap().id.as_ref(),

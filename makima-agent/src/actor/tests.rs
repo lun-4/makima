@@ -121,6 +121,7 @@ pub(super) struct ScriptedBackend {
     preparation: Option<super::AdmissionPreparation>,
     readiness: Option<super::PreparedReadiness>,
     terminal_checkpoint: Option<super::TerminalCheckpoint>,
+    hold_input: bool,
 }
 
 struct Gate {
@@ -164,6 +165,7 @@ impl ScriptedBackend {
             preparation: None,
             readiness: None,
             terminal_checkpoint: None,
+            hold_input: false,
         }
     }
 
@@ -686,6 +688,7 @@ fn restored_actor_hydrates_exact_history_and_tickets_before_start() {
         let (actor, task) = AgentActorHandle::spawn_managed_restored(
             agent,
             super::ActorRestoration {
+                input_held: false,
                 admitted: Vec::new(),
                 history: history.clone(),
                 results: vec![result.clone()],
@@ -816,6 +819,10 @@ fn default_completed(context: &TurnContext) -> BackendResult {
 }
 
 impl ActorBackend for ScriptedBackend {
+    fn hold_input_after_failure(&self) -> bool {
+        self.hold_input
+    }
+
     fn terminal_checkpoint(&self) -> Option<super::TerminalCheckpoint> {
         self.terminal_checkpoint.clone()
     }
@@ -2400,6 +2407,81 @@ fn subscriptions_after_close_are_disconnected() {
                 .await
                 .is_err()
         );
+    });
+}
+
+#[test_case::test_case(false, false; "headless_drains")]
+#[test_case::test_case(true, false; "submit_releases_fifo")]
+#[test_case::test_case(true, true; "cancel_discards")]
+fn queued_input_after_failure(hold_input: bool, cancel: bool) {
+    const FIRST: &str = "first";
+    const SECOND: &str = "second";
+    const THIRD: &str = "third";
+    const NEXT: &str = "next";
+    smol::block_on(async {
+        let gate = Gate::new();
+        let mut backend = ScriptedBackend::failing_setup();
+        backend.gate = Some(Arc::clone(&gate));
+        backend.hold_input = hold_input;
+        let state = Arc::clone(&backend.state);
+        let (actor, task) = spawn(backend);
+        let admit = |text| {
+            actor
+                .admit_turn_with_options(
+                    input(text),
+                    None,
+                    String::new(),
+                    super::TurnAdmissionOptions {
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::User,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let first = admit(FIRST);
+        let queued = [admit(SECOND), admit(THIRD)];
+        gate.open();
+        assert!(matches!(first.wait().await, TurnOutcome::Failed { .. }));
+        if hold_input {
+            assert!(actor.input_held());
+            assert_eq!(actor.runtime_barrier().await.unwrap().queued, queued.len());
+            assert!(
+                queued
+                    .iter()
+                    .all(|ticket| actor.outcome(ticket.turn_id()).is_none())
+            );
+        }
+        if cancel {
+            actor.cancel_local(0);
+            for ticket in queued {
+                assert!(matches!(
+                    ticket.wait().await,
+                    TurnOutcome::Cancelled {
+                        reason: TurnCancellationReason::User,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(state.runs.lock().unwrap().len(), 1);
+        } else {
+            let next = admit(NEXT);
+            for ticket in queued.into_iter().chain([next]) {
+                assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+            }
+            let runs = state.runs.lock().unwrap();
+            assert_eq!(
+                runs.iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>(),
+                [FIRST, SECOND, THIRD, NEXT]
+            );
+        }
+        assert!(!actor.input_held());
+        actor.close();
+        task.await;
     });
 }
 

@@ -472,14 +472,9 @@ mod tests {
             let path = directory.path().join(format!("{}.jsonl", session.id));
             let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
             writer
-                .append(vec![
-                    Record::Draft {
-                        text: Some(OLD_DRAFT.into()),
-                    },
-                    Record::Queued {
-                        messages: vec![OLD_QUEUE.into()],
-                    },
-                ])
+                .append(vec![Record::Draft {
+                    text: Some(OLD_DRAFT.into()),
+                }])
                 .await
                 .unwrap();
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -563,7 +558,6 @@ mod tests {
                 reopened.meta.input_draft.as_deref(),
                 Some(if redo { REPLACEMENT } else { SECOND })
             );
-            assert!(reopened.meta.queued_messages.is_empty());
             assert!(
                 manager
                     .shutdown(SHUTDOWN_TIMEOUT)
@@ -594,7 +588,6 @@ mod tests {
                 reopened.meta.input_draft.as_deref(),
                 Some(if redo { REPLACEMENT } else { SECOND })
             );
-            assert!(reopened.meta.queued_messages.is_empty());
         });
     }
 

@@ -75,9 +75,9 @@ use makima_agent::permissions::PermissionSnapshot;
 use makima_agent::rewind::RewindGuard;
 use makima_agent::tools::ToolFilter;
 use makima_agent::{
-    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
-    GraphLifecycle, ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader,
-    Post, SharedBuf, SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput,
+    AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, GraphLifecycle,
+    ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
+    SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput,
 };
 use makima_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -422,7 +422,6 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
-    recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) root_agent: Option<makima_agent::AgentRef>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
@@ -641,7 +640,6 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
-            recoverable_queue: Vec::new(),
             answer_tx: None,
             root_agent: None,
             cmd_tx: None,
@@ -864,6 +862,13 @@ impl App {
             );
         }
         *self.status_for_chat(self.active_chat) == Status::Streaming
+    }
+
+    fn focused_can_cancel(&self) -> bool {
+        self.focused_streaming()
+            || self
+                .focused_input_target()
+                .is_some_and(|target| target.input_held())
     }
 
     fn status_for_chat(&self, chat_idx: usize) -> &Status {
@@ -1957,7 +1962,7 @@ impl App {
             self.close_command_palette();
             self.sync_file_completion();
             return Some(if self.input_box.is_empty() {
-                if self.focused_streaming() {
+                if self.focused_can_cancel() {
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -2355,7 +2360,7 @@ impl App {
             return vec![];
         }
 
-        if !(self.focused_streaming() && is_streaming_stop_key(key))
+        if !(is_streaming_stop_key(key) && self.focused_can_cancel())
             && let Some(id) = self.dispatch_override(key)
         {
             return vec![Action::RunKeybind(id)];
@@ -2536,7 +2541,7 @@ impl App {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
                         {
-                            if streaming {
+                            if self.focused_can_cancel() {
                                 self.handle_cancel()
                             } else {
                                 self.open_rewind()
@@ -2544,7 +2549,7 @@ impl App {
                         } else {
                             self.last_esc = Some(Instant::now());
                             self.status_bar.flash(
-                                if streaming {
+                                if self.focused_can_cancel() {
                                     FLASH_CANCEL
                                 } else {
                                     FLASH_REWIND
@@ -2823,7 +2828,6 @@ impl App {
         self.active_input = None;
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent { turn_id, run_id }]
     }
@@ -2840,14 +2844,7 @@ impl App {
             && presentation > self.run_id
             && self.queue.accepts_actor_presentation(presentation)
         {
-            if envelope
-                .identity
-                .is_some_and(|identity| matches!(identity.kind, ActorWorkKind::Compact { .. }))
-            {
-                self.record_presentation_start(presentation);
-            } else {
-                self.record_run_start(presentation);
-            }
+            self.record_run_start(presentation);
         }
     }
 
@@ -3225,15 +3222,6 @@ impl App {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.terminalize_turn(&message);
-                    let pending = self.queue.root_text_messages();
-                    if envelope.identity.is_some_and(|identity| {
-                        matches!(identity.kind, ActorWorkKind::Compact { .. })
-                    }) {
-                        self.recoverable_queue.extend(pending);
-                    } else {
-                        self.recoverable_queue = pending;
-                    }
-                    self.queue.clear_root_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -4041,12 +4029,6 @@ impl App {
         self.permission_active()
             || self.pending_input != PendingInput::None
             || self.question_active()
-    }
-
-    /// True while `recoverable_queue` holds user text captured at an agent
-    /// error; a background run would wipe it (`start_run` clears the queue).
-    pub(crate) fn holds_recovery_text(&self) -> bool {
-        !self.recoverable_queue.is_empty()
     }
 
     pub fn has_modal_overlay(&self) -> bool {

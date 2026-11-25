@@ -178,8 +178,6 @@ pub struct SessionMeta {
     pub context_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_draft: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_messages: Vec<String>,
     #[serde(default, skip_serializing)]
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing)]
@@ -484,8 +482,6 @@ pub enum SessionRecord<M, U, T> {
     Post { d: StoredPost },
     #[serde(rename = "draft")]
     Draft { text: Option<String> },
-    #[serde(rename = "queued")]
-    Queued { messages: Vec<String> },
     #[serde(rename = "title")]
     Title { title: String },
     #[serde(rename = "usage")]
@@ -1022,6 +1018,17 @@ struct LegacyChildren {
 }
 
 #[derive(Deserialize)]
+struct LegacyQueueMeta {
+    #[serde(default)]
+    queued_messages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacyQueuedRecord {
+    messages: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct LegacyChild {
     tool_use_id: String,
     #[serde(default)]
@@ -1080,6 +1087,7 @@ where
     let mut agent_message_ids: BTreeMap<AgentId, Vec<MakimaId>> = BTreeMap::new();
     let mut tool_outputs = HashMap::new();
     let mut legacy_children = LegacyChildren::default();
+    let mut legacy_queue = Vec::new();
     let mut legacy_child_messages = Vec::new();
     let mut title = DEFAULT_TITLE.to_string();
     let mut title_set = false;
@@ -1135,7 +1143,17 @@ where
                             legacy_posts.push(serde_json::from_value(value["d"].take())?);
                             return Ok(None);
                         }
-                        Some("meta") => legacy_children = serde_json::from_value(value.clone())?,
+                        Some("queued") => {
+                            legacy_queue =
+                                serde_json::from_value::<LegacyQueuedRecord>(value)?.messages;
+                            return Ok(None);
+                        }
+                        Some("meta") => {
+                            legacy_children = serde_json::from_value(value.clone())?;
+                            legacy_queue =
+                                serde_json::from_value::<LegacyQueueMeta>(value.clone())?
+                                    .queued_messages;
+                        }
                         _ => {}
                     }
                 }
@@ -1259,13 +1277,15 @@ where
                 cleared_turns.extend(turns.into_iter().map(|turn| (Some(agent), turn)));
                 if let Some(draft) = input_draft {
                     meta.input_draft = (!draft.is_empty()).then_some(draft);
-                    let root = agent_revisions
-                        .iter()
-                        .find(|(_, record)| record.parent.is_none())
-                        .map(|(_, record)| record.id)
-                        .or_else(|| id.and_then(|id| id.to_string().parse().ok()));
-                    if root == Some(agent) {
-                        meta.queued_messages.clear();
+                    if !legacy_queue.is_empty() {
+                        let root = agent_revisions
+                            .iter()
+                            .find(|(_, record)| record.parent.is_none())
+                            .map(|(_, record)| record.id)
+                            .or_else(|| id.and_then(|id| id.to_string().parse().ok()));
+                        if root == Some(agent) {
+                            legacy_queue.clear();
+                        }
                     }
                 }
             }
@@ -1274,7 +1294,6 @@ where
             }
             SessionRecord::Post { d } => posts.push(d),
             SessionRecord::Draft { text } => meta.input_draft = text,
-            SessionRecord::Queued { messages } => meta.queued_messages = messages,
             SessionRecord::Title { title: next_title } => {
                 title = next_title;
                 title_set = true;
@@ -1320,6 +1339,16 @@ where
     let id = id.ok_or_else(|| SessionError::MissingHeader {
         path: display_path.to_string(),
     })?;
+
+    if version == LEGACY_LOG_FORMAT_VERSION {
+        for queued in legacy_queue {
+            let draft = meta.input_draft.get_or_insert_with(String::new);
+            if !draft.is_empty() {
+                draft.push_str("\n\n");
+            }
+            draft.push_str(&queued);
+        }
+    }
 
     let agents = latest_agents(&agent_revisions);
     let root = agents
@@ -3370,12 +3399,10 @@ mod tests {
         const CHILD: &str = "child";
         const NOTE: &str = "child rewound";
         const CHILD_DRAFT: &str = "discarded";
-        const ROOT_QUEUE: &str = "queued root prompt";
         let directory = TempDir::new().unwrap();
         let mut session = TestSession::new("model", "/project");
         session.push_message(user_message("root prompt"));
         session.meta.input_draft = Some(PENDING_DRAFT.into());
-        session.meta.queued_messages = vec![ROOT_QUEUE.into()];
         let first = user_message("first child prompt");
         register_child(&mut session, CHILD);
         session.set_subagent_messages(CHILD.into(), vec![first.clone(), user_message(CHILD_DRAFT)]);
@@ -3420,7 +3447,6 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.messages(), session.messages());
         assert_eq!(loaded.meta.input_draft.as_deref(), Some(CHILD_DRAFT));
-        assert_eq!(loaded.meta.queued_messages, [ROOT_QUEUE]);
         assert_eq!(loaded.meta.conversation, session.meta.conversation);
         let history = loaded.subagent_history_snapshot(CHILD).unwrap();
         assert_eq!(history.ids.as_slice(), [first_id, note_id]);
@@ -4120,6 +4146,86 @@ mod tests {
         assert_retired_meta_absent(&records(tmp.path(), id));
         let loaded = TestSession::load_from(id, tmp.path()).unwrap();
         assert_eq!(loaded.state(), session.state());
+    }
+
+    #[test_case(None, false, false; "metadata_only")]
+    #[test_case(Some(&["replacement prompt", "second prompt"]), false, false; "replace_queue")]
+    #[test_case(Some(&[]), false, false; "clear_queue")]
+    #[test_case(Some(&["superseded prompt"]), true, false; "reset_from_meta")]
+    #[test_case(None, false, true; "clear_on_root_fork")]
+    fn v2_queue_folds_into_draft_on_load_and_migration(
+        queued_record: Option<&[&str]>,
+        reset_meta: bool,
+        root_fork: bool,
+    ) {
+        const QUEUED: &str = "legacy queued prompt";
+        const NEW_DRAFT: &str = "new draft";
+        const FORK_NOTE: &str = "rewound";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let mut legacy = vec![
+            serde_json::json!({"t":"header", "v":2, "id":id, "model":"model", "cwd":"/tmp", "created_at":1}),
+            serde_json::json!({"t":"meta", "title":"legacy", "token_usage":null, "updated_at":2, "input_draft":PENDING_DRAFT, "queued_messages":[QUEUED]}),
+        ];
+        if let Some(messages) = queued_record {
+            legacy.push(serde_json::json!({"t":"queued", "messages":messages}));
+            legacy.push(serde_json::json!({"t":"draft", "text":NEW_DRAFT}));
+        }
+        if reset_meta {
+            legacy.push(serde_json::json!({"t":"meta", "title":"legacy", "token_usage":null, "updated_at":3, "input_draft":PENDING_DRAFT}));
+        }
+        if root_fork {
+            let fork = SessionRecord::<Value, Value, Value>::Fork {
+                agent: id.to_string().parse().unwrap(),
+                target: None,
+                note_id: MakimaId::generate(),
+                note: FORK_NOTE.into(),
+                conversation: ConversationState::fresh(None),
+                input_draft: Some(NEW_DRAFT.into()),
+                cleared_turns: Vec::new(),
+            };
+            legacy.push(serde_json::to_value(fork).unwrap());
+        }
+        let expected_draft = if reset_meta {
+            PENDING_DRAFT.to_owned()
+        } else if root_fork {
+            NEW_DRAFT.to_owned()
+        } else if let Some(messages) = queued_record {
+            [NEW_DRAFT]
+                .into_iter()
+                .chain(messages.iter().copied())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            format!("{PENDING_DRAFT}\n\n{QUEUED}")
+        };
+        let legacy = encode_records(&legacy).unwrap();
+        let path = jsonl_path(dir, id);
+        fs::write(&path, &legacy).unwrap();
+
+        let session = TestSession::load_from(id, dir).unwrap();
+        assert_eq!(
+            session.meta.input_draft.as_deref(),
+            Some(expected_draft.as_str())
+        );
+        assert_eq!(session.messages().len(), usize::from(root_fork));
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+
+        migrate_v2_before_append(dir, &session).unwrap();
+        let archive = archive_dir_for(dir, id).join("v2.jsonl");
+        assert_eq!(fs::read(archive).unwrap(), legacy);
+        assert!(
+            records(dir, id).iter().all(|record| {
+                record["t"] != "queued" && record.get("queued_messages").is_none()
+            })
+        );
+        let migrated = TestSession::load_from(id, dir).unwrap();
+        assert_eq!(
+            migrated.meta.input_draft.as_deref(),
+            Some(expected_draft.as_str())
+        );
+        assert_eq!(migrated.messages(), session.messages());
     }
 
     #[test_case("unique", true; "unique_child")]
@@ -5554,6 +5660,7 @@ mod tests {
     #[test_case(b"{\"t\":\"future_type\",\"d\":{}}\n" ; "unknown_record_type")]
     #[test_case(b"{\"t\":\"sub_msg\",\"sub\":\"child\",\"d\":null}\n" ; "v2_child_record_in_v3_log")]
     #[test_case(b"{\"t\":\"meta\",\"title\":7}\n" ; "record_with_a_field_of_the_wrong_shape")]
+    #[test_case(b"{\"t\":\"queued\",\"messages\":[]}\n" ; "retired_queued_record_in_v3_log")]
     fn record_another_version_wrote_refuses_the_load_and_stays_on_disk(record: &[u8]) {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -5625,7 +5732,6 @@ mod tests {
         const CWD: &str = "/project";
         const PROMPT: &str = "original prompt";
         const DRAFT: &str = "unfinished input";
-        const QUEUED: &str = "next prompt";
         const TITLE: &str = "renamed session";
         const CONTEXT_SIZE: u32 = 42;
         let tmp = TempDir::new().unwrap();
@@ -5638,20 +5744,12 @@ mod tests {
             SessionRecord::Draft {
                 text: Some(DRAFT.into()),
             },
-            SessionRecord::Queued {
-                messages: vec![QUEUED.into()],
-            },
             SessionRecord::Title {
                 title: TITLE.into(),
             },
         ];
         if clear {
-            updates.extend([
-                SessionRecord::Draft { text: None },
-                SessionRecord::Queued {
-                    messages: Vec::new(),
-                },
-            ]);
+            updates.push(SessionRecord::Draft { text: None });
         }
         let path = jsonl_path(tmp.path(), session.id);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -5661,14 +5759,6 @@ mod tests {
         assert_eq!(
             restored.meta.input_draft.as_deref(),
             (!clear).then_some(DRAFT)
-        );
-        assert_eq!(
-            restored.meta.queued_messages,
-            if clear {
-                Vec::<String>::new()
-            } else {
-                vec![QUEUED.to_owned()]
-            }
         );
         assert_eq!(restored.title, TITLE);
         assert_eq!(restored.messages(), session.messages());

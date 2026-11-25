@@ -29,6 +29,9 @@ pub struct StoredStateRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateChange {
+    InputHold {
+        held: bool,
+    },
     Admitted {
         turn: TurnId,
         origin: StoredTurnOrigin,
@@ -301,6 +304,7 @@ pub struct StoredJoinedInput {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StoredScopeState {
+    pub input_held: bool,
     pub generation: u64,
     pub config: Option<StoredAgentConfig>,
     pub rules: Vec<StoredRule>,
@@ -312,6 +316,12 @@ pub struct StoredScopeState {
     pub joined_inputs: BTreeMap<TurnId, BTreeMap<MakimaId, StoredJoinedInput>>,
     pub results: VecDeque<(TurnId, StoredTurnResult)>,
     pub deliveries: BTreeMap<(AgentId, TurnId), StoredDeliveryOp>,
+}
+
+impl StoredScopeState {
+    pub fn holds_input(&self, origin: &StoredTurnOrigin) -> bool {
+        self.input_held && *origin == StoredTurnOrigin::User
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -332,6 +342,7 @@ pub struct SessionStateReducer {
 
 #[derive(Debug, Clone, Default)]
 struct ReducedScope {
+    input_held: bool,
     generation: u64,
     config: Option<Arc<StoredAgentConfig>>,
     rules: Arc<Vec<StoredRule>>,
@@ -358,6 +369,7 @@ impl ReducedScope {
 
     fn materialize(&self) -> StoredScopeState {
         StoredScopeState {
+            input_held: self.input_held,
             generation: self.generation,
             config: self.config.as_deref().cloned(),
             rules: self.rules.as_ref().clone(),
@@ -532,6 +544,7 @@ impl SessionStateReducer {
         let mut scope = self.scopes.get(&record.agent).cloned().unwrap_or_default();
         scope.generation = record.generation;
         match &record.change {
+            StateChange::InputHold { held } => scope.input_held = *held,
             StateChange::Admitted { turn, origin } => {
                 if !scope.results.iter().any(|(id, _)| id == turn) {
                     scope.admitted.insert(*turn, Arc::new(origin.clone()));

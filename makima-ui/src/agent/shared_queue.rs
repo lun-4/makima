@@ -48,6 +48,7 @@ pub(crate) fn visible_pending(actor: &AgentActorHandle) -> Vec<PendingQueueEntry
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn pending_texts(entries: Vec<PendingQueueEntry>) -> Vec<String> {
     entries
         .into_iter()
@@ -114,10 +115,12 @@ impl QueueSender {
     }
 
     /// Clears what the user queued while keeping child-result deliveries.
+    #[cfg(test)]
     pub(crate) fn clear_user_work(&self) {
         let _ = self.actor.clear_user_work();
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
         pending_texts(visible_pending(&self.actor))
     }

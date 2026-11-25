@@ -582,7 +582,10 @@ impl AgentManagerHandle {
             .iter()
             .filter_map(|(agent, scope)| {
                 let agent = (*agent)?;
-                (!scope.admitted.is_empty()
+                (scope
+                    .admitted
+                    .values()
+                    .any(|origin| !scope.holds_input(origin))
                     && graph.nodes.get(&agent).is_some_and(|node| {
                         node.lifecycle == GraphLifecycle::Dormant
                             && node.residency == AgentResidency::Dormant
@@ -599,7 +602,17 @@ impl AgentManagerHandle {
             .snapshot()
             .fold()
             .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
-        Ok(view.scopes.values().map(|scope| scope.admitted.len()).sum())
+        Ok(view
+            .scopes
+            .values()
+            .map(|scope| {
+                scope
+                    .admitted
+                    .values()
+                    .filter(|origin| !scope.holds_input(origin))
+                    .count()
+            })
+            .sum())
     }
 
     pub fn suppress_root_continuations(&self) -> Result<usize, ManagerError> {
@@ -669,6 +682,9 @@ impl AgentManagerHandle {
         let mut changes = Vec::with_capacity(scope.admitted.len());
         // Queue reports first so every durable terminal record follows its accepted report.
         for (&turn, origin) in &scope.admitted {
+            if scope.holds_input(origin) {
+                continue;
+            }
             let result = TurnResult {
                 outcome: outcome(turn),
                 text: String::new(),
@@ -1064,6 +1080,7 @@ impl AgentManagerHandle {
             .collect::<Result<Vec<_>, ManagerError>>()?;
         let restoration = ActorRestoration {
             admitted,
+            input_held: scope.is_some_and(|scope| scope.input_held),
             history,
             results,
             deliveries,

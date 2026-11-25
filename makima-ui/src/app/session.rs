@@ -37,7 +37,6 @@ pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
         || !session.posts().is_empty()
         || session.meta.input_draft.is_some()
-        || !session.meta.queued_messages.is_empty()
         || session
             .subagent_messages()
             .values()
@@ -116,18 +115,13 @@ impl App {
         if self.restore_in_progress || self.rewind_pending {
             return;
         }
-        let meta = self.build_meta();
-        if self.state.session.meta.input_draft != meta.input_draft {
+        let draft = self.input_box.buffer.value();
+        let draft = (!draft.is_empty()).then_some(draft);
+        if self.state.session.meta.input_draft != draft {
             self.append_ui_record(SessionRecord::Draft {
-                text: meta.input_draft.clone(),
+                text: draft.clone(),
             });
-            self.state.session_mut().meta.input_draft = meta.input_draft;
-        }
-        if self.state.session.meta.queued_messages != meta.queued_messages {
-            self.append_ui_record(SessionRecord::Queued {
-                messages: meta.queued_messages.clone(),
-            });
-            self.state.session_mut().meta.queued_messages = meta.queued_messages;
+            self.state.session_mut().meta.input_draft = draft;
         }
     }
 
@@ -159,11 +153,6 @@ impl App {
             session_rules: Vec::new(),
             context_size: state.context_size,
             input_draft: (!draft.is_empty()).then_some(draft),
-            queued_messages: if self.recoverable_queue.is_empty() {
-                self.queue.root_text_messages()
-            } else {
-                self.recoverable_queue.clone()
-            },
             thinking: None,
             fast: false,
             workflow: false,
@@ -200,7 +189,6 @@ impl App {
         self.status = super::Status::Idle;
         self.clear_exit_request();
         self.queue.clear_root_user_work();
-        self.recoverable_queue.clear();
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
@@ -259,7 +247,6 @@ impl App {
 
     pub(crate) fn finish_root_rewind(&mut self, draft: String) {
         self.queue.unfocus_root();
-        self.recoverable_queue.clear();
         let notes = self.root_fork_notes();
         let (display, items) = history_to_display_with_notes(
             self.state.session.messages(),
@@ -271,7 +258,6 @@ impl App {
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);
-        self.state.session_mut().meta.queued_messages.clear();
         self.finish_rewind_input(draft);
     }
 

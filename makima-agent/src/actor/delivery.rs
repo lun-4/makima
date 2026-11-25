@@ -712,6 +712,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
     if state.lifecycle != ActorLifecycle::Open
         || state.idle.is_some()
         || state.delivery_suspended
+        || state.input_held
         || held(inner, state)
         || state.deliveries.is_empty()
         || !state.delivery_runs.is_empty()
@@ -739,7 +740,7 @@ pub(super) fn schedule(inner: &Arc<ActorInner>, state: &mut super::ActorState) {
         .flat_map(|pending| pending.work.iter().map(WorkReservation::hold_only))
         .collect::<Vec<_>>();
     state.turn_work.insert(turn_id, work);
-    inner.admit_ticket(turn_id, ticket.clone(), None);
+    inner.admit_ticket(turn_id, ticket.clone(), None, false);
     for pending in state.deliveries.values_mut() {
         pending.arrived_during_run = false;
     }

@@ -1295,7 +1295,8 @@ impl SessionRuntime {
         let (manager, root) = self.handles.manager_and_root();
         let actor = manager.actor(root).map_err(|error| error.to_string())?;
         let snapshot = actor.snapshot();
-        let starting = snapshot.active_turn.is_none() && snapshot.queued == 0;
+        let starting =
+            snapshot.active_turn.is_none() && snapshot.queued == 0 && !actor.input_held();
         let mut preamble = self.app.shell.results_for(Some(root)).to_vec();
         preamble.extend_from_slice(self.app.shell.results_for(None));
         let input = makima_agent::AgentInput {
@@ -1344,13 +1345,17 @@ impl SessionRuntime {
         self.notifications.reset();
     }
 
-    /// A mailbox wake waits until the actor is idle and failed-turn text is released.
+    /// A mailbox wake waits until the actor is idle and input is not held.
     fn quiescent(&self) -> bool {
         !self.lock_lost
             && !self.app.restore_in_progress
             && SessionStatus::of(&self.app) == SessionStatus::Idle
             && self.handles.queue.is_empty()
-            && !self.app.holds_recovery_text()
+            && !self
+                .app
+                .root_agent
+                .as_ref()
+                .is_some_and(AgentRef::input_held)
     }
 }
 
@@ -5748,12 +5753,18 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use makima_agent::actor::{ActorError, ActorHistory, ConfigPatch, TurnContext};
+    use makima_agent::actor::{
+        ActorError, ActorHistory, ConfigPatch, TurnAdmissionOptions, TurnContext, TurnOrigin,
+        TurnProvenance,
+    };
     use makima_agent::manager::{AgentMetadata, ResidentAgent};
     use makima_agent::plan_state::content_sha256;
     use makima_agent::{ActorBackend, AgentInput, BackendResult, ControlWork, WorkKind};
     use makima_domain::ThinkingConfig as DomainThinkingConfig;
-    use makima_providers::{Invocation, RequestDelivery};
+    use makima_providers::provider::BoxFuture;
+    use makima_providers::{
+        AgentError, Invocation, RequestDelivery, RequestOptions, StreamResponse,
+    };
     use makima_storage::checkpoint::ClaimingWriter;
     use makima_storage::sessions::HistorySnapshot;
 
@@ -8012,7 +8023,6 @@ end })
                     app.state.session.meta.input_draft.as_deref(),
                     Some(CHILD_PROMPT)
                 );
-                assert_eq!(app.state.session.meta.queued_messages, [REWIND_QUEUED]);
                 assert!(ticket.peek_result().is_none());
                 assert!(child_ticket.peek_result().is_some());
                 assert!(child_actor.pending_queue().is_empty());
@@ -8029,7 +8039,6 @@ end })
                 smol::block_on(rt.checkpoint.append(Vec::new())).unwrap();
                 let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
                 assert_eq!(reopened.meta.input_draft.as_deref(), Some(EDITED_PROMPT));
-                assert_eq!(reopened.meta.queued_messages, [REWIND_QUEUED]);
                 drop(root_idle);
             },
         );
@@ -8063,7 +8072,6 @@ end })
                 let history = rt.handles.history.load_full();
                 assert_eq!(rt.app.main_chat().last_message_text(), REWIND_TARGET);
                 assert_eq!(rt.app.queue.focus(), Some(0));
-                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
                 let completion = select_rewind(event_loop);
                 event_loop.handle_internal(completion);
                 let rt = &mut event_loop.sessions[0];
@@ -8079,7 +8087,6 @@ end })
                     rt.app.state.session.meta.input_draft.as_deref(),
                     Some(REWIND_DRAFT)
                 );
-                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
                 assert_eq!(rt.app.queue.focus(), Some(0));
                 assert_eq!(rt.app.queue.text_messages(), [REWIND_QUEUED]);
                 assert_eq!(actor.snapshot().queued, 1);
@@ -8127,7 +8134,6 @@ end })
                     .unwrap();
                 rt.app.input_box.set_input(REWIND_DRAFT.into());
                 rt.app.persist_input();
-                assert_eq!(rt.app.state.session.meta.queued_messages, [REWIND_QUEUED]);
                 let completion = select_rewind(event_loop);
                 assert!(matches!(
                     &completion,
@@ -8136,21 +8142,11 @@ end })
                 ));
                 assert_eq!(actor.snapshot().queued, 0);
                 assert!(ticket.peek_result().is_some());
-                assert_eq!(
-                    event_loop.sessions[0]
-                        .app
-                        .state
-                        .session
-                        .meta
-                        .queued_messages,
-                    [REWIND_QUEUED]
-                );
                 event_loop.handle_internal(completion);
                 let app = &mut event_loop.sessions[0].app;
                 assert_eq!(app.input_box.buffer.value(), REWIND_TARGET);
                 assert!(app.main_chat().last_message_text().contains(REWIND_NOTE));
                 assert!(app.queue.is_empty());
-                assert!(app.state.session.meta.queued_messages.is_empty());
                 if failure.is_some() {
                     assert!(
                         app.flash_text()
@@ -8161,7 +8157,6 @@ end })
                 let rt = &event_loop.sessions[0];
                 let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
                 assert_eq!(reopened.meta.input_draft.as_deref(), Some(REWIND_TARGET));
-                assert!(reopened.meta.queued_messages.is_empty());
                 let reopened_view = reopened.latest_state().unwrap();
                 assert!(
                     !reopened_view.scopes[&Some(root.id())]
@@ -9325,6 +9320,122 @@ end })
         });
     }
 
+    #[test_case(false; "submit_releases_held_input")]
+    #[test_case(true; "escape_discards_held_input")]
+    fn failed_turn_keeps_actor_queue_visible(cancel: bool) {
+        const FIRST: &str = "failing request";
+        const HELD: &str = "held request";
+        const NEXT: &str = "new request";
+        const FAILURE: &str = "fixture request failed";
+
+        struct FailingProvider {
+            entered: flume::Sender<()>,
+            fail: flume::Receiver<()>,
+        }
+
+        impl Provider for FailingProvider {
+            fn stream_message<'a>(
+                &'a self,
+                _model: &'a Model,
+                _messages: &'a [Message],
+                _system: &'a str,
+                _tools: &'a serde_json::Value,
+                _event_tx: &'a flume::Sender<makima_providers::ProviderEvent>,
+                _opts: RequestOptions,
+                _session_id: Option<&'a SessionRef>,
+                _invocation: &'a Invocation,
+                _delivery: RequestDelivery,
+            ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+                Box::pin(async move {
+                    self.entered.send(()).unwrap();
+                    self.fail.recv_async().await.unwrap();
+                    Err(AgentError::Config {
+                        message: FAILURE.into(),
+                    })
+                })
+            }
+        }
+
+        let (entered, requests) = flume::unbounded();
+        let (fail, gate) = flume::bounded(1);
+        with_event_loop_runtime(
+            |harness| {
+                harness
+                    .ctx()
+                    .spawn_runtime_with_provider(
+                        harness.session(),
+                        Some(PreparedProvider {
+                            model: crate::components::test_model(),
+                            provider: Arc::new(FailingProvider {
+                                entered,
+                                fail: gate,
+                            }),
+                        }),
+                    )
+                    .unwrap()
+            },
+            |event_loop| {
+                let submit = |event_loop: &mut EventLoop<'_>, text: &str| {
+                    event_loop.handle_input(Event::Paste(text.into()));
+                    event_loop.handle_input(Event::Key(crate::components::key(KeyCode::Enter)));
+                };
+                let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+                let actor = manager.actor(root).unwrap();
+                submit(event_loop, FIRST);
+                requests.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+                actor
+                    .admit_turn_with_options(
+                        AgentInput::new(HELD.into(), vec![]),
+                        None,
+                        String::new(),
+                        TurnAdmissionOptions {
+                            provenance: TurnProvenance {
+                                origin: TurnOrigin::User,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                fail.send(()).unwrap();
+                pump_until(event_loop, |event_loop| {
+                    actor.input_held()
+                        && matches!(&event_loop.sessions[0].app.status, Status::Error { message, .. } if message == FAILURE)
+                });
+                let runtime = &event_loop.sessions[0];
+                assert_eq!(runtime.app.queue.text_messages(), [HELD]);
+                assert!(!runtime.quiescent());
+                assert!(requests.is_empty());
+
+                if cancel {
+                    for _ in 0..2 {
+                        event_loop.handle_input(Event::Key(crate::components::key(KeyCode::Esc)));
+                    }
+                    let app = &event_loop.sessions[0].app;
+                    assert!(!actor.input_held());
+                    assert!(app.queue.is_empty());
+                    assert_eq!(app.status, Status::Idle);
+                    assert!(requests.is_empty());
+                } else {
+                    let presentation = runtime.app.run_id;
+                    submit(event_loop, NEXT);
+                    let app = &event_loop.sessions[0].app;
+                    assert_eq!(app.run_id, presentation);
+                    assert_ne!(app.chats[0].last_message_text(), NEXT);
+                    requests.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+                    pump_until(event_loop, |event_loop| {
+                        let chat = &event_loop.sessions[0].app.chats[0];
+                        (0..chat.message_count()).any(|i| {
+                            chat.message_at(i)
+                                .is_some_and(|message| message.text == HELD)
+                        })
+                    });
+                    assert!(!actor.input_held());
+                }
+            },
+        );
+    }
+
     /// Answers every request at once, reporting the model it was sent.
     struct AnsweringProvider {
         requests: flume::Sender<String>,
@@ -9879,7 +9990,6 @@ end })
     ) -> (AppSession, AgentId, AgentId, TurnId, TurnId) {
         const CHILD_KEY: &str = "recovered-child";
         const TOOL: &str = "interrupted-tool";
-        const QUEUED: &str = "inactive queued draft";
         let mut session = harness.session();
         let root = AgentId::generate();
         let child = AgentId::generate();
@@ -9919,16 +10029,17 @@ end })
                 },
             });
         }
-        session.meta.queued_messages.push(QUEUED.into());
         (session, root, child, root_turn, child_turn)
     }
 
     #[test_case(false; "startup")]
     #[test_case(true; "replacement")]
-    fn recovery_preserves_pending_turns_before_activation_and_queue_stays_inactive(replace: bool) {
+    fn recovery_preserves_pending_turns_before_activation(replace: bool) {
+        const DRAFT: &str = "unsent draft";
         let harness = RuntimeHarness::new();
         let mut outgoing = replace.then(|| harness.runtime(harness.session()));
-        let (session, root, child, root_turn, child_turn) = interrupted_session(&harness);
+        let (mut session, root, child, root_turn, child_turn) = interrupted_session(&harness);
+        session.meta.input_draft = Some(DRAFT.into());
         let session_id = session.id;
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
         assert!(!prepared.handles.is_initialized());
@@ -9982,7 +10093,6 @@ end })
                 .count(),
             1
         );
-        assert!(loaded.meta.queued_messages.is_empty());
         let (manager, root_id) = runtime.handles.manager_and_root();
         assert_eq!(root_id, root);
         assert!(manager.actor(root).is_ok());
@@ -9995,10 +10105,8 @@ end })
         assert!(Arc::ptr_eq(&history.messages, &prepared_history.messages));
         assert!(runtime.handles.queue.is_empty());
         runtime.activate_deferred();
-        assert_eq!(
-            runtime.app.input_box.buffer.value(),
-            loaded.meta.input_draft.unwrap()
-        );
+        assert_eq!(loaded.meta.input_draft.as_deref(), Some(DRAFT));
+        assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
         assert_eq!(
             manager
                 .actor(root)

@@ -266,6 +266,10 @@ impl AgentRef {
         self.manager.wake_agent(self.agent_id).await
     }
 
+    pub fn input_held(&self) -> bool {
+        self.actor().is_ok_and(|actor| actor.input_held())
+    }
+
     /// Admits input on the resident actor without starting reactivation.
     pub fn submit(
         &self,

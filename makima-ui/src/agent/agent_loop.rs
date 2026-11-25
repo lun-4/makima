@@ -445,6 +445,10 @@ impl TuiActorBackend {
 }
 
 impl ActorBackend for TuiActorBackend {
+    fn hold_input_after_failure(&self) -> bool {
+        true
+    }
+
     fn offload_store(&self) -> Option<Arc<OffloadStore>> {
         self.offload.clone()
     }

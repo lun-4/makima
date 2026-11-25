@@ -2563,10 +2563,6 @@ pub(crate) mod tests {
             );
             session.bind_root_id(root_id).unwrap();
             session.push_message(Message::user(ORIGINAL_RECOVERY_INPUT.into()));
-            session
-                .meta
-                .queued_messages
-                .push(ORIGINAL_RECOVERY_INPUT.into());
             session.push_state(makima_storage::session_state::StoredStateRecord {
                 seq: 2,
                 agent: Some(root_id),

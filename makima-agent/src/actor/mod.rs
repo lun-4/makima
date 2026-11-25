@@ -262,6 +262,7 @@ pub(crate) struct ActorInner {
     pub(crate) journal_incarnation: Option<JournalIncarnation>,
     terminal_checkpoint: Option<TerminalCheckpoint>,
     persist_turn_results: bool,
+    hold_input_after_failure: bool,
     mode_ceiling: Option<config::ModeCeiling>,
     pub(crate) completion_policy: types::CompletionPolicy,
     offload: Option<Arc<OffloadStore>>,
@@ -371,9 +372,11 @@ impl ActorInner {
         turn_id: TurnId,
         ticket: TurnTicket,
         input: Option<&AgentInput>,
+        release_input: bool,
     ) {
         if let Some(journal) = &self.journal
-            && let Err(error) = self.record_admission_input(journal, turn_id, &ticket, input)
+            && let Err(error) =
+                self.record_admission_input(journal, turn_id, &ticket, input, release_input)
         {
             tracing::warn!(%error, agent_id = %self.agent_id, %turn_id, "turn admission could not be journaled");
         }
@@ -387,6 +390,7 @@ impl ActorInner {
         turn_id: TurnId,
         ticket: &TurnTicket,
         input: Option<&AgentInput>,
+        release_input: bool,
     ) -> Result<(), String> {
         let input = input
             .map(serde_json::to_value)
@@ -413,6 +417,11 @@ impl ActorInner {
                         promoted: None,
                     },
                 }))
+                .chain(release_input.then_some(JournalChange {
+                    agent: Some(self.agent_id),
+                    generation: 0,
+                    change: StateChange::InputHold { held: false },
+                }))
                 .collect(),
                 ..Default::default()
             })
@@ -420,7 +429,7 @@ impl ActorInner {
             .map_err(|error| error.to_string())
     }
 
-    fn record_joined_input(&self, change: StateChange) -> Result<(), ActorError> {
+    fn record_input_change(&self, change: StateChange) -> Result<(), ActorError> {
         if let Some(journal) = &self.journal {
             journal
                 .commit(JournalCommit {
@@ -478,6 +487,7 @@ pub(crate) struct ActorState {
     pub(super) delivery_seen: VecDeque<TurnId>,
     pub(super) delivery_runs: HashMap<TurnId, Vec<TurnId>>,
     pub(super) delivery_suspended: bool,
+    input_held: bool,
     pub(super) delivery_held: bool,
     pub(super) parent_delivery_policy: Option<delivery::ParentDeliveryPolicy>,
 
@@ -965,6 +975,31 @@ fn materialize(
 }
 
 impl ActorState {
+    fn set_input_hold(&mut self, inner: &ActorInner, held: bool) {
+        if self.input_held == held {
+            return;
+        }
+        if let Err(error) = inner.record_input_change(StateChange::InputHold { held }) {
+            tracing::warn!(%error, agent_id = %inner.agent_id, held, "input hold could not be journaled");
+        }
+        self.input_held = held;
+        inner.queue.notify();
+    }
+
+    fn hold_queued_input(&mut self, inner: &ActorInner, failed: Option<TurnId>) {
+        if inner.hold_input_after_failure
+            && !self.suspended
+            && self.lifecycle == ActorLifecycle::Open
+            && self.instructions.iter().any(|(id, inbox)| {
+                Some(*id) != failed
+                    && self.processing.as_ref().and_then(|work| work.turn_id) != Some(*id)
+                    && inbox.ticket.provenance().origin == TurnOrigin::User
+            })
+        {
+            self.set_input_hold(inner, true);
+        }
+    }
+
     fn check_instruction_capacity(&self, bytes: usize) -> Result<(), ActorError> {
         let (count, total) = self
             .instructions
@@ -1138,6 +1173,7 @@ impl ActorState {
             delivery_seen: VecDeque::new(),
             delivery_runs: HashMap::new(),
             delivery_suspended: false,
+            input_held: false,
             delivery_held: false,
             parent_delivery_policy: None,
             lifecycle: ActorLifecycle::Open,
@@ -1283,6 +1319,9 @@ fn retire_turn(
             context_size: outcome.context_size(),
             context_window: outcome.context_window(),
         };
+    }
+    if matches!(outcome, TurnOutcome::Failed { .. }) {
+        state.hold_queued_input(inner, Some(turn_id));
     }
     state.instructions.remove(&turn_id);
     if settle_runner {
@@ -1694,6 +1733,7 @@ pub struct RestoredTurnAdmission {
 
 pub struct ActorRestoration {
     pub admitted: Vec<RestoredTurnAdmission>,
+    pub input_held: bool,
     pub history: HistorySnapshot,
     pub results: Vec<TurnResult>,
     pub deliveries: Vec<Arc<ChildDelivery>>,
@@ -1891,6 +1931,7 @@ impl AgentActorHandle {
             context_event_sender: backend.context_event_sender(),
             terminal_checkpoint: backend.terminal_checkpoint(),
             persist_turn_results: backend.persist_turn_results(),
+            hold_input_after_failure: backend.hold_input_after_failure(),
             #[cfg(test)]
             after_pop: Mutex::new(None),
             #[cfg(test)]
@@ -1907,6 +1948,7 @@ impl AgentActorHandle {
         if let Some(restoration) = restoration {
             let mut state = inner.state.lock_unpoisoned();
             state.usage = restoration.usage;
+            state.input_held = restoration.input_held;
             state.policy_generation = restoration.generation;
             state.delivery_seen = restoration.delivery_seen.into();
             let latest_continuation = restoration
@@ -1924,6 +1966,10 @@ impl AgentActorHandle {
                 let mut inbox = inbox::InstructionInbox::new(ticket.clone(), presentation);
                 inbox.operation = operation_id;
                 inbox.batchable = crate::batchable(&admission.input);
+                if state.input_held {
+                    inbox.initial =
+                        Some(state.pending_submission(turn_id, &admission.input, false, None));
+                }
                 for (id, input, notice) in admission.joined {
                     let presentation = state.pending_submission(turn_id, &input, false, notice);
                     let bytes = submission_bytes(&input).unwrap_or(MAX_PENDING_INSTRUCTION_BYTES);
@@ -2221,6 +2267,7 @@ impl AgentActorHandle {
     pub(crate) fn settle_local_cancel(&self, cut: LocalCancellationCut) {
         settle_deferred(&self.inner, cut.deferred, TurnCancellationReason::User);
         terminalize_work(&self.inner, cut.drained, TurnCancellationReason::User);
+        self.clear_empty_input_hold();
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -2301,6 +2348,10 @@ impl AgentActorHandle {
         self.inner.queue.remove_compact(operation_id)
     }
 
+    pub fn input_held(&self) -> bool {
+        self.inner.state.lock_unpoisoned().input_held
+    }
+
     pub fn pending_submissions(&self) -> Vec<PendingSubmission> {
         let state = self.inner.state.lock_unpoisoned();
         let mut pending: Vec<_> = state
@@ -2336,7 +2387,7 @@ impl AgentActorHandle {
         {
             if let Some(id) = inbox.pending[index].journal_id {
                 self.inner
-                    .record_joined_input(StateChange::JoinedInput {
+                    .record_input_change(StateChange::JoinedInput {
                         turn: turn_id,
                         id,
                         input: None,
@@ -2368,7 +2419,7 @@ impl AgentActorHandle {
             && let Some(id) = entry.journal_id
         {
             self.inner
-                .record_joined_input(StateChange::TurnInput {
+                .record_input_change(StateChange::TurnInput {
                     turn: turn_id,
                     input: Some(serde_json::to_value(&entry.input).ok()?),
                     promoted: Some(id),
@@ -2616,6 +2667,7 @@ impl AgentActorHandle {
                         ActorStatus::Idle => None,
                     });
             let target = active
+                .filter(|_| !state.input_held)
                 .filter(|id| {
                     state.instructions.get(id).is_some_and(|inbox| {
                         inbox.open
@@ -2635,7 +2687,8 @@ impl AgentActorHandle {
                 })
                 .or_else(|| {
                     state.instructions.iter().find_map(|(id, inbox)| {
-                        (inbox.open
+                        (!state.input_held
+                            && inbox.open
                             && batchable
                             && inbox.batchable
                             && inbox.submit_operation == Some(state.next_operation_id))
@@ -2663,7 +2716,8 @@ impl AgentActorHandle {
                     drop(state);
                     constraint(&policy).map_err(ActorError::InvalidConfig)?;
                     state = self.inner.state.lock_unpoisoned();
-                    if state.policy_generation != generation
+                    if state.input_held
+                        || state.policy_generation != generation
                         || state.next_operation_id != operation_boundary
                         || state.cancelled_correlations.contains_key(&correlation)
                         || state.lifecycle != ActorLifecycle::Open
@@ -2699,7 +2753,7 @@ impl AgentActorHandle {
                     let id = MakimaId::generate();
                     let payload =
                         serde_json::to_value(&input).map_err(|_| ActorError::InvalidInstruction)?;
-                    self.inner.record_joined_input(StateChange::JoinedInput {
+                    self.inner.record_input_change(StateChange::JoinedInput {
                         turn: target,
                         id,
                         input: Some(StoredJoinedInput {
@@ -2800,9 +2854,13 @@ impl AgentActorHandle {
             ));
             state.delivery_suspended = false;
             state.instructions.insert(turn_id, inbox);
-            self.inner
-                .admit_ticket(turn_id, ticket.clone(), Some(&input));
             let reason = state.cancelled_correlations.get(&correlation).copied();
+            let release = reason.is_none()
+                && state.input_held
+                && ticket.provenance().origin == TurnOrigin::User;
+            self.inner
+                .admit_ticket(turn_id, ticket.clone(), Some(&input), release);
+            state.input_held &= !release;
             let work = ActorOperation::Turn {
                 id,
                 input: Box::new(input),
@@ -2894,8 +2952,11 @@ impl AgentActorHandle {
             inbox.operation = after;
         }
         let reason = state.cancelled_correlations.get(&correlation).copied();
+        let release =
+            reason.is_none() && state.input_held && ticket.provenance().origin == TurnOrigin::User;
         self.inner
-            .admit_ticket(turn_id, ticket.clone(), Some(&input));
+            .admit_ticket(turn_id, ticket.clone(), Some(&input), release);
+        state.input_held &= !release;
         let work = ActorOperation::Turn {
             id: after,
             input: Box::new(input),
@@ -3120,6 +3181,7 @@ impl AgentActorHandle {
         drop(state);
         settle_deferred(&self.inner, deferred, TurnCancellationReason::User);
         terminalize_work(&self.inner, drained, TurnCancellationReason::User);
+        self.clear_empty_input_hold();
         len
     }
 
@@ -3152,6 +3214,19 @@ impl AgentActorHandle {
             active.fire(TurnCancellationReason::User);
         }
         terminalize_work(&self.inner, drained, TurnCancellationReason::User);
+        self.clear_empty_input_hold();
+    }
+
+    fn clear_empty_input_hold(&self) {
+        let mut state = self.inner.state.lock_unpoisoned();
+        if state.input_held
+            && !state
+                .instructions
+                .values()
+                .any(|inbox| inbox.ticket.provenance().origin == TurnOrigin::User)
+        {
+            state.set_input_hold(&self.inner, false);
+        }
     }
 
     /// Cancels one already-admitted turn by nominal identity. The exact turn
@@ -3205,6 +3280,7 @@ impl AgentActorHandle {
             let outcome = cancelled_outcome(self.inner.agent_id, admission.turn_id, reason);
             finalize_turn(&self.inner, admission.turn_id, outcome, &admission, true);
         }
+        self.clear_empty_input_hold();
     }
 
     /// Closes the actor: admissions are rejected, the active turn is

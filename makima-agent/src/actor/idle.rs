@@ -168,7 +168,11 @@ impl ActorState {
     /// ends the reservation so it runs like any other turn.
     pub(super) fn pop_work(&mut self, queue: &ActorQueue) -> Option<ActorWork> {
         let Some(reservation) = &mut self.idle else {
-            return queue.pop();
+            return if self.input_held {
+                queue.pop_unheld()
+            } else {
+                queue.pop()
+            };
         };
         if let Some(edit) = reservation.edit.take() {
             return Some(ActorWork::HistoryEdit(edit));

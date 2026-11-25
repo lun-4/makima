@@ -2010,11 +2010,10 @@ fn queue_item_consumed_marks_agent_streaming() {
     assert_eq!(app.status, Status::Streaming);
 }
 
-#[test_case(idle_app_with_queued_message, error_app ; "error")]
-#[test_case(app_with_queued_message, cancel_app ; "cancel")]
-fn clears_queue(setup: fn() -> App, terminate: fn(&mut App)) {
-    let mut app = setup();
-    terminate(&mut app);
+#[test]
+fn cancel_clears_queue() {
+    let mut app = app_with_queued_message();
+    cancel_app(&mut app);
     assert!(app.queue.is_empty());
 }
 
@@ -2065,20 +2064,6 @@ fn app_with_queued_message() -> App {
     app
 }
 
-/// A root error ends the turn before the app sees it, so the root holds no
-/// active turn that could absorb the queued message.
-fn idle_app_with_queued_message() -> App {
-    let mut app = idle_busy_app();
-    app.queue_and_notify(queued_msg("queued"));
-    app
-}
-
-fn idle_busy_app() -> App {
-    let mut app = test_app();
-    app.record_run_start(app.queue.reserve_run_id(app.run_id));
-    app
-}
-
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -2095,8 +2080,9 @@ fn cancel_app(app: &mut App) {
 }
 
 fn error_app(app: &mut App) {
+    const FAILURE: &str = "fixture control failed";
     app.update(agent_msg(AgentEvent::ControlError {
-        message: "boom".into(),
+        message: FAILURE.into(),
     }));
 }
 
@@ -5092,10 +5078,8 @@ fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
         Arc::clone(&app.theme_provider),
     ));
     app.chats[1].push_user_message("child work");
-    app.recoverable_queue.push("queued prompt".into());
     app.finish_root_rewind(CUT.into());
     assert_eq!(app.input_box.buffer.value(), CUT);
-    assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats[1].last_message_text(), "child work");
     assert_eq!(app.chats[0].message_count(), 3);
     assert_eq!(app.chats[0].message_at(0).unwrap().text, FIRST);
@@ -6267,12 +6251,11 @@ fn ctrl_q_pops_newest_visible_item() {
     );
 }
 
-#[test_case(app_with_queued_message, cancel_app ; "cancel")]
-#[test_case(idle_app_with_queued_message, error_app ; "error")]
-fn clears_queue_focus_on_terminate(setup: fn() -> App, terminate: fn(&mut App)) {
-    let mut app = setup();
+#[test]
+fn clears_queue_focus_on_terminate() {
+    let mut app = app_with_queued_message();
     app.queue.set_focus_at(0);
-    terminate(&mut app);
+    cancel_app(&mut app);
     assert!(app.queue.focus().is_none());
 }
 
@@ -6441,10 +6424,6 @@ fn session_has_content_covers_each_branch() {
     assert!(session_has_content(&session));
     session.meta.input_draft = None;
 
-    session.meta.queued_messages = vec!["queued".into()];
-    assert!(session_has_content(&session));
-    session.meta.queued_messages.clear();
-
     session.meta.mode = Some(StoredMode::Plan);
     assert!(session_has_content(&session));
     session.meta.mode = Some(StoredMode::Build);
@@ -6504,15 +6483,6 @@ fn checkpoint_syncs_ephemeral_content_into_meta() {
     assert!(app.state.plan.path().is_some());
     assert!(app.state.session.meta.thinking.is_none());
     assert!(session_has_content(&app.state.session));
-
-    let mut queued = app_with_queued_message();
-    queued.checkpoint();
-    let session = &queued.state.session;
-    assert!(session.messages().is_empty());
-    assert!(session.meta.input_draft.is_none());
-    assert!(session.meta.mode.is_none());
-    assert_eq!(session.meta.queued_messages, vec!["queued".to_string()]);
-    assert!(session_has_content(session));
 }
 
 #[test]
@@ -6557,21 +6527,6 @@ fn restore_resumed_session_keeps_recovered_draft_inactive() {
 
     app.checkpoint();
     assert_eq!(app.state.session.meta.input_draft.as_deref(), Some(DRAFT));
-    assert!(app.state.session.meta.queued_messages.is_empty());
-}
-
-#[test]
-fn apply_loaded_session_defers_queued_messages_until_flush() {
-    let mut app = test_app();
-    let mut session = AppSession::new("test-model", "/tmp/test");
-    session.meta.queued_messages = vec!["deferred".into()];
-    session.push_message(Message::user("hello".into()));
-
-    let model = app.root_config().model.clone();
-    app.apply_loaded_session(session, &model);
-
-    assert!(app.queue.is_empty());
-    assert_eq!(app.state.session.meta.queued_messages, ["deferred"]);
 }
 
 #[test]
@@ -7275,25 +7230,6 @@ fn focused_plan_state_is_isolated() {
         app.focused_model_spec(),
         app.focused_config().unwrap().model.spec()
     );
-}
-
-#[test]
-fn root_error_recovery_does_not_follow_child_queue_focus() {
-    let (mut app, rx) = app_with_subagent_actor(TASK_ID);
-    app.queue_and_notify(queued_msg("root pending"));
-    type_and_submit(&mut app, "child active");
-    received_input(&rx);
-    type_and_submit(&mut app, "child pending");
-    app.queue.set_focus_at(0);
-    assert_eq!(app.queue.focus(), Some(0));
-    assert_eq!(app.build_meta().queued_messages, ["root pending"]);
-    app.update(agent_msg(AgentEvent::ControlError {
-        message: "root failure".into(),
-    }));
-    assert_eq!(app.recoverable_queue, ["root pending"]);
-    assert_eq!(app.queue.text_messages(), ["child pending"]);
-    assert_eq!(app.queue.focus(), Some(0));
-    assert_eq!(app.build_meta().queued_messages, ["root pending"]);
 }
 
 #[test]
@@ -8264,89 +8200,6 @@ fn parent_done_preserves_shell_and_same_id_child_tool() {
     assert_eq!(app.chats[0].in_progress_count(), 1);
     assert_eq!(app.chats[1].in_progress_count(), 1);
     assert!(!app.chats[1].is_finished());
-}
-
-#[test]
-fn error_event_matching_run_id_saves_session_and_queued_messages() {
-    let mut app = with_history(idle_busy_app());
-    app.queue_and_notify(queued_msg("next"));
-
-    app.update(agent_msg(AgentEvent::ControlError {
-        message: "boom".into(),
-    }));
-    app.checkpoint();
-
-    assert_eq!(app.state.session.messages().len(), 2);
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
-    assert!(app.queue.is_empty());
-
-    assert_eq!(app.state.session.meta.queued_messages, ["next"]);
-
-    type_and_submit(&mut app, "replacement");
-    app.checkpoint();
-    assert!(app.state.session.meta.queued_messages.is_empty());
-}
-
-#[test_case(false; "success")]
-#[test_case(true; "failure")]
-fn standalone_compaction_preserves_error_recovery_text_in_checkpoint(failed: bool) {
-    const PENDING: &str = "pending user message";
-    const SUMMARY: &str = "compacted conversation";
-    const FAILURE: &str = "root failure";
-    let mut app = with_history(idle_busy_app());
-    app.queue_and_notify(queued_msg(PENDING));
-    app.update(agent_msg_with_run_id(
-        AgentEvent::ControlError {
-            message: FAILURE.into(),
-        },
-        app.run_id,
-    ));
-    assert!(app.holds_recovery_text());
-    app.checkpoint();
-    assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
-
-    let presentation = app.queue.reserve_run_id(app.run_id);
-    let identity = makima_agent::ActorWorkIdentity::new(
-        AgentId::generate(),
-        makima_agent::ActorWorkKind::Compact {
-            operation_id: presentation,
-        },
-        presentation,
-    );
-    for event in [
-        AgentEvent::ModelSwitched {
-            spec: test_model().spec(),
-            context_window: test_model().context_window,
-        },
-        AgentEvent::TextDelta {
-            text: SUMMARY.into(),
-        },
-        if failed {
-            AgentEvent::ControlError {
-                message: FAILURE.into(),
-            }
-        } else {
-            AgentEvent::ControlComplete {
-                usage: TokenUsage::default(),
-            }
-        },
-    ] {
-        app.update(Msg::Agent(Box::new(Envelope {
-            event,
-            subagent: None,
-            identity: Some(identity),
-        })));
-        assert!(app.holds_recovery_text());
-        app.checkpoint();
-        assert_eq!(app.state.session.meta.queued_messages, [PENDING]);
-    }
-    assert_eq!(app.run_id, presentation);
-    if failed {
-        assert!(matches!(&app.status, Status::Error { message, .. } if message == FAILURE));
-    } else {
-        assert_eq!(app.status, Status::Idle);
-        assert_actor_response(&mut app, SUMMARY);
-    }
 }
 
 // --- Plan form integration tests ---
@@ -10855,27 +10708,6 @@ fn draft_mutations_reach_disk_without_checkpoint(delete: bool) {
         (!delete).then_some(TYPED_DRAFT)
     );
     assert!(loaded.messages().is_empty());
-}
-
-#[test_case(false; "queued_messages")]
-#[test_case(true; "removed_message")]
-fn queue_mutations_reach_disk_without_checkpoint(remove: bool) {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.queue_and_notify(queued_msg(TYPED_DRAFT));
-    app.queue_and_notify(queued_msg(UNSENT_DRAFT));
-    if remove {
-        app.queue.set_focus_at(0);
-        app.update(Msg::Key(key(KeyCode::Enter)));
-    }
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let loaded = AppSession::load(id, &dir).unwrap();
-    let expected = if remove {
-        vec![UNSENT_DRAFT]
-    } else {
-        vec![TYPED_DRAFT, UNSENT_DRAFT]
-    };
-    assert_eq!(loaded.meta.queued_messages, expected);
 }
 
 #[test]
