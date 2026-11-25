@@ -82,6 +82,15 @@ impl PinnedCommandHost {
                     specs.iter().map(|spec| Arc::from(spec.as_str())).collect(),
                 )))
             }),
+            request @ HostRequest::Builtin(BuiltinOperation::ReloadContext) => {
+                self.session.request_for_actor(
+                    request,
+                    actor,
+                    move || target.validate().map_err(ConfigChangeError::from),
+                    CheckpointPublication::default(),
+                    publication_claim(),
+                )
+            }
             HostRequest::Builtin(BuiltinOperation::ToggleFast) => {
                 Box::pin(commit_change(services, target, ConfigChange::ToggleFast))
             }

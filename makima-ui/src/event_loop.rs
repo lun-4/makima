@@ -26,7 +26,7 @@ use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, PreparedModel, PreparedTransaction,
     PreparedTransactionSnapshot,
 };
-use makima_agent::command::{CONTEXT_RELOAD_ROOT_ONLY, CONTEXT_RELOADED, CustomCommand};
+use makima_agent::command::{CONTEXT_RELOADED, CustomCommand};
 use makima_agent::config_change::{
     ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_selection,
 };
@@ -4693,10 +4693,6 @@ impl<'t> EventLoop<'t> {
     ) -> Result<(), String> {
         let actor = self.pinned_actor(idx, pinned)?;
         let runtime = &self.sessions[idx];
-        let (_, root) = runtime.handles.manager_and_root();
-        if pinned.target.id() != root {
-            return Err(CONTEXT_RELOAD_ROOT_ONLY.into());
-        }
         let admission = pinned.clone();
         let publication = CheckpointPublication::default();
         let registration = runtime.lifetime_cancel.register_publication(&publication);
@@ -6245,6 +6241,59 @@ end })
                 }
             }
             assert!(actor.effective_config().unwrap().workflow);
+        });
+    }
+
+    #[test_case(false; "live_child_reloads_session_context")]
+    #[test_case(true; "closed_child_is_rejected")]
+    fn context_reload_from_pinned_child(closed: bool) {
+        const UPDATED_INSTRUCTIONS: &str = "Reload these session instructions from the child tab.";
+        with_event_loop(|event_loop| {
+            let runtime = &event_loop.sessions[0];
+            let (manager, root) = runtime.handles.manager_and_root();
+            let root = manager.lookup(root).unwrap();
+            let config = root.effective_config().unwrap().unwrap();
+            let access = root.state_access();
+            smol::block_on(runtime.coordinator.reload_context()).unwrap();
+            let before = root_context(&access).unwrap().unwrap();
+            assert!(!before.instructions.text.contains(UPDATED_INSTRUCTIONS));
+            std::fs::write(config.context.cwd().join("AGENTS.md"), UPDATED_INSTRUCTIONS).unwrap();
+            let child = manager
+                .spawn_child_trusted_with_config(
+                    &root,
+                    (*config).clone(),
+                    Default::default(),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                )
+                .unwrap();
+            let admission = PinnedCommandTarget::pin(TrustedTarget {
+                target: child.clone(),
+                template: runtime.handles.orchestration_template.clone(),
+            })
+            .unwrap();
+            if closed {
+                child.close_subtree().unwrap();
+            }
+            let (reply, response) = flume::bounded(1);
+            event_loop.handle_command(CommandEvent::Host {
+                target: runtime.app.command_target.id(),
+                request: makima_commands::HostRequest::Builtin(BuiltinOperation::ReloadContext),
+                admission: Some(Box::new(admission)),
+                reply,
+            });
+            let result = response.recv_timeout(SESSION_OP_TIMEOUT).unwrap();
+            let recorded = root_context(&access).unwrap().unwrap();
+            if closed {
+                assert!(matches!(result, Err(CommandError::StaleTarget)));
+                assert_eq!(recorded.instructions.text, before.instructions.text);
+            } else {
+                assert_eq!(result.unwrap(), HostResponse::Completed);
+                assert!(recorded.instructions.text.contains(UPDATED_INSTRUCTIONS));
+                let child_context = root_context(&child.state_access()).unwrap().unwrap();
+                assert_eq!(child_context.instructions.text, recorded.instructions.text);
+            }
         });
     }
 

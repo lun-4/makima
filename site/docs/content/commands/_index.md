@@ -32,7 +32,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/workflow` | Toggle workflow mode (task tools callable inside code_execution) | none |  | all |
 | `/exit` | Exit the application | none |  | TUI only |
 | `/reload` | Reload plugins and config | none |  | TUI only |
-| `/reload-context` | Reload recorded instructions and prompt context for the root agent | none |  | all |
+| `/reload-context` | Reload the session's recorded context from any agent | none |  | all |
 | `/trust` | Trust this folder and load its shared project config | none |  | TUI only |
 
 The portable built-ins are `/compact`, `/reload-context`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).

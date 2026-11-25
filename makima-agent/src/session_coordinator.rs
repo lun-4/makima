@@ -1259,7 +1259,7 @@ impl SessionCoordinatorHandle {
 
     pub fn reserve_context_reload_for_actor(
         &self,
-        actor: AgentActorHandle,
+        target_actor: AgentActorHandle,
         validate: impl Fn() -> Result<(), ConfigChangeError> + Send + Sync + 'static,
         publication: CheckpointPublication,
         claim: CheckpointClaim,
@@ -1268,12 +1268,18 @@ impl SessionCoordinatorHandle {
         self.ensure_live()?;
         validate()?;
         let binding = self.actor_binding()?;
-        binding.agent.validate_live()?;
-        if !binding.agent.actor()?.same_actor(&actor) {
+        let manager = binding.agent.manager();
+        let target = manager.lookup(target_actor.agent_id())?;
+        target.validate_live()?;
+        if !target.actor()?.same_actor(&target_actor) || manager.root_id()? != binding.agent.id() {
             return Err(ActorError::PolicyCancelled.into());
         }
-        let access = binding.agent.state_access();
-        let actor_registrations = actor.register_publication(&publication)?;
+        let actor = binding.agent.actor()?;
+        let access = target.state_access();
+        let mut actor_registrations = actor.register_publication(&publication)?;
+        if !actor.same_actor(&target_actor) {
+            actor_registrations.extend(target_actor.register_publication(&publication)?);
+        }
         let registration = self.register_publication(&publication)?;
         let mut ticket = ContextReloadTicket {
             coordinator: self.clone(),

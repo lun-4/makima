@@ -48,7 +48,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
 - `/btw` runs one isolated model request with copied history and no tools. Its question and response do not change the primary model history.
 - `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
-- `/reload-context` on the main agent adopts current instruction sources and available system-prompt contributions. Normal resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
+- `/reload-context` reloads the session's recorded context and can run from any agent. Normal resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
 

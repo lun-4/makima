@@ -45,7 +45,7 @@ A prompt whose first token is an available slash command runs that command befor
 
 Print, SDK stream mode and ACP share one set of built-ins: `/model`, `/fast`, `/yolo`, `/workflow`, `/cd`, `/compact`, `/reload-context`, `/new` (or `/clear`) and `/btw`. `/model` accepts an explicit model spec. A plugin's `makima.api.run_command` runs them on the agent its `ctx` is pinned to, a subagent included, as in the TUI: `/model`, `/fast`, `/workflow`, `/cd` and `/compact` change that agent and a command's turn runs on it, while `/yolo` and `/new` act on the session. `/btw` answers beside the conversation without adding to it, and its answer is the result; `/compact` succeeds with empty output. In ACP, `/new` returns guidance to start a new session instead. Commands that need an interactive UI are rejected in headless frontends. The `//` escape also works there, so `/help` becomes text via `//help`. Local commands reject image attachments, while agent-turn commands preserve them.
 
-`/reload-context` is root-only. It adopts current instruction sources and available system-prompt contributions for subsequent requests; ordinary resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
+`/reload-context` reloads the session's recorded context and can run from any agent. Ordinary resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
 
 See [Commands](/docs/commands/) for matching, collision priority, and the generated command list.
 

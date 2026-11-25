@@ -37,7 +37,6 @@ const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text 
 pub const NONINTERACTIVE_MODEL_USAGE: &str =
     "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode is unsupported by the current model";
-pub const CONTEXT_RELOAD_ROOT_ONLY: &str = "Context reload is available only for the root agent";
 pub const CONTEXT_RELOADED: &str = "Recorded context reloaded";
 
 pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {

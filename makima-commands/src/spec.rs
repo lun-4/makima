@@ -510,7 +510,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         ReloadContext,
         "/reload-context",
         &[],
-        "Reload recorded instructions and prompt context for the root agent",
+        "Reload the session's recorded context from any agent",
         typed & [],
         NO_ARGUMENT_COMPLETIONS,
         None,

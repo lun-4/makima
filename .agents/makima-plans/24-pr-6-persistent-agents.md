@@ -210,7 +210,7 @@ slot:on_change(function(ctx, event) end)               -- event = { agent, revis
 
 - At `prepare_prompt_inputs` (`makima-agent/src/agent/admission.rs:161`), hash instructions and resolved prompt slots per source. First sight journals `Context`. Later admissions use the recorded content. A differing on-disk hash posts one "instructions changed on disk, run /reload-context" notice per change and keeps the recorded text.
 - New `/reload-context` command (through the central command registry) journals new `Context` records via `reload_instructions` (`makima-ui/src/agent/agent_loop.rs:428`).
-- Resume and rewind build the root prompt from recorded content. `makima.agent.system_prompt(ctx, { instructions = true })` reads the recorded content as well, so a child spawned after an unreloaded change matches its parent. A child's system prompt is resolved at spawn and stored in `StoredAgentSpec`; the task plugin builds research and general prompts with instructions enabled (`plugins/task/init.lua`, `prepare`). `/reload-context` and the change notice apply to the root only, and children spawned afterwards get the current text.
+- Resume and rewind build the root prompt from recorded content. `makima.agent.system_prompt(ctx, { instructions = true })` reads the recorded content as well, so a child spawned after an unreloaded change matches its parent. A child's system prompt is resolved at spawn and stored in `StoredAgentSpec`; the task plugin builds research and general prompts with instructions enabled (`plugins/task/init.lua`, `prepare`). Root turn admission posts the change notice. `/reload-context` can run from any agent to reload the session's recorded context. Children spawned after the reload get the updated text.
 
 ### Phase 11: removed
 

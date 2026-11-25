@@ -109,7 +109,7 @@ TUI, SDK, and ACP use `session_recovery::open_session`. It claims the session lo
 
 Recovery rebuilds runtime providers, tools, permissions, and authority from current registrations and saved state. It continues unfinished turns with their recorded turn IDs, including child turns and parents waiting on them. It requests a cut-off streaming reply again. It reissues only in-flight tool calls marked resumable and inserts an interruption result for the rest. `MAKIMA_CONTINUE_ALL_AGENTS=0` records unfinished turns as `Interrupted` instead. See [Restart](../site/docs/content/agent-work/_index.md#restart) for the user-visible notice and tool result.
 
-Child result and delivery records key by `(AgentId, TurnId)`. Recovery reconstructs pending deliveries but does not deliver a consumed or withdrawn result again. This is independent of best-effort presentation events. `/reload-context` journals new root context; children retain the system prompt resolved at spawn.
+Child result and delivery records key by `(AgentId, TurnId)`. Recovery reconstructs pending deliveries but does not deliver a consumed or withdrawn result again. This is independent of best-effort presentation events. `/reload-context` can run from any agent. It reloads the session's recorded context and journals it on the root. Children retain the system prompt resolved at spawn.
 
 ### Legacy import identity
 

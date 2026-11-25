@@ -60,7 +60,7 @@ Saved sessions record the instruction text, source order, and resolved system-pr
 
 Newly encountered instruction sources are still added when first loaded, including subdirectory rules. Recording context does not load every instruction file in the project in advance.
 
-Run `/reload-context` on the main agent to adopt the current instruction sources and available prompt contributions. It records the new context for subsequent requests. If prompt contributions are unavailable during reload, their recorded values remain in use. The command is unavailable on subagents; descendants use the recorded root context, with each child's own prompt fixed at spawn.
+Run `/reload-context` from any agent to reload the session's recorded context. The command adopts the current instruction sources and available prompt contributions for subsequent requests. If prompt contributions are unavailable during reload, their recorded values remain in use. Each child's own system prompt remains fixed at spawn.
 
 Context reload is part of recorded session state. See [Persistence and resume](/docs/agent-work/#persistence-and-resume).
 
