@@ -73,6 +73,7 @@ use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
 use makima_agent::permissions::PermissionManager;
 #[cfg(test)]
 use makima_agent::permissions::PermissionSnapshot;
+use makima_agent::rewind::RewindGuard;
 use makima_agent::tools::ToolFilter;
 use makima_agent::{
     ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, Envelope,
@@ -135,7 +136,6 @@ pub(crate) const RESTORE_PRESENTATION: u64 = u64::MAX;
 /// carries no work identity and bypasses the per-run staleness filter.
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
-const FLASH_REWIND_ROOT_ONLY: &str = "Rewind is only available in the root chat";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `makima auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_AGENT_CHAT: &str = "Agent chat is unavailable";
@@ -401,7 +401,7 @@ pub struct App {
     pub(crate) command_runtime: Arc<CommandRuntime>,
     pub(crate) command_target: TargetHandle,
     pub(super) rewind_picker: ListPicker<rewind::RewindEntry>,
-    pub(crate) rewind_guard: Option<makima_agent::rewind::RewindGuard>,
+    pub(crate) rewind_guard: Option<RewindGuard>,
     pub(crate) rewind_pending: bool,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
@@ -866,10 +866,8 @@ impl App {
 
     pub(super) fn focused_streaming(&self) -> bool {
         if let Some(actor) = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| Some(target.id()) == self.selected_agent_id())
-            .and_then(|target| target.actor().ok())
+            .selected_agent_id()
+            .and_then(|id| self.root_agent.as_ref()?.manager().actor(id).ok())
         {
             return matches!(
                 actor.snapshot().status,

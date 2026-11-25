@@ -1,3 +1,4 @@
+use super::rewind::{PLANNING_WARNING, REWIND_WARNING, RewindEntry};
 use super::shell::ShellEvent;
 use super::*;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT};
@@ -5168,23 +5169,7 @@ fn double_esc_idle_without_runtime_reports_unavailable() {
 }
 
 #[test]
-fn rewind_is_disabled_in_child_chat() {
-    let mut app = test_app();
-    app.chats.push(Chat::new(
-        "Child".into(),
-        app.ui_config.clone(),
-        app.lua_event_handle.clone(),
-        Arc::clone(&app.theme_provider),
-    ));
-    app.active_chat = 1;
-    assert!(app.open_rewind().is_empty());
-    assert_eq!(app.status_bar.flash_text(), Some(FLASH_REWIND_ROOT_ONLY));
-    assert!(!app.rewind_pending);
-}
-
-#[test]
 fn rewind_picker_groups_targets_warns_and_routes_selection() {
-    use super::rewind::{PLANNING_WARNING, REWIND_WARNING, RewindEntry};
     let mut app = test_app();
     app.input_box.set_input("keep draft".into());
     app.rewind_picker.open(
@@ -5250,7 +5235,7 @@ fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
     ));
     app.chats[1].push_user_message("child work");
     app.recoverable_queue.push("queued prompt".into());
-    app.finish_rewind(CUT.into());
+    app.finish_root_rewind(CUT.into());
     assert_eq!(app.input_box.buffer.value(), CUT);
     assert!(app.recoverable_queue.is_empty());
     assert_eq!(app.chats[1].last_message_text(), "child work");
@@ -5262,7 +5247,6 @@ fn committed_rewind_rebuilds_only_root_context_and_restores_input() {
 
 #[test]
 fn cancelling_rewind_picker_keeps_the_draft_and_chat() {
-    use super::rewind::RewindEntry;
     let mut app = test_app();
     app.input_box.set_input("keep draft".into());
     app.main_chat().push_user_message("keep chat");

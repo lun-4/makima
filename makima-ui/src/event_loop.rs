@@ -1789,6 +1789,7 @@ impl SpawnCtx {
 enum InternalEvent {
     RewindCommitted {
         runtime: Arc<()>,
+        agent: AgentId,
         result: Result<RewindOutcome, String>,
     },
     ModelsDiscovered,
@@ -2597,29 +2598,44 @@ impl<'t> EventLoop<'t> {
                 session,
                 result,
             } => self.complete_bring_up(target, *session, result),
-            InternalEvent::RewindCommitted { runtime, result } => {
+            InternalEvent::RewindCommitted {
+                runtime,
+                agent,
+                result,
+            } => {
                 if let Some(idx) = self.runtime_position(&runtime) {
-                    self.sessions[idx].app.rewind_pending = false;
+                    let rt = &mut self.sessions[idx];
+                    rt.app.rewind_pending = false;
+                    let (manager, root) = rt.handles.manager_and_root();
                     match result {
                         Ok(RewindOutcome::Fork {
                             history,
                             draft,
                             warning,
                         }) => {
-                            let rt = &mut self.sessions[idx];
-                            let journal = rt.handles.manager_and_root().0.journal();
-                            let session = rt.app.state.session_mut();
-                            session.adopt_history(&history);
-                            session.replace_context_events(journal.context_events());
-                            rt.app.finish_rewind(draft);
+                            let events = manager.journal().context_events();
+                            if agent == root {
+                                let session = rt.app.state.session_mut();
+                                session.adopt_history(&history);
+                                session.replace_context_events(events);
+                                rt.app.finish_root_rewind(draft);
+                            } else {
+                                rt.app.finish_child_rewind(
+                                    manager.reference(agent),
+                                    history,
+                                    draft,
+                                    events,
+                                );
+                            }
                             if let Some(warning) = warning {
                                 rt.app.flash(format!("{REWIND_UNCERTAIN}: {warning}"));
                             }
                         }
-                        Ok(RewindOutcome::PlanningSession(parent)) => {
+                        Ok(RewindOutcome::PlanningSession(parent)) if agent == root => {
                             self.back_to_planning(idx, parent.session);
                         }
-                        Err(error) => self.sessions[idx].app.flash(error),
+                        Ok(RewindOutcome::PlanningSession(_)) => {}
+                        Err(error) => rt.app.flash(error),
                     }
                 }
             }
@@ -4276,16 +4292,16 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].app.flash(message);
             }
             Action::BeginRewind => {
+                let target = self.selected_target(idx);
                 let rt = &mut self.sessions[idx];
-                let result = rt
-                    .app
-                    .root_agent
-                    .as_ref()
-                    .ok_or_else(|| "Root agent is unavailable".to_owned())
-                    .and_then(|root| {
-                        root.begin_rewind(&rt.app.state.session)
-                            .map_err(|error| error.to_string())
-                    });
+                let result =
+                    target
+                        .ok_or_else(|| CLOSED_TARGET_ERR.to_owned())
+                        .and_then(|target| {
+                            target
+                                .begin_rewind(&rt.app.state.session)
+                                .map_err(|error| error.to_string())
+                        });
                 rt.app.rewind_pending = false;
                 match result {
                     Ok(guard) => rt.app.show_rewind(guard),
@@ -4304,13 +4320,18 @@ impl<'t> EventLoop<'t> {
                     return;
                 };
                 let runtime = rt.handles.identity();
+                let agent = guard.agent_id();
                 let tx = self.internal_tx.clone();
                 smol::spawn(async move {
                     let result = guard
                         .commit(target)
                         .await
                         .map_err(|error| error.to_string());
-                    let _ = tx.send(InternalEvent::RewindCommitted { runtime, result });
+                    let _ = tx.send(InternalEvent::RewindCommitted {
+                        runtime,
+                        agent,
+                        result,
+                    });
                 })
                 .detach();
             }
@@ -5687,7 +5708,7 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use makima_agent::actor::{ActorError, ActorHistory, ConfigPatch, TurnContext};
-    use makima_agent::manager::ResidentAgent;
+    use makima_agent::manager::{AgentMetadata, ResidentAgent};
     use makima_agent::plan_state::content_sha256;
     use makima_agent::{ActorBackend, AgentInput, BackendResult, ControlWork, WorkKind};
     use makima_domain::ThinkingConfig as DomainThinkingConfig;
@@ -7730,7 +7751,7 @@ end })
     const REWIND_DRAFT: &str = "unfinished draft";
     const REWIND_QUEUED: &str = "queued user turn";
     const REWIND_IO_ERROR: &str = "injected fork I/O failure";
-    const REWIND_NOTE: &str = "The session was rewound.";
+    const REWIND_NOTE: &str = "This conversation was rewound.";
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ForkFailure {
@@ -7819,6 +7840,104 @@ end })
                 return completion;
             }
         }
+    }
+
+    #[test_case(false; "child_stays_focused")]
+    #[test_case(true; "root_focused_before_commit")]
+    fn rewind_picker_targets_viewed_child_after_navigation(navigate: bool) {
+        const CHILD_NAME: &str = "rewind child";
+        const CHILD_KEY: &str = "rewind-child";
+        const CHILD_PROMPT: &str = "child rewind target";
+        const CHILD_QUEUED: &str = "queued child turn";
+        const EDITED_PROMPT: &str = "edited child draft";
+
+        with_event_loop_runtime(
+            |harness| rewind_runtime(harness, None),
+            |event_loop| {
+                let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+                let root = manager.lookup(root_id).unwrap();
+                let root_actor = root.actor().unwrap();
+                let config = (*root_actor.effective_config().unwrap()).clone();
+                let child = manager
+                    .spawn_child_trusted_with_config(
+                        &root,
+                        config,
+                        AgentMetadata {
+                            transcript_key: Some(CHILD_KEY.into()),
+                            ..Default::default()
+                        },
+                        vec![Message::user(CHILD_PROMPT.into())],
+                        None,
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                    )
+                    .unwrap();
+                let root_idle = root_actor.prepare_idle().unwrap();
+                let ticket = root_actor
+                    .admit_turn(
+                        AgentInput::new(REWIND_QUEUED.into(), vec![]),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap();
+                let app = &mut event_loop.sessions[0].app;
+                app.input_box.set_input(REWIND_DRAFT.into());
+                app.persist_input();
+                event_loop.sync_orchestration();
+                select_child_chat(event_loop, child.id(), CHILD_NAME);
+                let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                event_loop.handle_input(Event::Key(escape));
+                event_loop.handle_input(Event::Key(escape));
+                let app = &mut event_loop.sessions[0].app;
+                let [entry] = app.rewind_picker.items().unwrap() else {
+                    panic!("expected only the child prompt");
+                };
+                assert_eq!(entry.label, CHILD_PROMPT);
+                assert_eq!(app.rewind_guard.as_ref().unwrap().agent_id(), child.id());
+                let child_actor = child.actor().unwrap();
+                let child_ticket = child_actor
+                    .admit_turn(
+                        AgentInput::new(CHILD_QUEUED.into(), vec![]),
+                        None,
+                        String::new(),
+                    )
+                    .unwrap();
+                if navigate {
+                    app.active_chat = 0;
+                }
+                let completion = select_rewind(event_loop);
+                assert!(
+                    matches!(&completion, InternalEvent::RewindCommitted { agent, result: Ok(_), .. } if *agent == child.id())
+                );
+                event_loop.handle_internal(completion);
+
+                let rt = &mut event_loop.sessions[0];
+                let app = &mut rt.app;
+                assert_eq!(app.main_chat().last_message_text(), REWIND_TARGET);
+                assert_eq!(
+                    app.state.session.meta.input_draft.as_deref(),
+                    Some(CHILD_PROMPT)
+                );
+                assert_eq!(app.state.session.meta.queued_messages, [REWIND_QUEUED]);
+                assert!(ticket.peek_result().is_none());
+                assert!(child_ticket.peek_result().is_some());
+                assert!(child_actor.pending_queue().is_empty());
+                assert_eq!(app.input_box.buffer.value(), CHILD_PROMPT);
+                assert!(
+                    app.chats[app.agent_chat_index[&child.id()]]
+                        .last_message_text()
+                        .contains(REWIND_NOTE)
+                );
+                app.input_box.set_input(EDITED_PROMPT.into());
+                app.persist_input();
+                app.active_chat = 0;
+                assert_eq!(app.input_box.buffer.value(), EDITED_PROMPT);
+                smol::block_on(rt.checkpoint.append(Vec::new())).unwrap();
+                let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
+                assert_eq!(reopened.meta.input_draft.as_deref(), Some(EDITED_PROMPT));
+                assert_eq!(reopened.meta.queued_messages, [REWIND_QUEUED]);
+                drop(root_idle);
+            },
+        );
     }
 
     #[test_case(ForkFailure::Write; "write")]

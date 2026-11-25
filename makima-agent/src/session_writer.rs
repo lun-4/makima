@@ -746,7 +746,7 @@ mod tests {
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
     use makima_storage::conversation::ConversationState;
-    use makima_storage::id::MakimaId;
+    use makima_storage::id::{AgentId, MakimaId};
     use makima_storage::session_lock;
     use makima_storage::session_state::StateChange;
     use makima_storage::sessions::encode_records;
@@ -844,6 +844,7 @@ mod tests {
                 NEXT_SEQ,
             );
             let fork = Record::Fork {
+                agent: AgentId::generate(),
                 target: None,
                 note_id: MakimaId::generate(),
                 note: "rewind".into(),

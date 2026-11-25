@@ -111,7 +111,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 76. History epochs are opaque ordered identities within one namespace. Import remints distinct saved epochs while preserving order, equality, and all retained references. Independent imported namespaces must never be merged by equal raw epoch numbers.
 
 77. One `SessionWriter` per open saved session appends records in sequence order and acknowledges durability after fsync. Write failures retain pending records for retry. A torn final line is discarded before appending again. Compaction and forks cannot rewrite complete message records.
-78. Rewind holds the root idle guard and appends a fork with a stable target and a stored note. It can change only the root's context and pending input. Non-conversation state continues from its latest revision, and child delivery dispositions do not roll back.
+78. Rewind requires the selected agent to be idle. It holds that agent's idle guard and appends a fork with a stable target and a stored note. The fork changes only that agent's conversation and pending input. Other agents are unaffected. Non-conversation state retains its latest revision, and child-report delivery dispositions do not roll back.
 
 ## Lock order
 

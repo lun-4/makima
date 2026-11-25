@@ -8,13 +8,14 @@ use crate::{
 use makima_providers::{Message, TokenUsage};
 use makima_storage::{
     conversation::ConversationState,
-    id::MakimaId,
+    id::{AgentId, MakimaId},
     session_state::ParentLink,
     sessions::{ContextEntry, Session, SessionRecord, context_entries, next_epoch},
 };
 use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
 
+const REWIND_NOTE: &str = "This conversation was rewound.";
 const FILE_WARNING: &str = "Files may differ from what the conversation says. Files, tasks, mode, and session state have not been restored.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +33,7 @@ pub struct RewindTarget {
 
 #[derive(Debug, Error)]
 pub enum RewindError {
-    #[error("only the root agent can be rewound")]
-    NotRoot,
-    #[error("the root is not idle; interrupt its turn before rewinding")]
+    #[error("the agent is not idle; interrupt its turn before rewinding")]
     Busy,
     #[error("the rewind target is not available")]
     InvalidTarget,
@@ -73,9 +72,6 @@ impl AgentRef {
         &self,
         session: &Session<Message, TokenUsage, ToolOutput>,
     ) -> Result<RewindGuard, RewindError> {
-        if self.manager().root_id().map_err(|_| RewindError::NotRoot)? != self.id() {
-            return Err(RewindError::NotRoot);
-        }
         let journal = self.manager().journal();
         if journal.session_id().is_some_and(|id| id != session.id) {
             return Err(RewindError::WrongSession);
@@ -116,7 +112,9 @@ impl AgentRef {
                 });
             }
         }
-        let parent = session.parent().cloned();
+        let parent = (self.manager().root_id().ok() == Some(self.id()))
+            .then(|| session.parent().cloned())
+            .flatten();
         if parent.is_some() {
             targets.push(RewindTarget {
                 id: RewindTargetId::PlanningSession,
@@ -136,6 +134,10 @@ impl AgentRef {
 }
 
 impl RewindGuard {
+    pub fn agent_id(&self) -> AgentId {
+        self.agent.id()
+    }
+
     pub fn targets(&self) -> &[RewindTarget] {
         &self.targets
     }
@@ -160,12 +162,18 @@ impl RewindGuard {
             .user_text()
             .unwrap_or_default()
             .to_owned();
+        let agent = self.agent.id();
+        let agent_value = serde_json::json!(agent);
         let position = self
             .events
             .iter()
-            .position(|event| event["t"] == "msg" && event["id"] == serde_json::json!(prompt_id))
+            .position(|event| {
+                event["t"] == "msg"
+                    && event["agent"] == agent_value
+                    && event["id"] == serde_json::json!(prompt_id)
+            })
             .ok_or(RewindError::InvalidTarget)?;
-        let before = context_entries(&self.events[..position], self.agent.id())
+        let before = context_entries(&self.events[..position], agent)
             .map_err(|error| RewindError::Context(error.to_string()))?;
         let predecessor = before.last().map(ContextEntry::id);
         let actor = self
@@ -176,14 +184,14 @@ impl RewindGuard {
             .effective_config()
             .map(|config| config.mode.id().to_string())
             .unwrap_or_else(|| "build".into());
-        let subagents = format_subagents(&self.agent.manager());
+        let subagents = format_subagents(&self.agent.manager(), agent);
         let note = format!(
-            "The session was rewound. Current mode: {mode}.\n{FILE_WARNING}\n\nExisting subagents:\n{subagents}"
+            "{REWIND_NOTE} Current mode: {mode}.\n{FILE_WARNING}\n\nExisting subagents:\n{subagents}"
         );
         let conversation = ConversationState::fresh(None);
-        let root = self.agent.id();
         let cleared_turns = self.idle.cut_rewind_queue(&self.journal)?;
         let record: SessionRecord<Message, TokenUsage, ToolOutput> = SessionRecord::Fork {
+            agent,
             target: predecessor,
             note_id: MakimaId::generate(),
             note,
@@ -198,7 +206,7 @@ impl RewindGuard {
             events = self.events.clone();
         }
         events.push(event.clone());
-        let entries = context_entries(&events, self.agent.id())
+        let entries = context_entries(&events, agent)
             .map_err(|error| RewindError::Context(error.to_string()))?;
         let mut messages = Vec::new();
         let mut ids = Vec::new();
@@ -220,9 +228,9 @@ impl RewindGuard {
         let prepared = self
             .journal
             .prepare(JournalCommit {
-                incarnations: vec![self.journal.incarnation(root)],
-                histories: [(root, history.clone())].into(),
-                managed_histories: [root].into(),
+                incarnations: vec![self.journal.incarnation(agent)],
+                histories: [(agent, history.clone())].into(),
+                managed_histories: [agent].into(),
                 ..Default::default()
             })
             .await?;
@@ -239,7 +247,7 @@ impl RewindGuard {
         } else {
             None
         };
-        prepared.install_fork(root, event)?;
+        prepared.install_fork(agent, event)?;
         self.idle.install_rewind(history.clone());
         for turn in cleared_turns {
             let _ = actor.remove(turn);
@@ -254,7 +262,7 @@ impl RewindGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{RewindError, RewindOutcome, RewindTargetId};
+    use super::{REWIND_NOTE, RewindError, RewindOutcome, RewindTargetId};
     use crate::{
         AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
         TurnCancellationReason, TurnOutcome, TurnProvenance, TurnResult,
@@ -694,7 +702,7 @@ mod tests {
                     .unwrap()
                     .first_text_content()
                     .unwrap()
-                    .contains("session was rewound")
+                    .contains(REWIND_NOTE)
             );
             assert_ne!(
                 history.conversation,

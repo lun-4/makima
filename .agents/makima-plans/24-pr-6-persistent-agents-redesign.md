@@ -1,17 +1,17 @@
 # Agent Revamp PR 6: Persistence, redesign
 
-This document replaces the rewind, file restore and storage parts of `24-pr-6-persistent-agents.md`. It records the design agreed in review (questions Q1 to Q41). Durable agents, the Lua agent API, `makima.state`, the task plugin changes and recorded context stay as planned there, except where this document says otherwise.
+This document replaces the rewind, file restore and storage parts of `24-pr-6-persistent-agents.md`. It records the design agreed in review (questions Q1 to Q41), with the Q6 decision revised after review. Durable agents, the Lua agent API, `makima.state`, the task plugin changes and recorded context stay as planned there, except where this document says otherwise.
 
 ## Goal
 
 Keep what makes agents persistent. Make rewind small and simple.
 
-Rewind is a change to what the root agent remembers. Nothing else moves back. Subagents, mode, plan, config, rules, plugin state and files keep going forward.
+Rewind changes the selected idle agent's conversation and pending input. Other agents, mode, plan, config, rules, plugin state, and files are unaffected.
 
 ## Core rules
 
 1. The session log is append-only. Normal saves only append records. Nothing is deleted or rewritten. (Q9, Q30)
-2. Rewind only changes the root agent's context. It never touches other agents, state or files. (Q2, Q6, Q8)
+2. Rewind changes only the selected idle agent's conversation and pending input. It leaves other agents, non-conversation state, and files unchanged. (Q2, Q6, Q8)
 3. A quit or restart does not interrupt anything. On the next start, every agent continues as if nothing happened. (Q10, Q11)
 4. All frontends write through one API, with one writer in `makima-agent`. (Q36)
 
@@ -22,7 +22,7 @@ One file per session, `sessions/<session-id>.jsonl`, as today. (Q27)
 - Messages use one record type for every agent: `Msg { id, agent, d }`. `id` is stable (log `seq` or a `MakimaId`). It replaces both `Msg` (root, no id) and `SubMsg { sub }`. (Q20, Q31)
 - `meta.subagents`, `meta.subagent_conversations` and `meta.history_epochs` are removed. The agent records are the only description of children. (Q31)
 - Compaction is an event in the log. The old messages stay in the file. (Q9)
-- A rewind is a fork record for the root. It names the target message by id and carries the system note (see below). (Q16, Q19, Q20)
+- A rewind appends a fork record for the selected agent. The record identifies the target by stable ID and stores the system note. (Q16, Q19, Q20)
 - Posts and the planning-session link refer to messages by id, not by position. `Boundary` records are removed. (Q20)
 - State records (Config, Rules, Context, plugin slots, turns, deliveries) stay. They are only read as "latest". The "fold to sequence N" reducer, per-boundary snapshots and rewind previews are removed. (Q32)
 - Recorded context keys become fixed strings: `instruction:<path>` and `prompt:<plugin>:<slot>:<name>`. They are no longer serialized Rust enums or registration order. The v3 format is unreleased, so this needs no migration. (Q33)
@@ -33,9 +33,9 @@ One file per session, `sessions/<session-id>.jsonl`, as today. (Q27)
 - The only full rewrite is the one-time migration of a v2 session when it is first opened. The original goes to `archive/<id>/`. (Q30)
 - Deleting a session removes its files. Deletion goes through the writer. (Q36)
 
-## Building the root's context
+## Building an agent's context
 
-The context builder reads the root's events in log order (Q19):
+The context builder reads the selected agent's events in log order (Q19):
 
 ```
 Msg         append the message
@@ -51,46 +51,41 @@ Fork(id)    set the context back to what it was right after message `id`,
 
 ### Rules
 
-- Only the root can be rewound. Rewind is disabled in subagent tabs. (Q6)
-- Targets are the start of user turns. The rewound prompt goes back into the input box, and the root's queued messages are dropped. (Q3, Q5)
+- Any idle agent can be rewound from its chat, including a subagent. This replaces the root-only decision made in review. (Q6)
+- Targets are the start of the selected agent's user turns. On commit, the picker returns the prompt to the input box and drops that agent's pending messages. (Q3, Q5)
 - Files are never read, restored or written. (Q8)
 - Mode, plan, config, rules, plugin state and recorded context are not rewound. (Q2, Q17)
-- Subagents are not touched. Running subagents keep running. (Q1)
-- Reports from subagents keep being delivered, including ones about tasks the root no longer remembers. (Q2)
-- Reports the root had already read before the cut are not delivered again. (Q26)
+- Rewind does not modify other agents' conversations or queues and does not interrupt their work. (Q1)
+- Pending and future child reports remain eligible for delivery, including reports about tasks removed from the selected agent's conversation. (Q2)
+- Rewind preserves delivery dispositions. Reports the parent has already received are not delivered again. (Q26)
 
 ### Agent API
 
 Rewind lives in `makima-agent` as a two-step API. (Q28)
 
 ```
-begin_rewind()          fails if the root has a running turn (the user must interrupt first)
-                        takes the root's lock and returns a guard
-guard.targets()         user turns on the current line, cut-off branches,
-                        and "back to planning session" when the session has a parent link
+begin_rewind()          fails if the selected agent is not idle
+                        acquires and returns that agent's idle guard
+guard.targets()         user turns in the agent's current context and cut-off branches;
+                        "back to planning session" in the root picker if a parent link exists
 guard.commit(target)    appends the fork record, or switches to the planning session
 drop(guard)             releases the lock and writes nothing
 ```
 
-- The TUI calls `begin_rewind` when the rewind UI opens. While the guard is held, no root turn can start. Messages and subagent reports wait in the queue and are delivered after the rewind is complete. (Q15, Q26)
+- The TUI calls `begin_rewind` on the viewed agent when the picker opens. The guard prevents that agent from starting a turn. On commit, the selected agent's pending messages are dropped. Pending child reports can be delivered after the guard is released. (Q15, Q26)
 - Only the TUI uses the API in this PR. SDK and ACP get commands for it later. (Q35)
 
 ### System note
 
-The note is built when the fork is written and stored in the fork record, so the context is a plain function of the log. (Q4, Q16) It tells the root:
-
-- the session was rewound;
-- the current mode;
-- files may differ from what the conversation says;
-- the existing tasks, from the same code as `task_list`.
+The runtime builds the system note at commit and stores it in the fork record so context replay does not need to rebuild it. (Q4, Q16) The note tells the selected agent that its conversation was rewound. It also includes the current mode, a warning that files may differ from the conversation, and the existing tasks from the same code as `task_list`.
 
 ### UI
 
-The root chat shows only its current context. A divider row marks the fork ("rewound from turn X"), with the system note under it. Cut-off messages are reached through the rewind picker, which lists them as "rewound" groups. (Q21, Q22)
+The selected agent's chat shows its current context. A divider row marks the fork ("rewound from turn X"). The system note appears under the divider. The rewind picker lists cut-off messages in "rewound" groups. (Q21, Q22)
 
 ### Back to the planning session
 
-Clear-context plan approval still starts a new session with a link to the planning session. (Q18, Q25) In the implementation session, the rewind picker offers one entry for it: "back to planning session". Choosing it:
+Clear-context plan approval still starts a new session with a link to the planning session. (Q18, Q25) The implementation session's root picker offers "back to planning session" as a separate navigation action. This action does not append a fork. It:
 
 - suspends the implementation session the same way a quit does. Its agents continue when it is opened again. Nothing is recorded as `Interrupted`;
 - opens the planning session as it is (Plan mode, plan ready). Its conversation is not cut;
@@ -180,7 +175,6 @@ The copies have drifted today: TUI ignores the recorded model when one is passed
 
 - File restore: `file_restore/*` (including `secure.rs` and `recording.rs`), `makima-storage/src/restore.rs`, `blobs.rs`, `restore_digest.rs`, the `File`, `ToolExecution` and `RestoreRef` records, `sessions/restores/`, `sessions/blobs/`, the restore form, the shell-command counter, and `shell_execution` on tools. (Q8, Q17)
 - Boundary pins and `BoundarySnapshot`. (Q17)
-- Child rewind. (Q6)
 - Rewind into the planning session as a state restore: `parent_rewind.rs`, the rewind half of `plan_state.rs`, and `ParentLink.message_count` as a position. (Q7, Q17, Q18)
 - Folding Config, Rules, Context and plugin state back to a turn, including the rewindable `/reload-context`. (Q17, Q32)
 - Graph reconciliation on rewind (`manager/rewind.rs` `reconcile`). (Q17)
@@ -221,7 +215,6 @@ The copies have drifted today: TUI ignores the recorded model when one is passed
 ## Not in this PR
 
 - Rewind for SDK and ACP. (Q35)
-- Rewinding subagents. The fork record works per agent, so it can be added later. (Q6)
 - Letting plugins provide their private `local_tools` again at load, so such agents can be woken. (Q41)
 - Splitting the log per agent. (Q27)
 - Session lock liveness depends on file mtime (`HEARTBEAT_INTERVAL` 2 s, `STALE_AFTER` 5 s in `makima-storage/src/session_lock.rs:27-28`), so clock skew and coarse mtime granularity affect who owns a session. Known hazard, unchanged here.
@@ -230,7 +223,7 @@ The copies have drifted today: TUI ignores the recorded model when one is passed
 
 ## Docs to update
 
-- Rewind: what it changes (the root's context) and what it does not (everything else).
+- Rewind: any idle agent is eligible. Only the selected agent's conversation and pending input change.
 - Restart behaviour and `MAKIMA_CONTINUE_ALL_AGENTS`.
 - `register_tool`: `resumable`, with the rule "stateless tools are resumable".
 - `task_list`.

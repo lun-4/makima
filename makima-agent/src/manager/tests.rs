@@ -10,14 +10,16 @@ use std::time::Duration;
 use test_case::test_case;
 
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
-use crate::session_writer::{Record, SessionIo, SessionWriter};
+use crate::rewind::{RewindError, RewindOutcome, RewindTargetId};
+use crate::session_writer::{Record, SessionIo, SessionWriter, StoredSession};
 use crate::test_util::poll_until;
 use event_listener::Event;
 use flume::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use futures_lite::future::or;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
-    Invocation, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse, TokenUsage,
+    Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse,
+    TokenUsage,
 };
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, SessionRef};
@@ -6665,8 +6667,6 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
 
 #[test]
 fn rewind_admission_preserves_running_children_and_delivery_consumption() {
-    use crate::rewind::{RewindError, RewindOutcome, RewindTargetId};
-
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const REPORT_TEXT: &str = "rewind delivery regression report";
     const RUNNING_LABEL: &str = "inspect running child";
@@ -6676,7 +6676,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let mut session = crate::session_writer::StoredSession::new(MODEL, ".");
+        let mut session = StoredSession::new(MODEL, ".");
         let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
         manager.journal().bind_writer(writer).unwrap();
         let root_gate = Gate::new();
@@ -6867,5 +6867,95 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
         child_gate.release(1);
         child_ticket.wait().await;
         manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
+}
+
+#[test]
+fn rewinding_a_child_preserves_root_history_and_reopens() {
+    const ROOT_PROMPT: &str = "root prompt";
+    const CHILD_PROMPT: &str = "child prompt";
+    const GRANDCHILD_LABEL: &str = "child's own subagent";
+    smol::block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let session = StoredSession::new(SPAWN_MODEL, ".");
+        let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let journal = manager.journal();
+        journal.bind_writer(writer.clone()).unwrap();
+        let root = manager
+            .create_root(
+                vec![Message::user(ROOT_PROMPT.into())],
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let spawn = |parent, label: &str, messages| {
+            manager
+                .spawn_child_trusted_with_config(
+                    parent,
+                    config(SPAWN_MODEL, false),
+                    AgentMetadata {
+                        label: Some(label.into()),
+                        ..Default::default()
+                    },
+                    messages,
+                    None,
+                    |_| Ok::<_, String>(TestBackend::boxed()),
+                )
+                .unwrap()
+        };
+        let child = spawn(
+            &root,
+            CHILD_PROMPT,
+            vec![Message::user(CHILD_PROMPT.into())],
+        );
+        let grandchild = spawn(&child, GRANDCHILD_LABEL, Vec::new());
+        let before = journal.snapshot();
+        let guard = child.begin_rewind(&session).unwrap();
+        let target = RewindTargetId::Message(before.histories[&child.id()].ids[0]);
+        assert_eq!(guard.targets().len(), 1);
+        assert_eq!(guard.targets()[0].id, target);
+        let RewindOutcome::Fork { history, draft, .. } = guard.commit(target).await.unwrap() else {
+            panic!("expected fork");
+        };
+        assert_eq!(draft, CHILD_PROMPT);
+        assert_eq!(history.messages.len(), 1);
+        let note = history.messages[0].first_text_content().unwrap();
+        assert!(note.contains(GRANDCHILD_LABEL));
+        assert!(!note.contains(CHILD_PROMPT));
+        let after = journal.snapshot();
+        assert_eq!(
+            after.histories[&root.id()].ids,
+            before.histories[&root.id()].ids
+        );
+        assert_eq!(
+            after.histories[&grandchild.id()].ids,
+            before.histories[&grandchild.id()].ids
+        );
+        assert_eq!(
+            child.actor().unwrap().committed_history_snapshot().ids,
+            history.ids
+        );
+        assert!(
+            manager
+                .shutdown(COMPLETION_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        writer.close().await.unwrap();
+
+        let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+        let recovered = SessionJournal::from_session(&reopened).unwrap().snapshot();
+        assert_eq!(
+            recovered.histories[&root.id()].messages,
+            before.histories[&root.id()].messages
+        );
+        assert_eq!(recovered.histories[&child.id()].messages, history.messages);
+        assert_eq!(recovered.histories[&child.id()].ids, history.ids);
+        assert_eq!(
+            recovered.histories[&child.id()].conversation,
+            history.conversation
+        );
     });
 }

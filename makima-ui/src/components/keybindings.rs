@@ -482,7 +482,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
-        description: "Cancel active work or open rewind in the idle root chat",
+        description: "Cancel active work on the viewed agent or open its rewind picker if it is idle",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

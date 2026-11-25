@@ -121,9 +121,11 @@ History epochs are opaque identities with an order within one history namespace.
 
 ### Rewind
 
-`AgentRef::begin_rewind` acquires the root's idle guard. The guard prevents turn admission from starting root work while the picker is open. Dropping the guard makes no log change. Selecting a prompt appends a `Fork` with the target context entry ID and a stored note, then installs the rebuilt root context. The picker returns the selected prompt to the draft. It does not change child actors, files, or the latest non-conversation state.
+`AgentRef::begin_rewind` acquires the selected agent's idle guard. Any idle agent can be rewound. The guard prevents new work from starting on that agent while the picker is open. Dropping the guard without committing makes no log change. Selecting a prompt appends a `Fork` with a stable context target and a stored note, then installs the rebuilt conversation for that agent. The picker returns the selected prompt to the draft and drops the selected agent's pending messages. The fork does not change other agents, files, non-conversation state, or child-report delivery dispositions.
 
-Context replay applies `Msg`, `Compaction`, and `Fork` records in log order. A fork selects the context prefix ending at its target, then adds its note. An earlier branch or pre-compaction context remains selectable because the log retains those events. Clear-context plan approval creates a separate implementation session with a durable `ParentLink`. Following that link suspends the implementation session and opens the planning session without appending a fork to either log.
+Context replay applies the agent's `Msg`, `Compaction`, and `Fork` records in log order. A fork selects the context prefix ending at its target, then adds its note. An earlier branch or pre-compaction context remains selectable because the log retains those events.
+
+Clear-context plan approval creates a separate implementation session with a durable `ParentLink`. The root picker can follow that link as a separate navigation action. It suspends the implementation session and opens the planning session without appending a fork to either log.
 
 ## The actor
 
@@ -376,7 +378,7 @@ Live execution resources, pending permission prompts, shell processes, and plugi
 | Session journal and durable state fold | `makima-agent/src/journal.rs`, `makima-storage/src/session_state.rs` |
 | Session opening and restart continuation | `makima-agent/src/session_recovery.rs` |
 | Plugin state and recorded instructions | `makima-agent/src/state.rs`, `makima-lua/src/api/state.rs`, `makima-agent/src/context.rs` |
-| Root fork rewind and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
+| Per-agent rewind and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
 | Session format | `makima-storage/src/sessions.rs` |
 | Append-only writer and save receipts | `makima-agent/src/session_writer.rs`, `makima-agent/src/session_checkpoint.rs` |
 | Manager errors | `makima-agent/src/manager/manager_error.rs` |

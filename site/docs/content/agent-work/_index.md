@@ -37,15 +37,16 @@ If a write fails, the terminal UI shows an unsaved warning. Makima keeps the rec
 
 ## Rewind
 
-In the terminal UI, press `Esc Esc` in the idle root chat to open the rewind picker. If the root is running, stop it first. Only the root can be rewound.
+In the terminal UI, `Esc Esc` opens the rewind picker in any idle agent's chat, including a subagent chat. If the viewed agent is running, `Esc Esc` [cancels its active work](#cancellation) instead.
 
-- Current context lists user turns in the root's current conversation. Selecting one puts its prompt back in the input box and rewinds to just before that prompt. Makima drops the root's pending messages.
-- Rewound lists prompts outside the current context, including cut-off branches and prompts from before compaction. Select one to return to that line of conversation. This is how redo works.
-- Back to planning session is available after plan approval with clear context. It suspends the implementation session as a quit would and opens the planning session without cutting its conversation. Files changed during implementation stay changed. See [Restart](#restart) for what happens when the implementation session is reopened.
+- Current context lists user turns in the viewed agent's current conversation. Selecting a prompt rewinds the conversation to just before that prompt and returns the prompt to the input box.
+- Rewound lists the viewed agent's prompts outside its current context, including prompts from cut-off branches and from before compaction. Selecting one returns to that branch of the conversation.
 
-Selecting a prompt appends a fork to the session log. The fork changes only the root's conversation context. Subagents keep running and their new reports still reach the root. Mode, plan, configuration, rules, recorded context, plugin state, and files all keep their current values.
+Selecting a prompt appends a fork to the session log and drops the viewed agent's pending messages. Only that agent's conversation and pending input change. Other agents keep their conversations and queues, and any running work continues. Pending child reports remain eligible for delivery. Makima does not redeliver reports the parent has already consumed. Mode, plan, configuration, rules, recorded context, plugin state, and files stay unchanged.
 
-The root chat marks the fork and shows a system note with the current mode, a warning that files may differ from the conversation, and a list of existing subagents. The model sees the note too. The [`task_list` tool](/docs/tools/#task_list) can show the current task list later.
+The viewed chat marks the fork and shows a system note with the current mode, a warning that files may differ from the conversation, and a list of existing subagents. The model also receives the note. The [`task_list` tool](/docs/tools/#task_list) can show the current task list later.
+
+After plan approval with clear context, the root picker also offers Back to planning session. This action switches sessions without rewinding either conversation. It suspends the implementation session as a quit would and opens the planning session. Files changed during implementation stay changed. See [Restart](#restart) for what happens when the implementation session is reopened.
 
 ## Messages and turns
 
@@ -59,7 +60,7 @@ Acceptance does not mean the model has received the message. A pending message c
 
 Main and subagent views share input, queue, status, and controls. The subagent label identifies the viewed agent. The draft, attachments, and input history remain shared across view changes.
 
-Model, mode, plan, compact, shell commands, reference expansion, and file completion target the viewed agent. Each new child inherits its parent's working directory. Later directory changes affect only the target agent and take effect in queue order. Commands and pickers keep their original target when the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply.
+Model, mode, plan, compact, rewind, shell commands, reference expansion, and file completion target the viewed agent. Each new child inherits its parent's working directory. Later directory changes affect only the target agent and take effect in queue order. Commands and pickers keep their original target when the view changes. A closed target returns an error rather than redirecting work to the main agent. Agent restrictions still apply.
 
 Reset and new-session operations remain session-wide. The Lua `makima.session.*` APIs retain session scope.
 

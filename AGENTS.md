@@ -52,7 +52,7 @@ Rust workspace, key crates in root dir:
 
 - makima-ui: Uses ratatui for an interactive UI (elm like architecture). `makima-ui/src/click.rs` holds the per-frame hit registry: components record `HitTarget`s while they render, `App::view` appends them in render order, and `app/mouse.rs` arbitrates clicks, scrollbar drags, hover, and the modal outside-click gate.
 - makima-providers: Provider-neutral types (messages, events, `ModelInfo`, `ThinkingConfig`, errors), the `Provider` trait, `ProviderRegistry` and the login driver (`login.rs`: `drive_login`, `auth_status`, `logout`, `InteractionService`). It knows no provider by name
-- makima-agent: Owns the smol-based agent loop, persistent actors, durable agent graph, and per-session journal and `SessionWriter`. TUI, SDK, and ACP share `open_session` and restart continuation. Rewind appends a fork of the root context
+- makima-agent: Owns the smol-based agent loop, persistent actors, durable agent graph, and per-session journal and `SessionWriter`. TUI, SDK, and ACP share `open_session` and restart continuation. Rewind appends a fork of the selected idle agent's conversation.
 - makima-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
 - makima-storage: Persistent state across runs (e.g. sessions, auth); append-only v3 session logs retain messages, compactions, forks, and ordered state and agent revisions. Cross-process session locks (`session_lock`) guard resume and publication. Per-session offload dirs (`sessions/offload/<id>/`) hold tool output past the limits, written through `makima-agent`'s `tools::offload` store
 - makima-config: User config

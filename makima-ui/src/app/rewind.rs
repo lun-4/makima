@@ -1,6 +1,7 @@
-use super::{App, FLASH_REWIND_ROOT_ONLY};
+use super::App;
 use crate::components::Action;
 use crate::components::list_picker::{PickerAction, PickerItem};
+use crate::repaint::Dirty;
 use crossterm::event::KeyEvent;
 use makima_agent::rewind::{RewindGuard, RewindTargetId};
 
@@ -62,14 +63,10 @@ impl App {
             .collect();
         self.rewind_guard = Some(guard);
         self.rewind_picker.open(entries, REWIND_WARNING);
-        self.pending_dirty |= crate::repaint::Dirty::YES;
+        self.pending_dirty |= Dirty::YES;
     }
 
     pub(super) fn open_rewind(&mut self) -> Vec<Action> {
-        if !self.is_main_chat() {
-            self.flash(FLASH_REWIND_ROOT_ONLY.into());
-            return vec![];
-        }
         if self.coordinator.is_none() {
             self.flash(NO_REWIND_SESSION.into());
             return vec![];

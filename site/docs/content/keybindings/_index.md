@@ -55,7 +55,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+B` | Move the running tool call to the background |
 | `↑` / `↓` | Navigate input history |
-| `Esc Esc` | Cancel active work or open rewind in the idle root chat |
+| `Esc Esc` | Cancel active work on the viewed agent or open its rewind picker if it is idle |
 
 ## Form
 

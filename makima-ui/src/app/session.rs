@@ -5,10 +5,11 @@ use std::sync::atomic::AtomicBool;
 use crate::chat::{Chat, DONE_TEXT, history_to_display_with_notes, history_to_display_with_target};
 use crate::components::DisplayRole;
 use crate::components::{Action, SessionReplacementKind, SessionReplacementRequest};
+use crate::repaint::Dirty;
 use makima_agent::actor::HistoryChange;
 use makima_agent::agent::estimate_message_tokens;
 use makima_agent::session_writer::Record;
-use makima_agent::{HistorySnapshot, ModeId};
+use makima_agent::{AgentId, AgentRef, HistorySnapshot, ModeId};
 #[cfg(test)]
 use makima_providers::Model;
 use makima_storage::id::MakimaId;
@@ -17,6 +18,8 @@ use makima_storage::sessions::{
     ContextEntry, SessionMeta, SessionRecord, StoredMode, StoredPost, StoredSubagent,
     context_entries,
 };
+
+use serde_json::Value;
 
 use crate::AppSession;
 use makima_providers::RequestOptions;
@@ -285,12 +288,9 @@ impl App {
         self.plan_approval_pending = false;
     }
 
-    fn root_fork_notes(&self) -> HashMap<MakimaId, String> {
-        self.state
-            .session
-            .root_agent_id()
-            .or_else(|| self.state.session.id.to_string().parse().ok())
-            .and_then(|root| context_entries(self.state.session.context_events(), root).ok())
+    fn fork_notes(&self, agent: Option<AgentId>) -> HashMap<MakimaId, String> {
+        agent
+            .and_then(|agent| context_entries(self.state.session.context_events(), agent).ok())
             .unwrap_or_default()
             .into_iter()
             .filter_map(|entry| match entry {
@@ -300,7 +300,50 @@ impl App {
             .collect()
     }
 
-    pub(crate) fn finish_rewind(&mut self, draft: String) {
+    fn root_fork_notes(&self) -> HashMap<MakimaId, String> {
+        self.fork_notes(
+            self.state
+                .session
+                .root_agent_id()
+                .or_else(|| self.state.session.id.to_string().parse().ok()),
+        )
+    }
+
+    pub(crate) fn finish_child_rewind(
+        &mut self,
+        agent: AgentRef,
+        history: HistorySnapshot,
+        draft: String,
+        events: Vec<Value>,
+    ) {
+        self.finish_rewind_input(draft);
+        let id = agent.id();
+        let Some(&index) = self.agent_chat_index.get(&id) else {
+            return;
+        };
+        let Some(key) = self.chats[index].subagent_id.clone() else {
+            return;
+        };
+        let session = self.state.session_mut();
+        if !session.adopt_subagent_history(key.clone(), &history) {
+            return;
+        }
+        session.replace_context_events(events);
+        let notes = self.fork_notes(Some(id));
+        let (display, items) = history_to_display_with_notes(
+            &history.messages,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            &posts_in(self.state.session.posts(), Some(&key)),
+            Some(agent),
+            (&history.ids, &notes),
+        );
+        self.chats[index].load_messages(display);
+        self.chats[index].retry_info = None;
+        self.fire_restore_items(items);
+    }
+
+    pub(crate) fn finish_root_rewind(&mut self, draft: String) {
         self.queue.unfocus_root();
         self.recoverable_queue.clear();
         let notes = self.root_fork_notes();
@@ -314,13 +357,16 @@ impl App {
         );
         self.chats[0].load_messages(display);
         self.fire_restore_items(items);
-        let meta = &mut self.state.session_mut().meta;
-        meta.input_draft = (!draft.is_empty()).then(|| draft.clone());
-        meta.queued_messages.clear();
+        self.state.session_mut().meta.queued_messages.clear();
+        self.finish_rewind_input(draft);
+    }
+
+    fn finish_rewind_input(&mut self, draft: String) {
+        self.state.session_mut().meta.input_draft = (!draft.is_empty()).then(|| draft.clone());
         self.refresh_at_ref_labels(&draft);
         self.input_box.set_input(draft);
         self.input_box.buffer.move_to_end();
-        self.pending_dirty |= crate::repaint::Dirty::YES;
+        self.pending_dirty |= Dirty::YES;
     }
 
     pub(crate) fn restore_display(&mut self) {
@@ -466,7 +512,8 @@ impl App {
                 continue;
             };
             if let Some(messages) = self.state.session.subagent_messages().get(key) {
-                let (display, items) = history_to_display_with_target(
+                let notes = self.fork_notes(self.chats[index].agent_id);
+                let (display, items) = history_to_display_with_notes(
                     messages,
                     self.state.session.tool_outputs(),
                     &self.ui_config.tool_output_lines,
@@ -476,7 +523,7 @@ impl App {
                             .as_ref()
                             .map(|root| root.manager().reference(id))
                     }),
-                    &self.state.session.chat_message_ids(Some(key)),
+                    (&self.state.session.chat_message_ids(Some(key)), &notes),
                 );
                 self.chats[index].load_messages(display);
                 self.fire_restore_items(items);

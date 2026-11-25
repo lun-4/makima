@@ -1,15 +1,12 @@
-use crate::{ActorStatus, AgentManagerHandle, GraphLifecycle};
+use crate::{ActorStatus, AgentId, AgentManagerHandle, GraphLifecycle};
 use std::fmt::Write;
 
 const NO_SUBAGENTS: &str = "No subagents.";
 
-pub(crate) fn format_subagents(manager: &AgentManagerHandle) -> String {
-    let Ok(root) = manager.root_id() else {
-        return NO_SUBAGENTS.into();
-    };
+pub(crate) fn format_subagents(manager: &AgentManagerHandle, parent: AgentId) -> String {
     let mut output = String::new();
     for node in manager.snapshot() {
-        if node.parent_id != Some(root) {
+        if node.parent_id != Some(parent) {
             continue;
         }
         let status = if matches!(

@@ -453,10 +453,10 @@ impl JournalPrepared {
 
     pub(crate) fn install_fork(
         mut self,
-        root: AgentId,
+        agent: AgentId,
         event: serde_json::Value,
     ) -> Result<u64, JournalError> {
-        self.fork = Some((root, event));
+        self.fork = Some((agent, event));
         self.install()
     }
 
@@ -592,12 +592,12 @@ impl JournalPrepared {
         for address in SessionJournal::state_addresses(&self.commit) {
             state.plugin_state.reservations.remove(&address);
         }
-        if let Some((root, event)) = &self.fork {
-            let history = &self.commit.histories[root];
+        if let Some((agent, event)) = &self.fork {
+            let history = &self.commit.histories[agent];
             state.context_events.push(event.clone());
-            state.staged[index].histories.remove(root);
+            state.staged[index].histories.remove(agent);
             state.emitted_histories.insert(
-                *root,
+                *agent,
                 EmittedHistory {
                     epoch: history.epoch,
                     len: history.messages.len(),
