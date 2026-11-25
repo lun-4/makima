@@ -930,6 +930,8 @@ impl<'h> Agent<'h> {
         let cost = self.model.billed_cost(&response.usage, fast);
         let list_cost = self.model.list_cost(&response.usage, fast);
         self.ledger.add(response.usage, cost, list_cost);
+        self.history
+            .record_usage(&self.model.id, response.usage, cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
@@ -1388,7 +1390,9 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+    use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
+    use std::fs::read_to_string;
 
     const TEST_CWD: &str = "/tmp";
     const TEST_PLAN_PATH: &str = "/tmp/plan.md";
@@ -3120,6 +3124,74 @@ mod tests {
             assert_eq!(second.usage().input, 22);
             assert_eq!(first.num_turns(), 1);
             assert_eq!(second.num_turns(), 1);
+        });
+    }
+
+    #[test]
+    fn root_and_child_completions_write_cumulative_usage_once() {
+        const INPUTS: [u32; 3] = [11, 22, 33];
+        const TOTALS: [u32; 3] = [11, 33, 66];
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let model = default_model();
+            let mut session = StoredSession::new(&model.spec(), TEST_CWD);
+            let root = AgentId::generate();
+            let child = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+            journal.bind_writer(writer).unwrap();
+            journal
+                .commit(JournalCommit {
+                    agents: vec![test_record(child, Some(root))],
+                    ..Default::default()
+                })
+                .unwrap();
+
+            for (id, input) in [root, child, root].into_iter().zip(INPUTS) {
+                let mut response = text_response(StopReason::EndTurn);
+                response.usage.input = input;
+                let mut history = History::new(Vec::new()).with_journal(id, Arc::clone(&journal));
+                let mut params = test_params(MockProvider::new(vec![response]));
+                params.agent_id = id;
+                let (tx, _rx) = flume::unbounded();
+                let mut agent = Agent::new(
+                    params,
+                    AgentRunParams {
+                        history: ActorHistory::new(&mut history),
+                        system: String::new(),
+                        event_tx: EventSender::new(tx),
+                        tools: RequestTools::default(),
+                    },
+                );
+                assert!(matches!(
+                    run_admitted(&mut agent, TurnId::generate(), default_input()).await,
+                    TurnOutcome::Completed { .. }
+                ));
+            }
+            journal.flush().await.unwrap();
+            let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
+            let totals: Vec<_> = log
+                .lines()
+                .filter_map(|line| {
+                    let Record::Usage {
+                        token_usage,
+                        usage_by_model,
+                    } = serde_json::from_str(line).unwrap()
+                    else {
+                        return None;
+                    };
+                    assert_eq!(usage_by_model.len(), 1);
+                    assert_eq!(usage_by_model[&model.id], token_usage.billed(None));
+                    Some(token_usage.input)
+                })
+                .collect();
+            assert_eq!(totals, TOTALS);
+            let saved = StoredSession::load_from(session.id, dir.path()).unwrap();
+            assert_eq!(
+                SessionJournal::from_session(&saved).unwrap().usage(),
+                journal.usage()
+            );
         });
     }
 

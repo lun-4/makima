@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use async_lock::RwLockReadGuardArc;
 use makima_providers::{
     ContentBlock, ConversationLink, ConversationRelation, EMPTY_RESPONSE_MARKER, Message,
-    MessageKind, Role,
+    MessageKind, Role, TokenUsage,
 };
 use makima_storage::conversation::ConversationState;
 use makima_storage::id::MakimaId;
@@ -494,6 +494,12 @@ impl History {
             return Err(error.into());
         }
         Ok(ended.sent.map(|_| ended.id))
+    }
+
+    pub(crate) fn record_usage(&self, model: &str, usage: TokenUsage, cost: Option<f64>) {
+        if let Some((_, journal)) = &self.journal {
+            journal.record_usage(model, usage, cost);
+        }
     }
 
     pub fn truncate(&mut self, len: usize) {

@@ -2460,7 +2460,6 @@ fn reset_session_request_does_not_author_yolo_metadata() {
 #[test]
 fn reset_session_clears_plan() {
     let mut app = test_app();
-    app.state.token_usage.input = 500;
     app.chats[0].context_size = 1000;
     set_root_mode(&mut app, Mode::Build);
     app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
@@ -2480,7 +2479,6 @@ fn reset_session_clears_plan() {
     assert_eq!(request.session.meta.context_size, 0);
     assert_eq!(app.state.session.id, old_id);
     assert_eq!(app.command_target.id(), old_target);
-    assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.chats[0].context_size, 1000);
     assert!(!app.queue.is_empty());
     assert!(app.help_modal.is_open());
@@ -2901,7 +2899,7 @@ fn spawned_child_first_prompt_is_shown_once() {
 }
 
 #[test]
-fn turn_complete_tracks_usage_and_context_per_chat() {
+fn turn_complete_tracks_cost_and_context_per_chat() {
     let mut app = app_with_subagent();
 
     let main_usage = TokenUsage {
@@ -2909,7 +2907,7 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         output: 50,
         ..Default::default()
     };
-    app.update(agent_msg(turn_complete(main_usage, "test", None)));
+    app.update(agent_msg(turn_complete(main_usage, "test", MAIN_COST)));
 
     let sub_usage = TokenUsage {
         input: 200,
@@ -2917,13 +2915,13 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
         ..Default::default()
     };
     app.update(subagent_msg(
-        turn_complete(sub_usage, "test", None),
+        turn_complete(sub_usage, "test", SUB_COST),
         TASK_ID,
         None,
     ));
 
-    assert_eq!(app.state.token_usage.input, 300);
-    assert_eq!(app.state.token_usage.output, 125);
+    assert_eq!(app.chats[0].cost, MAIN_COST);
+    assert_eq!(app.chats[1].cost, SUB_COST);
     assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
 }
@@ -3077,74 +3075,6 @@ fn tool_inside_subagent_chat_gets_its_turn_usage() {
         app.chats[1].tool_turn_usage(TOOL_ID),
         Some(SUB_TOKENS.format(SUB_COST).as_str())
     );
-}
-
-#[test]
-fn turn_usage_persists_without_checkpoint() {
-    const ROOT_MODEL: &str = "root-model";
-    const CHILD_MODEL: &str = "child-model";
-    const COST: f64 = 0.25;
-    const USAGE: TokenUsage = TokenUsage {
-        input: 100,
-        output: 50,
-        cache_read: 10,
-        cache_creation: 0,
-    };
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    for model in [ROOT_MODEL, CHILD_MODEL, ROOT_MODEL] {
-        let event = turn_complete(USAGE, model, Some(COST));
-        let AgentEvent::TurnComplete(turn) = event else {
-            unreachable!();
-        };
-        app.account_turn_complete(Some(0), &turn);
-    }
-    let id = app.state.session.id;
-    let expected_usage = app.state.token_usage;
-    let expected_models = app.state.session.usage_by_model().clone();
-    drain_writer(app, writer);
-    let restored = AppSession::load(id, &dir).unwrap();
-    assert_eq!(restored.token_usage, expected_usage);
-    assert_eq!(restored.usage_by_model(), &expected_models);
-    assert_eq!(restored.usage_by_model().len(), 2);
-}
-
-#[test]
-fn turn_complete_accumulates_usage_by_model() {
-    let mut app = app_with_subagent();
-
-    app.update(agent_msg(turn_complete(
-        TokenUsage {
-            input: 100,
-            output: 50,
-            cache_read: 10,
-            ..Default::default()
-        },
-        "main-model",
-        None,
-    )));
-    app.update(subagent_msg(
-        turn_complete(
-            TokenUsage {
-                input: 200,
-                output: 75,
-                ..Default::default()
-            },
-            "sub-model",
-            None,
-        ),
-        TASK_ID,
-        None,
-    ));
-
-    let by_model = app.state.session.usage_by_model();
-    assert_eq!(by_model.len(), 2);
-    let main = &by_model["main-model"];
-    assert_eq!(main.input, 100);
-    assert_eq!(main.output, 50);
-    assert_eq!(main.cache_read, 10);
-    let sub = &by_model["sub-model"];
-    assert_eq!(sub.input, 200);
-    assert_eq!(sub.output, 75);
 }
 
 #[test]
@@ -12811,7 +12741,7 @@ fn final_history_after_subagent_closed_leaves_chat_closed() {
 }
 
 #[test]
-fn turn_complete_after_subagent_closed_only_accounts_usage() {
+fn turn_complete_after_subagent_closed_only_updates_chat_cost() {
     const MODEL: &str = "delayed-model";
     const COST: f64 = 0.125;
 
@@ -12839,20 +12769,11 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
         identity: Some(work_identity(1)),
     })));
 
-    assert_eq!(app.state.token_usage, usage);
     assert_eq!(app.chats[chat_idx].cost, Some(COST));
     assert_eq!(app.chats.len(), chat_count);
     assert!(app.chats[chat_idx].is_finished());
     assert!(app.active_subagent_closed());
     assert!(app.queue.text_messages().is_empty());
-
-    let tmp = TempDir::new().unwrap();
-    let dir = StateDir::from_path(tmp.path().to_path_buf());
-    let session_id = app.state.session.id;
-    app.state.session_mut().save(&dir).unwrap();
-    let persisted = AppSession::load(session_id, &dir).unwrap();
-    assert_eq!(persisted.usage_by_model().len(), 1);
-    assert_eq!(persisted.usage_by_model()[MODEL], usage.billed(Some(COST)));
 }
 
 #[test]
@@ -12880,11 +12801,7 @@ fn turn_complete_after_root_cancel_preserves_child() {
         identity: Some(work_identity(1)),
     })));
 
-    assert_eq!(app.state.token_usage, usage);
-    assert_eq!(
-        app.state.session.usage_by_model()[MODEL],
-        usage.billed(Some(COST))
-    );
+    assert_eq!(app.chats[chat_idx].cost, Some(COST));
     assert!(app.agent_chat_index.contains_key(&agent_id));
     assert!(!app.chats[chat_idx].is_finished());
     assert!(app.queue.text_messages().is_empty());

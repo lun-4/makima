@@ -73,7 +73,7 @@ use makima_storage::conversation::{ConversationRelation, ConversationState};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
 use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
-use makima_storage::sessions::{SESSIONS_DIR, Session, StoredTokenUsage, read_prefs};
+use makima_storage::sessions::{SESSIONS_DIR, Session, read_prefs};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -695,7 +695,6 @@ struct SdkRuntime {
     init: Value,
     resumed: bool,
     continuation_notice: Option<String>,
-    usage_seed: (TokenUsage, HashMap<String, StoredTokenUsage>),
     tasks: Mutex<Vec<smol::Task<()>>>,
     discovery: Mutex<Option<Discovery>>,
 }
@@ -1026,10 +1025,6 @@ impl SdkRuntime {
                 handle,
                 coordinator: coordinator.clone(),
                 checkpoint,
-                usage_seed: (
-                    recovered.session().token_usage,
-                    recovered.session().usage_by_model().clone(),
-                ),
                 _lock: lock_guard,
                 root: trusted_root,
                 commands: sdk_commands,
@@ -1062,11 +1057,6 @@ impl SdkRuntime {
             .install_orchestration_services(self.orchestration.clone());
         let observer =
             HeadlessObserver::new(params.lua_handle.clone(), self.handle.session_id.id());
-        observer.persist_usage(
-            self.checkpoint.as_ref().clone(),
-            self.usage_seed.0,
-            self.usage_seed.1.clone(),
-        );
         observer.install(self.root.target.clone());
         if self.resumed {
             if let Some(message) = &self.continuation_notice
@@ -2645,6 +2635,12 @@ mod tests {
     const SDK_ERROR_RESULT_SUBTYPE: &str = "error_during_execution";
     const SDK_GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const SDK_NESTED_TOOL: &str = "sdk_nested_task";
+    const SDK_NESTED_RESPONSE_USAGE: TokenUsage = TokenUsage {
+        input: 11,
+        output: 7,
+        cache_creation: 3,
+        cache_read: 5,
+    };
     const SDK_ROOT_PROMPT: &str = "sdk root request";
     const SDK_CHILD_PROMPT: &str = "sdk child request";
     const SDK_COMMAND_DONE: &str = "sdk command done";
@@ -5129,7 +5125,7 @@ mod tests {
                         content: vec![content],
                         ..Default::default()
                     },
-                    usage: TokenUsage::default(),
+                    usage: SDK_NESTED_RESPONSE_USAGE,
                     stop_reason: Some(stop_reason),
                 })
             })
@@ -5853,8 +5849,24 @@ mod tests {
         let saved = checkpointed.lock_unpoisoned();
         assert_eq!(saved.len(), initial_checkpoint_count + 3);
         drop(saved);
+        smol::block_on(child_checkpoint.drain()).unwrap();
         let durable = StoredSession::load(id, &child_storage).unwrap();
         assert!(durable.messages().iter().flat_map(|message| &message.content).any(|block| matches!(block, ContentBlock::Text { text } if text == SDK_ROOT_RESPONSE)));
+        requests.extend(received.try_iter());
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|(model, options)| model == TARGET_MODEL
+            && options.thinking == thinking
+            && !options.fast));
+        let expected_usage = requests.iter().fold(TokenUsage::default(), |mut sum, _| {
+            sum += SDK_NESTED_RESPONSE_USAGE;
+            sum
+        });
+        assert_eq!(durable.token_usage, expected_usage);
+        assert_eq!(durable.usage_by_model().len(), 1);
+        assert_eq!(
+            durable.usage_by_model()[&sdk_model(TARGET_MODEL).id],
+            expected_usage.billed(None)
+        );
         let graph = manager.snapshot();
         assert!(!graph.is_empty());
         for node in graph {
@@ -5879,11 +5891,6 @@ mod tests {
                 assert_eq!(actor.queued, 0);
             }
         }
-        requests.extend(received.try_iter());
-        assert_eq!(requests.len(), 5);
-        assert!(requests.iter().all(|(model, options)| model == TARGET_MODEL
-            && options.thinking == thinking
-            && !options.fast));
         smol::block_on(coordinator.close()).unwrap();
     }
 

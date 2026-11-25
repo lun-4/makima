@@ -7,7 +7,9 @@ use crate::{
     session_writer::{SessionWriter, WriterError},
 };
 use makima_config::ModelPolicy;
-use makima_providers::{ContentBlock, Message, Model, ProviderRegistry, Role, TokenUsage};
+use makima_providers::{
+    ContentBlock, Message, Model, ProviderRegistry, Role, TokenUsage, settle_session,
+};
 use makima_storage::{
     StateDir, StorageError,
     checkpoint::{CheckpointClaim, CheckpointError, CheckpointPublication},
@@ -101,7 +103,7 @@ pub fn open_session(
         .publication_guard()
         .publish(|| StoredSession::load_from(id, &directory))?
         .ok_or(OpenSessionError::LockLost(id))?;
-    let (session, resumed) = match (source, loaded) {
+    let (mut session, resumed) = match (source, loaded) {
         (SessionSource::Create(_), Ok(_)) => return Err(OpenSessionError::Exists(id)),
         (_, Ok(session)) => {
             if let Some(cwd) = resume_cwd
@@ -117,10 +119,28 @@ pub fn open_session(
         ) => (seed, false),
         (_, Err(error)) => return Err(error.into()),
     };
-    let (model, warning) = model.select(&session)?;
+    let (selected, warning) = model.select(&session)?;
+    if resumed
+        && (session.token_usage != TokenUsage::default() || !session.usage_by_model().is_empty())
+    {
+        let view = session.latest_state()?;
+        let fast = view
+            .scopes
+            .get(&session.root_agent_id())
+            .and_then(|scope| scope.config.as_ref())
+            .map_or(session.meta.fast, |config| config.fast);
+        let tokens = session.token_usage;
+        settle_session(
+            &tokens,
+            session.usage_by_model_mut(),
+            &selected,
+            fast,
+            model.providers,
+        );
+    }
     Ok(SessionOpening {
         session,
-        model,
+        model: selected,
         resumed,
         warning,
         lease,

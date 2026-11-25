@@ -77,7 +77,7 @@ use makima_agent::tools::ToolFilter;
 use makima_agent::{
     ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
     GraphLifecycle, ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader,
-    Post, SharedBuf, SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput, TurnCompleteEvent,
+    Post, SharedBuf, SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput,
 };
 use makima_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -2989,9 +2989,10 @@ impl App {
 
         if let Some(subagent) = &envelope.subagent {
             if self.terminal_subagents.contains(&subagent.agent_id) {
-                if let AgentEvent::TurnComplete(turn) = envelope.event {
-                    let chat_idx = self.agent_chat_index.get(&subagent.agent_id).copied();
-                    self.account_turn_complete(chat_idx, &turn);
+                if let AgentEvent::TurnComplete(turn) = envelope.event
+                    && let Some(&chat_idx) = self.agent_chat_index.get(&subagent.agent_id)
+                {
+                    add_cost(&mut self.chats[chat_idx].cost, turn.cost);
                 }
                 return vec![];
             }
@@ -3167,7 +3168,7 @@ impl App {
         self.chats[chat_idx].retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.account_turn_complete(Some(chat_idx), tc);
+            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -3284,20 +3285,6 @@ impl App {
             }
         }
         actions
-    }
-
-    fn account_turn_complete(&mut self, chat_idx: Option<usize>, turn: &TurnCompleteEvent) {
-        self.state.token_usage += turn.usage;
-        if let Some(chat_idx) = chat_idx {
-            add_cost(&mut self.chats[chat_idx].cost, turn.cost);
-        }
-        self.state
-            .session_mut()
-            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
-        self.append_ui_record(SessionRecord::Usage {
-            token_usage: self.state.token_usage,
-            usage_by_model: self.state.session.usage_by_model().clone(),
-        });
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went

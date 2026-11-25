@@ -1,6 +1,6 @@
 use makima_domain::LockExt;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::mem::take;
 use std::slice::from_ref;
 use std::sync::{
@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_lock::{RwLock, RwLockReadGuardArc, RwLockWriteGuardArc};
 use event_listener::{Event, EventListener};
 use imbl::{OrdMap, OrdSet};
-use makima_providers::{Message, TokenUsage};
+use makima_providers::{Message, TokenUsage, add_cost};
 use makima_storage::conversation::ConversationState;
 use makima_storage::id::{AgentId, MakimaId, TurnId};
 use makima_storage::session_state::{
@@ -22,8 +22,8 @@ use makima_storage::session_state::{
     StoredTurnResult, StoredTurnStatus,
 };
 use makima_storage::sessions::{
-    DEFAULT_TITLE, Session, SessionRecord, StoredRule, append_context_events, generate_title,
-    normalize_title,
+    DEFAULT_TITLE, Session, SessionRecord, StoredRule, StoredTokenUsage, append_context_events,
+    generate_title, normalize_title,
 };
 use thiserror::Error;
 
@@ -192,6 +192,27 @@ pub struct JournalCommit {
     pub managed_histories: BTreeSet<AgentId>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionUsage {
+    pub tokens: TokenUsage,
+    pub cost: Option<f64>,
+    pub by_model: HashMap<String, StoredTokenUsage>,
+}
+
+impl SessionUsage {
+    fn from_session(session: &StoredSession) -> Self {
+        let by_model = session.usage_by_model().clone();
+        Self {
+            tokens: session.token_usage,
+            cost: by_model
+                .values()
+                .filter_map(|usage| usage.cost)
+                .reduce(|a, b| a + b),
+            by_model,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionJournalSnapshot {
     pub epoch: MakimaId,
@@ -203,6 +224,7 @@ pub struct SessionJournalSnapshot {
     pub managed_histories: OrdSet<AgentId>,
     pub authoritative: bool,
     title: Option<Arc<str>>,
+    usage: Arc<SessionUsage>,
     reducer: Option<ReducerCache>,
     prepared_installed: Option<Arc<AtomicBool>>,
 }
@@ -290,6 +312,7 @@ impl SessionJournalSnapshot {
             managed_histories: OrdSet::new(),
             authoritative: false,
             title: None,
+            usage: Arc::default(),
             reducer: None,
             prepared_installed: None,
         }
@@ -298,7 +321,7 @@ impl SessionJournalSnapshot {
     pub fn apply_to(&self, session: &mut StoredSession) -> Result<(), JournalError> {
         if self.authoritative {
             self.fold()?;
-            self.apply_title(session);
+            self.apply_session_fields(session);
             session.replace_state(self.state.to_vec());
             session.replace_agent_revisions(self.agent_revisions.to_vec());
             session.replace_journal_histories(
@@ -335,7 +358,7 @@ impl SessionJournalSnapshot {
         let state: Vec<_> = state.into_values().collect();
         let agents: Vec<_> = agents.into_iter().collect();
         let view = SessionStateView::fold(&state, &agents)?;
-        self.apply_title(session);
+        self.apply_session_fields(session);
         session.replace_state(state);
         session.replace_agent_revisions(agents);
         for (agent, history) in &self.histories {
@@ -359,7 +382,15 @@ impl SessionJournalSnapshot {
         Ok(())
     }
 
-    fn apply_title(&self, session: &mut StoredSession) {
+    fn apply_session_fields(&self, session: &mut StoredSession) {
+        if session.token_usage != self.usage.tokens
+            || session.usage_by_model() != &self.usage.by_model
+        {
+            session.token_usage = self.usage.tokens;
+            session
+                .usage_by_model_mut()
+                .clone_from(&self.usage.by_model);
+        }
         if let Some(title) = &self.title {
             session.set_title(title.to_string());
         }
@@ -725,6 +756,7 @@ impl SessionJournal {
             let snapshot = &mut state.snapshot;
             snapshot.title =
                 (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
+            snapshot.usage = Arc::new(SessionUsage::from_session(session));
             snapshot.state =
                 JournalRecords::try_from_ordered(session.state().iter().cloned(), "state")?;
             snapshot.agent_revisions = JournalRecords::try_from_ordered(
@@ -811,6 +843,7 @@ impl SessionJournal {
             let mut state = journal.lock();
             snapshot.title =
                 (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
+            snapshot.usage = Arc::new(SessionUsage::from_session(session));
             state.emitted_histories = Self::history_baseline(&snapshot);
             state.snapshot = snapshot.clone();
             state.ready = snapshot;
@@ -1037,6 +1070,30 @@ impl SessionJournal {
         if state.ready.title.as_deref() != Some(&title) {
             state.ready.title = Some(Arc::from(title.as_str()));
             state.unwritten.push(SessionRecord::Title { title });
+            Self::emit_unwritten(&mut state);
+        }
+    }
+
+    pub fn usage(&self) -> SessionUsage {
+        self.lock().ready.usage.as_ref().clone()
+    }
+
+    pub fn cost(&self) -> Option<f64> {
+        self.lock().ready.usage.cost
+    }
+
+    pub(crate) fn record_usage(&self, model: &str, tokens: TokenUsage, cost: Option<f64>) {
+        let mut state = self.lock();
+        let usage = Arc::make_mut(&mut state.ready.usage);
+        usage.tokens += tokens;
+        add_cost(&mut usage.cost, cost);
+        *usage.by_model.entry(model.to_owned()).or_default() += tokens.billed(cost);
+        if self.persistent {
+            let record = SessionRecord::Usage {
+                token_usage: usage.tokens,
+                usage_by_model: usage.by_model.clone(),
+            };
+            state.unwritten.push(record);
             Self::emit_unwritten(&mut state);
         }
     }
@@ -2377,6 +2434,7 @@ impl SessionJournal {
         {
             if let Some(mut entry) = state.staged.pop_front() {
                 entry.snapshot.title = state.ready.title.clone();
+                entry.snapshot.usage = Arc::clone(&state.ready.usage);
                 let mut records: Vec<_> = entry
                     .snapshot
                     .state

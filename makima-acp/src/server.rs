@@ -51,7 +51,7 @@ use makima_lua::orchestration::{
 };
 use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
-use makima_providers::{Message, ProviderRegistry, TokenUsage, add_cost, settle_session};
+use makima_providers::{Message, ProviderRegistry, TokenUsage, add_cost};
 use makima_storage::StateDir;
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
@@ -774,14 +774,7 @@ async fn load_session(
         Some(history_snapshot),
         Some(Arc::clone(&checkpoint)),
     );
-    let mut usage_by_model = session.usage_by_model().clone();
-    let restored_cost = settle_session(
-        &session.token_usage,
-        &mut usage_by_model,
-        &recorded_model,
-        defaults.fast,
-        &params.providers,
-    );
+    let restored_cost = recovered.journal().cost();
     let (snapshot, mode) = install_session(
         srv,
         params,
@@ -1030,7 +1023,6 @@ async fn close_session(srv: &mut Server) {
         warn!(%error, "failed to drain session coordinator");
     }
     state.command_projection_task.cancel().await;
-    // Forwarding the last turn events can enqueue usage records.
     state.event_pump.finish().await;
     if let Some(checkpoint) = state.checkpoint
         && let Err(error) = checkpoint.drain().await
@@ -1232,13 +1224,6 @@ async fn install_session_with_lock(
         coordinator.clone(),
         Arc::clone(&checkpoint),
     );
-    let usage_seed = match StoredSession::load(handle.session_id.id(), &params.storage) {
-        Ok(seed) => seed,
-        Err(error) => {
-            rollback_install(handle, mcp, Some(coordinator)).await;
-            return Err(error.to_string());
-        }
-    };
     let mode = if continuation_count == 0 {
         checkpoint_root_mode(&handle, &coordinator).await
     } else {
@@ -1282,11 +1267,6 @@ async fn install_session_with_lock(
     }
     let project_trusted = handle.permissions.project_is_trusted();
     let observer = HeadlessObserver::new(params.lua_event_handle.clone(), handle.session_id.id());
-    observer.persist_usage(
-        checkpoint.as_ref().clone(),
-        usage_seed.token_usage,
-        usage_seed.usage_by_model().clone(),
-    );
     observer.install(trusted_root.target.clone());
     let event_pump = start_event_pump(
         &handle.events,
@@ -4825,64 +4805,6 @@ mod tests {
                     .is_err()
             );
             replacement.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn close_persists_usage_from_queued_turn_events() {
-        smol::block_on(async {
-            let (mut srv, ..) = server_awaiting_answer();
-            let directory = TempDir::new().unwrap();
-            let storage = StateDir::from_path(directory.path().to_path_buf());
-            let state = srv.session.as_mut().unwrap();
-            let session_id = state.handle.session_id.clone();
-            let mut seed = StoredSession::new(OFFLINE_SPEC, "/project");
-            seed.id = session_id.id();
-            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
-            let writer = Arc::new(SessionWriter::open_session(&sessions_dir, &seed).unwrap());
-            let observer = test_observer();
-            observer.persist_usage(
-                writer.as_ref().clone(),
-                TokenUsage::default(),
-                HashMap::new(),
-            );
-            let (events, event_rx) = flume::unbounded();
-            let usage = TokenUsage {
-                output: 17,
-                ..Default::default()
-            };
-            events
-                .send(subagent_activity(AgentEvent::TurnComplete(Box::new(
-                    makima_agent::TurnCompleteEvent {
-                        message: Message::default(),
-                        usage,
-                        model: OFFLINE_SPEC.into(),
-                        cost: None,
-                        context_size: None,
-                        context_window: 1,
-                    },
-                ))))
-                .unwrap();
-            state.checkpoint = Some(writer);
-            state.event_pump = start_event_pump(
-                &test_event_source(event_rx),
-                session_id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(&state.pending),
-                false,
-                state.handle.answer_tx.clone(),
-                state.coordinator.as_ref().unwrap().read(),
-                None,
-                PUMP_TRUSTED,
-                None,
-                observer,
-            );
-
-            close_session(&mut srv).await;
-
-            let saved = StoredSession::load(session_id.id(), &storage).unwrap();
-            assert_eq!(saved.token_usage, usage);
-            assert_eq!(saved.usage_by_model()[OFFLINE_SPEC].output, usage.output);
         });
     }
 

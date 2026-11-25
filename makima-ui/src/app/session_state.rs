@@ -9,7 +9,7 @@ use makima_agent::{AgentMode, ModeId, ModeRegistry, RunSettings, SessionDefaults
 use makima_agent::{modes, plan_state, session_defaults};
 use makima_config::ModelPolicy;
 use makima_providers::provider::Provider;
-use makima_providers::{Model, ProviderRegistry, TokenUsage, settle_session};
+use makima_providers::{Model, ProviderRegistry};
 use makima_storage::StateDir;
 use makima_storage::session_state::StoredAgentConfig;
 use makima_storage::sessions::{StoredMode, read_prefs};
@@ -49,11 +49,6 @@ impl ConfigSource {
 pub(crate) struct SessionState {
     /// Shared with the writer thread, so a checkpoint is just a refcount bump.
     pub session: Arc<AppSession>,
-    pub token_usage: TokenUsage,
-    /// What the session has billed so far: the restored total plus every turn
-    /// since. Kept running, because re-deriving it from the counters would
-    /// re-price history at today's rates. `None` while nothing was priced.
-    pub cost: Option<f64>,
     pub context_size: u32,
     pub plan: PlanState,
     pub warnings: Vec<String>,
@@ -119,24 +114,10 @@ impl SessionState {
             None => PlanState::None,
         };
 
-        let token_usage = session.token_usage;
-        let fast = stored
-            .as_ref()
-            .map_or(session.meta.fast, |config| config.fast)
-            && model.supports_fast();
-        let cost = settle_session(
-            &token_usage,
-            session.usage_by_model_mut(),
-            &model,
-            fast,
-            providers,
-        );
         let context_size = session.meta.context_size;
 
         Self {
             session: Arc::new(session),
-            token_usage,
-            cost,
             context_size,
             plan,
             warnings,
@@ -304,29 +285,17 @@ impl From<Mode> for StoredMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{test_model, test_pricing};
+    use crate::components::test_model;
     use makima_agent::ModeDef;
     use makima_agent::session_options::FAST_PENDING_MODEL_OPTION_ID;
+    use makima_providers::ThinkingConfig;
     use makima_providers::model::FastSupport;
-    use makima_providers::{FastPricing, ModelPricing, ThinkingConfig};
     use makima_storage::id::AgentId;
     use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
     use makima_storage::session_state::{StateChange, StoredStateRecord};
     use makima_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
     use test_case::test_case;
 
-    const RECORDED_COST: f64 = 0.42;
-    /// A round million, so a per-million rate reads straight off the bill.
-    const MILLION_INPUT: TokenUsage = TokenUsage {
-        input: 1_000_000,
-        output: 0,
-        cache_creation: 0,
-        cache_read: 0,
-    };
-    /// [`MILLION_INPUT`] at `test_pricing`'s standard input rate.
-    const LIST_PRICE: f64 = 3.0;
-    /// Twice the standard rate, so a resume that ignores `fast` bills half.
-    const FAST_INPUT_RATE: f64 = 6.0;
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
@@ -336,13 +305,6 @@ mod tests {
             &ModelPolicy::default(),
             &ProviderRegistry::default(),
         )
-    }
-
-    /// An old session: counters, no per-model breakdown.
-    fn session_with_counters() -> AppSession {
-        let mut session = AppSession::new("test-model", "/tmp");
-        session.token_usage = MILLION_INPUT;
-        session
     }
 
     fn make_plan_session(mode: Option<StoredMode>, plan_path: Option<String>) -> AppSession {
@@ -376,55 +338,14 @@ mod tests {
         session
     }
 
-    /// A resumed session opens on the bill it ran up, not on its counters
-    /// re-priced with whatever model is selected now. The model that recorded
-    /// this one prices to nothing, so only the recorded cost can answer.
-    #[test]
-    fn resumed_session_opens_on_the_cost_its_turns_recorded() {
-        let mut session = session_with_counters();
-        session.add_model_usage(
-            UNRESOLVABLE_MODEL,
-            session.token_usage.billed(Some(RECORDED_COST)),
-        );
-        let state = resumed(session, &test_model());
-        assert_eq!(state.cost, Some(RECORDED_COST));
-    }
-
-    /// Older sessions kept counters only, and those are priced with the
-    /// session's own clamped `fast` flag. A hardcoded `false` would open a
-    /// resumed fast session on half its bill.
-    #[test_case(false => Some(LIST_PRICE)     ; "standard_rates")]
-    #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
-    fn resume_without_a_breakdown_prices_the_counters(fast: bool) -> Option<f64> {
-        let mut session = session_with_counters();
-        session.meta.fast = fast;
-        let model = Model {
-            fast_support: Some(FastSupport::Supported),
-            pricing: ModelPricing {
-                fast: Some(FastPricing {
-                    input: FAST_INPUT_RATE,
-                    output: test_pricing().output,
-                }),
-                ..test_pricing()
-            },
-            ..test_model()
-        };
-
-        resumed(session, &model).cost
-    }
-
-    #[test_case(FastSupport::Pending, false ; "pending_prices_standard")]
+    #[test_case(FastSupport::Pending, false ; "pending_disables_fast")]
     #[test_case(FastSupport::Supported, true ; "supported_restores_fast")]
-    #[test_case(FastSupport::Unsupported, false ; "unsupported_prices_standard")]
-    fn resume_fast_support(support: FastSupport, fast_rates: bool) {
-        let mut session = session_with_counters();
+    #[test_case(FastSupport::Unsupported, false ; "unsupported_disables_fast")]
+    fn resume_fast_support(support: FastSupport, expected_fast: bool) {
+        let mut session = AppSession::new("test-model", "/tmp");
         session.meta.fast = true;
         let mut model = test_model();
         model.fast_support = Some(support);
-        model.pricing.fast = Some(FastPricing {
-            input: FAST_INPUT_RATE,
-            output: test_pricing().output,
-        });
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let mut state = SessionState::from_session(
@@ -432,14 +353,6 @@ mod tests {
             &model,
             &ModelPolicy::default(),
             &ProviderRegistry::default(),
-        );
-        assert_eq!(
-            state.cost,
-            Some(if fast_rates {
-                FAST_INPUT_RATE
-            } else {
-                LIST_PRICE
-            })
         );
         let seeded = state
             .starting_config(
@@ -451,7 +364,7 @@ mod tests {
                 SessionDefaults::default(),
             )
             .unwrap();
-        assert_eq!(seeded.fast, fast_rates);
+        assert_eq!(seeded.fast, expected_fast);
     }
 
     fn stored_config(model: &Model) -> StoredAgentConfig {
@@ -468,52 +381,6 @@ mod tests {
         }
     }
 
-    #[test_case(false ; "durable_standard_over_legacy_fast")]
-    #[test_case(true ; "durable_fast_over_legacy_standard")]
-    fn folded_config_prices_the_saved_model_and_fast(fast: bool) {
-        let mut model = test_model();
-        model.fast_support = Some(FastSupport::Supported);
-        model.pricing.fast = Some(FastPricing {
-            input: FAST_INPUT_RATE,
-            output: test_pricing().output,
-        });
-        let mut session = session_with_counters();
-        let mut stored = stored_config(&model);
-        stored.fast = !fast;
-        session.resolve_legacy_config(stored.clone()).unwrap();
-        stored.fast = fast;
-        session.push_state(StoredStateRecord {
-            seq: session
-                .state()
-                .iter()
-                .map(|record| record.seq)
-                .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
-                .max()
-                .unwrap_or(0)
-                + 1,
-            agent: session.root_agent_id(),
-            generation: 0,
-            change: StateChange::Config(stored),
-        });
-        session.model = UNRESOLVABLE_MODEL.into();
-        session.meta.fast = !fast;
-        let mut state = resumed(session, &model);
-        assert_eq!(
-            state.cost,
-            Some(if fast { FAST_INPUT_RATE } else { LIST_PRICE })
-        );
-        assert!(state.session.usage_by_model().contains_key(&model.id));
-        assert_eq!(state.session.model, model.spec());
-        state.update_model(&Model {
-            id: UNRESOLVABLE_MODEL.into(),
-            ..model
-        });
-        assert_eq!(
-            state.cost,
-            Some(if fast { FAST_INPUT_RATE } else { LIST_PRICE })
-        );
-    }
-
     #[test_case(false ; "durable_disabled_over_defaults_enabled")]
     #[test_case(true ; "durable_enabled_over_defaults_disabled")]
     fn starting_config_uses_durable_settings_cwd_and_exact_mode(enabled: bool) {
@@ -523,7 +390,7 @@ mod tests {
         let mut model = test_model();
         model.fast_support = Some(FastSupport::Supported);
         model.thinking_support = Some(makima_providers::ThinkingSupport::Yes);
-        let mut session = session_with_counters();
+        let mut session = AppSession::new("test-model", "/tmp");
         let mut stored = stored_config(&model);
         stored.fast = enabled;
         stored.workflow = enabled;
@@ -581,7 +448,7 @@ mod tests {
     fn durable_mode_controls_fallback_warnings(invalid_plan: bool) {
         const MISSING_SLOT_WARNING: &str = "Could not restore the saved mode: Cannot restore plan file: Active Plan configuration has no plan slot entry. Resumed in read-only mode; waiting for user input.";
         let model = test_model();
-        let mut session = session_with_counters();
+        let mut session = AppSession::new("test-model", "/tmp");
         let mut stored = stored_config(&model);
         if invalid_plan {
             stored.mode.id = ModeId::Plan.key().into();
@@ -619,7 +486,7 @@ mod tests {
     fn removed_legacy_mode_restores_without_tools() {
         let directory = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(directory.path().to_path_buf());
-        let mut session = session_with_counters();
+        let mut session = AppSession::new("test-model", "/tmp");
         session.meta.mode = Some(StoredMode::Custom("removed_mode".into()));
         let (state, config) = restore(session, &storage);
         assert!(modes::is_read_only_fallback(&config.mode));
@@ -633,7 +500,7 @@ mod tests {
         let storage = StateDir::from_path(directory.path().to_path_buf());
         let model = test_model();
         let path = directory.path().join("missing-written.md");
-        let mut session = session_with_counters();
+        let mut session = AppSession::new("test-model", "/tmp");
         let mut stored = stored_config(&model);
         let mode = AgentMode::Plan(path.clone());
         stored.mode = ModeRegistry::builtin()
@@ -679,7 +546,7 @@ mod tests {
     #[test]
     fn model_presentation_update_does_not_change_durable_fast_intent() {
         let model = test_model();
-        let mut session = session_with_counters();
+        let mut session = AppSession::new("test-model", "/tmp");
         let mut stored = stored_config(&model);
         stored
             .options

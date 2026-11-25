@@ -3698,17 +3698,16 @@ impl<'t> EventLoop<'t> {
     /// The totals live on the session, so a plugin that reloads mid run keeps
     /// the accounting it would lose by summing `TurnEnd` payloads itself.
     fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
-        let app = &self.sessions[idx].app;
+        let runtime = &self.sessions[idx];
+        let app = &runtime.app;
+        let (manager, _) = runtime.handles.manager_and_root();
+        let usage = manager.journal().usage();
         let snapshot = SessionSnapshot {
-            id: self.sessions[idx].id().to_string(),
+            id: runtime.id().to_string(),
             title: Some(app.title()),
             status: SessionStatus::of(app).as_str(),
             updated_at: app.state.session.updated_at,
-            usage: session_usage(
-                &app.state.token_usage,
-                app.state.cost,
-                app.state.session.usage_by_model(),
-            ),
+            usage: session_usage(&usage.tokens, usage.cost, &usage.by_model),
         };
         serde_json::to_value(snapshot).unwrap_or_default()
     }
@@ -9344,6 +9343,7 @@ end })
     /// Answers every request at once, reporting the model it was sent.
     struct AnsweringProvider {
         requests: flume::Sender<String>,
+        usage: TokenUsage,
     }
 
     impl Provider for AnsweringProvider {
@@ -9372,11 +9372,92 @@ end })
                         }],
                         ..Message::user(String::new())
                     },
-                    usage: TokenUsage::default(),
+                    usage: self.usage,
                     stop_reason: Some(makima_providers::StopReason::EndTurn),
                 })
             })
         }
+    }
+
+    #[test]
+    fn status_bar_global_cost_grows_after_actor_turns() {
+        const CHILD_NAME: &str = "other chat";
+        const CHILD_KEY: &str = "cost-test-child";
+        const PROMPT: &str = "bill this request";
+        const INPUT_TOKENS: u32 = 1_000;
+        const TURN_COST: f64 = 0.003;
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 24;
+
+        let (requests, requests_rx) = flume::unbounded();
+        with_event_loop_runtime(
+            |harness| {
+                let model = crate::components::test_model();
+                harness
+                    .ctx()
+                    .spawn_runtime_with_provider(
+                        harness.session(),
+                        Some(PreparedProvider {
+                            model,
+                            provider: Arc::new(AnsweringProvider {
+                                requests,
+                                usage: TokenUsage {
+                                    input: INPUT_TOKENS,
+                                    ..TokenUsage::default()
+                                },
+                            }),
+                        }),
+                    )
+                    .unwrap()
+            },
+            |event_loop| {
+                let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+                let root = manager.lookup(root_id).unwrap();
+                let config = (*root.actor().unwrap().effective_config().unwrap()).clone();
+                let child = manager
+                    .spawn_child_trusted_with_config(
+                        &root,
+                        config,
+                        AgentMetadata {
+                            transcript_key: Some(CHILD_KEY.into()),
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                        None,
+                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                    )
+                    .unwrap();
+                event_loop.sync_orchestration();
+                select_child_chat(event_loop, child.id(), CHILD_NAME);
+                let child_chat = event_loop.sessions[0].app.active_chat;
+                let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+                let render = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+                    terminal.draw(|frame| app.view(frame)).unwrap();
+                    crate::components::buffer_text(terminal.backend().buffer())
+                };
+                assert!(!render(&mut terminal, &mut event_loop.sessions[0].app).contains("Σ$"));
+
+                for turns in 1..=2 {
+                    let cost = TURN_COST * f64::from(turns);
+                    event_loop.sessions[0].app.active_chat = 0;
+                    event_loop.submit_text(0, PROMPT.into()).unwrap();
+                    pump_until(event_loop, |event_loop| {
+                        let app = &event_loop.sessions[0].app;
+                        matches!(app.status, Status::Idle) && app.chats[0].cost == Some(cost)
+                    });
+                    let snapshot = event_loop.session_snapshot_json(0);
+                    assert_eq!(snapshot["usage"]["total"]["cost"], json!(cost));
+                    assert_eq!(
+                        requests_rx.try_recv().unwrap(),
+                        crate::components::test_model().spec()
+                    );
+                    let app = &mut event_loop.sessions[0].app;
+                    app.active_chat = child_chat;
+                    assert!(render(&mut terminal, app).contains(&format!("Σ${cost:.3}")));
+                    assert_eq!(app.chats[child_chat].cost, None);
+                }
+            },
+        );
     }
 
     const PREPARED_MODEL: &str = "openai/gpt-5";
@@ -9477,6 +9558,7 @@ end })
             let (requests_tx, requests_rx) = flume::unbounded();
             let (prepare, started, release) = gated_preparer(Arc::new(AnsweringProvider {
                 requests: requests_tx,
+                usage: TokenUsage::default(),
             }));
             StartupPrepare {
                 spec: Arc::from(PREPARED_MODEL),

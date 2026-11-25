@@ -196,11 +196,13 @@ async fn finish_compact(
     if let Some(previous) = previous {
         end_conversation_detached(agent_provider, previous, ConversationEnd::Compacted);
     }
+    let cost = model.billed_cost(&response.usage, false);
+    history.record_usage(&model.id, response.usage, cost);
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message,
         usage: response.usage,
         model: model.id.clone(),
-        cost: model.billed_cost(&response.usage, false),
+        cost,
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));

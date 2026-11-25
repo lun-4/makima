@@ -6,11 +6,9 @@ use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use makima_agent::session_writer::SessionWriter;
 use makima_agent::{AgentEvent, AgentRef, Envelope};
 use makima_providers::{TokenUsage, add_cost};
 use makima_storage::id::MakimaId;
-use makima_storage::sessions::SessionRecord;
 use makima_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -100,13 +98,6 @@ pub struct HeadlessObserver {
     session_id: MakimaId,
     totals: Arc<Mutex<Totals>>,
     root: Arc<OnceLock<AgentRef>>,
-    persistence: Arc<Mutex<Option<UsagePersistence>>>,
-}
-
-struct UsagePersistence {
-    writer: SessionWriter,
-    usage: TokenUsage,
-    models: HashMap<String, StoredTokenUsage>,
 }
 
 impl HeadlessObserver {
@@ -116,37 +107,12 @@ impl HeadlessObserver {
             session_id,
             totals: Arc::default(),
             root: Arc::default(),
-            persistence: Arc::default(),
         }
-    }
-
-    pub fn persist_usage(
-        &self,
-        writer: SessionWriter,
-        usage: TokenUsage,
-        models: HashMap<String, StoredTokenUsage>,
-    ) {
-        *self.persistence.lock_unpoisoned() = Some(UsagePersistence {
-            writer,
-            usage,
-            models,
-        });
     }
 
     /// Folds one envelope into the totals, then fires its autocmd.
     pub fn observe(&self, envelope: &Envelope) {
         self.fold(envelope);
-        if let AgentEvent::TurnComplete(turn) = &envelope.event
-            && let Some(persistence) = self.persistence.lock_unpoisoned().as_mut()
-        {
-            persistence.usage += turn.usage;
-            *persistence.models.entry(turn.model.clone()).or_default() +=
-                turn.usage.billed(turn.cost);
-            drop(persistence.writer.append(vec![SessionRecord::Usage {
-                token_usage: persistence.usage,
-                usage_by_model: persistence.models.clone(),
-            }]));
-        }
         if let Some(root) = self.root.get() {
             agent_autocmd::dispatch(&self.handle, root, envelope);
         }
@@ -202,7 +168,6 @@ impl HeadlessObserver {
 
 #[cfg(test)]
 mod tests {
-    use makima_agent::session_writer::StoredSession;
     use makima_agent::{AgentId, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome};
     use makima_providers::Message;
 
@@ -278,38 +243,6 @@ mod tests {
             "{GROWS_MSG}"
         );
         assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
-    }
-
-    #[test]
-    fn persistent_usage_counts_response_once_and_keeps_seed() {
-        smol::block_on(async {
-            let directory = tempfile::tempdir().unwrap();
-            let mut seed = StoredSession::new("test/model", "/test");
-            seed.token_usage.input = FIRST_TURN_INPUT;
-            let writer = SessionWriter::open_session(directory.path(), &seed).unwrap();
-            writer.drain().await.unwrap();
-            let observer = HeadlessObserver::new(EventHandle::disconnected_for_test(), seed.id);
-            observer.persist_usage(writer.clone(), seed.token_usage, HashMap::new());
-            let mut response = turn_complete(SECOND_TURN_INPUT);
-            if let AgentEvent::TurnComplete(turn) = &mut response.event {
-                turn.usage.input = SECOND_TURN_INPUT;
-                turn.model = "test/model".into();
-                turn.cost = Some(TURN_COST);
-            }
-            observer.observe(&response);
-            observer.observe(&done(SECOND_TURN_INPUT));
-            writer.drain().await.unwrap();
-            let loaded = StoredSession::load_from(seed.id, directory.path()).unwrap();
-            assert_eq!(
-                loaded.token_usage.input,
-                FIRST_TURN_INPUT + SECOND_TURN_INPUT
-            );
-            assert_eq!(
-                loaded.usage_by_model()["test/model"].input,
-                SECOND_TURN_INPUT
-            );
-            assert_eq!(loaded.usage_by_model()["test/model"].cost, Some(TURN_COST));
-        });
     }
 
     #[test]

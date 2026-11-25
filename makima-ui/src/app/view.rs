@@ -569,7 +569,7 @@ impl App {
             model_id,
             model_switch_queued,
             stats: UsageStats {
-                global_cost: self.state.cost,
+                global_cost: self.session_cost(),
                 context_size: chat.context_size,
                 cost: chat.cost,
                 context_window: if let Some(config) = &config {

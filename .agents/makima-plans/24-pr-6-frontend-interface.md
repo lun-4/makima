@@ -144,7 +144,7 @@ pub enum SessionEvent {
 }
 ```
 
-One event pump per session: raw events go to the `SessionRecorder` (usage, `Out`, `Post`, written once), then `FrontendServices::observe` (Lua autocmds), then subscribers. The journal derives the title when it commits root history.
+One event pump per session: raw events go to the `SessionRecorder` (`Out` and `Post`, written once), then `FrontendServices::observe` (Lua autocmds), then subscribers. The journal derives the title when it commits root history and records usage before the agent emits `TurnComplete`.
 
 These become internal: the coordinator handle types and tickets, `SessionWriter` and `Record`, `open_session` and the recovery types, the headless spawn functions and `InteractiveHandle`, `TurnAdmitter`/`RootSubmission`, `project_session_journal`, and `apply_session_checkpoint` (deleted). Names drop "resume": `SessionSource::Resume` becomes `Existing`, `ResumeOrCreate` becomes `ExistingOrNew`.
 
@@ -156,7 +156,7 @@ One commit per step. Each step is verified on the build box (check, workspace ne
 
 0. `SessionRecorder` and the single event pump in `makima-agent/src/session/`. SDK, ACP and print use it in place of their own pumps. The TUI calls `recorder.observe(&envelope)` until step 9.
 1. Title: the journal derives the title on the first root-history commit with user text while the title is the default, and appends `Title` in the same flush. Until the handle and host exist, explicit titles go through `SessionJournal::set_title` for live sessions and `makima_agent::session::set_title` for stored sessions. Delete the TUI title diff and append, `update_title_if_default` in `AppSession::checkpoint`, and `apply_session_checkpoint`.
-2. Usage: the recorder folds `TurnComplete` into `SessionUsage` and appends `Usage`. Delete `HeadlessObserver::persist_usage` and the TUI's persistence in `account_turn_complete`, plus `SessionState.cost`/`token_usage`. The status bar reads `projection().usage.cost`, so the session cost grows live (#168).
+2. Usage: the agent records each completed provider response in `SessionJournal` before emitting `TurnComplete`, including tool rounds and successful compaction. The journal folds `SessionUsage` and appends cumulative `Usage` through its writer. It restores the fold from stored totals, not event replay. Delete `HeadlessObserver::persist_usage` and the TUI's persistence in `account_turn_complete`, plus `SessionState.cost`/`token_usage`. The status bar reads `SessionJournal::cost` until the session projection is available (#168).
 3. Drop `terminal_subagents` and `subagent_channels.closed`; read agent lifecycle from the agent layer.
 4. `Out`: the recorder appends tool outputs on `ToolDone`/`BackgroundDone`, after offload. Delete the TUI writes.
 5. `Post`: the recorder records posts, anchored to the agent's last committed message id. `StoredPost.chat` (tool-use id) becomes `agent: Option<AgentId>`. Delete the TUI persistence.

@@ -81,11 +81,12 @@ impl App {
             .as_ref()
             .map(|history| history.load_full());
         let meta = self.build_meta();
+        let token_usage = self.state.session.token_usage;
         AppSession::checkpoint(
             &mut self.state.session,
             snapshot.as_deref(),
             meta,
-            self.state.token_usage,
+            token_usage,
         );
     }
 
@@ -128,6 +129,10 @@ impl App {
             });
             self.state.session_mut().meta.queued_messages = meta.queued_messages;
         }
+    }
+
+    pub(super) fn session_cost(&self) -> Option<f64> {
+        self.root_agent.as_ref()?.manager().journal().cost()
     }
 
     pub(crate) fn title(&self) -> String {
@@ -286,7 +291,7 @@ impl App {
         let restoring = Arc::new(AtomicBool::new(true));
         self.restoring = restoring.clone();
 
-        let cost = self.state.cost;
+        let cost = self.session_cost();
         let context_size = self.state.context_size;
         let root_id = self.state.session.root_agent_id();
         let main = self.main_chat();
