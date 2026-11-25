@@ -23,6 +23,7 @@ use makima_agent::command::{
 };
 use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
 use makima_agent::permissions::PluginRuleStore;
+use makima_agent::session::SessionEvent;
 use makima_agent::session_coordinator::{
     SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
@@ -580,12 +581,17 @@ pub fn run(
                         }
                         _ => false,
                     };
-                    let event_rx = &handle.event_rx;
+                    handle.events.set_observer(move |event| {
+                        if !matches!(event.event, AgentEvent::StreamClosed) {
+                            observer.observe(event);
+                        }
+                    });
+                    let events = handle.events.subscribe();
                     let next = || {
                         if wait {
-                            smol::block_on(event_rx.recv_async()).ok()
+                            smol::block_on(events.next())
                         } else {
-                            event_rx.try_recv().ok()
+                            events.try_next()
                         }
                     };
                     let tool_names = &handle.tool_names;
@@ -619,11 +625,10 @@ pub fn run(
                         // rate it paid.
                         let mut cost = None;
 
-                        while let Some(envelope) = next() {
+                        while let Some(SessionEvent::Agent(envelope)) = next() {
                             if matches!(envelope.event, AgentEvent::StreamClosed) {
                                 break;
                             }
-                            observer.observe(&envelope);
                             let Envelope {
                                 ref event,
                                 ref subagent,
@@ -1881,11 +1886,11 @@ mod tests {
                     } else {
                         None
                     };
-                    let events = handle.event_rx.clone();
+                    let events = handle.events.subscribe();
                     let state = smol::block_on(futures_lite::future::or(
                         async {
                             let mut state = PrintTurnState::default();
-                            while let Ok(envelope) = events.recv_async().await {
+                            while let Some(SessionEvent::Agent(envelope)) = events.next().await {
                                 if let AgentEvent::TextDelta { text } = &envelope.event
                                     && envelope.subagent.is_none()
                                 {

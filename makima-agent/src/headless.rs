@@ -37,6 +37,7 @@ use crate::manager::{
 };
 use crate::permissions::{PermissionManager, PermissionSnapshot, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
+use crate::session::SessionEventPump;
 use crate::session_checkpoint::stored_agent_config;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::session_options::SessionOptionError;
@@ -533,7 +534,9 @@ impl WorkCancel {
 pub struct InteractiveHandle {
     pub manager: AgentManagerHandle,
     pub root: RootReadiness,
-    pub event_rx: Receiver<Envelope>,
+    pub events: Arc<SessionEventPump>,
+    #[cfg(test)]
+    event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
     pub input_tx: InteractiveInputSender,
     pub answer_tx: flume::Sender<String>,
@@ -1593,10 +1596,14 @@ fn spawn_interactive(
             drop(guard);
         }
     });
+    let raw_events = events.into_receiver();
+    let events = SessionEventPump::new(raw_events.clone(), manager.journal());
     InteractiveHandle {
         manager,
         root,
-        event_rx: events.into_receiver(),
+        events,
+        #[cfg(test)]
+        event_rx: raw_events,
         tool_names,
         input_tx,
         answer_tx,

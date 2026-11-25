@@ -38,6 +38,7 @@ use makima_agent::mcp;
 use makima_agent::permissions::{
     PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer,
 };
+use makima_agent::session::{SessionEvent, SessionSubscription};
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_defaults;
 use makima_agent::session_options::{
@@ -1079,6 +1080,11 @@ impl SdkRuntime {
                 .lua_handle
                 .notify_state_restored(self.root.target.clone());
         }
+        self.handle.events.set_observer(move |event| {
+            if !matches!(event.event, AgentEvent::StreamClosed) {
+                observer.observe(event);
+            }
+        });
         let pump = EventPump {
             writer: self.writer.clone(),
             shared: Arc::clone(&self.shared),
@@ -1092,9 +1098,8 @@ impl SdkRuntime {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            observer,
         }
-        .spawn(self.handle.event_rx.clone());
+        .spawn(self.handle.events.subscribe());
         self.tasks.lock_unpoisoned().extend([
             pump,
             watch_command_projection(
@@ -2235,22 +2240,20 @@ struct EventPump {
     cost: Option<f64>,
     request_counter: u64,
     terminal_run_id: Option<u64>,
-    observer: HeadlessObserver,
 }
 
 impl EventPump {
-    fn spawn(mut self, event_rx: Receiver<Envelope>) -> smol::Task<()> {
+    fn spawn(mut self, events: SessionSubscription) -> smol::Task<()> {
         let dispatch_end = self.shared.lock_unpoisoned().dispatch_end.1.clone();
         smol::spawn(async move {
             loop {
-                let next =
-                    smol::future::or(async { event_rx.recv_async().await.map(Ok).ok() }, async {
-                        dispatch_end.recv_async().await.map(Err).ok()
-                    })
-                    .await;
+                let next = smol::future::or(async { events.next().await.map(Ok) }, async {
+                    dispatch_end.recv_async().await.map(Err).ok()
+                })
+                .await;
                 let pumped = match next {
-                    Some(Ok(envelope)) => self.pump(envelope),
-                    Some(Err(end)) => self.report_dispatch(&event_rx, end),
+                    Some(Ok(SessionEvent::Agent(envelope))) => self.pump(envelope),
+                    Some(Err(end)) => self.report_dispatch(&events, end),
                     None => break,
                 };
                 match pumped {
@@ -2271,7 +2274,6 @@ impl EventPump {
         if matches!(envelope.event, AgentEvent::StreamClosed) {
             return Ok(false);
         }
-        self.observer.observe(&envelope);
         self.handle(envelope)?;
         Ok(true)
     }
@@ -2280,8 +2282,8 @@ impl EventPump {
     /// by now, so they are held first; a completed command reports the last
     /// of them as its result, like print does, or an empty one. Any other
     /// dispatch reported for itself, and what was held goes out as it came.
-    fn report_dispatch(&mut self, event_rx: &Receiver<Envelope>, end: DispatchEnd) -> Result<bool> {
-        while let Ok(envelope) = event_rx.try_recv() {
+    fn report_dispatch(&mut self, events: &SessionSubscription, end: DispatchEnd) -> Result<bool> {
+        while let Some(SessionEvent::Agent(envelope)) = events.try_next() {
             if !self.pump(envelope)? {
                 return Ok(false);
             }
@@ -3866,12 +3868,8 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            observer: HeadlessObserver::new(
-                makima_lua::EventHandle::disconnected_for_test(),
-                handle.session_id.id(),
-            ),
         }
-        .spawn(handle.event_rx.clone());
+        .spawn(handle.events.subscribe());
         let session = PendingSdkSession {
             handle,
             coordinator,
@@ -4718,10 +4716,13 @@ mod tests {
                 assert_eq!(actor.queued, 0);
                 assert!(actor.active_turn.is_none());
                 assert!(requests.is_empty());
-                assert!(!handle.event_rx.try_iter().any(|event| matches!(
-                    event.event,
-                    AgentEvent::ToolStart(_) | AgentEvent::QueueItemConsumed { .. }
-                )));
+                let events = handle.events.subscribe();
+                assert!(!std::iter::from_fn(|| events.try_next()).any(
+                    |SessionEvent::Agent(event)| matches!(
+                        event.event,
+                        AgentEvent::ToolStart(_) | AgentEvent::QueueItemConsumed { .. }
+                    )
+                ));
                 handle.manager.shutdown(SDK_GATE_TIMEOUT).await;
                 handle.task.cancel().await;
                 drop(checkpoint);
@@ -5571,6 +5572,10 @@ mod tests {
         );
         host.wait_for_worker_barrier_for_test();
         let (out_tx, out_rx) = flume::unbounded();
+        let observer = HeadlessObserver::new(lua_handle, handle.session_id.id());
+        handle
+            .events
+            .set_observer(move |event| observer.observe(event));
         let pump = EventPump {
             writer: SdkWriter {
                 session_id: handle.session_id.clone(),
@@ -5587,9 +5592,8 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            observer: HeadlessObserver::new(lua_handle, handle.session_id.id()),
         }
-        .spawn(handle.event_rx.clone());
+        .spawn(handle.events.subscribe());
         let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
         assert_eq!(
             smol::block_on(admit_sdk_turn(&shared, &handle.input_tx, input)),
@@ -6427,10 +6431,6 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            observer: HeadlessObserver::new(
-                makima_lua::EventHandle::disconnected_for_test(),
-                MakimaId::generate(),
-            ),
         };
         let outcome = || {
             TurnOutcome::completed(
@@ -6498,10 +6498,6 @@ mod tests {
             cost: None,
             request_counter: 0,
             terminal_run_id: None,
-            observer: HeadlessObserver::new(
-                makima_lua::EventHandle::disconnected_for_test(),
-                MakimaId::generate(),
-            ),
         };
         let agent_id = makima_agent::AgentId::generate();
         let turn_id = makima_agent::TurnId::generate();

@@ -792,7 +792,7 @@ impl TurnOutcome {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TextDelta {
@@ -1137,7 +1137,7 @@ pub struct InlineStyle {
     pub reversed: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnCompleteEvent {
     pub message: Message,
     pub usage: TokenUsage,
@@ -1406,7 +1406,7 @@ impl EventSender {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Envelope {
     #[serde(flatten)]
     pub event: AgentEvent,

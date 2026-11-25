@@ -24,6 +24,7 @@ use makima_agent::journal::SessionJournal;
 use makima_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use makima_agent::mcp::{self, McpHandle};
 use makima_agent::permissions::{PermissionAnswer, TaggedAnswer};
+use makima_agent::session::{SessionEvent, SessionEventPump};
 use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
 };
@@ -34,8 +35,8 @@ use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
 use makima_agent::types::{AgentEvent, encode_ask_answer};
 use makima_agent::{
-    AgentId, AgentInput, AgentRef, Envelope, ImageMediaType, ImageSource, ModeError,
-    TurnFailureKind, TurnId, TurnOutcome, TurnTicket,
+    AgentId, AgentInput, AgentRef, ImageMediaType, ImageSource, ModeError, TurnFailureKind, TurnId,
+    TurnOutcome, TurnTicket,
 };
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
@@ -1288,7 +1289,7 @@ async fn install_session_with_lock(
     );
     observer.install(trusted_root.target.clone());
     let event_pump = start_event_pump(
-        handle.event_rx.clone(),
+        &handle.events,
         handle.session_id.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
@@ -2349,7 +2350,7 @@ fn image_media_type(mime: &str) -> ImageMediaType {
 
 #[allow(clippy::too_many_arguments)]
 fn start_event_pump(
-    event_rx: Receiver<Envelope>,
+    events: &Arc<SessionEventPump>,
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
@@ -2361,37 +2362,36 @@ fn start_event_pump(
     initial_cost: Option<f64>,
     observer: HeadlessObserver,
 ) -> EventPump {
+    events.set_observer(move |event| observer.observe(event));
+    let events = events.subscribe();
     let (stop, stopped) = flume::bounded(1);
     let task = smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
         let mut tool_inputs: HashMap<String, Value> = HashMap::new();
         let mut stopping = false;
-
         loop {
-            let envelope = if stopping {
-                match event_rx.try_recv() {
-                    Ok(envelope) => envelope,
-                    Err(_) => break,
-                }
+            let next = if stopping {
+                events.try_next()
             } else {
-                let next = smol::future::or(async { Some(event_rx.recv_async().await) }, async {
+                match smol::future::or(async { Some(events.next().await) }, async {
                     match stopped.recv_async().await {
                         Ok(()) => None,
                         Err(_) => std::future::pending().await,
                     }
                 })
-                .await;
-                match next {
-                    Some(Ok(envelope)) => envelope,
-                    Some(Err(_)) => break,
+                .await
+                {
+                    Some(next) => next,
                     None => {
                         stopping = true;
                         continue;
                     }
                 }
             };
-            observer.observe(&envelope);
+            let Some(SessionEvent::Agent(envelope)) = next else {
+                break;
+            };
             // ACP fences on the presentation the actor stamped, which is the
             // same identity the rest of the frontend uses.
             let run_id = envelope.presentation().unwrap_or_default();
@@ -2714,6 +2714,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use makima_agent::Envelope;
     use makima_agent::actor::{ActorLifecycle, ActorStatus, TurnResult};
     use makima_agent::agent::PromptSlotSource;
     use makima_agent::journal::{JournalChange, JournalCommit};
@@ -2813,6 +2814,10 @@ mod tests {
         start_prompt(srv, raw, id)?;
         let dispatched = (&mut srv.dispatch.as_mut().expect("prompt dispatch").future).await;
         finish_prompt(srv, dispatched).await
+    }
+
+    fn test_event_source(raw: Receiver<Envelope>) -> Arc<SessionEventPump> {
+        SessionEventPump::new(raw, Arc::default())
     }
 
     fn test_observer() -> HeadlessObserver {
@@ -3252,7 +3257,7 @@ mod tests {
         }));
         session.pending.lock().unwrap().permissions.clear();
         start_event_pump(
-            session.handle.event_rx.clone(),
+            &session.handle.events,
             id,
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
@@ -4860,7 +4865,7 @@ mod tests {
                 .unwrap();
             state.checkpoint = Some(writer);
             state.event_pump = start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&state.pending),
@@ -5627,7 +5632,7 @@ mod tests {
             let session = srv.session.as_ref().unwrap();
             session.pending.lock().unwrap().permissions.clear();
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),
@@ -6059,7 +6064,7 @@ mod tests {
                 let session = srv.session.as_ref().unwrap();
                 session.pending.lock().unwrap().permissions.clear();
                 start_event_pump(
-                    event_rx,
+                    &test_event_source(event_rx),
                     session.handle.session_id.clone(),
                     srv.out_tx.clone(),
                     Arc::clone(&session.pending),
@@ -6195,7 +6200,7 @@ mod tests {
             let session_id = session.handle.session_id.to_string();
             let (event_tx, event_rx) = flume::unbounded();
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&pending),
@@ -6376,7 +6381,7 @@ mod tests {
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         let pump = start_event_pump(
-            event_rx,
+            &test_event_source(event_rx),
             session_id,
             out_tx,
             Arc::default(),
@@ -6483,7 +6488,7 @@ mod tests {
         let session = srv.session.as_mut().unwrap();
         session.pending.lock().unwrap().permissions.clear();
         session.event_pump = start_event_pump(
-            session.handle.event_rx.clone(),
+            &session.handle.events,
             session.handle.session_id.clone(),
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
@@ -6799,7 +6804,7 @@ mod tests {
             let session_id = SessionRef::from(MakimaId::generate());
             let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session_id,
                 out_tx,
                 Arc::clone(&pending),
@@ -6879,7 +6884,7 @@ mod tests {
             let session = srv.session.as_ref().unwrap();
             let pending = Arc::clone(&session.pending);
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&pending),
@@ -7010,7 +7015,7 @@ mod tests {
             let session_id = SessionRef::from(MakimaId::generate());
             let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session_id,
                 out_tx,
                 Arc::clone(&pending),
@@ -7067,7 +7072,7 @@ mod tests {
         let tool_id = "tool-1";
 
         start_event_pump(
-            event_rx,
+            &test_event_source(event_rx),
             session_id,
             out_tx,
             pending,
@@ -7149,7 +7154,7 @@ mod tests {
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         start_event_pump(
-            event_rx,
+            &test_event_source(event_rx),
             session_id,
             out_tx,
             PendingState::default(),
@@ -7294,7 +7299,7 @@ mod tests {
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
 
         let pump = start_event_pump(
-            event_rx,
+            &test_event_source(event_rx),
             session_id,
             out_tx,
             Arc::clone(&pending),
@@ -7725,7 +7730,7 @@ mod tests {
             session.command_root = command_root;
             previous_handle.task.cancel().await;
             start_event_pump(
-                session.handle.event_rx.clone(),
+                &session.handle.events,
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),
@@ -8218,7 +8223,7 @@ mod tests {
             let old = srv.session.as_ref().unwrap();
             old.pending.lock().unwrap().permissions.clear();
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 old.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&old.pending),
@@ -9392,7 +9397,7 @@ mod tests {
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
             start_event_pump(
-                event_rx,
+                &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),

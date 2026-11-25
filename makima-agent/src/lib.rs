@@ -55,6 +55,7 @@ pub mod diff;
 pub mod permissions;
 pub mod plan_state;
 pub mod prompt;
+pub mod session;
 pub mod session_checkpoint;
 pub mod session_coordinator;
 pub mod session_defaults;
