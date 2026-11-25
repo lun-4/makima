@@ -11016,15 +11016,6 @@ fn queue_mutations_reach_disk_without_checkpoint(remove: bool) {
 }
 
 #[test]
-fn title_mutation_reaches_disk_without_checkpoint() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.set_title(POST_TEXT.into());
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    assert_eq!(AppSession::load(id, &dir).unwrap().title, POST_TEXT);
-}
-
-#[test]
 fn idle_checkpoint_changes_nothing() {
     let mut app = test_app();
     app.state

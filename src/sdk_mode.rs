@@ -3501,6 +3501,9 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&current, &session.current()));
         smol::block_on(current.close()).unwrap();
+        let reloaded =
+            StoredSession::load(current.handle.session_id.id(), &session.storage).unwrap();
+        assert_eq!(reloaded.title, SDK_ROOT_PROMPT);
         session.params.lua_handle.clear_orchestration_services();
         let target = current.commands.target.clone();
         drop(current);

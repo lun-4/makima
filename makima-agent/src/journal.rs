@@ -21,7 +21,10 @@ use makima_storage::session_state::{
     StoredStateRecord, StoredTurnFailure, StoredTurnFailureKind, StoredTurnOutcome,
     StoredTurnResult, StoredTurnStatus,
 };
-use makima_storage::sessions::{Session, SessionRecord, StoredRule, append_context_events};
+use makima_storage::sessions::{
+    DEFAULT_TITLE, Session, SessionRecord, StoredRule, append_context_events, generate_title,
+    normalize_title,
+};
 use thiserror::Error;
 
 use crate::actor::{
@@ -199,6 +202,7 @@ pub struct SessionJournalSnapshot {
     pub histories: OrdMap<AgentId, HistorySnapshot>,
     pub managed_histories: OrdSet<AgentId>,
     pub authoritative: bool,
+    title: Option<Arc<str>>,
     reducer: Option<ReducerCache>,
     prepared_installed: Option<Arc<AtomicBool>>,
 }
@@ -285,6 +289,7 @@ impl SessionJournalSnapshot {
             histories: OrdMap::new(),
             managed_histories: OrdSet::new(),
             authoritative: false,
+            title: None,
             reducer: None,
             prepared_installed: None,
         }
@@ -293,6 +298,7 @@ impl SessionJournalSnapshot {
     pub fn apply_to(&self, session: &mut StoredSession) -> Result<(), JournalError> {
         if self.authoritative {
             self.fold()?;
+            self.apply_title(session);
             session.replace_state(self.state.to_vec());
             session.replace_agent_revisions(self.agent_revisions.to_vec());
             session.replace_journal_histories(
@@ -329,6 +335,7 @@ impl SessionJournalSnapshot {
         let state: Vec<_> = state.into_values().collect();
         let agents: Vec<_> = agents.into_iter().collect();
         let view = SessionStateView::fold(&state, &agents)?;
+        self.apply_title(session);
         session.replace_state(state);
         session.replace_agent_revisions(agents);
         for (agent, history) in &self.histories {
@@ -350,6 +357,12 @@ impl SessionJournalSnapshot {
             }
         }
         Ok(())
+    }
+
+    fn apply_title(&self, session: &mut StoredSession) {
+        if let Some(title) = &self.title {
+            session.set_title(title.to_string());
+        }
     }
 }
 
@@ -710,6 +723,8 @@ impl SessionJournal {
         {
             let mut state = journal.lock();
             let snapshot = &mut state.snapshot;
+            snapshot.title =
+                (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
             snapshot.state =
                 JournalRecords::try_from_ordered(session.state().iter().cloned(), "state")?;
             snapshot.agent_revisions = JournalRecords::try_from_ordered(
@@ -745,7 +760,7 @@ impl SessionJournal {
 
     pub(crate) fn from_exact_snapshot(
         session: &StoredSession,
-        snapshot: SessionJournalSnapshot,
+        mut snapshot: SessionJournalSnapshot,
     ) -> Result<Self, JournalError> {
         let view = snapshot.fold()?;
         if !session.state().iter().eq(snapshot.state.iter())
@@ -794,6 +809,8 @@ impl SessionJournal {
         let journal = Self::default();
         {
             let mut state = journal.lock();
+            snapshot.title =
+                (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
             state.emitted_histories = Self::history_baseline(&snapshot);
             state.snapshot = snapshot.clone();
             state.ready = snapshot;
@@ -1003,6 +1020,25 @@ impl SessionJournal {
 
     pub fn session_id(&self) -> Option<MakimaId> {
         self.lock().session_id
+    }
+
+    pub fn title(&self) -> String {
+        self.lock()
+            .ready
+            .title
+            .as_deref()
+            .unwrap_or(DEFAULT_TITLE)
+            .to_owned()
+    }
+
+    pub fn set_title(&self, title: String) {
+        let title = normalize_title(&title);
+        let mut state = self.lock();
+        if state.ready.title.as_deref() != Some(&title) {
+            state.ready.title = Some(Arc::from(title.as_str()));
+            state.unwritten.push(SessionRecord::Title { title });
+            Self::emit_unwritten(&mut state);
+        }
     }
 
     pub fn snapshot(&self) -> SessionJournalSnapshot {
@@ -2339,7 +2375,8 @@ impl SessionJournal {
             .front()
             .is_some_and(|entry| entry.pending.is_none())
         {
-            if let Some(entry) = state.staged.pop_front() {
+            if let Some(mut entry) = state.staged.pop_front() {
+                entry.snapshot.title = state.ready.title.clone();
                 let mut records: Vec<_> = entry
                     .snapshot
                     .state
@@ -2422,6 +2459,16 @@ impl SessionJournal {
                             compacted: history.compacted,
                             conversation: history.conversation.clone(),
                         });
+                    }
+                    if entry.snapshot.title.is_none()
+                        && entry
+                            .snapshot
+                            .latest_agent(agent)
+                            .is_some_and(|record| record.parent.is_none())
+                        && let Some(title) = generate_title(&history.messages)
+                    {
+                        entry.snapshot.title = Some(Arc::from(title.as_str()));
+                        state.unwritten.push(SessionRecord::Title { title });
                     }
                     state.emitted_histories.insert(
                         agent,
@@ -2525,6 +2572,7 @@ mod tests {
     use crate::actor::{
         ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES, TurnProvenance, TurnResult,
     };
+    use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::tools::offload::OffloadStore;
     use crate::{HistorySnapshot, ToolOutput, TurnCancellationReason, TurnOutcome};
     use makima_providers::{Message, TokenUsage};
@@ -2533,9 +2581,10 @@ mod tests {
         MAX_INLINE_TURN_RESULT_BYTES, StateChange, StoredAgentConfig, StoredDelivery,
         StoredDeliveryOp, StoredModeSnapshot, StoredPayload, StoredTurnOrigin,
     };
-    use makima_storage::sessions::Session;
+    use makima_storage::sessions::{DEFAULT_TITLE, Session};
     use makima_storage::test_util::test_record;
     use serde_json::json;
+    use std::fs::read_to_string;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
 
@@ -2544,6 +2593,72 @@ mod tests {
 
     use async_lock::RwLockReadGuardArc;
     use std::collections::BTreeMap;
+
+    #[test_case(None; "derived_once_from_root")]
+    #[test_case(Some(DEFAULT_TITLE); "explicit_default_survives_reopen")]
+    fn title_is_written_once(explicit: Option<&str>) {
+        const CHILD_TEXT: &str = "child request";
+        const ROOT_TEXT: &str = "root request";
+        const LATER_TEXT: &str = "later root request";
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("test", "/test");
+            let root = AgentId::generate();
+            let child = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = SessionJournal::from_session(&session).unwrap();
+            journal.bind_writer(writer.clone()).unwrap();
+            journal
+                .commit(JournalCommit {
+                    agents: vec![test_record(child, Some(root))],
+                    histories: [(
+                        child,
+                        HistorySnapshot::new(vec![Message::user(CHILD_TEXT.into())]),
+                    )]
+                    .into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(journal.title(), DEFAULT_TITLE);
+            let journal = if let Some(title) = explicit {
+                journal.set_title(title.into());
+                journal.flush().await.unwrap();
+                let session = StoredSession::load_from(session.id, dir.path()).unwrap();
+                let journal = SessionJournal::from_session(&session).unwrap();
+                journal.bind_writer(writer).unwrap();
+                journal
+            } else {
+                journal
+            };
+            for text in [ROOT_TEXT, LATER_TEXT] {
+                journal
+                    .commit(JournalCommit {
+                        histories: [(root, HistorySnapshot::new(vec![Message::user(text.into())]))]
+                            .into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            journal.flush().await.unwrap();
+            let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
+            let titles: Vec<_> = log
+                .lines()
+                .filter_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
+                    Record::Title { title } => Some(title),
+                    _ => None,
+                })
+                .collect();
+            let expected = explicit.unwrap_or(ROOT_TEXT);
+            assert_eq!(titles, [expected]);
+            assert_eq!(
+                StoredSession::load_from(session.id, dir.path())
+                    .unwrap()
+                    .title,
+                expected
+            );
+        });
+    }
 
     pub(crate) struct JournalCheckpoint {
         snapshot: SessionJournalSnapshot,

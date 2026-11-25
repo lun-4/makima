@@ -39,6 +39,7 @@ use makima_agent::manager::AgentResidency;
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
 use makima_agent::rewind::RewindOutcome;
+use makima_agent::session::set_title;
 use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
@@ -85,9 +86,9 @@ use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
 use makima_storage::session_state::StateChange;
+use makima_storage::sessions::SESSIONS_DIR;
 #[cfg(test)]
-use makima_storage::sessions::SessionError;
-use makima_storage::sessions::{SESSIONS_DIR, SessionRecord, normalize_title};
+use makima_storage::sessions::{SessionError, SessionRecord};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -3407,7 +3408,7 @@ impl<'t> EventLoop<'t> {
                 "SessionStatusChanged",
                 json!({
                     "session_id": rt.id(),
-                    "title": rt.app.state.session.title,
+                    "title": rt.app.title(),
                     "status": status.as_str(),
                     "focused": i == self.focused,
                 }),
@@ -3652,27 +3653,17 @@ impl<'t> EventLoop<'t> {
                 }
             },
             SessionRequest::SetTitle { id, title } => {
-                let title = normalize_title(&title);
                 let reply = (|| {
                     let id = parse_session_id(&id)?;
                     if let Some(i) = self.position(id) {
-                        self.sessions[i].app.set_title(title);
+                        let runtime = &self.sessions[i];
+                        if runtime.lock_lost {
+                            return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+                        }
+                        runtime.app.set_title(title);
                     } else {
-                        let mut session =
-                            AppSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        let lease = claim_lock(&self.ctx.sessions_dir, &id)
+                        smol::block_on(set_title(&self.ctx.sessions_dir, id, title))
                             .map_err(|error| error.to_string())?;
-                        let writer = SessionWriter::open_session(&self.ctx.sessions_dir, &session)
-                            .map_err(|error| error.to_string())?;
-                        writer.bind_publication_guard(Some(lease.publication_guard()));
-                        smol::block_on(writer.append_owned(
-                            vec![SessionRecord::Title {
-                                title: session.title.clone(),
-                            }],
-                            lease.publication_guard(),
-                        ))
-                        .map_err(|error| error.to_string())?;
                     }
                     Ok(json!(true))
                 })();
@@ -3710,7 +3701,7 @@ impl<'t> EventLoop<'t> {
         let app = &self.sessions[idx].app;
         let snapshot = SessionSnapshot {
             id: self.sessions[idx].id().to_string(),
-            title: Some(app.state.session.title.clone()),
+            title: Some(app.title()),
             status: SessionStatus::of(app).as_str(),
             updated_at: app.state.session.updated_at,
             usage: session_usage(
@@ -5382,7 +5373,7 @@ impl<'t> EventLoop<'t> {
 fn live_session_row(id: MakimaId, app: &App, focused: bool) -> serde_json::Value {
     json!({
         "id": id,
-        "title": app.state.session.title,
+        "title": app.title(),
         "status": SessionStatus::of(app).as_str(),
         "updated_at": app.state.session.updated_at,
         "message_count": live_message_count(app),
@@ -8531,6 +8522,47 @@ end })
         fn path(&self, name: &str) -> PathBuf {
             self.dir.join(name)
         }
+    }
+
+    #[test_case(false; "offline")]
+    #[test_case(true; "live")]
+    fn session_set_title_persists_without_checkpoint(live: bool) {
+        const RAW_TITLE: &str = "  renamed\n session  ";
+        const TITLE: &str = "renamed session";
+        with_event_loop(|event_loop| {
+            let storage = &event_loop.ctx.storage;
+            let id = if live {
+                event_loop.sessions[event_loop.focused].id()
+            } else {
+                let mut session = AppSession::new(
+                    &event_loop.ctx.model_slot.load().model.spec(),
+                    &event_loop.ctx.workspace_cwd,
+                );
+                session.save(storage).unwrap();
+                session.id
+            };
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop.handle_session_request(
+                SessionRequest::SetTitle {
+                    id: id.to_string(),
+                    title: RAW_TITLE.into(),
+                },
+                reply_tx,
+            );
+            assert_eq!(
+                reply_rx.recv_timeout(PUMP_TIMEOUT).unwrap(),
+                Ok(json!(true))
+            );
+            if live {
+                let runtime = &event_loop.sessions[event_loop.focused];
+                assert_eq!(runtime.app.title(), TITLE);
+                smol::block_on(runtime.handles.manager_and_root().0.journal().flush()).unwrap();
+            }
+            assert_eq!(
+                AppSession::load(id, &event_loop.ctx.storage).unwrap().title,
+                TITLE
+            );
+        });
     }
 
     #[test_case(false; "deletion_completes")]

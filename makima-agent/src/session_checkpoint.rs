@@ -4,7 +4,7 @@ use crate::{
     config_change::ConfigChangeError,
     journal::{JournalIncarnation, JournalPrepared, SessionJournal},
     session_coordinator::{SessionCheckpoint, SessionCheckpointKind},
-    session_writer::{SessionWriter, StoredSession, WriterError},
+    session_writer::{SessionWriter, WriterError},
 };
 use makima_storage::{
     checkpoint::{
@@ -174,25 +174,14 @@ pub fn stored_agent_config(
     })
 }
 
-pub fn apply_session_checkpoint(session: &mut StoredSession, checkpoint: &SessionCheckpoint) {
-    if checkpoint.kind != SessionCheckpointKind::Options
-        && let Some(history) = &checkpoint.history
-    {
-        session.adopt_history(history);
-        session.update_title_if_default();
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CHECKPOINT_CANCELLED, SessionCheckpoint, SessionCheckpointKind, SessionWriter,
-        StoredSession,
-    };
+    use super::{CHECKPOINT_CANCELLED, SessionCheckpoint, SessionCheckpointKind, SessionWriter};
     use crate::{
         cancel::CancelToken,
         journal::{JournalChange, JournalCommit, SessionJournal},
         session_options::SessionOptions,
+        session_writer::StoredSession,
     };
     use makima_storage::{
         checkpoint::{

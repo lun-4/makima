@@ -170,12 +170,11 @@ impl HeadlessObserver {
         }
     }
 
-    /// Installs the provider `makima.session.read` answers from. There is no
-    /// rename path under the headless drivers, so `title` stays nil rather
-    /// than echoing the id back as a fake one, and usage has no per-model
-    /// split.
+    /// Installs the provider for `makima.session.read`.
     pub fn install(&self, root: AgentRef) {
-        self.handle.observe_agents(&root.manager());
+        let manager = root.manager();
+        self.handle.observe_agents(&manager);
+        let journal = manager.journal();
         let _ = self.root.set(root);
         let totals = Arc::clone(&self.totals);
         let id = self.session_id;
@@ -187,7 +186,7 @@ impl HeadlessObserver {
             let totals = totals.lock_unpoisoned();
             serde_json::to_value(SessionSnapshot {
                 id: id.to_string(),
-                title: None,
+                title: Some(journal.title()),
                 status: if totals.working {
                     STATUS_WORKING
                 } else {

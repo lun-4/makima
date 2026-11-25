@@ -80,7 +80,6 @@ impl App {
             .shared_history
             .as_ref()
             .map(|history| history.load_full());
-        let title = self.state.session.title.clone();
         let meta = self.build_meta();
         AppSession::checkpoint(
             &mut self.state.session,
@@ -88,11 +87,6 @@ impl App {
             meta,
             self.state.token_usage,
         );
-        if self.state.session.title != title {
-            self.append_ui_record(SessionRecord::Title {
-                title: self.state.session.title.clone(),
-            });
-        }
     }
 
     pub(crate) fn checkpoint_now(&mut self) {
@@ -136,12 +130,16 @@ impl App {
         }
     }
 
-    pub(crate) fn set_title(&mut self, title: String) {
-        if self.state.session.title != title {
-            self.append_ui_record(SessionRecord::Title {
-                title: title.clone(),
-            });
-            self.state.session_mut().set_title(title);
+    pub(crate) fn title(&self) -> String {
+        self.root_agent.as_ref().map_or_else(
+            || self.state.session.title.clone(),
+            |root| root.manager().journal().title(),
+        )
+    }
+
+    pub(crate) fn set_title(&self, title: String) {
+        if let Some(root) = &self.root_agent {
+            root.manager().journal().set_title(title);
         }
     }
 

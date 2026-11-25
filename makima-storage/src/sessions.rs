@@ -55,7 +55,7 @@ const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_VERSION: u32 = 3;
 #[cfg(test)]
 const TAIL_BUF: u64 = 4096;
-const DEFAULT_TITLE: &str = "New session";
+pub const DEFAULT_TITLE: &str = "New session";
 const MAX_TITLE_LEN: usize = 60;
 const FILE_CHANGED_UNDERNEATH: &str = "file changed underneath";
 /// Original v2 logs retained during one-time migration.
@@ -285,6 +285,7 @@ impl<M> Default for HistorySnapshot<M> {
 pub struct Session<M, U, T> {
     pub id: MakimaId,
     pub title: String,
+    title_set: bool,
     pub cwd: String,
     pub model: String,
     messages: Arc<Vec<M>>,
@@ -410,24 +411,22 @@ pub fn normalize_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
-    let first_user_text = messages.iter().find_map(|m| m.first_user_text());
-
-    let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
-        return DEFAULT_TITLE.into();
-    };
+pub fn generate_title<M: TitleSource>(messages: &[M]) -> Option<String> {
+    let text = messages
+        .iter()
+        .filter_map(|message| message.first_user_text().map(str::trim))
+        .find(|text| !text.is_empty())?;
     let text = normalize_title(text);
-
     if text.len() <= MAX_TITLE_LEN {
-        return text;
+        return Some(text);
     }
 
     let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
     let truncated = &text[..boundary];
-    match truncated.rfind(' ') {
+    Some(match truncated.rfind(' ') {
         Some(pos) if pos > MAX_TITLE_LEN / 2 => format!("{}…", &truncated[..pos]),
         _ => format!("{truncated}…"),
-    }
+    })
 }
 
 // -- JSONL record types --
@@ -894,6 +893,14 @@ where
         },
     )?;
     buf.extend_from_slice(&meta_record(session)?);
+    if session.title_set && session.title == DEFAULT_TITLE {
+        append_record(
+            &mut buf,
+            &SessionRecord::<&M, &U, &T>::Title {
+                title: session.title.clone(),
+            },
+        )?;
+    }
     file.write_all(&buf).map_err(StorageError::from)?;
     Ok(())
 }
@@ -1072,6 +1079,7 @@ where
     let mut legacy_children = LegacyChildren::default();
     let mut legacy_child_messages = Vec::new();
     let mut title = DEFAULT_TITLE.to_string();
+    let mut title_set = false;
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut posts = Vec::new();
@@ -1259,7 +1267,10 @@ where
             SessionRecord::Post { d } => posts.push(d),
             SessionRecord::Draft { text } => meta.input_draft = text,
             SessionRecord::Queued { messages } => meta.queued_messages = messages,
-            SessionRecord::Title { title: next_title } => title = next_title,
+            SessionRecord::Title { title: next_title } => {
+                title = next_title;
+                title_set = true;
+            }
             SessionRecord::Usage {
                 token_usage: usage,
                 usage_by_model: by_model,
@@ -1282,6 +1293,7 @@ where
                 legacy_plan: m_legacy_plan,
             } => {
                 title = m_title;
+                title_set = false;
                 if parent_recorded {
                     parent = m_parent;
                 }
@@ -1367,6 +1379,7 @@ where
     let mut session = Session {
         id,
         title,
+        title_set,
         cwd,
         model,
         messages: Arc::new(messages),
@@ -2127,6 +2140,7 @@ where
         Self {
             id: MakimaId::generate(),
             title: DEFAULT_TITLE.into(),
+            title_set: false,
             cwd: cwd.into(),
             model: model.into(),
             messages: Arc::default(),
@@ -2601,9 +2615,6 @@ where
         let session = Arc::make_mut(this);
         if let Some(snapshot) = history {
             session.adopt_history(snapshot);
-            // The title comes from the messages, so it goes stale exactly when
-            // they move.
-            session.update_title_if_default();
         }
         session.set_meta(meta);
         session.set_token_usage(token_usage);
@@ -2808,11 +2819,16 @@ where
         &mut self.usage_by_model
     }
 
+    pub fn title_is_default(&self) -> bool {
+        !self.title_set && self.title == DEFAULT_TITLE
+    }
+
     pub fn set_title(&mut self, title: String) {
-        if self.title == title {
+        if self.title == title && !self.title_is_default() {
             return;
         }
         self.title = title;
+        self.title_set = true;
         self.touch();
     }
 
@@ -2998,12 +3014,6 @@ where
             .max_by_key(|s| s.updated_at)
             .map(|s| Self::load_from(s.id, dir).map(Some))
             .unwrap_or(Ok(None))
-    }
-
-    pub fn update_title_if_default(&mut self) {
-        if self.title == DEFAULT_TITLE {
-            self.set_title(generate_title(&self.messages));
-        }
     }
 
     pub fn delete(id: MakimaId, dir: &StateDir) -> Result<(), SessionError> {
@@ -5108,7 +5118,12 @@ mod tests {
         } else {
             vec![user_message(input)]
         };
-        assert_eq!(generate_title(&messages), expected);
+        assert_eq!(
+            generate_title(&messages)
+                .as_deref()
+                .unwrap_or(DEFAULT_TITLE),
+            expected
+        );
     }
 
     #[test]
@@ -5180,7 +5195,7 @@ mod tests {
     #[test]
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
-        let title = generate_title(&[user_message(&input)]);
+        let title = generate_title(&[user_message(&input)]).unwrap();
         assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
     }

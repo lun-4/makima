@@ -144,7 +144,7 @@ pub enum SessionEvent {
 }
 ```
 
-One event pump per session: raw events go to the `SessionRecorder` (title, usage, `Out`, `Post`, written once), then `FrontendServices::observe` (Lua autocmds), then subscribers.
+One event pump per session: raw events go to the `SessionRecorder` (usage, `Out`, `Post`, written once), then `FrontendServices::observe` (Lua autocmds), then subscribers. The journal derives the title when it commits root history.
 
 These become internal: the coordinator handle types and tickets, `SessionWriter` and `Record`, `open_session` and the recovery types, the headless spawn functions and `InteractiveHandle`, `TurnAdmitter`/`RootSubmission`, `project_session_journal`, and `apply_session_checkpoint` (deleted). Names drop "resume": `SessionSource::Resume` becomes `Existing`, `ResumeOrCreate` becomes `ExistingOrNew`.
 
@@ -155,7 +155,7 @@ The signatures are the target shape. Steps may adjust them when the code shows a
 One commit per step. Each step is verified on the build box (check, workspace nextest, clippy, gen-docs) before the next starts.
 
 0. `SessionRecorder` and the single event pump in `makima-agent/src/session/`. SDK, ACP and print use it in place of their own pumps. The TUI calls `recorder.observe(&envelope)` until step 9.
-1. Title: the journal derives the title on the first root-history commit with user text while the title is the default, and appends `Title` in the same flush. Explicit titles go through the handle or `SessionHost::set_title` (no frontend opens its own writer). Delete the TUI title diff and append, `update_title_if_default` in `AppSession::checkpoint`, and `apply_session_checkpoint`.
+1. Title: the journal derives the title on the first root-history commit with user text while the title is the default, and appends `Title` in the same flush. Until the handle and host exist, explicit titles go through `SessionJournal::set_title` for live sessions and `makima_agent::session::set_title` for stored sessions. Delete the TUI title diff and append, `update_title_if_default` in `AppSession::checkpoint`, and `apply_session_checkpoint`.
 2. Usage: the recorder folds `TurnComplete` into `SessionUsage` and appends `Usage`. Delete `HeadlessObserver::persist_usage` and the TUI's persistence in `account_turn_complete`, plus `SessionState.cost`/`token_usage`. The status bar reads `projection().usage.cost`, so the session cost grows live (#168).
 3. Drop `terminal_subagents` and `subagent_channels.closed`; read agent lifecycle from the agent layer.
 4. `Out`: the recorder appends tool outputs on `ToolDone`/`BackgroundDone`, after offload. Delete the TUI writes.
