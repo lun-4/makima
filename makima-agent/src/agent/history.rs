@@ -496,6 +496,10 @@ impl History {
         Ok(ended.sent.map(|_| ended.id))
     }
 
+    pub(crate) fn journal(&self) -> Option<&Arc<SessionJournal>> {
+        self.journal.as_ref().map(|(_, journal)| journal)
+    }
+
     pub(crate) fn record_usage(&self, model: &str, usage: TokenUsage, cost: Option<f64>) {
         if let Some((_, journal)) = &self.journal {
             journal.record_usage(model, usage, cost);

@@ -22,8 +22,8 @@ use makima_storage::session_state::{
     StoredTurnResult, StoredTurnStatus,
 };
 use makima_storage::sessions::{
-    DEFAULT_TITLE, Session, SessionRecord, StoredRule, StoredTokenUsage, append_context_events,
-    generate_title, normalize_title,
+    DEFAULT_TITLE, Session, SessionRecord, StoredPost, StoredRule, StoredTokenUsage,
+    append_context_events, generate_title, normalize_title,
 };
 use thiserror::Error;
 
@@ -38,7 +38,7 @@ use crate::state::{
     StateScope, read_slot, validate_access, validate_record,
 };
 use crate::tools::offload::OffloadStore;
-use crate::{HistorySnapshot, ToolOutput, TurnOutcome};
+use crate::{HistorySnapshot, Post, ToolOutput, TurnOutcome};
 
 mod records;
 pub use records::{JournalRecord, JournalRecords};
@@ -223,6 +223,8 @@ pub struct SessionJournalSnapshot {
     pub histories: OrdMap<AgentId, HistorySnapshot>,
     pub managed_histories: OrdSet<AgentId>,
     pub authoritative: bool,
+    pub tool_outputs: Arc<HashMap<String, Arc<ToolOutput>>>,
+    pub posts: Arc<Vec<StoredPost>>,
     title: Option<Arc<str>>,
     usage: Arc<SessionUsage>,
     reducer: Option<ReducerCache>,
@@ -311,6 +313,8 @@ impl SessionJournalSnapshot {
             histories: OrdMap::new(),
             managed_histories: OrdSet::new(),
             authoritative: false,
+            tool_outputs: Arc::default(),
+            posts: Arc::default(),
             title: None,
             usage: Arc::default(),
             reducer: None,
@@ -383,6 +387,8 @@ impl SessionJournalSnapshot {
     }
 
     fn apply_session_fields(&self, session: &mut StoredSession) {
+        session.replace_tool_outputs(self.tool_outputs.as_ref().clone());
+        session.replace_posts(self.posts.as_ref().clone());
         if session.token_usage != self.usage.tokens
             || session.usage_by_model() != &self.usage.by_model
         {
@@ -757,6 +763,8 @@ impl SessionJournal {
             snapshot.title =
                 (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
             snapshot.usage = Arc::new(SessionUsage::from_session(session));
+            snapshot.tool_outputs = Arc::new(session.tool_outputs().clone());
+            snapshot.posts = Arc::new(session.posts().to_vec());
             snapshot.state =
                 JournalRecords::try_from_ordered(session.state().iter().cloned(), "state")?;
             snapshot.agent_revisions = JournalRecords::try_from_ordered(
@@ -844,6 +852,8 @@ impl SessionJournal {
             snapshot.title =
                 (!session.title_is_default()).then(|| Arc::from(session.title.as_str()));
             snapshot.usage = Arc::new(SessionUsage::from_session(session));
+            snapshot.tool_outputs = Arc::new(session.tool_outputs().clone());
+            snapshot.posts = Arc::new(session.posts().to_vec());
             state.emitted_histories = Self::history_baseline(&snapshot);
             state.snapshot = snapshot.clone();
             state.ready = snapshot;
@@ -1094,6 +1104,45 @@ impl SessionJournal {
                 usage_by_model: usage.by_model.clone(),
             };
             state.unwritten.push(record);
+            Self::emit_unwritten(&mut state);
+        }
+    }
+
+    pub(crate) fn record_tool_output(&self, id: &str, output: &ToolOutput) {
+        let mut state = self.lock();
+        if state.ready.tool_outputs.contains_key(id) {
+            return;
+        }
+        Arc::make_mut(&mut state.ready.tool_outputs)
+            .insert(id.to_owned(), Arc::new(output.clone()));
+        if self.persistent {
+            state.unwritten.push(SessionRecord::Out {
+                id: id.to_owned(),
+                d: output.clone(),
+            });
+            Self::emit_unwritten(&mut state);
+        }
+    }
+
+    pub fn record_post(&self, target: AgentId, post: Post) {
+        let mut state = self.lock();
+        let agent = state
+            .ready
+            .latest_agent(target)
+            .and_then(|record| record.parent.map(|_| target));
+        let after_message = state
+            .ready
+            .histories
+            .get(&target)
+            .and_then(|history| history.ids.last().copied());
+        let stored = StoredPost {
+            agent,
+            after_message,
+            post,
+        };
+        Arc::make_mut(&mut state.ready.posts).push(stored.clone());
+        if self.persistent {
+            state.unwritten.push(SessionRecord::Post { d: stored });
             Self::emit_unwritten(&mut state);
         }
     }
@@ -1791,6 +1840,8 @@ impl SessionJournal {
                     Self::validate_incarnations(&state, &commit.incarnations)?;
                     self.resolve_state_edits(&mut state, &mut commit)?;
                     let mut candidate = Self::apply_commit(&state.snapshot, commit.clone())?;
+                    candidate.tool_outputs = Arc::clone(&state.ready.tool_outputs);
+                    candidate.posts = Arc::clone(&state.ready.posts);
                     candidate.prepared_installed = Some(Arc::new(AtomicBool::new(false)));
                     let pending = if commit.changes.is_empty() {
                         let mut staged = state.snapshot.clone();
@@ -2435,6 +2486,8 @@ impl SessionJournal {
             if let Some(mut entry) = state.staged.pop_front() {
                 entry.snapshot.title = state.ready.title.clone();
                 entry.snapshot.usage = Arc::clone(&state.ready.usage);
+                entry.snapshot.tool_outputs = Arc::clone(&state.ready.tool_outputs);
+                entry.snapshot.posts = Arc::clone(&state.ready.posts);
                 let mut records: Vec<_> = entry
                     .snapshot
                     .state
@@ -2632,7 +2685,7 @@ mod tests {
     };
     use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::tools::offload::OffloadStore;
-    use crate::{HistorySnapshot, ToolOutput, TurnCancellationReason, TurnOutcome};
+    use crate::{HistorySnapshot, Post, ToolOutput, TurnCancellationReason, TurnOutcome};
     use makima_providers::{Message, TokenUsage};
     use makima_storage::id::{AgentId, TurnId};
     use makima_storage::session_state::{
@@ -2651,6 +2704,46 @@ mod tests {
 
     use async_lock::RwLockReadGuardArc;
     use std::collections::BTreeMap;
+
+    const CHILD_POST: &str = "child update";
+
+    #[test]
+    fn child_post_uses_its_last_committed_message() {
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("test", "/test");
+            let root = AgentId::generate();
+            let child = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = SessionJournal::from_session(&session).unwrap();
+            journal.bind_writer(writer).unwrap();
+            let history = HistorySnapshot::new(vec![Message::user(CHILD_POST.into())]);
+            let child_message = history.ids[0];
+            journal
+                .commit(JournalCommit {
+                    agents: vec![test_record(child, Some(root))],
+                    histories: [(child, history)].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            journal.record_post(
+                child,
+                Post {
+                    text: CHILD_POST.into(),
+                    level: Default::default(),
+                    agent: None,
+                },
+            );
+            journal.flush().await.unwrap();
+            let reloaded = StoredSession::load_from(session.id, dir.path()).unwrap();
+            journal.snapshot().apply_to(&mut session).unwrap();
+            assert_eq!(session.posts(), reloaded.posts());
+            let post = &reloaded.posts()[0];
+            assert_eq!(post.agent, Some(child));
+            assert_eq!(post.after_message, Some(child_message));
+        });
+    }
 
     #[test_case(None; "derived_once_from_root")]
     #[test_case(Some(DEFAULT_TITLE); "explicit_default_survives_reopen")]

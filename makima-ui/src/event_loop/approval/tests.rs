@@ -44,7 +44,7 @@ use crate::AppSession;
 use crate::app::mode::{Mode, PlanState};
 use crate::components::keybindings::key;
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
-use crate::components::{self, Action, Status};
+use crate::components::{self, Action, DisplayRole, Status};
 use crate::model_capabilities::test_support::seeded;
 use crate::plan_approval::{
     APPROVAL_BUSY, APPROVAL_CHANGED, IMPLEMENT_PARALLEL_HINT, idle_error_message, read_plan,
@@ -701,23 +701,12 @@ fn managed_child_approval(
                 identity: None,
             }),
         );
+        let app = &event_loop.sessions[index].app;
+        let chat = &app.chats[app.agent_chat_index[&child_id]];
+        assert_eq!(chat.last_message_text(), CHILD_PROMPT);
         assert_eq!(
-            event_loop.sessions[index]
-                .app
-                .state
-                .session
-                .posts()
-                .iter()
-                .find(|post| post.chat.as_deref() == Some(child_key.as_str()))
-                .unwrap()
-                .after_message,
-            event_loop.sessions[index]
-                .app
-                .state
-                .session
-                .chat_message_ids(Some(&child_key))
-                .last()
-                .copied(),
+            chat.last_message_role(),
+            Some(&DisplayRole::Post(makima_domain::PostLevel::Info))
         );
         let child_events = child.subscribe_events();
         release.send(()).unwrap();

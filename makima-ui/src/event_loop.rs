@@ -3085,22 +3085,6 @@ impl<'t> EventLoop<'t> {
     fn handle_agent(&mut self, idx: usize, envelope: Box<makima_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
         rt.app.adopt_actor_presentation(&envelope);
-        if let AgentEvent::Post(post) = envelope.event {
-            let after_message = envelope.subagent.as_ref().and_then(|info| {
-                let (manager, _) = rt.handles.manager_and_root();
-                manager.actor(info.agent_id).ok().map(|_| {
-                    rt.app
-                        .state
-                        .session
-                        .chat_message_ids(Some(&info.parent_tool_use_id))
-                        .last()
-                        .copied()
-                })
-            });
-            rt.app
-                .push_post(envelope.subagent.as_ref(), post, after_message);
-            return;
-        }
         let current = is_current_top_level(rt.app.run_id, &envelope);
         match &envelope.event {
             AgentEvent::QueueSettled => {
@@ -3963,6 +3947,7 @@ impl<'t> EventLoop<'t> {
         session.quiescent()
             && actor_idle
             && !session.app.has_content()
+            && manager.journal().snapshot().posts.is_empty()
             && session.app.input_box.buffer.value().is_empty()
     }
 

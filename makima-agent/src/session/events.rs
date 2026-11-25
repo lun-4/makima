@@ -6,8 +6,7 @@ use std::task::Poll;
 use flume::{Receiver, Sender};
 use makima_domain::LockExt;
 
-use super::recorder::SessionRecorder;
-use crate::{AgentEvent, Envelope, journal::SessionJournal};
+use crate::{AgentEvent, Envelope};
 
 #[derive(Clone)]
 pub enum SessionEvent {
@@ -17,7 +16,6 @@ pub enum SessionEvent {
 type Observer = Box<dyn FnMut(&Envelope) + Send>;
 
 struct PumpState {
-    recorder: SessionRecorder,
     observer: Option<Observer>,
     subscribers: Option<Vec<Sender<SessionEvent>>>,
 }
@@ -31,7 +29,6 @@ impl PumpState {
             self.subscribers = None;
             return;
         };
-        self.recorder.observe(&envelope);
         if let Some(observe) = &mut self.observer {
             observe(&envelope);
         }
@@ -58,11 +55,10 @@ pub struct SessionEventPump {
 }
 
 impl SessionEventPump {
-    pub fn new(raw: Receiver<Envelope>, journal: Arc<SessionJournal>) -> Arc<Self> {
+    pub fn new(raw: Receiver<Envelope>) -> Arc<Self> {
         Arc::new(Self {
             raw,
             state: Mutex::new(PumpState {
-                recorder: SessionRecorder::new(journal),
                 observer: None,
                 subscribers: Some(Vec::new()),
             }),
@@ -121,8 +117,6 @@ impl SessionSubscription {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use futures_lite::future::poll_once;
 
     use super::{SessionEvent, SessionEventPump};
@@ -131,10 +125,10 @@ mod tests {
     const TEXT: [&str; 2] = ["first", "second"];
 
     #[test]
-    fn records_and_observes_before_ordered_fanout() {
+    fn observes_before_ordered_fanout() {
         smol::block_on(async {
             let (guard, raw) = event_stream();
-            let pump = SessionEventPump::new(raw.into_receiver(), Arc::default());
+            let pump = SessionEventPump::new(raw.into_receiver());
             let (observed, observations) = flume::unbounded();
             pump.set_observer(move |event| {
                 if let AgentEvent::TextDelta { text } = &event.event {
@@ -151,12 +145,11 @@ mod tests {
                     .send(AgentEvent::TextDelta { text: text.into() })
                     .unwrap();
             }
-            for (index, text) in TEXT.into_iter().enumerate() {
+            for text in TEXT {
                 let SessionEvent::Agent(event) = first.try_next().unwrap();
                 assert!(
                     matches!(event.event, AgentEvent::TextDelta { text: actual } if actual == text)
                 );
-                assert_eq!(pump.state.lock().unwrap().recorder.observed, index + 1);
                 assert_eq!(observations.try_recv().unwrap(), text);
             }
             let mut event = waiting.await;

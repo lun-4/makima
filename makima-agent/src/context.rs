@@ -176,11 +176,15 @@ impl ContextBinding {
 impl ContextUpdate {
     pub fn notify(&self, sender: &EventSender) {
         if self.notice {
-            let _ = sender.send(AgentEvent::Post(Post {
+            let post = Post {
                 text: CONTEXT_CHANGED_NOTICE.into(),
                 level: PostLevel::Warn,
                 agent: None,
-            }));
+            };
+            self.access
+                .journal
+                .record_post(self.access.target, post.clone());
+            let _ = sender.send(AgentEvent::Post(post));
         }
     }
 }

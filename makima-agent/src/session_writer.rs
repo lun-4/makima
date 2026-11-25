@@ -1121,7 +1121,7 @@ mod tests {
                 },
                 Record::Post {
                     d: StoredPost {
-                        chat: None,
+                        agent: None,
                         after_message: Some(original),
                         post: Post {
                             text: "post".into(),

@@ -870,18 +870,16 @@ const POST_TEXT: &str = "review found issues";
 /// No run uses it, so a post must get past the stale-run filter.
 const UNRELATED_RUN_ID: u64 = 99;
 
-fn post_msg(subagent: Option<SubagentInfo>) -> (Msg, Post) {
-    let post = Post {
-        text: POST_TEXT.into(),
-        level: PostLevel::Error,
-        agent: None,
-    };
-    let msg = Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::Post(post.clone()),
+fn post_msg(subagent: Option<SubagentInfo>) -> Msg {
+    Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::Post(Post {
+            text: POST_TEXT.into(),
+            level: PostLevel::Error,
+            agent: None,
+        }),
         subagent,
         identity: Some(work_identity(UNRELATED_RUN_ID)),
-    }));
-    (msg, post)
+    }))
 }
 
 fn assert_last_is_post(chat: &Chat) {
@@ -999,15 +997,18 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
         }),
         ..Message::observation(format!("{HEADER}\n{}", delivery.to_json()))
     });
-    app.push_post(
-        None,
-        Post {
-            text: POST_TEXT.into(),
-            level: PostLevel::Info,
-            agent: Some(target.to_string()),
-        },
-        None,
-    );
+    let post = Post {
+        text: POST_TEXT.into(),
+        level: PostLevel::Info,
+        agent: Some(target.to_string()),
+    };
+    app.display_post(None, &post);
+    let journal = SessionJournal::from_session(&app.state.session).unwrap();
+    journal.record_post(root, post);
+    journal
+        .snapshot()
+        .apply_to(app.state.session_mut())
+        .unwrap();
     let before: Vec<_> = (0..app.chats[0].message_count())
         .map(|index| app.chats[0].message_at(index).unwrap().clone())
         .collect();
@@ -1071,23 +1072,11 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
 }
 
 #[test]
-fn main_chat_post_is_recorded_and_restored() {
+fn main_chat_post_ignores_the_stale_run_filter() {
     let mut app = test_app();
-    let (msg, post) = post_msg(None);
-    app.update(msg);
+    app.update(post_msg(None));
     assert_last_is_post(&app.chats[0]);
-    assert_eq!(
-        app.state.session.posts(),
-        [StoredPost {
-            chat: None,
-            after_message: None,
-            post,
-        }]
-    );
-
-    app.reset_ui_chrome();
-    app.restore_display();
-    assert_last_is_post(&app.chats[0]);
+    assert!(app.state.session.posts().is_empty());
 }
 
 #[test_case(false, false, false, false ; "live_link")]
@@ -1115,25 +1104,29 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared
             None,
         ));
     }
-    app.push_post(
-        None,
-        Post {
-            text: POST_TEXT.into(),
-            level: PostLevel::Warn,
-            agent: Some(
-                if missing {
-                    AgentId::generate()
-                } else {
-                    agent_id
-                }
-                .to_string(),
-            ),
-        },
-        None,
-    );
+    let post = Post {
+        text: POST_TEXT.into(),
+        level: PostLevel::Warn,
+        agent: Some(
+            if missing {
+                AgentId::generate()
+            } else {
+                agent_id
+            }
+            .to_string(),
+        ),
+    };
     if restored {
+        let journal = SessionJournal::from_session(&app.state.session).unwrap();
+        journal.record_post(app.state.session.root_agent_id().unwrap(), post);
+        journal
+            .snapshot()
+            .apply_to(app.state.session_mut())
+            .unwrap();
         app.reset_ui_chrome();
         app.restore_display();
+    } else {
+        app.display_post(None, &post);
     }
     render_app(&mut app, 100, 40);
     let area = app.msg_area();
@@ -1174,19 +1167,11 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared
 #[test]
 fn subagent_post_lands_in_the_child_chat() {
     let mut app = test_app();
-    let (msg, post) = post_msg(Some(subagent_info(TASK_ID, "reviewer")));
-    app.update(msg);
+    app.update(post_msg(Some(subagent_info(TASK_ID, "reviewer"))));
     let chat_idx = app.chat_index[TASK_ID];
     assert_ne!(chat_idx, 0);
     assert_last_is_post(&app.chats[chat_idx]);
-    assert_eq!(
-        app.state.session.posts(),
-        [StoredPost {
-            chat: Some(TASK_ID.into()),
-            after_message: None,
-            post,
-        }]
-    );
+    assert!(app.state.session.posts().is_empty());
 }
 
 fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {
@@ -6560,54 +6545,6 @@ fn drain_writer(app: App, writer: SessionWriter) {
     smol::block_on(writer.append(Vec::new())).unwrap();
 }
 
-#[test_case(false; "plain_post")]
-#[test_case(true; "root_linked_post")]
-fn post_mutation_persists_post_only_session(linked: bool) {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    let root = app.state.session.root_agent_id().unwrap();
-    let post = Post {
-        text: POST_TEXT.into(),
-        level: PostLevel::Info,
-        agent: linked.then(|| root.to_string()),
-    };
-    app.push_post(None, post.clone(), None);
-    assert!(app.state.session.messages().is_empty());
-    assert!(session_has_content(&app.state.session));
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let loaded = AppSession::load(id, &dir).unwrap();
-    assert!(loaded.messages().is_empty());
-    assert_eq!(loaded.root_agent_id(), Some(root));
-    assert_eq!(
-        loaded.posts(),
-        [StoredPost {
-            chat: None,
-            after_message: None,
-            post
-        }]
-    );
-    let mut restored = test_app();
-    restored.state.session = Arc::new(loaded);
-    restored.reset_ui_chrome();
-    restored.restore_display();
-    assert_eq!(restored.chats[0].message_at(0).unwrap().text, POST_TEXT);
-    if linked {
-        render_app(&mut restored, 100, 40);
-        let area = restored.msg_area();
-        let row = (area.y..area.bottom())
-            .find(|&row| restored.chats[0].post_agent_at(row, area) == Some(root))
-            .unwrap();
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            restored.update(mouse_event(kind, area.x, row));
-        }
-        assert_eq!(restored.active_chat, 0);
-        assert_eq!(restored.status_bar.flash_text(), None);
-    }
-}
-
 #[test]
 fn restore_resumed_session_keeps_recovered_draft_inactive() {
     const DRAFT: &str = "q1\n\nq2";
@@ -7557,7 +7494,8 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     let child_id = AgentId::generate();
     let index = usize::from(child);
     let chat = child.then_some(TASK_ID.to_owned());
-    let other_chat = (!child).then_some(TASK_ID.to_owned());
+    let agent = child.then_some(child_id);
+    let other_agent = (!child).then_some(child_id);
     let messages = vec![Message::user("kept prompt".into())];
     let mut original = messages.clone();
     original.push(Message::user(REMOVED_POST.into()));
@@ -7571,7 +7509,7 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     app.restore_display();
     let message_ids = app.state.session.chat_message_ids(chat.as_deref());
     let retained = StoredPost {
-        chat: chat.clone(),
+        agent,
         after_message: Some(message_ids[0]),
         post: Post {
             text: POST_TEXT.into(),
@@ -7580,7 +7518,7 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
         },
     };
     let other = StoredPost {
-        chat: other_chat,
+        agent: other_agent,
         after_message: Some(makima_storage::id::MakimaId::generate()),
         post: Post {
             text: OTHER_POST.into(),
@@ -7591,7 +7529,7 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
     let expected_posts = [
         retained.clone(),
         StoredPost {
-            chat: chat.clone(),
+            agent,
             after_message: Some(message_ids[1]),
             post: Post {
                 text: REMOVED_POST.into(),
@@ -7601,7 +7539,7 @@ fn history_replacement_retains_posts_but_hides_inactive_anchors(child: bool) {
         },
         other.clone(),
         StoredPost {
-            chat: chat.clone(),
+            agent,
             after_message: None,
             post: Post {
                 text: UNANCHORED_POST.into(),
@@ -10829,13 +10767,8 @@ const TYPED_DRAFT: &str = "hi";
 const UNSENT_DRAFT: &str = "half typed thought";
 const LIVE_AGENT_TEXT: &str = "live agent turn";
 const STORED_SESSION_TEXT: &str = "other session talk";
-const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
-
-fn tool_text(id: &str) -> String {
-    format!("output of {id}")
-}
 
 fn attach_live_history(app: &mut App, messages: Vec<Message>) -> History {
     let mirror: makima_agent::SharedMessages =
@@ -10959,37 +10892,6 @@ fn idle_checkpoint_changes_nothing() {
 
     assert_eq!(app.state.session.revision(), revision);
     assert_eq!(app.state.session.updated_at, updated_at);
-}
-
-#[test]
-fn tool_output_mutations_both_reach_disk() {
-    let (_tmp, dir, writer, mut app) = tempdir_app();
-    app.state
-        .session_mut()
-        .push_message(Message::user("prompt".into()));
-    app.status = Status::Streaming;
-    app.run_id = 1;
-
-    for tool_id in TOOL_IDS {
-        app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
-            id: tool_id.into(),
-            tool: "bash".into(),
-            output: ToolOutput::Plain(tool_text(tool_id).into()),
-            is_error: false,
-            annotation: None,
-            written_path: None,
-        }))));
-    }
-
-    let id = app.state.session.id;
-    drain_writer(app, writer);
-    let loaded = AppSession::load(id, &dir).unwrap();
-    for tool_id in TOOL_IDS {
-        match loaded.tool_outputs().get(tool_id).map(Arc::as_ref) {
-            Some(ToolOutput::Plain(out)) => assert_eq!(out.text, tool_text(tool_id)),
-            other => panic!("missing plain output for {tool_id}: {other:?}"),
-        }
-    }
 }
 
 #[test]
@@ -12907,7 +12809,7 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
     assert!(app.chats[chat_idx].is_finished());
     assert_eq!(app.chats[chat_idx].last_message_text(), DONE_TEXT);
 
-    app.update(post_msg(Some(info)).0);
+    app.update(post_msg(Some(info)));
     assert_last_is_post(&app.chats[chat_idx]);
     assert!(app.chats[chat_idx].is_finished());
 }
@@ -14229,14 +14131,6 @@ fn a_moved_call_appears_in_tasks_until_it_finishes() {
         .find(|entry| matches!(&entry.identity, TaskIdentity::Background(id) if id == "call_moved"))
         .expect("a finished call stays listed");
     assert_eq!(entry.finished, Some(true));
-    assert_eq!(
-        app.state
-            .session
-            .tool_outputs()
-            .get("call_moved")
-            .map(|o| o.as_text()),
-        Some("done".into())
-    );
 }
 
 #[test]
@@ -14260,14 +14154,6 @@ fn a_lost_background_call_reads_as_failed() {
         .expect("a lost call stays listed");
     assert_eq!(entry.finished, Some(true));
     assert_eq!(entry.context, "failed");
-    let output = app
-        .state
-        .session
-        .tool_outputs()
-        .get("call_lost")
-        .map(|o| o.as_text())
-        .expect("the row keeps a lost notice");
-    assert!(output.contains("lost"), "{output}");
 }
 
 #[test]

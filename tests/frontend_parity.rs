@@ -34,10 +34,12 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use makima_agent::permissions::PERMISSION_DENIED_PREFIX;
 use makima_agent::{AgentMode, ModeDef, ModeId, ToolOutput};
 use makima_lua::ui_sink::NO_UI_ERR;
 use makima_providers::{Message, TokenUsage};
 use makima_storage::StateDir;
+use makima_storage::id::MakimaId;
 use makima_storage::plans::{
     ApprovedPlan, PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot,
 };
@@ -61,6 +63,8 @@ const BAD_THINKING_COMMAND: &str = "/thinking bogus";
 const PARITY_THINKING_COMMAND: &str = "/parity_thinking";
 const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
+const ASK_POST: &str = "Permission flow completed.";
+const ASK_TOOL_USE: &str = "call_1";
 const ASK_PROMPT: &str = "run the asking tool";
 const CHILD_ASK_COMMAND: &str = "/parity_child_ask";
 const BACKGROUND_COMMAND: &str = "/parity_background";
@@ -531,7 +535,14 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
             );
             let result = expect(&output, |message| message["type"] == "result");
             assert_eq!(result["is_error"], false, "{result}");
-            sdk_output = Some(output);
+            sdk_output = Some((
+                output,
+                result["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<MakimaId>()
+                    .unwrap(),
+            ));
         }
         Frontend::Acp => {
             let (output, session) = acp_session(&mut child, &mut stdin, &work);
@@ -558,8 +569,22 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     let status = wait_exit(child);
     let log = stderr.join().unwrap();
     assert!(status.success(), "{log}");
-    if let Some(output) = sdk_output {
+    if let Some((output, id)) = sdk_output {
         assert_one_result_per_message(&output);
+        let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+        let session = Session::<Message, TokenUsage, ToolOutput>::load(id, &storage).unwrap();
+        let post = &session.posts()[0];
+        assert_eq!(post.post.text, ASK_POST);
+        assert_eq!(post.agent, None);
+        assert_eq!(
+            post.after_message,
+            session.chat_message_ids(None).last().copied()
+        );
+        assert!(
+            session.tool_outputs()[ASK_TOOL_USE]
+                .as_text()
+                .starts_with(PERMISSION_DENIED_PREFIX)
+        );
     }
     let bodies: Vec<_> = bodies.try_iter().collect();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
@@ -1068,7 +1093,10 @@ makima.api.register_command({{
 }})
 makima.api.register_command({{
   name = "{ASK_COMMAND}", tui_only = false,
-  handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
+  handler = function(_, ctx)
+    prompt(ctx, "{ASK_PROMPT}")
+    assert(makima.ui.post(ctx, "{ASK_POST}"))
+  end,
 }})
 makima.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,

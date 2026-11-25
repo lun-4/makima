@@ -381,24 +381,12 @@ pub fn write_prefs(state_dir: &StateDir, prefs: &Prefs) -> Result<(), StorageErr
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPost {
-    /// Transcript id of the chat holding the post; `None` is the main chat.
+    /// Destination agent. `None` addresses the root chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chat: Option<String>,
-    #[serde(default, deserialize_with = "post_message_id")]
+    pub agent: Option<AgentId>,
+    #[serde(default)]
     pub after_message: Option<MakimaId>,
-    #[serde(flatten)]
     pub post: Post,
-}
-
-fn post_message_id<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<MakimaId>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::String(id) => id.parse().map(Some).map_err(serde::de::Error::custom),
-        serde_json::Value::Null | serde_json::Value::Number(_) => Ok(None),
-        _ => Err(serde::de::Error::custom("invalid post message id")),
-    }
 }
 
 pub trait TitleSource {
@@ -1056,6 +1044,21 @@ struct LegacyChildMessage<M> {
     message: M,
 }
 
+#[derive(Deserialize)]
+struct LegacyPost {
+    chat: Option<String>,
+    after_message: Option<LegacyPostAnchor>,
+    #[serde(flatten)]
+    post: Post,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LegacyPostAnchor {
+    Id(MakimaId),
+    Position(usize),
+}
+
 fn load_jsonl<M, U, T>(data: &[u8], display_path: &str) -> Result<Session<M, U, T>, SessionError>
 where
     M: DeserializeOwned,
@@ -1083,6 +1086,7 @@ where
     let mut token_usage = U::default();
     let mut updated_at = 0u64;
     let mut posts = Vec::new();
+    let mut legacy_posts = Vec::new();
     let mut usage_by_model = HashMap::new();
     let mut meta = SessionMeta::default();
     let mut legacy_config = None;
@@ -1118,13 +1122,17 @@ where
         let record: SessionRecord<M, U, T> = match serde_json::from_slice::<serde_json::Value>(line)
             .and_then(|value| {
                 sequence_high_water = sequence_high_water.max(value["seq"].as_u64());
-                let value = decode_log_record(value);
+                let mut value = decode_log_record(value);
                 if version == LEGACY_LOG_FORMAT_VERSION {
                     match value["t"].as_str() {
                         Some("sub_msg") => {
                             let message =
                                 serde_json::from_value::<LegacyChildMessage<M>>(value.clone())?;
                             legacy_child_messages.push((message, value["d"].clone()));
+                            return Ok(None);
+                        }
+                        Some("post") => {
+                            legacy_posts.push(serde_json::from_value(value["d"].take())?);
                             return Ok(None);
                         }
                         Some("meta") => legacy_children = serde_json::from_value(value.clone())?,
@@ -1414,7 +1422,7 @@ where
     };
     if version == LEGACY_LOG_FORMAT_VERSION {
         session.legacy_config = Some(LegacyConfig::from_meta(&session.meta));
-        session.migrate_legacy_children(legacy_children, legacy_child_messages);
+        session.migrate_legacy_children(legacy_children, legacy_child_messages, legacy_posts);
         session.ensure_child_histories();
     }
     session.migrate_legacy_plan(legacy_plan)?;
@@ -1439,20 +1447,6 @@ where
                 event["agent"] = serde_json::json!(root);
                 root_index += 1;
             }
-        }
-    }
-    let legacy_post_positions: Vec<_> = complete_prefix(data)
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .filter(|record| record["t"] == "post")
-        .map(|record| record["d"]["after_message"].as_u64())
-        .collect();
-    for (index, position) in legacy_post_positions.into_iter().enumerate() {
-        if let Some(position) = position.and_then(|position| usize::try_from(position).ok()) {
-            let ids = session.chat_message_ids(session.posts[index].chat.as_deref());
-            session.posts[index].after_message = position
-                .checked_sub(1)
-                .and_then(|index| ids.get(index).copied());
         }
     }
     session.restore_loaded_history_epochs(&history_epochs);
@@ -1926,6 +1920,7 @@ impl<M, U, T> Session<M, U, T> {
             subagent_conversations,
         }: LegacyChildren,
         messages: Vec<(LegacyChildMessage<M>, serde_json::Value)>,
+        posts: Vec<LegacyPost>,
     ) {
         let root = self.seed_root_and_rules();
         let mut seq = self.next_state_seq();
@@ -2040,14 +2035,44 @@ impl<M, U, T> Session<M, U, T> {
                 }));
             }
         }
-        for stored in &mut self.posts {
-            stored.post.agent = stored
-                .post
+        for LegacyPost {
+            chat,
+            after_message,
+            mut post,
+        } in posts
+        {
+            let agent = match chat.as_deref() {
+                None => None,
+                Some(key) => {
+                    let Some(&agent) = agents.get(key) else {
+                        continue;
+                    };
+                    Some(agent)
+                }
+            };
+            let after_message = match after_message {
+                Some(LegacyPostAnchor::Id(id)) => Some(id),
+                Some(LegacyPostAnchor::Position(position)) => {
+                    position.checked_sub(1).and_then(|index| match agent {
+                        None => self.message_id(index),
+                        Some(agent) => context_message_ids(&self.context_events, agent)
+                            .get(index)
+                            .copied(),
+                    })
+                }
+                None => None,
+            };
+            post.agent = post
                 .agent
                 .as_deref()
                 .filter(|key| !unavailable.contains(*key))
                 .and_then(|key| agents.get(key))
                 .map(ToString::to_string);
+            self.posts.push(StoredPost {
+                agent,
+                after_message,
+                post,
+            });
         }
     }
 
@@ -2180,10 +2205,16 @@ where
     }
 
     fn rebind_message_agent(&mut self, id: AgentId) {
-        let previous = serde_json::json!(self.message_agent());
+        let previous = self.message_agent();
+        let previous_value = serde_json::json!(previous);
         for event in &mut self.context_events {
-            if event["agent"] == previous {
+            if event["agent"] == previous_value {
                 event["agent"] = serde_json::json!(id);
+            }
+        }
+        for stored in &mut self.posts {
+            if stored.agent == Some(previous) {
+                stored.agent = Some(id);
             }
         }
     }
@@ -2630,6 +2661,11 @@ where
         }
     }
 
+    /// Applies the journal's tool outputs to the in-memory projection.
+    pub fn replace_tool_outputs(&mut self, outputs: HashMap<String, Arc<T>>) {
+        self.tool_outputs = outputs;
+    }
+
     pub fn subagent_history_snapshot(&self, id: &str) -> Option<HistorySnapshot<M>> {
         self.subagent_messages.get(id).map(|messages| {
             let agent = self.child_agent(id);
@@ -2806,7 +2842,10 @@ where
         self.touch();
     }
 
-    pub fn prune_posts(&mut self, _chat: Option<&str>, _new_len: usize) {}
+    /// Applies the journal's posts to the in-memory projection.
+    pub fn replace_posts(&mut self, posts: Vec<StoredPost>) {
+        self.posts = posts;
+    }
 
     pub fn usage_by_model(&self) -> &HashMap<String, StoredTokenUsage> {
         &self.usage_by_model
@@ -2866,25 +2905,32 @@ where
         tool_ids: impl Fn(&M) -> Vec<String>,
         live_ids: &[String],
     ) {
-        self.prune_posts(None, self.messages.len());
         let previous_counts = (
             self.subagent_messages.len(),
             self.subagent_history_epochs.len(),
             self.posts.len(),
             self.tool_outputs.len(),
         );
+        let root = self.message_agent();
         let mut post_agents: HashMap<Option<&str>, Vec<&str>> = HashMap::new();
         for stored in &self.posts {
-            if let Some(agent) = stored.post.agent.as_deref() {
-                let transcript_key = agent
+            let chat = match stored.agent {
+                None => None,
+                Some(agent) if agent == root => None,
+                Some(agent) => {
+                    let Some(record) = self.agents.get(&agent) else {
+                        continue;
+                    };
+                    Some(record.transcript_key.as_str())
+                }
+            };
+            if let Some(subject) = stored.post.agent.as_deref() {
+                let transcript_key = subject
                     .parse::<AgentId>()
                     .ok()
                     .and_then(|id| self.agents.get(&id))
-                    .map_or(agent, |record| record.transcript_key.as_str());
-                post_agents
-                    .entry(stored.chat.as_deref())
-                    .or_default()
-                    .push(transcript_key);
+                    .map_or(subject, |record| record.transcript_key.as_str());
+                post_agents.entry(chat).or_default().push(transcript_key);
             }
         }
         let mut pending: Vec<String> = self
@@ -2915,10 +2961,12 @@ where
         self.subagent_messages
             .retain(|id, _| reachable.contains(id));
         self.posts.retain(|stored| {
-            stored
-                .chat
-                .as_ref()
-                .is_none_or(|chat| reachable.contains(chat))
+            let agent = stored.agent.unwrap_or(root);
+            agent == root
+                || self
+                    .agents
+                    .get(&agent)
+                    .is_some_and(|record| reachable.contains(&record.transcript_key))
         });
         self.tool_outputs.retain(|id, _| reachable.contains(id));
         if previous_counts
@@ -3084,8 +3132,8 @@ mod tests {
     use super::ThinkingParseError;
     use super::{
         ARCHIVE_DIR, CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSIONS_DIR, TAIL_BUF,
-        generate_title, jsonl_path, load_cwd_index, offload_dir, root_record, update_cwd_index,
-        write_full_session,
+        generate_title, jsonl_path, load_cwd_index, migrate_v2_before_append, offload_dir,
+        root_record, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionMeta, SessionRecord,
@@ -3111,6 +3159,7 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt, symlink_dir};
     use std::path::{Path, PathBuf};
+    use std::slice;
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -3156,6 +3205,11 @@ mod tests {
         let first_id = session.last_message_id().unwrap();
         session.push_message(second.clone());
         let second_id = session.last_message_id().unwrap();
+        let post = StoredPost {
+            after_message: Some(second_id),
+            ..stored_post(Some(session.message_agent()), None)
+        };
+        session.push_post(post.clone());
         if compact {
             session.replace_messages(vec![user_message("summary")]);
             session.meta.compacted = true;
@@ -3180,12 +3234,16 @@ mod tests {
             loaded.chat_message_ids(None),
             session.chat_message_ids(None)
         );
+        assert!(!loaded.chat_message_ids(None).contains(&second_id));
+        assert_eq!(loaded.posts(), slice::from_ref(&post));
         loaded.fork(Some(second_id), REDO_NOTE.into()).unwrap();
         assert_eq!(&loaded.messages()[..2], &[first, second]);
+        assert!(loaded.chat_message_ids(None).contains(&second_id));
         assert_eq!(loaded.messages()[2]["content"][0]["text"], REDO_NOTE);
         loaded.save_to(directory.path()).unwrap();
         let reloaded = TestSession::load_from(session.id, directory.path()).unwrap();
         assert_eq!(reloaded.messages(), loaded.messages());
+        assert_eq!(reloaded.posts(), [post]);
         assert_eq!(
             reloaded.chat_message_ids(None),
             loaded.chat_message_ids(None)
@@ -3604,7 +3662,7 @@ mod tests {
         ));
         current.insert_tool_output(POST_AGENT.into(), Value::Bool(true));
         current.set_subagent_messages(POST_AGENT.into(), vec![user_message(PENDING_DRAFT)]);
-        current.push_post(stored_post(None, 0, None));
+        current.push_post(stored_post(None, None));
         let high_water = current.sequence_high_water();
         let revision = current.revision();
         current.replace_authoritative(replacement).unwrap();
@@ -4090,7 +4148,9 @@ mod tests {
             _ => vec![child],
         };
         let meta = serde_json::json!({"t":"meta", "title":"legacy", "token_usage":null, "updated_at":2, "subagents":children});
-        let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":0, "text":POST_TEXT, "agent":KEY}});
+        let root_message = serde_json::json!({"t":"msg", "d":user_message(POST_TEXT)});
+        let post = serde_json::json!({"t":"post", "d":{"chat":null, "after_message":1, "text":POST_TEXT, "agent":KEY}});
+        let child_post = serde_json::json!({"t":"post", "d":{"chat":KEY, "after_message":1, "text":POST_TEXT, "agent":KEY}});
         let history = if case == "missing" {
             String::new()
         } else {
@@ -4098,11 +4158,14 @@ mod tests {
         };
         fs::write(
             jsonl_path(tmp.path(), id),
-            format!("{header}\n{meta}\n{post}\n{history}\n"),
+            format!("{header}\n{root_message}\n{meta}\n{post}\n{child_post}\n{history}\n"),
         )
         .unwrap();
-        let mut loaded = TestSession::load_from(id, tmp.path()).unwrap();
+        let loaded = TestSession::load_from(id, tmp.path()).unwrap();
         let target = loaded.posts()[0].post.agent.clone();
+        assert_eq!(loaded.posts()[0].agent, None);
+        assert_eq!(loaded.posts()[0].after_message, loaded.message_id(0));
+        assert!(loaded.posts()[0].after_message.is_some());
         assert_eq!(target.is_some(), available);
         if let Some(target) = &target {
             let target = target.parse::<AgentId>().unwrap();
@@ -4112,10 +4175,36 @@ mod tests {
                 StoredAgentLifecycle::Closed
             );
         }
-        loaded.save_to(tmp.path()).unwrap();
+        if case == "missing" {
+            assert_eq!(loaded.posts().len(), 1);
+        } else {
+            let child = &loaded.posts()[1];
+            assert_eq!(child.agent, loaded.child_agent(KEY));
+            assert!(child.agent.is_some());
+            assert_eq!(
+                child.after_message,
+                loaded.chat_message_ids(Some(KEY)).first().copied()
+            );
+            assert!(child.after_message.is_some());
+            assert_eq!(child.post.agent, target);
+        }
+        migrate_v2_before_append(tmp.path(), &loaded).unwrap();
         let rewritten = TestSession::load_from(id, tmp.path()).unwrap();
-        assert_eq!(rewritten.posts()[0].post.agent, target);
-        assert_eq!(rewritten.posts()[0].post.text, POST_TEXT);
+        assert_eq!(rewritten.posts(), loaded.posts());
+    }
+
+    #[test_case(serde_json::json!({"chat": null, "text": POST_TEXT}); "flattened_post")]
+    #[test_case(serde_json::json!({"after_message": 1, "post": {"text": POST_TEXT}}); "positional_anchor")]
+    fn v3_rejects_legacy_post_shapes(post: Value) {
+        let tmp = TempDir::new().unwrap();
+        let id: MakimaId = FIXTURE_ID.parse().unwrap();
+        let header = serde_json::json!({"t":"header", "v":3, "id":id, "model":"m", "cwd":"/tmp", "created_at":1});
+        let post = serde_json::json!({"t":"post", "d":post});
+        fs::write(jsonl_path(tmp.path(), id), format!("{header}\n{post}\n")).unwrap();
+        assert!(matches!(
+            TestSession::load_from(id, tmp.path()),
+            Err(SessionError::UnreadableRecord { line: 2, .. })
+        ));
     }
 
     #[test]
@@ -4582,14 +4671,14 @@ mod tests {
         assert_eq!(loaded.subagent_messages["sub-2"].len(), 1);
     }
 
-    fn stored_post(chat: Option<&str>, _after_message: usize, agent: Option<&str>) -> StoredPost {
+    fn stored_post(agent: Option<AgentId>, subject: Option<AgentId>) -> StoredPost {
         StoredPost {
-            chat: chat.map(str::to_owned),
+            agent,
             after_message: None,
             post: Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Warn,
-                agent: agent.map(str::to_owned),
+                agent: subject.map(|id| id.to_string()),
             },
         }
     }
@@ -4616,11 +4705,11 @@ mod tests {
             session.push_agent_revision(record.created_seq, record);
             session.set_subagent_messages(key.into(), vec![user_message(key)]);
         }
-        let kept = stored_post(None, 0, Some(&ids[0].to_string()));
-        let nested = stored_post(Some(CHILD_KEY), 0, Some(&ids[1].to_string()));
+        let kept = stored_post(Some(root), Some(ids[0]));
+        let nested = stored_post(Some(ids[0]), Some(ids[1]));
         session.push_post(kept.clone());
         session.push_post(nested.clone());
-        session.push_post(stored_post(Some(ORPHAN_KEY), 0, Some(&ids[2].to_string())));
+        session.push_post(stored_post(Some(ids[2]), Some(ids[2])));
         let tmp = TempDir::new().unwrap();
         if reload {
             session.save_to(tmp.path()).unwrap();
@@ -4661,12 +4750,13 @@ mod tests {
             session.set_subagent_messages(id.into(), references);
             session.insert_tool_output(id.into(), Value::Null);
         }
-        session.push_post(stored_post(
-            Some(MESSAGE_DESCENDANT),
-            0,
-            Some(POST_DESCENDANT),
-        ));
-        session.push_post(stored_post(Some(ORPHAN_CHILD), 0, Some(ORPHAN_CHILD)));
+        let kept = stored_post(
+            session.child_agent(MESSAGE_DESCENDANT),
+            session.child_agent(POST_DESCENDANT),
+        );
+        let orphan = session.child_agent(ORPHAN_CHILD);
+        session.push_post(kept.clone());
+        session.push_post(stored_post(orphan, orphan));
         session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
         for id in [POST_AGENT, MESSAGE_DESCENDANT, POST_DESCENDANT, LIVE_CHILD] {
             assert!(session.subagent_messages().contains_key(id));
@@ -4674,14 +4764,7 @@ mod tests {
         }
         assert!(!session.subagent_messages().contains_key(ORPHAN_CHILD));
         assert!(!session.tool_outputs().contains_key(ORPHAN_CHILD));
-        assert_eq!(
-            session.posts(),
-            [stored_post(
-                Some(MESSAGE_DESCENDANT),
-                0,
-                Some(POST_DESCENDANT)
-            )]
-        );
+        assert_eq!(session.posts(), [kept]);
         let revision = session.revision();
         session.prune_orphans_preserving(ids, &[LIVE_CHILD.into()]);
         assert_eq!(session.revision(), revision);

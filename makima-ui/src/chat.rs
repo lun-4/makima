@@ -1353,7 +1353,7 @@ mod tests {
         ];
         let message_ids = vec![MakimaId::generate(), MakimaId::generate()];
         let post = StoredPost {
-            chat: None,
+            agent: None,
             after_message: after_message.checked_sub(1).map(|index| {
                 message_ids
                     .get(index)
@@ -1404,7 +1404,7 @@ mod tests {
             ..Message::observation(format!("{DELIVERY_HEADER}\n{envelope}"))
         };
         let post = StoredPost {
-            chat: None,
+            agent: None,
             after_message: Some(MakimaId::generate()),
             post: Post {
                 text: REPLY_TEXT.into(),

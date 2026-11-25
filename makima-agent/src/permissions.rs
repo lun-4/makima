@@ -1084,11 +1084,21 @@ impl PermissionManager {
             Err(PermissionDecisionError::Journal(_)) => return Err(deny(None)),
             Err(error @ PermissionDecisionError::Config { .. }) => {
                 warn!(%error);
-                event_tx.try_send(AgentEvent::Post(Post {
+                let post = Post {
                     text: error.to_string(),
                     level: PostLevel::Warn,
                     agent: None,
-                }));
+                };
+                if let Some(binding) = &prompt_binding
+                    && let Some(agent) = binding
+                        .incarnation
+                        .as_ref()
+                        .map(|binding| binding.agent)
+                        .or_else(|| event_tx.identity().map(|identity| identity.agent_id))
+                {
+                    binding.journal.record_post(agent, post.clone());
+                }
+                event_tx.try_send(AgentEvent::Post(post));
             }
         }
         if answer.is_allow() {

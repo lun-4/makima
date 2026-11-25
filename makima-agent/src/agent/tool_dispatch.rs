@@ -1277,7 +1277,11 @@ async fn execute_tool_calls(
         recent_calls.record(name, &input);
     }
 
+    let journal = history.journal().cloned();
     for err in &immediate_errors {
+        if let Some(journal) = &journal {
+            journal.record_tool_output(&err.id, &err.output);
+        }
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
@@ -1319,6 +1323,7 @@ async fn execute_tool_calls(
         let mailbox_clone = mailbox.clone();
         let task_scope = Arc::clone(&scope);
         let cancel_reason = cancel_reason.cloned();
+        let journal = journal.clone();
         let task = smol::spawn(async move {
             let _guard = guard;
             let run_id = task_scope.id().to_owned();
@@ -1339,6 +1344,9 @@ async fn execute_tool_calls(
                     )
                 }
             };
+            if let Some(journal) = journal {
+                journal.record_tool_output(&done.id, &done.output);
+            }
             if task_scope.claim_foreground() {
                 if let Some(mailbox) = &mailbox_clone {
                     mailbox.finish_call(task_scope.id());
@@ -1532,6 +1540,7 @@ fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::read_to_string;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1542,7 +1551,7 @@ mod tests {
         DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
     };
     use makima_storage::checkpoint::{CheckpointWriter, accept_all};
-    use makima_storage::id::MakimaId;
+    use makima_storage::id::{AgentId, MakimaId};
     use test_case::test_case;
 
     use super::*;
@@ -1550,6 +1559,7 @@ mod tests {
     use crate::agent::history::History;
     use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
+    use crate::journal::SessionJournal;
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
     use crate::permissions::{
@@ -1559,6 +1569,7 @@ mod tests {
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
+    use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::template::Vars;
     use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
@@ -5233,7 +5244,14 @@ mod tests {
             let (started_tx, started_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
-            let mut history = History::new(Vec::new());
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("test", "/test");
+            let root = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+            journal.bind_writer(writer).unwrap();
+            let mut history = History::new(Vec::new()).with_journal(root, Arc::clone(&journal));
             let mover = {
                 let mailbox = mailbox.clone();
                 smol::spawn(async move {
@@ -5276,16 +5294,29 @@ mod tests {
             assert_eq!(mailbox.outstanding(), 0);
 
             let mut moved = false;
-            let mut done = false;
-            while let Ok(envelope) = events.try_recv() {
+            let output = loop {
+                let envelope = events.recv_async().await.unwrap();
                 match envelope.event {
                     AgentEvent::ToolMoved { id, .. } if id == SLOW_ID => moved = true,
-                    AgentEvent::BackgroundDone(event) if event.id == SLOW_ID => done = true,
+                    AgentEvent::BackgroundDone(event) if event.id == SLOW_ID => break event.output,
                     _ => {}
                 }
-            }
-            assert!(moved, "the UI must hear about the move");
-            assert!(done, "the UI must get the final result");
+            };
+            assert!(moved);
+            journal.flush().await.unwrap();
+            let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
+            let saved: Vec<_> = log
+                .lines()
+                .filter_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
+                    Record::Out { id, d } if id == SLOW_ID => Some(d),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&saved[0]).unwrap(),
+                serde_json::to_value(&output).unwrap()
+            );
         });
     }
 

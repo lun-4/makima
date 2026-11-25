@@ -100,12 +100,10 @@ use makima_storage::StateDir;
 use makima_storage::input_history::InputHistory;
 use makima_storage::model::persist_model;
 use makima_storage::session_state::StoredAgentLifecycle;
-use makima_storage::sessions::StoredPost;
 
 use crate::theme::ThemesProvider;
 use makima_agent::session_writer::SessionWriter;
 use makima_storage::session_lock::SessionPublicationGuard;
-use makima_storage::sessions::SessionRecord;
 use ratatui::layout::Position;
 
 const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
@@ -1756,13 +1754,6 @@ impl App {
     }
 
     fn settle_background_call(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        self.append_ui_record(SessionRecord::Out {
-            id: done.id.clone(),
-            d: done.output.clone(),
-        });
-        self.state
-            .session_mut()
-            .insert_tool_output(done.id.clone(), done.output.clone());
         self.chats[chat_idx].handle_event(AgentEvent::BackgroundDone(Box::new(done.clone())), None);
         if self.background_calls.iter().all(|call| call.id != done.id) {
             self.track_background_call(chat_idx, &done.id, &done.tool, "");
@@ -2893,7 +2884,7 @@ impl App {
         }
         // Posts belong to no run, so the stale-run filter below must not see them.
         if let AgentEvent::Post(post) = envelope.event {
-            self.push_post(envelope.subagent.as_ref(), post, None);
+            self.display_post(envelope.subagent.as_ref(), &post);
             return vec![];
         }
         // A moved call reports after the turn that took its receipt is gone,
@@ -3094,13 +3085,6 @@ impl App {
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
-            self.append_ui_record(SessionRecord::Out {
-                id: e.id.clone(),
-                d: e.output.clone(),
-            });
-            self.state
-                .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone());
             let sub_idx = subagent_agent_id
                 .is_none()
                 .then(|| self.chat_index.get(&e.id).copied())
@@ -3298,33 +3282,14 @@ impl App {
         !defer
     }
 
-    pub(crate) fn push_post(
-        &mut self,
-        subagent: Option<&SubagentInfo>,
-        post: Post,
-        committed_message: Option<Option<makima_storage::id::MakimaId>>,
-    ) {
-        let (chat_idx, chat) = match subagent {
-            Some(subagent) => (
-                self.agent_chat_index
-                    .get(&subagent.agent_id)
-                    .copied()
-                    .unwrap_or_else(|| self.resolve_or_create_chat(subagent)),
-                Some(subagent.parent_tool_use_id.clone()),
-            ),
-            None => (0, None),
-        };
-        self.chats[chat_idx].push_post(&post);
-        let session = &self.state.session;
-        let after_message = committed_message
-            .unwrap_or_else(|| session.chat_message_ids(chat.as_deref()).last().copied());
-        let stored = StoredPost {
-            chat,
-            after_message,
-            post,
-        };
-        self.append_ui_record(SessionRecord::Post { d: stored.clone() });
-        self.state.session_mut().push_post(stored);
+    fn display_post(&mut self, subagent: Option<&SubagentInfo>, post: &Post) {
+        let chat_idx = subagent.map_or(0, |subagent| {
+            self.agent_chat_index
+                .get(&subagent.agent_id)
+                .copied()
+                .unwrap_or_else(|| self.resolve_or_create_chat(subagent))
+        });
+        self.chats[chat_idx].push_post(post);
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {

@@ -2797,7 +2797,7 @@ mod tests {
     }
 
     fn test_event_source(raw: Receiver<Envelope>) -> Arc<SessionEventPump> {
-        SessionEventPump::new(raw, Arc::default())
+        SessionEventPump::new(raw)
     }
 
     fn test_observer() -> HeadlessObserver {

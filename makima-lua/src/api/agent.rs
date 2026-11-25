@@ -1983,9 +1983,16 @@ async fn build_session(
 /// Puts {post} in the chat of {target}. A Lua child shares its parent's event
 /// stream, so its posts carry its identity to land in its own chat.
 pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Result<(), String> {
-    let event = AgentEvent::Post(post);
-    let Some(state) = handles::session_state(lua, target.target.id()) else {
-        let record = target.target.manager().journal().agent(target.target.id());
+    let agent = target.target.id();
+    let journal = target.target.manager().journal();
+    let (sender, subagent) = if let Some(state) = handles::session_state(lua, agent) {
+        if state.silent {
+            return Err(POST_TARGET_SILENT.into());
+        }
+        let subagent = state.subagent_info.get().ok_or(POST_TARGET_NOT_STARTED)?;
+        (state.parent_event_tx.clone(), Some(subagent.clone()))
+    } else {
+        let record = journal.agent(agent);
         if record
             .as_ref()
             .is_some_and(|record| record.spec.as_ref().is_some_and(|spec| spec.silent))
@@ -2005,26 +2012,14 @@ pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Resul
                 answer_tx: None,
                 cancel: None,
             });
-        return target
-            .template
-            .event_tx
-            .send_envelope(Envelope {
-                event,
-                subagent,
-                identity: target.template.event_tx.identity(),
-            })
-            .map_err(|error| error.to_string());
+        (target.template.event_tx.clone(), subagent)
     };
-    if state.silent {
-        return Err(POST_TARGET_SILENT.into());
-    }
-    let subagent = state.subagent_info.get().ok_or(POST_TARGET_NOT_STARTED)?;
-    state
-        .parent_event_tx
+    journal.record_post(agent, post.clone());
+    sender
         .send_envelope(Envelope {
-            event,
-            subagent: Some(subagent.clone()),
-            identity: state.parent_event_tx.identity(),
+            event: AgentEvent::Post(post),
+            subagent,
+            identity: sender.identity(),
         })
         .map_err(|error| error.to_string())
 }

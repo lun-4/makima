@@ -243,15 +243,12 @@ impl App {
         let Some(&index) = self.agent_chat_index.get(&id) else {
             return;
         };
-        let Some(key) = self.chats[index].subagent_id.clone() else {
-            return;
-        };
         let notes = self.fork_notes(Some(id));
         let (display, items) = history_to_display_with_notes(
             &history.messages,
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(self.state.session.posts(), Some(&key)),
+            &posts_for(self.state.session.posts(), Some(id)),
             Some(agent),
             (&history.ids, &notes),
         );
@@ -268,7 +265,7 @@ impl App {
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(self.state.session.posts(), None),
+            &posts_for(self.state.session.posts(), None),
             self.root_agent.clone(),
             (&self.state.session.chat_message_ids(None), &notes),
         );
@@ -382,7 +379,7 @@ impl App {
             self.state.session.messages(),
             self.state.session.tool_outputs(),
             &self.ui_config.tool_output_lines,
-            &posts_in(posts, None),
+            &posts_for(posts, None),
             self.chats[0].agent_id.and_then(|id| {
                 self.root_agent
                     .as_ref()
@@ -397,23 +394,27 @@ impl App {
             let Some(key) = self.chats[index].subagent_id.as_deref() else {
                 continue;
             };
-            if let Some(messages) = self.state.session.subagent_messages().get(key) {
-                let notes = self.fork_notes(self.chats[index].agent_id);
-                let (display, items) = history_to_display_with_notes(
-                    messages,
-                    self.state.session.tool_outputs(),
-                    &self.ui_config.tool_output_lines,
-                    &posts_in(posts, Some(key)),
-                    self.chats[index].agent_id.and_then(|id| {
-                        self.root_agent
-                            .as_ref()
-                            .map(|root| root.manager().reference(id))
-                    }),
-                    (&self.state.session.chat_message_ids(Some(key)), &notes),
-                );
-                self.chats[index].load_messages(display);
-                self.fire_restore_items(items);
-            }
+            let messages = self
+                .state
+                .session
+                .subagent_messages()
+                .get(key)
+                .map_or(&[][..], |messages| messages.as_slice());
+            let notes = self.fork_notes(self.chats[index].agent_id);
+            let (display, items) = history_to_display_with_notes(
+                messages,
+                self.state.session.tool_outputs(),
+                &self.ui_config.tool_output_lines,
+                &posts_for(posts, self.chats[index].agent_id),
+                self.chats[index].agent_id.and_then(|id| {
+                    self.root_agent
+                        .as_ref()
+                        .map(|root| root.manager().reference(id))
+                }),
+                (&self.state.session.chat_message_ids(Some(key)), &notes),
+            );
+            self.chats[index].load_messages(display);
+            self.fire_restore_items(items);
             let status = self.chats[index]
                 .agent_id
                 .and_then(|id| self.state.session.agents().get(&id))
@@ -507,14 +508,27 @@ impl App {
             .root_agent
             .as_ref()
             .map(|root| root.manager().reference(change.agent_id));
-        let posts = self.state.session.posts();
+        let snapshot = target
+            .as_ref()
+            .map(|agent| agent.manager().journal().snapshot());
+        let session = &self.state.session;
+        let (outputs, posts) = snapshot.as_ref().map_or_else(
+            || (session.tool_outputs(), session.posts()),
+            |snapshot| (snapshot.tool_outputs.as_ref(), snapshot.posts.as_slice()),
+        );
+        let stored_ids = session.chat_message_ids(chat);
+        let ids = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.histories.get(&change.agent_id))
+            .filter(|history| history.epoch == change.epoch)
+            .map_or(stored_ids.as_slice(), |history| history.ids.as_slice());
         let (display, items) = history_to_display_with_target(
             &change.messages,
-            self.state.session.tool_outputs(),
+            outputs,
             &self.ui_config.tool_output_lines,
-            &posts_in(posts, chat),
+            &posts_for(posts, (index != 0).then_some(change.agent_id)),
             target,
-            &self.state.session.chat_message_ids(chat),
+            ids,
         );
         self.chats[index].load_messages(display);
         self.chats[index].context_size = context_size;
@@ -568,28 +582,34 @@ impl App {
     }
 }
 
-fn posts_in<'a>(posts: &'a [StoredPost], chat: Option<&str>) -> Vec<&'a StoredPost> {
+fn posts_for(posts: &[StoredPost], agent: Option<AgentId>) -> Vec<&StoredPost> {
     posts
         .iter()
-        .filter(|stored| stored.chat.as_deref() == chat)
+        .filter(|stored| stored.agent == agent)
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use makima_agent::actor::{ConfigChange, ConfigPatch, HistoryChange};
+    use makima_agent::journal::SessionJournal;
     use makima_agent::permissions::PermissionSnapshot;
-    use makima_agent::{AgentId, HistorySnapshot, SubagentInfo};
+    use makima_agent::{AgentId, HistorySnapshot, SubagentInfo, ToolOutput};
     use makima_domain::{Post, PostLevel};
-    use makima_providers::{Effort, Message, ModelSelection, RequestOptions, ThinkingConfig};
+    use makima_providers::{
+        ContentBlock, Effort, Message, ModelSelection, RequestOptions, Role, ThinkingConfig,
+    };
+    use std::sync::Arc;
 
     use makima_storage::session_state::{
         StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentSpec, StoredModeCeiling,
         StoredModeSnapshot, StoredStateRecord,
     };
-    use makima_storage::sessions::{StoredEffect, StoredPost, StoredRule};
+    use makima_storage::sessions::{StoredEffect, StoredRule};
 
-    use super::{CLOSED_AGENT_TEXT, DORMANT_AGENT_TEXT, RETIRED_AGENT_TEXT, session_has_content};
+    use super::{
+        CLOSED_AGENT_TEXT, DORMANT_AGENT_TEXT, DisplayRole, RETIRED_AGENT_TEXT, session_has_content,
+    };
 
     const TRANSCRIPT: &str = "configured-child";
     const CONFIG_MODEL: &str = "provider/committed";
@@ -597,7 +617,7 @@ mod tests {
 
     #[test_case::test_case(false; "root")]
     #[test_case::test_case(true; "child")]
-    fn stable_post_anchor_survives_display_restore_and_history_change(child: bool) {
+    fn journal_post_anchor_survives_display_restore_and_history_change(child: bool) {
         const PROMPT: &str = "original prompt";
         const POST: &str = "review result";
         let mut app = super::super::tests::test_app();
@@ -605,7 +625,6 @@ mod tests {
         let child_id = AgentId::generate();
         let session = app.state.session_mut();
         session.bind_root_id(root).unwrap();
-        let chat = child.then_some(TRANSCRIPT);
         if child {
             let mut record = session.agents()[&root].clone();
             record.id = child_id;
@@ -626,54 +645,67 @@ mod tests {
         } else {
             session.push_message(Message::user(PROMPT.into()));
         }
-        let message_id = session.chat_message_ids(chat)[0];
-        session.push_post(StoredPost {
-            chat: chat.map(str::to_owned),
-            after_message: Some(message_id),
-            post: Post {
+        let agent = if child { child_id } else { root };
+        let journal = SessionJournal::from_session(session).unwrap();
+        journal.record_post(
+            agent,
+            Post {
                 text: POST.into(),
                 level: PostLevel::Info,
                 agent: None,
             },
-        });
-        assert_eq!(session.chat_message_ids(chat), [message_id]);
-        assert_eq!(session.posts()[0].after_message, Some(message_id));
+        );
+        journal.snapshot().apply_to(session).unwrap();
         let history = if child {
             session.subagent_history_snapshot(TRANSCRIPT).unwrap()
         } else {
             session.history_snapshot()
         };
         app.restore_display();
-        let agent = if child { child_id } else { root };
         let index = app.agent_chat_index[&agent];
-        assert!(
-            (0..app.chats[index].message_count())
-                .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST })
-        );
+        assert_eq!(app.chats[index].message_at(0).unwrap().text, PROMPT);
+        assert_eq!(app.chats[index].message_at(1).unwrap().text, POST);
         app.apply_history_change(HistoryChange {
             agent_id: agent,
             epoch: history.epoch,
             messages: history.messages,
             draft: Message::user(PROMPT.into()),
         });
-        assert!(
-            (0..app.chats[index].message_count())
-                .any(|offset| { app.chats[index].message_at(offset).unwrap().text == POST })
-        );
-        assert_eq!(app.state.session.posts()[0].after_message, Some(message_id));
-        app.push_post(
-            None,
-            Post {
-                text: POST.into(),
-                level: PostLevel::Info,
-                agent: None,
-            },
-            Some(Some(message_id)),
-        );
-        assert_eq!(
-            app.state.session.posts().last().unwrap().after_message,
-            Some(message_id)
-        );
+        assert_eq!(app.chats[index].message_at(1).unwrap().text, POST);
+    }
+
+    #[test]
+    fn restored_tool_renders_the_projected_output() {
+        const TOOL_ID: &str = "restore-tool";
+        const OUTPUT: &str = "complete output from the journal";
+        let mut app = super::super::tests::test_app();
+        let session = app.state.session_mut();
+        session.push_message(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                TOOL_ID,
+                "bash",
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        });
+        session.push_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: TOOL_ID.into(),
+                content: "provider preview".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        });
+        let mut snapshot = SessionJournal::from_session(session).unwrap().snapshot();
+        Arc::make_mut(&mut snapshot.tool_outputs)
+            .insert(TOOL_ID.into(), Arc::new(ToolOutput::Plain(OUTPUT.into())));
+        snapshot.apply_to(session).unwrap();
+        app.restore_display();
+        let tool = app.chats[0].message_at(0).unwrap();
+        assert!(matches!(&tool.role, DisplayRole::Tool(role) if role.id == TOOL_ID));
+        assert_eq!(tool.tool_output.as_deref().unwrap().as_text(), OUTPUT);
     }
 
     fn stored_config() -> StoredAgentConfig {
@@ -945,21 +977,17 @@ mod tests {
             answer_tx: None,
             cancel: None,
         };
-        app.push_post(
+        app.display_post(
             Some(&info),
-            makima_agent::Post {
+            &Post {
                 text: CHILD_TEXT.into(),
                 level: Default::default(),
                 agent: None,
             },
-            None,
         );
         assert!(app.chats[index].is_finished());
         assert_eq!(app.chats[index].last_message_text(), CHILD_TEXT);
-        assert_eq!(
-            app.state.session.posts()[0].chat.as_deref(),
-            Some(TRANSCRIPT)
-        );
+        assert!(app.state.session.posts().is_empty());
         assert_eq!(app.agent_chat_index[&root], 0);
         assert!(app.queue.is_empty());
     }

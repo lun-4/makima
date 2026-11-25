@@ -1597,7 +1597,7 @@ fn spawn_interactive(
         }
     });
     let raw_events = events.into_receiver();
-    let events = SessionEventPump::new(raw_events.clone(), manager.journal());
+    let events = SessionEventPump::new(raw_events.clone());
     InteractiveHandle {
         manager,
         root,
