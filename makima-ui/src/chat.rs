@@ -521,6 +521,7 @@ impl Chat {
         self.messages_panel.push(post_message(post));
     }
 
+    #[cfg(test)]
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));

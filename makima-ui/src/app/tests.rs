@@ -55,6 +55,8 @@ use test_case::test_case;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(1);
 const TASK_ID: &str = "task1";
+const CHILD_PROMPT: &str = "Find all TODO comments";
+const CHILD_REPLY: &str = "Found three TODO comments";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
 const LATE_MODEL_SPEC: &str = "ollama/glm-5";
@@ -2868,25 +2870,34 @@ fn subagents_get_descriptive_names() {
 }
 
 #[test]
-fn subagent_prompt_shown_once_and_not_duplicated() {
+fn spawned_child_first_prompt_is_shown_once() {
     let mut app = streaming_app();
     app.update(subagent_msg_with_prompt(
-        AgentEvent::TextDelta { text: "a".into() },
+        AgentEvent::QueueItemConsumed {
+            text: CHILD_PROMPT.into(),
+            images: Vec::new(),
+            mcp_startup_notice: None,
+            already_displayed: false,
+        },
         TASK_ID,
         Some("research"),
-        Some("Find all TODO comments"),
+        Some(CHILD_PROMPT),
     ));
     assert_eq!(app.chats[1].message_count(), 1);
-    assert_eq!(app.chats[1].last_message_text(), "Find all TODO comments");
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
+    assert_eq!(app.chats[1].last_message_text(), CHILD_PROMPT);
 
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "b".into() },
+    app.update(subagent_msg_with_prompt(
+        AgentEvent::TextDelta {
+            text: CHILD_REPLY.into(),
+        },
         TASK_ID,
         Some("research"),
+        Some(CHILD_PROMPT),
     ));
     app.chats[1].flush();
     assert_eq!(app.chats[1].message_count(), 2);
-    assert_eq!(app.chats[1].last_message_text(), "ab");
+    assert_eq!(app.chats[1].last_message_text(), CHILD_REPLY);
 }
 
 #[test]

@@ -3421,9 +3421,6 @@ impl App {
         );
         chat.parent_agent_id = subagent.parent_agent_id;
         chat.set_started_at_now();
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
         self.chats.push(chat);
         self.sync_task_picker();
         idx
