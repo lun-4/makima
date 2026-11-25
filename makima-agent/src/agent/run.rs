@@ -140,33 +140,6 @@ pub struct RunSettings {
     pub thinking: ThinkingConfig,
 }
 
-/// The provider and model available when a run begins.
-pub trait ModelSource: Send + Sync {
-    /// `None` while the source has nothing to offer yet, which reads as "no
-    /// change" rather than forcing a caller to invent a placeholder provider.
-    fn current(&self) -> Option<(Arc<dyn Provider>, Model)>;
-}
-
-/// A [`ModelSource`] a frontend can install into. Adoption is a store rather
-/// than a round-trip to whatever loop owns the run.
-#[derive(Clone, Default)]
-pub struct SharedModel(Arc<arc_swap::ArcSwapOption<(Arc<dyn Provider>, Model)>>);
-
-impl SharedModel {
-    pub fn install(&self, provider: Arc<dyn Provider>, model: Model) {
-        self.0.store(Some(Arc::new((provider, model))));
-    }
-}
-
-impl ModelSource for SharedModel {
-    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
-        self.0
-            .load()
-            .as_ref()
-            .map(|snapshot| (Arc::clone(&snapshot.0), snapshot.1.clone()))
-    }
-}
-
 #[derive(Clone)]
 pub struct AgentParams {
     pub agent_id: AgentId,

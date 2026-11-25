@@ -15,6 +15,7 @@ use makima_agent::actor::{
     ActorBackend, ActorHistory, BackendResult, ControlWork, EffectiveAgentConfig, TurnContext,
     WorkKind,
 };
+use makima_agent::agent::resolve_compaction_model;
 use makima_agent::mcp::config::McpServerStatus;
 use makima_agent::mcp::{McpHandle, McpSession};
 use makima_agent::permissions::PermissionManager;
@@ -593,7 +594,7 @@ impl ActorBackend for TuiActorBackend {
             };
             let (base_provider, base_model) = compaction_source(settings);
 
-            let (provider, model) = makima_agent::agent::resolve_compaction_model(
+            let (provider, model) = resolve_compaction_model(
                 &base_provider,
                 &base_model,
                 &self.providers,

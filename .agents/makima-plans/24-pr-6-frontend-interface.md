@@ -50,8 +50,6 @@ pub struct FrontendProfile {
     pub question_mode: QuestionMode,
     pub interactive_reauth: bool,
     pub tool_output_lines: ToolOutputLines,
-    pub system_override: Option<String>,
-    pub append_system: Option<String>,
     pub excluded_tools: Vec<&'static str>,
     pub mcp: Option<McpHandle>,
 }
@@ -113,7 +111,7 @@ impl SessionHandle {
     pub async fn close(self, timeout: Duration) -> ShutdownReport;
 }
 
-pub enum CancelScope { Turn { agent: AgentId, run: u64 }, Subtree(AgentId), ToolUse(String) }
+pub enum CancelScope { Turn(TurnTicket), Subtree(AgentId), ToolUse(String) }
 
 pub struct SessionProjection {
     pub id: MakimaId,
@@ -145,7 +143,7 @@ pub enum SessionEvent {
 
 One event pump per session: raw events go to `FrontendServices::observe` (Lua autocmds), then subscribers. The journal derives the title when it commits root history. The agent records usage before `TurnComplete` and records tool outputs and posts before emitting their events.
 
-These become internal: the coordinator handle types and tickets, `SessionWriter` and `Record`, `open_session` and the recovery types, the headless spawn functions and `InteractiveHandle`, `TurnAdmitter`/`RootSubmission`, `project_session_journal`, and `apply_session_checkpoint` (deleted). Names drop "resume": `SessionSource::Resume` becomes `Existing`, `ResumeOrCreate` becomes `ExistingOrNew`.
+These become internal: the coordinator handle types, `SessionWriter` and `Record`, `open_session` and the recovery types, the headless spawn functions and `InteractiveHandle`, `TurnAdmitter`/`RootSubmission`, `project_session_journal`, and `apply_session_checkpoint` (deleted). Names drop "resume": `SessionSource::Resume` becomes `Existing`, `ResumeOrCreate` becomes `ExistingOrNew`.
 
 The signatures are the target shape. Steps may adjust them when the code shows a smaller correct form; the plan is updated when they do.
 
@@ -153,7 +151,7 @@ The signatures are the target shape. Steps may adjust them when the code shows a
 
 One commit per step. Each step is verified on the build box (check, workspace nextest, clippy, gen-docs) before the next starts.
 
-0. `SessionRecorder` and the single event pump in `makima-agent/src/session/`. SDK, ACP and print use it in place of their own pumps. The TUI calls `recorder.observe(&envelope)` until step 9.
+0. SDK, ACP and print share `SessionEventPump` in `makima-agent/src/session/`. The journal records facts at their producers. The event pump does not record facts.
 1. Title: the journal derives the title on the first root-history commit with user text while the title is the default, and appends `Title` in the same flush. Until the handle and host exist, explicit titles go through `SessionJournal::set_title` for live sessions and `makima_agent::session::set_title` for stored sessions. Delete the TUI title diff and append, `update_title_if_default` in `AppSession::checkpoint`, and `apply_session_checkpoint`.
 2. Usage: the agent records each completed provider response in `SessionJournal` before emitting `TurnComplete`, including tool rounds and successful compaction. The journal folds `SessionUsage` and appends cumulative `Usage` through its writer. It restores the fold from stored totals, not event replay. Delete `HeadlessObserver::persist_usage` and the TUI's persistence in `account_turn_complete`, plus `SessionState.cost`/`token_usage`. The status bar reads `SessionJournal::cost` until the session projection is available (#168).
 3. Drop `terminal_subagents` and `subagent_channels.closed`; read agent lifecycle from the agent layer.
@@ -162,7 +160,13 @@ One commit per step. Each step is verified on the build box (check, workspace ne
 6. Work held after a failed turn: the TUI backend opts in at actor creation. SDK, ACP, and print continue draining the queue after failure. A failed turn or compaction records `StateChange::InputHold` for queued user admissions. Recovery keeps held admissions without continuing them. The next accepted user submit releases the hold and queues a distinct turn behind held work, even for Join. Local cancel discards held admissions. The TUI displays the actor queue and reads its hold state before a mailbox wake. Remove `recoverable_queue` and the v3 `Queued` record. The v2 reader still folds legacy queued text into the draft.
 7. Shell `!cmd`: `AgentRef::run_shell` takes the shell settings, cancellation token and output callback. It runs in the selected actor's cwd. Both forms display output. Only `!` records a `StateChange::Preamble` for the agent. The next accepted user submission admits a distinct turn; one `TurnInput` record admits it, consumes the preamble IDs and releases any input hold. Previously held turns and mailbox wakes do not take the preamble. Delete the TUI buckets and all reads and drains. The previous `admit_user_turn_on` already drained after a successful submit; `SendMessage` only served mailbox wakes on this branch.
 8. `SessionJournalSnapshot` also serves as the read projection. `SessionJournal::projection()` shares the committed snapshot by `Arc`. The TUI refreshes its reference without copying the histories and keeps the actor's shared history for in-flight display. `SessionJournal::set_draft` writes the change-checked `Draft` record. Model and cwd come from committed config. Remove the TUI mirror writes, `App::checkpoint`, `checkpoint_all`, `AppSession::checkpoint`, and `project_session_journal`. `AgentRef::begin_rewind()` reads the journal directly. Reload carries tab IDs and reopens the logs under their locks, including tabs whose cwd changed during the previous UI run.
-9. One shared actor backend: `HeadlessBackend` configured by `FrontendProfile` replaces `TuiActorBackend` and the `AgentHandles` builder. btw becomes `ask_isolated`; TUI and SDK reset become `SessionHandle::reset`; `CancelMap`/CancelAll becomes `CancelScope`; `ProviderSlot` shrinks to UI model discovery. The TUI composition moves onto `SessionHost::open`.
+9. One shared actor backend and session host:
+   - 9a: Share the startup config checkpoint and compaction model resolution. Remove `InteractiveControl::Compact`, the `ModelSource` implementation for `ProviderSlot`, and the unused `InteractiveHandle.model` projection and `SharedModel`.
+   - 9b: Configure `HeadlessBackend` through `FrontendProfile`: `question_mode`, `interactive_reauth`, `tool_output_lines`, `hold_input_after_failure`, and `excluded_tools`. Support shared or owned MCP, with MCP-ready gating, cancellable initialization and OAuth. Share `file_write_locks`, check `cancel_setup` early, emit `ControlError` on setup failure, and emit `ModelSwitched` per turn. The system prompt override and append belong to host config. The TUI remains on its backend.
+   - 9c: Run the TUI root and children on the shared backend and delete `TuiActorBackend`. Adopt terminal checkpoint semantics explicitly.
+   - 9d: Replace `command_router`, `AgentCommand` and `WorkCancel::Turn` with `CancelScope { Turn(TurnTicket), Subtree(AgentId), ToolUse(String) }`. Use one answer map. Run isolated questions (`btw`) outside the actor queue for every frontend, using pinned context and a history snapshot so they can run during an active turn, as in the TUI today. Delete `btw_system` and the TUI's separate provider path for `btw`.
+   - 9e-1: Use one `SessionHost::open` for SDK, ACP and print.
+   - 9e-2: Move the TUI to `SessionHost::open`. Define reset once. The TUI carries root config and permissions into the new session. Match that behavior in SDK or document why it differs. ACP and print may omit reset.
 
 Log format changes (v3 is unreleased, no migration): `StateChange::InputHold` and no `Queued` (6), `StateChange::Preamble` (7), `StoredPost.agent` (5).
 

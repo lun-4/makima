@@ -32,15 +32,14 @@ use makima_agent::config_change::{
 };
 use makima_agent::context::root_context;
 use makima_agent::end_conversation_detached;
-use makima_agent::headless::default_model_preparer;
-use makima_agent::journal::{JournalChange, JournalCommit, SessionJournalSnapshot};
+use makima_agent::headless::{checkpoint_deferred_startup_config, default_model_preparer};
+use makima_agent::journal::SessionJournalSnapshot;
 use makima_agent::manager::AgentResidency;
 #[cfg(test)]
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
 use makima_agent::rewind::RewindOutcome;
 use makima_agent::session::set_title;
-use makima_agent::session_checkpoint::stored_agent_config;
 use makima_agent::session_coordinator::{
     ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions, canonical_directory, publication_claim,
@@ -85,7 +84,6 @@ use makima_storage::StorageError;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
-use makima_storage::session_state::StateChange;
 use makima_storage::sessions::SESSIONS_DIR;
 #[cfg(test)]
 use makima_storage::sessions::{SessionError, SessionRecord};
@@ -758,33 +756,13 @@ fn observe_config_commits(
     Ok(ui_rx)
 }
 
-fn checkpoint_runtime_config(
+fn checkpoint_root_config(
     handles: &AgentHandles,
     coordinator: &SessionCoordinatorHandle,
 ) -> Result<(), ConfigChangeError> {
-    let (manager, root) = handles.manager_and_root();
-    let actor = manager.actor(root)?;
-    let commit = actor
-        .config_snapshot()
-        .ok_or_else(|| ConfigChangeError::from("root configuration is unavailable".to_owned()))?;
-    let history = handles.history.load_full().as_ref().clone();
-    let config = stored_agent_config(&commit.config, coordinator.read().options().config_values())
-        .map_err(|error| ConfigChangeError::from(error.to_string()))?;
-    coordinator
-        .permissions()?
-        .commit_startup(JournalCommit {
-            changes: vec![JournalChange {
-                agent: Some(root),
-                generation: commit.generation,
-                change: StateChange::Config(config),
-            }],
-            histories: [(root, history.clone())].into(),
-            managed_histories: [root].into(),
-            ..Default::default()
-        })
-        .map_err(|error| ConfigChangeError::from(error.to_string()))?;
+    let root = handles.manager_and_root().0.root()?;
     smol::block_on(bounded_session_op(
-        manager.journal().flush(),
+        checkpoint_deferred_startup_config(&root, coordinator),
         SESSION_OP_TIMEOUT,
     ))
     .map_err(ConfigChangeError::from)
@@ -960,7 +938,7 @@ impl PreparedSessionRuntime {
             }
         };
         if !initialized_before_publication
-            && let Err(error) = checkpoint_runtime_config(handles.initialized(), &coordinator)
+            && let Err(error) = checkpoint_root_config(handles.initialized(), &coordinator)
         {
             coordinator.retire();
             if let Err(release_error) = release_lock_state(session_lock.take()) {
@@ -1099,7 +1077,7 @@ impl PreparedSessionRuntime {
             }
         };
         if !initialized_before_publication
-            && let Err(error) = checkpoint_runtime_config(handles.initialized(), &coordinator)
+            && let Err(error) = checkpoint_root_config(handles.initialized(), &coordinator)
         {
             coordinator.retire();
             if same_session {

@@ -4502,15 +4502,7 @@ mod tests {
                         })
                     })
                 }),
-                Arc::new({
-                    let model = handle.model.clone();
-                    move |commit| {
-                        model.install(
-                            Arc::clone(&commit.config.provider),
-                            commit.config.model.clone(),
-                        );
-                    }
-                }),
+                Arc::new(|_| {}),
             )
             .unwrap();
         let command_registry = test_registry(&[]);

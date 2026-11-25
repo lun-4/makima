@@ -22,8 +22,7 @@ pub use instructions::{
     is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
-    Agent, AgentParams, AgentRunParams, ModelSource, NO_ADMITTED_CWD_ERR, ResolvedPromptInputs,
-    RunSettings, SharedModel, TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens,
-    resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, NO_ADMITTED_CWD_ERR, ResolvedPromptInputs, RunSettings,
+    TurnAdmissionSnapshot, TurnPromptInputs, estimate_message_tokens, resolve_compaction_model,
 };
 pub use streaming::end_conversation_detached;

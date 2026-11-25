@@ -21,13 +21,13 @@ use tracing::warn;
 
 use crate::actor::{
     ActorError, ActorHistory, AdmissionPreparation, AgentActorHandle, AgentContextSnapshot,
-    CompactionStatus, PreparedModel, PreparedReadiness, TerminalCheckpoint, TurnAdmissionOptions,
-    TurnOrigin, TurnProvenance,
+    CompactionStatus, ConfigCommit, PreparedModel, PreparedReadiness, TerminalCheckpoint,
+    TurnAdmissionOptions, TurnOrigin, TurnProvenance,
 };
 #[cfg(test)]
 use crate::agent::History;
 use crate::agent::isolated_turn::IsolatedTurnEvent;
-use crate::agent::{self, PromptSlotSource, TurnSetup};
+use crate::agent::{self, PromptSlotSource, TurnSetup, resolve_compaction_model};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::config_change::{ConfigChangeError, reserve_in_turn_for_actor, unresolved_model};
 use crate::context::{ContextPolicy, RootContext, root_context};
@@ -52,9 +52,9 @@ use crate::tools::{
 use crate::{
     ActorBackend, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentLimits,
     AgentManagerHandle, AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult,
-    ControlWork, EffectiveAgentConfig, Envelope, EventSender, McpHandle, McpSession,
-    PermissionsConfig, RunLedger, RunSettings, SessionMailbox, ToolOutputLines, TurnContext,
-    TurnFailure, TurnFailureKind, TurnId, TurnTicket, WorkKind,
+    ControlWork, EffectiveAgentConfig, Envelope, EventSender, HistorySnapshot, McpHandle,
+    McpSession, PermissionsConfig, RunLedger, RunSettings, SessionMailbox, ToolOutputLines,
+    TurnContext, TurnFailure, TurnFailureKind, TurnId, TurnTicket, WorkKind,
 };
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -148,7 +148,6 @@ pub enum ManualCompactionEvent {
 }
 
 pub enum InteractiveControl {
-    Compact(flume::Sender<Result<(), String>>),
     ManualCompaction {
         instructions: Option<String>,
         output: flume::Sender<ManualCompactionEvent>,
@@ -183,7 +182,7 @@ struct PendingControl {
 impl PendingControl {
     fn cancel(&mut self) {
         match self.control.take() {
-            Some(InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply)) => {
+            Some(InteractiveControl::Reset(reply)) => {
                 let _ = reply.send(Err(OPERATION_CANCELLED.into()));
             }
             Some(InteractiveControl::ManualCompaction { output, .. }) => {
@@ -541,7 +540,6 @@ pub struct InteractiveHandle {
     pub input_tx: InteractiveInputSender,
     pub answer_tx: flume::Sender<String>,
     pub control_tx: InteractiveControlSender,
-    pub model: crate::SharedModel,
     pub session_id: SessionRef,
     pub mailbox: SessionMailbox,
     pub permissions: Arc<PermissionManager>,
@@ -567,28 +565,53 @@ pub async fn checkpoint_startup_config(
         .prepare_idle_subtree(root.id())
         .map_err(|error| error.to_string())?;
     let source = idle.source_snapshot().map_err(|error| error.to_string())?;
+    persist_startup_config(root, coordinator, source.config, source.history).await
+}
+
+/// Checkpoints startup before the runner is released, including a recovered queue.
+pub async fn checkpoint_deferred_startup_config(
+    root: &AgentRef,
+    coordinator: &SessionCoordinatorHandle,
+) -> Result<(), String> {
+    let actor = root.actor().map_err(|error| error.to_string())?;
+    let config = actor.config_snapshot().ok_or(HEADLESS_CONFIG_UNAVAILABLE)?;
+    persist_startup_config(
+        root,
+        coordinator,
+        config,
+        actor.committed_history_snapshot(),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn persist_startup_config(
+    root: &AgentRef,
+    coordinator: &SessionCoordinatorHandle,
+    commit: ConfigCommit,
+    history: HistorySnapshot,
+) -> Result<Arc<EffectiveAgentConfig>, String> {
     let options = coordinator.read().options().config_values();
-    let config =
-        stored_agent_config(&source.config.config, options).map_err(|error| error.to_string())?;
+    let config = stored_agent_config(&commit.config, options).map_err(|error| error.to_string())?;
     coordinator
         .permissions()
         .map_err(|error| error.to_string())?
         .commit_startup(JournalCommit {
             changes: vec![JournalChange {
                 agent: Some(root.id()),
-                generation: source.config.generation,
+                generation: commit.generation,
                 change: StateChange::Config(config),
             }],
-            histories: [(root.id(), source.history.clone())].into(),
+            histories: [(root.id(), history.clone())].into(),
             managed_histories: [root.id()].into(),
             ..Default::default()
         })
         .map_err(|error| error.to_string())?;
     coordinator
-        .persist_history(source.history)
+        .persist_history(history)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(source.config.config)
+    Ok(commit.config)
 }
 
 pub fn default_preparation(providers: Arc<ProviderRegistry>) -> ProviderPreparation {
@@ -753,12 +776,24 @@ impl HeadlessBackend {
             .session_id
             .as_ref()
             .filter(|_| self.persist_turn_results);
-        let result = agent::compact(
-            &config.provider,
+        let (provider, model) = resolve_compaction_model(
             &config.provider,
             &config.model,
+            &self.params.providers,
+            &self.params.model_policy,
+        )
+        .await;
+        let event_tx = self.event_sender(context);
+        event_tx.try_send(AgentEvent::ModelSwitched {
+            spec: model.spec(),
+            context_window: model.context_window,
+        });
+        let result = agent::compact(
+            &provider,
+            &config.provider,
+            &model,
             history.reborrow(),
-            &self.event_sender(context),
+            &event_tx,
             cancel,
             &self.params.config,
             instructions,
@@ -923,10 +958,6 @@ impl ActorBackend for HeadlessBackend {
                 .as_ref()
                 .and_then(|pending| pending.lock_unpoisoned().control.take());
             match control {
-                Some(InteractiveControl::Compact(reply)) => {
-                    let result = self.compact(history, &context, None, &context.cancel).await;
-                    let _ = reply.send(compaction_result(result));
-                }
                 Some(InteractiveControl::ManualCompaction {
                     instructions,
                     output,
@@ -1240,7 +1271,6 @@ fn spawn_interactive(
         AgentManagerHandle::new(AgentLimits::default()).expect("default agent limits are valid")
     });
     let root = RootReadiness::default();
-    let model = crate::SharedModel::default();
     let (guard, events) = crate::types::event_stream();
     let raw_tx = guard.tx().clone();
     let (lifetime_tx, lifetime_rx) = flume::unbounded();
@@ -1296,7 +1326,6 @@ fn spawn_interactive(
     let task = smol::spawn({
         let manager = manager.clone();
         let root = root.clone();
-        let model_source = model.clone();
         let permissions = Arc::clone(&permissions);
         let mailbox = mailbox.clone();
         let session_ref = session_ref.clone();
@@ -1314,7 +1343,6 @@ fn spawn_interactive(
                         .bind_result_store(Arc::clone(store))
                         .map_err(|error| error.to_string())?;
                 }
-                model_source.install(Arc::clone(&provider), model.clone());
                 let mut mode_fallback = false;
                 let config = if let Some(stored) = restored_config {
                     let restored = crate::plan_state::prepare_restore_for_agent(
@@ -1608,7 +1636,6 @@ fn spawn_interactive(
         input_tx,
         answer_tx,
         control_tx,
-        model,
         session_id: session_ref,
         mailbox,
         permissions,
@@ -1646,10 +1673,13 @@ pub(crate) mod tests {
     use crate::test_util::MockBackend;
     use crate::tools::offload::{OffloadBackend, OffloadError};
     use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
+    use makima_providers::login::{AuthStatus, InteractionService};
+    use makima_providers::model_registry;
     use makima_providers::provider::Provider;
     use makima_providers::{
-        ContentBlock, ConversationEnd, Invocation, RequestDelivery, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, ConversationEnd, Invocation, ModelInfo, ModelTier, PreparedProvider,
+        ProviderBackend, RegisteredProvider, RequestDelivery, Role, StopReason, StreamResponse,
+        TokenUsage,
     };
     use makima_storage::StateDir;
     use makima_storage::checkpoint::{
@@ -1672,6 +1702,9 @@ pub(crate) mod tests {
     const HEADLESS_PROVIDER_ERROR: &str = "headless provider failed";
     const SAVED_OUTPUT: &str = "saved output";
     const SAVE_ERROR: &str = "save failed";
+    const COMPACTION_PROVIDER: &str = "test-compaction";
+    const COMPACTION_MODEL: &str = "test-compaction/summary";
+    const COMPACTION_WINDOW: u32 = 32_768;
     const FIRST: &str = "first provider";
     const SECOND: &str = "second provider";
     const TEST_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
@@ -1817,6 +1850,46 @@ pub(crate) mod tests {
                     .send((self.name, model.spec(), system.into(), options.fast));
                 Ok(response(self.name))
             })
+        }
+    }
+
+    struct CompactionBackend(Arc<dyn Provider>);
+
+    impl ProviderBackend for CompactionBackend {
+        fn prepare(
+            &self,
+            model: Model,
+            _: ModelInfo,
+        ) -> BoxFuture<'static, Result<PreparedProvider, crate::AgentError>> {
+            let provider = Arc::clone(&self.0);
+            Box::pin(async move { Ok(PreparedProvider { model, provider }) })
+        }
+
+        fn discover(
+            &self,
+            _: bool,
+        ) -> Option<BoxFuture<'static, Result<Vec<ModelInfo>, crate::AgentError>>> {
+            None
+        }
+
+        fn login(
+            &self,
+            _: String,
+            _: Value,
+            _: Arc<dyn InteractionService>,
+        ) -> BoxFuture<'static, Result<Option<String>, crate::AgentError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn auth_status(
+            &self,
+            _: Value,
+        ) -> Option<BoxFuture<'static, Result<AuthStatus, crate::AgentError>>> {
+            None
+        }
+
+        fn logout(&self) -> Option<BoxFuture<'static, Result<(), crate::AgentError>>> {
+            None
         }
     }
 
@@ -3507,6 +3580,67 @@ pub(crate) mod tests {
         });
     }
 
+    #[test]
+    fn managed_manual_compaction_uses_model_override() {
+        smol::block_on(async {
+            let (base_provider, base_requests) = recording();
+            let (compact_provider, compact_requests) = recording();
+            let mut params =
+                interactive_params(MakimaId::generate(), vec![Message::user(SECOND.into())]);
+            params.providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+                id: COMPACTION_PROVIDER.into(),
+                display_name: COMPACTION_PROVIDER.into(),
+                models: vec![ModelInfo {
+                    context_window: Some(COMPACTION_WINDOW),
+                    ..ModelInfo::id_only(Model::parse_spec(COMPACTION_MODEL).unwrap().1.into())
+                }],
+                backend: Arc::new(CompactionBackend(compact_provider)),
+                auth: Default::default(),
+                docs: None,
+            }]));
+            let coordinator = coordinator(params.session_id.as_ref().unwrap().id(), checkpoint());
+            let binding = coordinator_binding(coordinator.clone(), Arc::clone(&base_provider));
+            let handle = spawn_interactive_with_binding(
+                params,
+                Box::new(move |model| {
+                    Box::pin(async move {
+                        Ok(PreparedModel {
+                            model,
+                            provider: base_provider,
+                        })
+                    })
+                }),
+                None,
+                Some(binding),
+            );
+            let actor = bounded(handle.initialized_root())
+                .await
+                .unwrap()
+                .actor()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let state = StateDir::from_path(directory.path().into());
+            model_registry::set_and_persist(COMPACTION_MODEL.into(), ModelTier::Compaction, &state);
+            let result = bounded(
+                handle
+                    .control_tx
+                    .compact_to(actor, None, CancelToken::none()),
+            )
+            .await;
+            model_registry::unset_and_persist(COMPACTION_MODEL, ModelTier::Compaction, &state);
+            result.unwrap();
+            assert!(base_requests.is_empty());
+            assert_eq!(compact_requests.try_recv().unwrap().1, COMPACTION_MODEL);
+            assert!(handle.event_rx.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::ModelSwitched { spec, context_window }
+                    if spec == COMPACTION_MODEL && context_window == COMPACTION_WINDOW
+            )));
+            bounded(handle.task.cancel()).await;
+            bounded(coordinator.close()).await.unwrap();
+        });
+    }
+
     #[test_case(false ; "manual_compaction_persists_before_reporting_success")]
     #[test_case(true ; "failed_persistence_reports_failure_and_rolls_history_back")]
     fn managed_manual_compaction(fail: bool) {
@@ -3599,11 +3733,8 @@ pub(crate) mod tests {
         });
     }
 
-    #[test_case(InteractiveControl::Compact ; "compact")]
-    #[test_case(InteractiveControl::Reset ; "reset")]
-    fn control_dropped_on_close_replies_cancelled(
-        control: fn(flume::Sender<Result<(), String>>) -> InteractiveControl,
-    ) {
+    #[test]
+    fn reset_dropped_on_close_replies_cancelled() {
         smol::block_on(async {
             let (seen, received) = flume::bounded(1);
             let (release, released) = flume::bounded::<()>(1);
@@ -3624,7 +3755,11 @@ pub(crate) mod tests {
             let _turn = handle.input_tx.admit(first_input()).await.unwrap();
             bounded(received.recv_async()).await.unwrap();
             let (reply, replies) = flume::bounded(1);
-            handle.control_tx.send(control(reply)).await.unwrap();
+            handle
+                .control_tx
+                .send(InteractiveControl::Reset(reply))
+                .await
+                .unwrap();
             root.actor().unwrap().close();
             assert_eq!(
                 bounded(replies.recv_async()).await.unwrap(),

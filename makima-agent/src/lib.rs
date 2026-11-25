@@ -24,9 +24,9 @@ pub use actor::{
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    ModelSource, RESTART_TOOL_INTERRUPTION, RunSettings, SharedMessages, SharedModel,
-    UNAVAILABLE_RESULT, USER_TOOL_INTERRUPTION, close_dangling_tool_calls,
-    end_conversation_detached, find_subdirectory_instructions, is_instruction_file,
+    RESTART_TOOL_INTERRUPTION, RunSettings, SharedMessages, UNAVAILABLE_RESULT,
+    USER_TOOL_INTERRUPTION, close_dangling_tool_calls, end_conversation_detached,
+    find_subdirectory_instructions, is_instruction_file,
 };
 pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{

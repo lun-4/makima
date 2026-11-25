@@ -2602,9 +2602,7 @@ mod tests {
     };
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::tools::ToolRegistry;
-    use makima_agent::{
-        AgentError, AgentId, AgentRef, ModeDef, ModeRegistry, ModelSource, PreparedModel,
-    };
+    use makima_agent::{AgentError, AgentId, AgentRef, ModeDef, ModeRegistry, PreparedModel};
     use makima_commands::{CommandError, CommandFuture, TargetCapabilities, TargetCapability};
     use makima_lua::{PluginHost, orchestration::OrchestrationServices};
     use makima_providers::login::{AuthStatus, InteractionService};
@@ -5554,7 +5552,6 @@ mod tests {
                 .spec(),
             TARGET_MODEL
         );
-        assert_eq!(handle.model.current().unwrap().1.spec(), TARGET_MODEL);
 
         smol::block_on(catalog.apply(vec![SDK_DISCOVERED_MODEL.into()], None));
         assert!(

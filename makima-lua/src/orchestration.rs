@@ -419,9 +419,8 @@ pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
     (binding, root)
 }
 
-/// Binds a headless frontend's root actor to {coordinator}, so committed
-/// config installs the model and cwd on {handle} and the YOLO option drives
-/// its permissions, and returns the root that {root_binding} delivered.
+/// Binds the root actor and its permissions to {coordinator} and returns
+/// the target delivered by {root_binding}.
 pub async fn bind_frontend_root(
     handle: &InteractiveHandle,
     coordinator: &SessionCoordinatorHandle,
@@ -432,17 +431,12 @@ pub async fn bind_frontend_root(
         .bind_permissions(Arc::clone(&handle.permissions))
         .map_err(|error| error.to_string())?;
     let root = handle.initialized_root().await?;
-    let model = handle.model.clone();
     let permissions = Arc::clone(&handle.permissions);
     coordinator
         .bind_actor(
             root,
             prepare_model,
             Arc::new(move |commit| {
-                model.install(
-                    Arc::clone(&commit.config.provider),
-                    commit.config.model.clone(),
-                );
                 permissions.set_cwd(commit.config.context.cwd().to_path_buf());
             }),
         )
