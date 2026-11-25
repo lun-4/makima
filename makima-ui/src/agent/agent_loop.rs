@@ -16,7 +16,6 @@ use makima_agent::actor::{
     WorkKind,
 };
 use makima_agent::agent::resolve_compaction_model;
-use makima_agent::mcp::config::McpServerStatus;
 use makima_agent::mcp::{McpHandle, McpSession};
 use makima_agent::permissions::PermissionManager;
 use makima_agent::template;
@@ -28,7 +27,7 @@ use makima_agent::tools::{
 use makima_agent::{
     ActorWorkIdentity, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams,
     AgentRunParams, CancelMap, CancelToken, Envelope, EventSender, History, Instructions,
-    McpCommand, SessionMailbox, ToolOutputLines, TurnCancellationReason, TurnId, TurnOutcome,
+    SessionMailbox, ToolOutputLines, TurnCancellationReason, TurnId, TurnOutcome,
 };
 use makima_config::ModelPolicy;
 use makima_lua::EventHandle;
@@ -214,7 +213,7 @@ impl TuiActorBackend {
             if self.init_cancel.race(mcp.ready()).await.is_err() {
                 return false;
             }
-            spawn_oauth_for_needs_auth(mcp);
+            mcp.spawn_oauth_for_needs_auth();
         }
         self.initialized = !self.init_cancel.is_cancelled();
         self.initialized
@@ -640,50 +639,6 @@ fn compaction_source(
     settings: &makima_agent::RunSettings,
 ) -> (Arc<dyn makima_providers::provider::Provider>, Model) {
     (Arc::clone(&settings.provider), settings.model.clone())
-}
-
-fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
-    let snapshot = handle.reader().load().clone();
-    for info in snapshot.infos.iter() {
-        let McpServerStatus::NeedsAuth { ref url } = info.status else {
-            continue;
-        };
-        let Some(ref server_url) = info.url else {
-            continue;
-        };
-        let handle = handle.clone();
-        let server_name = info.name.clone();
-        let server_url = server_url.clone();
-        let www_auth = url.clone();
-        let oauth = info.oauth.clone();
-        smol::spawn(async move {
-            let storage = match makima_storage::StateDir::resolve() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(server = %server_name, error = %e, "cannot resolve storage for OAuth");
-                    return;
-                }
-            };
-            if let Err(e) = makima_agent::mcp::oauth::authenticate(
-                &server_name,
-                &server_url,
-                www_auth.as_deref(),
-                &storage,
-                makima_agent::mcp::oauth::Interaction::Background,
-                oauth,
-            )
-            .await
-            {
-                tracing::warn!(server = %server_name, error = %e, "background OAuth failed");
-                return;
-            }
-            handle.send(McpCommand::Reconnect {
-                server: server_name.clone(),
-            });
-            tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
-        })
-        .detach();
-    }
 }
 
 #[cfg(test)]

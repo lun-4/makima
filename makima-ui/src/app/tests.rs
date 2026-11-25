@@ -16,14 +16,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use makima_agent::actor::{ActorHistory, HistoryChange, PreparedModel};
 use makima_agent::command::{CommandScope, CustomCommand};
 use makima_agent::headless::{
-    InteractiveHandle, InteractiveParams, spawn_interactive_with_checkpoint,
+    FrontendProfile, InteractiveHandle, InteractiveParams, spawn_interactive_with_checkpoint,
 };
 use makima_agent::journal::{JournalCommit, SessionJournal};
 use makima_agent::permissions::PermissionManager;
 use makima_agent::session_recovery::{OpenModel, SessionSource, open_session};
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{
-    QuestionMode, TASK_SPAWN_TOOL_NAME, ToolAudience, ToolRegistry, cli_tool_ctx, local_tool,
+    TASK_SPAWN_TOOL_NAME, ToolAudience, ToolRegistry, cli_tool_ctx, local_tool,
 };
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentManagerHandle, AgentMode, AgentRef, BackendResult,
@@ -1003,7 +1003,7 @@ fn sdk_created_session_restores_title_tool_output_post_and_cost() {
                     permissions_config: Default::default(),
                     timeouts: Default::default(),
                     prompt_slots: Default::default(),
-                    excluded_tools: Vec::new(),
+                    profile: FrontendProfile::default(),
                     mcp_handle: None,
                     initial_wd: dir.path().to_path_buf(),
                     session_id: Some(SessionRef::from(id)),
@@ -1017,7 +1017,6 @@ fn sdk_created_session_restores_title_tool_output_post_and_cost() {
                     model_policy: policy,
                     providers,
                     modes,
-                    question_mode: QuestionMode::Headless,
                     plugin_rules: Arc::default(),
                     project_config: ProjectConfig::for_project(dir.path()),
                     local_tools: Arc::new(HashMap::from([(

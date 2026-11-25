@@ -27,7 +27,9 @@ use crate::actor::{
 #[cfg(test)]
 use crate::agent::History;
 use crate::agent::isolated_turn::IsolatedTurnEvent;
-use crate::agent::{self, PromptSlotSource, TurnSetup, resolve_compaction_model};
+use crate::agent::{
+    self, Instructions, NO_ADMITTED_CWD_ERR, PromptSlotSource, TurnSetup, resolve_compaction_model,
+};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::config_change::{ConfigChangeError, reserve_in_turn_for_actor, unresolved_model};
 use crate::context::{ContextPolicy, RootContext, root_context};
@@ -46,15 +48,16 @@ use crate::state::StateAccess;
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext, ToolRegistry,
-    TurnToolBindings,
+    Deadline, FileReadTracker, FileWriteLocks, LocalTools, QuestionMode, RequestTools,
+    ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
 };
 use crate::{
-    ActorBackend, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentLimits,
+    ActorBackend, Agent, AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentLimits,
     AgentManagerHandle, AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult,
     ControlWork, EffectiveAgentConfig, Envelope, EventSender, HistorySnapshot, McpHandle,
     McpSession, PermissionsConfig, RunLedger, RunSettings, SessionMailbox, ToolOutputLines,
-    TurnContext, TurnFailure, TurnFailureKind, TurnId, TurnTicket, WorkKind,
+    TurnCancellationReason, TurnContext, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
+    TurnTicket, WorkKind,
 };
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +65,9 @@ const INITIALIZATION_CLOSED: &str = "session ended before initialization";
 const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
 const OPERATION_CANCELLED: &str = "operation cancelled";
 const ROOT_NOT_READY: &str = "session root is not initialized yet";
+const NO_TURN_CONFIG: &str = "turn was admitted without an effective agent configuration";
+const SETUP_FAILED: &str = "agent turn setup failed";
+const MCP_INIT_CANCELLED: &str = "MCP initialization cancelled";
 const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavailable";
 const FALLBACK_CHECKPOINT_UNAVAILABLE: &str =
     "restored mode fallback requires a session checkpoint";
@@ -109,13 +115,61 @@ pub type RootBinding = Box<
         + Send,
 >;
 
+#[derive(Default)]
+pub enum McpLifecycle {
+    #[default]
+    Owned,
+    Shared {
+        init_cancel: CancelToken,
+    },
+}
+
+pub struct FrontendProfile {
+    pub question_mode: QuestionMode,
+    pub interactive_reauth: bool,
+    pub tool_output_lines: ToolOutputLines,
+    pub hold_input_after_failure: bool,
+    pub excluded_tools: Vec<&'static str>,
+    pub mcp_lifecycle: McpLifecycle,
+    /// Emit `ControlError` for frontends that do not display root setup outcomes.
+    pub report_setup_errors: bool,
+}
+
+impl Default for FrontendProfile {
+    fn default() -> Self {
+        Self {
+            question_mode: QuestionMode::Headless,
+            interactive_reauth: false,
+            tool_output_lines: ToolOutputLines::default(),
+            hold_input_after_failure: false,
+            excluded_tools: Vec::new(),
+            mcp_lifecycle: McpLifecycle::Owned,
+            report_setup_errors: false,
+        }
+    }
+}
+
+impl FrontendProfile {
+    pub fn tui(tool_output_lines: ToolOutputLines, init_cancel: CancelToken) -> Self {
+        Self {
+            question_mode: QuestionMode::Tui,
+            interactive_reauth: true,
+            tool_output_lines,
+            hold_input_after_failure: true,
+            mcp_lifecycle: McpLifecycle::Shared { init_cancel },
+            report_setup_errors: true,
+            ..Self::default()
+        }
+    }
+}
+
 pub struct InteractiveParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: PromptSlotSource,
-    pub excluded_tools: Vec<&'static str>,
+    pub profile: FrontendProfile,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub session_id: Option<SessionRef>,
@@ -129,7 +183,6 @@ pub struct InteractiveParams {
     pub model_policy: Arc<ModelPolicy>,
     pub providers: Arc<ProviderRegistry>,
     pub modes: Arc<crate::ModeRegistry>,
-    pub question_mode: crate::tools::QuestionMode,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
     pub local_tools: LocalTools,
@@ -632,41 +685,139 @@ pub fn default_model_preparer(providers: Arc<ProviderRegistry>) -> ModelPreparer
     })
 }
 
-struct HeadlessBackend {
+#[derive(Default)]
+pub struct HeadlessBackendOptions {
+    pub persist_turn_results: bool,
+    pub system_override: Option<String>,
+    pub append_system: Option<String>,
+    pub prompt_slots: PromptSlotSource,
+    pub local_tools: LocalTools,
+    pub mcp: Option<McpSession>,
+    pub answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
+}
+
+pub struct HeadlessBackend {
     params: AgentParams,
     persist_turn_results: bool,
     excluded_tools: Vec<&'static str>,
+    hold_input_after_failure: bool,
+    report_setup_errors: bool,
+    mcp_lifecycle: McpLifecycle,
+    mcp_initialized: bool,
     system_override: Option<String>,
     append_system: Option<String>,
     setup: TurnSetup,
-    local_tools: LocalTools,
-    mcp: Option<McpSession>,
     answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
     raw_tx: flume::Sender<Envelope>,
-    root: RootReadiness,
 }
 
 impl HeadlessBackend {
+    pub fn new(
+        mut params: AgentParams,
+        profile: FrontendProfile,
+        raw_tx: flume::Sender<Envelope>,
+        options: HeadlessBackendOptions,
+    ) -> Self {
+        params.tool_output_lines = profile.tool_output_lines;
+        params.question_mode = profile.question_mode;
+        params.interactive_reauth = profile.interactive_reauth;
+        Self {
+            setup: TurnSetup {
+                registry: Arc::clone(&params.registry),
+                local_tools: options.local_tools,
+                mcp: options.mcp,
+                slots: options.prompt_slots,
+                modes: Arc::clone(&params.modes),
+                instructions: true,
+            },
+            params,
+            persist_turn_results: options.persist_turn_results,
+            excluded_tools: profile.excluded_tools,
+            hold_input_after_failure: profile.hold_input_after_failure,
+            report_setup_errors: profile.report_setup_errors,
+            mcp_lifecycle: profile.mcp_lifecycle,
+            mcp_initialized: false,
+            system_override: options.system_override,
+            append_system: options.append_system,
+            answer_rx: options.answer_rx,
+            raw_tx,
+        }
+    }
+
     fn event_sender(&self, context: &TurnContext) -> EventSender {
         EventSender::with_identity(self.raw_tx.clone(), Some(context.work))
     }
 
-    async fn config(&self, context: &TurnContext) -> Result<Arc<EffectiveAgentConfig>, String> {
-        if let Some(config) = &context.policy {
-            return Ok(Arc::clone(config));
+    async fn initialize_mcp(&mut self) -> bool {
+        let McpLifecycle::Shared { init_cancel } = &self.mcp_lifecycle else {
+            return true;
+        };
+        if self.mcp_initialized {
+            return true;
         }
-        self.root
-            .get()
-            .await?
-            .effective_config()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| HEADLESS_CONFIG_UNAVAILABLE.to_owned())
+        if init_cancel.is_cancelled() {
+            return false;
+        }
+        if let Some(mcp) = &self.setup.mcp {
+            if init_cancel.race(mcp.ready()).await.is_err() || init_cancel.is_cancelled() {
+                return false;
+            }
+            mcp.spawn_oauth_for_needs_auth();
+        }
+        self.mcp_initialized = !init_cancel.is_cancelled();
+        self.mcp_initialized
+    }
+
+    fn setup_failed(
+        &self,
+        context: &TurnContext,
+        turn_id: TurnId,
+        failure: TurnFailure,
+    ) -> BackendResult {
+        warn!(%turn_id, error = %failure.diagnostic, "{SETUP_FAILED}");
+        if !self.report_setup_errors {
+            return BackendResult::SetupFailed(Some(failure));
+        }
+        if let Some(inbox) = &context.inbox {
+            inbox.close();
+        }
+        let event_tx = self.event_sender(context);
+        context.output.set_terminal_sender(event_tx.clone());
+        let _ = event_tx.send(AgentEvent::ControlError {
+            message: format!("{SETUP_FAILED}: {}", failure.user_message),
+        });
+        BackendResult::EnteredRun(TurnOutcome::failed(
+            context.agent_id,
+            turn_id,
+            Default::default(),
+            0,
+            failure,
+        ))
+    }
+
+    fn cancel_setup(&self, context: &TurnContext, turn_id: TurnId) -> BackendResult {
+        if let Some(inbox) = &context.inbox {
+            inbox.close();
+        }
+        context
+            .output
+            .set_terminal_sender(self.event_sender(context));
+        BackendResult::EnteredRun(TurnOutcome::cancelled(
+            context.agent_id,
+            turn_id,
+            Default::default(),
+            0,
+            context
+                .cancel_reason
+                .reason()
+                .unwrap_or(TurnCancellationReason::User),
+        ))
     }
 
     fn system(
         &self,
         config: &EffectiveAgentConfig,
-        instructions: &agent::Instructions,
+        instructions: &Instructions,
         slots: &ResolvedSlots,
     ) -> String {
         let vars = template::env_vars_for(config.context.cwd());
@@ -698,11 +849,11 @@ impl HeadlessBackend {
             &self.params.config,
             &self.excluded_tools,
             config.workflow,
-            self.mcp.is_some(),
+            self.setup.mcp.is_some(),
         )
     }
 
-    fn template(&self, config: &EffectiveAgentConfig) -> ToolContext {
+    pub fn template(&self, config: &EffectiveAgentConfig) -> ToolContext {
         let tools = self.tools(config);
         ToolContext {
             execution_agent_id: Some(self.params.agent_id),
@@ -720,7 +871,7 @@ impl HeadlessBackend {
             user_response_rx: self.answer_rx.clone(),
             loaded_instructions: Default::default(),
             cancel: CancelToken::none(),
-            mcp: self.mcp.clone(),
+            mcp: self.setup.mcp.clone(),
             deadline: Deadline::None,
             config: self.params.config.clone(),
             tool_filter: Arc::clone(tools.filter()),
@@ -741,12 +892,12 @@ impl HeadlessBackend {
             registry: Arc::clone(&self.params.registry),
             workflow: config.workflow,
             audience: self.params.audience,
-            local_tools: Arc::clone(&self.local_tools),
+            local_tools: Arc::clone(&self.setup.local_tools),
             local_tool_capture: None,
             turn_bindings: Arc::new(TurnToolBindings::capture(
                 &self.params.registry,
-                &self.local_tools,
-                self.mcp.as_ref(),
+                &self.setup.local_tools,
+                self.setup.mcp.as_ref(),
             )),
             live_sink: None,
             model_policy: Arc::clone(&self.params.model_policy),
@@ -766,9 +917,8 @@ impl HeadlessBackend {
         instructions: Option<&str>,
         cancel: &CancelToken,
     ) -> ManualCompactionEvent {
-        let config = match self.config(context).await {
-            Ok(config) => config,
-            Err(error) => return ManualCompactionEvent::Failed(error),
+        let Some(config) = &context.policy else {
+            return ManualCompactionEvent::Failed(NO_TURN_CONFIG.into());
         };
         let previous = history.snapshot().clone();
         let session = self
@@ -812,6 +962,10 @@ impl HeadlessBackend {
 }
 
 impl ActorBackend for HeadlessBackend {
+    fn hold_input_after_failure(&self) -> bool {
+        self.hold_input_after_failure
+    }
+
     fn context_event_sender(&self) -> Option<EventSender> {
         Some(EventSender::new(self.raw_tx.clone()))
     }
@@ -868,75 +1022,107 @@ impl ActorBackend for HeadlessBackend {
     fn run_turn<'a>(
         &'a mut self,
         history: ActorHistory<'a>,
-        context: TurnContext,
+        mut context: TurnContext,
         mut input: AgentInput,
         _work: WorkKind,
     ) -> BoxFuture<'a, BackendResult> {
         Box::pin(async move {
             let turn_id = context.turn_id.unwrap_or_else(TurnId::generate);
-            let config = match self.config(&context).await {
-                Ok(config) => config,
-                Err(error) => {
-                    warn!(%turn_id, %error, "headless turn setup failed");
-                    return BackendResult::SetupFailed(Some(TurnFailure {
-                        kind: TurnFailureKind::Internal,
-                        diagnostic: error.clone(),
-                        user_message: error,
-                        retryable: true,
-                    }));
-                }
+            if context.cancel.is_cancelled() {
+                return self.cancel_setup(&context, turn_id);
+            }
+            let event_tx = self.event_sender(&context);
+            if let Some(config) = &context.policy {
+                event_tx.try_send(AgentEvent::ModelSwitched {
+                    spec: config.model.spec(),
+                    context_window: config.model.context_window,
+                });
+            }
+            let initialized = context.cancel.race(self.initialize_mcp()).await;
+            if context.cancel.is_cancelled() {
+                return self.cancel_setup(&context, turn_id);
+            }
+            let fail = |message: &str| TurnFailure {
+                kind: TurnFailureKind::Internal,
+                diagnostic: message.into(),
+                user_message: message.into(),
+                retryable: true,
             };
+            if !matches!(initialized, Ok(true)) {
+                return self.setup_failed(&context, turn_id, fail(MCP_INIT_CANCELLED));
+            }
+            let Some(config) = &context.policy else {
+                return self.setup_failed(&context, turn_id, fail(NO_TURN_CONFIG));
+            };
+            // Turns admitted during startup captured an incomplete MCP catalog.
+            if matches!(self.mcp_lifecycle, McpLifecycle::Shared { .. })
+                && let Some(mcp) = &self.setup.mcp
+                && let Some(admission) = &mut context.admission
+                && admission.mcp_startup_notice.is_some()
+            {
+                Arc::make_mut(&mut admission.bindings).refresh_mcp(mcp);
+            }
             let prompt_inputs = context
                 .admission
                 .as_ref()
-                .and_then(|admission| admission.prompt_inputs.clone());
-            let slots = match &prompt_inputs {
-                Some(inputs) => match inputs.resolve(&mut input, self.mcp.as_ref()).await {
-                    Ok(slots) => slots,
-                    Err(error) => {
-                        warn!(%turn_id, %error, "headless turn inputs failed");
-                        return BackendResult::SetupFailed(Some(TurnFailure {
+                .and_then(|admission| admission.prompt_inputs.as_ref());
+            let Some(prompt_inputs) = prompt_inputs else {
+                return self.setup_failed(&context, turn_id, fail(NO_ADMITTED_CWD_ERR));
+            };
+            let setup = context
+                .cancel
+                .race(async {
+                    let slots = prompt_inputs
+                        .resolve(&mut input, self.setup.mcp.as_ref())
+                        .await?;
+                    if let Some(answer_rx) = &self.answer_rx {
+                        while answer_rx.lock().await.try_recv().is_ok() {}
+                    }
+                    Ok::<_, AgentError>(slots)
+                })
+                .await;
+            let slots = match setup {
+                Err(_) => return self.cancel_setup(&context, turn_id),
+                Ok(Err(error)) => {
+                    return self.setup_failed(
+                        &context,
+                        turn_id,
+                        TurnFailure {
                             kind: TurnFailureKind::Internal,
                             diagnostic: error.to_string(),
                             user_message: error.user_message(),
                             retryable: false,
-                        }));
-                    }
-                },
-                None => Arc::default(),
+                        },
+                    );
+                }
+                Ok(Ok(slots)) => slots,
             };
-            let root_context = prompt_inputs
-                .as_ref()
-                .and_then(|inputs| inputs.root_context());
+            let root_context = prompt_inputs.root_context();
             let instructions = root_context
                 .as_ref()
                 .map(|context| context.instructions.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| prompt_inputs.instructions.clone());
             let slots = root_context
                 .as_ref()
                 .map(|context| Arc::clone(&context.slots))
                 .unwrap_or(slots);
-            let event_tx = self.event_sender(&context);
             context.output.set_terminal_sender(event_tx.clone());
-            if let Some(answer_rx) = &self.answer_rx {
-                while answer_rx.lock().await.try_recv().is_ok() {}
-            }
             let mut params = self.params.clone();
             params.prompt_slots = Arc::clone(&slots);
             let mut agent = Agent::for_actor_turn(
                 params,
                 AgentRunParams {
                     history,
-                    system: self.system(&config, &instructions, &slots),
+                    system: self.system(config, &instructions, &slots),
                     event_tx: event_tx.clone(),
-                    tools: self.tools(&config),
+                    tools: self.tools(config),
                 },
                 &context,
                 instructions.loaded,
             )
             .with_user_response_rx(self.answer_rx.clone())
-            .with_local_tools(Arc::clone(&self.local_tools))
-            .with_mcp(self.mcp.clone());
+            .with_local_tools(Arc::clone(&self.setup.local_tools))
+            .with_mcp(self.setup.mcp.clone());
             let outcome = agent.run(turn_id, input).await;
             drop(agent);
             BackendResult::EnteredRun(outcome)
@@ -1000,13 +1186,9 @@ impl ActorBackend for HeadlessBackend {
                         let _ = output.send(IsolatedTurnEvent::Error(error.to_string()));
                         return BackendResult::ControlFailed;
                     }
-                    let config = match self.config(&context).await {
-                        Ok(config) => config,
-                        Err(error) => {
-                            let _ =
-                                output.send(agent::isolated_turn::IsolatedTurnEvent::Error(error));
-                            return BackendResult::ControlFailed;
-                        }
+                    let Some(config) = &context.policy else {
+                        let _ = output.send(IsolatedTurnEvent::Error(NO_TURN_CONFIG.into()));
+                        return BackendResult::ControlFailed;
                     };
                     let (trigger, combined) = CancelToken::new();
                     let cancellation = smol::spawn({
@@ -1023,7 +1205,7 @@ impl ActorBackend for HeadlessBackend {
                             history: history.as_slice().to_vec(),
                             previous: history.branch(history.len()),
                             system: self.system(
-                                &config,
+                                config,
                                 &pinned_context.instructions,
                                 &pinned_context.slots,
                             ),
@@ -1313,7 +1495,7 @@ fn spawn_interactive(
         &template::env_vars_for(&params.initial_wd),
         &params.model,
         &params.config,
-        &params.excluded_tools,
+        &params.profile.excluded_tools,
         params.defaults.workflow,
         params.mcp_handle.is_some(),
     );
@@ -1331,6 +1513,7 @@ fn spawn_interactive(
         let session_ref = session_ref.clone();
         async move {
             let _lifetime = lifetime;
+            let owns_mcp = matches!(params.profile.mcp_lifecycle, McpLifecycle::Owned);
             let initialized = async {
                 if let Some(error) = startup_error {
                     return Err(error);
@@ -1390,9 +1573,8 @@ fn spawn_interactive(
                         .suppress_root_continuations()
                         .map_err(|error| error.to_string())?;
                 }
-                let backend = HeadlessBackend {
-                    persist_turn_results,
-                    params: AgentParams {
+                let backend = HeadlessBackend::new(
+                    AgentParams {
                         agent_id: root_id,
                         provider,
                         model,
@@ -1409,31 +1591,26 @@ fn spawn_interactive(
                         subagent_cancels: children,
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
-                        question_mode: params.question_mode,
+                        question_mode: QuestionMode::Headless,
                         interactive_reauth: false,
                         model_policy: params.model_policy,
                         providers: params.providers,
-                        file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
+                        file_write_locks: Arc::new(FileWriteLocks::new()),
                         offload,
                         managed_turn: None,
                     },
-                    excluded_tools: params.excluded_tools,
-                    system_override: params.system_prompt_override,
-                    append_system: params.append_system_prompt,
-                    setup: TurnSetup {
-                        registry: Arc::clone(ToolRegistry::global_arc()),
-                        local_tools: Arc::clone(&params.local_tools),
-                        mcp: mcp.clone(),
-                        slots: params.prompt_slots,
-                        modes: Arc::clone(&params.modes),
-                        instructions: true,
+                    params.profile,
+                    raw_tx.clone(),
+                    HeadlessBackendOptions {
+                        persist_turn_results,
+                        system_override: params.system_prompt_override,
+                        append_system: params.append_system_prompt,
+                        prompt_slots: params.prompt_slots,
+                        local_tools: params.local_tools,
+                        mcp,
+                        answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
                     },
-                    local_tools: params.local_tools,
-                    mcp,
-                    answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
-                    raw_tx: raw_tx.clone(),
-                    root: root.clone(),
-                };
+                );
                 let mut template = backend.template(&config);
                 if restored_graph {
                     let manager_for_binding = manager.clone();
@@ -1617,7 +1794,7 @@ fn spawn_interactive(
                 }
             }
             manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
-            if let Some(handle) = params.mcp_handle {
+            if owns_mcp && let Some(handle) = params.mcp_handle {
                 handle.shutdown().await;
             }
             drain_offload(_lifetime.offload_cleanup()).await;
@@ -1668,11 +1845,18 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
     use crate::actor::{ActorEvent, ConfigChange, ConfigPatch, PreparedModel};
+    use crate::cancel::ReasonedCancelToken;
+    use crate::mcp::{McpCommand, test_support::gated_session};
+    use crate::prompt::{PromptId, Slot, SlotEntry};
     use crate::session_coordinator::tests::bind_initializing_actor;
     use crate::session_coordinator::{SessionCoordinatorParams, builtin_option_definitions};
     use crate::test_util::MockBackend;
+    use crate::tools::QUESTION_TOOL_NAME;
     use crate::tools::offload::{OffloadBackend, OffloadError};
-    use crate::{DoneReason, McpPromptRef, ModeRegistry, ToolOutput, TurnOutcome, TurnResult};
+    use crate::{
+        ActorWorkIdentity, ActorWorkKind, DoneReason, McpPromptRef, ModeRegistry, ToolOutput,
+        TurnResult,
+    };
     use makima_providers::login::{AuthStatus, InteractionService};
     use makima_providers::model_registry;
     use makima_providers::provider::Provider;
@@ -1698,6 +1882,14 @@ pub(crate) mod tests {
     use std::thread;
     use test_case::test_case;
 
+    const ADMITTED_CWD: &str = "/tmp/admitted";
+    const ADMITTED_INSTRUCTIONS: &str = "admitted instructions";
+    const ADMITTED_IDENTITY: &str = "admitted identity";
+    const MCP_TOOL: &str = "stub.tool";
+    const MCP_WIRE_TOOL: &str = "stub__tool";
+    const OUTPUT_LINES: usize = 12;
+    const CHANGED_CWD: &str = "/tmp/changed";
+    const PRESENTATION: u64 = 1;
     const GATE_TIMEOUT: Duration = Duration::from_secs(10);
     const HEADLESS_PROVIDER_ERROR: &str = "headless provider failed";
     const SAVED_OUTPUT: &str = "saved output";
@@ -1721,7 +1913,7 @@ pub(crate) mod tests {
     const TERMINAL_HANDLE_CANCEL: &str = "headless lifetime cancelled";
     const TERMINAL_COORDINATOR_CLOSE: &str = "terminal coordinator closed";
     type Checkpoint = Arc<dyn CheckpointWriter<crate::session_coordinator::SessionCheckpoint>>;
-    type RecordedRequest = (&'static str, String, String, bool);
+    type RecordedRequest = (&'static str, String, String, bool, Vec<String>);
 
     #[derive(Clone, Copy)]
     enum ProviderExit {
@@ -1796,7 +1988,7 @@ pub(crate) mod tests {
 
     struct RecordingProvider {
         name: &'static str,
-        requests: flume::Sender<(&'static str, String, String, bool)>,
+        requests: flume::Sender<RecordedRequest>,
     }
 
     struct EndRecordingProvider {
@@ -1837,7 +2029,7 @@ pub(crate) mod tests {
             model: &'a Model,
             _: &'a [Message],
             system: &'a str,
-            _: &'a Value,
+            tools: &'a Value,
             _: &'a flume::Sender<makima_providers::ProviderEvent>,
             options: RequestOptions,
             _: Option<&'a SessionRef>,
@@ -1845,9 +2037,13 @@ pub(crate) mod tests {
             _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
-                let _ = self
-                    .requests
-                    .send((self.name, model.spec(), system.into(), options.fast));
+                let _ = self.requests.send((
+                    self.name,
+                    model.spec(),
+                    system.into(),
+                    options.fast,
+                    extract_tool_names(tools),
+                ));
                 Ok(response(self.name))
             })
         }
@@ -1967,7 +2163,7 @@ pub(crate) mod tests {
                 ))
                 .await
                 .unwrap();
-                let (_, _, system, _) = bounded(requests.recv_async()).await.unwrap();
+                let (_, _, system, _, _) = bounded(requests.recv_async()).await.unwrap();
                 let (expected_instructions, rejected_instructions, expected_slot, rejected_slot) =
                     if reloaded {
                         (
@@ -2034,7 +2230,7 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-            let (_, _, system, _) = bounded(requests.recv_async()).await.unwrap();
+            let (_, _, system, _, _) = bounded(requests.recv_async()).await.unwrap();
             assert!(system.contains(INSTRUCTIONS));
             assert!(
                 root_context(&root.state_access())
@@ -2104,7 +2300,7 @@ pub(crate) mod tests {
             permissions_config: PermissionsConfig::default(),
             timeouts: Timeouts::default(),
             prompt_slots: PromptSlotSource::default(),
-            excluded_tools: Vec::new(),
+            profile: FrontendProfile::default(),
             mcp_handle: None,
             initial_wd: PathBuf::from(TEST_CWD.as_str()),
             session_id: Some(SessionRef::from(session_id)),
@@ -2117,7 +2313,6 @@ pub(crate) mod tests {
             defaults: Default::default(),
             model_policy: Arc::default(),
             modes: Arc::new(ModeRegistry::builtin()),
-            question_mode: crate::tools::QuestionMode::Headless,
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(Path::new(TEST_CWD.as_str())),
             local_tools: Arc::default(),
@@ -2247,6 +2442,399 @@ pub(crate) mod tests {
             }),
             received,
         )
+    }
+
+    fn tui_backend(
+        profile: FrontendProfile,
+        options: HeadlessBackendOptions,
+    ) -> (
+        HeadlessBackend,
+        EffectiveAgentConfig,
+        Receiver<Envelope>,
+        Receiver<RecordedRequest>,
+    ) {
+        let cwd = PathBuf::from(ADMITTED_CWD);
+        let (provider, requests) = recording();
+        let model = Model::from_spec(TEST_MODEL).unwrap();
+        let (events, received) = flume::unbounded();
+        let params = AgentParams {
+            agent_id: AgentId::generate(),
+            provider: Arc::clone(&provider),
+            model: model.clone(),
+            config: AgentConfig::default(),
+            tool_output_lines: ToolOutputLines::default(),
+            permissions: Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                cwd.clone(),
+                ProjectConfig::for_project(&cwd),
+                Arc::default(),
+            )),
+            session_id: None,
+            mailbox: None,
+            timeouts: Timeouts::default(),
+            file_tracker: FileReadTracker::fresh(),
+            prompt_slots: Arc::default(),
+            root_context: None,
+            modes: Arc::new(ModeRegistry::builtin()),
+            subagent_cancels: Arc::default(),
+            registry: Arc::clone(ToolRegistry::global_arc()),
+            audience: ToolAudience::MAIN,
+            question_mode: QuestionMode::Headless,
+            interactive_reauth: false,
+            model_policy: Arc::default(),
+            providers: Arc::default(),
+            file_write_locks: Arc::new(FileWriteLocks::new()),
+            offload: None,
+            managed_turn: None,
+        };
+        let config = EffectiveAgentConfig::new(
+            RunSettings {
+                provider,
+                model,
+                fast: false,
+                workflow: false,
+                thinking: Default::default(),
+            },
+            AgentMode::Build,
+        )
+        .with_context(AgentContextSnapshot::new(cwd));
+        (
+            HeadlessBackend::new(params, profile, events, options),
+            config,
+            received,
+            requests,
+        )
+    }
+
+    fn turn_context(
+        backend: &HeadlessBackend,
+        policy: Option<EffectiveAgentConfig>,
+    ) -> TurnContext {
+        let agent_id = backend.params.agent_id;
+        let turn_id = TurnId::generate();
+        TurnContext {
+            agent_id,
+            turn_id: Some(turn_id),
+            work: ActorWorkIdentity::new(
+                agent_id,
+                ActorWorkKind::Turn {
+                    operation_id: PRESENTATION,
+                    turn_id,
+                },
+                PRESENTATION,
+            ),
+            output: Default::default(),
+            provenance: Default::default(),
+            cancel: CancelToken::none(),
+            cancel_reason: ReasonedCancelToken::none(),
+            generation: 0,
+            policy: policy.map(Arc::new),
+            interrupt: None,
+            inbox: None,
+            managed_turn: None,
+            admission: None,
+        }
+    }
+
+    #[test_case(false, true; "missing_policy")]
+    #[test_case(true, true; "missing_prompt_inputs")]
+    #[test_case(true, false; "headless_setup_failure")]
+    fn a_setup_failure_reaches_the_user(has_policy: bool, tui: bool) {
+        smol::block_on(async {
+            let profile = if tui {
+                FrontendProfile::tui(ToolOutputLines::default(), CancelToken::none())
+            } else {
+                FrontendProfile::default()
+            };
+            let (mut backend, config, events, requests) = tui_backend(profile, Default::default());
+            let context = turn_context(&backend, has_policy.then_some(config));
+            let mut history = History::new(Vec::new());
+            let result = backend
+                .run_turn(
+                    ActorHistory::new(&mut history),
+                    context,
+                    first_input(),
+                    WorkKind::Turn,
+                )
+                .await;
+            let expected = if has_policy {
+                NO_ADMITTED_CWD_ERR
+            } else {
+                NO_TURN_CONFIG
+            };
+            let failure = match result {
+                BackendResult::EnteredRun(TurnOutcome::Failed { failure, .. }) if tui => failure,
+                BackendResult::SetupFailed(Some(failure)) if !tui => failure,
+                result => panic!("unexpected setup result: {result:?}"),
+            };
+            assert_eq!(failure.user_message, expected);
+            let mut emitted = events.drain();
+            if has_policy {
+                let model = emitted.next().unwrap();
+                assert_eq!(model.presentation(), Some(PRESENTATION));
+                assert!(
+                    matches!(model.event, AgentEvent::ModelSwitched { spec, .. } if spec == TEST_MODEL)
+                );
+            }
+            if tui {
+                let error = emitted.next().unwrap();
+                assert_eq!(error.presentation(), Some(PRESENTATION));
+                assert!(
+                    matches!(error.event, AgentEvent::ControlError { message } if message == format!("{SETUP_FAILED}: {expected}"))
+                );
+            }
+            assert!(emitted.next().is_none());
+            assert!(requests.is_empty());
+            assert!(history.is_empty());
+        });
+    }
+
+    #[test_case(TurnCancellationReason::User; "user")]
+    #[test_case(TurnCancellationReason::Closed; "closed")]
+    #[test_case(TurnCancellationReason::Shutdown; "shutdown")]
+    fn cancelled_prompt_setup_releases_backend(reason: TurnCancellationReason) {
+        smol::block_on(async {
+            let profile = FrontendProfile::tui(ToolOutputLines::default(), CancelToken::none());
+            let (mut backend, config, events, requests) = tui_backend(profile, Default::default());
+            let input = first_input();
+            let mut snapshot = backend.setup.snapshot(&input, Some(&config));
+            let (pending_prompt, receiver) = flume::bounded(1);
+            Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap()).resolved = Some(receiver);
+            let mut context = turn_context(&backend, Some(config.clone()));
+            let (trigger, cancel) = CancelToken::new();
+            let (reason_trigger, cancel_reason) = ReasonedCancelToken::new();
+            context.cancel = cancel;
+            context.cancel_reason = cancel_reason;
+            context.admission = Some(snapshot);
+            let expected = TurnOutcome::cancelled(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                0,
+                reason,
+            );
+            let mut history = History::new(Vec::new());
+            {
+                let mut run = backend.run_turn(
+                    ActorHistory::new(&mut history),
+                    context,
+                    input,
+                    WorkKind::Turn,
+                );
+                assert!(future::poll_once(&mut run).await.is_none());
+                assert!(matches!(
+                    events.try_recv().unwrap().event,
+                    AgentEvent::ModelSwitched { .. }
+                ));
+                reason_trigger.cancel(reason);
+                trigger.cancel();
+                assert!(
+                    matches!(bounded(&mut run).await, BackendResult::EnteredRun(outcome) if outcome == expected)
+                );
+            }
+            assert!(events.is_empty());
+            assert!(pending_prompt.is_disconnected());
+            assert!(requests.is_empty());
+            let successor = first_input();
+            let mut context = turn_context(&backend, Some(config.clone()));
+            context.admission = Some(backend.setup.snapshot(&successor, Some(&config)));
+            assert!(matches!(
+                bounded(backend.run_turn(
+                    ActorHistory::new(&mut history),
+                    context,
+                    successor,
+                    WorkKind::Turn
+                ))
+                .await,
+                BackendResult::EnteredRun(TurnOutcome::Completed { .. })
+            ));
+            assert_eq!(requests.len(), 1);
+        });
+    }
+
+    #[test_case(false; "cancelled_initialization")]
+    #[test_case(true; "cancelled_admission")]
+    fn submission_setup_respects_admission_cancellation(cancelled: bool) {
+        smol::block_on(async {
+            let (init_trigger, init_cancel) = CancelToken::new();
+            let profile = FrontendProfile::tui(ToolOutputLines::default(), init_cancel);
+            let (mcp, _publish, _) = gated_session(&[]);
+            let options = HeadlessBackendOptions {
+                mcp: Some(mcp),
+                ..Default::default()
+            };
+            let (mut backend, config, events, requests) = tui_backend(profile, options);
+            let mut context = turn_context(&backend, Some(config));
+            let (trigger, cancel) = CancelToken::new();
+            context.cancel = cancel;
+            if cancelled {
+                trigger.cancel();
+            }
+            let mut history = History::new(Vec::new());
+            let mut result = backend.run_turn(
+                ActorHistory::new(&mut history),
+                context,
+                first_input(),
+                WorkKind::Turn,
+            );
+            if cancelled {
+                assert!(matches!(
+                    result.await,
+                    BackendResult::EnteredRun(TurnOutcome::Cancelled {
+                        reason: TurnCancellationReason::User,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(future::poll_once(&mut result).await.is_none());
+                init_trigger.cancel();
+                assert!(
+                    matches!(result.await, BackendResult::EnteredRun(TurnOutcome::Failed { failure, .. }) if failure.user_message == MCP_INIT_CANCELLED)
+                );
+                assert!(matches!(
+                    events.try_recv().unwrap().event,
+                    AgentEvent::ModelSwitched { .. }
+                ));
+                assert!(
+                    matches!(events.try_recv().unwrap().event, AgentEvent::ControlError { message } if message == format!("{SETUP_FAILED}: {MCP_INIT_CANCELLED}"))
+                );
+            }
+            assert!(events.is_empty());
+            assert!(requests.is_empty());
+        });
+    }
+
+    #[test]
+    fn tui_template_and_admitted_prompt_use_the_pinned_environment() {
+        smol::block_on(async {
+            let lines = ToolOutputLines {
+                bash: OUTPUT_LINES,
+                ..Default::default()
+            };
+            let mut profile = FrontendProfile::tui(lines, CancelToken::none());
+            profile.excluded_tools.push(QUESTION_TOOL_NAME);
+            let mut slots = ResolvedSlots::default();
+            slots.insert(
+                PromptId::System,
+                Slot::Identity,
+                SlotEntry {
+                    plugin: "test".into(),
+                    name: "default".into(),
+                    content: ADMITTED_IDENTITY.into(),
+                },
+            );
+            let options = HeadlessBackendOptions {
+                prompt_slots: PromptSlotSource::new(move || {
+                    let (tx, rx) = flume::bounded(1);
+                    tx.send(slots.clone()).unwrap();
+                    rx
+                }),
+                ..Default::default()
+            };
+            let (mut backend, config, _events, requests) = tui_backend(profile, options);
+            let template = backend.template(&config);
+            assert_eq!(template.cwd, Path::new(ADMITTED_CWD));
+            assert_eq!(template.question_mode, QuestionMode::Tui);
+            assert_eq!(template.tool_output_lines, lines);
+            assert!(template.interactive_reauth);
+            assert!(backend.hold_input_after_failure());
+            assert!(Arc::ptr_eq(
+                &template.file_write_locks,
+                &backend.params.file_write_locks
+            ));
+            assert!(!template.tool_filter.matches(QUESTION_TOOL_NAME));
+            let input = first_input();
+            let mut snapshot = backend.setup.snapshot(&input, Some(&config));
+            assert_eq!(
+                backend
+                    .template(
+                        &config
+                            .clone()
+                            .with_context(AgentContextSnapshot::new(PathBuf::from(CHANGED_CWD)))
+                    )
+                    .cwd,
+                Path::new(CHANGED_CWD)
+            );
+            Arc::make_mut(snapshot.prompt_inputs.as_mut().unwrap())
+                .instructions
+                .text = ADMITTED_INSTRUCTIONS.into();
+            let mut context = turn_context(&backend, Some(config));
+            context.admission = Some(
+                backend.prepared_readiness().unwrap()(snapshot)
+                    .await
+                    .unwrap(),
+            );
+            let mut history = History::new(Vec::new());
+            assert!(matches!(
+                bounded(backend.run_turn(
+                    ActorHistory::new(&mut history),
+                    context,
+                    input,
+                    WorkKind::Turn
+                ))
+                .await,
+                BackendResult::EnteredRun(TurnOutcome::Completed { .. })
+            ));
+            let (_, _, system, _, _) = requests.try_recv().unwrap();
+            for expected in [ADMITTED_CWD, ADMITTED_INSTRUCTIONS, ADMITTED_IDENTITY] {
+                assert!(system.contains(expected));
+            }
+            assert!(!system.contains(CHANGED_CWD));
+        });
+    }
+
+    #[test_case(false; "owned_shutdown")]
+    #[test_case(true; "shared_waits_and_leaves_mcp_running")]
+    fn session_mcp_lifecycle(shared: bool) {
+        smol::block_on(async {
+            let (mcp, publish, commands) = gated_session(&[(MCP_TOOL, MCP_TOOL)]);
+            let (provider, requests) = recording();
+            let mut params = interactive_params(MakimaId::generate(), Vec::new());
+            params.mcp_handle = Some(McpHandle::clone(&mcp));
+            if shared {
+                params.profile =
+                    FrontendProfile::tui(ToolOutputLines::default(), CancelToken::none());
+            }
+            let handle = spawn_nonpersistent_with_binding(
+                params,
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
+                None,
+            );
+            let ticket = bounded(handle.input_tx.admit(first_input())).await.unwrap();
+            if shared {
+                loop {
+                    if matches!(
+                        bounded(handle.event_rx.recv_async()).await.unwrap().event,
+                        AgentEvent::ModelSwitched { .. }
+                    ) {
+                        break;
+                    }
+                }
+                assert!(requests.is_empty());
+            }
+            if shared {
+                publish();
+            }
+            assert!(matches!(
+                bounded(ticket.wait()).await,
+                TurnOutcome::Completed { .. }
+            ));
+            let (_, _, _, _, tools) = requests.try_recv().unwrap();
+            assert_eq!(tools.iter().any(|tool| tool == MCP_WIRE_TOOL), shared);
+            let InteractiveHandle { input_tx, task, .. } = handle;
+            drop(input_tx);
+            if !shared {
+                let McpCommand::Shutdown { ack } = bounded(commands.recv_async()).await.unwrap()
+                else {
+                    panic!("expected MCP shutdown");
+                };
+                ack.send(()).unwrap();
+            }
+            bounded(task).await;
+            assert!(commands.is_empty());
+        });
     }
 
     #[test_case(false; "fallback_checkpoint_precedes_admission")]
@@ -3851,11 +4439,11 @@ pub(crate) mod tests {
             let before = bounded(received.recv_async()).await.unwrap();
             let after = bounded(received.recv_async()).await.unwrap();
             assert_eq!(
-                before,
+                (before.0, before.1, before.2, before.3),
                 (FIRST, TEST_MODEL.to_owned(), FIRST_SYSTEM.into(), false)
             );
             assert_eq!(
-                after,
+                (after.0, after.1, after.2, after.3),
                 (
                     SECOND,
                     "anthropic/claude-opus-4-8".into(),

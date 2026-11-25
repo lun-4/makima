@@ -21,7 +21,9 @@ use makima_agent::cancel::CancelToken;
 use makima_agent::command::{
     self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
-use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
+use makima_agent::headless::{
+    self, FrontendProfile, InteractiveHandle, InteractiveParams, ProviderPreparation,
+};
 use makima_agent::permissions::PluginRuleStore;
 use makima_agent::session::SessionEvent;
 use makima_agent::session_coordinator::{
@@ -29,8 +31,8 @@ use makima_agent::session_coordinator::{
     builtin_option_definitions,
 };
 use makima_agent::session_defaults;
+use makima_agent::tools::QUESTION_TOOL_NAME;
 use makima_agent::tools::offload::OffloadCleanup;
-use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use makima_agent::{
     AgentConfig, AgentEvent, AgentInput, DoneReason, Envelope, ImageSource, PermissionsConfig,
     TurnOutcome,
@@ -530,7 +532,10 @@ pub fn run(
                 permissions_config,
                 timeouts,
                 prompt_slots: lua_handle.prompt_slot_source(),
-                excluded_tools: vec![QUESTION_TOOL_NAME],
+                profile: FrontendProfile {
+                    excluded_tools: vec![QUESTION_TOOL_NAME],
+                    ..Default::default()
+                },
                 mcp_handle,
                 initial_wd: cwd,
                 session_id: None,
@@ -544,7 +549,6 @@ pub fn run(
                 model_policy: Arc::clone(&model_policy),
                 providers: Arc::clone(&providers),
                 modes: lua_handle.mode_registry(),
-                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
                 project_config,
                 local_tools: Default::default(),
@@ -1101,7 +1105,7 @@ mod tests {
             permissions_config: PermissionsConfig::default(),
             timeouts: Default::default(),
             prompt_slots: Default::default(),
-            excluded_tools: Vec::new(),
+            profile: FrontendProfile::default(),
             mcp_handle: None,
             initial_wd: cwd.to_path_buf(),
             session_id: None,
@@ -1115,7 +1119,6 @@ mod tests {
             model_policy: Arc::default(),
             providers: print_providers(),
             modes: EventHandle::disconnected_for_test().mode_registry(),
-            question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(cwd),
             local_tools: Default::default(),

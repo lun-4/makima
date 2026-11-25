@@ -39,6 +39,7 @@ use makima_commands::{
 };
 use makima_config::ProjectConfig;
 use makima_providers::{ContentBlock, Message};
+use makima_storage::StateDir;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -760,6 +761,50 @@ impl McpHandle {
         let _ = self.ready_rx.recv_async().await;
     }
 
+    pub fn spawn_oauth_for_needs_auth(&self) {
+        let snapshot = self.reader().load().clone();
+        for info in snapshot.infos.iter() {
+            let McpServerStatus::NeedsAuth { ref url } = info.status else {
+                continue;
+            };
+            let Some(ref server_url) = info.url else {
+                continue;
+            };
+            let handle = self.clone();
+            let server_name = info.name.clone();
+            let server_url = server_url.clone();
+            let www_auth = url.clone();
+            let oauth = info.oauth.clone();
+            smol::spawn(async move {
+                let storage = match StateDir::resolve() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(server = %server_name, error = %e, "cannot resolve storage for OAuth");
+                        return;
+                    }
+                };
+                if let Err(e) = oauth::authenticate(
+                    &server_name,
+                    &server_url,
+                    www_auth.as_deref(),
+                    &storage,
+                    oauth::Interaction::Background,
+                    oauth,
+                )
+                .await
+                {
+                    warn!(server = %server_name, error = %e, "background OAuth failed");
+                    return;
+                }
+                handle.send(McpCommand::Reconnect {
+                    server: server_name.clone(),
+                });
+                info!(server = %server_name, "MCP server authenticated via OAuth");
+            })
+            .detach();
+        }
+    }
+
     pub fn connecting_count(&self) -> usize {
         self.published
             .load()
@@ -1265,7 +1310,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             url,
             headers,
             config.timeout,
-            makima_storage::StateDir::resolve().ok(),
+            StateDir::resolve().ok(),
         )?),
     };
     let capabilities = transport::initialize(transport.as_ref()).await?;
@@ -1548,6 +1593,42 @@ pub mod test_support {
         McpHandle, McpManagerInner, McpPromptDef, McpPublishedState, McpSession, McpToolDef,
         SEPARATOR, ServerEntry, publish,
     };
+
+    #[cfg(test)]
+    use super::{McpCommand, McpSnapshot};
+    #[cfg(test)]
+    use flume::Receiver;
+
+    #[cfg(test)]
+    pub(crate) fn gated_session(
+        tools: &[(&str, &str)],
+    ) -> (McpSession, impl FnOnce(), Receiver<McpCommand>) {
+        let published = stub_session(tools).handle.published.load_full();
+        let mut session = stub_session(&[]);
+        let mut infos = session.reader().load().infos.clone();
+        infos[0].status = McpServerStatus::Connecting;
+        session.handle.published.store(Arc::new(McpPublishedState {
+            snapshot: Arc::new(McpSnapshot {
+                infos,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let (cmd_tx, commands) = flume::unbounded();
+        let (ready, ready_rx) = flume::bounded(0);
+        session.handle.cmd_tx = cmd_tx;
+        session.handle.ready_rx = ready_rx;
+        session.handle.defer_tools = usize::MAX;
+        let target = Arc::clone(&session.handle.published);
+        (
+            session,
+            move || {
+                target.store(published);
+                drop(ready);
+            },
+            commands,
+        )
+    }
 
     const PROMPTS_GET: &str = "prompts/get";
 

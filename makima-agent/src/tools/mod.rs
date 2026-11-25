@@ -355,32 +355,41 @@ impl TurnToolBindings {
         local_tools: &LocalTools,
         mcp: Option<&McpSession>,
     ) -> Self {
-        let mut routes = HashMap::new();
-        let mcp_published = mcp.map(McpSession::published_binding);
-        if let Some((mcp, published)) = mcp.zip(mcp_published.as_ref()) {
-            routes.insert(TOOL_SEARCH_TOOL_NAME.to_owned(), TurnToolRoute::ToolSearch);
-            for binding in mcp.tool_bindings(published) {
-                let qualified = binding.qualified_name().to_string();
-                routes.insert(
-                    wire_tool_name(&qualified),
-                    TurnToolRoute::Mcp(binding.clone()),
-                );
-                routes.insert(qualified, TurnToolRoute::Mcp(binding));
-            }
+        let mut bindings = Self::default();
+        if let Some(mcp) = mcp {
+            bindings.refresh_mcp(mcp);
         }
         for entry in registry.iter().iter() {
-            routes.insert(
+            bindings.routes.insert(
                 entry.name().to_owned(),
                 TurnToolRoute::Native(entry.clone()),
             );
         }
         for (name, tool) in local_tools.iter() {
-            routes.insert(name.clone(), TurnToolRoute::Local(tool.clone()));
+            bindings
+                .routes
+                .insert(name.clone(), TurnToolRoute::Local(tool.clone()));
         }
-        Self {
-            routes,
-            mcp_published,
+        bindings
+    }
+
+    pub(crate) fn refresh_mcp(&mut self, mcp: &McpSession) {
+        self.routes
+            .retain(|_, route| !matches!(route, TurnToolRoute::Mcp(_) | TurnToolRoute::ToolSearch));
+        let published = mcp.published_binding();
+        self.routes
+            .entry(TOOL_SEARCH_TOOL_NAME.into())
+            .or_insert(TurnToolRoute::ToolSearch);
+        for binding in mcp.tool_bindings(&published) {
+            let qualified = binding.qualified_name().to_string();
+            self.routes
+                .entry(wire_tool_name(&qualified))
+                .or_insert_with(|| TurnToolRoute::Mcp(binding.clone()));
+            self.routes
+                .entry(qualified)
+                .or_insert(TurnToolRoute::Mcp(binding));
         }
+        self.mcp_published = Some(published);
     }
 
     pub fn extend_mcp_tools(&self, mcp: &McpSession, tools: &mut Value) {

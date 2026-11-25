@@ -51,7 +51,9 @@ pub struct FrontendProfile {
     pub interactive_reauth: bool,
     pub tool_output_lines: ToolOutputLines,
     pub excluded_tools: Vec<&'static str>,
-    pub mcp: Option<McpHandle>,
+    pub hold_input_after_failure: bool,
+    pub mcp_lifecycle: McpLifecycle,
+    pub report_setup_errors: bool,
 }
 
 pub struct OpenRequest<'a> {
@@ -162,8 +164,8 @@ One commit per step. Each step is verified on the build box (check, workspace ne
 8. `SessionJournalSnapshot` also serves as the read projection. `SessionJournal::projection()` shares the committed snapshot by `Arc`. The TUI refreshes its reference without copying the histories and keeps the actor's shared history for in-flight display. `SessionJournal::set_draft` writes the change-checked `Draft` record. Model and cwd come from committed config. Remove the TUI mirror writes, `App::checkpoint`, `checkpoint_all`, `AppSession::checkpoint`, and `project_session_journal`. `AgentRef::begin_rewind()` reads the journal directly. Reload carries tab IDs and reopens the logs under their locks, including tabs whose cwd changed during the previous UI run.
 9. One shared actor backend and session host:
    - 9a: Share the startup config checkpoint and compaction model resolution. Remove `InteractiveControl::Compact`, the `ModelSource` implementation for `ProviderSlot`, and the unused `InteractiveHandle.model` projection and `SharedModel`.
-   - 9b: Configure `HeadlessBackend` through `FrontendProfile`: `question_mode`, `interactive_reauth`, `tool_output_lines`, `hold_input_after_failure`, and `excluded_tools`. Support shared or owned MCP, with MCP-ready gating, cancellable initialization and OAuth. Share `file_write_locks`, check `cancel_setup` early, emit `ControlError` on setup failure, and emit `ModelSwitched` per turn. The system prompt override and append belong to host config. The TUI remains on its backend.
-   - 9c: Run the TUI root and children on the shared backend and delete `TuiActorBackend`. Adopt terminal checkpoint semantics explicitly.
+   - 9b: Configure `HeadlessBackend` through `FrontendProfile`. The default profile preserves headless question handling, output limits and setup failure delivery. The TUI profile holds queued input after failure, enables interactive reauthentication, and reports setup failures with `ControlError`. The shared backend checks cancellation before and during setup and announces the admitted model for each turn. An owned MCP handle shuts down with the session. A shared handle is gated on first-turn readiness with a cancellation token and starts background OAuth after readiness. The host supplies file write locks, system prompt overrides and append text. The TUI still constructs `TuiActorBackend`.
+   - 9c: Construct `HeadlessBackend` with `FrontendProfile::tui` and use `template(&initial_config)` for orchestration. Pass the existing shared file write locks and MCP handle. Keep the existing runner start gate and shared history in `ResidentAgent` and the deferred root factory. Enable `persist_turn_results` and adopt the shared terminal checkpoint: new work waits for terminal publication, and a checkpoint error fails the outcome. Persistent TUI sessions use the journal writer. Delete `TuiActorBackend` and its duplicate specs. Keep any temporary `btw_system` publication in the TUI host until 9d.
    - 9d: Replace `command_router`, `AgentCommand` and `WorkCancel::Turn` with `CancelScope { Turn(TurnTicket), Subtree(AgentId), ToolUse(String) }`. Use one answer map. Run isolated questions (`btw`) outside the actor queue for every frontend, using pinned context and a history snapshot so they can run during an active turn, as in the TUI today. Delete `btw_system` and the TUI's separate provider path for `btw`.
    - 9e-1: Use one `SessionHost::open` for SDK, ACP and print.
    - 9e-2: Move the TUI to `SessionHost::open`. Define reset once. The TUI carries root config and permissions into the new session. Match that behavior in SDK or document why it differs. ACP and print may omit reset.

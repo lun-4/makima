@@ -94,6 +94,10 @@ impl TurnSetup {
         let mode_def = config
             .and_then(|config| config.mode_def.clone())
             .unwrap_or_else(|| self.modes.current(mode));
+        let mcp_startup_notice = self.mcp.as_ref().and_then(|mcp| {
+            let count = mcp.connecting_count();
+            (count > 0).then_some(count)
+        });
         TurnAdmissionSnapshot {
             mode_def: Some(Arc::new(mode_def)),
             prompt_inputs: config.map(|config| Arc::new(self.prompt_inputs(input, config))),
@@ -102,10 +106,7 @@ impl TurnSetup {
                 &self.local_tools,
                 self.mcp.as_ref(),
             )),
-            mcp_startup_notice: self.mcp.as_ref().and_then(|mcp| {
-                let count = mcp.connecting_count();
-                (count > 0).then_some(count)
-            }),
+            mcp_startup_notice,
         }
     }
 

@@ -19,7 +19,9 @@ use agent_client_protocol_schema::{
 use event_listener::Event;
 use flume::{Receiver, Sender};
 use makima_agent::config_change::ConfigChangeError;
-use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, WorkCancel};
+use makima_agent::headless::{
+    self, FrontendProfile, InteractiveHandle, InteractiveParams, WorkCancel,
+};
 use makima_agent::journal::SessionJournal;
 use makima_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use makima_agent::mcp::{self, McpHandle};
@@ -841,7 +843,6 @@ fn spawn_session_with_checkpoint(
         permissions_config: permissions,
         timeouts: params.timeouts,
         prompt_slots: params.prompt_slots.clone(),
-        excluded_tools: Vec::new(),
         mcp_handle,
         initial_wd: cwd,
         session_id,
@@ -855,10 +856,13 @@ fn spawn_session_with_checkpoint(
         defaults,
         model_policy: Arc::clone(&params.model_policy),
         providers: Arc::clone(&params.providers),
-        question_mode: if elicitation {
-            QuestionMode::Elicitation
-        } else {
-            QuestionMode::Headless
+        profile: FrontendProfile {
+            question_mode: if elicitation {
+                QuestionMode::Elicitation
+            } else {
+                QuestionMode::Headless
+            },
+            ..Default::default()
         },
         plugin_rules: Arc::clone(&params.plugin_rules),
         project_config,
@@ -3103,7 +3107,7 @@ mod tests {
                 },
                 timeouts: Default::default(),
                 prompt_slots: Default::default(),
-                excluded_tools: Vec::new(),
+                profile: FrontendProfile::default(),
                 mcp_handle: None,
                 initial_wd: PathBuf::from("/tmp"),
                 session_id: Some(id.clone()),
@@ -3117,7 +3121,6 @@ mod tests {
                 model_policy: Arc::default(),
                 providers: spec_providers(),
                 modes: Arc::new(makima_agent::ModeRegistry::builtin()),
-                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/tmp")),
                 local_tools: Default::default(),
@@ -4438,7 +4441,7 @@ mod tests {
                 permissions_config: Default::default(),
                 timeouts: Default::default(),
                 prompt_slots: Default::default(),
-                excluded_tools: Vec::new(),
+                profile: FrontendProfile::default(),
                 mcp_handle: None,
                 initial_wd: PathBuf::from("/project"),
                 session_id: Some(SessionRef::from(session_id)),
@@ -4452,7 +4455,6 @@ mod tests {
                 defaults: Default::default(),
                 model_policy: Arc::default(),
                 providers: spec_providers(),
-                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(Path::new("/project")),
                 local_tools: Default::default(),

@@ -31,8 +31,8 @@ use makima_agent::command::{
 };
 use makima_agent::config_change::ConfigChangeError;
 use makima_agent::headless::{
-    self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
-    RootSubmission, WorkCancel,
+    self, FrontendProfile, InteractiveControlSender, InteractiveHandle, InteractiveInputSender,
+    InteractiveParams, RootSubmission, WorkCancel,
 };
 use makima_agent::mcp;
 use makima_agent::permissions::{
@@ -48,7 +48,7 @@ use makima_agent::session_recovery::{
     OpenModel, OpenSessionError, SessionOpening, SessionSource, open_session,
 };
 use makima_agent::session_writer::SessionWriter;
-use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
+use makima_agent::tools::QUESTION_TOOL_NAME;
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
     PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
@@ -848,8 +848,10 @@ impl SdkRuntime {
                 permissions_config,
                 timeouts,
                 prompt_slots,
-                excluded_tools: vec![QUESTION_TOOL_NAME],
-                question_mode: QuestionMode::Headless,
+                profile: FrontendProfile {
+                    excluded_tools: vec![QUESTION_TOOL_NAME],
+                    ..Default::default()
+                },
                 mcp_handle,
                 initial_wd: cwd.clone(),
                 session_id: Some(session_id),
@@ -3715,7 +3717,7 @@ mod tests {
             permissions_config: PermissionsConfig::default(),
             timeouts: Default::default(),
             prompt_slots: Default::default(),
-            excluded_tools: Vec::new(),
+            profile: FrontendProfile::default(),
             mcp_handle: None,
             initial_wd: cwd.clone(),
             session_id: None,
@@ -3732,7 +3734,6 @@ mod tests {
                 "openai",
             ])),
             modes: Arc::new(makima_agent::ModeRegistry::builtin()),
-            question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(&cwd),
             local_tools: Default::default(),
@@ -5270,7 +5271,10 @@ mod tests {
                 permissions_config: PermissionsConfig::default(),
                 timeouts: Default::default(),
                 prompt_slots: lua_handle.prompt_slot_source(),
-                excluded_tools: vec![QUESTION_TOOL_NAME],
+                profile: FrontendProfile {
+                    excluded_tools: vec![QUESTION_TOOL_NAME],
+                    ..Default::default()
+                },
                 mcp_handle: None,
                 initial_wd: cwd.clone(),
                 session_id: None,
@@ -5287,7 +5291,6 @@ mod tests {
                     "openai",
                 ])),
                 modes: lua_handle.mode_registry(),
-                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::default(),
                 project_config: ProjectConfig::for_project(&cwd),
                 local_tools: Default::default(),
