@@ -117,7 +117,7 @@ Escape interrupts the agent the user is looking at. Interrupting a subagent this
 
 ## Task plugin
 
-- Add a `task_list` tool: id, description and status (running, idle, done) of the root's tasks, read from the `policy` slot and the agent graph. The rewind note uses the same code. (Q34)
+- `task_list` shows the ID, description and status (running, idle or done) of the caller's descendant tasks. It reads the `policy` slot and the agent graph. If an agent is missing from the graph, `task_list` shows its task as done only if the caller appears in the task's stored ancestry. The rewind note uses the same code. (Q34)
 
 ## Single writer
 

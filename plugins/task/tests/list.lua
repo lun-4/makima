@@ -3,7 +3,6 @@ local originals = {
   tool = makima.api.register_tool,
   register = makima.state.register,
   get = makima.agent.get,
-  root = makima.agent.root,
 }
 local POLICY_ERROR = "task policy unavailable"
 local STATUS_ERROR = "status unavailable"
@@ -42,14 +41,6 @@ makima.state.register = function(name, spec)
     end,
   }
 end
-makima.agent.root = function(ctx)
-  eq(ctx, context)
-  return {
-    id = function()
-      return root_id
-    end,
-  }
-end
 makima.agent.get = function(ctx, id)
   eq(ctx, context)
   assert(tasks[id], "only resolve tasks from the policy")
@@ -57,7 +48,7 @@ makima.agent.get = function(ctx, id)
   if not status then
     return nil, "agent " .. id .. " is unknown"
   end
-  if caller_id ~= root_id and id ~= "idle" then
+  if caller_id ~= root_id and not (caller_id == "queued" and id == "idle") then
     return nil, "agent " .. id .. " is not a descendant of agent " .. caller_id
   end
   return {
@@ -89,12 +80,13 @@ local ok, err = pcall(function()
 
   eq(output(), "No tasks.")
   tasks = {
-    running = { description = "Active task" },
-    closed = { description = "Closed task" },
-    idle = { description = "Waiting task" },
-    queued = { description = "Queued task" },
-    missing = { description = "Missing agent" },
-    dormant = { description = "Dormant task" },
+    running = { description = "Active task", ancestry = { root_id } },
+    closed = { description = "Closed task", ancestry = { root_id } },
+    idle = { description = "Waiting task", ancestry = { root_id, "queued" } },
+    queued = { description = "Queued task", ancestry = { root_id } },
+    missing = { description = "Missing agent", ancestry = { root_id, "queued" } },
+    untracked = { description = "Missing ancestry" },
+    dormant = { description = "Dormant task", ancestry = { root_id } },
   }
   agents = {
     running = { status = "working", queued = 0 },
@@ -118,7 +110,9 @@ local ok, err = pcall(function()
   )
 
   caller_id = "queued"
-  eq(output(), "idle: Waiting task (idle)")
+  eq(output(), "idle: Waiting task (idle)\nmissing: Missing agent (done)")
+  caller_id = "running"
+  eq(output(), "No tasks.")
   caller_id = root_id
 
   tasks = { running = tasks.running }
@@ -127,7 +121,7 @@ local ok, err = pcall(function()
   tasks.running.description = "Updated description"
   agents.running.status = "closed"
   eq(output(), "running: Updated description (done)")
-  tasks = { unreadable = { description = "Unavailable status" } }
+  tasks = { unreadable = { description = "Unavailable status", ancestry = { root_id } } }
   local unreadable = tool.handler({}, context)
   eq(unreadable.is_error, true)
   eq(unreadable.llm_output, STATUS_ERROR)
@@ -143,5 +137,4 @@ makima.api.register_command = originals.command
 makima.api.register_tool = originals.tool
 makima.state.register = originals.register
 makima.agent.get = originals.get
-makima.agent.root = originals.root
 assert(ok, tostring(err))

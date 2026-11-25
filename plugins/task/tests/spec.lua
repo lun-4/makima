@@ -61,11 +61,13 @@ case("task_policy_uses_durable_ids_and_current_authority", function()
   }
   local tools, command, stored
   tools = {}
+  local caller_id = "owner-durable"
+  local root_id = "root-durable"
   local context = {
     agent = function()
       return {
         id = function()
-          return "owner-durable"
+          return caller_id
         end,
       }
     end,
@@ -167,11 +169,14 @@ case("task_policy_uses_durable_ids_and_current_authority", function()
     eq(admitted, 0)
     eq(stored, nil)
     reject_commit = false
+    stored = { [caller_id] = { description = "Parent task", writes = false, ancestry = { root_id } } }
     local spawned = tools.task_spawn.handler({ description = "retirement", prompt = "" }, context)
     assert(not spawned.is_error, spawned.llm_output)
     eq(makima.json.decode(spawned.llm_output).task_id, agent_id)
     eq(stored[agent_id].owner, nil)
     eq(stored[agent_id].writes, false)
+    eq(table.concat(stored[agent_id].ancestry, ","), root_id .. "," .. caller_id)
+    eq(table.concat(stored[caller_id].ancestry, ","), root_id)
     accessible = false
     local denied = tools.task_stop.handler({ task_id = agent_id }, context)
     eq(denied.is_error, true)

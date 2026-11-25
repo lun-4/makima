@@ -224,6 +224,11 @@ local function enqueue(agent, message, ctx)
 end
 
 local function spawn(spec, input, ctx)
+  local caller, caller_err = ctx:agent()
+  if not caller then
+    return nil, caller_err
+  end
+  local caller_id = caller:id()
   local agent, spawn_err = makima.agent.spawn(ctx, spawn_options(spec, input))
   if not agent then
     return nil, spawn_err
@@ -236,9 +241,16 @@ local function spawn(spec, input, ctx)
       if tasks[task_id] then
         error("duplicate task_id")
       end
+      local parent = tasks[caller_id]
+      local ancestry = {}
+      for i, id in ipairs(parent and parent.ancestry or {}) do
+        ancestry[i] = id
+      end
+      ancestry[#ancestry + 1] = caller_id
       tasks[task_id] = {
         description = input.description,
         writes = spec.subagent_type == "general",
+        ancestry = ancestry,
       }
       return tasks
     end)
@@ -750,12 +762,7 @@ makima.api.register_tool({
     if not caller then
       return { llm_output = caller_err, is_error = true }
     end
-    local root, root_err = makima.agent.root(ctx)
-    if not root then
-      return { llm_output = root_err, is_error = true }
-    end
     local caller_id = caller:id()
-    local is_root = caller_id == root:id()
     local lines = {}
     for id, task in pairs(tasks) do
       if id ~= caller_id then
@@ -772,8 +779,7 @@ makima.api.register_tool({
             label = (status.status == "working" or (status.queued or 0) > 0) and "running" or "idle"
           end
         elseif lookup_err == "agent " .. id .. " is unknown" then
-          -- Only the root can list missing tasks, which have no graph ancestry to check.
-          label = is_root and "done" or nil
+          label = task.ancestry and table.find(task.ancestry, caller_id) and "done" or nil
         elseif lookup_err ~= "agent " .. id .. " is not a descendant of agent " .. caller_id then
           return { llm_output = lookup_err, is_error = true }
         end

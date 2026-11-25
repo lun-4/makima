@@ -487,6 +487,7 @@ fn task_tools_restore_policy_and_exact_turns(kind: &str) {
         policy.as_ref().unwrap()[ids["task_id"].as_str().unwrap()],
         json!({
             "description": kind, "writes": kind == "general",
+            "ancestry": [ids["owner"]],
         })
     );
     let host = host.restart_host(dir.path());
