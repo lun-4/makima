@@ -19,7 +19,7 @@ use makima_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_cand
 use makima_providers::{ImageMediaType, ImageSource, Model, ProviderRegistry};
 
 use crate::config_change::ConfigChangeError;
-use crate::headless::{InteractiveControl, InteractiveControlSender};
+use crate::headless::InteractiveControlSender;
 use crate::session_coordinator::SessionCoordinatorHandle;
 use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
 use crate::{AgentActorHandle, AgentInput, McpPromptRef};
@@ -38,6 +38,7 @@ pub const NONINTERACTIVE_MODEL_USAGE: &str =
     "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode is unsupported by the current model";
 pub const CONTEXT_RELOADED: &str = "Recorded context reloaded";
+pub const SESSION_RESET_UNSUPPORTED: &str = "this frontend cannot replace the session";
 
 pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
     attachments
@@ -85,8 +86,7 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
-/// What a [`SessionCommandHost`] can run: the portable set plus replacing
-/// the session's history.
+/// Session command capabilities for frontends that handle replacement or return guidance.
 pub fn session_capabilities() -> TargetCapabilities {
     portable_capabilities().union(TargetCapabilities::from_slice(&[
         TargetCapability::SessionReplacement,
@@ -95,7 +95,6 @@ pub fn session_capabilities() -> TargetCapabilities {
 }
 
 pub struct SessionCommandHost {
-    control_tx: InteractiveControlSender,
     coordinator: SessionCoordinatorHandle,
     providers: Arc<ProviderRegistry>,
     reset_session_guidance: Option<Arc<str>>,
@@ -104,12 +103,11 @@ pub struct SessionCommandHost {
 
 impl SessionCommandHost {
     pub fn new(
-        control_tx: InteractiveControlSender,
+        _control_tx: InteractiveControlSender,
         coordinator: SessionCoordinatorHandle,
         providers: Arc<ProviderRegistry>,
     ) -> Self {
         Self {
-            control_tx,
             coordinator,
             providers,
             reset_session_guidance: None,
@@ -144,27 +142,10 @@ impl SessionCommandHost {
         }
         match request {
             HostRequest::Builtin(BuiltinOperation::ResetSession) => {
-                if let Some(guidance) = self.reset_session_guidance.clone() {
-                    return Box::pin(async move {
-                        validate().map_err(producer_error)?;
-                        Ok(HostResponse::FrontendFeedback(FrontendFeedback::Text(
-                            guidance,
-                        )))
-                    });
-                }
-                let control_tx = self.control_tx.clone();
+                let response = self.reset_response();
                 Box::pin(async move {
                     validate().map_err(producer_error)?;
-                    let (reply, response) = flume::bounded(1);
-                    control_tx
-                        .send_to(actor, InteractiveControl::Reset(reply))
-                        .map_err(producer_error)?;
                     response
-                        .recv_async()
-                        .await
-                        .map_err(|_| CommandError::StaleTarget)?
-                        .map(|()| HostResponse::Completed)
-                        .map_err(producer_error)
                 })
             }
             HostRequest::Builtin(BuiltinOperation::ToggleYolo) => {
@@ -216,24 +197,11 @@ impl SessionCommandHost {
         })
     }
 
-    fn control(
-        &self,
-        make: impl FnOnce(flume::Sender<Result<(), String>>) -> InteractiveControl + Send + 'static,
-    ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let control_tx = self.control_tx.clone();
-        Box::pin(async move {
-            let (reply, response) = flume::bounded(1);
-            control_tx
-                .send(make(reply))
-                .await
-                .map_err(|_| CommandError::StaleTarget)?;
-            response
-                .recv_async()
-                .await
-                .map_err(|_| CommandError::StaleTarget)?
-                .map(|()| HostResponse::Completed)
-                .map_err(|error| CommandError::Producer(Arc::from(error)))
-        })
+    fn reset_response(&self) -> Result<HostResponse, CommandError> {
+        self.reset_session_guidance
+            .clone()
+            .map(|guidance| HostResponse::FrontendFeedback(FrontendFeedback::Text(guidance)))
+            .ok_or_else(|| producer_error(SESSION_RESET_UNSUPPORTED))
     }
 }
 
@@ -288,14 +256,10 @@ impl makima_commands::CommandHost for SessionCommandHost {
             BuiltinOperation::Compact(instructions) => {
                 Box::pin(async move { Ok(HostResponse::ManualCompaction(instructions)) })
             }
-            BuiltinOperation::ResetSession => match self.reset_session_guidance.clone() {
-                Some(guidance) => Box::pin(async move {
-                    Ok(HostResponse::FrontendFeedback(FrontendFeedback::Text(
-                        guidance,
-                    )))
-                }),
-                None => self.control(InteractiveControl::Reset),
-            },
+            BuiltinOperation::ResetSession => {
+                let response = self.reset_response();
+                Box::pin(async move { response })
+            }
             BuiltinOperation::ToggleYolo => self.toggle_option(YOLO_OPTION_ID),
             BuiltinOperation::ToggleFast => self.toggle_option(FAST_OPTION_ID),
             BuiltinOperation::ToggleWorkflow => self.toggle_option(WORKFLOW_OPTION_ID),

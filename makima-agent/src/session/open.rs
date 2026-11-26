@@ -8,38 +8,50 @@ use makima_domain::LockExt;
 use makima_providers::provider::BoxFuture;
 use makima_providers::{Message, ProviderRegistry};
 use makima_storage::StateDir;
-use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
+use makima_storage::checkpoint::{
+    CheckpointClaim, CheckpointPublication, CheckpointWriter, ClaimingWriter,
+};
 use makima_storage::id::SessionRef;
-use makima_storage::session_lock::LockHeartbeat;
-use makima_storage::sessions::read_prefs;
+use makima_storage::session_lock::{ClaimedSessionLock, LockHeartbeat, SessionPublicationGuard};
+use makima_storage::session_state::StateChange;
+use makima_storage::sessions::{SESSIONS_DIR, read_prefs};
 use smol::Task;
 use tracing::warn;
 
+use crate::actor::{PreparedModel, PreparedTransactionSnapshot};
 use crate::cancel::SessionCancellation;
 use crate::command::SessionCommandHost;
 use crate::headless::{
     self, InteractiveControlSender, InteractiveHandle, InteractiveInputSender, InteractiveParams,
-    McpLifecycle, ProviderPreparation, RootBinding,
+    McpLifecycle, ProviderPreparation, RootBinding, SessionRunnerSettings,
 };
-use crate::journal::SessionJournalSnapshot;
+use crate::journal::{JournalChange, JournalCommit, SessionJournalSnapshot};
 use crate::mcp::McpHandle;
-use crate::permissions::PermissionManager;
+use crate::permissions::{PermissionManager, PermissionSnapshot};
+use crate::session_checkpoint::stored_agent_config;
 use crate::session_coordinator::{
-    SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
+    ConfigProjector, ModelPreparer, PreparedSessionCoordinator, SessionCheckpoint,
+    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
     builtin_option_definitions,
 };
 use crate::session_defaults;
 use crate::session_options::MODEL_OPTION_ID;
 use crate::session_recovery::{
-    OpenModel, OpenSessionError, SessionSource, continuation_notice, open_session,
+    OpenModel, OpenSessionError, RecoveryCandidate, SessionSource, continuation_notice,
+    open_session, resolve_legacy_mode,
 };
-use crate::session_writer::SessionWriter;
-use crate::tools::offload::OffloadCleanup;
-use crate::{AgentManagerHandle, AgentRef, Envelope, TurnId};
+use crate::session_writer::{SessionWriter, StoredSession, WriterStatus};
+use crate::tools::offload::{OffloadCleanup, OffloadStore};
+use crate::tools::{FileWriteLocks, ToolContext};
+use crate::{
+    AgentId, AgentManagerHandle, AgentRef, CancelToken, Envelope, SessionMailbox, SharedMessages,
+    TurnId,
+};
 
-use super::{AnswerRouter, SessionEventPump};
+use super::{AnswerRouter, ResetSeed, SessionEventPump};
 
-const MISSING_ROOT: &str = "recovered session has no root agent";
+const REUSE_UNAVAILABLE: &str = "session replacement requires the current session writer";
+const ROOT_CONFIG_UNAVAILABLE: &str = "session root configuration is unavailable";
 
 pub enum Durability<'a> {
     Persistent {
@@ -63,12 +75,20 @@ pub trait FrontendServices {
         Box::pin(async { Ok(()) })
     }
 
-    fn root_binding(&mut self) -> RootBinding;
+    fn root_binding(&mut self) -> Option<RootBinding> {
+        None
+    }
 
-    fn bind_root<'a>(&'a mut self, session: &'a SessionHandle)
-    -> BoxFuture<'a, Result<(), String>>;
+    fn bind_root<'a>(
+        &'a mut self,
+        _session: &'a SessionHandle,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 
-    fn observe(&mut self, session: &SessionHandle) -> FrontendObserver;
+    fn observe(&mut self, _session: &SessionHandle) -> FrontendObserver {
+        Box::new(|_| {})
+    }
 }
 
 pub struct OpenRequest<'a> {
@@ -98,7 +118,14 @@ pub struct SessionHandle {
     offload_cleanup: Option<OffloadCleanup>,
     mcp: Option<McpHandle>,
     checkpoint: Option<Arc<SessionWriter>>,
-    _lock: Option<Arc<LockHeartbeat>>,
+    lock: Option<LockHeartbeat>,
+    mailbox: SessionMailbox,
+    template: ToolContext,
+    agent_tx: flume::Sender<Envelope>,
+    agent_rx: flume::Receiver<Envelope>,
+    history: SharedMessages,
+    offload: Option<Arc<OffloadStore>>,
+    start: Mutex<Option<flume::Sender<()>>>,
     was_existing: bool,
     continuing_root: BTreeSet<TurnId>,
     continuation_count: usize,
@@ -108,6 +135,57 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    pub fn activate(&self) {
+        if let Some(start) = self.start.lock_unpoisoned().take() {
+            let _ = start.try_send(());
+        }
+    }
+
+    pub fn runner_start_is_pending(&self) -> bool {
+        self.start.lock_unpoisoned().is_some()
+    }
+
+    pub fn template(&self) -> &ToolContext {
+        &self.template
+    }
+    pub fn agent_sender(&self) -> flume::Sender<Envelope> {
+        self.agent_tx.clone()
+    }
+    pub fn agent_receiver(&self) -> flume::Receiver<Envelope> {
+        self.agent_rx.clone()
+    }
+    pub fn shared_history(&self) -> SharedMessages {
+        Arc::clone(&self.history)
+    }
+    pub fn mailbox(&self) -> &SessionMailbox {
+        &self.mailbox
+    }
+    pub fn offload(&self) -> Option<Arc<OffloadStore>> {
+        self.offload.clone()
+    }
+    pub fn writer(&self) -> Option<SessionPersistence> {
+        self.checkpoint.clone().map(SessionPersistence)
+    }
+
+    pub fn reuse(
+        &self,
+        guard: SessionPublicationGuard,
+        seed: StoredSession,
+    ) -> Result<SessionReuse, OpenSessionError> {
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .filter(|writer| writer.session_id() == seed.id)
+            .ok_or_else(|| OpenSessionError::Compose(REUSE_UNAVAILABLE.into()))?;
+        Ok(SessionReuse {
+            guard,
+            seed,
+            checkpoint: Arc::clone(checkpoint),
+            coordinator: self.coordinator.clone(),
+            offload: self.offload(),
+        })
+    }
+
     pub fn root(&self) -> &AgentRef {
         &self.root
     }
@@ -187,7 +265,152 @@ impl SessionHandle {
     }
 }
 
+#[derive(Default)]
+pub struct PrepareOptions {
+    pub permission_base: Option<Arc<PermissionManager>>,
+    pub model_prepare: Option<ModelPreparer>,
+    pub file_write_locks: Option<Arc<FileWriteLocks>>,
+    pub reuse: Option<SessionReuse>,
+    pub reset: Option<ResetSeed>,
+    pub expected_cwd: Option<String>,
+    pub project_config: Option<ConfigProjector>,
+    pub offload: Option<Arc<OffloadStore>>,
+    pub startup: Option<PreparedModel>,
+}
+
+pub struct SessionReuse {
+    guard: SessionPublicationGuard,
+    seed: StoredSession,
+    checkpoint: Arc<SessionWriter>,
+    coordinator: SessionCoordinatorHandle,
+    offload: Option<Arc<OffloadStore>>,
+}
+
+#[derive(Clone)]
+pub struct SessionPersistence(Arc<SessionWriter>);
+
+impl SessionPersistence {
+    pub fn from_writer(writer: Arc<SessionWriter>) -> Self {
+        Self(writer)
+    }
+
+    pub async fn drain(&self) -> Result<(), OpenSessionError> {
+        Ok(self.0.drain().await?)
+    }
+
+    pub async fn close(&self) -> Result<(), OpenSessionError> {
+        self.0.close().await?;
+        Ok(())
+    }
+
+    pub fn status(&self) -> WriterStatus {
+        self.0.status()
+    }
+
+    pub async fn publish_transaction(
+        &self,
+        snapshot: PreparedTransactionSnapshot,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> Result<(), String> {
+        claim(&publication).map_err(|error| error.to_string())?;
+        if let Some(install) = snapshot.install {
+            install()?;
+        }
+        self.drain().await.map_err(|error| error.to_string())
+    }
+}
+
+struct Publication {
+    recovery: RecoveryCandidate,
+    guard: SessionPublicationGuard,
+    lease: Option<ClaimedSessionLock>,
+    replacing: Option<SessionCoordinatorHandle>,
+}
+
+pub struct PreparedSession {
+    session: SessionHandle,
+    coordinator: PreparedSessionCoordinator,
+    publication: Option<Publication>,
+    warnings: Vec<String>,
+}
+
+impl PreparedSession {
+    pub fn session(&self) -> &SessionHandle {
+        &self.session
+    }
+
+    pub fn stored(&self) -> Option<&StoredSession> {
+        self.publication
+            .as_ref()
+            .map(|pending| pending.recovery.session())
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn take_lease(&mut self) -> Option<ClaimedSessionLock> {
+        self.publication.as_mut()?.lease.take()
+    }
+
+    pub fn writer(&self) -> Option<SessionPersistence> {
+        self.session.writer()
+    }
+
+    pub async fn publish(self) -> Result<SessionHandle, OpenSessionError> {
+        let Self {
+            mut session,
+            coordinator,
+            publication,
+            ..
+        } = self;
+        let mut replacing = None;
+        if let Some(Publication {
+            recovery,
+            guard,
+            lease,
+            replacing: current,
+        }) = publication
+        {
+            let writer = session
+                .checkpoint
+                .as_ref()
+                .ok_or_else(|| OpenSessionError::Compose(REUSE_UNAVAILABLE.into()))?;
+            let id = session.session_id.id();
+            guard
+                .publish(|| ())?
+                .ok_or(OpenSessionError::LockLost(id))?;
+            recovery.publish_staged(writer, guard.clone()).await?;
+            writer.bind_publication_guard(Some(guard));
+            if let Some(lease) = lease {
+                let coordinator = session.coordinator.clone();
+                session.lock = Some(LockHeartbeat::spawn(lease, move || coordinator.retire()));
+            }
+            replacing = current;
+        }
+        if let Some(current) = replacing {
+            coordinator.activate_replacing(&current)?;
+        } else {
+            coordinator.activate()?;
+        }
+        Ok(session)
+    }
+}
+
 pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSessionError> {
+    let session = prepare(request, PrepareOptions::default())
+        .await?
+        .publish()
+        .await?;
+    session.activate();
+    Ok(session)
+}
+
+pub async fn prepare(
+    request: OpenRequest<'_>,
+    settings: PrepareOptions,
+) -> Result<PreparedSession, OpenSessionError> {
     let OpenRequest {
         mut params,
         durability,
@@ -197,15 +420,29 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
         prepare,
         services,
     } = request;
+    let PrepareOptions {
+        permission_base,
+        model_prepare,
+        file_write_locks,
+        reuse,
+        reset,
+        expected_cwd,
+        project_config,
+        mut offload,
+        startup,
+    } = settings;
+    let mut warnings = Vec::new();
     let mut was_existing = false;
     let mut continuing_root = BTreeSet::new();
     let mut continuation_count = 0;
     let mut persisted_options = Default::default();
     let mut checkpoint = None;
-    let mut lock = None;
+    let mut publication = None;
     let mut history = None;
     let mut opening_cost = None;
     let mut skip_startup = false;
+    let mut effective_config = None;
+    let mut permissions = None;
     if let Durability::Persistent {
         storage,
         source,
@@ -214,41 +451,147 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
         skip_startup_if_children_continue,
     } = durability
     {
+        let (source, reset_config) = match reset {
+            Some(seed) => (SessionSource::New(seed.session), seed.config),
+            None => (*source, None),
+        };
         let working_dir = params.initial_wd.to_string_lossy();
-        let opening = open_session(
-            storage,
-            *source,
-            OpenModel {
+        let expected_cwd = expected_cwd
+            .as_deref()
+            .or_else(|| require_matching_cwd.then_some(working_dir.as_ref()));
+        let (mut stored, guard, lease, writer, replacing) = if let Some(reuse) = reuse {
+            offload = reuse.offload;
+            let (model, warning) = OpenModel {
                 startup: &params.model,
                 explicit: explicit_model,
                 providers: &params.providers,
                 policy: &params.model_policy,
-            },
-            require_matching_cwd.then_some(working_dir.as_ref()),
-        )?;
-        was_existing = opening.resumed;
-        if let Some(warning) = &opening.warning {
-            let session_id = opening.session.id;
-            warn!(%warning, %session_id, "session model restoration");
+            }
+            .select(&reuse.seed)?;
+            params.model = model;
+            warnings.extend(warning);
+            (
+                reuse.seed,
+                reuse.guard,
+                None,
+                Some(reuse.checkpoint),
+                Some(reuse.coordinator),
+            )
+        } else {
+            let opening = open_session(
+                storage,
+                source,
+                OpenModel {
+                    startup: &params.model,
+                    explicit: explicit_model,
+                    providers: &params.providers,
+                    policy: &params.model_policy,
+                },
+                expected_cwd,
+            )?;
+            was_existing = opening.resumed;
+            warnings.extend(opening.warning.clone());
+            params.model = opening.model.clone();
+            let (stored, lease) = opening.into_claimed();
+            let guard = lease.publication_guard();
+            (stored, guard, Some(lease), None, None)
+        };
+        let root = stored.root_agent_id().unwrap_or_else(AgentId::generate);
+        stored.bind_root_id(root)?;
+        if permission_base.is_some()
+            && stored
+                .latest_state()?
+                .scopes
+                .get(&Some(root))
+                .is_none_or(|scope| scope.config.is_none())
+        {
+            let defaults = session_defaults::resolve(
+                params.defaults,
+                &read_prefs(storage),
+                &stored.meta,
+                stored.messages().is_empty(),
+                &params.model,
+            );
+            stored.meta.fast = defaults.fast;
+            stored.meta.workflow = defaults.workflow;
+            stored.meta.thinking = defaults.thinking;
         }
-        params.model = opening.model.clone();
-        let (writer, lease, recovered) = opening
-            .recover_with_continuation(storage, &params.modes, continue_turns)
-            .await?;
-        let session = recovered.session();
-        let root = session
-            .root_agent_id()
-            .ok_or_else(|| OpenSessionError::Compose(MISSING_ROOT.into()))?;
-        let snapshot = session.history_snapshot();
-        let state = session.latest_state()?;
+        if was_existing || permission_base.is_some() {
+            warnings.extend(resolve_legacy_mode(&mut stored, &params.modes, storage)?);
+        }
+        let state = stored.latest_state()?;
         let root_scope = state.scopes.get(&Some(root));
         let config = root_scope.and_then(|scope| scope.config.as_ref());
+        let snapshot = stored.history_snapshot();
+        let cwd = config.map(|config| config.cwd.as_str()).or_else(|| {
+            (!require_matching_cwd || permission_base.is_some()).then_some(stored.cwd.as_str())
+        });
+        if let Some(path) = cwd
+            .map(Path::new)
+            .filter(|path| require_matching_cwd || path.is_absolute())
+        {
+            params.initial_wd = path.to_path_buf();
+        }
+        params.defaults = if let Some(config) = &reset_config {
+            let config = &config.0;
+            SessionDefaults {
+                fast: config.fast,
+                workflow: config.workflow,
+                thinking: Some(config.thinking.into()),
+            }
+        } else if let Some(config) = config {
+            SessionDefaults {
+                fast: config.fast,
+                workflow: config.workflow,
+                thinking: config.thinking,
+            }
+        } else {
+            session_defaults::resolve(
+                params.defaults,
+                &read_prefs(storage),
+                &stored.meta,
+                snapshot.messages.is_empty(),
+                &params.model,
+            )
+        };
+        persisted_options = config
+            .map(|config| &config.options)
+            .unwrap_or(&stored.meta.session_options)
+            .clone();
+        if !require_matching_cwd && permission_base.is_none() {
+            persisted_options.remove(MODEL_OPTION_ID);
+        }
+        if let Some(base) = permission_base {
+            let mut snapshot = if let Some((config, rules)) = reset_config {
+                params.initial_wd = config.context.cwd().to_path_buf();
+                params.model = config.model.clone();
+                effective_config = Some((*config).clone());
+                rules
+            } else {
+                let (rules, yolo) = state
+                    .scopes
+                    .get(&None)
+                    .map(|scope| (&scope.rules, scope.yolo))
+                    .unwrap_or((&stored.meta.session_rules, stored.meta.yolo));
+                PermissionSnapshot::from_stored(rules, yolo).map_err(compose)?
+            };
+            if !was_existing && !state.scopes.contains_key(&None) {
+                snapshot.yolo = snapshot.yolo.or_else(|| base.persisted_yolo());
+            }
+            let manager = Arc::new(base.fork());
+            manager.restore(snapshot);
+            manager.set_cwd(params.initial_wd.clone());
+            permissions = Some(manager);
+        }
+        let candidate =
+            RecoveryCandidate::prepare_with_continuation(stored.clone(), continue_turns)?;
+        let state = candidate.session().latest_state()?;
         continuation_count = state
             .scopes
             .values()
             .map(|scope| scope.admitted.len())
             .sum();
-        if let Some(scope) = root_scope {
+        if let Some(scope) = state.scopes.get(&Some(root)) {
             continuing_root.extend(scope.admitted.keys().copied());
         }
         if let Some(config) = config {
@@ -258,129 +601,109 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
                 &config.mode,
                 &params.modes,
             )
-            .map_err(|error| OpenSessionError::Compose(error.to_string()))?;
+            .map_err(compose)?;
             if crate::modes::is_read_only_fallback(&restored.mode) {
                 continuation_count -= continuing_root.len();
                 continuing_root.clear();
             }
         }
-        skip_startup = !continuing_root.is_empty()
-            || (skip_startup_if_children_continue && continuation_count != 0);
-        let cwd = config
-            .map(|config| config.cwd.as_str())
-            .or_else(|| (!require_matching_cwd).then_some(session.cwd.as_str()));
-        if let Some(path) = cwd
-            .map(Path::new)
-            .filter(|path| require_matching_cwd || path.is_absolute())
-        {
-            params.initial_wd = path.to_path_buf();
-        }
-        params.defaults = config.map_or_else(
-            || {
-                session_defaults::resolve(
-                    params.defaults,
-                    &read_prefs(storage),
-                    &session.meta,
-                    snapshot.messages.is_empty(),
-                    &params.model,
-                )
-            },
-            |config| SessionDefaults {
-                fast: config.fast,
-                workflow: config.workflow,
-                thinking: config.thinking,
-            },
-        );
-        persisted_options = config
-            .map(|config| &config.options)
-            .unwrap_or(&session.meta.session_options)
-            .clone();
-        if !require_matching_cwd {
-            persisted_options.remove(MODEL_OPTION_ID);
-        }
-        params.session_id = Some(SessionRef::from(session.id));
+        skip_startup = permissions.is_none()
+            && (!continuing_root.is_empty()
+                || (skip_startup_if_children_continue && continuation_count != 0));
+        let journal = candidate.journal();
+        params.session_id = Some(SessionRef::from(stored.id));
         params.root_id = Some(root);
-        params.journal = Some(recovered.journal());
-        opening_cost = recovered.journal().cost();
-        history = Some(snapshot);
+        params.journal = Some(Arc::clone(&journal));
+        opening_cost = journal.cost();
+        history = Some(candidate.session().history_snapshot());
+        let writer = match writer {
+            Some(writer) => writer,
+            None => {
+                let directory = storage.ensure_subdir(SESSIONS_DIR)?;
+                let writer = Arc::new(SessionWriter::open_session(&directory, &stored)?);
+                writer.append_owned(Vec::new(), guard.clone()).await?;
+                writer
+            }
+        };
         checkpoint = Some(writer);
-        lock = Some(lease);
+        publication = Some(Publication {
+            recovery: candidate,
+            guard,
+            lease,
+            replacing,
+        });
     }
     services
         .configure(&mut params, !continuing_root.is_empty())
         .await
         .map_err(OpenSessionError::Compose)?;
+    let model = params.model.clone();
+    let model = match (&effective_config, startup) {
+        (Some(config), _) => PreparedModel {
+            model: config.model.clone(),
+            provider: Arc::clone(&config.provider),
+        },
+        (None, startup) => match prepare(model.clone()).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error = error.user_message();
+                let Some(startup) = startup else {
+                    return Err(OpenSessionError::Compose(error));
+                };
+                warnings.push(format!(
+                    "failed to restore model {}: {error}; using {}",
+                    model.spec(),
+                    startup.model.spec()
+                ));
+                startup
+            }
+        },
+    };
+    params.model = model.model.clone();
     let opening_history = history
         .as_ref()
         .map(|history| Arc::clone(&history.messages))
         .unwrap_or_default();
-    let cwd = params.initial_wd.clone();
-    let model = params.model.spec();
-    let defaults = params.defaults;
-    let ephemeral_yolo = params.permissions_config.yolo;
     let providers = Arc::clone(&params.providers);
     let model_policy = Arc::clone(&params.model_policy);
+    let defaults = params.defaults;
+    let ephemeral_yolo = params.permissions_config.yolo;
     let mcp = if matches!(params.profile.mcp_lifecycle, McpLifecycle::Owned) {
         params.mcp_handle.clone()
     } else {
         None
     };
-    let binding = Some(services.root_binding());
-    let interactive = match &checkpoint {
-        Some(writer) => headless::spawn_interactive_with_checkpoint(
-            params,
-            prepare,
-            history,
-            binding,
-            Arc::clone(writer),
-        ),
-        None => headless::spawn_nonpersistent_with_binding(params, prepare, binding),
+    let init_trigger = if matches!(params.profile.mcp_lifecycle, McpLifecycle::Shared { .. }) {
+        let (trigger, init_cancel) = CancelToken::new();
+        params.profile.mcp_lifecycle = McpLifecycle::Shared { init_cancel };
+        Some(trigger)
+    } else {
+        None
     };
-    let setup = async {
-        let root = interactive
-            .initialized_root()
-            .await
-            .map_err(OpenSessionError::Compose)?;
-        if let Some(writer) = &checkpoint {
-            writer.bind_journal(interactive.manager.journal()).await?;
-        }
-        let definitions = builtin_option_definitions(
-            model,
-            model_options,
-            if checkpoint.is_some() {
-                interactive.permissions.is_yolo()
-            } else {
-                ephemeral_yolo
-            },
-            defaults.fast,
-            defaults.workflow,
-            defaults.thinking.into(),
-        );
-        let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-            session_id: interactive.session_id.id(),
-            catalog: options,
-            definitions,
-            persisted_options,
-            model_policy,
-            checkpoint: checkpoint.clone().map_or_else(
-                ClaimingWriter::accept_all,
-                |writer| -> Arc<dyn CheckpointWriter<SessionCheckpoint>> { writer },
-            ),
-            mailbox: interactive.mailbox.clone(),
-        })?;
-        Ok::<_, OpenSessionError>((root, coordinator))
-    }
-    .await;
-    let (root, coordinator) = match setup {
-        Ok(setup) => setup,
-        Err(error) => {
-            interactive.task.cancel().await;
-            if let Some(mcp) = mcp {
-                mcp.shutdown().await;
-            }
-            return Err(error);
-        }
-    };
+    let spec = params.model.spec();
+    let binding = services.root_binding();
+    let interactive = headless::spawn_session_runner(
+        params,
+        Box::new(move |_| Box::pin(async { Ok(model) })),
+        history,
+        binding,
+        checkpoint.is_some(),
+        checkpoint.clone(),
+        SessionRunnerSettings {
+            permissions,
+            file_write_locks,
+            offload,
+            effective_config,
+            deferred: true,
+            init_trigger,
+            ..Default::default()
+        },
+    );
+    let root = interactive
+        .initialized_root()
+        .await
+        .map_err(OpenSessionError::Compose)?;
+    let template = interactive.template.recv_async().await.map_err(compose)?;
     let InteractiveHandle {
         session_id,
         manager,
@@ -390,15 +713,67 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
         input_tx,
         control_tx,
         permissions,
+        mailbox,
         tool_names,
         task,
         offload_cleanup,
+        agent_tx,
+        agent_rx,
+        runner_start,
+        history,
+        offload,
         ..
     } = interactive;
+    let commit = root
+        .actor()
+        .map_err(compose)?
+        .config_snapshot()
+        .ok_or_else(|| OpenSessionError::Compose(ROOT_CONFIG_UNAVAILABLE.into()))?;
+    let cwd = commit.config.context.cwd().to_path_buf();
+    let coordinator = PreparedSessionCoordinator::new(SessionCoordinatorParams {
+        session_id: session_id.id(),
+        catalog: options,
+        definitions: builtin_option_definitions(
+            spec,
+            model_options,
+            if checkpoint.is_some() {
+                permissions.is_yolo()
+            } else {
+                ephemeral_yolo
+            },
+            defaults.fast,
+            defaults.workflow,
+            defaults.thinking.into(),
+        ),
+        persisted_options,
+        model_policy,
+        checkpoint: checkpoint.clone().map_or_else(
+            ClaimingWriter::accept_all,
+            |writer| -> Arc<dyn CheckpointWriter<SessionCheckpoint>> { writer },
+        ),
+        mailbox: mailbox.clone(),
+    })?;
+    let binding = coordinator
+        .bind(
+            Arc::clone(&permissions),
+            root.clone(),
+            model_prepare
+                .unwrap_or_else(|| headless::default_model_preparer(Arc::clone(&providers))),
+            Arc::new({
+                let permissions = Arc::clone(&permissions);
+                move |commit| {
+                    permissions.set_cwd(commit.config.context.cwd().to_path_buf());
+                    if let Some(project) = &project_config {
+                        project(commit);
+                    }
+                }
+            }),
+        )
+        .map_err(compose)?;
     let session = SessionHandle {
         session_id,
         manager,
-        coordinator,
+        coordinator: binding,
         events,
         cancellation,
         answers,
@@ -407,12 +782,19 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
         permissions,
         tool_names,
         root,
-        providers: Arc::clone(&providers),
+        providers,
         task: Mutex::new(Some(task)),
         offload_cleanup,
         mcp,
         checkpoint,
-        _lock: lock,
+        lock: None,
+        mailbox,
+        template,
+        agent_tx,
+        agent_rx,
+        history,
+        offload,
+        start: Mutex::new(runner_start),
         was_existing,
         continuing_root,
         continuation_count,
@@ -420,44 +802,51 @@ pub async fn open(request: OpenRequest<'_>) -> Result<SessionHandle, OpenSession
         opening_cost,
         cwd,
     };
-    let bound = async {
+    services
+        .bind_root(&session)
+        .await
+        .map_err(OpenSessionError::Compose)?;
+    session.events.set_observer(services.observe(&session));
+    if session.is_persistent() && !skip_startup {
+        let config = stored_agent_config(
+            &commit.config,
+            session.coordinator.read().options().config_values(),
+        )
+        .map_err(compose)?;
+        let id = session.root.id();
         session
-            .coordinator
-            .bind_permissions(Arc::clone(&session.permissions))?;
-        let permissions = Arc::clone(&session.permissions);
-        session
-            .coordinator
-            .bind_actor(
-                session.root.clone(),
-                headless::default_model_preparer(providers),
-                Arc::new(move |commit| {
-                    permissions.set_cwd(commit.config.context.cwd().to_path_buf())
-                }),
-            )
-            .map_err(|error| OpenSessionError::Compose(error.to_string()))?;
-        services
-            .bind_root(&session)
-            .await
-            .map_err(OpenSessionError::Compose)?;
-        if session.is_persistent() && !skip_startup {
-            headless::checkpoint_startup_config(session.root(), &session.coordinator)
-                .await
-                .map_err(OpenSessionError::Compose)?;
-        }
-        session.events.set_observer(services.observe(&session));
-        Ok::<_, OpenSessionError>(())
+            .permissions
+            .commit_startup(JournalCommit {
+                changes: vec![JournalChange {
+                    agent: Some(id),
+                    generation: commit.generation,
+                    change: StateChange::Config(config),
+                }],
+                histories: [(
+                    id,
+                    session
+                        .root
+                        .actor()
+                        .map_err(compose)?
+                        .committed_history_snapshot(),
+                )]
+                .into(),
+                managed_histories: [id].into(),
+                ..Default::default()
+            })
+            .map_err(compose)?;
     }
-    .await;
-    if let Err(error) = bound {
-        session.coordinator.retire();
-        let task = session.task.lock_unpoisoned().take();
-        if let Some(task) = task {
-            task.cancel().await;
-        }
-        if let Some(mcp) = &session.mcp {
-            mcp.shutdown().await;
-        }
-        return Err(error);
+    for warning in &warnings {
+        warn!(%warning, session_id = %session.session_id, "session restoration");
     }
-    Ok(session)
+    Ok(PreparedSession {
+        session,
+        coordinator,
+        publication,
+        warnings,
+    })
+}
+
+fn compose(error: impl ToString) -> OpenSessionError {
+    OpenSessionError::Compose(error.to_string())
 }

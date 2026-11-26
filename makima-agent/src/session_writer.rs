@@ -119,27 +119,32 @@ enum Payload {
     Close,
     Records(Vec<Record>),
     Fork(Box<Record>),
+    Recovery(Vec<Record>),
 }
 
 impl Payload {
     fn count(&self) -> usize {
         match self {
             Self::Close => 0,
-            Self::Records(records) => records.len(),
+            Self::Records(records) | Self::Recovery(records) => records.len(),
             Self::Fork(_) => 1,
         }
+    }
+
+    fn is_atomic(&self) -> bool {
+        matches!(self, Self::Fork(_) | Self::Recovery(_))
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ForkWriteError {
+enum AtomicWriteError {
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("fork append failed ({write}); rollback failed ({rollback}); writer fenced")]
+    #[error("atomic append failed ({write}); rollback failed ({rollback}); writer fenced")]
     Rollback {
         write: io::Error,
         rollback: io::Error,
-        fork_visible: bool,
+        batch_visible: bool,
     },
 }
 
@@ -247,6 +252,14 @@ impl SessionWriter {
     /// A visible fork whose durability cannot be confirmed returns an acknowledgment with a warning.
     pub(crate) fn append_fork(&self, record: Record) -> Receipt {
         self.enqueue(Payload::Fork(Box::new(record)), None)
+    }
+
+    pub(crate) fn append_recovery(
+        &self,
+        records: Vec<Record>,
+        guard: SessionPublicationGuard,
+    ) -> Receipt {
+        self.enqueue(Payload::Recovery(records), Some(guard))
     }
 
     /// Discards unsaved records and stops this writer. Use only before deletion.
@@ -377,8 +390,8 @@ async fn initialize(
         }
         if let Some(error) = &ordinary_error {
             pending.retain(|request| {
-                if matches!(request.payload, Payload::Fork(_)) {
-                    status.lock_unpoisoned().unsaved_records -= 1;
+                if request.payload.is_atomic() {
+                    status.lock_unpoisoned().unsaved_records -= request.payload.count();
                     let _ = request.reply.send(Err(error.clone()));
                     return false;
                 }
@@ -411,17 +424,17 @@ async fn initialize(
                 status.lock_unpoisoned().error = Some(error.clone());
                 update_journals(&journals, Some(error.to_string()));
                 pending.retain_mut(|request| {
-                    let fork = matches!(request.payload, Payload::Fork(_));
-                    if fork {
-                        status.lock_unpoisoned().unsaved_records -= 1;
+                    let atomic = request.payload.is_atomic();
+                    if atomic {
+                        status.lock_unpoisoned().unsaved_records -= request.payload.count();
                     }
                     let _ = request.reply.try_send(Err(error.clone()));
-                    if !fork {
+                    if !atomic {
                         let (reply, receiver) = flume::bounded(1);
                         drop(receiver);
                         request.reply = reply;
                     }
-                    !fork
+                    !atomic
                 });
                 if !pending.is_empty() {
                     warn!(%session_id, %error, "session initialization failed; retrying retained records");
@@ -475,15 +488,16 @@ async fn run(
                     }));
                     return;
                 }
-                Payload::Fork(record) => {
+                payload @ (Payload::Fork(_) | Payload::Recovery(_)) => {
+                    let count = payload.count();
                     if let Some(error) = &ordinary_error {
-                        status.lock_unpoisoned().unsaved_records -= 1;
+                        status.lock_unpoisoned().unsaved_records -= count;
                         let _ = reply.send(Err(error.clone()));
                         continue;
                     }
                     if needs_sync {
                         pending.push_front(Request {
-                            payload: Payload::Fork(record),
+                            payload,
                             guard,
                             reply,
                         });
@@ -491,34 +505,47 @@ async fn run(
                     }
                     let mut candidate_seq = next_seq;
                     let mut encoded = Vec::new();
-                    let encoded_result = if matches!(*record, Record::Fork { .. }) {
-                        encode_record(&record, &mut candidate_seq, &mut encoded)
-                    } else {
-                        Err(io::Error::other("append_fork requires a fork record"))
+                    let fork = matches!(payload, Payload::Fork(_));
+                    let records = match &payload {
+                        Payload::Fork(record) => std::slice::from_ref(record.as_ref()),
+                        Payload::Recovery(records) => records.as_slice(),
+                        _ => unreachable!(),
                     };
+                    let encoded_result =
+                        records.iter().try_for_each(|record| match (fork, record) {
+                            (false, Record::Fork { .. }) => {
+                                Err(io::Error::other("fork records require append_fork"))
+                            }
+                            (true, Record::Fork { .. }) | (false, _) => {
+                                encode_record(record, &mut candidate_seq, &mut encoded)
+                            }
+                            (true, _) => {
+                                Err(io::Error::other("append_fork requires a fork record"))
+                            }
+                        });
                     if let Err(error) = encoded_result {
-                        status.lock_unpoisoned().unsaved_records -= 1;
+                        status.lock_unpoisoned().unsaved_records -= count;
                         let _ = reply.send(Err(writer_error(session_id, error)));
                         continue;
                     }
                     let (returned_io, result) = smol::unblock(move || {
-                        let result = publish(guard.as_ref(), || write_fork(&mut *io, &encoded));
+                        let result = publish(guard.as_ref(), || write_atomic(&mut *io, &encoded));
                         (io, result)
                     })
                     .await;
                     io = returned_io;
-                    let fenced = matches!(&result, Err(ForkWriteError::Rollback { .. }));
-                    let visible = result.is_ok()
-                        || matches!(
+                    let fenced = matches!(&result, Err(AtomicWriteError::Rollback { .. }));
+                    let visible_fork = fork
+                        && matches!(
                             &result,
-                            Err(ForkWriteError::Rollback {
-                                fork_visible: true,
+                            Err(AtomicWriteError::Rollback {
+                                batch_visible: true,
                                 ..
                             })
                         );
                     let error = result.err().map(|error| writer_error(session_id, error));
                     let receipt = if let Some(error) = &error
-                        && !visible
+                        && !visible_fork
                     {
                         Err(error.clone())
                     } else {
@@ -530,7 +557,7 @@ async fn run(
                     };
                     {
                         let mut status = status.lock_unpoisoned();
-                        status.unsaved_records -= 1;
+                        status.unsaved_records -= count;
                         status.error = error.clone();
                     }
                     update_journals(&journals, error.as_ref().map(ToString::to_string));
@@ -667,25 +694,25 @@ fn write_and_sync(io: &mut dyn SessionIo, bytes: &[u8], written: &mut usize) -> 
     io.sync()
 }
 
-fn write_fork(io: &mut dyn SessionIo, bytes: &[u8]) -> Result<(), ForkWriteError> {
+fn write_atomic(io: &mut dyn SessionIo, bytes: &[u8]) -> Result<(), AtomicWriteError> {
     let position = io.position()?;
     let mut written = 0;
     if let Err(write) = write_and_sync(io, bytes, &mut written) {
-        let (rollback, fork_visible) = match io.truncate(position) {
+        let (rollback, batch_visible) = match io.truncate(position) {
             Ok(()) => (io.sync(), false),
             Err(error) => {
-                let fork_visible = io.position().map_or(written == bytes.len(), |end| {
+                let batch_visible = io.position().map_or(written == bytes.len(), |end| {
                     end.saturating_sub(position) >= bytes.len() as u64
                 });
-                (Err(error), fork_visible)
+                (Err(error), batch_visible)
             }
         };
         return match rollback {
             Ok(()) => Err(write.into()),
-            Err(rollback) => Err(ForkWriteError::Rollback {
+            Err(rollback) => Err(AtomicWriteError::Rollback {
                 write,
                 rollback,
-                fork_visible,
+                batch_visible,
             }),
         };
     }
@@ -822,17 +849,20 @@ mod tests {
         }
     }
 
-    #[test_case(false; "partial_write")]
-    #[test_case(true; "fsync")]
-    fn failed_fork_syncs_rollback_and_does_not_consume_sequence(fail_sync: bool) {
+    #[test_case(false, false; "fork_partial_write")]
+    #[test_case(true, false; "fork_fsync")]
+    #[test_case(false, true; "recovery_partial_write")]
+    #[test_case(true, true; "recovery_fsync")]
+    fn failed_atomic_append_rolls_back_without_retrying(fail_sync: bool, recovery: bool) {
         smol::block_on(async {
             const PREFIX: &[u8] = b"{\"t\":\"out\",\"id\":\"prior\",\"seq\":7,\"d\":\"prior\"}\n";
             const NEXT_SEQ: u64 = 8;
             const FOLLOWING: &str = "following";
             let bytes = Arc::new(Mutex::new(PREFIX.to_vec()));
             let (synced, durable) = flume::unbounded();
+            let session_id = MakimaId::generate();
             let writer = SessionWriter::with_io(
-                MakimaId::generate(),
+                session_id,
                 FakeIo {
                     bytes: Arc::clone(&bytes),
                     fail_write: !fail_sync,
@@ -843,16 +873,27 @@ mod tests {
                 },
                 NEXT_SEQ,
             );
-            let fork = Record::Fork {
-                agent: AgentId::generate(),
-                target: None,
-                note_id: MakimaId::generate(),
-                note: "rewind".into(),
-                conversation: ConversationState::fresh(None),
-                input_draft: None,
-                cleared_turns: Vec::new(),
+            let dir = tempfile::tempdir().unwrap();
+            let lease = session_lock::claim(dir.path(), &session_id)
+                .unwrap()
+                .unwrap();
+            let receipt = if recovery {
+                writer.append_recovery(
+                    vec![output("first"), output("second")],
+                    lease.publication_guard(),
+                )
+            } else {
+                writer.append_fork(Record::Fork {
+                    agent: AgentId::generate(),
+                    target: None,
+                    note_id: MakimaId::generate(),
+                    note: "rewind".into(),
+                    conversation: ConversationState::fresh(None),
+                    input_draft: None,
+                    cleared_turns: Vec::new(),
+                })
             };
-            let error = writer.append_fork(fork).await.unwrap_err();
+            let error = receipt.await.unwrap_err();
             assert_eq!(
                 error.message.as_ref(),
                 io::Error::from_raw_os_error(DISK_FULL).to_string()

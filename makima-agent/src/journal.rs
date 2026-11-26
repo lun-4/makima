@@ -1074,6 +1074,13 @@ impl SessionJournal {
         Ok(())
     }
 
+    pub(crate) fn take_unwritten(&self) -> Vec<JournalSessionRecord> {
+        let mut state = self.lock();
+        Self::emit_unwritten(&mut state);
+        state.captured_unwritten = 0;
+        take(&mut state.unwritten)
+    }
+
     pub fn bind_writer(&self, writer: SessionWriter) -> Result<(), JournalError> {
         let mut state = self.lock();
         if state.session_id.is_some_and(|id| id != writer.session_id()) {
@@ -1083,6 +1090,11 @@ impl SessionJournal {
         state.writer.get_or_insert(writer);
         Self::emit_unwritten(&mut state);
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn replace_writer_for_test(&self, writer: SessionWriter) {
+        self.lock().writer = Some(writer);
     }
 
     fn set_session_id(state: &mut JournalState, id: MakimaId) {

@@ -1,4 +1,4 @@
-//! Multi-session supervisor: every session owns an `App` + `AgentHandles` and
+//! Multi-session supervisor: every session owns an `App` + `RuntimeChannels` and
 //! keeps draining agent events while backgrounded; only the focused session
 //! renders and receives input. `SpawnCtx` carries the shared resources needed
 //! to spawn session runtimes at any point.
@@ -19,12 +19,12 @@ use std::time::{Duration, Instant};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
+use arc_swap::ArcSwap;
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, PreparedModel, PreparedTransaction,
-    PreparedTransactionSnapshot,
 };
 use makima_agent::command::{CONTEXT_RELOADED, CustomCommand};
 use makima_agent::config_change::{
@@ -33,25 +33,26 @@ use makima_agent::config_change::{
 #[cfg(test)]
 use makima_agent::context::root_context;
 use makima_agent::end_conversation_detached;
-use makima_agent::headless::{checkpoint_deferred_startup_config, default_model_preparer};
+use makima_agent::headless::{FrontendProfile, InteractiveParams, default_model_preparer};
 use makima_agent::journal::SessionJournalSnapshot;
 use makima_agent::manager::AgentResidency;
 #[cfg(test)]
 use makima_agent::permissions::PermissionAnswer;
-use makima_agent::permissions::{PermissionManager, PermissionSnapshot};
+use makima_agent::permissions::PermissionManager;
 use makima_agent::rewind::RewindOutcome;
-use makima_agent::session::set_title;
+use makima_agent::session::{
+    self, Durability, FrontendServices, OpenRequest, PrepareOptions, PreparedSession, ResetSeed,
+    SessionPersistence, SessionSource, set_title,
+};
 use makima_agent::session_coordinator::{
-    ModelPreparer, PreparedSessionCoordinator, SessionCoordinatorHandle, SessionCoordinatorParams,
-    builtin_option_definitions, canonical_directory, publication_claim,
+    ModelPreparer, SessionCoordinatorHandle, canonical_directory, publication_claim,
 };
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID,
 };
-use makima_agent::session_recovery::{
-    OpenModel, RecoveryCandidate, SessionSource, open_session, prepare_session_recovery,
-};
+use makima_agent::session_recovery::{OpenModel, continue_all_agents};
 use makima_agent::tools::FileWriteLocks;
+#[cfg(test)]
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentRef, CancelToken, CancelTrigger, Envelope,
@@ -74,15 +75,17 @@ use makima_lua::{
     SessionRequest, StatusContentReader, UiAction, UiReply,
 };
 use makima_providers::Timeouts;
-use makima_providers::provider::Provider;
+use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     ConversationEnd, Message, Model, ModelTier, PreparedProvider, ProviderRegistry,
 };
 use makima_storage::StateDir;
 #[cfg(test)]
 use makima_storage::StorageError;
-use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
+use makima_storage::checkpoint::CheckpointPublication;
+#[cfg(test)]
+use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, MakimaIdParseError};
 use makima_storage::session_lock::{self, ClaimedSessionLock, SessionPublicationGuard};
 use makima_storage::sessions::SESSIONS_DIR;
 #[cfg(test)]
@@ -97,11 +100,10 @@ fn claim_lock(dir: &Path, id: &MakimaId) -> Result<ClaimedSessionLock> {
 use crate::AppSession;
 use crate::agent::pending::PendingProvider;
 use crate::agent::{
-    AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot, SystemPromptOverride,
-    shared_queue::QueueItem,
+    ProviderChange, ProviderSlot, RuntimeChannels, SystemPromptOverride,
+    shared_queue::{QueueItem, QueueSender, actor_queue},
 };
 use crate::app::EMPTY_PROMPT_ERR;
-use crate::app::session_state::SessionState;
 use crate::app::shell::ShellEvent;
 use crate::app::{
     App, Msg, Notification, PreparedApp, SubmitOutcome, session_has_content, turn_response,
@@ -124,6 +126,7 @@ use crate::repaint::{Dirty, IDLE_POLL};
 
 use crate::terminal;
 use crate::theme::ThemesProvider;
+#[cfg(test)]
 use makima_agent::session_writer::SessionWriter;
 
 mod approval;
@@ -588,19 +591,6 @@ impl RenewingDeletionLease {
             .lock_unpoisoned()
             .publication_guard()
     }
-
-    fn into_claimed_lock(mut self) -> Result<ClaimedSessionLock, String> {
-        let lease = self.lease.take().ok_or(NOT_LIVE_ERR)?;
-        let _ = self.wake.send(());
-        self.done.recv().map_err(|error| error.to_string())?;
-        Arc::try_unwrap(lease)
-            .map_err(|_| NOT_LIVE_ERR.to_owned())
-            .map(|lease| {
-                lease
-                    .into_inner()
-                    .unwrap_or_else(|error| error.into_inner())
-            })
-    }
 }
 
 impl Drop for RenewingDeletionLease {
@@ -703,71 +693,6 @@ fn complete_option_toggle(app: &mut App, id: &'static str, enabled: bool) {
     app.apply_toggled_option(id, enabled);
 }
 
-fn observe_config_commits(
-    handles: &AgentHandles,
-    model_slot: Arc<ProviderSlot>,
-    coordinator: SessionCoordinatorHandle,
-    prepare: ModelPreparer,
-) -> Result<flume::Receiver<ConfigCommit>, ConfigChangeError> {
-    let (manager, root) = handles.manager_and_root();
-    let (ui_tx, ui_rx) = flume::unbounded();
-    let actor = manager.actor(root)?;
-    {
-        let target = manager.lookup(root);
-        let cwd = handles.cwd_slot();
-        let permissions = Arc::clone(&handles.orchestration_template.permissions);
-        let journal = manager.journal();
-        let binding = permissions
-            .bind_journal(Arc::clone(&journal), Some(journal.incarnation(root)))
-            .map_err(|error| ConfigChangeError::from(error.to_string()))
-            .and_then(|()| {
-                coordinator.bind_permissions(Arc::clone(&permissions))?;
-                Ok(())
-            })
-            .and_then(|()| target.map_err(ConfigChangeError::from))
-            .and_then(|target| {
-                coordinator.bind_actor(
-                    target,
-                    model_slot.track_preparation(prepare),
-                    Arc::new(move |commit| {
-                        model_slot.project(
-                            commit.config.model.clone(),
-                            Arc::clone(&commit.config.provider),
-                        );
-                        let path = commit.config.context.cwd().to_path_buf();
-                        cwd.store(Arc::new(path.clone()));
-                        permissions.set_cwd(path);
-                    }),
-                )
-            });
-        if let Err(error) = binding {
-            coordinator.retire();
-            actor.close();
-            return Err(error);
-        }
-        let commits = actor.subscribe_config_commits();
-        smol::spawn(async move {
-            while let Ok(commit) = commits.recv_async().await {
-                let _ = ui_tx.send(commit);
-            }
-        })
-        .detach();
-    }
-    Ok(ui_rx)
-}
-
-fn checkpoint_root_config(
-    handles: &AgentHandles,
-    coordinator: &SessionCoordinatorHandle,
-) -> Result<(), ConfigChangeError> {
-    let root = handles.manager_and_root().0.root()?;
-    smol::block_on(bounded_session_op(
-        checkpoint_deferred_startup_config(&root, coordinator),
-        SESSION_OP_TIMEOUT,
-    ))
-    .map_err(ConfigChangeError::from)
-}
-
 fn rollback_startup_runtimes(mut runtimes: Vec<SessionRuntime>) {
     for runtime in &mut runtimes {
         runtime.cancel_background_work();
@@ -797,10 +722,10 @@ struct SessionRuntime {
     /// changed.
     projected_config: Option<ConfigCommit>,
     app: App,
-    handles: AgentHandles,
+    handles: RuntimeChannels,
     model_slot: Arc<ProviderSlot>,
     coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionWriter>,
+    checkpoint: SessionPersistence,
     _coordinator_retirement: CoordinatorRetirement,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -810,6 +735,8 @@ struct SessionRuntime {
     lock_lost: bool,
     restore_pending: bool,
     pending_approval: Option<PendingPlanApproval>,
+    #[cfg(test)]
+    test_storage: Option<tempfile::TempDir>,
 }
 
 /// Where a session goes once the model it needs is prepared.
@@ -824,25 +751,20 @@ enum RuntimeTarget {
     },
 }
 
-enum RuntimeOwnership {
-    Claim,
-    Reload,
-    Reuse(SessionPublicationGuard),
-}
-
 struct PreparedSessionRuntime {
     app: PreparedApp,
-    handles: PreparedAgentHandles,
-    recovery: Option<RecoveryCandidate>,
-    session_lock: Option<ClaimedSessionLock>,
+    prepared: PreparedSession,
+    lease: Option<ClaimedSessionLock>,
     model_slot: Arc<ProviderSlot>,
-    coordinator: PreparedSessionCoordinator,
-    checkpoint: Arc<SessionWriter>,
-    prepare_provider: ModelPreparer,
+    config_commits: flume::Receiver<ConfigCommit>,
+    actor_rx: flume::Receiver<ActorEvent>,
+    queue: QueueSender,
+    cwd: Arc<ArcSwap<PathBuf>>,
+    mcp_handle: Option<McpHandle>,
     provider: Option<PreparedProvider>,
-    shell_tx: flume::Sender<ShellEvent>,
-    shell_rx: flume::Receiver<ShellEvent>,
     resumed: bool,
+    #[cfg(test)]
+    before_publish: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
 }
 
 impl PreparedSessionRuntime {
@@ -851,119 +773,79 @@ impl PreparedSessionRuntime {
         (
             self.app.session_id(),
             self.app.command_target_id(),
-            self.recovery
-                .as_ref()
-                .expect("pending runtime recovery")
-                .session()
-                .root_agent_id()
-                .expect("prepared root identity"),
+            self.prepared.session().root().id(),
         )
     }
 
+    fn take_lease(&mut self) -> Option<SessionLockState> {
+        self.lease.take().map(SessionLockState::Held)
+    }
+
     fn activate(
+        mut self,
+        startup_model_slot: &ProviderSlot,
+        session_lock: Option<SessionLockState>,
+    ) -> Result<SessionRuntime> {
+        let lock = session_lock.or_else(|| self.take_lease());
+        self.publish(startup_model_slot, lock)
+            .map_err(|(error, _)| eyre!(error))
+    }
+
+    fn publish(
         self,
         startup_model_slot: &ProviderSlot,
-        mut session_lock: Option<SessionLockState>,
-    ) -> Result<SessionRuntime, ConfigChangeError> {
-        let Self {
-            app,
-            mut handles,
-            recovery,
-            session_lock: prepared_lock,
-            model_slot,
-            coordinator,
-            provider,
-            shell_tx,
-            shell_rx,
-            resumed,
-            checkpoint,
-            prepare_provider,
-            ..
-        } = self;
-        if session_lock.is_none() {
-            session_lock = prepared_lock.map(SessionLockState::Held);
-        }
-        let _guard = session_lock
+        session_lock: Option<SessionLockState>,
+    ) -> std::result::Result<SessionRuntime, (String, Option<SessionLockState>)> {
+        let Some(guard) = session_lock
             .as_ref()
             .and_then(SessionLockState::publication_guard)
-            .ok_or(LOCK_UNAVAILABLE_REPLACEMENT_ERR)?;
-        checkpoint.bind_publication_guard(Some(_guard.clone()));
-        let initialized_before_publication = recovery.is_none();
-        let initialized = if let Some(recovery) = recovery {
-            smol::block_on(bounded_session_op(
-                async {
-                    recovery
-                        .publish(
-                            &checkpoint,
-                            CheckpointPublication::default(),
-                            publication_claim(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-                SESSION_OP_TIMEOUT,
-            ))
-            .and_then(|recovered| handles.initialize(recovered))
-        } else {
-            Ok(())
+        else {
+            return Err((LOCK_UNAVAILABLE_REPLACEMENT_ERR.into(), session_lock));
         };
-        if let Err(error) = initialized {
-            if let Err(release_error) = release_lock_state(session_lock.take()) {
-                warn!(%release_error, "session lock release failed after recovery error");
-            }
-            return Err(error.into());
-        }
-        let coordinator = match coordinator.activate() {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                if let Err(release_error) = release_lock_state(session_lock.take()) {
-                    warn!(%release_error, "session lock release failed after activation error");
-                }
-                return Err(error.into());
-            }
-        };
-        let config_commits = match observe_config_commits(
-            handles.initialized(),
-            Arc::clone(&model_slot),
-            coordinator.clone(),
-            prepare_provider,
-        ) {
-            Ok(commits) => commits,
-            Err(error) => {
-                coordinator.retire();
-                if let Err(release_error) = release_lock_state(session_lock.take()) {
-                    warn!(%release_error, "session lock release failed after binding error");
-                }
-                return Err(error);
-            }
-        };
-        if !initialized_before_publication
-            && let Err(error) = checkpoint_root_config(handles.initialized(), &coordinator)
+        #[cfg(test)]
+        if let Some(hook) = self.before_publish
+            && let Err(error) = hook()
         {
-            coordinator.retire();
-            if let Err(release_error) = release_lock_state(session_lock.take()) {
-                warn!(%release_error, "session lock release failed after startup checkpoint error");
-            }
-            return Err(error);
+            return Err((error, session_lock));
         }
-        if let Some(provider) = provider {
+        if let Err(error) = validate_publication_guard(&guard) {
+            return Err((error, session_lock));
+        }
+        let checkpoint = self
+            .prepared
+            .session()
+            .writer()
+            .expect("persistent session");
+        let session = match smol::block_on(self.prepared.publish()) {
+            Ok(session) => session,
+            Err(error) => return Err((error.to_string(), session_lock)),
+        };
+        if let Some(provider) = self.provider {
             startup_model_slot.install(provider.model, provider.provider);
         }
-        let handles = handles.activate();
-        let mut app = app.activate();
+        let coordinator = session.coordinator.clone();
+        let handles = RuntimeChannels::new(
+            session,
+            self.actor_rx,
+            self.queue,
+            self.cwd,
+            self.mcp_handle,
+        );
+        let mut app = self.app.activate();
         handles.apply_to_app(&mut app);
         app.refresh_session_projection();
         app.coordinator = Some(coordinator.clone());
         let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
+        let (shell_tx, shell_rx) = flume::unbounded();
         Ok(SessionRuntime {
             generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             lifetime_cancel,
             lifetime_trigger: Some(lifetime_trigger),
-            config_commits,
+            config_commits: self.config_commits,
             projected_config: None,
             app,
             handles,
-            model_slot,
+            model_slot: self.model_slot,
             _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
             coordinator,
             checkpoint,
@@ -973,149 +855,30 @@ impl PreparedSessionRuntime {
             notifications: RunNotificationState::default(),
             session_lock,
             lock_lost: false,
-            restore_pending: resumed,
+            restore_pending: self.resumed,
             pending_approval: None,
+            #[cfg(test)]
+            test_storage: None,
         })
     }
 
+    #[cfg(test)]
     fn activate_replacing(
-        self,
+        mut self,
         startup_model_slot: &ProviderSlot,
-        mut session_lock: Option<SessionLockState>,
-        current: &mut SessionRuntime,
-    ) -> std::result::Result<SessionRuntime, (Box<ConfigChangeError>, Option<SessionLockState>)>
-    {
-        let Self {
-            app,
-            mut handles,
-            recovery,
-            session_lock: prepared_lock,
-            model_slot,
-            coordinator,
-            provider,
-            shell_tx,
-            shell_rx,
-            resumed,
-            checkpoint,
-            prepare_provider,
-            ..
-        } = self;
-        if session_lock.is_none() {
-            session_lock = prepared_lock.map(SessionLockState::Held);
-        }
-        let _guard = match session_lock
-            .as_ref()
-            .and_then(SessionLockState::publication_guard)
-        {
-            Some(guard) => guard,
-            None => {
-                return Err((
-                    Box::new(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into()),
-                    session_lock,
-                ));
-            }
-        };
-        checkpoint.bind_publication_guard(Some(_guard.clone()));
-        let same_session = app.session_id() == current.id();
-        let initialized_before_publication = recovery.is_none();
-        if let Some(recovery) = recovery {
-            let recovered = smol::block_on(bounded_session_op(
-                async {
-                    recovery
-                        .publish(
-                            &checkpoint,
-                            CheckpointPublication::default(),
-                            publication_claim(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-                SESSION_OP_TIMEOUT,
-            ));
-            let initialized = recovered.and_then(|recovered| handles.initialize(recovered));
-            if let Err(error) = initialized {
-                return Err((Box::new(error.into()), session_lock));
-            }
-        }
-        match _guard.publish(|| ()) {
-            Ok(Some(())) => {}
-            result => {
-                if same_session {
-                    stop_runtime_after_recovery_failure(current, LOCK_LOST_REPLACEMENT_ERR);
-                }
-                let error = result.err().map_or_else(
-                    || LOCK_LOST_REPLACEMENT_ERR.to_owned(),
-                    |error| error.to_string(),
-                );
-                return Err((Box::new(error.into()), session_lock));
-            }
-        }
-        let activated = if same_session {
-            coordinator.activate_replacing(&current.coordinator)
-        } else {
-            coordinator.activate()
-        };
-        let coordinator = match activated {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                return Err((Box::new(error.into()), session_lock));
-            }
-        };
-        let config_commits = match observe_config_commits(
-            handles.initialized(),
-            Arc::clone(&model_slot),
-            coordinator.clone(),
-            prepare_provider,
-        ) {
-            Ok(commits) => commits,
-            Err(error) => {
-                coordinator.retire();
-                if same_session {
-                    stop_runtime_after_recovery_failure(current, &error.to_string());
-                }
-                return Err((Box::new(error), session_lock));
-            }
-        };
-        if !initialized_before_publication
-            && let Err(error) = checkpoint_root_config(handles.initialized(), &coordinator)
-        {
-            coordinator.retire();
-            if same_session {
-                stop_runtime_after_recovery_failure(current, &error.to_string());
-            }
-            return Err((Box::new(error), session_lock));
-        }
-        if let Some(provider) = provider {
-            startup_model_slot.install(provider.model, provider.provider);
-        }
-        let handles = handles.activate();
-        let mut app = app.activate();
-        handles.apply_to_app(&mut app);
-        app.refresh_session_projection();
-        app.coordinator = Some(coordinator.clone());
-        let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
-        Ok(SessionRuntime {
-            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
-            lifetime_cancel,
-            lifetime_trigger: Some(lifetime_trigger),
-            config_commits,
-            projected_config: None,
-            app,
-            handles,
-            model_slot,
-            _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
-            coordinator,
-            checkpoint,
-            shell_tx,
-            shell_rx,
-            last_status: SessionStatus::Idle,
-            notifications: RunNotificationState::default(),
-            session_lock,
-            lock_lost: false,
-            restore_pending: resumed,
-            pending_approval: None,
-        })
+        target_lock: Option<SessionLockState>,
+        _current: &mut SessionRuntime,
+    ) -> std::result::Result<SessionRuntime, (String, Option<SessionLockState>)> {
+        let lock = target_lock.or_else(|| self.take_lease());
+        self.publish(startup_model_slot, lock)
     }
+}
+
+fn validate_publication_guard(guard: &SessionPublicationGuard) -> Result<(), String> {
+    guard
+        .publish(|| ())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| LOCK_LOST_REPLACEMENT_ERR.into())
 }
 
 fn ensure_replacement_lock_available(
@@ -1140,9 +903,7 @@ fn swap_session_runtime(
     target_lock: Option<SessionLockState>,
     model_slot: &ProviderSlot,
 ) -> std::result::Result<SessionRuntime, (String, Option<SessionLockState>)> {
-    let mut runtime = prepared
-        .activate_replacing(model_slot, target_lock, current)
-        .map_err(|(error, target_lock)| (error.to_string(), target_lock))?;
+    let mut runtime = prepared.publish(model_slot, target_lock)?;
     runtime.app.exit_on_done = current.app.exit_on_done;
     runtime
         .app
@@ -1153,6 +914,7 @@ fn swap_session_runtime(
     old.app
         .command_runtime
         .finish_theme_preview(old.app.command_target.id(), false);
+    #[cfg(test)]
     current.activate_deferred();
     Ok(old)
 }
@@ -1176,18 +938,26 @@ fn replace_session_runtime(
             }
         }
     } else {
-        Some(SessionLockState::Held(
+        Some(
             prepared
-                .session_lock
-                .take()
+                .take_lease()
                 .ok_or(LOCK_UNAVAILABLE_REPLACEMENT_ERR)?,
-        ))
+        )
     };
     match swap_session_runtime(current, prepared, target_lock, model_slot) {
         Ok(old) => Ok(old),
         Err((error, target_lock)) => {
             if same_id {
                 current.session_lock = target_lock;
+                if let Some(guard) = current
+                    .session_lock
+                    .as_ref()
+                    .and_then(SessionLockState::publication_guard)
+                    && validate_publication_guard(&guard).is_err()
+                {
+                    stop_runtime_after_recovery_failure(current, LOCK_LOST_REPLACEMENT_ERR);
+                    return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+                }
             } else if let Err(release_error) = release_lock_state(target_lock) {
                 warn!(%release_error, "replacement lock release failed after activation error");
             }
@@ -1311,6 +1081,7 @@ impl SessionRuntime {
 }
 
 /// Everything needed to bring up a new session runtime after startup.
+#[derive(Clone)]
 struct SpawnCtx {
     initial_model_override: bool,
     workspace_cwd: String,
@@ -1336,67 +1107,18 @@ struct SpawnCtx {
     catalog: ModelCatalog,
     model_policy: Arc<ModelPolicy>,
     session_defaults: SessionDefaults,
+    project_config: ProjectConfig,
     system_prompt: SystemPromptOverride,
     command_runtime: Arc<CommandRuntime>,
     model_capabilities: Arc<ModelCapabilityCache>,
     trust_question: Option<TrustQuestion>,
 }
 
-struct CoordinatorDeps {
-    catalog: makima_agent::session_coordinator::SessionOptionCatalog,
-    model_policy: Arc<ModelPolicy>,
-    checkpoint: Arc<SessionWriter>,
-}
+struct UiSessionServices;
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_coordinator(
-    deps: &CoordinatorDeps,
-    session: &AppSession,
-    available_models: Vec<Arc<str>>,
-    handles: &PreparedAgentHandles,
-    permissions: &Arc<PermissionManager>,
-    config: &makima_agent::EffectiveAgentConfig,
-) -> Result<PreparedSessionCoordinator> {
-    let mailbox = handles
-        .mailbox()
-        .ok_or_else(|| eyre!("session mailbox unavailable"))?;
-    let model_spec = session.model.clone();
-    let definitions = builtin_option_definitions(
-        Arc::from(model_spec.as_str()),
-        available_models,
-        permissions.is_yolo(),
-        config.fast,
-        config.workflow,
-        config.thinking,
-    );
-    let view = session.latest_state()?;
-    let persisted_options = session
-        .root_agent_id()
-        .and_then(|root| view.scopes.get(&Some(root)))
-        .and_then(|scope| scope.config.as_ref())
-        .map(|config| config.options.clone())
-        .unwrap_or_else(|| session.meta.session_options.clone());
-    PreparedSessionCoordinator::new(SessionCoordinatorParams {
-        session_id: session.id,
-        catalog: deps.catalog.clone(),
-        definitions,
-        persisted_options,
-        model_policy: Arc::clone(&deps.model_policy),
-        checkpoint: deps.checkpoint.clone(),
-        mailbox,
-    })
-    .map_err(|error| eyre!(error))
-}
+impl FrontendServices for UiSessionServices {}
 
 impl SpawnCtx {
-    fn coordinator_deps(&self, checkpoint: Arc<SessionWriter>) -> CoordinatorDeps {
-        CoordinatorDeps {
-            catalog: self.lua_event_handle.session_option_catalog(),
-            model_policy: Arc::clone(&self.model_policy),
-            checkpoint,
-        }
-    }
-
     #[cfg(test)]
     fn prepare_runtime(&self, session: AppSession) -> Result<PreparedSessionRuntime> {
         self.prepare_runtime_with_provider(session, None)
@@ -1408,8 +1130,11 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
         current: &SessionRuntime,
     ) -> Result<PreparedSessionRuntime, String> {
-        let same_session = session.id == current.id();
-        let ownership = if same_session {
+        let mut options = PrepareOptions {
+            permission_base: Some(Arc::clone(&current.app.permissions)),
+            ..Default::default()
+        };
+        if session.id == current.id() {
             if current.lock_lost {
                 return Err(LOCK_LOST_REPLACEMENT_ERR.into());
             }
@@ -1418,22 +1143,18 @@ impl SpawnCtx {
                 .as_ref()
                 .and_then(SessionLockState::publication_guard)
                 .ok_or(LOCK_UNAVAILABLE_REPLACEMENT_ERR)?;
-            RuntimeOwnership::Reuse(guard)
+            options.reuse = Some(
+                current
+                    .handles
+                    .session
+                    .reuse(guard, session.clone())
+                    .map_err(|error| error.to_string())?,
+            );
         } else {
-            RuntimeOwnership::Claim
-        };
-        let offload = same_session
-            .then(|| current.handles.offload.clone())
-            .flatten();
-        self.prepare_runtime_with_config(
-            session,
-            provider,
-            &current.app.permissions,
-            ownership,
-            None,
-            offload,
-        )
-        .map_err(|error| error.to_string())
+            options.expected_cwd = Some(self.workspace_cwd.clone());
+        }
+        self.prepare_runtime_with_options(session, provider, options)
+            .map_err(|error| error.to_string())
     }
 
     fn open_model<'a>(&'a self, startup: &'a Model) -> OpenModel<'a> {
@@ -1450,204 +1171,150 @@ impl SpawnCtx {
         session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> Result<PreparedSessionRuntime> {
-        self.prepare_runtime_with_provider_and_permissions(session, provider, &self.permissions)
-    }
-
-    fn prepare_runtime_with_provider_and_permissions(
-        &self,
-        session: AppSession,
-        provider: Option<PreparedProvider>,
-        permissions: &PermissionManager,
-    ) -> Result<PreparedSessionRuntime> {
-        self.prepare_runtime_with_config(
+        self.prepare_runtime_with_options(
             session,
             provider,
-            permissions,
-            RuntimeOwnership::Claim,
-            None,
-            None,
+            PrepareOptions {
+                expected_cwd: Some(self.workspace_cwd.clone()),
+                ..Default::default()
+            },
         )
     }
 
-    fn prepare_runtime_with_config(
-        &self,
-        session: AppSession,
-        provider: Option<PreparedProvider>,
-        permissions: &PermissionManager,
-        ownership: RuntimeOwnership,
-        effective_config: Option<(makima_agent::EffectiveAgentConfig, PermissionSnapshot)>,
-        offload: Option<Arc<OffloadStore>>,
-    ) -> Result<PreparedSessionRuntime> {
-        self.prepare_runtime_candidate(
-            session,
-            provider,
-            permissions,
-            ownership,
-            effective_config,
-            offload,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_runtime_candidate(
+    fn prepare_runtime_with_options(
         &self,
         mut session: AppSession,
         provider: Option<PreparedProvider>,
-        permissions: &PermissionManager,
-        ownership: RuntimeOwnership,
-        effective_config: Option<(makima_agent::EffectiveAgentConfig, PermissionSnapshot)>,
-        offload: Option<Arc<OffloadStore>>,
-        exact: Option<SessionJournalSnapshot>,
+        mut options: PrepareOptions,
     ) -> Result<PreparedSessionRuntime> {
-        let startup = self.model_slot.load().model.clone();
-        let (guard, renewing, selection) = match ownership {
-            RuntimeOwnership::Claim | RuntimeOwnership::Reload => {
-                let source = if session.checkpoint_required() {
-                    SessionSource::Existing(session.id)
-                } else {
-                    SessionSource::ExistingOrNew(session)
-                };
-                let opened = open_session(
-                    &self.storage,
-                    source,
-                    self.open_model(&startup),
-                    matches!(ownership, RuntimeOwnership::Claim)
-                        .then_some(self.workspace_cwd.as_str()),
-                )?;
-                let selection = opened
-                    .resumed
-                    .then(|| (opened.model.clone(), opened.warning.clone()));
-                let (owned, lock) = opened.into_claimed();
-                session = owned;
-                let lease = RenewingDeletionLease::new(lock);
-                (lease.publication_guard(), Some(lease), selection)
-            }
-            RuntimeOwnership::Reuse(guard) => (guard, None, None),
+        let startup = self.model_slot.load();
+        let fallback = PreparedModel {
+            model: startup.model.clone(),
+            provider: Arc::clone(&startup.provider) as Arc<dyn Provider>,
         };
-        let mut model_warning = None;
-        let provider = match selection {
-            Some((selected, warning)) if effective_config.is_none() => {
-                model_warning = warning;
-                if provider
-                    .as_ref()
-                    .is_some_and(|prepared| prepared.model.spec() == selected.spec())
-                {
-                    provider
-                } else if selected.spec() == startup.spec() {
-                    None
-                } else {
-                    let spec = selected.spec();
-                    match smol::block_on((self.prepare_provider)(Arc::from(spec.as_str()))) {
-                        Ok(prepared) => Some(PreparedProvider {
-                            model: prepared.model,
-                            provider: prepared.provider,
-                        }),
-                        Err(error) => {
-                            model_warning =
-                                Some(restore_warning(&spec, &error.to_string(), &startup));
-                            None
-                        }
-                    }
-                }
-            }
-            _ => provider,
-        };
-        let session_lock = match renewing {
-            Some(lease) => Some(lease.into_claimed_lock().map_err(|error| eyre!(error))?),
-            None => None,
-        };
-        let session_id = session.id;
-        let offload = offload.or_else(|| {
-            Some(Arc::new(OffloadStore::for_session(
-                self.storage.path(),
-                &SessionRef::from(session_id),
-            )))
-        });
-        let cwd = PathBuf::from(&session.cwd);
-        let (model, runtime_provider): (Model, Arc<dyn Provider>) = match provider.as_ref() {
-            Some(provider) => (provider.model.clone(), Arc::clone(&provider.provider)),
-            None => {
-                let startup = self.model_slot.load();
-                (
-                    startup.model.clone(),
-                    Arc::clone(&startup.provider) as Arc<dyn Provider>,
-                )
-            }
-        };
-        session.model = model.spec();
+        drop(startup);
         let model_slot = ProviderSlot::with_change_tx(
-            model.clone(),
-            runtime_provider,
+            fallback.model.clone(),
+            Arc::clone(&fallback.provider),
             self.model_slot.change_tx(),
         );
-        let mut state = SessionState::from_session(&session)?;
-        let resumed = session_has_content(&state.projection);
-        let view = session.latest_state()?;
-        let permission_snapshot = match (&effective_config, view.scopes.get(&None)) {
-            (Some((_, snapshot)), _) => snapshot.clone(),
-            (_, Some(scope)) => PermissionSnapshot::from_stored(&scope.rules, scope.yolo)?,
-            (_, None) if resumed => {
-                PermissionSnapshot::from_stored(&session.meta.session_rules, session.meta.yolo)?
+        let supplied = provider;
+        options.startup = Some(fallback.clone());
+        let supplied_model = supplied.as_ref().map(|p| p.model.clone());
+        let prepare_provider = Arc::clone(&self.prepare_provider);
+        let track_slot = Arc::clone(&model_slot);
+        let prepare = Box::new(move |model: Model| -> BoxFuture<'static, _> {
+            Box::pin(async move {
+                let spec = model.spec();
+                let prepared = if let Some(prepared) = supplied.filter(|p| p.model.spec() == spec) {
+                    prepared
+                } else if fallback.model.spec() == spec {
+                    fallback
+                } else {
+                    prepare_provider(Arc::from(spec)).await.map_err(|error| {
+                        makima_providers::AgentError::Config {
+                            message: error.to_string(),
+                        }
+                    })?
+                };
+                Ok(track_slot.track_model(prepared))
+            })
+        });
+        let cwd = Arc::new(ArcSwap::from_pointee(PathBuf::from(&session.cwd)));
+        options
+            .permission_base
+            .get_or_insert_with(|| Arc::clone(&self.permissions));
+        options.model_prepare =
+            Some(model_slot.track_preparation(Arc::clone(&self.prepare_provider)));
+        options.project_config = Some(Arc::new({
+            let model_slot = Arc::clone(&model_slot);
+            let cwd = Arc::clone(&cwd);
+            move |commit: &ConfigCommit| {
+                model_slot.project(
+                    commit.config.model.clone(),
+                    Arc::clone(&commit.config.provider),
+                );
+                cwd.store(Arc::new(commit.config.context.cwd().to_path_buf()));
             }
-            (_, None) => {
-                let mut snapshot = PermissionSnapshot::from_stored(
-                    &session.meta.session_rules,
-                    session.meta.yolo,
-                )?;
-                snapshot.yolo = snapshot.yolo.or_else(|| permissions.persisted_yolo());
-                snapshot
-            }
-        };
-        let permissions = Arc::new(permissions.fork());
-        permissions.restore(permission_snapshot);
-        // Resolve the agent's configuration before the app exists, so mode, fast,
-        // workflow and thinking have one starting value: the one the agent is
-        // seeded with. `effective_config` only carries a caller's explicit
-        // override; everything else comes from the session being resumed.
-        let config = guard
-            .publish(|| -> Result<_> {
-                Ok(match effective_config {
-                    Some((config, _)) => config,
-                    None => {
-                        let provider = Arc::clone(&model_slot.load().provider) as Arc<dyn Provider>;
-                        state.starting_config(
-                            provider,
-                            &model,
-                            cwd.clone(),
-                            &self.lua_event_handle.mode_registry(),
-                            &self.storage,
-                            self.session_defaults,
-                        )?
-                    }
-                })
-            })?
-            .ok_or_else(|| eyre!(LOCK_LOST_REPLACEMENT_ERR))??;
-        let cwd = config.context.cwd().to_path_buf();
-        session.set_cwd(cwd.to_string_lossy().into_owned());
-        permissions.set_cwd(cwd.clone());
-        let root_id = session.root_agent_id().unwrap_or_else(AgentId::generate);
-        session.bind_root_id(root_id)?;
-        let stored = makima_agent::session_checkpoint::stored_agent_config(
-            &config,
-            session.meta.session_options.clone(),
-        )?;
-        session.resolve_legacy_config(stored)?;
-        if let Some(snapshot) = &exact {
-            let history = snapshot
-                .histories
-                .get(&root_id)
-                .ok_or_else(|| eyre!(NOT_LIVE_ERR))?;
-            session.adopt_history(history);
+        }));
+        options.file_write_locks = Some(Arc::clone(&self.file_write_locks));
+        let initial_wd = PathBuf::from(&session.cwd);
+        // A new tab can be seeded from its focused tab rather than the startup model.
+        let model = if !session.checkpoint_required() {
+            supplied_model.inspect(|model| session.model = model.spec())
+        } else {
+            None
         }
-        let (checkpoint, recovery) =
-            prepare_session_recovery(&self.sessions_dir, session, guard.clone(), exact)?;
-        let session = recovery.session().clone();
-        let coordinator_config = config.clone();
+        .unwrap_or_else(|| self.model_slot.load().model.clone());
+        let source = if session.checkpoint_required() {
+            SessionSource::Existing(session.id)
+        } else {
+            SessionSource::ExistingOrNew(session)
+        };
+        let (_, init_cancel) = CancelToken::new();
+        let mut prepared = smol::block_on(session::prepare(
+            OpenRequest {
+                params: InteractiveParams {
+                    model,
+                    config: self.config.clone(),
+                    permissions_config: Default::default(),
+                    timeouts: self.timeouts,
+                    prompt_slots: self.lua_event_handle.prompt_slot_source(),
+                    profile: FrontendProfile::tui(self.ui_config.tool_output_lines, init_cancel),
+                    mcp_handle: self.mcp_handle.clone(),
+                    initial_wd,
+                    session_id: None,
+                    root_id: None,
+                    journal: None,
+                    initial_history: Vec::new(),
+                    yolo: false,
+                    system_prompt_override: self.system_prompt.override_text.clone(),
+                    append_system_prompt: self.system_prompt.append_text.clone(),
+                    defaults: self.session_defaults,
+                    model_policy: Arc::clone(&self.model_policy),
+                    providers: Arc::clone(&self.providers),
+                    modes: self.lua_event_handle.mode_registry(),
+                    plugin_rules: Arc::default(),
+                    project_config: self.project_config.clone(),
+                    local_tools: Arc::default(),
+                    state_dir: Some(self.storage.path().to_path_buf()),
+                    answers: true,
+                },
+                durability: Durability::Persistent {
+                    storage: &self.storage,
+                    source: Box::new(source),
+                    explicit_model: self.initial_model_override,
+                    require_matching_cwd: options.expected_cwd.is_some(),
+                    skip_startup_if_children_continue: true,
+                },
+                continue_turns: continue_all_agents(),
+                options: self.lua_event_handle.session_option_catalog(),
+                model_options: self.catalog.snapshot(),
+                prepare,
+                services: &mut UiSessionServices,
+            },
+            options,
+        ))?;
+        let root = prepared.session().root();
+        let actor = root.actor()?;
+        let config_commits = actor.subscribe_config_commits();
+        let actor_rx = actor.subscribe_events();
+        let config = actor
+            .effective_config()
+            .ok_or_else(|| eyre!(NOT_LIVE_ERR))?;
+        let startup_provider: Arc<dyn Provider> = self.model_slot.load().provider.clone();
+        let provider =
+            (!Arc::ptr_eq(&config.provider, &startup_provider)).then(|| PreparedProvider {
+                model: config.model.clone(),
+                provider: Arc::clone(&config.provider),
+            });
+        model_slot.project(config.model.clone(), Arc::clone(&config.provider));
+        cwd.store(Arc::new(config.context.cwd().to_path_buf()));
+        let queue = actor_queue(Arc::new(actor));
         let mut app = App::prepare(
-            config.clone(),
+            (*config).clone(),
             &self.config,
-            session.clone(),
+            prepared.stored().expect("persistent session seed").clone(),
             self.storage.clone(),
             self.catalog.specs(),
             self.mcp_handle
@@ -1660,7 +1327,7 @@ impl SpawnCtx {
             self.status_content_reader.clone(),
             self.ui_config.clone(),
             self.input_history_size,
-            Arc::clone(&permissions),
+            Arc::clone(&prepared.session().permissions),
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
             Arc::clone(&self.providers),
@@ -1668,49 +1335,27 @@ impl SpawnCtx {
             Arc::clone(&self.command_runtime),
             Arc::clone(&self.model_capabilities),
         )?;
-        app.app.state.warnings.extend(state.warnings);
-        app.app.state.warnings.extend(model_warning);
-        let handles = AgentHandles::prepare_recovered(
-            config,
-            self.config.clone(),
-            self.ui_config.tool_output_lines,
-            &permissions,
-            cwd,
-            SessionRef::from(session_id),
-            offload,
-            self.timeouts,
-            self.lua_event_handle.clone(),
-            self.mcp_handle.clone(),
-            Arc::clone(&self.model_policy),
-            Arc::clone(&self.providers),
-            self.system_prompt.clone(),
-            Arc::clone(&self.file_write_locks),
-        );
-        smol::block_on(checkpoint.append_owned(Vec::new(), guard.clone()))?;
-        let deps = self.coordinator_deps(checkpoint);
-        let coordinator = prepare_coordinator(
-            &deps,
-            &session,
-            self.catalog.snapshot(),
-            &handles,
-            &permissions,
-            &coordinator_config,
-        )?;
+        app.app
+            .state
+            .warnings
+            .extend_from_slice(prepared.warnings());
         app.app.trust_question = self.trust_question.clone();
-        let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        let resumed = session_has_content(&app.app.state.projection);
+        let lease = prepared.take_lease();
         Ok(PreparedSessionRuntime {
             app,
-            handles,
-            recovery: Some(recovery),
-            session_lock,
+            lease,
+            prepared,
             model_slot,
-            coordinator,
-            checkpoint: deps.checkpoint,
-            prepare_provider: Arc::clone(&self.prepare_provider),
+            config_commits,
+            actor_rx,
+            queue,
+            cwd,
+            mcp_handle: self.mcp_handle.clone(),
             provider,
-            shell_tx,
-            shell_rx,
             resumed,
+            #[cfg(test)]
+            before_publish: None,
         })
     }
 
@@ -1725,10 +1370,13 @@ impl SpawnCtx {
         provider: Option<PreparedProvider>,
     ) -> Result<SessionRuntime> {
         let prepared = self.prepare_runtime_with_provider(session, provider)?;
-        let mut runtime = prepared
-            .activate(&self.model_slot, None)
-            .map_err(|error| eyre!(error))?;
-        runtime.activate_deferred();
+        let runtime = prepared.activate(&self.model_slot, None)?;
+        #[cfg(test)]
+        let runtime = {
+            let mut runtime = runtime;
+            runtime.activate_deferred();
+            runtime
+        };
         Ok(runtime)
     }
 }
@@ -1784,7 +1432,7 @@ enum InternalEvent {
     RuntimePrepared {
         target: RuntimeTarget,
         session: Box<AppSession>,
-        result: Result<PreparedProvider, String>,
+        result: Result<PreparedProvider, (Arc<str>, ConfigChangeError)>,
     },
     SessionHeartbeat(u64),
 }
@@ -2112,6 +1760,7 @@ impl<'t> EventLoop<'t> {
             catalog,
             model_policy,
             session_defaults,
+            project_config,
             system_prompt: SystemPromptOverride {
                 override_text: system_prompt_override,
                 append_text: append_system_prompt,
@@ -2131,46 +1780,18 @@ impl<'t> EventLoop<'t> {
             ),
         };
         let mut runtimes = Vec::with_capacity(sessions.len());
-        let mut prepares = Vec::new();
         let mut on_startup_provider = Vec::new();
         for session in sessions {
-            let (selected, _) = match ctx.open_model(&model).select(&session) {
-                Ok(selection) => selection,
-                Err(error) => {
-                    rollback_startup_runtimes(runtimes);
-                    return Err(error.into());
-                }
-            };
-            let restore = (selected.spec() != model.spec()).then(|| {
-                (
-                    Arc::<str>::from(selected.spec()),
-                    selected,
-                    Arc::new(PendingProvider::default()),
-                )
-            });
-            let provider = restore
-                .as_ref()
-                .map(|(_, model, pending)| PreparedProvider {
-                    model: model.clone(),
-                    provider: Arc::clone(pending) as Arc<dyn Provider>,
-                });
-            let runtime = if reloading {
-                ctx.prepare_runtime_with_config(
+            let runtime = ctx
+                .prepare_runtime_with_options(
                     session,
-                    provider,
-                    &ctx.permissions,
-                    RuntimeOwnership::Reload,
                     None,
-                    None,
+                    PrepareOptions {
+                        expected_cwd: (!reloading).then(|| ctx.workspace_cwd.clone()),
+                        ..Default::default()
+                    },
                 )
-                .and_then(|prepared| {
-                    prepared
-                        .activate(&ctx.model_slot, None)
-                        .map_err(|error| eyre!(error))
-                })
-            } else {
-                ctx.spawn_runtime_with_provider(session, provider)
-            };
+                .and_then(|prepared| prepared.activate(&ctx.model_slot, None));
             let runtime = match runtime {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -2178,43 +1799,28 @@ impl<'t> EventLoop<'t> {
                     return Err(error);
                 }
             };
-            let seeded = {
-                let current = runtime.model_slot.load();
-                (
+            if let Some(config) = runtime.config()
+                && config.model.spec() == model.spec()
+            {
+                on_startup_provider.push((
                     runtime.id(),
                     PreparedModel {
-                        model: current.model.clone(),
-                        provider: Arc::clone(&current.provider) as Arc<dyn Provider>,
+                        model: config.model.clone(),
+                        provider: Arc::clone(&config.provider),
                     },
-                )
-            };
-            match restore {
-                Some((spec, _, pending)) if seeded.1.model.spec() == spec.as_ref() => prepares
-                    .push(StartupPrepare {
-                        spec,
-                        pending,
-                        root: false,
-                        targets: vec![seeded],
-                    }),
-                _ if seeded.1.model.spec() == model.spec() => on_startup_provider.push(seeded),
-                _ => {}
+                ));
             }
             runtimes.push(runtime);
         }
         ctx.initial_model_override = false;
         if let Some(pending) = startup_pending {
-            prepares.push(StartupPrepare {
+            StartupPrepare {
                 spec: Arc::from(model.spec()),
                 pending,
                 root: true,
                 targets: on_startup_provider,
-            });
-        }
-        for prepare in prepares {
-            prepare.spawn(Arc::clone(&ctx.prepare_provider), internal_tx.clone());
-        }
-        for runtime in &mut runtimes {
-            runtime.activate_deferred();
+            }
+            .spawn(Arc::clone(&ctx.prepare_provider), internal_tx.clone());
         }
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
@@ -2247,7 +1853,7 @@ impl<'t> EventLoop<'t> {
             warn_tx.clone(),
             internal_tx.clone(),
         );
-        Ok(Self {
+        let mut event_loop = Self {
             terminal,
             sessions: runtimes,
             focused,
@@ -2273,7 +1879,12 @@ impl<'t> EventLoop<'t> {
             internal_tx,
             internal_rx,
             model_discovery,
-        })
+        };
+        event_loop.sync_orchestration();
+        for runtime in &mut event_loop.sessions {
+            runtime.activate_deferred();
+        }
+        Ok(event_loop)
     }
 
     fn sync_orchestration(&mut self) {
@@ -3746,6 +3357,7 @@ impl<'t> EventLoop<'t> {
         }
         self.sessions.push(rt);
         let idx = self.sessions.len() - 1;
+        self.sync_orchestration();
         self.sessions[idx].activate_deferred();
         idx
     }
@@ -3767,7 +3379,9 @@ impl<'t> EventLoop<'t> {
         let prepare = Arc::clone(&self.ctx.prepare_provider);
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
-            let result = prepare(spec).await.map_err(|error| error.to_string());
+            let result = prepare(Arc::clone(&spec))
+                .await
+                .map_err(|error| (spec, error));
             let _ = internal_tx.send(InternalEvent::RuntimePrepared {
                 target,
                 session: Box::new(session),
@@ -3781,10 +3395,27 @@ impl<'t> EventLoop<'t> {
         &mut self,
         target: RuntimeTarget,
         session: AppSession,
-        result: Result<PreparedProvider, String>,
+        result: Result<PreparedProvider, (Arc<str>, ConfigChangeError)>,
     ) {
-        let result =
-            result.and_then(|provider| self.place_runtime(&target, session, Some(provider)));
+        let result = match result {
+            Ok(provider) => self.place_runtime(&target, session, Some(provider)),
+            Err((spec, error)) => {
+                // The checkpoint may have changed since prefetch. Reuse the error
+                // only if shared preparation selects the same model under its lease.
+                let mut ctx = self.ctx.clone();
+                let prepare = Arc::clone(&ctx.prepare_provider);
+                let failure = Mutex::new(Some(error));
+                ctx.prepare_provider = Arc::new(move |selected| {
+                    if selected == spec
+                        && let Some(error) = failure.lock_unpoisoned().take()
+                    {
+                        return Box::pin(async move { Err(error) });
+                    }
+                    prepare(selected)
+                });
+                self.place_runtime_with(&ctx, &target, session, None)
+            }
+        };
         self.report_placement(target, result);
     }
 
@@ -3794,15 +3425,25 @@ impl<'t> EventLoop<'t> {
         session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> Result<(), String> {
+        self.place_runtime_with(&self.ctx.clone(), target, session, provider)
+    }
+
+    fn place_runtime_with(
+        &mut self,
+        ctx: &SpawnCtx,
+        target: &RuntimeTarget,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> Result<(), String> {
         let (runtime, kind) = match target {
-            RuntimeTarget::Open { .. } => return self.open_runtime(session, provider),
+            RuntimeTarget::Open { .. } => return self.open_runtime(ctx, session, provider),
             RuntimeTarget::Replace { runtime, kind, .. } => (runtime, kind),
         };
         let idx = self.runtime_position(runtime).ok_or(RUNTIME_GONE_ERR)?;
         // Taking a blank tab was decided before the model was prepared; the
         // user may have typed or started work there since, so look again.
         if kind.is_none() && !self.blank_and_idle(idx) {
-            return self.open_runtime(session, provider);
+            return self.open_runtime(ctx, session, provider);
         }
         if self.sessions[idx].lock_lost {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
@@ -3812,27 +3453,31 @@ impl<'t> EventLoop<'t> {
             .flatten();
         let prepared = if matches!(kind, Some(SessionReplacementKind::Reset { .. })) {
             let runtime = &self.sessions[idx];
-            let config = (*runtime.app.root_config()).clone();
-            let permissions = runtime.app.permissions.snapshot();
-            self.ctx
-                .prepare_runtime_with_config(
-                    session,
-                    provider,
-                    &runtime.app.permissions,
-                    RuntimeOwnership::Claim,
-                    Some((config, permissions)),
-                    None,
-                )
-                .map_err(|error| error.to_string())?
+            let reset =
+                ResetSeed::from_root(runtime.handles.session.root(), &runtime.app.permissions)
+                    .map_err(|error| error.to_string())?
+                    .with_session(session.clone());
+            ctx.prepare_runtime_with_options(
+                session,
+                provider,
+                PrepareOptions {
+                    permission_base: Some(Arc::clone(&runtime.app.permissions)),
+                    reset: Some(reset),
+                    expected_cwd: Some(self.ctx.workspace_cwd.clone()),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| error.to_string())?
         } else {
-            self.ctx
-                .prepare_replacement_runtime(session, provider, &self.sessions[idx])?
+            ctx.prepare_replacement_runtime(session, provider, &self.sessions[idx])?
         };
         let reset_journal = matches!(kind, Some(SessionReplacementKind::Reset { .. }))
             .then(|| self.sessions[idx].handles.manager_and_root().0.journal());
         if matches!(kind, Some(SessionReplacementKind::Planning)) {
             let mut old =
                 replace_session_runtime(&mut self.sessions[idx], prepared, &self.ctx.model_slot)?;
+            self.sync_orchestration();
+            self.sessions[idx].activate_deferred();
             old.cancel_background_work();
             smol::spawn(async move {
                 let SessionRuntime {
@@ -3885,6 +3530,7 @@ impl<'t> EventLoop<'t> {
 
     fn open_runtime(
         &mut self,
+        ctx: &SpawnCtx,
         session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> Result<(), String> {
@@ -3892,9 +3538,9 @@ impl<'t> EventLoop<'t> {
             self.set_focused(idx);
             return Ok(());
         }
-        let runtime = self
-            .ctx
-            .spawn_runtime_with_provider(session, provider)
+        let runtime = ctx
+            .prepare_runtime_with_provider(session, provider)
+            .and_then(|prepared| prepared.activate(&ctx.model_slot, None))
             .map_err(|error| error.to_string())?;
         let idx = self.push_runtime(runtime);
         self.set_focused(idx);
@@ -3952,6 +3598,8 @@ impl<'t> EventLoop<'t> {
         prepared: PreparedSessionRuntime,
     ) -> Result<(), String> {
         let old = replace_session_runtime(&mut self.sessions[idx], prepared, &self.ctx.model_slot)?;
+        self.sync_orchestration();
+        self.sessions[idx].activate_deferred();
         smol::spawn(self.retire_runtime(idx, old, ())).detach();
         Ok(())
     }
@@ -3974,11 +3622,11 @@ impl<'t> EventLoop<'t> {
             lock_lost,
             ..
         } = old;
-        if !lock_lost {
-            app.persist_input();
-        }
         let retired_id = app.state.projection.id;
         let replaced_session = retired_id != self.sessions[idx].id();
+        if replaced_session && !lock_lost {
+            app.persist_input();
+        }
         let ended_conversation = replaced_session
             .then(|| handles.history.load().conversation.clone())
             .flatten()
@@ -4865,13 +4513,10 @@ impl<'t> EventLoop<'t> {
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
                         let _registration = registration;
-                        publish_writer_transaction(
-                            &checkpoint,
-                            snapshot,
-                            publication,
-                            publication_claim(),
-                        )
-                        .await
+                        checkpoint
+                            .publish_transaction(snapshot, publication, publication_claim())
+                            .await
+                            .map_err(|error| error.to_string())
                     })
                 }),
                 finalize: Box::new(|_| {}),
@@ -5392,19 +5037,6 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
     }
 }
 
-async fn publish_writer_transaction(
-    writer: &SessionWriter,
-    snapshot: PreparedTransactionSnapshot,
-    publication: CheckpointPublication,
-    claim: CheckpointClaim,
-) -> Result<(), String> {
-    claim(&publication).map_err(|error| error.to_string())?;
-    if let Some(install) = snapshot.install {
-        install()?;
-    }
-    writer.drain().await.map_err(|error| error.to_string())
-}
-
 fn runtime_config_mutations(
     runtime: &SessionRuntime,
     orchestration: Arc<AgentOrchestration>,
@@ -5459,7 +5091,10 @@ fn runtime_config_mutations(
                 publish: Box::new(move |snapshot, publication| {
                     Box::pin(async move {
                         let _registration = registration;
-                        publish_writer_transaction(&checkpoint, snapshot, publication, claim).await
+                        checkpoint
+                            .publish_transaction(snapshot, publication, claim)
+                            .await
+                            .map_err(|error| error.to_string())
                     })
                 }),
                 finalize: Box::new(|_| {}),
@@ -5662,7 +5297,6 @@ mod tests {
     use makima_providers::{
         AgentError, Invocation, RequestDelivery, RequestOptions, StreamResponse,
     };
-    use makima_storage::checkpoint::ClaimingWriter;
     use makima_storage::sessions::HistorySnapshot;
 
     /// A preparer for tests, from a blocking one over the resolved model,
@@ -7074,110 +6708,19 @@ end })
         model
     }
 
-    struct TestSessionIo;
-
-    impl makima_agent::session_writer::SessionIo for TestSessionIo {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            Ok(bytes.len())
-        }
-        fn sync(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A runtime whose app and provider slot both start on `model`.
     fn test_runtime(model: Model) -> SessionRuntime {
-        let id = MakimaId::generate();
-        test_runtime_with_id(model, id)
+        test_runtime_with_id(model, MakimaId::generate())
     }
 
     fn test_runtime_with_id(model: Model, id: MakimaId) -> SessionRuntime {
-        let (model_slot, _change_rx) = ProviderSlot::new(model, Arc::new(StubProvider));
-        let permissions = Arc::new(PermissionManager::new(
-            makima_config::PermissionsConfig::default(),
-            PathBuf::from("/tmp"),
-            ProjectConfig::for_project(Path::new("/tmp")),
-            Arc::default(),
-        ));
-        let mut app = crate::app::tests::test_app();
-        let handles = AgentHandles::spawn(
-            &model_slot,
-            Vec::new(),
-            AgentConfig::default(),
-            makima_agent::ToolOutputLines::default(),
-            &permissions,
-            PathBuf::from("/tmp"),
-            None,
-            Timeouts::default(),
-            EventHandle::disconnected_for_test(),
-            None,
-            Arc::new(ModelPolicy::default()),
-            Arc::default(),
-            SystemPromptOverride::default(),
-        );
-        handles.apply_to_app(&mut app);
-        let journal = handles.manager_and_root().0.journal();
-        journal.bind_session(id).unwrap();
-        app.state.projection = journal.projection();
-        let checkpoint = Arc::new(SessionWriter::with_io(id, TestSessionIo, 0));
-        let coordinator = test_coordinator(id);
-        let (shell_tx, shell_rx) = flume::unbounded();
-        let config_commits = observe_config_commits(
-            &handles,
-            Arc::clone(&model_slot),
-            coordinator.clone(),
-            sync_preparer(|model| {
-                Ok(makima_agent::PreparedModel {
-                    model,
-                    provider: Arc::new(StubProvider),
-                })
-            }),
-        )
-        .unwrap();
-        let (lifetime_trigger, lifetime_cancel) = CancelToken::new();
-        SessionRuntime {
-            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
-            lifetime_cancel,
-            lifetime_trigger: Some(lifetime_trigger),
-            config_commits,
-            projected_config: None,
-            app,
-            handles,
-            model_slot,
-            _coordinator_retirement: CoordinatorRetirement(coordinator.clone()),
-            coordinator,
-            checkpoint,
-            shell_tx,
-            shell_rx,
-            last_status: SessionStatus::Idle,
-            notifications: RunNotificationState::default(),
-            session_lock: None,
-            lock_lost: false,
-            restore_pending: false,
-            pending_approval: None,
-        }
-    }
-
-    fn test_coordinator(session_id: MakimaId) -> SessionCoordinatorHandle {
-        PreparedSessionCoordinator::new(SessionCoordinatorParams {
-            session_id,
-            catalog: Default::default(),
-            definitions: builtin_option_definitions(
-                "anthropic/test-model",
-                [Arc::from("anthropic/test-model")],
-                false,
-                false,
-                false,
-                makima_agent::ThinkingConfig::Off,
-            ),
-            persisted_options: Default::default(),
-            model_policy: Arc::default(),
-            checkpoint: ClaimingWriter::accept_all(),
-            mailbox: makima_agent::SessionMailbox::new(session_id),
-        })
-        .expect("coordinator preparation")
-        .activate()
-        .expect("coordinator activation")
+        let mut harness = RuntimeHarness::new();
+        let ctx = harness.ctx.as_mut().unwrap();
+        ctx.model_slot = ProviderSlot::new(model, Arc::new(StubProvider)).0;
+        let mut session = harness.session();
+        session.id = id;
+        let mut runtime = harness.runtime(session);
+        runtime.test_storage = Some(harness._temp_dir);
+        runtime
     }
 
     struct StubProvider;
@@ -7600,6 +7143,7 @@ end })
                 catalog,
                 model_policy: Arc::new(ModelPolicy::default()),
                 session_defaults: SessionDefaults::default(),
+                project_config: ProjectConfig::for_project(temp_dir.path()),
                 system_prompt: SystemPromptOverride::default(),
                 command_runtime,
                 model_capabilities: ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
@@ -7729,15 +7273,6 @@ end })
         }
     }
 
-    impl Drop for RuntimeHarness {
-        fn drop(&mut self) {
-            let Some(ctx) = self.ctx.take() else {
-                return;
-            };
-            drop(ctx);
-        }
-    }
-
     pub(super) fn shutdown_manager(manager: &makima_agent::AgentManagerHandle) {
         let report = smol::block_on(manager.shutdown(RUNTIME_SHUTDOWN_TIMEOUT));
         assert!(report.timed_out.is_empty());
@@ -7747,12 +7282,13 @@ end })
         let SessionRuntime {
             handles,
             session_lock,
+            test_storage: _storage,
             ..
         } = runtime;
         release_lock_state(session_lock).unwrap();
         let manager = handles.manager_and_root().0;
-        drop(handles);
         shutdown_manager(&manager);
+        drop(handles);
     }
 
     const REWIND_TARGET: &str = "rewind target";
@@ -7810,14 +7346,16 @@ end })
         let mut session = harness.session();
         session.push_message(Message::user(REWIND_TARGET.into()));
         let ctx = harness.ctx();
-        let mut prepared = ctx.prepare_runtime(session).unwrap();
+        let prepared = ctx.prepare_runtime(session).unwrap();
+        let mut runtime = prepared.activate(&ctx.model_slot, None).unwrap();
         if let Some(failure) = failure {
-            let id = prepared.snapshot().0;
+            let id = runtime.id();
             let log = fs::OpenOptions::new()
                 .read(true)
                 .append(true)
                 .open(ctx.sessions_dir.join(format!("{id}.jsonl")))
                 .unwrap();
+            let next_seq = AppSession::load(id, &ctx.storage).unwrap().next_state_seq();
             let writer = SessionWriter::with_io(
                 id,
                 FailingForkIo {
@@ -7825,11 +7363,18 @@ end })
                     failure,
                     writing_fork: false,
                 },
-                1,
+                next_seq,
             );
-            prepared.checkpoint = Arc::new(writer);
+            let guard = runtime.session_lock.as_ref().unwrap().publication_guard();
+            writer.bind_publication_guard(guard);
+            runtime.checkpoint = SessionPersistence::from_writer(Arc::new(writer.clone()));
+            runtime
+                .handles
+                .session
+                .manager
+                .journal()
+                .replace_writer_for_test(writer);
         }
-        let mut runtime = prepared.activate(&ctx.model_slot, None).unwrap();
         runtime.app.restore_display();
         runtime
     }
@@ -7933,7 +7478,7 @@ end })
                 app.persist_input();
                 app.active_chat = 0;
                 assert_eq!(app.input_box.buffer.value(), EDITED_PROMPT);
-                smol::block_on(rt.checkpoint.append(Vec::new())).unwrap();
+                smol::block_on(rt.checkpoint.drain()).unwrap();
                 let reopened = AppSession::load_from(rt.id(), &event_loop.sessions_dir).unwrap();
                 assert_eq!(reopened.meta.input_draft.as_deref(), Some(EDITED_PROMPT));
                 drop(root_idle);
@@ -8506,13 +8051,13 @@ end })
             })));
             let prepared = event_loop
                 .ctx
-                .prepare_runtime_with_config(
+                .prepare_runtime_with_options(
                     session,
                     None,
-                    &event_loop.ctx.permissions,
-                    RuntimeOwnership::Claim,
-                    None,
-                    Some(Arc::clone(&store)),
+                    PrepareOptions {
+                        offload: Some(Arc::clone(&store)),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
             let runtime = prepared.activate(&event_loop.ctx.model_slot, None).unwrap();
@@ -8821,13 +8366,13 @@ end })
         })));
         let prepared = harness
             .ctx()
-            .prepare_runtime_with_config(
+            .prepare_runtime_with_options(
                 session.clone(),
                 None,
-                &harness.ctx().permissions,
-                RuntimeOwnership::Claim,
-                None,
-                Some(Arc::clone(&store)),
+                PrepareOptions {
+                    offload: Some(Arc::clone(&store)),
+                    ..Default::default()
+                },
             )
             .unwrap();
         let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
@@ -8871,7 +8416,7 @@ end })
         const PLAN: &str = "active-approved-plan.md";
         let mut harness = RuntimeHarness::new();
         let prepared = harness.prepare();
-        let mut owner = prepared.recovery.as_ref().unwrap().session().clone();
+        let mut owner = prepared.prepared.stored().unwrap().clone();
         drop(prepared);
         let id = owner.id;
         let root = owner.root_agent_id().unwrap();
@@ -9692,7 +9237,7 @@ end })
         const CONTENT: &str = "approved plan restored before admission";
         let harness = RuntimeHarness::new();
         let prepared = harness.prepare();
-        let mut session = prepared.recovery.as_ref().unwrap().session().clone();
+        let mut session = prepared.prepared.stored().unwrap().clone();
         let root = session.root_agent_id().unwrap();
         let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
             .config
@@ -9742,7 +9287,7 @@ end })
         });
         harness.append_fixture(
             &session,
-            prepared.session_lock.as_ref().unwrap().publication_guard(),
+            prepared.lease.as_ref().unwrap().publication_guard(),
         );
         drop(prepared);
         let runtime = harness.runtime(session);
@@ -9847,15 +9392,10 @@ end })
         assert_eq!(harness.target_count(), target_count);
         assert!(SessionMailbox::notify(session_id, "early".into(), false).is_err());
         assert_eq!(
-            prepared
-                .recovery
-                .as_ref()
-                .unwrap()
-                .session()
-                .root_agent_id(),
+            prepared.prepared.stored().unwrap().root_agent_id(),
             Some(root_id)
         );
-        assert!(!prepared.handles.is_initialized());
+        assert!(prepared.prepared.session().runner_start_is_pending());
 
         drop(prepared);
     }
@@ -9970,17 +9510,12 @@ end })
         session.meta.input_draft = Some(DRAFT.into());
         let session_id = session.id;
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
-        assert!(!prepared.handles.is_initialized());
+        assert!(prepared.prepared.session().runner_start_is_pending());
         let bootstrap = AppSession::load(session_id, &harness.ctx().storage).unwrap();
         assert_eq!(bootstrap.root_agent_id(), Some(root));
         const NOT_ACTIVATED: &str = "must not enter unpublished mailbox";
         assert!(SessionMailbox::notify(session_id, NOT_ACTIVATED.into(), false).is_err());
-        let prepared_history = prepared
-            .recovery
-            .as_ref()
-            .unwrap()
-            .session()
-            .history_snapshot();
+        let prepared_history = prepared.prepared.stored().unwrap().history_snapshot();
         let mut runtime = if let Some(current) = outgoing.as_mut() {
             prepared
                 .activate_replacing(&harness.ctx().model_slot, None, current)
@@ -10102,8 +9637,8 @@ end })
             } else {
                 let prepared = prepared.as_ref().unwrap();
                 (
-                    prepared.recovery.as_ref().unwrap().session().clone(),
-                    prepared.session_lock.as_ref().unwrap().publication_guard(),
+                    prepared.prepared.stored().unwrap().clone(),
+                    prepared.lease.as_ref().unwrap().publication_guard(),
                 )
             };
             let root = session.root_agent_id().unwrap();
@@ -10183,7 +9718,7 @@ end })
         const CURRENT_DRAFT: &str = "latest saved draft";
         let harness = RuntimeHarness::new();
         let prepared = harness.prepare();
-        let mut current = prepared.recovery.as_ref().unwrap().session().clone();
+        let mut current = prepared.prepared.stored().unwrap().clone();
         drop(prepared);
         current.replace_messages(vec![Message::user(STALE_TEXT.into())]);
         current.save(&harness.ctx().storage).unwrap();
@@ -10206,7 +9741,7 @@ end })
         current.save(&harness.ctx().storage).unwrap();
         lease.release().unwrap();
         let prepared = harness.ctx().prepare_runtime(stale).unwrap();
-        let recovered = prepared.recovery.as_ref().unwrap().session();
+        let recovered = prepared.prepared.stored().unwrap();
         assert_eq!(recovered.root_agent_id(), Some(root));
         assert_eq!(recovered.messages().len(), 1);
         assert_eq!(
@@ -10253,7 +9788,7 @@ end })
         match prepared.provider.as_ref() {
             Some(retained) => {
                 assert!(matching);
-                assert!(Arc::ptr_eq(&retained.provider, &provider));
+                assert_eq!(retained.provider.key_count(), provider.key_count());
             }
             None => assert!(!matching),
         }
@@ -10269,7 +9804,7 @@ end })
         use makima_storage::session_state::{StateChange, StoredStateRecord};
         let mut harness = RuntimeHarness::new();
         let prepared = harness.prepare();
-        let mut current = prepared.recovery.as_ref().unwrap().session().clone();
+        let mut current = prepared.prepared.stored().unwrap().clone();
         let stale = AppSession::load(current.id, &harness.ctx().storage).unwrap();
         let root = current.root_agent_id().unwrap();
         let latest_model = Model::from_spec("openai/authoritative-checkpoint").unwrap();
@@ -10290,7 +9825,7 @@ end })
         });
         harness.append_fixture(
             &current,
-            prepared.session_lock.as_ref().unwrap().publication_guard(),
+            prepared.lease.as_ref().unwrap().publication_guard(),
         );
         drop(prepared);
         let (requested, requests) = flume::unbounded();
@@ -10434,10 +9969,9 @@ end })
         let prepared = harness.ctx().prepare_runtime(session).unwrap();
         assert_eq!(
             prepared
-                .recovery
-                .as_ref()
+                .prepared
+                .stored()
                 .unwrap()
-                .session()
                 .meta
                 .input_draft
                 .as_deref(),
@@ -10467,7 +10001,7 @@ end })
         harness.ctx.as_mut().unwrap().model_slot =
             ProviderSlot::new(model, Arc::new(StubProvider)).0;
         let prepared = harness.prepare();
-        let mut session = prepared.recovery.as_ref().unwrap().session().clone();
+        let mut session = prepared.prepared.stored().unwrap().clone();
         let root = session.root_agent_id().unwrap();
         let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
             .config
@@ -10492,7 +10026,7 @@ end })
         session.set_cwd(stored.cwd.clone());
         harness.append_fixture(
             &session,
-            prepared.session_lock.as_ref().unwrap().publication_guard(),
+            prepared.lease.as_ref().unwrap().publication_guard(),
         );
         drop(prepared);
 
@@ -10546,7 +10080,9 @@ end })
             smol::block_on(bounded_session_op(
                 async {
                     prepared
-                        .checkpoint
+                        .prepared
+                        .writer()
+                        .unwrap()
                         .close()
                         .await
                         .map_err(|error| error.to_string())
@@ -10640,7 +10176,11 @@ end })
         let startup_provider = harness.ctx().model_slot.load().provider.identity();
         let (entered, entering) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
-        prepared.handles.gate_initialization(entered, released);
+        prepared.before_publish = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Ok(())
+        }));
         let lock_path = session_lock::lock_path(&harness.ctx().sessions_dir, &session_id);
         let observer = std::thread::spawn(move || {
             entering.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
@@ -10686,9 +10226,11 @@ end })
             .unwrap();
         let (entered, entering) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
-        prepared
-            .handles
-            .fail_initialization_after(entered, released, FAILURE);
+        prepared.before_publish = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            Err(FAILURE.into())
+        }));
         let observer = std::thread::spawn(move || {
             entering.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
             release.send(()).unwrap();
@@ -10799,6 +10341,33 @@ end })
                     .iter()
                     .any(|warning| warning.contains(INVALID_MODEL))
             );
+        });
+    }
+
+    #[test]
+    fn saved_provider_preparation_failure_uses_startup_without_retrying() {
+        const PREPARE_FAILURE: &str = "test provider unavailable";
+        with_event_loop(|event_loop| {
+            let startup = event_loop.ctx.model_slot.load().model.spec();
+            let (attempt_tx, attempts) = flume::unbounded();
+            event_loop.ctx.prepare_provider = Arc::new(move |spec| {
+                attempt_tx.send(spec).unwrap();
+                Box::pin(async { Err(ConfigChangeError::from(PREPARE_FAILURE)) })
+            });
+            let mut session = AppSession::new(PREPARED_MODEL, &event_loop.ctx.workspace_cwd);
+            session.save(&event_loop.ctx.storage).unwrap();
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            event_loop.bring_up(RuntimeTarget::Open { reply: reply_tx }, session.clone());
+            pump_until(event_loop, |_| !reply_rx.is_empty());
+
+            assert!(reply_rx.try_recv().unwrap().is_ok());
+            let runtime = &event_loop.sessions[event_loop.position(session.id).unwrap()];
+            assert_eq!(runtime.config().unwrap().model.spec(), startup);
+            assert!(runtime.app.state.warnings.iter().any(|warning| {
+                warning.contains(PREPARED_MODEL) && warning.contains(PREPARE_FAILURE)
+            }));
+            assert_eq!(attempts.try_recv().unwrap().as_ref(), PREPARED_MODEL);
+            assert!(attempts.is_empty());
         });
     }
 
@@ -11149,7 +10718,7 @@ end })
             &providers,
             |harness| {
                 let prepared = harness.prepare();
-                let mut session = prepared.recovery.as_ref().unwrap().session().clone();
+                let mut session = prepared.prepared.stored().unwrap().clone();
                 let root = session.root_agent_id().unwrap();
                 let mut stored = session.latest_state().unwrap().scopes[&Some(root)]
                     .config
@@ -11201,7 +10770,7 @@ end })
                 });
                 harness.append_fixture(
                     &session,
-                    prepared.session_lock.as_ref().unwrap().publication_guard(),
+                    prepared.lease.as_ref().unwrap().publication_guard(),
                 );
                 drop(prepared);
                 harness.runtime(session)
@@ -13003,7 +12572,7 @@ end })
         };
         runtime.app.persist_input();
 
-        let writer = Arc::clone(&runtime.checkpoint);
+        let writer = runtime.checkpoint.clone();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -13067,7 +12636,7 @@ end })
         ));
         cleanup.join().unwrap();
 
-        let writer = Arc::clone(&runtime.checkpoint);
+        let writer = runtime.checkpoint.clone();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
@@ -13113,7 +12682,7 @@ end })
             }
         });
 
-        let writer = Arc::clone(&runtime.checkpoint);
+        let writer = runtime.checkpoint.clone();
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);

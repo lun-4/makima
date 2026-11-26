@@ -4,16 +4,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig, PreparedModel};
+use makima_agent::ModeId;
+use makima_agent::actor::EffectiveAgentConfig;
+#[cfg(test)]
+use makima_agent::actor::{AgentContextSnapshot, PreparedModel};
 use makima_agent::journal::{SessionJournal, SessionJournalSnapshot};
-use makima_agent::{AgentMode, ModeId, ModeRegistry, RunSettings, SessionDefaults};
-use makima_agent::{modes, plan_state, session_defaults};
+use makima_agent::plan_state;
+#[cfg(test)]
+use makima_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
+#[cfg(test)]
+use makima_agent::{modes, session_defaults};
+#[cfg(test)]
 use makima_providers::Model;
+#[cfg(test)]
 use makima_providers::provider::Provider;
+#[cfg(test)]
 use makima_storage::StateDir;
 #[cfg(test)]
 use makima_storage::session_state::StoredAgentConfig;
-use makima_storage::sessions::{StoredMode, read_prefs};
+use makima_storage::sessions::StoredMode;
+#[cfg(test)]
+use makima_storage::sessions::read_prefs;
 
 use crate::AppSession;
 
@@ -104,6 +115,7 @@ impl SessionState {
     /// The configuration the agent is seeded with: the session being resumed,
     /// or {defaults} for a blank one. The app shows it until the agent
     /// answers, then the agent's committed config.
+    #[cfg(test)]
     pub fn starting_config(
         &mut self,
         provider: Arc<dyn Provider>,

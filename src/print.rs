@@ -2067,6 +2067,21 @@ mod tests {
         ));
     }
 
+    #[test_case("/new"; "builtin")]
+    #[test_case("/clear"; "alias")]
+    fn print_rejects_session_reset(command: &str) {
+        let registry = CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let Err(error) = dispatch_idle(&registry, input(command)) else {
+            panic!("print accepted session replacement");
+        };
+        assert!(matches!(
+            error.downcast_ref::<CommandError>(),
+            Some(CommandError::Producer(message)) if message.as_ref() == command::SESSION_RESET_UNSUPPORTED
+        ));
+    }
+
     #[test]
     fn unknown_command_rejects_and_skips_runner() {
         let registry = CommandRegistry::new();

@@ -654,7 +654,7 @@ struct AcpServices<'a> {
 }
 
 impl FrontendServices for AcpServices<'_> {
-    fn root_binding(&mut self) -> RootBinding {
+    fn root_binding(&mut self) -> Option<RootBinding> {
         self.lua.root_binding()
     }
 

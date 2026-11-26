@@ -28,7 +28,7 @@ use makima_storage::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -233,21 +233,6 @@ impl SessionOpening {
             .await?;
         Ok((writer, lock, recovered))
     }
-}
-
-pub fn prepare_session_recovery(
-    directory: &Path,
-    session: StoredSession,
-    guard: SessionPublicationGuard,
-    exact: Option<SessionJournalSnapshot>,
-) -> Result<(Arc<SessionWriter>, RecoveryCandidate), OpenSessionError> {
-    let candidate = match exact {
-        Some(snapshot) => RecoveryCandidate::from_exact(session.clone(), snapshot)?,
-        None => RecoveryCandidate::prepare(session.clone())?,
-    };
-    let writer = Arc::new(SessionWriter::open_session(directory, &session)?);
-    writer.bind_publication_guard(Some(guard));
-    Ok((writer, candidate))
 }
 
 pub fn continuation_notice(count: usize) -> Option<String> {
@@ -628,6 +613,29 @@ impl RecoveryCandidate {
         })
     }
 
+    pub(crate) fn journal(&self) -> Arc<SessionJournal> {
+        Arc::clone(&self.journal)
+    }
+
+    pub(crate) async fn publish_staged(
+        mut self,
+        writer: &SessionWriter,
+        guard: SessionPublicationGuard,
+    ) -> Result<(), OpenSessionError> {
+        if writer.session_id() != self.session.id {
+            return Err(OpenSessionError::Compose(WRONG_WRITER.into()));
+        }
+        let snapshot = self.journal.projection();
+        self.records.extend(self.journal.take_unwritten());
+        writer.append_recovery(self.records, guard).await?;
+        self.journal
+            .acknowledge(&snapshot)
+            .and_then(|()| self.journal.bind_writer(writer.clone()))
+            .map_err(|error| OpenSessionError::Compose(error.to_string()))?;
+        writer.attach_journal(&self.journal);
+        Ok(())
+    }
+
     pub fn session(&self) -> &StoredSession {
         &self.session
     }
@@ -770,7 +778,10 @@ fn complete_tool_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentLimits, AgentManagerHandle};
+    use crate::{
+        AgentLimits, AgentManagerHandle,
+        journal::{JournalChange, JournalCommit},
+    };
     use makima_storage::{
         StateDir,
         checkpoint::{CheckpointClaim, CheckpointPublication},
@@ -1444,6 +1455,57 @@ mod tests {
             assert!(
                 matches!(result, Err(CheckpointError::Save { message, .. }) if message.as_ref() == WRONG_WRITER)
             );
+        });
+    }
+
+    #[test_case(false; "ownership_lost")]
+    #[test_case(true; "published")]
+    fn staged_recovery_acknowledges_and_attaches_only_on_success(owned: bool) {
+        smol::block_on(async {
+            const KEY: &str = "staged-recovery-test";
+            let directory = TempDir::new().unwrap();
+            let session = StoredSession::new(MODEL, CWD);
+            let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+            let previous = Arc::new(SessionJournal::from_session(&session).unwrap());
+            writer.attach_journal(&previous);
+            let lease = session_lock::claim(directory.path(), &session.id)
+                .unwrap()
+                .unwrap();
+            let guard = lease.publication_guard();
+            let candidate = RecoveryCandidate::prepare_with_continuation(session, false).unwrap();
+            let journal = candidate.journal();
+            let revision = journal
+                .commit(JournalCommit {
+                    changes: vec![JournalChange {
+                        agent: None,
+                        generation: 0,
+                        change: StateChange::Plugin {
+                            key: KEY.into(),
+                            version: 1,
+                            value: Some(json!(true)),
+                        },
+                    }],
+                    ..JournalCommit::default()
+                })
+                .unwrap();
+            let before = journal.published_revision();
+            assert!(revision > before);
+            if !owned {
+                lease.release().unwrap();
+            }
+            assert_eq!(
+                candidate.publish_staged(&writer, guard).await.is_ok(),
+                owned
+            );
+            assert_eq!(
+                journal.published_revision(),
+                if owned { revision } else { before }
+            );
+            assert!(Arc::ptr_eq(
+                writer.journals().as_slice().first().unwrap(),
+                if owned { &journal } else { &previous },
+            ));
+            writer.close().await.unwrap();
         });
     }
 

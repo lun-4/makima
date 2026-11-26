@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use event_listener::Event;
-#[cfg(test)]
-use flume::Receiver;
+use flume::{Receiver, Sender};
 use futures_lite::future;
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use makima_providers::Message;
@@ -57,9 +56,9 @@ use crate::{
     ActorBackend, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentLimits,
     AgentManagerHandle, AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult,
     ControlWork, EffectiveAgentConfig, Envelope, EventSender, HistorySnapshot, McpHandle,
-    McpSession, PermissionsConfig, RunLedger, RunSettings, SessionMailbox, ToolOutputLines,
-    TurnCancellationReason, TurnContext, TurnFailure, TurnFailureKind, TurnId, TurnOutcome,
-    TurnTicket, WorkKind,
+    McpSession, PermissionsConfig, RunLedger, RunSettings, SessionMailbox, SharedMessages,
+    ToolOutputLines, TurnCancellationReason, TurnContext, TurnFailure, TurnFailureKind, TurnId,
+    TurnOutcome, TurnTicket, WorkKind,
 };
 
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,7 +71,6 @@ const HEADLESS_CONFIG_UNAVAILABLE: &str = "managed headless configuration unavai
 const FALLBACK_CHECKPOINT_UNAVAILABLE: &str =
     "restored mode fallback requires a session checkpoint";
 const COMPACTION_CANCELLED: &str = "compaction cancelled";
-const RESET_REQUIRES_FRONTEND: &str = "session reset requires frontend runtime replacement";
 
 #[derive(Clone, Default)]
 pub struct RootReadiness(Arc<RootInitialization>);
@@ -207,7 +205,6 @@ pub enum InteractiveControl {
         output: flume::Sender<ManualCompactionEvent>,
         cancel: CancelToken,
     },
-    Reset(flume::Sender<Result<(), String>>),
 }
 
 #[derive(Clone)]
@@ -227,9 +224,6 @@ struct PendingControl {
 impl PendingControl {
     fn cancel(&mut self) {
         match self.control.take() {
-            Some(InteractiveControl::Reset(reply)) => {
-                let _ = reply.send(Err(OPERATION_CANCELLED.into()));
-            }
             Some(InteractiveControl::ManualCompaction { output, .. }) => {
                 let _ = output.send(ManualCompactionEvent::Cancelled);
             }
@@ -264,10 +258,8 @@ impl InteractiveControlSender {
             "headless-control:{}",
             self.next.fetch_add(1, Ordering::Relaxed)
         );
-        let cancel = match &control {
-            InteractiveControl::ManualCompaction { cancel, .. } => Some(cancel.clone()),
-            _ => None,
-        };
+        let InteractiveControl::ManualCompaction { cancel, .. } = &control;
+        let cancel = cancel.clone();
         let (done, finished) = flume::bounded(0);
         let pending = Arc::new(StdMutex::new(PendingControl {
             control: Some(control),
@@ -277,24 +269,22 @@ impl InteractiveControlSender {
         actor
             .push_control(key.clone(), key.clone(), Some(pending))
             .map_err(|error| error.to_string())?;
-        if let Some(cancel) = cancel {
-            smol::spawn(async move {
-                future::or(
-                    async {
-                        cancel.cancelled().await;
-                        actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
-                        if let Some(pending) = queued.upgrade() {
-                            pending.lock_unpoisoned().cancel();
-                        }
-                    },
-                    async {
-                        let _ = finished.recv_async().await;
-                    },
-                )
-                .await;
-            })
-            .detach();
-        }
+        smol::spawn(async move {
+            future::or(
+                async {
+                    cancel.cancelled().await;
+                    actor.cancel_correlation(&key, crate::TurnCancellationReason::User);
+                    if let Some(pending) = queued.upgrade() {
+                        pending.lock_unpoisoned().cancel();
+                    }
+                },
+                async {
+                    let _ = finished.recv_async().await;
+                },
+            )
+            .await;
+        })
+        .detach();
         Ok(())
     }
 
@@ -431,6 +421,13 @@ pub struct InteractiveHandle {
     pub cancellation: SessionCancellation,
     pub root: RootReadiness,
     pub events: Arc<SessionEventPump>,
+    pub(crate) agent_tx: Sender<Envelope>,
+    // An alternative to the event pump, not a second stream.
+    pub(crate) agent_rx: Receiver<Envelope>,
+    pub(crate) runner_start: Option<Sender<()>>,
+    pub(crate) template: Receiver<ToolContext>,
+    pub(crate) history: SharedMessages,
+    pub(crate) offload: Option<Arc<OffloadStore>>,
     #[cfg(test)]
     event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
@@ -463,23 +460,6 @@ pub async fn checkpoint_startup_config(
         .map_err(|error| error.to_string())?;
     let source = idle.source_snapshot().map_err(|error| error.to_string())?;
     persist_startup_config(root, coordinator, source.config, source.history).await
-}
-
-/// Checkpoints startup before the runner is released, including a recovered queue.
-pub async fn checkpoint_deferred_startup_config(
-    root: &AgentRef,
-    coordinator: &SessionCoordinatorHandle,
-) -> Result<(), String> {
-    let actor = root.actor().map_err(|error| error.to_string())?;
-    let config = actor.config_snapshot().ok_or(HEADLESS_CONFIG_UNAVAILABLE)?;
-    persist_startup_config(
-        root,
-        coordinator,
-        config,
-        actor.committed_history_snapshot(),
-    )
-    .await
-    .map(|_| ())
 }
 
 async fn persist_startup_config(
@@ -1005,10 +985,6 @@ impl ActorBackend for HeadlessBackend {
                     let _ = output.send(result);
                     BackendResult::ControlCompacted(status)
                 }
-                Some(InteractiveControl::Reset(reply)) => {
-                    let _ = reply.send(Err(RESET_REQUIRES_FRONTEND.into()));
-                    BackendResult::ControlFailed
-                }
                 None => BackendResult::ControlFailed,
             }
         })
@@ -1141,44 +1117,91 @@ fn session_offload(state_dir: Option<&Path>, session: &SessionRef) -> Option<Arc
 pub fn spawn_interactive_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,
-    history: Option<crate::agent::HistorySnapshot>,
+    history: Option<HistorySnapshot>,
     binding: Option<RootBinding>,
 ) -> InteractiveHandle {
-    spawn_interactive(params, prepare, history, binding, true, None)
+    spawn_session_runner(
+        params,
+        prepare,
+        history,
+        binding,
+        true,
+        None,
+        Default::default(),
+    )
 }
 
 pub fn spawn_interactive_with_checkpoint(
     params: InteractiveParams,
     prepare: ProviderPreparation,
-    history: Option<crate::agent::HistorySnapshot>,
+    history: Option<HistorySnapshot>,
     binding: Option<RootBinding>,
     checkpoint: Arc<SessionWriter>,
 ) -> InteractiveHandle {
-    spawn_interactive(params, prepare, history, binding, true, Some(checkpoint))
+    spawn_session_runner(
+        params,
+        prepare,
+        history,
+        binding,
+        true,
+        Some(checkpoint),
+        Default::default(),
+    )
 }
 
+#[cfg(test)]
+#[cfg(test)]
 pub(crate) fn spawn_nonpersistent_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,
     binding: Option<RootBinding>,
 ) -> InteractiveHandle {
-    spawn_interactive(params, prepare, None, binding, false, None)
+    spawn_session_runner(
+        params,
+        prepare,
+        None,
+        binding,
+        false,
+        None,
+        Default::default(),
+    )
 }
 
-fn spawn_interactive(
+#[derive(Default)]
+pub(crate) struct SessionRunnerSettings {
+    pub permissions: Option<Arc<PermissionManager>>,
+    pub mailbox: Option<SessionMailbox>,
+    pub file_write_locks: Option<Arc<FileWriteLocks>>,
+    pub offload: Option<Arc<OffloadStore>>,
+    pub effective_config: Option<EffectiveAgentConfig>,
+    pub deferred: bool,
+    // The trigger paired with the token passed to FrontendProfile::tui.
+    pub init_trigger: Option<CancelTrigger>,
+}
+
+pub(crate) fn spawn_session_runner(
     mut params: InteractiveParams,
     prepare: ProviderPreparation,
-    history: Option<crate::agent::HistorySnapshot>,
+    history: Option<HistorySnapshot>,
     binding: Option<RootBinding>,
     persist_turn_results: bool,
     checkpoint: Option<Arc<SessionWriter>>,
+    settings: SessionRunnerSettings,
 ) -> InteractiveHandle {
+    let SessionRunnerSettings {
+        permissions,
+        mailbox,
+        file_write_locks,
+        offload,
+        effective_config,
+        deferred,
+        init_trigger,
+    } = settings;
     let session_ref = params
         .session_id
         .clone()
         .unwrap_or_else(|| SessionRef::from(MakimaId::generate()));
-    let root_id = params.root_id.unwrap_or_else(AgentId::generate);
-    let mailbox = SessionMailbox::new(session_ref.id());
+    let mailbox = mailbox.unwrap_or_else(|| SessionMailbox::new(session_ref.id()));
     let limits = AgentLimits {
         max_concurrent_agent_turns: params.config.max_concurrent_agent_turns.max(1),
         max_agent_depth: params.config.max_agent_depth,
@@ -1186,13 +1209,27 @@ fn spawn_interactive(
         max_active_agents: params.config.max_active_agents,
         max_retained_agents: params.config.max_retained_agents,
     };
-    let journal = if persist_turn_results {
-        params.journal.clone().unwrap_or_default()
-    } else {
-        Arc::new(SessionJournal::nonpersistent())
-    };
+    let journal = params.journal.take().unwrap_or_else(|| {
+        if persist_turn_results {
+            Arc::default()
+        } else {
+            Arc::new(SessionJournal::nonpersistent())
+        }
+    });
+    let preserve_offload = journal.session_id().is_some();
     let snapshot = journal.snapshot();
+    let root_id = params
+        .root_id
+        .or_else(|| snapshot.root_agent_id())
+        .unwrap_or_else(AgentId::generate);
     let restored_graph = snapshot.agent_revisions.iter().next().is_some();
+    let history = snapshot
+        .histories
+        .get(&root_id)
+        .cloned()
+        .or(history)
+        .unwrap_or_else(|| HistorySnapshot::new(std::mem::take(&mut params.initial_history)));
+    let history = Arc::new(arc_swap::ArcSwap::from_pointee(history));
     let mut restored_config = None;
     let mut restored_permissions = PermissionSnapshot::default();
     let manager = if restored_graph {
@@ -1200,15 +1237,19 @@ fn spawn_interactive(
             .fold()
             .map_err(|error| error.to_string())
             .and_then(|view| {
-                if let Some(scope) = view.scopes.get(&None) {
+                if permissions.is_none()
+                    && let Some(scope) = view.scopes.get(&None)
+                {
                     restored_permissions =
                         PermissionSnapshot::from_stored(&scope.rules, scope.yolo)
                             .map_err(|error| error.to_string())?;
                 }
-                restored_config = view
-                    .scopes
-                    .get(&Some(root_id))
-                    .and_then(|scope| scope.config.clone());
+                if effective_config.is_none() {
+                    restored_config = view
+                        .scopes
+                        .get(&Some(root_id))
+                        .and_then(|scope| scope.config.clone());
+                }
                 if let Some(stored) = &mut restored_config {
                     if checkpoint.is_some() {
                         stored.model = params.model.spec();
@@ -1243,12 +1284,12 @@ fn spawn_interactive(
     });
     let root = RootReadiness::default();
     let (guard, events) = crate::types::event_stream();
-    let raw_tx = guard.tx().clone();
+    let agent_tx = guard.tx().clone();
     let (lifetime_tx, lifetime_rx) = flume::unbounded();
     let input_tx = InteractiveInputSender {
         admitter: TurnAdmitter {
             root: root.clone(),
-            events: raw_tx.clone(),
+            events: agent_tx.clone(),
             next: Arc::new(AtomicU64::new(0)),
         },
         _lifetime: lifetime_tx,
@@ -1259,49 +1300,84 @@ fn spawn_interactive(
     };
     let answers = AnswerRouter::default();
     let backend_answers = params.answers.then(|| answers.clone());
-    let mut permission_config = params.permissions_config.clone();
-    permission_config.yolo |= params.yolo;
-    let permissions = Arc::new(PermissionManager::new(
-        permission_config,
-        params.initial_wd.clone(),
-        params.project_config.clone(),
-        Arc::clone(&params.plugin_rules),
-    ));
-    permissions.restore(restored_permissions);
-    let offload = session_offload(params.state_dir.as_deref(), &session_ref);
-    let cleanup = offload
-        .as_ref()
-        .map(|store| OffloadCleanup::new(Arc::clone(store)));
+    let permissions = permissions.unwrap_or_else(|| {
+        let mut permission_config = params.permissions_config.clone();
+        permission_config.yolo |= params.yolo;
+        let permissions = Arc::new(PermissionManager::new(
+            permission_config,
+            effective_config.as_ref().map_or_else(
+                || params.initial_wd.clone(),
+                |config| config.context.cwd().to_path_buf(),
+            ),
+            params.project_config.clone(),
+            Arc::clone(&params.plugin_rules),
+        ));
+        permissions.restore(restored_permissions);
+        permissions
+    });
+    let (offload, cleanup) = match offload {
+        Some(store) => (Some(store), None),
+        None => {
+            let store = session_offload(params.state_dir.as_deref(), &session_ref);
+            let cleanup = store
+                .as_ref()
+                .filter(|_| !preserve_offload)
+                .map(|store| OffloadCleanup::new(Arc::clone(store)));
+            (store, cleanup)
+        }
+    };
     let children = Arc::new(CancelMap::new());
-    let cancellation =
-        SessionCancellation::new(manager.clone(), root_id, Arc::clone(&children), None);
+    let cancellation = SessionCancellation::new(
+        manager.clone(),
+        root_id,
+        Arc::clone(&children),
+        init_trigger,
+    );
     let lifetime = ManagedLifetime {
         manager: manager.clone(),
         root: root.clone(),
         cleanup: cleanup.clone(),
         children: Arc::clone(&children),
     };
+    let (cwd, model, workflow) = effective_config.as_ref().map_or(
+        (
+            params.initial_wd.as_path(),
+            &params.model,
+            params.defaults.workflow,
+        ),
+        |config| (config.context.cwd(), &config.model, config.workflow),
+    );
     let tools = RequestTools::build(
         ToolRegistry::global(),
-        &template::env_vars_for(&params.initial_wd),
-        &params.model,
+        &template::env_vars_for(cwd),
+        model,
         &params.config,
         &params.profile.excluded_tools,
-        params.defaults.workflow,
+        workflow,
         params.mcp_handle.is_some(),
     );
     let mcp = params
         .mcp_handle
         .clone()
-        .map(|handle| McpSession::new(handle, &params.initial_history));
+        .map(|handle| McpSession::new(handle, &history.load().messages));
     let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
-    let offload_cleanup = cleanup.clone();
+    let offload_cleanup = cleanup;
+    let (template_tx, template) = flume::bounded(1);
+    let (start, started) = flume::bounded(1);
+    let (runner_start, automatic_start) = if deferred {
+        (Some(start), None)
+    } else {
+        (None, Some(start))
+    };
     let task = smol::spawn({
         let manager = manager.clone();
         let root = root.clone();
         let permissions = Arc::clone(&permissions);
         let mailbox = mailbox.clone();
         let session_ref = session_ref.clone();
+        let offload = offload.clone();
+        let history = Arc::clone(&history);
+        let raw_tx = agent_tx.clone();
         async move {
             let _lifetime = lifetime;
             let owns_mcp = matches!(params.profile.mcp_lifecycle, McpLifecycle::Owned);
@@ -1309,57 +1385,58 @@ fn spawn_interactive(
                 if let Some(error) = startup_error {
                     return Err(error);
                 }
-                let PreparedModel { model, provider } = prepare(params.model.clone())
-                    .await
-                    .map_err(|error| error.user_message())?;
-                if persist_turn_results && let Some(store) = &offload {
+                if let Some(store) = &offload {
                     manager
                         .bind_result_store(Arc::clone(store))
                         .map_err(|error| error.to_string())?;
                 }
-                let mut mode_fallback = false;
-                let config = if let Some(stored) = restored_config {
-                    let restored = crate::plan_state::prepare_restore_for_agent(
-                        &snapshot.fold().map_err(|error| error.to_string())?,
-                        root_id,
-                        &stored.mode,
-                        &params.modes,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    if let Some(warning) = restored.warning {
-                        mode_fallback = true;
-                        warn!(%warning, "saved mode restoration fell back to read-only");
-                        let _ = raw_tx.send(Envelope {
-                            event: AgentEvent::ControlError { message: warning },
-                            subagent: None,
-                            identity: None,
-                        });
-                    }
-                    EffectiveAgentConfig::from_stored(
-                        &stored,
-                        PreparedModel {
-                            provider: Arc::clone(&provider),
-                            model: model.clone(),
-                        },
-                        (restored.mode, restored.definition),
-                    )
-                    .map_err(|error| error.to_string())?
+                let config = if let Some(config) = effective_config {
+                    config
                 } else {
-                    EffectiveAgentConfig::new(
-                        RunSettings {
-                            provider: Arc::clone(&provider),
-                            model: model.clone(),
-                            fast: params.defaults.fast,
-                            workflow: params.defaults.workflow,
-                            thinking: params.defaults.thinking.into(),
-                        },
-                        AgentMode::Build,
-                    )
-                    .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
-                    .with_mode_def(Some(params.modes.current(&AgentMode::Build)))
-                };
-                if restored_graph && crate::modes::is_read_only_fallback(&config.mode) {
-                    mode_fallback = true;
+                    let prepared = prepare(params.model.clone())
+                        .await
+                        .map_err(|error| error.user_message())?;
+                    if let Some(stored) = restored_config {
+                        let restored = crate::plan_state::prepare_restore_for_agent(
+                            &snapshot.fold().map_err(|error| error.to_string())?,
+                            root_id,
+                            &stored.mode,
+                            &params.modes,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if let Some(warning) = restored.warning {
+                            warn!(%warning, "saved mode restoration fell back to read-only");
+                            let _ = raw_tx.send(Envelope {
+                                event: AgentEvent::ControlError { message: warning },
+                                subagent: None,
+                                identity: None,
+                            });
+                        }
+                        EffectiveAgentConfig::from_stored(
+                            &stored,
+                            prepared,
+                            (restored.mode, restored.definition),
+                        )
+                        .map_err(|error| error.to_string())?
+                    } else {
+                        EffectiveAgentConfig::new(
+                            RunSettings {
+                                provider: prepared.provider,
+                                model: prepared.model,
+                                fast: params.defaults.fast,
+                                workflow: params.defaults.workflow,
+                                thinking: params.defaults.thinking.into(),
+                            },
+                            AgentMode::Build,
+                        )
+                        .with_context(AgentContextSnapshot::new(params.initial_wd.clone()))
+                        .with_mode_def(Some(params.modes.current(&AgentMode::Build)))
+                    }
+                }
+                .normalize_initial_mode();
+                let mode_fallback =
+                    restored_graph && crate::modes::is_read_only_fallback(&config.mode);
+                if mode_fallback {
                     manager
                         .suppress_root_continuations()
                         .map_err(|error| error.to_string())?;
@@ -1367,8 +1444,8 @@ fn spawn_interactive(
                 let backend = HeadlessBackend::new(
                     AgentParams {
                         agent_id: root_id,
-                        provider,
-                        model,
+                        provider: Arc::clone(&config.provider),
+                        model: config.model.clone(),
                         config: params.config,
                         tool_output_lines: ToolOutputLines::default(),
                         permissions,
@@ -1386,7 +1463,7 @@ fn spawn_interactive(
                         interactive_reauth: false,
                         model_policy: params.model_policy,
                         providers: params.providers,
-                        file_write_locks: Arc::new(FileWriteLocks::new()),
+                        file_write_locks: file_write_locks.unwrap_or_default(),
                         offload,
                         managed_turn: None,
                     },
@@ -1404,11 +1481,11 @@ fn spawn_interactive(
                     },
                 );
                 let mut template = backend.template(&config);
-                if restored_graph {
+                let reference = if restored_graph {
                     let manager_for_binding = manager.clone();
+                    let binding_template = template.clone();
                     let initialize: ResidentInitializer =
                         Box::new(move |installed: ResidentInitialization| {
-                            template.execution_agent_id = Some(installed.agent.id());
                             Box::pin(async move {
                                 manager_for_binding
                                     .validate_activation(&installed.incarnation)
@@ -1416,7 +1493,7 @@ fn spawn_interactive(
                                         ReactivationError::Initialization(error.to_string())
                                     })?;
                                 let journal = manager_for_binding.journal();
-                                template
+                                binding_template
                                     .permissions
                                     .bind_journal(
                                         Arc::clone(&journal),
@@ -1436,45 +1513,43 @@ fn spawn_interactive(
                                     binding(
                                         manager_for_binding,
                                         installed.agent.clone(),
-                                        template,
+                                        binding_template,
                                         Some(&installed),
                                     )
                                     .await
                                     .map_err(ReactivationError::Initialization)?;
                                 }
+                                if deferred || !mode_fallback {
+                                    return Ok(());
+                                }
                                 let actor = installed.actor.clone();
                                 installed
                                     .finish_with(async move {
-                                        if mode_fallback {
-                                            let checkpoint = checkpoint.ok_or_else(|| {
-                                                ReactivationError::Initialization(
-                                                    FALLBACK_CHECKPOINT_UNAVAILABLE.into(),
-                                                )
-                                            })?;
-                                            let commit =
-                                                actor.config_snapshot().ok_or_else(|| {
+                                        let checkpoint = checkpoint.ok_or_else(|| {
+                                            ReactivationError::Initialization(
+                                                FALLBACK_CHECKPOINT_UNAVAILABLE.into(),
+                                            )
+                                        })?;
+                                        let commit = actor.config_snapshot().ok_or_else(|| {
+                                            ReactivationError::Initialization(
+                                                HEADLESS_CONFIG_UNAVAILABLE.into(),
+                                            )
+                                        })?;
+                                        let stored =
+                                            stored_agent_config(&commit.config, Default::default())
+                                                .map_err(|error| {
                                                     ReactivationError::Initialization(
-                                                        HEADLESS_CONFIG_UNAVAILABLE.into(),
+                                                        error.to_string(),
                                                     )
                                                 })?;
-                                            let stored = stored_agent_config(
-                                                &commit.config,
-                                                Default::default(),
-                                            )
-                                            .map_err(|error| {
-                                                ReactivationError::Initialization(error.to_string())
-                                            })?;
-                                            let (_startup_trigger, startup_cancel) =
-                                                CancelToken::new();
-                                            let expected_incarnation = incarnation.clone();
-                                            let prepared = journal
-                                                .prepare_with(move |current| {
-                                                    let mut stored = stored;
-                                                    if let Some(latest) = current
-                                                        .state
-                                                        .iter()
-                                                        .rev()
-                                                        .find_map(|record| match &record.change {
+                                        let (_startup_trigger, startup_cancel) = CancelToken::new();
+                                        let expected_incarnation = incarnation.clone();
+                                        let prepared = journal
+                                            .prepare_with(move |current| {
+                                                let mut stored = stored;
+                                                if let Some(latest) =
+                                                    current.state.iter().rev().find_map(|record| {
+                                                        match &record.change {
                                                             StateChange::Config(config)
                                                                 if record.agent
                                                                     == Some(incarnation.agent) =>
@@ -1482,100 +1557,91 @@ fn spawn_interactive(
                                                                 Some(config)
                                                             }
                                                             _ => None,
-                                                        })
-                                                    {
-                                                        stored.options = latest.options.clone();
-                                                    }
-                                                    JournalCommit {
-                                                        incarnations: vec![incarnation.clone()],
-                                                        changes: vec![JournalChange {
-                                                            agent: Some(incarnation.agent),
-                                                            generation: commit.generation,
-                                                            change: StateChange::Config(stored),
-                                                        }],
-                                                        ..Default::default()
-                                                    }
-                                                })
-                                                .await
-                                                .map_err(|error| {
-                                                    ReactivationError::Initialization(
-                                                        error.to_string(),
-                                                    )
-                                                })?;
-                                            checkpoint
-                                                .publish_prepared(
-                                                    prepared,
-                                                    startup_cancel,
-                                                    expected_incarnation,
-                                                    Arc::clone(&journal),
-                                                )
-                                                .await
-                                                .map_err(|error| {
-                                                    ReactivationError::Initialization(
-                                                        error.to_string(),
-                                                    )
-                                                })?;
-                                        }
+                                                        }
+                                                    })
+                                                {
+                                                    stored.options = latest.options.clone();
+                                                }
+                                                JournalCommit {
+                                                    incarnations: vec![incarnation.clone()],
+                                                    changes: vec![JournalChange {
+                                                        agent: Some(incarnation.agent),
+                                                        generation: commit.generation,
+                                                        change: StateChange::Config(stored),
+                                                    }],
+                                                    ..Default::default()
+                                                }
+                                            })
+                                            .await
+                                            .map_err(|error| {
+                                                ReactivationError::Initialization(error.to_string())
+                                            })?;
+                                        checkpoint
+                                            .publish_prepared(
+                                                prepared,
+                                                startup_cancel,
+                                                expected_incarnation,
+                                                Arc::clone(&journal),
+                                            )
+                                            .await
+                                            .map_err(|error| {
+                                                ReactivationError::Initialization(error.to_string())
+                                            })?;
                                         Ok(())
                                     })
                                     .await
                             })
                         });
-                    let reference = manager
+                    manager
                         .ensure_resident_with(root_id, move |_| async move {
                             Ok(ResidentAgent {
                                 backend: Box::new(backend),
                                 config,
-                                shared_messages: None,
-                                start: None,
+                                shared_messages: Some(history),
+                                start: Some(started),
                                 initialize: Some(initialize),
                             })
                         })
                         .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    let initial_history = history.load().messages.as_ref().clone();
+                    let reference = manager
+                        .create_root_deferred_with_id_and_config(
+                            root_id,
+                            Some(config),
+                            initial_history,
+                            Some(history),
+                            |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend)),
+                            started,
+                        )
                         .map_err(|error| error.to_string())?;
-                    root.finish(Ok(reference.clone()));
-                    return Ok(reference);
+                    template.execution_agent_id = Some(reference.id());
+                    let journal = manager.journal();
+                    template
+                        .permissions
+                        .bind_journal(
+                            Arc::clone(&journal),
+                            Some(journal.incarnation(reference.id())),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if let Some(binding) = binding {
+                        binding(manager.clone(), reference.clone(), template.clone(), None).await?;
+                    }
+                    reference
+                };
+                // Startup cannot wait for a frontend to receive the template.
+                let _ = template_tx.try_send(template);
+                root.finish(Ok(reference));
+                if let Some(start) = automatic_start {
+                    start
+                        .try_send(())
+                        .map_err(|_| INITIALIZATION_CLOSED.to_owned())?;
                 }
-                let mirror =
-                    history.map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)));
-                let initial_history = mirror
-                    .as_ref()
-                    .map(|mirror| mirror.load().messages.as_ref().clone())
-                    .unwrap_or(params.initial_history);
-                let (start, started) = flume::bounded(1);
-                let reference = manager
-                    .create_root_deferred_with_id_and_config(
-                        root_id,
-                        Some(config),
-                        initial_history,
-                        mirror,
-                        |agent_id| {
-                            let mut backend = backend;
-                            backend.params.agent_id = agent_id;
-                            Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
-                        },
-                        started,
-                    )
-                    .map_err(|error| error.to_string())?;
-                template.execution_agent_id = Some(reference.id());
-                let journal = manager.journal();
-                template
-                    .permissions
-                    .bind_journal(
-                        Arc::clone(&journal),
-                        Some(journal.incarnation(reference.id())),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if let Some(binding) = binding {
-                    binding(manager.clone(), reference.clone(), template, None).await?;
-                }
-                root.finish(Ok(reference.clone()));
-                start
-                    .send(())
-                    .map_err(|_| INITIALIZATION_CLOSED.to_owned())?;
-                Ok::<_, String>(reference)
+                Ok::<_, String>(())
             }
             .await;
+            drop(template_tx);
             match initialized {
                 Ok(_) => {
                     let _ = lifetime_rx.recv_async().await;
@@ -1600,6 +1666,12 @@ fn spawn_interactive(
         cancellation,
         root,
         events,
+        agent_tx,
+        agent_rx: raw_events.clone(),
+        runner_start,
+        template,
+        history,
+        offload,
         #[cfg(test)]
         event_rx: raw_events,
         tool_names,
@@ -1654,9 +1726,9 @@ pub(crate) mod tests {
     use makima_providers::model_registry;
     use makima_providers::provider::Provider;
     use makima_providers::{
-        ContentBlock, ConversationEnd, Invocation, InvocationPurpose, ModelInfo, ModelTier,
-        PreparedProvider, ProviderBackend, ProviderEvent, RegisteredProvider, RequestDelivery,
-        Role, StopReason, StreamResponse, TokenUsage,
+        ContentBlock, Invocation, InvocationPurpose, ModelInfo, ModelTier, PreparedProvider,
+        ProviderBackend, ProviderEvent, RegisteredProvider, RequestDelivery, Role, StopReason,
+        StreamResponse, TokenUsage,
     };
     use makima_storage::StateDir;
     use makima_storage::checkpoint::{
@@ -1791,38 +1863,6 @@ pub(crate) mod tests {
     struct RecordingProvider {
         name: &'static str,
         requests: flume::Sender<RecordedRequest>,
-    }
-
-    struct EndRecordingProvider {
-        requests: flume::Sender<Arc<str>>,
-        ended: flume::Sender<(String, ConversationEnd)>,
-    }
-
-    impl Provider for EndRecordingProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
-            _: &'a Value,
-            _: &'a flume::Sender<makima_providers::ProviderEvent>,
-            _: RequestOptions,
-            _: Option<&'a SessionRef>,
-            invocation: &'a Invocation,
-            _delivery: RequestDelivery,
-        ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
-            let _ = self.requests.send(Arc::clone(&invocation.conversation_id));
-            Box::pin(async { Ok(response(SAVED_OUTPUT)) })
-        }
-
-        fn end_conversation(
-            &self,
-            conversation_id: &str,
-            reason: ConversationEnd,
-        ) -> BoxFuture<'_, ()> {
-            let _ = self.ended.send((conversation_id.to_owned(), reason));
-            Box::pin(async {})
-        }
     }
 
     impl Provider for RecordingProvider {
@@ -2661,9 +2701,89 @@ pub(crate) mod tests {
         });
     }
 
-    #[test_case(false; "fallback_checkpoint_precedes_admission")]
-    #[test_case(true; "binding_failure_leaves_saved_config_unchanged")]
-    fn restored_plan_fallback_publication(reject_binding: bool) {
+    #[test_case(false; "runs_after_release")]
+    #[test_case(true; "cancels_mcp_init")]
+    fn deferred_runner_uses_supplied_config_and_waits_for_release(cancel_init: bool) {
+        smol::block_on(async {
+            let session_id = MakimaId::generate();
+            let mut params = interactive_params(session_id, Vec::new());
+            let (mcp, publish, commands) = gated_session(&[]);
+            params.mcp_handle = Some(McpHandle::clone(&mcp));
+            let (init_trigger, init_cancel) = CancelToken::new();
+            params.profile = FrontendProfile::tui(ToolOutputLines::default(), init_cancel);
+            if !cancel_init {
+                publish();
+            }
+            let (provider, requests) = recording();
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider,
+                    model: params.model.clone(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            )
+            .with_context(AgentContextSnapshot::new(PathBuf::from(ADMITTED_CWD)));
+            let offload_directory = tempfile::tempdir().unwrap();
+            let store = session_offload(
+                Some(offload_directory.path()),
+                &SessionRef::from(session_id),
+            )
+            .unwrap();
+            let handle = spawn_session_runner(
+                params,
+                Box::new(|_| panic!("supplied config must bypass provider preparation")),
+                None,
+                None,
+                false,
+                None,
+                SessionRunnerSettings {
+                    deferred: true,
+                    init_trigger: Some(init_trigger),
+                    effective_config: Some(config),
+                    offload: Some(Arc::clone(&store)),
+                    ..Default::default()
+                },
+            );
+            let root = bounded(handle.initialized_root()).await.unwrap();
+            let template = bounded(handle.template.recv_async()).await.unwrap();
+            assert_eq!(template.execution_agent_id, Some(root.id()));
+            assert_eq!(template.cwd, Path::new(ADMITTED_CWD));
+            assert!(Arc::ptr_eq(handle.offload.as_ref().unwrap(), &store));
+            assert!(Arc::ptr_eq(template.offload.as_ref().unwrap(), &store));
+            if cancel_init {
+                handle
+                    .cancellation
+                    .cancel(CancelScope::Subtree(root.id()))
+                    .unwrap();
+            }
+            let ticket = bounded(handle.input_tx.admit(first_input())).await.unwrap();
+            assert!(future::poll_once(ticket.wait()).await.is_none());
+            handle.runner_start.unwrap().try_send(()).unwrap();
+            let outcome = bounded(ticket.wait()).await;
+            if cancel_init {
+                assert!(
+                    matches!(outcome, TurnOutcome::Failed { failure, .. } if failure.user_message == MCP_INIT_CANCELLED)
+                );
+                assert!(requests.is_empty());
+            } else {
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                assert_eq!(requests.len(), 1);
+                assert!(!handle.history.load().messages.is_empty());
+            }
+            drop(handle.input_tx);
+            bounded(handle.task).await;
+            assert!(commands.is_empty());
+            assert!(store.put(SAVED_OUTPUT).is_ok());
+        });
+    }
+
+    #[test_case(false, false; "fallback_checkpoint_precedes_admission")]
+    #[test_case(true, false; "binding_failure_leaves_saved_config_unchanged")]
+    #[test_case(false, true; "deferred_fallback_leaves_saved_config_unchanged")]
+    fn restored_plan_fallback_publication(reject_binding: bool, deferred: bool) {
         use crate::session_recovery::{OpenModel, SessionSource, open_session};
 
         const STARTUP_MODEL: &str = "openai/gpt-5";
@@ -2724,7 +2844,7 @@ pub(crate) mod tests {
             let (entered, entering) = flume::bounded(1);
             let (release, released) = flume::bounded(1);
             let expected_config = recovered_config.clone();
-            let handle = spawn_interactive_with_checkpoint(
+            let handle = spawn_session_runner(
                 params,
                 Box::new(move |model| {
                     Box::pin(async move { Ok(PreparedModel { model, provider }) })
@@ -2748,7 +2868,12 @@ pub(crate) mod tests {
                         Ok(())
                     })
                 })),
-                checkpoint,
+                true,
+                Some(checkpoint),
+                SessionRunnerSettings {
+                    deferred,
+                    ..Default::default()
+                },
             );
             bounded(entering.recv_async()).await.unwrap();
             assert!(handle.root.current().is_none());
@@ -2768,8 +2893,16 @@ pub(crate) mod tests {
                 let effective = initialized.unwrap().effective_config().unwrap().unwrap();
                 assert!(crate::modes::is_read_only_fallback(&effective.mode));
                 assert_eq!(effective.model.spec(), STARTUP_MODEL);
-                assert_eq!(config.mode.id, effective.mode.id().key());
-                assert_eq!(config.model, STARTUP_MODEL);
+                if deferred {
+                    assert!(handle.runner_start.is_some());
+                    let template = bounded(handle.template.recv_async()).await.unwrap();
+                    assert_eq!(template.mode, effective.mode);
+                    assert_eq!(config.mode.id, recovered_config.mode.id);
+                    assert_eq!(config.model, TEST_MODEL);
+                } else {
+                    assert_eq!(config.mode.id, effective.mode.id().key());
+                    assert_eq!(config.model, STARTUP_MODEL);
+                }
             }
             assert!(requests.is_empty());
             bounded(handle.task.cancel()).await;
@@ -4148,44 +4281,6 @@ pub(crate) mod tests {
         });
     }
 
-    #[test]
-    fn reset_dropped_on_close_replies_cancelled() {
-        smol::block_on(async {
-            let (seen, received) = flume::bounded(1);
-            let (release, released) = flume::bounded::<()>(1);
-            let checkpoint: Checkpoint = Arc::new(
-                move |request: CheckpointRequest<crate::session_coordinator::SessionCheckpoint>| {
-                    let seen = seen.clone();
-                    let released = released.clone();
-                    Box::pin(async move {
-                        let _ = seen.send_async(()).await;
-                        let _ = released.recv_async().await;
-                        Ok(CheckpointAck::for_request(&request))
-                    }) as CheckpointFuture
-                },
-            );
-            let (provider, _) = recording();
-            let (handle, coordinator) = fixture(Vec::new(), checkpoint, provider);
-            let root = handle.initialized_root().await.unwrap();
-            let _turn = handle.input_tx.admit(first_input()).await.unwrap();
-            bounded(received.recv_async()).await.unwrap();
-            let (reply, replies) = flume::bounded(1);
-            handle
-                .control_tx
-                .send(InteractiveControl::Reset(reply))
-                .await
-                .unwrap();
-            root.actor().unwrap().close();
-            assert_eq!(
-                bounded(replies.recv_async()).await.unwrap(),
-                Err(OPERATION_CANCELLED.to_owned())
-            );
-            drop(release);
-            handle.task.cancel().await;
-            coordinator.close().await.unwrap();
-        });
-    }
-
     #[test_case(false ; "a_failed_compaction_is_never_persisted")]
     #[test_case(true ; "cancelled_persistence_reports_cancellation_not_failure")]
     fn unsuccessful_compaction_rolls_back(cancelled: bool) {
@@ -4279,74 +4374,6 @@ pub(crate) mod tests {
                 )
             );
             assert!(received.is_empty());
-            handle.task.cancel().await;
-            coordinator.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn actor_reset_requires_frontend_and_preserves_history_and_conversation() {
-        smol::block_on(async {
-            let (requests_tx, requests_rx) = flume::unbounded();
-            let (ended_tx, ended_rx) = flume::unbounded();
-            let (handle, coordinator) = fixture(
-                Vec::new(),
-                checkpoint(),
-                Arc::new(EndRecordingProvider {
-                    requests: requests_tx,
-                    ended: ended_tx,
-                }),
-            );
-            let root = handle.initialized_root().await.unwrap();
-            let turn = handle.input_tx.admit(first_input()).await.unwrap();
-            bounded(turn.wait()).await;
-            bounded(requests_rx.recv_async()).await.unwrap();
-            let history = root.actor().unwrap().committed_history();
-            let (reply, response) = flume::bounded(1);
-            handle
-                .control_tx
-                .send(InteractiveControl::Reset(reply))
-                .await
-                .unwrap();
-            assert_eq!(
-                bounded(response.recv_async()).await.unwrap(),
-                Err(RESET_REQUIRES_FRONTEND.into())
-            );
-            assert_eq!(root.actor().unwrap().committed_history(), history);
-            assert!(ended_rx.is_empty());
-            handle.task.cancel().await;
-            coordinator.close().await.unwrap();
-        });
-    }
-
-    #[test]
-    fn reset_is_ordered_after_active_turn() {
-        smol::block_on(async {
-            let (entered, received) = flume::bounded(1);
-            let (release, released) = flume::bounded(1);
-            let provider = Arc::new(GatedHeadlessProvider {
-                entered,
-                release: released,
-                exit: ProviderExit::Success,
-            });
-            let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
-            let primary = handle.input_tx.admit(first_input()).await.unwrap();
-            bounded(received.recv_async()).await.unwrap();
-            let (reply, response) = flume::bounded(1);
-            handle
-                .control_tx
-                .send(InteractiveControl::Reset(reply))
-                .await
-                .unwrap();
-            assert!(response.is_empty());
-            release.send_async(()).await.unwrap();
-            bounded(primary.wait()).await;
-            assert_eq!(
-                bounded(response.recv_async()).await.unwrap(),
-                Err(RESET_REQUIRES_FRONTEND.into())
-            );
-            let root = handle.initialized_root().await.unwrap();
-            assert!(root.actor().unwrap().committed_message_count() > 0);
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
         });

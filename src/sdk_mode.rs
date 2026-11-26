@@ -40,7 +40,7 @@ use makima_agent::mcp;
 use makima_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
 use makima_agent::session::{
     AnswerKey, AnswerRouter, Durability, FrontendObserver, FrontendServices, OpenRequest,
-    SessionEvent, SessionHandle, SessionSubscription, open,
+    ResetSeed, SessionEvent, SessionHandle, SessionSubscription, open,
 };
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_options::{
@@ -734,7 +734,7 @@ struct SdkServices<'a> {
 }
 
 impl FrontendServices for SdkServices<'_> {
-    fn root_binding(&mut self) -> RootBinding {
+    fn root_binding(&mut self) -> Option<RootBinding> {
         self.lua.root_binding()
     }
 
@@ -773,39 +773,6 @@ impl FrontendServices for SdkServices<'_> {
                 self.permission_mode,
                 explicit,
             );
-            if explicit {
-                let bypass = self.permission_mode == PermissionMode::BypassPermissions;
-                handle
-                    .coordinator
-                    .set_option(
-                        YOLO_OPTION_ID,
-                        if bypass {
-                            ENABLED_VALUE
-                        } else {
-                            DISABLED_VALUE
-                        },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let key = if self.permission_mode == PermissionMode::Plan {
-                    ModeId::Plan.key()
-                } else {
-                    ModeId::Build.key()
-                };
-                makima_lua::orchestration::set_mode(
-                    &*self.lua.bound()?.orchestration,
-                    handle.root(),
-                    &self.params.lua_handle.mode_registry(),
-                    key,
-                    self.storage,
-                )
-                .await
-                .map_err(|error| format!("set startup permission mode: {error}"))?;
-                handle
-                    .permissions
-                    .try_set_yolo(bypass)
-                    .map_err(|error| error.to_string())?;
-            }
             Ok(())
         })
     }
@@ -815,17 +782,60 @@ impl FrontendServices for SdkServices<'_> {
     }
 }
 
+impl SdkServices<'_> {
+    async fn apply_startup_permission_mode(&self, handle: &SessionHandle) -> Result<(), String> {
+        if self.params.cli.permission_mode.is_some() {
+            let bypass = self.permission_mode == PermissionMode::BypassPermissions;
+            handle
+                .coordinator
+                .set_option(
+                    YOLO_OPTION_ID,
+                    if bypass {
+                        ENABLED_VALUE
+                    } else {
+                        DISABLED_VALUE
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let key = if self.permission_mode == PermissionMode::Plan {
+                ModeId::Plan.key()
+            } else {
+                ModeId::Build.key()
+            };
+            makima_lua::orchestration::set_mode(
+                &*self.lua.bound()?.orchestration,
+                handle.root(),
+                &self.params.lua_handle.mode_registry(),
+                key,
+                self.storage,
+            )
+            .await
+            .map_err(|error| format!("set startup permission mode: {error}"))?;
+            handle
+                .permissions
+                .try_set_yolo(bypass)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 impl SdkRuntime {
-    async fn prepare(session: &Arc<SdkSession>, fresh: bool) -> Result<Arc<Self>> {
+    async fn prepare(session: &Arc<SdkSession>, reset: Option<ResetSeed>) -> Result<Arc<Self>> {
         let params = &session.params;
         let cli = &params.cli;
         let storage = &session.storage;
-        let source = sdk_session_source(
-            (!fresh).then_some(cli),
-            &params.cwd.to_string_lossy(),
-            storage,
-            &params.model.spec(),
-        )?;
+        let fresh = reset.is_some();
+        let source = match reset {
+            Some(seed) => seed.into_source(),
+            None => sdk_session_source(
+                cli,
+                &params.cwd.to_string_lossy(),
+                storage,
+                &params.model.spec(),
+            )?,
+        };
         let permission_mode = PermissionMode::resolve(
             cli.permission_mode.as_deref(),
             cli.yolo || params.permissions_config.yolo,
@@ -889,6 +899,10 @@ impl SdkRuntime {
             }
             result => result?,
         };
+        if let Err(error) = services.apply_startup_permission_mode(&handle).await {
+            let _ = handle.close(SDK_SHUTDOWN_TIMEOUT).await;
+            return Err(eyre!(error));
+        }
         let permission_mode = services.permission_mode;
         let bound = services.lua.into_bound().map_err(|error| eyre!(error))?;
         let root = handle.root();
@@ -1056,7 +1070,7 @@ impl SdkSession {
             input_closed: AtomicBool::new(false),
             reset: smol::lock::Mutex::new(()),
         });
-        let runtime = smol::block_on(SdkRuntime::prepare(&session, false))?;
+        let runtime = smol::block_on(SdkRuntime::prepare(&session, None))?;
         let original = runtime
             .commands
             .registry
@@ -1112,7 +1126,8 @@ impl SdkSession {
             return Err(sdk_command_error(WORK_ACTIVE));
         }
         old.handle.manager.wait_settled().await;
-        let prepared = SdkRuntime::prepare(self, true)
+        let seed = ResetSeed::new(&self.params.model.spec(), &self.params.cwd);
+        let prepared = SdkRuntime::prepare(self, Some(seed))
             .await
             .map_err(sdk_command_error)?;
         if active_work() {
@@ -1646,29 +1661,24 @@ type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
 #[cfg(test)]
 fn open_sdk_session(
-    cli: Option<&Cli>,
+    cli: &Cli,
     cwd: &str,
     storage: &StateDir,
     model: OpenModel<'_>,
 ) -> Result<SessionOpening> {
     let source = sdk_session_source(cli, cwd, storage, &model.startup.spec())?;
     match open_session(storage, source, model, Some(cwd)) {
-        Err(OpenSessionError::Exists(_)) if cli.is_some_and(|cli| cli.fork_session) => {
-            Err(eyre!(FORK_DESTINATION_EXISTS))
-        }
+        Err(OpenSessionError::Exists(_)) if cli.fork_session => Err(eyre!(FORK_DESTINATION_EXISTS)),
         result => Ok(result?),
     }
 }
 
 fn sdk_session_source(
-    cli: Option<&Cli>,
+    cli: &Cli,
     cwd: &str,
     storage: &StateDir,
     startup_model: &str,
 ) -> Result<SessionSource> {
-    let Some(cli) = cli else {
-        return Ok(SessionSource::New(StoredSession::new(startup_model, cwd)));
-    };
     let pinned = cli
         .session_id
         .as_deref()
@@ -2589,6 +2599,7 @@ mod tests {
     const RESTORED_MODEL: &str = "anthropic/claude-opus-4-6";
     const RESET_PROVIDER: &str = "sdk-reset";
     const RESET_MODEL: &str = "sdk-reset/offline";
+    const RESET_RESTORED_MODEL: &str = "sdk-reset/restored";
     const RESET_STATE_KEY: &str = "sdk/reset-state";
     const RESET_STATE_VALUE: &str = "previous session state";
     const RESET_TOOL: &str = "sdk_reset_active_tool";
@@ -2864,7 +2875,8 @@ mod tests {
         let storage = StateDir::from_path(directory.path().to_path_buf());
         let plan = directory.path().join(LEGACY_PLAN_FILE);
         std::fs::write(&plan, LEGACY_PLAN_CONTENT).unwrap();
-        let mut saved = StoredSession::new(RESET_MODEL, &directory.path().to_string_lossy());
+        let mut saved =
+            StoredSession::new(RESET_RESTORED_MODEL, &directory.path().to_string_lossy());
         saved.replace_messages(vec![Message::user(SDK_ROOT_PROMPT.into())]);
         saved.save(&storage).unwrap();
         let path = storage
@@ -2900,16 +2912,9 @@ mod tests {
         let resumed = session.current();
         let root = resumed.root.target.id();
         assert_eq!(resumed.handle.session_id.id(), saved.id);
-        assert_eq!(
-            resumed
-                .root
-                .target
-                .effective_config()
-                .unwrap()
-                .unwrap()
-                .mode,
-            AgentMode::Plan(plan.clone())
-        );
+        let resumed_config = resumed.root.target.effective_config().unwrap().unwrap();
+        assert_eq!(resumed_config.mode, AgentMode::Plan(plan.clone()));
+        assert_eq!(resumed_config.model.spec(), RESET_RESTORED_MODEL);
         let migrated = StoredSession::load(saved.id, &storage).unwrap();
         let plans =
             makima_agent::plan_state::plan_entries(&migrated.latest_state().unwrap()).unwrap();
@@ -2931,6 +2936,9 @@ mod tests {
         let fresh = session.current();
         assert_ne!(fresh.handle.session_id.id(), saved.id);
         assert_ne!(fresh.root.target.id(), root);
+        let fresh_config = fresh.root.target.effective_config().unwrap().unwrap();
+        assert_eq!(fresh_config.model.spec(), RESET_MODEL);
+        assert_eq!(fresh_config.mode, AgentMode::Build);
         let mut replacement = StoredSession::load(fresh.handle.session_id.id(), &storage).unwrap();
         fresh
             .handle
@@ -2957,7 +2965,7 @@ mod tests {
     fn open_test_session(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<SessionOpening> {
         let params = idle_params();
         open_sdk_session(
-            Some(cli),
+            cli,
             cwd,
             storage,
             OpenModel {
@@ -2994,7 +3002,7 @@ mod tests {
                 args.push(saved.id.to_string());
             }
             let cli = Cli::parse_from(args);
-            let source = sdk_session_source(Some(&cli), &cwd, &storage, STARTUP_MODEL).unwrap();
+            let source = sdk_session_source(&cli, &cwd, &storage, STARTUP_MODEL).unwrap();
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
                 .unwrap()
@@ -3295,7 +3303,7 @@ mod tests {
             saved.push_message(Message::user(SDK_ROOT_PROMPT.into()));
             saved.save(&storage).unwrap();
             let cli = Cli::parse_from(["makima", "-c", &saved.id.to_string()]);
-            let source = sdk_session_source(Some(&cli), &cwd, &storage, STARTUP_MODEL).unwrap();
+            let source = sdk_session_source(&cli, &cwd, &storage, STARTUP_MODEL).unwrap();
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let competing_lease = session_lock::claim(&sessions_dir, &saved.id)
                 .unwrap()

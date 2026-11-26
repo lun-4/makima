@@ -539,10 +539,10 @@ impl<'a> HeadlessServices<'a> {
 }
 
 impl FrontendServices for HeadlessServices<'_> {
-    fn root_binding(&mut self) -> RootBinding {
+    fn root_binding(&mut self) -> Option<RootBinding> {
         let (binding, root) = root_binding();
         self.binding = Some(root);
-        binding
+        Some(binding)
     }
 
     fn bind_root<'a>(

@@ -805,6 +805,13 @@ impl SessionCoordinatorHandle {
         permissions: Arc<PermissionManager>,
     ) -> Result<(), SessionCoordinatorError> {
         self.ensure_bindable()?;
+        self.set_permissions(permissions)
+    }
+
+    fn set_permissions(
+        &self,
+        permissions: Arc<PermissionManager>,
+    ) -> Result<(), SessionCoordinatorError> {
         let mut bound = self.read.permissions.lock_unpoisoned();
         if let Some(current) = &*bound {
             if !Arc::ptr_eq(current, &permissions) {
@@ -837,6 +844,15 @@ impl SessionCoordinatorHandle {
         project_config: ConfigProjector,
     ) -> Result<(), ConfigChangeError> {
         self.ensure_bindable()?;
+        self.set_actor(agent, prepare_model, project_config)
+    }
+
+    fn set_actor(
+        &self,
+        agent: AgentRef,
+        prepare_model: ModelPreparer,
+        project_config: ConfigProjector,
+    ) -> Result<(), ConfigChangeError> {
         agent.validate_live()?;
         self.bind_actor_config(
             agent.clone(),
@@ -1499,6 +1515,19 @@ impl PreparedSessionCoordinator {
             mailbox,
             rx,
         })
+    }
+
+    pub(crate) fn bind(
+        &self,
+        permissions: Arc<PermissionManager>,
+        agent: AgentRef,
+        prepare_model: ModelPreparer,
+        project_config: ConfigProjector,
+    ) -> Result<SessionCoordinatorHandle, ConfigChangeError> {
+        self.handle.set_permissions(permissions)?;
+        self.handle
+            .set_actor(agent, prepare_model, project_config)?;
+        Ok(self.handle.clone())
     }
 
     pub fn activate(self) -> Result<SessionCoordinatorHandle, SessionCoordinatorError> {
