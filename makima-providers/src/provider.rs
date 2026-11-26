@@ -11,6 +11,7 @@ use serde_json::Value;
 use makima_storage::id::SessionRef;
 
 use crate::model::Model;
+use crate::registry::PreparedProvider;
 use crate::retry::RetryPolicy;
 use crate::{
     AgentError, ConversationEnd, Invocation, Message, ProviderEvent, ProviderUsage,
@@ -50,6 +51,11 @@ impl From<&ProviderConfig> for Timeouts {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Provider: Any + Send + Sync {
+    /// Resolves a deferred provider and model before the run applies model capabilities and prices.
+    fn model_preparation(&self) -> Option<BoxFuture<'_, Result<&PreparedProvider, AgentError>>> {
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
         &'a self,

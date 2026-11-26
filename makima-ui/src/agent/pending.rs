@@ -57,6 +57,16 @@ impl PendingProvider {
 }
 
 impl Provider for PendingProvider {
+    fn model_preparation(&self) -> Option<BoxFuture<'_, Result<&PreparedModel, AgentError>>> {
+        Some(Box::pin(async {
+            #[cfg(test)]
+            if let Some(probe) = &self.request_probe {
+                let _ = probe.try_send(());
+            }
+            self.prepared().await
+        }))
+    }
+
     fn stream_message<'a>(
         &'a self,
         _model: &'a Model,
@@ -70,10 +80,6 @@ impl Provider for PendingProvider {
         delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(probe) = &self.request_probe {
-                let _ = probe.try_send(());
-            }
             let prepared = self.prepared().await?;
             prepared
                 .provider

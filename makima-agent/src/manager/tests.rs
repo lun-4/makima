@@ -61,6 +61,7 @@ const EXPECTED_PERSISTENCE_ERROR: &str = "expected persistence error";
 const RECEIPT_SYNC_FAILED: &str = "injected fsync failure";
 const SPAWN_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
 const PRIVATE_TOOLS_REASON: &str = "private tools cannot be restored";
+const GATED_SPAWN_LABEL: &str = "gated spawn";
 
 struct ReceiptGateIo {
     entered: Sender<()>,
@@ -487,6 +488,65 @@ fn lifecycle_revision_waits_for_earlier_receipt(
                 .unwrap();
         }
         manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
+        writer.close().await.unwrap();
+    });
+}
+
+#[test_case(false; "spawn")]
+#[test_case(true; "retire")]
+fn lifecycle_revision_waiter_observes_shutdown_before_earlier_receipt(retires: bool) {
+    receipt_test(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let journal = manager.journal();
+        let (writer, syncing, release) = ReceiptGateIo::writer(
+            |record| matches!(record, Record::Agent { d, .. } if d.label.as_deref() == Some(GATED_SPAWN_LABEL)),
+        );
+        journal.bind_writer(writer.clone()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
+            .unwrap();
+        let spawn = |label| {
+            manager.spawn_child_trusted_with_config(
+                &root,
+                config(SPAWN_MODEL, false),
+                AgentMetadata {
+                    label,
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            )
+        };
+        let child = if retires {
+            Some(spawn(None).await.unwrap())
+        } else {
+            None
+        };
+        let mut first = Box::pin(spawn(Some(GATED_SPAWN_LABEL.into())));
+        assert!(poll_once(&mut first).await.is_none());
+        syncing.recv_async().await.unwrap();
+        assert!(journal.agent_revision_blocked());
+
+        let mut waiting = Box::pin(async {
+            if let Some(child) = &child {
+                manager.retire_trusted(child).await
+            } else {
+                spawn(None).await.map(|_| ())
+            }
+        });
+        assert!(poll_once(&mut waiting).await.is_none());
+        manager.shutdown(Duration::ZERO).await;
+        assert!(journal.agent_revision_blocked());
+        assert!(matches!(
+            poll_once(&mut waiting).await,
+            Some(Err(ManagerError::GraphShutdown))
+        ));
+
+        release.send(false).unwrap();
+        first.await.unwrap();
+        manager.wait_until_reaped().await;
         writer.close().await.unwrap();
     });
 }

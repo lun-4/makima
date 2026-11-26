@@ -86,6 +86,10 @@ impl TrackedProvider {
 }
 
 impl Provider for TrackedProvider {
+    fn model_preparation(&self) -> Option<BoxFuture<'_, Result<&PreparedModel, AgentError>>> {
+        self.inner.model_preparation()
+    }
+
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,

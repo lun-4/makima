@@ -280,8 +280,7 @@ impl<'h> Agent<'h> {
         agent
     }
 
-    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
-        crate::prompt::append_model_identity(&mut run.system, &params.model);
+    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         Self {
             agent_id: params.agent_id,
             provider: params.provider,
@@ -591,6 +590,30 @@ impl<'h> Agent<'h> {
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        let prepared = match self.provider.model_preparation() {
+            Some(preparation) => Some(
+                self.cancel
+                    .race(preparation)
+                    .await
+                    .map_err(|_| AgentError::Cancelled)??
+                    .clone(),
+            ),
+            None => None,
+        };
+        if let Some(prepared) = prepared {
+            let switched = self.model.id != prepared.model.id
+                || self.model.provider != prepared.model.provider
+                || self.model.context_window != prepared.model.context_window;
+            self.provider = prepared.provider;
+            self.model = Arc::new(prepared.model);
+            if switched {
+                self.event_tx.send(AgentEvent::ModelSwitched {
+                    spec: self.model.spec(),
+                    context_window: self.model.context_window,
+                })?;
+            }
+        }
+        crate::prompt::append_model_identity(&mut self.system, &self.model);
         if !super::history::pending_tool_calls(self.history.as_slice()).is_empty() {
             let ctx = self.tool_context()?;
             tool_dispatch::resume_tool_calls(

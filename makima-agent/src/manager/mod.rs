@@ -41,6 +41,7 @@ use std::time::Duration;
 use async_lock::{RwLock, RwLockWriteGuardArc, Semaphore, SemaphoreGuardArc};
 use event_listener::Event;
 use futures_lite::FutureExt;
+use futures_lite::future::or;
 use makima_providers::{Message, TokenUsage, provider::BoxFuture};
 use tracing::{info, warn};
 
@@ -347,6 +348,7 @@ pub(crate) struct ManagerInner {
     watchers: Mutex<WatcherRegistry>,
     next_watcher: AtomicU64,
     shutdown: AtomicBool,
+    shutdown_started: Event,
     reaped: Event,
     #[cfg(test)]
     commit_gate: Mutex<Option<TestGate>>,
@@ -418,6 +420,7 @@ impl AgentManagerHandle {
                 observers: Vec::new(),
             }),
             shutdown: AtomicBool::new(false),
+            shutdown_started: Event::new(),
             reaped: Event::new(),
             #[cfg(test)]
             commit_gate: Mutex::new(None),
@@ -1566,6 +1569,7 @@ impl AgentManagerHandle {
         current: Option<&CurrentManagedTurn>,
     ) -> Result<(), ManagerError> {
         let result = loop {
+            let shutdown = self.0.shutdown_started.listen();
             let progress = self.0.journal.listen_for_progress();
             {
                 let mut graph = self.lock_graph();
@@ -1603,7 +1607,7 @@ impl AgentManagerHandle {
                     }
                 }
             }
-            progress.await;
+            or(progress, shutdown).await;
         };
         result
             .recv_async()
@@ -3474,6 +3478,7 @@ impl AgentManagerHandle {
             armed: true,
         };
         let result = loop {
+            let shutdown = self.0.shutdown_started.listen();
             let progress = self.0.journal.listen_for_progress();
             {
                 let mut graph = self.lock_graph();
@@ -3539,7 +3544,7 @@ impl AgentManagerHandle {
                     }
                 }
             }
-            progress.await;
+            or(progress, shutdown).await;
         };
         result
             .recv_async()
@@ -4263,6 +4268,7 @@ impl AgentManagerHandle {
                 graph.shutting_down = true;
                 self.0.journal.revoke_all_state_turns();
                 self.0.shutdown.store(true, Ordering::Release);
+                self.0.shutdown_started.notify(usize::MAX);
                 graph
                     .nodes
                     .iter()
@@ -4324,6 +4330,7 @@ impl AgentManagerHandle {
             graph.shutting_down = true;
             self.0.journal.revoke_all_state_turns();
             self.0.shutdown.store(true, Ordering::Release);
+            self.0.shutdown_started.notify(usize::MAX);
             for id in &ids {
                 let replacement = Self::next_reservation(&mut graph);
                 if let Some(node) = graph.nodes.get_mut(id) {

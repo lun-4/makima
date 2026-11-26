@@ -9597,13 +9597,22 @@ end })
     fn recovered_turn_waits_for_committed_startup_model_fallback(startup_pending: bool) {
         const RESTORE_FAILURE: &str = "saved model credentials unavailable";
         const PREPARED_WINDOW: u32 = 123_456;
+        const SAVED_INPUT_PRICE: f64 = 2.0;
+        const FALLBACK_INPUT_PRICE: f64 = 4.0;
+        const USAGE: TokenUsage = TokenUsage {
+            input: 1_000,
+            output: 0,
+            cache_creation: 0,
+            cache_read: 0,
+        };
+        const FALLBACK_COST: f64 = 0.004;
         let (waiting_tx, waiting_rx) = flume::bounded(1);
         let waiter = Arc::new(PendingProvider::with_request_probe(waiting_tx));
         let runtime_waiter = Arc::clone(&waiter);
         let (requests_tx, requests_rx) = flume::unbounded();
         let fallback: Arc<dyn Provider> = Arc::new(AnsweringProvider {
             requests: requests_tx,
-            usage: TokenUsage::default(),
+            usage: USAGE,
         });
         let startup = Arc::new(PendingProvider::default());
         let root = AgentId::generate();
@@ -9630,10 +9639,15 @@ end })
                     },
                 });
                 session.save(&ctx.storage).unwrap();
+                let mut saved_model = Model::from_spec(PREPARED_MODEL).unwrap();
+                saved_model.pricing.input = SAVED_INPUT_PRICE;
                 let mut runtime = ctx
                     .prepare_runtime_with_options(
                         session,
-                        None,
+                        Some(PreparedProvider {
+                            model: saved_model,
+                            provider: runtime_waiter.clone(),
+                        }),
                         PrepareOptions::default(),
                         Some(runtime_waiter),
                     )
@@ -9651,9 +9665,12 @@ end })
                 let ticket = actor.turn_ticket(turn).unwrap();
                 let config = actor.effective_config().unwrap();
                 assert_eq!(config.model.spec(), PREPARED_MODEL);
+                assert_eq!(config.model.pricing.input, SAVED_INPUT_PRICE);
                 let mut startup_model = event_loop.ctx.model_slot.load().model.clone();
                 startup_model.context_window = PREPARED_WINDOW;
+                startup_model.pricing.input = FALLBACK_INPUT_PRICE;
                 let startup_spec = startup_model.spec();
+                let startup_id = startup_model.id.clone();
                 let prepared_startup = PreparedModel {
                     model: startup_model,
                     provider: fallback,
@@ -9725,6 +9742,31 @@ end })
                     state.scopes[&Some(root)].config.as_ref().unwrap().model,
                     startup_spec
                 );
+                assert_eq!(saved.usage_by_model().len(), 1);
+                assert_eq!(
+                    saved.usage_by_model()[&startup_id],
+                    USAGE.billed(Some(FALLBACK_COST))
+                );
+
+                let mut switched = None;
+                let mut completed = None;
+                let events = &event_loop.sessions[0].handles.events;
+                while let Some(SessionEvent::Agent(envelope)) = events.try_next() {
+                    match envelope.event {
+                        AgentEvent::ModelSwitched {
+                            spec,
+                            context_window,
+                        } => {
+                            switched = Some((spec, context_window));
+                        }
+                        AgentEvent::TurnComplete(event) => completed = Some(event),
+                        _ => {}
+                    }
+                }
+                assert_eq!(switched, Some((startup_spec, PREPARED_WINDOW)));
+                let completed = completed.unwrap();
+                assert_eq!(completed.model, startup_id);
+                assert_eq!(completed.cost, Some(FALLBACK_COST));
             },
         );
     }
