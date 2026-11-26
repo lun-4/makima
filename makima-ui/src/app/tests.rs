@@ -960,7 +960,7 @@ fn sdk_created_session_restores_title_tool_output_post_and_cost() {
         async {
             let opened = open_session(
                 &storage,
-                SessionSource::Create(seed),
+                SessionSource::New(seed),
                 OpenModel {
                     startup: &model,
                     explicit: true,

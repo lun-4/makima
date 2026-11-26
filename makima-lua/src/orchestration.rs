@@ -1,20 +1,25 @@
+use crate::EventHandle;
 use crate::agent_errors::{
     NO_ORCHESTRATION_SERVICES, ORCHESTRATION_CONTEXT_EXPIRED, ORCHESTRATION_SERVICES_EXPIRED,
 };
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
+use crate::session_snapshot::HeadlessObserver;
 use makima_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use makima_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use makima_agent::command::command_input;
 use makima_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
-use makima_agent::headless::{InteractiveControl, InteractiveHandle, RootBinding};
+use makima_agent::headless::{
+    InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding, TurnAdmitter,
+};
 use makima_agent::manager::AgentIncarnation;
+use makima_agent::session::{FrontendObserver, FrontendServices, SessionHandle};
 use makima_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::{
-    AgentActorHandle, AgentReactivator, AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin,
-    TurnProvenance, tools::ToolContext,
+    AgentActorHandle, AgentEvent, AgentReactivator, AgentRef, ModeRegistry, TurnAdmissionOptions,
+    TurnOrigin, TurnProvenance, tools::ToolContext,
 };
 use makima_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
@@ -22,6 +27,7 @@ use makima_commands::{
 };
 use makima_domain::LockExt;
 use makima_providers::Message;
+use makima_providers::provider::BoxFuture;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use makima_storage::sessions::HistorySnapshot;
@@ -281,14 +287,39 @@ pub fn command_runner(
 /// prompt to answer.
 pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
     let root = handle.root.clone();
-    let admitter = handle.input_tx.admitter();
-    let control = handle.control_tx.clone();
+    outcomes(
+        move || {
+            let root = root.clone();
+            async move { root.get().await }
+        },
+        handle.input_tx.admitter(),
+        handle.control_tx.clone(),
+    )
+}
+
+pub fn headless_session_outcomes(handle: &SessionHandle) -> OutcomeExecutor {
+    let root = handle.root().clone();
+    outcomes(
+        move || std::future::ready(Ok(root.clone())),
+        handle.input_tx.admitter(),
+        handle.control_tx.clone(),
+    )
+}
+
+fn outcomes<F>(
+    root: impl Fn() -> F + Send + Sync + 'static,
+    admitter: TurnAdmitter,
+    control: InteractiveControlSender,
+) -> OutcomeExecutor
+where
+    F: Future<Output = Result<AgentRef, String>> + Send + 'static,
+{
     Arc::new(move |cmdline, outcome, admission| {
-        let root = root.clone();
+        let root = root();
         let admitter = admitter.clone();
         let control = control.clone();
         Box::pin(async move {
-            let root = root.get().await?;
+            let root = root.await?;
             let actor = admission.actor()?;
             let target = admission.target.clone();
             let child =
@@ -365,6 +396,13 @@ pub fn child_persistence(
     label: &'static str,
     services: Weak<AgentOrchestration>,
     _writer: Arc<SessionWriter>,
+) -> (ConfigMutationReserver, TurnCompletion) {
+    journal_child_persistence(label, services)
+}
+
+fn journal_child_persistence(
+    label: &'static str,
+    services: Weak<AgentOrchestration>,
 ) -> (ConfigMutationReserver, TurnCompletion) {
     let config_services = services.clone();
     let reserver: ConfigMutationReserver = Arc::new(move |target, publication| {
@@ -447,24 +485,120 @@ pub async fn bind_frontend_root(
         .map_err(|error| error.to_string())
 }
 
-/// The orchestration a non-UI frontend binds to its root graph: the root's
-/// config commits through {coordinator} and its children persist to
-/// {checkpoint}, and {catalog}'s discovery refreshes it. `label` names the
-/// frontend in the closed-graph error.
-pub fn durable_frontend(
+pub struct HeadlessServices<'a> {
     label: &'static str,
-    catalog: &ModelCatalog,
-    root: TrustedTarget,
-    coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionWriter>,
-) -> Arc<AgentOrchestration> {
-    Arc::new_cyclic(|services| {
-        let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
-        frontend_root(catalog, root, child_config, coordinator).with_completion(completion)
-    })
+    catalog: &'a ModelCatalog,
+    events: EventHandle,
+    ignore_stream_closed: bool,
+    binding: Option<flume::Receiver<TrustedTarget>>,
+    bound: Option<BoundHeadless>,
 }
 
-/// The root half of [`durable_frontend`]: root config goes through
+pub struct BoundHeadless {
+    pub root: TrustedTarget,
+    pub orchestration: Arc<AgentOrchestration>,
+    events: EventHandle,
+    observer: HeadlessObserver,
+}
+
+impl BoundHeadless {
+    pub fn activate(&self) {
+        self.events
+            .install_orchestration_services(self.orchestration.clone());
+        self.observer.install(self.root.target.clone());
+    }
+}
+
+impl<'a> HeadlessServices<'a> {
+    pub fn new(label: &'static str, catalog: &'a ModelCatalog, events: EventHandle) -> Self {
+        Self {
+            label,
+            catalog,
+            events,
+            ignore_stream_closed: false,
+            binding: None,
+            bound: None,
+        }
+    }
+
+    pub fn ignore_stream_closed(mut self) -> Self {
+        self.ignore_stream_closed = true;
+        self
+    }
+
+    pub fn bound(&self) -> Result<&BoundHeadless, String> {
+        self.bound
+            .as_ref()
+            .ok_or_else(|| "headless root is not bound".to_owned())
+    }
+
+    pub fn into_bound(self) -> Result<BoundHeadless, String> {
+        self.bound
+            .ok_or_else(|| "headless root is not bound".to_owned())
+    }
+}
+
+impl FrontendServices for HeadlessServices<'_> {
+    fn root_binding(&mut self) -> RootBinding {
+        let (binding, root) = root_binding();
+        self.binding = Some(root);
+        binding
+    }
+
+    fn bind_root<'a>(
+        &'a mut self,
+        session: &'a SessionHandle,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let root = self
+                .binding
+                .take()
+                .ok_or_else(|| "headless root binding is missing".to_owned())?
+                .recv_async()
+                .await
+                .map_err(|error| error.to_string())?;
+            let coordinator = session.coordinator.clone();
+            let orchestration = if session.is_persistent() {
+                Arc::new_cyclic(|services| {
+                    let (config, completion) =
+                        journal_child_persistence(self.label, services.clone());
+                    frontend_root(self.catalog, root.clone(), config, coordinator)
+                        .with_completion(completion)
+                })
+            } else {
+                Arc::new(frontend_root(
+                    self.catalog,
+                    root.clone(),
+                    Arc::new(|_, publication| Ok(nonpersistent_config_mutation(publication))),
+                    coordinator,
+                ))
+            };
+            self.catalog.attach(&orchestration);
+            let observer = HeadlessObserver::new(self.events.clone(), session.session_id.id());
+            self.bound = Some(BoundHeadless {
+                root,
+                orchestration,
+                events: self.events.clone(),
+                observer,
+            });
+            Ok(())
+        })
+    }
+
+    fn observe(&mut self, _: &SessionHandle) -> FrontendObserver {
+        let observer = self.bound.as_ref().map(|bound| bound.observer.clone());
+        let ignore_stream_closed = self.ignore_stream_closed;
+        Box::new(move |event| {
+            if let Some(observer) = &observer
+                && !(ignore_stream_closed && matches!(event.event, AgentEvent::StreamClosed))
+            {
+                observer.observe(event);
+            }
+        })
+    }
+}
+
+/// Root config goes through
 /// {coordinator}, children through {child_config}.
 pub fn frontend_root(
     catalog: &ModelCatalog,

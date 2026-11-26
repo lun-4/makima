@@ -3,7 +3,7 @@ use crate::{
     agent::UNAVAILABLE_RESULT,
     journal::{DeliveryInboxUsage, SessionJournal, SessionJournalSnapshot, restored_preview_bytes},
     modes, plan_state,
-    session_coordinator::SessionCoordinatorHandle,
+    session_coordinator::{SessionCoordinatorError, SessionCoordinatorHandle},
     session_writer::{SessionWriter, WriterError},
 };
 use makima_config::ModelPolicy;
@@ -42,9 +42,9 @@ const WRONG_WRITER: &str = "recovery writer belongs to another session";
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
 pub enum SessionSource {
-    Resume(MakimaId),
-    Create(StoredSession),
-    ResumeOrCreate(StoredSession),
+    Existing(MakimaId),
+    New(StoredSession),
+    ExistingOrNew(StoredSession),
 }
 
 pub struct OpenModel<'a> {
@@ -63,7 +63,11 @@ pub enum OpenSessionError {
     #[error("session {0}: lock ownership was lost")]
     LockLost(MakimaId),
     #[error(transparent)]
-    ResumeBlocked(#[from] ResumeBlock),
+    ExistingBlocked(#[from] ResumeBlock),
+    #[error("{0}")]
+    Compose(String),
+    #[error(transparent)]
+    Coordinator(#[from] SessionCoordinatorError),
     #[error(transparent)]
     Load(#[from] SessionError),
     #[error(transparent)]
@@ -92,8 +96,8 @@ pub fn open_session(
     resume_cwd: Option<&str>,
 ) -> Result<SessionOpening, OpenSessionError> {
     let id = match &source {
-        SessionSource::Resume(id) => *id,
-        SessionSource::Create(seed) | SessionSource::ResumeOrCreate(seed) => seed.id,
+        SessionSource::Existing(id) => *id,
+        SessionSource::New(seed) | SessionSource::ExistingOrNew(seed) => seed.id,
     };
     let directory = storage.ensure_subdir(SESSIONS_DIR)?;
     let lease = session_lock::claim(&directory, &id)?.ok_or(OpenSessionError::Busy(id))?;
@@ -102,7 +106,7 @@ pub fn open_session(
         .publish(|| StoredSession::load_from(id, &directory))?
         .ok_or(OpenSessionError::LockLost(id))?;
     let (mut session, resumed) = match (source, loaded) {
-        (SessionSource::Create(_), Ok(_)) => return Err(OpenSessionError::Exists(id)),
+        (SessionSource::New(_), Ok(_)) => return Err(OpenSessionError::Exists(id)),
         (_, Ok(session)) => {
             if let Some(cwd) = resume_cwd
                 && let Some(block) = session_lock::resume_block(&session.cwd, cwd, false)
@@ -112,7 +116,7 @@ pub fn open_session(
             (session, true)
         }
         (
-            SessionSource::Create(seed) | SessionSource::ResumeOrCreate(seed),
+            SessionSource::New(seed) | SessionSource::ExistingOrNew(seed),
             Err(SessionError::Storage(StorageError::NotFound(_))),
         ) => (seed, false),
         (_, Err(error)) => return Err(error.into()),
@@ -181,9 +185,19 @@ impl SessionOpening {
     }
 
     pub async fn recover(
+        self,
+        storage: &StateDir,
+        modes: &ModeRegistry,
+    ) -> Result<(Arc<SessionWriter>, Arc<LockHeartbeat>, RecoveredSession), OpenSessionError> {
+        self.recover_with_continuation(storage, modes, continue_all_agents())
+            .await
+    }
+
+    pub(crate) async fn recover_with_continuation(
         mut self,
         storage: &StateDir,
         modes: &ModeRegistry,
+        continue_turns: bool,
     ) -> Result<(Arc<SessionWriter>, Arc<LockHeartbeat>, RecoveredSession), OpenSessionError> {
         let id = self.session.id;
         let root = self
@@ -201,12 +215,10 @@ impl SessionOpening {
                 coordinator.retire();
             }
         }));
-        let (writer, candidate) = prepare_session_recovery(
-            &self.directory,
-            self.session,
-            lock.publication_guard(),
-            None,
-        )?;
+        let candidate =
+            RecoveryCandidate::prepare_with_continuation(self.session.clone(), continue_turns)?;
+        let writer = Arc::new(SessionWriter::open_session(&self.directory, &self.session)?);
+        writer.bind_publication_guard(Some(lock.publication_guard()));
         let recovered = candidate
             .publish(
                 &writer,
@@ -832,7 +844,7 @@ mod tests {
         let open = || {
             open_session(
                 &storage,
-                SessionSource::Resume(id),
+                SessionSource::Existing(id),
                 OpenModel {
                     startup: &startup,
                     explicit,

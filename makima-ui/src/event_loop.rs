@@ -1504,9 +1504,9 @@ impl SpawnCtx {
         let (guard, renewing, selection) = match ownership {
             RuntimeOwnership::Claim | RuntimeOwnership::Reload => {
                 let source = if session.checkpoint_required() {
-                    SessionSource::Resume(session.id)
+                    SessionSource::Existing(session.id)
                 } else {
-                    SessionSource::ResumeOrCreate(session)
+                    SessionSource::ExistingOrNew(session)
                 };
                 let opened = open_session(
                     &self.storage,

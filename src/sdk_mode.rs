@@ -28,30 +28,36 @@ use makima_agent::agent::PromptSlotSource;
 use makima_agent::agent::isolated_turn::collect_answer;
 use makima_agent::cancel::{CancelScope, CancelToken, CancelTrigger, SessionCancellation};
 use makima_agent::command::{
-    CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
+    CustomCommand, StandardCommands, StandardCompletions, session_capabilities,
 };
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::headless::RootBinding;
 use makima_agent::headless::{
-    self, FrontendProfile, InteractiveControlSender, InteractiveHandle, InteractiveInputSender,
-    InteractiveParams, RootSubmission, WorkCancel,
+    self, FrontendProfile, InteractiveControlSender, InteractiveInputSender, InteractiveParams,
+    RootSubmission, WorkCancel,
 };
 use makima_agent::mcp;
 use makima_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
-use makima_agent::session::{AnswerKey, AnswerRouter, SessionEvent, SessionSubscription};
+use makima_agent::session::{
+    AnswerKey, AnswerRouter, Durability, FrontendObserver, FrontendServices, OpenRequest,
+    SessionEvent, SessionHandle, SessionSubscription, open,
+};
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
-use makima_agent::session_defaults;
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, MODEL_OPTION_ID, YOLO_OPTION_ID,
 };
-use makima_agent::session_recovery::{
-    OpenModel, OpenSessionError, SessionOpening, SessionSource, open_session,
-};
+#[cfg(test)]
+use makima_agent::session_recovery::{OpenModel, SessionOpening, open_session};
+use makima_agent::session_recovery::{OpenSessionError, SessionSource, continue_all_agents};
+#[cfg(test)]
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QUESTION_TOOL_NAME;
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentManagerHandle, AgentMode, Envelope, ModeId,
     PermissionsConfig, ToolOutput, TurnId, TurnOutcome,
 };
+#[cfg(test)]
+use makima_agent::{command::SessionCommandHost, headless::InteractiveHandle, session_defaults};
 use makima_commands::{
     BuiltinOperation, CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome,
     CommandRegistry, HostRequest, HostResponse, InputDispatch, Producer, ProducerPrecedence,
@@ -59,11 +65,13 @@ use makima_commands::{
 };
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use makima_lua::orchestration::{
-    AgentOrchestration, Discovery, ModelCatalog, PinnedCommandHost, PinnedCommandTarget,
-    TrustedTarget,
+    BoundHeadless, Discovery, HeadlessServices, ModelCatalog, PinnedCommandHost,
+    PinnedCommandTarget, TrustedTarget,
 };
+#[cfg(test)]
 use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
+use makima_providers::provider::BoxFuture;
 use makima_providers::{
     ImageSource, Message, ProviderRegistry, StopReason, Timeouts, TokenUsage, add_cost,
 };
@@ -72,7 +80,7 @@ use makima_storage::conversation::{ConversationRelation, ConversationState};
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_lock;
 use makima_storage::session_state::{ParentLink, StateChange, StoredStateRecord};
-use makima_storage::sessions::{SESSIONS_DIR, Session, read_prefs};
+use makima_storage::sessions::{SESSIONS_DIR, Session};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -85,6 +93,7 @@ const OUTPUT_CLOSED: &str = "the SDK output is closed";
 const SESSION_ID_CONFLICT: &str =
     "--session-id must match the resumed session; use --fork-session to copy it to a new session";
 const FORK_DESTINATION_EXISTS: &str = "--fork-session requires a new --session-id";
+const CONTINUING_PERMISSION_MODE: &str = "cannot apply --permission-mode to a continuing root turn; omit the flag or set MAKIMA_CONTINUE_ALL_AGENTS=0";
 const SDK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const RESET_COMMAND: &str = "/reset";
 const CHILD_SESSION_RESET: &str = "resetting the session is unsupported for child agents";
@@ -693,19 +702,14 @@ impl SdkCommands {
 }
 
 struct SdkRuntime {
-    handle: InteractiveHandle,
-    coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionWriter>,
-    _lock: Arc<session_lock::LockHeartbeat>,
+    handle: SessionHandle,
     root: TrustedTarget,
     commands: Arc<SdkCommands>,
-    orchestration: Arc<AgentOrchestration>,
+    bound: BoundHeadless,
     catalog: ModelCatalog,
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
     init: Value,
-    resumed: bool,
-    continuation_notice: Option<String>,
     tasks: Mutex<Vec<smol::Task<()>>>,
     discovery: Mutex<Option<Discovery>>,
 }
@@ -722,359 +726,252 @@ struct SdkSession {
     reset: smol::lock::Mutex<()>,
 }
 
-impl SdkRuntime {
-    async fn prepare(session: &Arc<SdkSession>, fresh: bool) -> Result<Arc<Self>> {
-        let params = &session.params;
-        let cli = &params.cli;
-        let cwd = params.cwd.clone();
-        let config = params.config.clone();
-        let permissions_config = params.permissions_config.clone();
-        let timeouts = params.timeouts;
-        let prompt_slots = params.prompt_slots.clone();
-        let defaults = params.defaults;
-        let model_policy = Arc::clone(&params.model_policy);
-        let providers = Arc::clone(&params.providers);
-        let plugin_rules = Arc::clone(&params.plugin_rules);
-        let project_config = params.project_config.clone();
-        let command_registry = params.command_registry.clone();
-        let session_options = params.session_options.clone();
-        let lua_handle = &params.lua_handle;
-        let explicit_permission_mode = cli.permission_mode.is_some();
-        let permission_mode = PermissionMode::resolve(
-            cli.permission_mode.as_deref(),
-            cli.yolo || permissions_config.yolo,
-        );
-        let startup_permission_mode = permission_mode;
+struct SdkServices<'a> {
+    lua: HeadlessServices<'a>,
+    params: &'a SdkParams,
+    storage: &'a StateDir,
+    permission_mode: PermissionMode,
+}
 
-        let working_dir = cwd.to_string_lossy().into_owned();
-        let storage = &session.storage;
-        let opening = open_sdk_session(
-            if fresh { None } else { Some(cli) },
-            &working_dir,
-            storage,
-            OpenModel {
-                startup: &params.model,
-                explicit: params.explicit_model && !fresh,
-                providers: &providers,
-                policy: &model_policy,
-            },
-        )?;
-        let resumed = opening.resumed;
-        let session_id = SessionRef::from(opening.session.id);
-        let model = opening.model.clone();
-        if let Some(warning) = &opening.warning {
-            warn!(%warning, %session_id, "session model restoration");
-        }
-        let (checkpoint, lock_guard, recovered) = opening
-            .recover(storage, &lua_handle.mode_registry())
-            .await?;
-        let root_id = recovered
-            .session()
-            .root_agent_id()
-            .ok_or_else(|| eyre!("recovered session has no root agent"))?;
-        let initial_history = recovered.session().history_snapshot();
-        let meta = &recovered.session().meta;
-        let recovered_state = recovered.session().latest_state()?;
-        let mut continuation_count = recovered_state
-            .scopes
-            .values()
-            .map(|scope| scope.admitted.len())
-            .sum::<usize>();
-        let root_scope = recovered_state.scopes.get(&Some(root_id));
-        let mut continuing_root = root_scope.is_some_and(|scope| !scope.admitted.is_empty());
-        if let Some(stored) = root_scope.and_then(|scope| scope.config.as_ref()) {
-            let restored_mode = makima_agent::plan_state::prepare_restore_for_agent(
-                &recovered_state,
-                root_id,
-                &stored.mode,
-                &lua_handle.mode_registry(),
-            )?;
-            if makima_agent::modes::is_read_only_fallback(&restored_mode.mode) {
-                continuation_count -= recovered_state.scopes[&Some(root_id)].admitted.len();
-                continuing_root = false;
+impl FrontendServices for SdkServices<'_> {
+    fn root_binding(&mut self) -> RootBinding {
+        self.lua.root_binding()
+    }
+
+    fn configure<'a>(
+        &'a mut self,
+        params: &'a mut InteractiveParams,
+        continuing_root: bool,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if self.params.cli.permission_mode.is_some() && continuing_root {
+                return Err(CONTINUING_PERMISSION_MODE.into());
             }
-        }
-        if continuing_root && explicit_permission_mode {
-            return Err(eyre!(
-                "cannot apply --permission-mode to a continuing root turn; omit the flag or set MAKIMA_CONTINUE_ALL_AGENTS=0"
-            ));
-        }
-        let continuation_notice =
-            makima_agent::session_recovery::continuation_notice(continuation_count);
-        let recovered_config = root_scope.and_then(|scope| scope.config.as_ref());
-        let cwd = recovered_config
-            .map(|config| PathBuf::from(&config.cwd))
-            .unwrap_or(cwd);
-        let persisted_yolo = recovered_state
-            .scopes
-            .get(&None)
-            .and_then(|scope| scope.yolo);
-        let permission_mode = restored_permission_mode(
-            persisted_yolo,
-            startup_permission_mode,
-            explicit_permission_mode,
-        );
-        let yolo = startup_permission_mode == PermissionMode::BypassPermissions;
-        let defaults = recovered_config.map_or_else(
-            || {
-                session_defaults::resolve(
-                    defaults,
-                    &read_prefs(storage),
-                    meta,
-                    initial_history.messages.is_empty(),
-                    &model,
-                )
-            },
-            |config| SessionDefaults {
-                fast: config.fast,
-                workflow: config.workflow,
-                thinking: config.thinking,
-            },
-        );
-        let persisted_options = recovered_config
-            .map(|config| config.options.clone())
-            .unwrap_or_else(|| meta.session_options.clone());
-
-        let (mcp_handle, mcp_config_errors) = async {
-            let (handle, errors) =
-                mcp::start_with_commands(&cwd, project_config.clone(), command_registry.clone())
-                    .await;
+            let (handle, errors) = mcp::start_with_commands(
+                &params.initial_wd,
+                params.project_config.clone(),
+                self.params.command_registry.clone(),
+            )
+            .await;
             if let Some(handle) = &handle {
                 handle.ready().await;
             }
-            (handle, errors)
-        }
-        .await;
-        if !mcp_config_errors.is_empty() {
-            eprintln!("MCP config error: {mcp_config_errors}");
-        }
+            if !errors.is_empty() {
+                eprintln!("MCP config error: {errors}");
+            }
+            params.mcp_handle = handle;
+            Ok(())
+        })
+    }
 
-        let startup_model = model.clone();
-        let catalog = ModelCatalog::offline(Arc::clone(&providers), &model_policy);
-        let (binding, root_target) = makima_lua::orchestration::root_binding();
-        let handle = headless::spawn_interactive_with_checkpoint(
-            InteractiveParams {
-                model,
-                config,
-                permissions_config,
-                timeouts,
-                prompt_slots,
-                profile: FrontendProfile {
-                    excluded_tools: vec![QUESTION_TOOL_NAME],
-                    ..Default::default()
-                },
-                mcp_handle,
-                initial_wd: cwd.clone(),
-                session_id: Some(session_id),
-                root_id: Some(root_id),
-                journal: Some(recovered.journal()),
-                initial_history: Vec::new(),
-                yolo,
-                system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
-                append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-                defaults,
-                modes: lua_handle.mode_registry(),
-                model_policy: Arc::clone(&model_policy),
-                providers: Arc::clone(&providers),
-                plugin_rules,
-                project_config,
-                local_tools: Default::default(),
-                state_dir: Some(storage.path().to_path_buf()),
-                answers: true,
-            },
-            headless::default_preparation(Arc::clone(&providers)),
-            Some(initial_history),
-            Some(binding),
-            Arc::clone(&checkpoint),
-        );
-        handle
-            .initialized_root()
-            .await
-            .map_err(|error| eyre!(error))?;
-        let definitions = makima_agent::session_coordinator::builtin_option_definitions(
-            startup_model.spec(),
-            catalog.snapshot(),
-            handle.permissions.is_yolo(),
-            defaults.fast,
-            defaults.workflow,
-            defaults.thinking.into(),
-        );
-        checkpoint
-            .bind_journal(handle.manager.journal())
-            .await
-            .map_err(|error| eyre!(error))?;
-        let coordinator = SessionCoordinatorHandle::register(
-            makima_agent::session_coordinator::SessionCoordinatorParams {
-                session_id: handle.session_id.id(),
-                catalog: session_options.clone(),
-                definitions,
-                persisted_options,
-                model_policy: Arc::clone(&model_policy),
-                checkpoint: checkpoint.clone(),
-                mailbox: handle.mailbox.clone(),
-            },
-        )
-        .map_err(|error| eyre!("register session coordinator: {error}"))?;
-        let prepared: Result<Arc<Self>> = async {
-            coordinator
-                .bind_permissions(Arc::clone(&handle.permissions))
-                .map_err(|error| eyre!("bind session permissions: {error}"))?;
-            let trusted_root = makima_lua::orchestration::bind_frontend_root(
-                &handle,
-                &coordinator,
-                &root_target,
-                headless::default_model_preparer(Arc::clone(&providers)),
-            )
-            .await
-            .map_err(|error| eyre!("bind session actor: {error}"))?;
-            let root = trusted_root.target.clone();
-            let orchestration = makima_lua::orchestration::durable_frontend(
-                "SDK",
-                &catalog,
-                trusted_root.clone(),
-                coordinator.clone(),
-                Arc::clone(&checkpoint),
+    fn bind_root<'a>(&'a mut self, handle: &'a SessionHandle) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let explicit = self.params.cli.permission_mode.is_some();
+            self.lua.bind_root(handle).await?;
+            self.permission_mode = restored_permission_mode(
+                handle.permissions.persisted_yolo(),
+                self.permission_mode,
+                explicit,
             );
-            let sdk_commands = Arc::new(SdkCommands::bind(
-                command_registry,
-                Arc::clone(&session.standard_commands),
-                SdkCommandHost {
-                    inner: PinnedCommandHost::new(
-                        SessionCommandHost::new(
-                            handle.control_tx.clone(),
-                            coordinator.clone(),
-                            Arc::clone(&providers),
-                        ),
-                        trusted_root.clone(),
-                        &orchestration,
-                        headless::default_model_preparer(Arc::clone(&providers)),
-                    ),
-                    root: trusted_root.clone(),
-                    session: Arc::downgrade(session),
-                },
-            ));
-            orchestration.bind_commands(
-                &root,
-                makima_lua::orchestration::command_runner(
-                    sdk_commands.registry.clone(),
-                    sdk_commands.target.clone(),
-                    makima_lua::orchestration::headless_outcomes(&handle),
-                ),
-            );
-            let modes = lua_handle.mode_registry();
-            if explicit_permission_mode {
-                coordinator
+            if explicit {
+                let bypass = self.permission_mode == PermissionMode::BypassPermissions;
+                handle
+                    .coordinator
                     .set_option(
                         YOLO_OPTION_ID,
-                        if permission_mode == PermissionMode::BypassPermissions {
+                        if bypass {
                             ENABLED_VALUE
                         } else {
                             DISABLED_VALUE
                         },
                     )
                     .await
-                    .map_err(|error| eyre!(error))?;
-                let key = if permission_mode == PermissionMode::Plan {
+                    .map_err(|error| error.to_string())?;
+                let key = if self.permission_mode == PermissionMode::Plan {
                     ModeId::Plan.key()
                 } else {
                     ModeId::Build.key()
                 };
-                makima_lua::orchestration::set_mode(&*orchestration, &root, &modes, key, storage)
-                    .await
-                    .map_err(|error| eyre!("set startup permission mode: {error}"))?;
+                makima_lua::orchestration::set_mode(
+                    &*self.lua.bound()?.orchestration,
+                    handle.root(),
+                    &self.params.lua_handle.mode_registry(),
+                    key,
+                    self.storage,
+                )
+                .await
+                .map_err(|error| format!("set startup permission mode: {error}"))?;
                 handle
                     .permissions
-                    .try_set_yolo(permission_mode == PermissionMode::BypassPermissions)
-                    .map_err(|error| eyre!(error))?;
+                    .try_set_yolo(bypass)
+                    .map_err(|error| error.to_string())?;
             }
-            let committed_config = if continuing_root {
-                root.effective_config()?
-                    .ok_or_else(|| eyre!("recovered root has no effective config"))?
-            } else {
-                headless::checkpoint_startup_config(&root, &coordinator)
-                    .await
-                    .map_err(|error| eyre!(error))?
-            };
-            let restored_work = if continuing_root && let Some(scope) = root_scope {
-                let actor = root.actor()?;
-                scope
-                    .admitted
-                    .keys()
-                    .filter_map(|&id| actor.turn_ticket(id))
-                    .filter(|ticket| ticket.peek().is_none())
-                    .map(|ticket| {
-                        WorkCancel::Scope(CancelScope::Turn(ticket), handle.cancellation.clone())
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            catalog.attach(&orchestration);
-            let committed_plan = matches!(committed_config.mode, AgentMode::Plan(_));
-            let permission_mode = if committed_plan {
-                PermissionMode::Plan
-            } else if handle.permissions.is_yolo() {
-                PermissionMode::BypassPermissions
-            } else if permission_mode == PermissionMode::BypassPermissions {
-                PermissionMode::Default
-            } else {
-                permission_mode
-            };
+            Ok(())
+        })
+    }
 
-            let writer = SdkWriter {
-                session_id: handle.session_id.clone(),
-                out_tx: session.out_tx.clone(),
-            };
-            let tools: Vec<_> = handle
-                .tool_names
-                .iter()
-                .map(|name| makima_to_claude_tool_name(name))
-                .collect();
-            let init = serde_json::json!({
-                "cwd": committed_config.context.cwd(), "tools": tools,
-                "model": committed_config.model.id, "permissionMode": permission_mode.as_str(),
-                "apiKeySource": "none", "mcp_servers": [],
-                "slash_commands": sdk_commands.slash_commands(), "output_style": "default",
-            });
-            Ok(Arc::new(Self {
-                handle,
-                coordinator: coordinator.clone(),
-                checkpoint,
-                _lock: lock_guard,
-                root: trusted_root,
-                commands: sdk_commands,
-                orchestration,
-                catalog,
-                writer,
-                shared: Arc::new(Mutex::new(Shared {
-                    restored_work,
-                    input_closed: session.input_closed.load(Ordering::Acquire),
-                    ..Shared::new()
-                })),
-                init,
-                resumed,
-                continuation_notice,
-                tasks: Mutex::new(Vec::new()),
-                discovery: Mutex::new(None),
-            }))
-        }
-        .await;
-        if prepared.is_err() {
-            coordinator.retire();
-        }
-        prepared
+    fn observe(&mut self, session: &SessionHandle) -> FrontendObserver {
+        self.lua.observe(session)
+    }
+}
+
+impl SdkRuntime {
+    async fn prepare(session: &Arc<SdkSession>, fresh: bool) -> Result<Arc<Self>> {
+        let params = &session.params;
+        let cli = &params.cli;
+        let storage = &session.storage;
+        let source = sdk_session_source(
+            (!fresh).then_some(cli),
+            &params.cwd.to_string_lossy(),
+            storage,
+            &params.model.spec(),
+        )?;
+        let permission_mode = PermissionMode::resolve(
+            cli.permission_mode.as_deref(),
+            cli.yolo || params.permissions_config.yolo,
+        );
+        let providers = &params.providers;
+        let catalog = ModelCatalog::offline(Arc::clone(providers), &params.model_policy);
+        let mut services = SdkServices {
+            lua: HeadlessServices::new("SDK", &catalog, params.lua_handle.clone())
+                .ignore_stream_closed(),
+            params,
+            storage,
+            permission_mode,
+        };
+        let handle = match open(OpenRequest {
+            params: InteractiveParams {
+                model: params.model.clone(),
+                config: params.config.clone(),
+                permissions_config: params.permissions_config.clone(),
+                timeouts: params.timeouts,
+                prompt_slots: params.prompt_slots.clone(),
+                profile: FrontendProfile {
+                    excluded_tools: vec![QUESTION_TOOL_NAME],
+                    ..Default::default()
+                },
+                mcp_handle: None,
+                initial_wd: params.cwd.clone(),
+                session_id: None,
+                root_id: None,
+                journal: None,
+                initial_history: Vec::new(),
+                yolo: permission_mode == PermissionMode::BypassPermissions,
+                system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
+                append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
+                defaults: params.defaults,
+                modes: params.lua_handle.mode_registry(),
+                model_policy: Arc::clone(&params.model_policy),
+                providers: Arc::clone(providers),
+                plugin_rules: Arc::clone(&params.plugin_rules),
+                project_config: params.project_config.clone(),
+                local_tools: Default::default(),
+                state_dir: Some(storage.path().to_path_buf()),
+                answers: true,
+            },
+            durability: Durability::Persistent {
+                storage,
+                source: Box::new(source),
+                explicit_model: params.explicit_model && !fresh,
+                require_matching_cwd: true,
+                skip_startup_if_children_continue: false,
+            },
+            continue_turns: continue_all_agents(),
+            options: params.session_options.clone(),
+            model_options: catalog.snapshot(),
+            prepare: headless::default_preparation(Arc::clone(providers)),
+            services: &mut services,
+        })
+        .await
+        {
+            Err(OpenSessionError::Exists(_)) if !fresh && cli.fork_session => {
+                return Err(eyre!(FORK_DESTINATION_EXISTS));
+            }
+            result => result?,
+        };
+        let permission_mode = services.permission_mode;
+        let bound = services.lua.into_bound().map_err(|error| eyre!(error))?;
+        let root = handle.root();
+        let committed_config = root
+            .effective_config()?
+            .ok_or_else(|| eyre!("recovered root has no effective config"))?;
+        let actor = root.actor()?;
+        let restored_work = handle
+            .continuing_root()
+            .iter()
+            .filter_map(|&id| actor.turn_ticket(id))
+            .filter(|ticket| ticket.peek().is_none())
+            .map(|ticket| WorkCancel::Scope(CancelScope::Turn(ticket), handle.cancellation.clone()))
+            .collect();
+        let commands = Arc::new(SdkCommands::bind(
+            params.command_registry.clone(),
+            Arc::clone(&session.standard_commands),
+            SdkCommandHost {
+                inner: PinnedCommandHost::new(
+                    handle.command_host(),
+                    bound.root.clone(),
+                    &bound.orchestration,
+                    headless::default_model_preparer(Arc::clone(providers)),
+                ),
+                root: bound.root.clone(),
+                session: Arc::downgrade(session),
+            },
+        ));
+        bound.orchestration.bind_commands(
+            root,
+            makima_lua::orchestration::command_runner(
+                commands.registry.clone(),
+                commands.target.clone(),
+                makima_lua::orchestration::headless_session_outcomes(&handle),
+            ),
+        );
+        let permission_mode = if matches!(committed_config.mode, AgentMode::Plan(_)) {
+            PermissionMode::Plan
+        } else if handle.permissions.is_yolo() {
+            PermissionMode::BypassPermissions
+        } else if permission_mode == PermissionMode::BypassPermissions {
+            PermissionMode::Default
+        } else {
+            permission_mode
+        };
+        let writer = SdkWriter {
+            session_id: handle.session_id.clone(),
+            out_tx: session.out_tx.clone(),
+        };
+        let tools: Vec<_> = handle
+            .tool_names
+            .iter()
+            .map(|name| makima_to_claude_tool_name(name))
+            .collect();
+        let init = serde_json::json!({
+            "cwd": committed_config.context.cwd(), "tools": tools,
+            "model": committed_config.model.id, "permissionMode": permission_mode.as_str(),
+            "apiKeySource": "none", "mcp_servers": [],
+            "slash_commands": commands.slash_commands(), "output_style": "default",
+        });
+        Ok(Arc::new(Self {
+            handle,
+            root: bound.root.clone(),
+            commands,
+            bound,
+            catalog,
+            writer,
+            shared: Arc::new(Mutex::new(Shared {
+                restored_work,
+                input_closed: session.input_closed.load(Ordering::Acquire),
+                ..Shared::new()
+            })),
+            init,
+            tasks: Mutex::new(Vec::new()),
+            discovery: Mutex::new(None),
+        }))
     }
 
     fn activate(&self, session: &SdkSession) {
         let params = &session.params;
-        params
-            .lua_handle
-            .install_orchestration_services(self.orchestration.clone());
-        let observer =
-            HeadlessObserver::new(params.lua_handle.clone(), self.handle.session_id.id());
-        observer.install(self.root.target.clone());
-        if self.resumed {
-            if let Some(message) = &self.continuation_notice
+        self.bound.activate();
+        if self.handle.was_existing() {
+            if let Some(message) = self.handle.continuation_notice()
                 && let Err(error) = self
                     .writer
                     .emit_system("warning", serde_json::json!({ "message": message }))
@@ -1085,15 +982,10 @@ impl SdkRuntime {
                 .lua_handle
                 .notify_state_restored(self.root.target.clone());
         }
-        self.handle.events.set_observer(move |event| {
-            if !matches!(event.event, AgentEvent::StreamClosed) {
-                observer.observe(event);
-            }
-        });
         let pump = EventPump {
             writer: self.writer.clone(),
             shared: Arc::clone(&self.shared),
-            read: self.coordinator.read(),
+            read: self.handle.coordinator.read(),
             permissions: Arc::clone(&self.handle.permissions),
             answers: self.handle.answers.clone(),
             include_partial_messages: params.cli.include_partial_messages,
@@ -1133,20 +1025,12 @@ impl SdkRuntime {
 
     async fn close(&self) -> Result<()> {
         self.discovery.lock_unpoisoned().take();
-        self.handle.manager.suspend(SDK_SHUTDOWN_TIMEOUT).await;
-        let closed = if SessionCoordinatorHandle::resolve(self.handle.session_id.id()).is_ok() {
-            self.coordinator.close().await
-        } else {
-            Ok(())
-        };
-        let drained = self.checkpoint.drain().await;
-        self.handle.manager.journal().invalidate_state_access();
+        let closed = self.handle.close(SDK_SHUTDOWN_TIMEOUT).await;
         let tasks = mem::take(&mut *self.tasks.lock_unpoisoned());
         for task in tasks {
             task.cancel().await;
         }
-        closed.map_err(|error| eyre!(error))?;
-        drained?;
+        closed?;
         Ok(())
     }
 }
@@ -1236,7 +1120,7 @@ impl SdkSession {
             return Err(sdk_command_error(WORK_ACTIVE));
         }
         old.handle.manager.wait_settled().await;
-        if let Err(error) = old.checkpoint.drain().await {
+        if let Err(error) = old.handle.drain().await {
             let _ = prepared.close().await;
             return Err(sdk_command_error(error));
         }
@@ -1254,7 +1138,7 @@ impl SdkSession {
                 .manager
                 .close_incarnation(&pinned.incarnation())
                 .map_err(sdk_command_error)?;
-            old.coordinator.retire();
+            old.handle.coordinator.retire();
             old.handle.manager.journal().invalidate_state_access();
             *current = Some(Arc::clone(&prepared));
             prepared.activate(self);
@@ -1424,12 +1308,12 @@ fn handle_sdk_message(
 ) -> Result<bool> {
     let runtime = session.current();
     let writer = &runtime.writer;
-    let coordinator = &runtime.coordinator;
+    let coordinator = &runtime.handle.coordinator;
     let shared = &runtime.shared;
     let sdk_commands = &runtime.commands;
     let set_mode = |key: &str| {
         smol::block_on(makima_lua::orchestration::set_mode(
-            &*runtime.orchestration,
+            &*runtime.bound.orchestration,
             &runtime.root.target,
             &session.params.lua_handle.mode_registry(),
             key,
@@ -1760,6 +1644,7 @@ fn emit_command_result(
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
+#[cfg(test)]
 fn open_sdk_session(
     cli: Option<&Cli>,
     cwd: &str,
@@ -1782,10 +1667,7 @@ fn sdk_session_source(
     startup_model: &str,
 ) -> Result<SessionSource> {
     let Some(cli) = cli else {
-        return Ok(SessionSource::Create(StoredSession::new(
-            startup_model,
-            cwd,
-        )));
+        return Ok(SessionSource::New(StoredSession::new(startup_model, cwd)));
     };
     let pinned = cli
         .session_id
@@ -1817,7 +1699,7 @@ fn sdk_session_source(
         if pinned.is_some_and(|pinned| pinned != id) {
             return Err(eyre!(SESSION_ID_CONFLICT));
         }
-        return Ok(SessionSource::Resume(id));
+        return Ok(SessionSource::Existing(id));
     }
 
     let mut seed = StoredSession::new(startup_model, cwd);
@@ -1842,9 +1724,9 @@ fn sdk_session_source(
         }
     }
     if pinned.is_some() && !cli.fork_session {
-        Ok(SessionSource::ResumeOrCreate(seed))
+        Ok(SessionSource::ExistingOrNew(seed))
     } else {
-        Ok(SessionSource::Create(seed))
+        Ok(SessionSource::New(seed))
     }
 }
 
@@ -2860,7 +2742,7 @@ mod tests {
                 .unwrap();
             slot.set(&access, RESET_STATE_VALUE.into(), Some(StateRevision(0)))
                 .unwrap();
-            previous.checkpoint.drain().await.unwrap();
+            previous.handle.drain().await.unwrap();
             let plans = storage.path().join(PLANS_DIR);
             if fail {
                 std::fs::remove_dir(&plans).unwrap();
@@ -3341,7 +3223,7 @@ mod tests {
                 .spec(),
             expected
         );
-        smol::block_on(runtime.checkpoint.drain()).unwrap();
+        smol::block_on(runtime.handle.drain()).unwrap();
         let saved = StoredSession::load(runtime.handle.session_id.id(), &storage).unwrap();
         assert_eq!(saved.parent().unwrap().session, source.id);
         assert_eq!(saved.messages(), source.messages());
@@ -3696,10 +3578,10 @@ mod tests {
         let init: Value = serde_json::from_str(&out_rx.recv().unwrap()).unwrap();
         assert_eq!(init["model"], expected.split_once('/').unwrap().1);
         assert_eq!(
-            runtime.coordinator.read().options().values()[MODEL_OPTION_ID],
+            runtime.handle.coordinator.read().options().values()[MODEL_OPTION_ID],
             expected
         );
-        smol::block_on(runtime.checkpoint.drain()).unwrap();
+        smol::block_on(runtime.handle.drain()).unwrap();
         let saved = StoredSession::load(saved.id, &storage).unwrap();
         assert_eq!(
             saved.latest_state().unwrap().scopes[&Some(root)]

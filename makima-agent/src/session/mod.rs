@@ -6,16 +6,16 @@ use makima_storage::{
     sessions::{SessionRecord, normalize_title},
 };
 
-use crate::{
-    session_recovery::OpenSessionError,
-    session_writer::{SessionWriter, StoredSession},
-};
+use crate::session_writer::{SessionWriter, StoredSession};
 
 mod answers;
 mod events;
+mod open;
 
+pub use crate::session_recovery::{OpenSessionError, SessionSource};
 pub use answers::{AnswerError, AnswerKey, AnswerRouter, PendingAnswer};
 pub use events::{SessionEvent, SessionEventPump, SessionSubscription};
+pub use open::{Durability, FrontendObserver, FrontendServices, OpenRequest, SessionHandle, open};
 
 pub async fn set_title(
     directory: &Path,

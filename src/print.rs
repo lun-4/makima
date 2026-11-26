@@ -19,18 +19,11 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use makima_agent::agent::isolated_turn::collect_answer;
 use makima_agent::cancel::CancelToken;
-use makima_agent::command::{
-    self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
-};
-use makima_agent::headless::{
-    self, FrontendProfile, InteractiveHandle, InteractiveParams, ProviderPreparation,
-};
+use makima_agent::command::{self, StandardCommands, StandardCompletions, session_capabilities};
+use makima_agent::headless::{self, FrontendProfile, InteractiveParams, ProviderPreparation};
 use makima_agent::permissions::PluginRuleStore;
-use makima_agent::session::SessionEvent;
-use makima_agent::session_coordinator::{
-    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
-    builtin_option_definitions,
-};
+use makima_agent::session::{Durability, OpenRequest, SessionEvent, SessionHandle, open};
+use makima_agent::session_coordinator::SessionOptionCatalog;
 use makima_agent::session_defaults;
 use makima_agent::tools::QUESTION_TOOL_NAME;
 use makima_agent::tools::offload::OffloadCleanup;
@@ -44,13 +37,12 @@ use makima_commands::{
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use makima_lua::EventHandle;
 use makima_lua::orchestration::{
-    self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, PinnedCommandTarget, TrustedTarget,
+    self, ACTIVE_DISCOVERY_BOUND, Discovery, HeadlessServices, ModelCatalog, PinnedCommandTarget,
+    TrustedTarget,
 };
-use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
 use makima_providers::{ProviderRegistry, TokenUsage, add_cost};
 use makima_storage::StateDir;
-use makima_storage::checkpoint::ClaimingWriter;
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::sessions::{SessionMeta, read_prefs};
 use serde::Serialize;
@@ -313,11 +305,8 @@ fn run_and_settle<T>(
     }
 }
 
-/// A print run's root: an ordinary managed root whose session coordinator
-/// publishes into a writer that saves nothing.
 struct PrintSession {
-    handle: InteractiveHandle,
-    coordinator: SessionCoordinatorHandle,
+    handle: SessionHandle,
     root: TrustedTarget,
     commands: TargetHandle,
     _discovery: Discovery,
@@ -333,72 +322,43 @@ fn start_print_session(
 ) -> Result<PrintSession> {
     let catalog = ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy);
     let active_provider = params.model.provider.to_string();
-    let definitions = builtin_option_definitions(
-        Arc::from(params.model.spec()),
-        catalog.snapshot(),
-        params.permissions_config.yolo,
-        params.defaults.fast,
-        params.defaults.workflow,
-        params.defaults.thinking.into(),
-    );
-    let model_policy = Arc::clone(&params.model_policy);
     let providers = Arc::clone(&params.providers);
-    let (binding, root_target) = orchestration::root_binding();
-    let handle = headless::spawn_nonpersistent_with_binding(params, prepare, Some(binding));
-    smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-        session_id: handle.session_id.id(),
-        catalog: session_options,
-        definitions,
-        persisted_options: Default::default(),
-        model_policy: Arc::clone(&model_policy),
-        checkpoint: ClaimingWriter::accept_all(),
-        mailbox: handle.mailbox.clone(),
-    })
-    .map_err(|error| eyre!("register print session coordinator: {error}"))?;
-    let root = smol::block_on(orchestration::bind_frontend_root(
-        &handle,
-        &coordinator,
-        &root_target,
-        headless::default_model_preparer(Arc::clone(&providers)),
-    ))
-    .map_err(|error| eyre!("bind print root: {error}"))?;
-    let orchestration = Arc::new(orchestration::frontend_root(
-        &catalog,
-        root.clone(),
-        Arc::new(|_, publication| Ok(orchestration::nonpersistent_config_mutation(publication))),
-        coordinator.clone(),
-    ));
-    catalog.attach(&orchestration);
+    let mut services =
+        HeadlessServices::new("print", &catalog, lua_handle.clone()).ignore_stream_closed();
+    let handle = smol::block_on(open(OpenRequest {
+        params,
+        durability: Durability::Ephemeral,
+        continue_turns: false,
+        options: session_options,
+        model_options: catalog.snapshot(),
+        prepare,
+        services: &mut services,
+    }))?;
+    let bound = services.into_bound().map_err(|error| eyre!(error))?;
     let discovery = discover(&catalog, active_provider);
     smol::block_on(discovery.wait_active(ACTIVE_DISCOVERY_BOUND));
     let commands = registry.bind_target(
         session_capabilities(),
         Arc::new(orchestration::PinnedCommandHost::new(
-            SessionCommandHost::new(
-                handle.control_tx.clone(),
-                coordinator.clone(),
-                Arc::clone(&providers),
-            ),
-            root.clone(),
-            &orchestration,
+            handle.command_host(),
+            bound.root.clone(),
+            &bound.orchestration,
             headless::default_model_preparer(providers),
         )),
     );
-    orchestration.bind_commands(
-        &root.target,
+    bound.orchestration.bind_commands(
+        &bound.root.target,
         orchestration::command_runner(
             registry.clone(),
             commands.clone(),
-            orchestration::headless_outcomes(&handle),
+            orchestration::headless_session_outcomes(&handle),
         ),
     );
-    lua_handle.install_orchestration_services(orchestration);
+    bound.activate();
     lua_handle.save_no_preferences();
     Ok(PrintSession {
         handle,
-        coordinator,
-        root,
+        root: bound.root,
         commands,
         _discovery: discovery,
     })
@@ -411,19 +371,10 @@ fn with_print_session<T>(
     body: impl FnOnce(&PrintSession) -> Result<T>,
 ) -> Result<T> {
     let result = catch_unwind(AssertUnwindSafe(|| body(&session)));
-    let PrintSession {
-        handle,
-        coordinator,
-        ..
-    } = session;
-    let InteractiveHandle {
-        manager,
-        task,
-        offload_cleanup,
-        input_tx,
-        ..
-    } = handle;
-    drop(input_tx);
+    let manager = session.handle.manager.clone();
+    let coordinator = session.handle.coordinator.clone();
+    let (task, offload_cleanup) = session.handle.into_ephemeral_shutdown();
+    let task = task.ok_or_else(|| eyre!("print session task is closed"))?;
     let closing = coordinator.clone();
     let settled = run_and_settle(
         task,
@@ -565,8 +516,6 @@ pub fn run(
 
         with_print_session(session, |session| {
             let handle = &session.handle;
-            let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
-            observer.install(session.root.target.clone());
             let admission =
                 PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
             let work = dispatch_print(&command_registry, &session.commands, literal, &admission)?;
@@ -586,11 +535,6 @@ pub fn run(
                         }
                         _ => false,
                     };
-                    handle.events.set_observer(move |event| {
-                        if !matches!(event.event, AgentEvent::StreamClosed) {
-                            observer.observe(event);
-                        }
-                    });
                     let events = handle.events.subscribe();
                     let next = || {
                         if wait {
@@ -830,6 +774,7 @@ pub fn run(
 mod tests {
     use super::*;
     use flume::{Receiver, Sender};
+    use makima_agent::session_coordinator::SessionCoordinatorHandle;
     use makima_agent::{
         ActorLifecycle, ActorStatus, AgentError, AgentId, AgentManagerHandle, GraphLifecycle,
         SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
@@ -1428,7 +1373,7 @@ mod tests {
         );
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
         let manager = session.handle.manager.clone();
-        let root = session.root.target.clone();
+        let root = session.handle.root().clone();
         let actor = root.actor().unwrap();
         let session_id = session.handle.session_id.id();
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1542,7 +1487,7 @@ mod tests {
         .unwrap();
 
         with_print_session(session, |session| {
-            let config = session.root.target.effective_config().unwrap().unwrap();
+            let config = session.handle.root().effective_config().unwrap().unwrap();
             assert_eq!(config.model.context_window, DISCOVERED_WINDOW);
             host.wait_for_worker_barrier_for_test();
             assert!(matches!(
@@ -1785,7 +1730,7 @@ mod tests {
         let mut ran = false;
         let result = with_print_session(session, |session| {
             let handle = &session.handle;
-            let root = session.root.target.clone();
+            let root = handle.root().clone();
             assert!(session.root.template.opts.fast);
             let target = &session.commands;
             assert_eq!(root.effective_config().unwrap().unwrap().context.cwd(), cwd);

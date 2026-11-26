@@ -1157,7 +1157,7 @@ pub fn spawn_interactive_with_checkpoint(
     spawn_interactive(params, prepare, history, binding, true, Some(checkpoint))
 }
 
-pub fn spawn_nonpersistent_with_binding(
+pub(crate) fn spawn_nonpersistent_with_binding(
     params: InteractiveParams,
     prepare: ProviderPreparation,
     binding: Option<RootBinding>,
@@ -2698,7 +2698,7 @@ pub(crate) mod tests {
             params.model = Model::from_spec(STARTUP_MODEL).unwrap();
             let opening = open_session(
                 &storage,
-                SessionSource::Resume(id),
+                SessionSource::Existing(id),
                 OpenModel {
                     startup: &params.model,
                     explicit: false,
