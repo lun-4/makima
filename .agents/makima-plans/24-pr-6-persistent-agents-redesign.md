@@ -13,7 +13,7 @@ Rewind changes the selected idle agent's conversation and pending input. Other a
 1. The session log is append-only. Normal saves only append records. Nothing is deleted or rewritten. (Q9, Q30)
 2. Rewind changes only the selected idle agent's conversation and pending input. It leaves other agents, non-conversation state, and files unchanged. (Q2, Q6, Q8)
 3. A quit or restart does not interrupt anything. On the next start, every agent continues as if nothing happened. (Q10, Q11)
-4. All frontends write through one API, with one writer in `makima-agent`. (Q36)
+4. All frontends write through one API, with one writer in `makima-agent`. (Q36) After review this became stricter: frontends are clients. They read the journal's projection and change the session only through agent-layer verbs. See [Frontends and the TUI](#frontends-and-the-tui-after-review).
 
 ## The log
 
@@ -171,6 +171,48 @@ SDK, ACP and TUI open sessions through one function in `makima-agent`. It claims
 
 The copies have drifted today: TUI ignores the recorded model when one is passed explicitly, ACP fails hard when the policy rejects it, and SDK has its own `startup_model`. Pick one behaviour.
 
+After review this grew into the whole session pipeline, `makima_agent::session::{open, prepare}`, used by TUI, SDK, ACP and print. It also starts the shared backend, binds Lua, checkpoints the startup config and installs the observer. See below.
+
+## Frontends and the TUI (after review)
+
+Review ("current agent, not root") and hands-on testing of the TUI led to more work in this PR. The frontend part follows its own plan, [24-pr-6-frontend-interface.md](24-pr-6-frontend-interface.md), one commit per step.
+
+### Current agent, not root
+
+A reviewer asked to aim for "current agent" instead of "root only" wherever possible, so the PR does not build a root/guest split into the design.
+
+- Any idle agent can be rewound, including a subagent. The `Fork` record names its agent. The note lists that agent's own children. In the TUI, `Esc Esc` works in any tab and rewinds the agent you are looking at. (This revises Q6.)
+- `task_list` shows a task whose agent is gone to any ancestor. Each task stores the chain of agents that started it.
+- `/reload-context` runs from any agent and reloads the session's recorded context.
+- What stays root-specific is structural: one parentless agent per graph, and ACP/SDK expose one conversation per session.
+
+### One submit path, dormant agents wake
+
+Typing into a tab and `task_send` are the same operation. Both call `AgentRef::submit`. A dormant agent is woken first with `AgentRef::wake`, through a reactivator that the Lua host installs once per runtime. So a restored subagent tab accepts input and opens its rewind picker. The input box is cleared only when the input is accepted, so a refused send keeps the text.
+
+After a restart, only agents with unfinished admitted turns continue. An agent that was idle loads as dormant and is woken on demand.
+
+### The TUI does not own subagents
+
+The TUI used to rebuild a v2-style subagent list from its tabs and write it into its session copy. That made up agent records at the copy's own sequence numbers, which collided with the journal and broke the shutdown projection. Tabs now come from the journal's agent records and labels. `StoredSubagent`, `set_subagents` and `sync_subagents` are gone, and `legacy_child` lives only in the v2 migration.
+
+### Frontends are clients
+
+- **The journal owns every session fact and writes it once:** title (derived from the first root user text, or an explicit rename), usage and cost, tool outputs, posts (anchored to the agent's last message), input held after a failed turn (`StateChange::InputHold`), `!cmd` results waiting for the agent's next turn (`StateChange::Preamble`), and the draft.
+- **Frontends read `SessionJournal::projection()`.** The TUI keeps no session copy. `App::checkpoint`, `AppSession::checkpoint`, `append_ui_record` and `project_session_journal` are gone.
+- **One backend.** `HeadlessBackend` runs every agent for every frontend. `FrontendProfile` holds what differs (question mode, interactive reauth, tool output lines, holding input after a failure, excluded tools, owned or shared MCP, setup error reporting). `TuiActorBackend` is gone.
+- **Shared verbs:** `AgentRef::{submit, wake, run_shell, ask_isolated, begin_rewind}`, `CancelScope` with `SessionCancellation`, one `AnswerRouter` per session, and one reset (`ResetSeed`).
+- **Isolated questions** (`/btw`) run outside the actor queue for every frontend, from a snapshot of the agent's context and history, so they work during a busy turn.
+
+### TUI fixes found by hands-on testing
+
+- `/tasks` ages a row from its turn's admission, keeps the age and context size of restored subagents, and nests background tool calls under the agent that runs them.
+- The session cost in the status bar grows during a run. It used to show only the total restored at startup (#168).
+- A subagent's first prompt is shown once.
+- Restore snapshots go only to the chat that holds the tool row, so other tabs no longer log `snapshot dropped`.
+- Plugin callbacks on host events (`TurnEnd`, `SessionStatusChanged`) are no longer killed after an unrelated cancelled task (they were dispatched without their own scope).
+- After a failed turn, queued messages are held instead of being lost when the next run starts.
+
 ## Removed from the PR
 
 - File restore: `file_restore/*` (including `secure.rs` and `recording.rs`), `makima-storage/src/restore.rs`, `blobs.rs`, `restore_digest.rs`, the `File`, `ToolExecution` and `RestoreRef` records, `sessions/restores/`, `sessions/blobs/`, the restore form, the shell-command counter, and `shell_execution` on tools. (Q8, Q17)
@@ -214,7 +256,9 @@ The copies have drifted today: TUI ignores the recorded model when one is passed
 
 ## Not in this PR
 
-- Rewind for SDK and ACP. (Q35)
+- Rewind for SDK and ACP. (Q35) The agent-layer call needs no frontend state, so it can be added later.
+- Lua `makima.session.*` (list, create, focus, rename, delete) outside the TUI. It still goes through the TUI's UI channel.
+- The TUI still schedules lease heartbeats, coordinates tab replacement and keeps `ProviderSlot` for model discovery and usage. SDK picks fork sources itself.
 - Letting plugins provide their private `local_tools` again at load, so such agents can be woken. (Q41)
 - Splitting the log per agent. (Q27)
 - Session lock liveness depends on file mtime (`HEARTBEAT_INTERVAL` 2 s, `STALE_AFTER` 5 s in `makima-storage/src/session_lock.rs:27-28`), so clock skew and coarse mtime granularity affect who owns a session. Known hazard, unchanged here.
