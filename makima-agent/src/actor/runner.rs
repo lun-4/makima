@@ -182,8 +182,16 @@ impl Runner {
             let state = self.inner.state.lock_unpoisoned();
             let probe = super::ActorRuntimeProbe {
                 operations: state.operations.len(),
-                queued: self.queue.len(),
-                deliveries: state.deliveries.len(),
+                queued: if state.input_held {
+                    self.queue.unheld_len()
+                } else {
+                    self.queue.len()
+                },
+                deliveries: if state.input_held {
+                    0
+                } else {
+                    state.deliveries.len()
+                },
                 pending_publications: state.pending_publications,
                 retained_results: state.retained_order.len(),
                 processing: state.processing.is_some()

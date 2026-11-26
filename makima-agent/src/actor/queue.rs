@@ -62,12 +62,30 @@ impl ActorQueue {
         self.items.lock_unpoisoned().pop_front()
     }
 
+    fn runs_during_input_hold(work: &ActorWork) -> bool {
+        !matches!(work, ActorWork::Turn(admission) if admission.ticket.provenance().origin == TurnOrigin::User)
+    }
+
     pub(super) fn pop_unheld(&self) -> Option<ActorWork> {
         let mut items = self.items.lock_unpoisoned();
-        let index = items.iter().position(|work| {
-            !matches!(work, ActorWork::Turn(admission) if admission.ticket.provenance().origin == TurnOrigin::User)
-        })?;
+        let index = items.iter().position(Self::runs_during_input_hold)?;
         items.remove(index)
+    }
+
+    pub(super) fn has_unheld_work(&self) -> bool {
+        self.items
+            .lock_unpoisoned()
+            .iter()
+            .any(Self::runs_during_input_hold)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) fn unheld_len(&self) -> usize {
+        self.items
+            .lock_unpoisoned()
+            .iter()
+            .filter(|work| Self::runs_during_input_hold(work))
+            .count()
     }
 
     /// Extracts the given admitted turn from anywhere in the queue without

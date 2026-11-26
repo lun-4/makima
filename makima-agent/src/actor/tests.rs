@@ -2448,7 +2448,8 @@ fn queued_input_after_failure(hold_input: bool, cancel: bool) {
         assert!(matches!(first.wait().await, TurnOutcome::Failed { .. }));
         if hold_input {
             assert!(actor.input_held());
-            assert_eq!(actor.runtime_barrier().await.unwrap().queued, queued.len());
+            assert!(actor.runtime_barrier().await.unwrap().is_quiescent());
+            assert_eq!(actor.snapshot().queued, queued.len());
             assert!(
                 queued
                     .iter()

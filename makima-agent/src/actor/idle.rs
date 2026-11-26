@@ -154,14 +154,26 @@ impl ActorState {
             .filter(|reservation| Arc::ptr_eq(&reservation.owner, owner))
     }
 
-    pub(super) fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+    fn has_pending_nonqueued_work(&self) -> bool {
         self.status != ActorStatus::Idle
             || self.active.is_some()
             || self.processing.is_some()
             || self.config_publication.is_some()
             || self.pending_publications != 0
             || !self.operations.is_empty()
-            || !queue.is_empty()
+    }
+
+    pub(super) fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+        self.has_pending_nonqueued_work() || !queue.is_empty()
+    }
+
+    pub(super) fn has_pending_unheld_work(&self, queue: &ActorQueue) -> bool {
+        self.has_pending_nonqueued_work()
+            || if self.input_held {
+                queue.has_unheld_work()
+            } else {
+                !queue.is_empty()
+            }
     }
 
     /// While reserved, only the permitted turn may start, and starting it

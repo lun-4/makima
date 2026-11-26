@@ -2515,7 +2515,8 @@ fn restored_held_input_waits_for_user_submit() {
             .unwrap();
         let actor = manager.actor(id).unwrap();
         assert!(actor.input_held());
-        assert_eq!(actor.runtime_barrier().await.unwrap().queued, 1);
+        assert!(actor.runtime_barrier().await.unwrap().is_quiescent());
+        assert_eq!(actor.snapshot().queued, 1);
         let held = actor.turn_ticket(turn).unwrap();
         let next = actor
             .admit_turn_with_options(

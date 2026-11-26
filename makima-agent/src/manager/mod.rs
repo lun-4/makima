@@ -2427,10 +2427,9 @@ impl AgentManagerHandle {
             .collect()
     }
 
-    /// Resolves once no agent in the graph has work running or waiting,
-    /// child results still on their way to a parent included. A pass that
-    /// saw an agent run out of work mid-check is repeated, since that agent
-    /// may have handed work to one already checked.
+    /// Waits for work and child results to settle, excluding work held until
+    /// new input arrives. Rechecks if an actor drains mid-pass, since it may
+    /// have handed work to an actor already checked.
     pub async fn wait_settled(&self) {
         loop {
             let actors: Vec<_> = self

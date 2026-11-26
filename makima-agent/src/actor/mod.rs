@@ -3521,7 +3521,7 @@ impl AgentActorHandle {
         );
     }
 
-    /// Nothing runs or waits here: no work, child result, or terminal publication.
+    /// Whether the actor has settled without another input to release a hold.
     /// Closed actors still wait for terminal publications to settle.
     pub(crate) fn is_settled(&self) -> bool {
         let state = self.inner.state.lock_unpoisoned();
@@ -3529,8 +3529,8 @@ impl AgentActorHandle {
             && (state.lifecycle != ActorLifecycle::Open
                 || !(state.runner_busy
                     || state.preparing.is_some()
-                    || state.has_pending_work(&self.inner.queue)
-                    || !state.deliveries.is_empty()
+                    || state.has_pending_unheld_work(&self.inner.queue)
+                    || (!state.input_held && !state.deliveries.is_empty())
                     || !state.delivery_runs.is_empty()))
     }
 

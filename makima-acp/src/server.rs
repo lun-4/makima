@@ -17,7 +17,7 @@ use agent_client_protocol_schema::{
     TextContent, ToolCallStatus, UnstructuredCommandInput,
 };
 use event_listener::Event;
-use flume::Sender;
+use flume::{Receiver, Sender};
 use makima_agent::agent::isolated_turn::IsolatedTurnEvent;
 use makima_agent::cancel::SessionCancellation;
 use makima_agent::config_change::ConfigChangeError;
@@ -29,7 +29,7 @@ use makima_agent::mcp::{self, McpHandle};
 use makima_agent::permissions::PermissionAnswer;
 use makima_agent::session::{
     AnswerKey, AnswerRouter, Durability, FrontendServices, OpenRequest, OpenSessionError,
-    SessionEvent, SessionEventPump, SessionHandle, SessionSource, open,
+    PrepareOptions, SessionEvent, SessionEventPump, SessionHandle, SessionSource, prepare,
 };
 use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
@@ -125,6 +125,8 @@ struct PendingElicitation {
 struct Pending {
     operation: Option<PendingOperation>,
     isolated: Option<PendingOperation>,
+    /// A root turn already visible on the wire, including automatic turns without a prompt.
+    projected_root: Option<TurnId>,
     /// Prompts whose message started a turn of its own behind the running
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
@@ -633,10 +635,6 @@ async fn load_session(
         None,
     )
     .await?;
-    if let Some(session) = &srv.session {
-        srv.lua_event_handle
-            .notify_state_restored(session.command_root.target.clone());
-    }
     let resp = methods::load_session_response(&mode, &srv.lua_event_handle.mode_registry())
         .config_options(methods::session_config_options(
             &snapshot,
@@ -758,21 +756,24 @@ async fn open_acp_session(
         validated_project,
         permission_error: None,
     };
-    let handle = open(OpenRequest {
-        params: interactive_params(params, cwd, srv.elicitation),
-        durability: Durability::Persistent {
-            storage: &params.storage,
-            source: Box::new(source),
-            explicit_model: params.model_explicit,
-            require_matching_cwd: false,
-            skip_startup_if_children_continue: true,
+    let prepared = prepare(
+        OpenRequest {
+            params: interactive_params(params, cwd, srv.elicitation),
+            durability: Durability::Persistent {
+                storage: &params.storage,
+                source: Box::new(source),
+                explicit_model: params.model_explicit,
+                require_matching_cwd: false,
+                skip_startup_if_children_continue: true,
+            },
+            continue_turns: continue_all_agents(),
+            options: srv.lua_event_handle.session_option_catalog(),
+            model_options: srv.catalog.snapshot(),
+            prepare: headless::default_preparation(Arc::clone(&params.providers)),
+            services: &mut services,
         },
-        continue_turns: continue_all_agents(),
-        options: srv.lua_event_handle.session_option_catalog(),
-        model_options: srv.catalog.snapshot(),
-        prepare: headless::default_preparation(Arc::clone(&params.providers)),
-        services: &mut services,
-    })
+        PrepareOptions::default(),
+    )
     .await
     .map_err(|error| {
         services
@@ -780,6 +781,10 @@ async fn open_acp_session(
             .take()
             .unwrap_or_else(|| session_open_error(id, error))
     })?;
+    let handle = prepared
+        .publish()
+        .await
+        .map_err(|error| session_open_error(id, error))?;
     let bound = match services.lua.into_bound() {
         Ok(bound) => bound,
         Err(error) => {
@@ -1032,7 +1037,7 @@ fn install_session(
         Arc::clone(&option_projection),
         coordinator.read().subscribe(),
     );
-    srv.session = Some(SessionState {
+    let session = srv.session.insert(SessionState {
         handle,
         #[cfg(test)]
         test_coordinator: None,
@@ -1050,6 +1055,11 @@ fn install_session(
         option_projection: Some(option_projection),
         option_projection_task,
     });
+    if session.handle.was_existing() {
+        srv.lua_event_handle
+            .notify_state_restored(session.command_root.target.clone());
+    }
+    session.handle.activate();
     option_snapshot
 }
 
@@ -1321,6 +1331,7 @@ async fn run_dispatch(
         InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(feedback)) => {
             let text = feedback.to_string();
             let sid = SessionId::from(session.handle.session_id.to_string());
+            let _pending = session.pending.lock().unwrap();
             session_update(&srv.out_tx, &sid, translate::text_delta(&text));
             respond_prompt(&srv.out_tx, id.clone(), StopReason::EndTurn);
             Ok(())
@@ -1520,66 +1531,80 @@ fn send_isolated_turn(
     let out_tx = out_tx.clone();
     let sid = SessionId::from(session.handle.session_id.to_string());
     smol::spawn(async move {
-        while let Ok(event) = events.recv_async().await {
-            match event {
-                IsolatedTurnEvent::TextDelta(text) => {
-                    session_update(&out_tx, &sid, translate::text_delta(&text));
-                }
-                IsolatedTurnEvent::ThinkingDelta(text) => {
-                    session_update(&out_tx, &sid, translate::thinking_delta(&text));
-                }
-                IsolatedTurnEvent::Done => {
-                    finish_operation(
-                        &pending,
-                        operation_id,
-                        OperationKind::IsolatedTurn,
-                        |request_id| respond_prompt(&out_tx, request_id, StopReason::EndTurn),
-                    );
-                    break;
-                }
-                IsolatedTurnEvent::Cancelled => {
-                    finish_operation(
-                        &pending,
-                        operation_id,
-                        OperationKind::IsolatedTurn,
-                        |request_id| respond_prompt(&out_tx, request_id, StopReason::Cancelled),
-                    );
-                    break;
-                }
-                IsolatedTurnEvent::Error(message) => {
-                    finish_operation(
-                        &pending,
-                        operation_id,
-                        OperationKind::IsolatedTurn,
-                        |request_id| {
-                            let error =
-                                AcpError::internal_error().data(Value::String(message.clone()));
-                            send(
-                                &out_tx,
-                                Response::new(request_id, Err::<AgentResponse, _>(error)),
-                            );
-                        },
-                    );
-                    break;
-                }
-            }
-        }
-        finish_operation(
-            &pending,
-            operation_id,
-            OperationKind::IsolatedTurn,
-            |request_id| {
-                let error = AcpError::internal_error()
-                    .data(Value::String("isolated turn event stream ended".into()));
-                send(
-                    &out_tx,
-                    Response::new(request_id, Err::<AgentResponse, _>(error)),
-                );
-            },
-        );
+        project_isolated_turn(events, &pending, operation_id, &out_tx, &sid).await;
     })
     .detach();
     Ok(())
+}
+
+async fn project_isolated_turn(
+    events: Receiver<IsolatedTurnEvent>,
+    pending: &PendingState,
+    operation_id: u64,
+    out_tx: &Sender<Value>,
+    sid: &SessionId,
+) {
+    let mut chunks: Vec<(bool, String)> = Vec::new();
+    let result = loop {
+        let (thinking, text) = match events.recv_async().await {
+            Ok(IsolatedTurnEvent::TextDelta(text)) => (false, text),
+            Ok(IsolatedTurnEvent::ThinkingDelta(text)) => (true, text),
+            Ok(IsolatedTurnEvent::Done) => break Ok(StopReason::EndTurn),
+            Ok(IsolatedTurnEvent::Cancelled) => break Ok(StopReason::Cancelled),
+            Ok(IsolatedTurnEvent::Error(message)) => break Err(message),
+            Err(_) => break Err("isolated turn event stream ended".into()),
+        };
+        if let Some((_, previous)) = chunks.last_mut().filter(|(kind, _)| *kind == thinking) {
+            previous.push_str(&text);
+        } else {
+            chunks.push((thinking, text));
+        }
+    };
+
+    loop {
+        let settled = {
+            let mut pending = pending.lock().unwrap();
+            let Some(operation) = pending.isolated.as_ref().filter(|op| op.id == operation_id)
+            else {
+                return;
+            };
+            // The primary response and the isolated batch share this lock and the wire queue.
+            if pending.operation.is_none() && pending.projected_root.is_none() {
+                let result = if operation.cancelling {
+                    Ok(StopReason::Cancelled)
+                } else {
+                    result
+                };
+                let operation = pending.isolated.take().unwrap();
+                if !matches!(&result, Ok(StopReason::Cancelled)) {
+                    for (thinking, text) in chunks {
+                        let update = if thinking {
+                            translate::thinking_delta(&text)
+                        } else {
+                            translate::text_delta(&text)
+                        };
+                        session_update(out_tx, sid, update);
+                    }
+                }
+                let request_id = operation.request_id.clone();
+                drop(operation);
+                match result {
+                    Ok(reason) => respond_prompt(out_tx, request_id, reason),
+                    Err(message) => send(
+                        out_tx,
+                        Response::<AgentResponse>::new(
+                            request_id,
+                            Err(AcpError::internal_error().data(Value::String(message))),
+                        ),
+                    ),
+                }
+                pending.settled.notify(usize::MAX);
+                return;
+            }
+            pending.settled.listen()
+        };
+        settled.await;
+    }
 }
 
 async fn send_command_turn(
@@ -1695,13 +1720,7 @@ fn finish_operation(
         let matches = |operation: &mut PendingOperation| {
             operation.id == operation_id && operation.kind == kind
         };
-        if kind == OperationKind::IsolatedTurn {
-            let Some(operation) = pending.isolated.take_if(matches) else {
-                return false;
-            };
-            pending.settled.notify(usize::MAX);
-            operation
-        } else if pending.operation.as_mut().is_some_and(matches) {
+        if pending.operation.as_mut().is_some_and(matches) {
             pending.settle()
         } else {
             return false;
@@ -1712,22 +1731,36 @@ fn finish_operation(
 }
 
 /// Answers the prompts of the turn presented as {run_id}, running or queued.
-fn finish_primary_run(pending: &PendingState, run_id: u64, respond: impl FnMut(RequestId)) -> bool {
-    let operation = {
-        let mut pending = pending.lock().unwrap();
-        let primary = |operation: &PendingOperation| {
-            operation.kind == OperationKind::PrimaryTurn && operation.run_id == Some(run_id)
-        };
-        if pending.operation.as_ref().is_some_and(primary) {
-            pending.settle()
-        } else if let Some(index) = pending.queued.iter().position(primary) {
-            pending.queued.remove(index).unwrap()
-        } else {
-            return false;
+fn finish_primary_run(
+    pending: &PendingState,
+    run_id: u64,
+    turn_id: Option<TurnId>,
+    respond: impl FnMut(RequestId),
+) {
+    let mut pending = pending.lock().unwrap();
+    if let Some(turn_id) = turn_id {
+        pending.continuing_root.remove(&turn_id);
+        pending
+            .elicitations
+            .retain(|_, elicitation| elicitation.turn_id != turn_id);
+        if pending.projected_root == Some(turn_id) {
+            pending.projected_root = None;
+            pending.settled.notify(usize::MAX);
         }
+    }
+    let primary = |operation: &PendingOperation| {
+        operation.kind == OperationKind::PrimaryTurn && operation.run_id == Some(run_id)
     };
-    answer(operation, respond);
-    true
+    let operation = if pending.operation.as_ref().is_some_and(primary) {
+        Some(pending.settle())
+    } else if let Some(index) = pending.queued.iter().position(primary) {
+        pending.queued.remove(index)
+    } else {
+        None
+    };
+    if let Some(operation) = operation {
+        answer(operation, respond);
+    }
 }
 
 /// Drops {operation} first, so its cancellation fires before the answers.
@@ -2194,50 +2227,47 @@ fn start_event_pump(
                 }
                 AgentEvent::TurnOutcome(outcome) => {
                     tool_inputs.clear();
-                    {
-                        let mut pending = pending.lock().unwrap();
-                        let turn_id = outcome.turn_id();
-                        pending.continuing_root.remove(&turn_id);
-                        pending
-                            .elicitations
-                            .retain(|_, elicitation| elicitation.turn_id != turn_id);
-                    }
-                    finish_primary_run(&pending, run_id, |request_id| match &outcome {
-                        TurnOutcome::Completed { reason, .. } => {
-                            let resp = PromptResponse::new(translate::map_done_reason(*reason));
-                            send(
-                                &out_tx,
-                                Response::new(request_id, Ok(AgentResponse::PromptResponse(resp))),
-                            );
-                        }
-                        TurnOutcome::Cancelled { .. } => {
-                            respond_prompt(&out_tx, request_id, StopReason::Cancelled);
-                        }
-                        TurnOutcome::Failed { failure, .. } => {
-                            let error = if failure.kind == TurnFailureKind::Authentication {
-                                AcpError::auth_required()
-                                    .data(Value::String(AUTH_FAILED_MSG.into()))
-                            } else {
-                                AcpError::internal_error().data(json_str(&failure.user_message))
-                            };
-                            send(
-                                &out_tx,
-                                Response::<AgentResponse>::new(request_id, Err(error)),
-                            );
+                    finish_primary_run(&pending, run_id, Some(outcome.turn_id()), |request_id| {
+                        match &outcome {
+                            TurnOutcome::Completed { reason, .. } => {
+                                let resp = PromptResponse::new(translate::map_done_reason(*reason));
+                                send(
+                                    &out_tx,
+                                    Response::new(
+                                        request_id,
+                                        Ok(AgentResponse::PromptResponse(resp)),
+                                    ),
+                                );
+                            }
+                            TurnOutcome::Cancelled { .. } => {
+                                respond_prompt(&out_tx, request_id, StopReason::Cancelled);
+                            }
+                            TurnOutcome::Failed { failure, .. } => {
+                                let error = if failure.kind == TurnFailureKind::Authentication {
+                                    AcpError::auth_required()
+                                        .data(Value::String(AUTH_FAILED_MSG.into()))
+                                } else {
+                                    AcpError::internal_error().data(json_str(&failure.user_message))
+                                };
+                                send(
+                                    &out_tx,
+                                    Response::<AgentResponse>::new(request_id, Err(error)),
+                                );
+                            }
                         }
                     });
                     continue;
                 }
                 AgentEvent::ControlComplete { .. } => {
                     tool_inputs.clear();
-                    finish_primary_run(&pending, run_id, |request_id| {
+                    finish_primary_run(&pending, run_id, None, |request_id| {
                         respond_prompt(&out_tx, request_id, StopReason::EndTurn)
                     });
                     continue;
                 }
                 AgentEvent::ControlError { message } => {
                     tool_inputs.clear();
-                    finish_primary_run(&pending, run_id, |request_id| {
+                    finish_primary_run(&pending, run_id, None, |request_id| {
                         let error = AcpError::internal_error().data(Value::String(message.clone()));
                         send(
                             &out_tx,
@@ -2248,11 +2278,16 @@ fn start_event_pump(
                 }
                 _ => continue,
             };
+            let mut pending = pending.lock().unwrap();
+            if let Some(turn_id) = turn_id {
+                pending.projected_root = Some(turn_id);
+            }
             session_update(&out_tx, &sid, update);
         }
         let unanswered = {
             let mut pending = pending.lock().unwrap();
             pending.elicitations.clear();
+            pending.projected_root = None;
             if pending
                 .operation
                 .as_ref()
@@ -2260,7 +2295,9 @@ fn start_event_pump(
             {
                 pending.take_all()
             } else {
-                Vec::new()
+                let isolated = pending.isolated.take();
+                pending.settled.notify(usize::MAX);
+                isolated.into_iter().collect()
             }
         };
         for request_id in unanswered.iter().flat_map(PendingOperation::requests) {
@@ -2370,7 +2407,7 @@ mod tests {
     use makima_agent::agent::PromptSlotSource;
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
-    use makima_agent::session::PendingAnswer;
+    use makima_agent::session::{PendingAnswer, open};
     use makima_agent::session_options::MODEL_OPTION_ID;
     use makima_agent::session_recovery::{OpenModel, open_session};
     use makima_agent::session_writer::SessionWriter;
@@ -7089,6 +7126,116 @@ mod tests {
                 "{terminal}"
             );
             assert!(out_rx.is_empty(), "failed compaction completes once");
+        });
+    }
+
+    #[test]
+    fn btw_chunks_follow_primary_response() {
+        smol::block_on(async {
+            const PRIMARY_ID: i64 = 30;
+            const ISOLATED_ID: i64 = 31;
+            const ISOLATED_OPERATION: u64 = 2;
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
+            dispatch_prompt(&mut srv, "primary", false, &RequestId::Number(PRIMARY_ID))
+                .await
+                .unwrap();
+            turns.next().await;
+            let session = srv.session.as_mut().unwrap();
+            let pending = &session.pending;
+            let sid = SessionId::from(session.handle.session_id.to_string());
+            let (root_tx, root_rx) = flume::unbounded();
+            let (isolated_tx, isolated_rx) = flume::bounded(0);
+            session.event_pump = start_event_pump(
+                &test_event_source(root_rx),
+                session.handle.session_id.clone(),
+                srv.out_tx.clone(),
+                Arc::clone(pending),
+                false,
+                session.answers().clone(),
+                session.coordinator().read(),
+                None,
+                PUMP_TRUSTED,
+                None,
+            );
+            let pending = &session.pending;
+            pending.lock().unwrap().isolated = Some(PendingOperation {
+                id: ISOLATED_OPERATION,
+                request_id: RequestId::Number(ISOLATED_ID),
+                kind: OperationKind::IsolatedTurn,
+                run_id: None,
+                cancelling: false,
+                cancel: None,
+                joined: Vec::new(),
+            });
+            let project = smol::spawn({
+                let pending = Arc::clone(pending);
+                let out_tx = srv.out_tx.clone();
+                async move {
+                    project_isolated_turn(isolated_rx, &pending, ISOLATED_OPERATION, &out_tx, &sid)
+                        .await;
+                }
+            });
+            let turn_id = turns.latest().turn_id();
+            let agent_id = session.command_root.target.id();
+            let envelope = |event| {
+                let mut envelope = primary_envelope(pending, event);
+                let identity = envelope.identity.as_mut().unwrap();
+                identity.kind = ActorWorkKind::Turn {
+                    operation_id: identity.presentation_id,
+                    turn_id,
+                };
+                envelope
+            };
+            let next = || within(out_rx.recv_async(), "missing ACP output");
+            for (primary, isolated) in [
+                ("primary one", "isolated one "),
+                ("primary two", "isolated two"),
+            ] {
+                root_tx
+                    .send(envelope(AgentEvent::TextDelta {
+                        text: primary.into(),
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    next().await.unwrap()["params"]["update"]["content"]["text"],
+                    primary
+                );
+                within(
+                    isolated_tx.send_async(IsolatedTurnEvent::TextDelta(isolated.into())),
+                    "isolated projector did not consume the chunk",
+                )
+                .await
+                .unwrap();
+            }
+            within(
+                isolated_tx.send_async(IsolatedTurnEvent::Done),
+                "isolated projector did not finish",
+            )
+            .await
+            .unwrap();
+            root_tx
+                .send(envelope(AgentEvent::TurnOutcome(TurnOutcome::completed(
+                    agent_id,
+                    turn_id,
+                    TokenUsage::default(),
+                    1,
+                    DoneReason::EndTurn,
+                ))))
+                .unwrap();
+
+            let terminal = next().await.unwrap();
+            assert_eq!(terminal["id"], PRIMARY_ID);
+            assert_eq!(terminal["result"]["stopReason"], END_TURN);
+            assert_eq!(
+                next().await.unwrap()["params"]["update"]["content"]["text"],
+                "isolated one isolated two"
+            );
+            let terminal = next().await.unwrap();
+            assert_eq!(terminal["id"], ISOLATED_ID);
+            assert_eq!(terminal["result"]["stopReason"], END_TURN);
+            within(project, "isolated projector did not exit").await;
+            assert!(out_rx.is_empty());
+            close_session(&mut srv).await;
         });
     }
 

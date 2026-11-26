@@ -40,7 +40,7 @@ use makima_agent::mcp;
 use makima_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
 use makima_agent::session::{
     AnswerKey, AnswerRouter, Durability, FrontendObserver, FrontendServices, OpenRequest,
-    ResetSeed, SessionEvent, SessionHandle, SessionSubscription, open,
+    PrepareOptions, ResetSeed, SessionEvent, SessionHandle, SessionSubscription, prepare,
 };
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_options::{
@@ -849,49 +849,55 @@ impl SdkRuntime {
             storage,
             permission_mode,
         };
-        let handle = match open(OpenRequest {
-            params: InteractiveParams {
-                model: params.model.clone(),
-                config: params.config.clone(),
-                permissions_config: params.permissions_config.clone(),
-                timeouts: params.timeouts,
-                prompt_slots: params.prompt_slots.clone(),
-                profile: FrontendProfile {
-                    excluded_tools: vec![QUESTION_TOOL_NAME],
-                    ..Default::default()
+        let prepared = match prepare(
+            OpenRequest {
+                params: InteractiveParams {
+                    model: params.model.clone(),
+                    config: params.config.clone(),
+                    permissions_config: params.permissions_config.clone(),
+                    timeouts: params.timeouts,
+                    prompt_slots: params.prompt_slots.clone(),
+                    profile: FrontendProfile {
+                        excluded_tools: vec![QUESTION_TOOL_NAME],
+                        ..Default::default()
+                    },
+                    mcp_handle: None,
+                    initial_wd: params.cwd.clone(),
+                    session_id: None,
+                    root_id: None,
+                    journal: None,
+                    initial_history: Vec::new(),
+                    yolo: permission_mode == PermissionMode::BypassPermissions,
+                    system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
+                    append_system_prompt: cli
+                        .append_system_prompt
+                        .clone()
+                        .filter(|s| !s.is_empty()),
+                    defaults: params.defaults,
+                    modes: params.lua_handle.mode_registry(),
+                    model_policy: Arc::clone(&params.model_policy),
+                    providers: Arc::clone(providers),
+                    plugin_rules: Arc::clone(&params.plugin_rules),
+                    project_config: params.project_config.clone(),
+                    local_tools: Default::default(),
+                    state_dir: Some(storage.path().to_path_buf()),
+                    answers: true,
                 },
-                mcp_handle: None,
-                initial_wd: params.cwd.clone(),
-                session_id: None,
-                root_id: None,
-                journal: None,
-                initial_history: Vec::new(),
-                yolo: permission_mode == PermissionMode::BypassPermissions,
-                system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
-                append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
-                defaults: params.defaults,
-                modes: params.lua_handle.mode_registry(),
-                model_policy: Arc::clone(&params.model_policy),
-                providers: Arc::clone(providers),
-                plugin_rules: Arc::clone(&params.plugin_rules),
-                project_config: params.project_config.clone(),
-                local_tools: Default::default(),
-                state_dir: Some(storage.path().to_path_buf()),
-                answers: true,
+                durability: Durability::Persistent {
+                    storage,
+                    source: Box::new(source),
+                    explicit_model: params.explicit_model && !fresh,
+                    require_matching_cwd: true,
+                    skip_startup_if_children_continue: false,
+                },
+                continue_turns: continue_all_agents(),
+                options: params.session_options.clone(),
+                model_options: catalog.snapshot(),
+                prepare: headless::default_preparation(Arc::clone(providers)),
+                services: &mut services,
             },
-            durability: Durability::Persistent {
-                storage,
-                source: Box::new(source),
-                explicit_model: params.explicit_model && !fresh,
-                require_matching_cwd: true,
-                skip_startup_if_children_continue: false,
-            },
-            continue_turns: continue_all_agents(),
-            options: params.session_options.clone(),
-            model_options: catalog.snapshot(),
-            prepare: headless::default_preparation(Arc::clone(providers)),
-            services: &mut services,
-        })
+            PrepareOptions::default(),
+        )
         .await
         {
             Err(OpenSessionError::Exists(_)) if !fresh && cli.fork_session => {
@@ -899,6 +905,7 @@ impl SdkRuntime {
             }
             result => result?,
         };
+        let handle = prepared.publish().await?;
         if let Err(error) = services.apply_startup_permission_mode(&handle).await {
             let _ = handle.close(SDK_SHUTDOWN_TIMEOUT).await;
             return Err(eyre!(error));
@@ -1023,6 +1030,7 @@ impl SdkRuntime {
             params.model.provider.to_string(),
             |_| {},
         ));
+        self.handle.activate();
     }
 
     fn dispatch(&self) -> UserDispatch {
