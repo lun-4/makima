@@ -8,6 +8,7 @@ use makima_providers::{CompleteModelSelection, TokenUsage};
 use std::sync::Arc;
 
 use crate::actor::{ActorHistory, TurnResult};
+use crate::agent::isolated_turn::IsolatedPrompt;
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::journal::SessionJournal;
 use crate::manager::{CurrentManagedTurn, ManagerInner, WorkAdmission};
@@ -260,6 +261,10 @@ pub type TerminalCheckpoint = Arc<
 >;
 
 pub trait ActorBackend: Send {
+    fn isolated_prompt(&self) -> Option<IsolatedPrompt> {
+        None
+    }
+
     fn hold_input_after_failure(&self) -> bool {
         false
     }

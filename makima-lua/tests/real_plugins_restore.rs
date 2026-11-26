@@ -11,8 +11,10 @@ use std::time::Duration;
 use makima_agent::actor::{ActorHistory, AgentContextSnapshot, PreparedModel};
 use makima_agent::config_change::unresolved_model;
 use makima_agent::manager::AgentResidency;
-use makima_agent::permissions::PermissionManager;
-use makima_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
+use makima_agent::permissions::{
+    DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager,
+};
+use makima_agent::session::AnswerRouter;
 use makima_agent::session_coordinator::{
     SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
     builtin_option_definitions,
@@ -21,7 +23,7 @@ use makima_agent::session_options::{DISABLED_VALUE, ENABLED_VALUE, YOLO_OPTION_I
 use makima_agent::tools::offload::{OffloadStore, is_offload_notice};
 use makima_agent::tools::{FILE_TRUNCATED_MARKER, ToolContext, ToolRegistry, TurnToolBindings};
 use makima_agent::{
-    ActorBackend, ActorLifecycle, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle,
+    ActorBackend, ActorLifecycle, AgentEvent, AgentId, AgentInput, AgentLimits, AgentManagerHandle,
     BackendResult, ControlWork, DoneReason, GraphLifecycle, ManagerError, SessionMailbox,
     TurnContext, TurnOutcome, WorkKind,
 };
@@ -204,6 +206,7 @@ makima.api.register_command({
 "#;
 const MANAGED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MANAGED_BASH_TIMEOUT: Duration = Duration::from_secs(5);
+const CLASSIFIER_TOOL_USE_ID: &str = "classifier_tool_use_id";
 const CLASSIFIER_TOOL_NAME: &str = "classifier_verdict";
 const AUTO_MODE_DENIED: &str = "command denied by auto-mode: ";
 
@@ -1913,38 +1916,28 @@ fn yolo_permissions(session: &SessionCoordinatorHandle) -> Arc<PermissionManager
     permissions
 }
 
-/// Like [`exec_verdict`], but with a live event channel (so tests can assert
-/// `AgentEvent::PermissionRequest` was emitted) and an optional canned user
-/// answer pre-loaded on the response channel for the deny→prompt path to
-/// consume. `answer = None` leaves `user_response_rx` unset, modeling a
-/// headless/ACP run without an answerer.
+/// Captures tool events and answers the emitted permission request when an answer is supplied.
 fn exec_verdict_prompt(
     host: &PluginHost,
     reg: &ToolRegistry,
     session: &SessionCoordinatorHandle,
     input: Value,
     permissions: Arc<PermissionManager>,
-    answer: Option<&str>,
+    answer: Option<PermissionAnswer>,
 ) -> Verdict {
     let (tx, rx) = flume::unbounded();
     let event_tx = makima_agent::EventSender::new(tx);
     let mut ctx = makima_agent::tools::test_support::stub_ctx_with_session(
         &makima_agent::AgentMode::Build,
         Some(&event_tx),
-        Some("classifier_tool_use_id"),
+        Some(CLASSIFIER_TOOL_USE_ID),
         session.read().session_id(),
     );
     ctx.permissions = permissions;
-    if let Some(answer) = answer {
-        let (answer_tx, answer_rx) = flume::unbounded::<String>();
-        ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(answer_rx)));
-        let answer_parsed = makima_agent::permissions::PermissionAnswer::decode(answer)
-            .expect("valid permission answer");
-        let tagged =
-            makima_agent::permissions::TaggedAnswer::new("classifier_tool_use_id", answer_parsed)
-                .encode();
-        answer_tx.send(tagged).unwrap();
-    }
+    let agent_id = AgentId::generate();
+    ctx.execution_agent_id = Some(agent_id);
+    let answers = answer.as_ref().map(|_| AnswerRouter::default());
+    ctx.answers = answers.clone();
     ctx.tool_output_lines = view_lines();
     let inv = reg
         .get("bash")
@@ -1952,7 +1945,37 @@ fn exec_verdict_prompt(
         .tool
         .parse(&input)
         .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
+    let (result, mut events) = smol::block_on(smol::future::zip(inv.execute(&ctx), async {
+        let mut events = Vec::new();
+        if let Some((answers, answer)) = answers.zip(answer) {
+            smol::future::or(
+                async {
+                    loop {
+                        let event = rx.recv_async().await.unwrap().event;
+                        let answered = if let AgentEvent::PermissionRequest { id, ask, .. } = &event
+                        {
+                            assert_eq!(id, CLASSIFIER_TOOL_USE_ID);
+                            assert_eq!(ask.agent_id(), agent_id);
+                            answers.answer(ask.clone(), answer.encode()).unwrap();
+                            true
+                        } else {
+                            false
+                        };
+                        events.push(event);
+                        if answered {
+                            break;
+                        }
+                    }
+                },
+                async {
+                    smol::Timer::after(MANAGED_BASH_TIMEOUT).await;
+                    panic!("tool did not request permission");
+                },
+            )
+            .await;
+        }
+        events
+    }));
     host.load_source("auto_barrier", "").unwrap();
     let (is_error, output) = match result.output {
         Ok(makima_agent::ToolOutput::Plain(s)) | Ok(makima_agent::ToolOutput::Markdown(s)) => {
@@ -1961,7 +1984,7 @@ fn exec_verdict_prompt(
         Err(e) => (true, e),
         other => panic!("unexpected output: {other:?}"),
     };
-    let events = rx.drain().map(|env| env.event).collect();
+    events.extend(rx.drain().map(|env| env.event));
     Verdict {
         is_error,
         output,
@@ -2405,7 +2428,7 @@ fn auto_mode_deny_user_allow_runs() {
         &session,
         json!({ "command": "echo ask-allow-side-effect" }),
         prompt_permissions(),
-        Some("allow"),
+        Some(PermissionAnswer::AllowOnce),
     );
     assert!(
         !result.is_error,
@@ -2432,7 +2455,7 @@ fn auto_mode_deny_user_deny_fails() {
         &session,
         json!({ "command": "echo ask-deny-side-effect" }),
         prompt_permissions(),
-        Some("deny"),
+        Some(PermissionAnswer::Deny),
     );
     assert!(result.is_error, "a user deny must fail the tool");
     assert_eq!(
@@ -2453,7 +2476,7 @@ fn auto_mode_classifier_error_user_allow_runs() {
         &session,
         json!({ "command": "echo classifier-error-allowed" }),
         prompt_permissions(),
-        Some("allow"),
+        Some(PermissionAnswer::AllowOnce),
     );
     assert!(
         !result.is_error,
@@ -2554,7 +2577,7 @@ fn auto_mode_deny_cd_hint_prompts_on_raw_input_scopes() {
         &session,
         json!({ "command": "cd /tmp && echo foo" }),
         Arc::clone(&echo_only),
-        Some("allow"),
+        Some(PermissionAnswer::AllowOnce),
     );
     assert!(
         !result.is_error,

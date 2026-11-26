@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use async_lock::Mutex;
 use event_listener::Event;
+#[cfg(test)]
 use flume::Receiver;
 use futures_lite::future;
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
@@ -26,25 +26,27 @@ use crate::actor::{
 };
 #[cfg(test)]
 use crate::agent::History;
-use crate::agent::isolated_turn::IsolatedTurnEvent;
+#[cfg(test)]
+use crate::agent::isolated_turn::collect_answer;
+use crate::agent::isolated_turn::{IsolatedPrompt, OPERATION_CANCELLED};
 use crate::agent::{
     self, Instructions, NO_ADMITTED_CWD_ERR, PromptSlotSource, TurnSetup, resolve_compaction_model,
 };
-use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
-use crate::config_change::{ConfigChangeError, reserve_in_turn_for_actor, unresolved_model};
-use crate::context::{ContextPolicy, RootContext, root_context};
+use crate::cancel::{CancelMap, CancelScope, CancelToken, CancelTrigger, SessionCancellation};
+use crate::config_change::{ConfigChangeError, unresolved_model};
+#[cfg(test)]
+use crate::context::root_context;
 use crate::journal::{JournalChange, JournalCommit, JournalIncarnation, SessionJournal};
 use crate::manager::{
     ReactivationError, ResidentAgent, ResidentInitialization, ResidentInitializer, SubmitOptions,
 };
 use crate::permissions::{PermissionManager, PermissionSnapshot, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
-use crate::session::SessionEventPump;
+use crate::session::{AnswerRouter, SessionEventPump};
 use crate::session_checkpoint::stored_agent_config;
 use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::session_options::SessionOptionError;
 use crate::session_writer::SessionWriter;
-use crate::state::StateAccess;
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{
@@ -52,7 +54,7 @@ use crate::tools::{
     ToolAudience, ToolContext, ToolRegistry, TurnToolBindings,
 };
 use crate::{
-    ActorBackend, Agent, AgentConfig, AgentError, AgentEvent, AgentId, AgentInput, AgentLimits,
+    ActorBackend, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentLimits,
     AgentManagerHandle, AgentMode, AgentParams, AgentRef, AgentRunParams, BackendResult,
     ControlWork, EffectiveAgentConfig, Envelope, EventSender, HistorySnapshot, McpHandle,
     McpSession, PermissionsConfig, RunLedger, RunSettings, SessionMailbox, ToolOutputLines,
@@ -63,8 +65,6 @@ use crate::{
 const GRAPH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_CLOSED: &str = "session ended before initialization";
 const TERMINAL_CHECKPOINT_TIMEOUT: &str = "checkpoint timed out";
-const OPERATION_CANCELLED: &str = "operation cancelled";
-const ROOT_NOT_READY: &str = "session root is not initialized yet";
 const NO_TURN_CONFIG: &str = "turn was admitted without an effective agent configuration";
 const SETUP_FAILED: &str = "agent turn setup failed";
 const MCP_INIT_CANCELLED: &str = "MCP initialization cancelled";
@@ -94,6 +94,7 @@ impl RootReadiness {
         }
     }
 
+    #[cfg(test)]
     fn current(&self) -> Option<Result<AgentRef, String>> {
         self.0.result.get().cloned()
     }
@@ -187,7 +188,7 @@ pub struct InteractiveParams {
     pub project_config: ProjectConfig,
     pub local_tools: LocalTools,
     pub state_dir: Option<PathBuf>,
-    /// Whether the frontend answers permission asks over `answer_tx`. Without
+    /// Whether the frontend answers permission asks through the answer router. Without
     /// it every ask is denied at once instead of waiting on nobody.
     pub answers: bool,
 }
@@ -207,20 +208,11 @@ pub enum InteractiveControl {
         cancel: CancelToken,
     },
     Reset(flume::Sender<Result<(), String>>),
-    IsolatedTurn {
-        question: String,
-        images: Vec<makima_providers::ImageSource>,
-        root_context: Arc<RootContext>,
-        context_access: StateAccess,
-        output: flume::Sender<agent::isolated_turn::IsolatedTurnEvent>,
-        cancel: CancelToken,
-    },
 }
 
 #[derive(Clone)]
 pub struct InteractiveControlSender {
     root: RootReadiness,
-    session_id: MakimaId,
     next: Arc<AtomicU64>,
 }
 
@@ -240,9 +232,6 @@ impl PendingControl {
             }
             Some(InteractiveControl::ManualCompaction { output, .. }) => {
                 let _ = output.send(ManualCompactionEvent::Cancelled);
-            }
-            Some(InteractiveControl::IsolatedTurn { output, .. }) => {
-                let _ = output.send(agent::isolated_turn::IsolatedTurnEvent::Cancelled);
             }
             None => {}
         }
@@ -276,8 +265,7 @@ impl InteractiveControlSender {
             self.next.fetch_add(1, Ordering::Relaxed)
         );
         let cancel = match &control {
-            InteractiveControl::ManualCompaction { cancel, .. }
-            | InteractiveControl::IsolatedTurn { cancel, .. } => Some(cancel.clone()),
+            InteractiveControl::ManualCompaction { cancel, .. } => Some(cancel.clone()),
             _ => None,
         };
         let (done, finished) = flume::bounded(0);
@@ -330,124 +318,6 @@ impl InteractiveControlSender {
                 Ok(ManualCompactionEvent::Started) => {}
                 Ok(event) => return compaction_result(event),
                 Err(_) => return Err(OPERATION_CANCELLED.into()),
-            }
-        }
-    }
-
-    pub async fn send_isolated_to(
-        &self,
-        actor: AgentActorHandle,
-        question: String,
-        images: Vec<makima_providers::ImageSource>,
-        output: flume::Sender<IsolatedTurnEvent>,
-        cancel: CancelToken,
-    ) -> Result<(), String> {
-        let (context, context_access) = cancel
-            .race(async {
-                let root = self.root.get().await?;
-                root.validate_live().map_err(|error| error.to_string())?;
-                let current = root.actor().map_err(|error| error.to_string())?;
-                if !current.same_actor(&actor) {
-                    return Err(OPERATION_CANCELLED.into());
-                }
-                let access = root.state_access().read_only();
-                let session = root
-                    .manager()
-                    .journal()
-                    .session_id()
-                    .unwrap_or(self.session_id);
-                let context = match SessionCoordinatorHandle::resolve(session) {
-                    Ok(coordinator) => coordinator
-                        .ensure_root_context_for_actor(&actor)
-                        .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => {
-                        if root.manager().journal().is_persistent() {
-                            root_context(&access)
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| error.to_string())
-                        } else {
-                            if let Some(context) =
-                                root_context(&access).map_err(|error| error.to_string())?
-                            {
-                                return Ok((context, access));
-                            }
-                            let operation = reserve_in_turn_for_actor(actor.clone(), || {
-                                root.validate_live()?;
-                                if !root.actor()?.same_actor(&actor) {
-                                    return Err(ActorError::PolicyCancelled.into());
-                                }
-                                root_context(&access).map_err(|error| {
-                                    ConfigChangeError::Rejected(error.to_string().into())
-                                })?;
-                                Ok(actor.reserve_prepared_operation(None)?)
-                            })
-                            .await
-                            .map_err(|error| error.to_string())?;
-                            operation
-                                .wait_predecessor()
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            root_context(&access).map_err(|error| error.to_string())?;
-                            if root_context(&access)
-                                .map_err(|error| error.to_string())?
-                                .is_none()
-                            {
-                                operation
-                                    .request_context(ContextPolicy::Admission)
-                                    .map_err(|error| error.to_string())?;
-                                operation.resolve(None).map_err(|error| error.to_string())?;
-                                operation
-                                    .wait_ready()
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                root_context(&access).map_err(|error| error.to_string())?;
-                                operation.commit().map_err(|error| error.to_string())?;
-                            }
-                            root_context(&access)
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| HEADLESS_CONFIG_UNAVAILABLE.into())
-                        }
-                    }
-                }?;
-                root_context(&access).map_err(|error| error.to_string())?;
-                Ok::<_, String>((context, access))
-            })
-            .await
-            .map_err(|_| OPERATION_CANCELLED.to_string())??;
-        self.send_to(
-            actor,
-            InteractiveControl::IsolatedTurn {
-                question,
-                images,
-                root_context: context,
-                context_access,
-                output,
-                cancel,
-            },
-        )
-    }
-
-    pub async fn ask_isolated_to(
-        &self,
-        actor: AgentActorHandle,
-        question: String,
-        images: Vec<makima_providers::ImageSource>,
-        cancel: CancelToken,
-    ) -> Result<String, String> {
-        let (output, events) = flume::unbounded();
-        self.send_isolated_to(actor, question, images, output, cancel)
-            .await?;
-        let mut answer = String::new();
-        loop {
-            match events.recv_async().await {
-                Ok(IsolatedTurnEvent::TextDelta(text)) => answer.push_str(&text),
-                Ok(IsolatedTurnEvent::ThinkingDelta(_)) => {}
-                Ok(IsolatedTurnEvent::Done) => return Ok(answer),
-                Ok(IsolatedTurnEvent::Error(error)) => return Err(error),
-                Ok(IsolatedTurnEvent::Cancelled) | Err(_) => {
-                    return Err(OPERATION_CANCELLED.into());
-                }
             }
         }
     }
@@ -529,54 +399,27 @@ impl InteractiveInputSender {
     pub fn admitter(&self) -> TurnAdmitter {
         self.admitter.clone()
     }
-
-    /// Cancels {ticket}'s turn alone; the rest of the session keeps running.
-    /// Holds no part of the sender, so it never keeps the session alive.
-    pub fn turn_cancel(&self, ticket: TurnTicket) -> WorkCancel {
-        WorkCancel::Turn {
-            ticket,
-            root: self.admitter.root.clone(),
-        }
-    }
 }
 
-/// What a frontend cancels when its user interrupts the work in flight: a
-/// local operation's trigger, or an admitted turn on the actor.
 pub enum WorkCancel {
     Control(CancelTrigger),
-    Turn {
-        ticket: TurnTicket,
-        root: RootReadiness,
-    },
+    Scope(CancelScope, SessionCancellation),
 }
 
 impl WorkCancel {
     pub fn turn_id(&self) -> Option<TurnId> {
         match self {
-            Self::Control(_) => None,
-            Self::Turn { ticket, .. } => Some(ticket.turn_id()),
+            Self::Scope(CancelScope::Turn(ticket), _) => Some(ticket.turn_id()),
+            _ => None,
         }
     }
 
     pub fn cancel(self) {
         match self {
             Self::Control(trigger) => trigger.cancel(),
-            Self::Turn { ticket, root } => {
-                let cancelled = root
-                    .current()
-                    .ok_or_else(|| ROOT_NOT_READY.to_owned())
-                    .flatten()
-                    .and_then(|root| root.actor().map_err(|error| error.to_string()))
-                    .and_then(|actor| {
-                        if !actor.owns_ticket(&ticket) {
-                            return Ok(());
-                        }
-                        actor
-                            .cancel_turn(ticket.turn_id())
-                            .map_err(|error| error.to_string())
-                    });
-                if let Err(error) = cancelled {
-                    warn!(%error, turn_id = %ticket.turn_id(), "turn cancel failed");
+            Self::Scope(scope, cancellation) => {
+                if let Err(error) = cancellation.cancel(scope) {
+                    warn!(%error, "work cancellation failed");
                 }
             }
         }
@@ -585,13 +428,14 @@ impl WorkCancel {
 
 pub struct InteractiveHandle {
     pub manager: AgentManagerHandle,
+    pub cancellation: SessionCancellation,
     pub root: RootReadiness,
     pub events: Arc<SessionEventPump>,
     #[cfg(test)]
     event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
     pub input_tx: InteractiveInputSender,
-    pub answer_tx: flume::Sender<String>,
+    pub answers: AnswerRouter,
     pub control_tx: InteractiveControlSender,
     pub session_id: SessionRef,
     pub mailbox: SessionMailbox,
@@ -694,7 +538,7 @@ pub struct HeadlessBackendOptions {
     pub prompt_slots: PromptSlotSource,
     pub local_tools: LocalTools,
     pub mcp: Option<McpSession>,
-    pub answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
+    pub answers: Option<AnswerRouter>,
 }
 
 pub struct HeadlessBackend {
@@ -705,10 +549,9 @@ pub struct HeadlessBackend {
     report_setup_errors: bool,
     mcp_lifecycle: McpLifecycle,
     mcp_initialized: bool,
-    system_override: Option<String>,
-    append_system: Option<String>,
+    prompt: IsolatedPrompt,
     setup: TurnSetup,
-    answer_rx: Option<Arc<Mutex<Receiver<String>>>>,
+    answers: Option<AnswerRouter>,
     raw_tx: flume::Sender<Envelope>,
 }
 
@@ -722,26 +565,33 @@ impl HeadlessBackend {
         params.tool_output_lines = profile.tool_output_lines;
         params.question_mode = profile.question_mode;
         params.interactive_reauth = profile.interactive_reauth;
+        let setup = TurnSetup {
+            registry: Arc::clone(&params.registry),
+            local_tools: options.local_tools,
+            mcp: options.mcp,
+            slots: options.prompt_slots,
+            modes: Arc::clone(&params.modes),
+            instructions: !options.child,
+        };
         Self {
-            setup: TurnSetup {
-                registry: Arc::clone(&params.registry),
-                local_tools: options.local_tools,
-                mcp: options.mcp,
-                slots: options.prompt_slots,
-                modes: Arc::clone(&params.modes),
-                instructions: !options.child,
-            },
-            params,
             persist_turn_results: options.persist_turn_results,
             excluded_tools: profile.excluded_tools,
             hold_input_after_failure: profile.hold_input_after_failure,
             report_setup_errors: profile.report_setup_errors,
             mcp_lifecycle: profile.mcp_lifecycle,
             mcp_initialized: false,
-            system_override: options.system_override,
-            append_system: options.append_system,
-            answer_rx: options.answer_rx,
+            prompt: IsolatedPrompt {
+                override_text: options.system_override.map(Arc::from),
+                append_text: options.append_system.map(Arc::from),
+                modes: Arc::clone(&params.modes),
+                cold_slots: (profile.question_mode != QuestionMode::Tui && !options.child)
+                    .then(|| setup.slots.clone()),
+                session_id: params.session_id.clone(),
+            },
+            answers: options.answers,
             raw_tx,
+            params,
+            setup,
         }
     }
 
@@ -821,25 +671,13 @@ impl HeadlessBackend {
         instructions: &Instructions,
         slots: &ResolvedSlots,
     ) -> String {
-        let vars = template::env_vars_for(config.context.cwd());
-        let definition = config
-            .mode_def
-            .clone()
-            .unwrap_or_else(|| self.params.modes.current(&config.mode));
-        let mut system = self.system_override.clone().unwrap_or_else(|| {
-            agent::build_system_prompt_with_def(
-                &vars,
-                &definition,
-                &config.mode,
-                &instructions.text,
-                slots,
-            )
-        });
-        if let Some(append) = &self.append_system {
-            system.push('\n');
-            system.push_str(append);
-        }
-        system
+        self.prompt.system(
+            config.context.cwd(),
+            &config.mode,
+            config.mode_def.as_ref(),
+            instructions,
+            slots,
+        )
     }
 
     fn tools(&self, config: &EffectiveAgentConfig) -> RequestTools {
@@ -869,7 +707,7 @@ impl HeadlessBackend {
             cwd: config.context.cwd().to_path_buf(),
             tool_use_id: None,
             call: None,
-            user_response_rx: self.answer_rx.clone(),
+            answers: self.answers.clone(),
             loaded_instructions: Default::default(),
             cancel: CancelToken::none(),
             mcp: self.setup.mcp.clone(),
@@ -963,6 +801,10 @@ impl HeadlessBackend {
 }
 
 impl ActorBackend for HeadlessBackend {
+    fn isolated_prompt(&self) -> Option<IsolatedPrompt> {
+        Some(self.prompt.clone())
+    }
+
     fn hold_input_after_failure(&self) -> bool {
         self.hold_input_after_failure
     }
@@ -1072,15 +914,7 @@ impl ActorBackend for HeadlessBackend {
             };
             let setup = context
                 .cancel
-                .race(async {
-                    let slots = prompt_inputs
-                        .resolve(&mut input, self.setup.mcp.as_ref())
-                        .await?;
-                    if let Some(answer_rx) = &self.answer_rx {
-                        while answer_rx.lock().await.try_recv().is_ok() {}
-                    }
-                    Ok::<_, AgentError>(slots)
-                })
+                .race(prompt_inputs.resolve(&mut input, self.setup.mcp.as_ref()))
                 .await;
             let slots = match setup {
                 Err(_) => return self.cancel_setup(&context, turn_id),
@@ -1121,7 +955,7 @@ impl ActorBackend for HeadlessBackend {
                 &context,
                 instructions.loaded,
             )
-            .with_user_response_rx(self.answer_rx.clone())
+            .with_answers(self.answers.clone())
             .with_local_tools(Arc::clone(&self.setup.local_tools))
             .with_mcp(self.setup.mcp.clone());
             let outcome = agent.run(turn_id, input).await;
@@ -1169,60 +1003,14 @@ impl ActorBackend for HeadlessBackend {
                         _ => CompactionStatus::Failed,
                     };
                     let _ = output.send(result);
-                    return BackendResult::ControlCompacted(status);
+                    BackendResult::ControlCompacted(status)
                 }
                 Some(InteractiveControl::Reset(reply)) => {
                     let _ = reply.send(Err(RESET_REQUIRES_FRONTEND.into()));
-                    return BackendResult::ControlFailed;
+                    BackendResult::ControlFailed
                 }
-                Some(InteractiveControl::IsolatedTurn {
-                    question,
-                    images,
-                    root_context: pinned_context,
-                    context_access,
-                    output,
-                    cancel,
-                }) => {
-                    if let Err(error) = root_context(&context_access) {
-                        let _ = output.send(IsolatedTurnEvent::Error(error.to_string()));
-                        return BackendResult::ControlFailed;
-                    }
-                    let Some(config) = &context.policy else {
-                        let _ = output.send(IsolatedTurnEvent::Error(NO_TURN_CONFIG.into()));
-                        return BackendResult::ControlFailed;
-                    };
-                    let (trigger, combined) = CancelToken::new();
-                    let cancellation = smol::spawn({
-                        let actor_cancel = context.cancel.clone();
-                        async move {
-                            future::or(cancel.cancelled(), actor_cancel.cancelled()).await;
-                            trigger.cancel();
-                        }
-                    });
-                    agent::isolated_turn::run_isolated_turn(
-                        agent::isolated_turn::IsolatedTurnRequest {
-                            provider: Arc::clone(&config.provider),
-                            model: config.model.clone(),
-                            history: history.as_slice().to_vec(),
-                            previous: history.branch(history.len()),
-                            system: self.system(
-                                config,
-                                &pinned_context.instructions,
-                                &pinned_context.slots,
-                            ),
-                            question,
-                            images,
-                            session_id: self.params.session_id.clone(),
-                            cancel: combined,
-                        },
-                        output,
-                    )
-                    .await;
-                    cancellation.cancel().await;
-                }
-                None => return BackendResult::ControlFailed,
+                None => BackendResult::ControlFailed,
             }
-            BackendResult::ControlDone
         })
     }
 
@@ -1467,10 +1255,10 @@ fn spawn_interactive(
     };
     let control_tx = InteractiveControlSender {
         root: root.clone(),
-        session_id: session_ref.id(),
         next: Arc::new(AtomicU64::new(0)),
     };
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let answers = AnswerRouter::default();
+    let backend_answers = params.answers.then(|| answers.clone());
     let mut permission_config = params.permissions_config.clone();
     permission_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
@@ -1485,6 +1273,8 @@ fn spawn_interactive(
         .as_ref()
         .map(|store| OffloadCleanup::new(Arc::clone(store)));
     let children = Arc::new(CancelMap::new());
+    let cancellation =
+        SessionCancellation::new(manager.clone(), root_id, Arc::clone(&children), None);
     let lifetime = ManagedLifetime {
         manager: manager.clone(),
         root: root.clone(),
@@ -1610,7 +1400,7 @@ fn spawn_interactive(
                         prompt_slots: params.prompt_slots,
                         local_tools: params.local_tools,
                         mcp,
-                        answer_rx: params.answers.then(|| Arc::new(Mutex::new(answer_rx))),
+                        answers: backend_answers,
                     },
                 );
                 let mut template = backend.template(&config);
@@ -1807,13 +1597,14 @@ fn spawn_interactive(
     let events = SessionEventPump::new(raw_events.clone());
     InteractiveHandle {
         manager,
+        cancellation,
         root,
         events,
         #[cfg(test)]
         event_rx: raw_events,
         tool_names,
         input_tx,
-        answer_tx,
+        answers,
         control_tx,
         session_id: session_ref,
         mailbox,
@@ -1863,9 +1654,9 @@ pub(crate) mod tests {
     use makima_providers::model_registry;
     use makima_providers::provider::Provider;
     use makima_providers::{
-        ContentBlock, ConversationEnd, Invocation, ModelInfo, ModelTier, PreparedProvider,
-        ProviderBackend, RegisteredProvider, RequestDelivery, Role, StopReason, StreamResponse,
-        TokenUsage,
+        ContentBlock, ConversationEnd, Invocation, InvocationPurpose, ModelInfo, ModelTier,
+        PreparedProvider, ProviderBackend, ProviderEvent, RegisteredProvider, RequestDelivery,
+        Role, StopReason, StreamResponse, TokenUsage,
     };
     use makima_storage::StateDir;
     use makima_storage::checkpoint::{
@@ -1948,13 +1739,22 @@ pub(crate) mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<makima_providers::ProviderEvent>,
+            events: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
-            _invocation: &'a Invocation,
+            invocation: &'a Invocation,
             _delivery: RequestDelivery,
         ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
             Box::pin(async move {
+                if invocation.purpose == InvocationPurpose::Isolated {
+                    events
+                        .send_async(ProviderEvent::TextDelta {
+                            text: SAVED_OUTPUT.into(),
+                        })
+                        .await
+                        .unwrap();
+                    return Ok(response(SAVED_OUTPUT));
+                }
                 self.entered.send_async(()).await.unwrap();
                 self.release.recv_async().await.unwrap();
                 match self.exit {
@@ -2157,11 +1957,9 @@ pub(crate) mod tests {
                     bounded(coordinator.reload_context()).await.unwrap();
                 }
                 let (_trigger, cancel) = CancelToken::new();
-                bounded(handle.control_tx.ask_isolated_to(
-                    actor.clone(),
-                    QUESTION.into(),
-                    Vec::new(),
-                    cancel,
+                bounded(collect_answer(
+                    root.ask_isolated(QUESTION.into(), Vec::new(), cancel)
+                        .unwrap(),
                 ))
                 .await
                 .unwrap();
@@ -2224,11 +2022,9 @@ pub(crate) mod tests {
             assert!(root.manager().journal().session_id().is_none());
             assert!(root_context(&root.state_access()).unwrap().is_none());
             let (_trigger, cancel) = CancelToken::new();
-            bounded(handle.control_tx.ask_isolated_to(
-                actor.clone(),
-                QUESTION.into(),
-                Vec::new(),
-                cancel,
+            bounded(collect_answer(
+                root.ask_isolated(QUESTION.into(), Vec::new(), cancel)
+                    .unwrap(),
             ))
             .await
             .unwrap();
@@ -2249,6 +2045,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn isolated_question_completes_during_primary_turn() {
+        smol::block_on(async {
+            let (entered, received) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let provider = Arc::new(GatedHeadlessProvider {
+                entered,
+                release: released,
+                exit: ProviderExit::Success,
+            });
+            let (handle, coordinator) = fixture(Vec::new(), checkpoint(), provider);
+            let primary = handle.input_tx.admit(first_input()).await.unwrap();
+            bounded(received.recv_async()).await.unwrap();
+            let root = bounded(handle.root.get()).await.unwrap();
+            let actor = root.actor().unwrap();
+            let history = actor.committed_history();
+            let events = root
+                .ask_isolated(FIRST.into(), Vec::new(), CancelToken::none())
+                .unwrap();
+            assert_eq!(bounded(collect_answer(events)).await.unwrap(), SAVED_OUTPUT);
+            assert!(primary.peek().is_none());
+            assert_eq!(actor.committed_history(), history);
+            release.send_async(()).await.unwrap();
+            bounded(primary.wait()).await;
+            bounded(handle.task.cancel()).await;
+            bounded(coordinator.close()).await.unwrap();
+        });
+    }
+
+    #[test]
     fn isolated_control_cancellation_precedes_context_initialization() {
         smol::block_on(async {
             let (provider, requests) = recording();
@@ -2257,11 +2082,8 @@ pub(crate) mod tests {
             let actor = root.actor().unwrap();
             let (trigger, cancel) = CancelToken::new();
             trigger.cancel();
-            let result = bounded(handle.control_tx.ask_isolated_to(
-                actor.clone(),
-                FIRST.into(),
-                Vec::new(),
-                cancel,
+            let result = bounded(collect_answer(
+                root.ask_isolated(FIRST.into(), Vec::new(), cancel).unwrap(),
             ))
             .await;
             assert_eq!(result, Err(OPERATION_CANCELLED.into()));
@@ -3884,7 +3706,10 @@ pub(crate) mod tests {
                     )
                     .unwrap();
                 assert_ne!(queued.turn_id(), first.turn_id());
-                handle.input_tx.turn_cancel(queued.clone()).cancel();
+                handle
+                    .cancellation
+                    .cancel(CancelScope::Turn(queued.clone()))
+                    .unwrap();
                 queued
             };
             let saved = bounded_terminal(

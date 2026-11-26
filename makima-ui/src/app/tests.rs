@@ -19,7 +19,8 @@ use makima_agent::headless::{
     FrontendProfile, InteractiveHandle, InteractiveParams, spawn_interactive_with_checkpoint,
 };
 use makima_agent::journal::{JournalCommit, SessionJournal};
-use makima_agent::permissions::PermissionManager;
+use makima_agent::permissions::{PermissionAnswer, PermissionManager};
+use makima_agent::session::{AnswerKey, AnswerRouter, PendingAnswer};
 use makima_agent::session_recovery::{OpenModel, SessionSource, open_session};
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::{
@@ -832,44 +833,21 @@ fn done_event() -> Msg {
     agent_msg(done())
 }
 
-fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
-    subagent_info_with_tx(parent_id, name, None)
-}
-
-fn subagent_info_with_tx(
-    parent_id: &str,
-    name: &str,
-    answer_tx: Option<flume::Sender<String>>,
-) -> SubagentInfo {
-    subagent_info_full(parent_id, name, answer_tx, None)
-}
-
 thread_local! {
     static SUBAGENT_IDS: RefCell<HashMap<String, AgentId>> = RefCell::new(HashMap::new());
 }
 
-fn subagent_info_full(
-    parent_id: &str,
-    name: &str,
-    answer_tx: Option<flume::Sender<String>>,
-    input_tx: Option<flume::Sender<String>>,
-) -> SubagentInfo {
+fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
     let agent_id = SUBAGENT_IDS.with(|agent_ids| {
         *agent_ids
             .borrow_mut()
             .entry(parent_id.to_owned())
             .or_insert_with(AgentId::generate)
     });
-    subagent_info_for_agent(agent_id, parent_id, name, answer_tx, input_tx)
+    subagent_info_for_agent(agent_id, parent_id, name)
 }
 
-fn subagent_info_for_agent(
-    agent_id: AgentId,
-    parent_id: &str,
-    name: &str,
-    answer_tx: Option<flume::Sender<String>>,
-    _input_tx: Option<flume::Sender<String>>,
-) -> SubagentInfo {
+fn subagent_info_for_agent(agent_id: AgentId, parent_id: &str, name: &str) -> SubagentInfo {
     SubagentInfo {
         agent_id,
         parent_agent_id: None,
@@ -878,7 +856,6 @@ fn subagent_info_for_agent(
         prompt: None,
         model: None,
         opts: None,
-        answer_tx,
         cancel: None,
     }
 }
@@ -1163,9 +1140,7 @@ fn post_and_completion_keep_same_navigation_after_reload(missing: bool) {
         child,
         HistorySnapshot::new(vec![Message::user(POST_TEXT.into())]),
     );
-    app.resolve_or_create_chat(&subagent_info_for_agent(
-        child, TRANSCRIPT, LABEL, None, None,
-    ));
+    app.resolve_or_create_chat(&subagent_info_for_agent(child, TRANSCRIPT, LABEL));
     let delivery = Arc::new(ChildDelivery {
         label: Some(LABEL.into()),
         result: TurnResult {
@@ -1297,8 +1272,6 @@ fn linked_post_opens_its_agent(restored: bool, missing: bool, drag: bool, shared
             AgentId::generate(),
             TASK_ID,
             "other reviewer",
-            None,
-            None,
         ));
     }
     let post = Post {
@@ -1732,7 +1705,7 @@ fn completion_notice_navigates_to_child(
     let mut children = Vec::new();
     for _ in 0..2 {
         let agent_id = AgentId::generate();
-        let info = subagent_info_for_agent(agent_id, TASK_ID, LABEL, None, None);
+        let info = subagent_info_for_agent(agent_id, TASK_ID, LABEL);
         let index = app.resolve_or_create_chat(&info);
         let text = format!("{}{TAIL}", "界".repeat(COMPLETION_PREVIEW_CHARS + 1));
         app.chats[index].push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
@@ -3528,9 +3501,7 @@ fn task_picker_preserves_missing_and_completed_age_semantics() {
 fn turn_delta(agent_id: AgentId, turn_id: TurnId) -> Msg {
     Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(subagent_info_for_agent(
-            agent_id, TASK_ID, TASK_ID, None, None,
-        )),
+        subagent: Some(subagent_info_for_agent(agent_id, TASK_ID, TASK_ID)),
         identity: Some(makima_agent::ActorWorkIdentity::new(
             agent_id,
             makima_agent::ActorWorkKind::Turn {
@@ -3987,10 +3958,9 @@ fn rendered_upper_surface_blocks_covered_picker_and_wheel(surface: u8) {
     match surface {
         0 => {
             app.permission_prompt.open(
-                "scroll-permission".into(),
                 makima_config::ToolKey::native(PERM_TOOL),
                 vec![PERM_SCOPE.into()],
-                None,
+                false,
             );
             app.active_input = Some(InputKind::Permission);
         }
@@ -4270,13 +4240,12 @@ fn model_footer_enter_does_not_answer_active_permission_confirmation() {
         MODEL_SPEC_GPT9.into(),
     ])));
     app.run_builtin(BuiltinAction::ModelPicker);
-    let (answer_tx, answer_rx) = flume::bounded(1);
-    app.answer_tx = Some(answer_tx);
-    app.permission_prompt.open(
-        "footer-permission".into(),
+    let answer = register_root_answer(&mut app);
+    app.permission_prompt.open_request(
+        answer.key(),
         makima_config::ToolKey::native(PERM_TOOL),
         vec![PERM_SCOPE.into()],
-        None,
+        false,
     );
     app.active_input = Some(InputKind::Permission);
     assert!(app.update(Msg::Key(key(KeyCode::Char('a')))).is_empty());
@@ -4303,10 +4272,10 @@ fn model_footer_enter_does_not_answer_active_permission_confirmation() {
     assert!(!app.model_picker.is_open());
     assert!(app.permission_active());
     assert!(app.permission_prompt.is_open());
-    assert!(answer_rx.try_recv().is_err());
+    assert!(answer.is_empty());
     assert!(matches!(
         app.permission_prompt.handle_key(key(KeyCode::Enter)),
-        Some(makima_agent::permissions::PermissionAnswer::AllowAlwaysLocal)
+        Some(PermissionAnswer::AllowAlwaysLocal)
     ));
 }
 
@@ -4314,10 +4283,9 @@ fn model_footer_enter_does_not_answer_active_permission_confirmation() {
 fn click_permission_hint_answers() {
     let mut app = test_app();
     app.permission_prompt.open(
-        "req".into(),
         makima_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
+        false,
     );
     app.active_input = Some(crate::app::InputKind::Permission);
     render_app(&mut app, 100, 40);
@@ -4630,7 +4598,7 @@ fn app_with_subagent() -> App {
 }
 
 fn add_picker_agent(app: &mut App, agent_id: AgentId, parent_id: AgentId, name: &str) {
-    let mut info = subagent_info_for_agent(agent_id, name, name, None, None);
+    let mut info = subagent_info_for_agent(agent_id, name, name);
     info.parent_agent_id = Some(parent_id);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
@@ -5042,9 +5010,11 @@ const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
 #[test]
 fn cancel_clears_pending_input() {
     let mut app = streaming_app();
-    app.pending_input = PendingInput::AuthRetry { agent_id: None };
+    let answer = register_root_answer(&mut app);
+    app.update(agent_msg(AgentEvent::AuthRequired { ask: answer.key() }));
     cancel_app(&mut app);
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(app.pending_auth.is_empty());
+    assert!(answer.is_empty());
 }
 
 #[test]
@@ -5937,7 +5907,7 @@ fn middle_scroll_async_overlay_prevents_final_motion() {
     app.middle_scroll.as_mut().unwrap().move_to(0, now);
     let before = app.chats[0].scroll_top();
     app.last_input = Some(now);
-    assert!(app.begin_input_demand(bash_perm_demand(PERM_SCOPE)));
+    assert!(app.begin_input_demand(bash_perm_demand()));
     app.last_input = Some(now - IDLE_AGE);
     let _ = app.tick_at(now + Duration::from_millis(100));
     assert!(app.permission_active());
@@ -7331,7 +7301,7 @@ fn focused_retry_tracks_only_target_until_request_progress(child: bool) {
     };
     let info = target
         .as_ref()
-        .map(|target| subagent_info_for_agent(target.id(), TASK_ID, "research", None, None));
+        .map(|target| subagent_info_for_agent(target.id(), TASK_ID, "research"));
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::Retry {
             attempt: 1,
@@ -7518,8 +7488,7 @@ fn history_replacement_preserves_live_child_navigation() {
     let mut app = app_without_splash();
     let root = bind_history_actor(&mut app, Vec::new());
     let agent_id = AgentId::generate();
-    let index =
-        app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY, None, None));
+    let index = app.resolve_or_create_chat(&subagent_info_for_agent(agent_id, KEY, KEY));
     let turn_id = TurnId::generate();
     let envelope = serde_json::json!({"kind":"child_result", "agent_id":agent_id.to_string(), "turn_id":turn_id.to_string(), "text":KEY});
     let observation = Message {
@@ -7734,84 +7703,84 @@ fn auth_retry_type_then_enter(app: &mut App) -> Vec<Action> {
     type_and_submit(app, "ignored")
 }
 
+fn register_root_answer(app: &mut App) -> PendingAnswer {
+    let root = app.chats[0].agent_id.unwrap_or_else(AgentId::generate);
+    app.answers
+        .get_or_insert_with(AnswerRouter::default)
+        .register(root)
+}
+
 #[test_case(auth_retry_enter          ; "bare_enter")]
 #[test_case(auth_retry_type_then_enter ; "typed_text_then_enter")]
 fn auth_retry_sends_empty_answer(submit: fn(&mut App) -> Vec<Action>) {
     let mut app = streaming_app();
-    let (tx, rx) = flume::unbounded();
-    app.answer_tx = Some(tx);
-
-    app.update(agent_msg(AgentEvent::AuthRequired));
-    assert!(matches!(
-        app.pending_input,
-        PendingInput::AuthRetry { agent_id: None }
-    ));
+    let answer = register_root_answer(&mut app);
+    app.update(agent_msg(AgentEvent::AuthRequired { ask: answer.key() }));
+    assert_eq!(app.pending_auth.front(), Some(&answer.key()));
 
     let actions = submit(&mut app);
     assert!(actions.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
-    assert_eq!(rx.try_recv().unwrap(), "");
-}
-
-fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Receiver<String>) {
-    let (sub_tx, sub_rx) = flume::unbounded();
-    let (main_tx, main_rx) = flume::unbounded();
-    let mut app = streaming_app();
-    app.answer_tx = Some(main_tx);
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
-        identity: Some(work_identity(1)),
-    })));
-    (app, sub_rx, main_rx)
+    assert!(app.pending_auth.is_empty());
+    assert_eq!(answer.try_recv().unwrap(), "");
 }
 
 #[test]
-fn auth_required_in_subagent_shows_in_both_chats() {
+fn concurrent_auth_retries_route_distinct_keys_in_order() {
     let mut app = app_with_subagent_id("sub1");
+    let root = register_root_answer(&mut app);
+    let router = app.answers.as_ref().unwrap();
+    let child_id = app.chats[1].agent_id.unwrap();
+    let child = router.register(child_id);
+    let other_child_ask = router.register(child_id);
     app.update(subagent_msg(
-        AgentEvent::AuthRequired,
+        AgentEvent::AuthRequired { ask: child.key() },
         "sub1",
         Some("research"),
     ));
 
     assert_eq!(app.chats[1].last_message_text(), AUTH_EXPIRED_MSG);
     assert_eq!(app.chats[0].last_message_text(), AUTH_EXPIRED_MSG);
-    assert!(matches!(
-        app.pending_input,
-        PendingInput::AuthRetry { agent_id: Some(_) }
-    ));
+    app.update(agent_msg(AgentEvent::AuthRequired { ask: root.key() }));
+    for ask in [child.key(), other_child_ask.key()] {
+        app.update(subagent_msg(
+            AgentEvent::AuthRequired { ask },
+            "sub1",
+            Some("research"),
+        ));
+    }
+
+    for answer in [&child, &root, &other_child_ask] {
+        assert!(app.awaiting_input());
+        assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(answer.try_recv().unwrap(), "");
+    }
+    assert!(!app.awaiting_input());
 }
 
 #[test]
-fn auth_retry_in_subagent_routes_to_subagent_channel() {
-    let (mut app, sub_rx, main_rx) = app_with_subagent_tx("sub1");
+fn root_cancel_preserves_subagent_auth_retry() {
+    let mut app = app_with_subagent_id("sub1");
+    let root = register_root_answer(&mut app);
+    let answer = app
+        .answers
+        .as_ref()
+        .unwrap()
+        .register(app.chats[1].agent_id.unwrap());
+    app.update(agent_msg(AgentEvent::AuthRequired { ask: root.key() }));
     app.update(subagent_msg(
-        AgentEvent::AuthRequired,
+        AgentEvent::AuthRequired { ask: answer.key() },
         "sub1",
         Some("research"),
     ));
-    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
-
-    assert!(actions.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
-    assert_eq!(sub_rx.try_recv().unwrap(), "");
-    assert!(main_rx.try_recv().is_err());
-}
-
-#[test]
-fn cancel_clears_subagent_auth_retry() {
-    let (mut app, sub_rx, _main_rx) = app_with_subagent_tx("sub1");
-    app.update(subagent_msg(
-        AgentEvent::AuthRequired,
-        "sub1",
-        Some("research"),
-    ));
+    assert_eq!(app.pending_auth.len(), 2);
 
     cancel_app(&mut app);
 
-    assert_eq!(app.pending_input, PendingInput::None);
-    assert!(sub_rx.try_recv().is_err());
+    assert_eq!(app.pending_auth.front(), Some(&answer.key()));
+    auth_retry_enter(&mut app);
+    assert_eq!(answer.try_recv().unwrap(), "");
+    assert!(root.is_empty());
+    assert!(app.pending_auth.is_empty());
 }
 
 #[test]
@@ -7819,29 +7788,37 @@ fn stale_auth_required_after_cancel_is_dropped() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 2;
+    let answer = register_root_answer(&mut app);
     let count_before = app.chats[0].message_count();
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::AuthRequired,
-        subagent: None,
-        identity: Some(work_identity(1)),
-    })));
-    assert_eq!(app.pending_input, PendingInput::None);
+    app.update(agent_msg_with_run_id(
+        AgentEvent::AuthRequired { ask: answer.key() },
+        1,
+    ));
+    assert!(app.pending_auth.is_empty());
     assert_eq!(app.chats[0].message_count(), count_before);
+    assert!(answer.is_empty());
 }
 
 #[test]
-fn send_to_agent_unknown_subagent_falls_back_to_main() {
-    let (main_tx, main_rx) = flume::unbounded();
-    let mut app = streaming_app();
-    app.answer_tx = Some(main_tx);
-
-    app.pending_input = PendingInput::AuthRetry {
-        agent_id: Some(AgentId::generate()),
-    };
+fn expired_subagent_auth_retry_does_not_fall_back() {
+    let mut app = app_with_subagent_id("sub1");
+    let root = register_root_answer(&mut app);
+    let router = app.answers.as_ref().unwrap();
+    let child_id = app.chats[1].agent_id.unwrap();
+    let expired = router.register(child_id);
+    let next = router.register(child_id);
+    app.update(subagent_msg(
+        AgentEvent::AuthRequired { ask: expired.key() },
+        "sub1",
+        Some("research"),
+    ));
+    assert_eq!(app.pending_auth.front(), Some(&expired.key()));
+    drop(expired);
     app.update(Msg::Key(key(KeyCode::Enter)));
 
-    assert_eq!(main_rx.try_recv().unwrap(), "");
-    assert_eq!(app.pending_input, PendingInput::None);
+    assert!(app.pending_auth.is_empty());
+    assert!(root.is_empty());
+    assert!(next.is_empty());
 }
 
 /// Output that mutates a segment already on screen, rather than appending a
@@ -9109,13 +9086,7 @@ fn plan_picker_retirement_discards_open_draft(child: bool, closed: bool) {
         assert!(target.validate_live().is_err());
         app.update(Msg::Agent(Box::new(Envelope {
             event: AgentEvent::SubagentClosed,
-            subagent: Some(subagent_info_for_agent(
-                target.id(),
-                TASK_ID,
-                SUBAGENT_NAME,
-                None,
-                None,
-            )),
+            subagent: Some(subagent_info_for_agent(target.id(), TASK_ID, SUBAGENT_NAME)),
             identity: Some(work_identity(1)),
         })));
         app.sync_focused_plan_form();
@@ -9304,10 +9275,9 @@ fn plan_picker_yields_to_blocking_overlay(surface: BlockingSurface) {
     match surface {
         BlockingSurface::Permission => {
             app.permission_prompt.open(
-                "permission".into(),
                 makima_config::ToolKey::native("bash"),
                 vec!["execute".into()],
-                None,
+                false,
             );
             app.active_input = Some(InputKind::Permission);
         }
@@ -10123,8 +10093,7 @@ fn failed_subagent_is_presented_without_ui_delivery() {
     const FAILURE_MESSAGE: &str = "provider unavailable";
 
     let mut app = streaming_app();
-    let (input_tx, _input_rx) = flume::unbounded();
-    let info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
+    let info = subagent_info(TASK_ID, "worker");
     let outcome = TurnOutcome::failed(
         info.agent_id,
         TurnId::generate(),
@@ -10182,10 +10151,9 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
     app.permission_prompt.open(
-        "id".into(),
         makima_config::ToolKey::native("bash"),
         vec!["execute".into()],
-        None,
+        false,
     );
     app.active_input = Some(InputKind::Permission);
     assert!(app.permission_prompt.is_open());
@@ -10355,10 +10323,9 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
     open_split_window(&mut app, makima_lua::Split::Left);
     open_split_window(&mut app, makima_lua::Split::Above);
     app.permission_prompt.open(
-        "perm-1".into(),
         makima_config::ToolKey::native("bash"),
         vec!["ls".into()],
-        None,
+        false,
     );
     app.active_input = Some(InputKind::Permission);
 
@@ -10513,8 +10480,8 @@ fn normalized_focused_render_matrix(width: u16, height: u16) {
                                 );
                             }
                             RenderSurface::Permission => {
-                                let mut demand = bash_perm_demand("matrix-permission");
-                                demand.perm.as_mut().unwrap().agent_id = app.selected_agent_id();
+                                let mut demand = bash_perm_demand();
+                                demand.perm.as_mut().unwrap().is_subagent = child;
                                 assert!(!app.begin_input_demand(demand));
                                 assert!(app.permission_active());
                             }
@@ -10613,13 +10580,24 @@ fn focused_status_render_does_not_leak_root_state(root_busy: bool, child_busy: b
 
 #[test]
 fn viewed_agent_cancel_is_local() {
-    let mut app = app_with_subagent();
+    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
+    app.chats[1].flush();
     let child_count = app.chats[1].message_count();
     let agent_id = app.chats[1].agent_id.unwrap();
+    let root = register_root_answer(&mut app);
+    let router = app.answers.as_ref().unwrap();
+    let child = router.register(agent_id);
+    let other_child_ask = router.register(agent_id);
+    app.pending_auth
+        .extend([child.key(), root.key(), other_child_ask.key()]);
+
     app.handle_cancel();
+
+    assert_eq!(app.pending_auth.len(), 1);
+    assert_eq!(app.pending_auth.front(), Some(&root.key()));
     assert_eq!(app.chats[1].message_count(), child_count);
     assert!(!app.chats[1].is_finished());
-    assert!(app.subagent_answers.contains_key(&agent_id));
+    assert!(app.observed_live_agents.contains(&agent_id));
 }
 
 #[test]
@@ -10693,19 +10671,18 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
-    assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
 }
 
 #[test]
-fn cancel_subagent_retains_channel() {
-    let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
-    assert!(!app.subagent_answers.is_empty());
+fn cancel_subagent_retains_live_observation() {
+    let mut app = app_with_subagent();
+    assert!(!app.observed_live_agents.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.subagent_answers.contains_key(&agent_id));
+    assert!(app.observed_live_agents.contains(&agent_id));
 }
 
 #[test]
@@ -12249,7 +12226,7 @@ fn spawn_input_child_under(
         .unwrap()
         .configure_parent_delivery(false)
         .unwrap();
-    let info = subagent_info_for_agent(target.id(), id, name, None, None);
+    let info = subagent_info_for_agent(target.id(), id, name);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(info),
@@ -12370,7 +12347,6 @@ fn shared_submission_preserves_images(child: bool) {
 fn submit_after_subagent_completion_routes_to_reusable_child() {
     let (mut app, input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let input_tx = None;
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TurnOutcome(TurnOutcome::completed(
             agent_id,
@@ -12379,9 +12355,7 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
             1,
             DoneReason::EndTurn,
         )),
-        subagent: Some(subagent_info_for_agent(
-            agent_id, TASK_ID, "research", None, input_tx,
-        )),
+        subagent: Some(subagent_info_for_agent(agent_id, TASK_ID, "research")),
         identity: Some(work_identity(1)),
     })));
 
@@ -12429,7 +12403,7 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     app.open_tasks();
     assert!(!app.active_subagent_closed());
     assert!(app.task_picker.item(chat_idx).unwrap().is_spinning());
@@ -12475,31 +12449,35 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
     );
 }
 
-#[test]
-fn subagent_closed_replaces_active_permission_with_live_root_request() {
-    const CHILD_PERMISSION_ID: &str = "child-permission";
-    const ROOT_PERMISSION_ID: &str = "root-permission";
-
+#[test_case(false; "active_child_permission")]
+#[test_case(true; "deferred_child_permission")]
+fn subagent_closed_promotes_and_routes_live_root_permission(deferred: bool) {
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
-    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
-    let permission = |id: &str| AgentEvent::PermissionRequest {
-        id: id.into(),
-        tool: makima_config::ToolKey::native(PERM_TOOL),
-        scopes: vec![PERM_SCOPE.into()],
-    };
+    let child_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(child_id, TASK_ID, "research");
+    let root = register_root_answer(&mut app);
+    let router = app.answers.as_ref().unwrap();
+    let child = router.register(child_id);
+    let auth = router.register(child_id);
 
+    if deferred {
+        app.last_input = Some(Instant::now());
+    }
     app.update(Msg::Agent(Box::new(Envelope {
-        event: permission(CHILD_PERMISSION_ID),
+        event: permission_request_event(child.key()),
         subagent: Some(info.clone()),
         identity: Some(work_identity(1)),
     })));
-    app.pending_input = PendingInput::AuthRetry {
-        agent_id: Some(agent_id),
-    };
-    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
-    assert_eq!(app.permission_prompt.agent_id(), Some(agent_id));
-    assert_eq!(app.input_queue.len(), 1);
+    app.pending_auth.push_back(auth.key());
+    app.update(agent_msg(permission_request_event(root.key())));
+    if deferred {
+        assert_eq!(app.input_queue.len(), 2);
+        assert!(!app.permission_prompt.is_open());
+        app.last_input = None;
+    } else {
+        assert_eq!(app.permission_prompt.answer_key(), Some(&child.key()));
+        assert_eq!(app.input_queue.len(), 1);
+    }
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
@@ -12508,44 +12486,18 @@ fn subagent_closed_replaces_active_permission_with_live_root_request() {
     })));
 
     assert!(app.permission_active());
-    assert_eq!(app.permission_prompt.agent_id(), None);
+    assert_eq!(app.permission_prompt.answer_key(), Some(&root.key()));
     assert!(app.input_queue.is_empty());
-    assert_eq!(app.pending_input, PendingInput::None);
-}
+    assert!(app.pending_auth.is_empty());
 
-#[test]
-fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
-    const CHILD_PERMISSION_ID: &str = "deferred-child-permission";
-    const ROOT_PERMISSION_ID: &str = "deferred-root-permission";
-
-    let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
-    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
-    let permission = |id: &str| AgentEvent::PermissionRequest {
-        id: id.into(),
-        tool: makima_config::ToolKey::native(PERM_TOOL),
-        scopes: vec![PERM_SCOPE.into()],
-    };
-    app.last_input = Some(Instant::now());
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: permission(CHILD_PERMISSION_ID),
-        subagent: Some(info.clone()),
-        identity: Some(work_identity(1)),
-    })));
-    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
-    assert_eq!(app.input_queue.len(), 2);
-    assert!(!app.permission_prompt.is_open());
-    app.last_input = None;
-
-    app.update(Msg::Agent(Box::new(Envelope {
-        event: AgentEvent::SubagentClosed,
-        subagent: Some(info),
-        identity: Some(work_identity(1)),
-    })));
-
-    assert!(app.permission_active());
-    assert_eq!(app.permission_prompt.agent_id(), None);
-    assert!(app.input_queue.is_empty());
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(!app.permission_active());
+    assert_eq!(
+        root.try_recv().unwrap(),
+        PermissionAnswer::AllowOnce.encode()
+    );
+    assert!(child.is_empty());
+    assert!(auth.is_empty());
 }
 
 #[test_case(false, DONE_TEXT, &DisplayRole::Done ; "completed")]
@@ -12558,7 +12510,7 @@ fn subagent_closed_preserves_terminal_status(
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     if failed {
         app.chats[chat_idx].mark_failed(expected_text);
     } else {
@@ -12584,7 +12536,7 @@ fn final_history_after_subagent_closed_leaves_chat_closed() {
     let chat_idx = app.active_chat;
     let chat_count = app.chats.len();
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     let messages = vec![Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
@@ -12632,7 +12584,7 @@ fn turn_complete_after_subagent_closed_only_updates_chat_cost() {
     let chat_idx = app.active_chat;
     let chat_count = app.chats.len();
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     let usage = TokenUsage {
         input: 100,
         output: 25,
@@ -12669,7 +12621,7 @@ fn turn_complete_after_root_cancel_preserves_child() {
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     let usage = TokenUsage {
         input: 80,
         output: 20,
@@ -12734,7 +12686,7 @@ fn progress_after_subagent_closed_does_not_reopen_chat() {
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let chat_idx = app.active_chat;
     let agent_id = app.chats[chat_idx].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
 
     close_input_child(&mut app, &info);
@@ -12766,7 +12718,7 @@ fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
 
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
             text: IN_PROGRESS.into(),
@@ -12805,7 +12757,7 @@ fn subagent_closed_prunes_only_its_presentation_state() {
     app.stamped_subagent_outcomes.insert((agent_id, turn_id));
     app.stamped_subagent_outcomes
         .insert((other_agent_id, other_turn_id));
-    let info = subagent_info_for_agent(agent_id, TASK_ID, "research", None, None);
+    let info = subagent_info_for_agent(agent_id, TASK_ID, "research");
 
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
@@ -12854,14 +12806,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
     let mut app = streaming_app();
     let parent_id = AgentId::generate();
     let grandchild_id = AgentId::generate();
-    let (input_tx, _input_rx) = flume::unbounded();
-    let mut grandchild = subagent_info_for_agent(
-        grandchild_id,
-        "grandchild-task",
-        "grandchild",
-        None,
-        Some(input_tx),
-    );
+    let mut grandchild = subagent_info_for_agent(grandchild_id, "grandchild-task", "grandchild");
     grandchild.parent_agent_id = Some(parent_id);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentHistory {
@@ -12891,13 +12836,7 @@ fn grandchild_history_is_visible_but_not_promoted_to_root() {
 #[test]
 fn task_picker_rows_show_snippet() {
     let (mut app, _input_rx) = app_with_subagent_actor(TASK_ID);
-    let info = subagent_info_for_agent(
-        app.selected_agent_id().unwrap(),
-        TASK_ID,
-        "research",
-        None,
-        None,
-    );
+    let info = subagent_info_for_agent(app.selected_agent_id().unwrap(), TASK_ID, "research");
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta {
             text: "progress line".into(),
@@ -12917,9 +12856,10 @@ fn task_picker_rows_show_snippet() {
 
 const BELL_TOOL_NAME: &str = "bash";
 
-fn permission_request_event() -> AgentEvent {
+fn permission_request_event(ask: AnswerKey) -> AgentEvent {
     AgentEvent::PermissionRequest {
         id: "perm-1".into(),
+        ask,
         tool: makima_config::ToolKey::native(BELL_TOOL_NAME),
         scopes: vec!["execute".into()],
     }
@@ -12951,7 +12891,8 @@ fn turn_complete_bell_disabled() {
 #[test]
 fn permission_request_emits_bell() {
     let mut app = streaming_app();
-    let actions = app.update(agent_msg(permission_request_event()));
+    let answer = register_root_answer(&mut app);
+    let actions = app.update(agent_msg(permission_request_event(answer.key())));
     assert!(
         actions.iter().all(|a| !matches!(a, Action::Bell)),
         "bell is routed via pending_bell, not Action::Bell"
@@ -12968,7 +12909,8 @@ fn permission_request_bell_disabled() {
     app.ui_config.bell.permission = false;
     app.status = Status::Streaming;
     app.run_id = 1;
-    let actions = app.update(agent_msg(permission_request_event()));
+    let answer = register_root_answer(&mut app);
+    let actions = app.update(agent_msg(permission_request_event(answer.key())));
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Bell)),
         "disabled permission should not bell"
@@ -13274,26 +13216,18 @@ const PERM_TOOL: &str = "bash";
 const PERM_SCOPE: &str = "execute";
 const QUESTION_TEXT: &str = "QUESTIONLINE";
 
-fn perm_demand(id: &str, tool: makima_config::ToolKey, scopes: Vec<String>) -> InputDemand {
+fn bash_perm_demand() -> InputDemand {
     InputDemand {
         kind: InputKind::Permission,
         blocked_by_modal: false,
         hold_until_submit: false,
         perm: Some(PermissionPayload {
-            id: id.into(),
-            tool,
-            scopes,
-            agent_id: None,
+            ask: AnswerRouter::default().register(AgentId::generate()).key(),
+            tool: makima_config::ToolKey::native(PERM_TOOL),
+            scopes: vec![PERM_SCOPE.into()],
+            is_subagent: false,
         }),
     }
-}
-
-fn bash_perm_demand(id: &str) -> InputDemand {
-    perm_demand(
-        id,
-        makima_config::ToolKey::native(PERM_TOOL),
-        vec![PERM_SCOPE.into()],
-    )
 }
 
 fn below_input_config(height: u16) -> makima_lua::FloatConfig {
@@ -13358,7 +13292,7 @@ fn rendered_area(app: &mut App) -> Vec<String> {
 fn permission_deferred_while_typing() {
     let mut app = test_app();
     app.last_input = Some(Instant::now());
-    let defer = app.begin_input_demand(bash_perm_demand("perm"));
+    let defer = app.begin_input_demand(bash_perm_demand());
     assert!(defer, "demand queued while typing");
     assert_eq!(app.input_queue.len(), 1);
     assert!(!app.permission_active());
@@ -13378,7 +13312,7 @@ fn permission_deferred_while_typing() {
 fn permission_promotes_after_idle() {
     let mut app = test_app();
     app.last_input = Some(Instant::now());
-    assert!(app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(app.begin_input_demand(bash_perm_demand()));
     app.last_input = Some(Instant::now() - IDLE_AGE);
     let _ = app.tick();
     assert!(
@@ -13399,7 +13333,7 @@ fn permission_promotes_on_modal_close() {
     app.run_builtin(BuiltinAction::ModelPicker);
     assert!(app.has_blocking_modal());
     app.last_input = Some(Instant::now());
-    let mut demand = bash_perm_demand("perm");
+    let mut demand = bash_perm_demand();
     demand.blocked_by_modal = true;
     assert!(app.begin_input_demand(demand));
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -13414,7 +13348,7 @@ fn permission_promotes_on_modal_close() {
 fn permission_immediate_when_idle() {
     let mut app = test_app();
     app.last_input = None;
-    let defer = app.begin_input_demand(bash_perm_demand("perm"));
+    let defer = app.begin_input_demand(bash_perm_demand());
     assert!(!defer, "idle demand activates immediately");
     assert!(app.input_queue.is_empty());
     assert!(app.permission_active());
@@ -13429,10 +13363,9 @@ fn permission_immediate_when_idle() {
 fn permission_drawn_on_top_of_model_picker() {
     let mut app = app_with_tall_model_picker();
     app.permission_prompt.open(
-        "perm".into(),
         makima_config::ToolKey::native(PERM_TOOL),
         vec![PERM_SCOPE.into()],
-        None,
+        false,
     );
     app.active_input = Some(InputKind::Permission);
     assert!(app.permission_active());
@@ -13475,7 +13408,7 @@ fn permission_hidden_while_deferred() {
     let mut app = test_app();
     let (_msg, _bottom, _status, baseline_input, _splits) = app.layout_geometry(RENDER_AREA);
     app.last_input = Some(Instant::now());
-    app.begin_input_demand(bash_perm_demand("perm"));
+    app.begin_input_demand(bash_perm_demand());
     let text = rendered(&mut app);
     assert!(
         !text.contains("Permission Required"),
@@ -13623,7 +13556,8 @@ fn question_drawn_on_top_when_active() {
 fn bell_deferred_until_idle_promotion() {
     let mut app = streaming_app();
     app.last_input = Some(Instant::now());
-    let actions = app.update(agent_msg(permission_request_event()));
+    let answer = register_root_answer(&mut app);
+    let actions = app.update(agent_msg(permission_request_event(answer.key())));
     assert!(
         actions.iter().all(|a| !matches!(a, Action::Bell)),
         "no Action::Bell on arrival while deferred"
@@ -13646,7 +13580,8 @@ fn bell_deferred_until_modal_close_promotion() {
     app.last_input = Some(Instant::now());
     app.status = Status::Streaming;
     app.run_id = 1;
-    let actions = app.update(agent_msg(permission_request_event()));
+    let answer = register_root_answer(&mut app);
+    let actions = app.update(agent_msg(permission_request_event(answer.key())));
     assert!(
         actions.iter().all(|a| !matches!(a, Action::Bell)),
         "no Action::Bell on arrival behind a modal"
@@ -13733,7 +13668,7 @@ fn non_input_window_not_deferred() {
 fn second_demand_enqueues_not_zombie() {
     let mut app = test_app();
     app.last_input = Some(Instant::now());
-    app.begin_input_demand(bash_perm_demand("p1"));
+    app.begin_input_demand(bash_perm_demand());
     let (active, _event_rx, _cmd_tx) = open_question_win(&mut app, true);
     assert!(!active, "second demand queues while the first is queued");
     assert_eq!(app.input_queue.len(), 2);
@@ -13771,7 +13706,7 @@ fn second_demand_enqueues_not_zombie() {
 fn queued_permission_no_overlay_side_effects() {
     let mut app = test_app();
     app.last_input = Some(Instant::now());
-    app.begin_input_demand(bash_perm_demand("p"));
+    app.begin_input_demand(bash_perm_demand());
     assert!(
         !app.any_overlay_open(),
         "queued prompt does not count as an overlay"
@@ -13818,7 +13753,7 @@ fn alt_m_defers_active_permission_until_submit() {
     let mut app = test_app();
     app.last_input = None;
     assert!(
-        !app.begin_input_demand(bash_perm_demand("perm")),
+        !app.begin_input_demand(bash_perm_demand()),
         "idle demand activates immediately"
     );
     assert!(app.permission_active());
@@ -13891,7 +13826,7 @@ fn alt_m_defers_active_question_until_submit() {
 fn alt_m_toggles_back_to_the_held_permission() {
     let mut app = test_app();
     app.last_input = None;
-    assert!(!app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(!app.begin_input_demand(bash_perm_demand()));
     assert!(app.permission_active());
 
     app.update(Msg::Key(alt_m()));
@@ -13914,7 +13849,7 @@ fn alt_m_toggle_ignores_auto_deferred_head() {
     // timer; Alt+M must not force it, nor reach past FIFO order.
     let mut app = test_app();
     app.last_input = Some(Instant::now());
-    assert!(app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(app.begin_input_demand(bash_perm_demand()));
     assert!(!app.held_input_pending());
 
     app.update(Msg::Key(alt_m()));
@@ -13935,7 +13870,7 @@ fn defer_hint_pins_above_status_bar_until_restored() {
 
     let mut app = test_app();
     app.last_input = None;
-    assert!(!app.begin_input_demand(bash_perm_demand("perm")));
+    assert!(!app.begin_input_demand(bash_perm_demand()));
     let baseline = rendered_area(&mut app);
     assert!(
         !hint_row(&baseline).contains("Undefer"),
@@ -14113,7 +14048,7 @@ fn background_calls_nest_under_their_agent() {
     let child = AgentId::generate();
     add_picker_agent(&mut app, child, root, CHILD);
     for (index, command) in COMMANDS.into_iter().enumerate() {
-        let mut info = subagent_info_for_agent(child, CHILD, CHILD, None, None);
+        let mut info = subagent_info_for_agent(child, CHILD, CHILD);
         info.parent_agent_id = Some(root);
         app.update(Msg::Agent(Box::new(Envelope {
             event: AgentEvent::ToolMoved {

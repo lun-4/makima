@@ -179,6 +179,7 @@ use futures_lite::FutureExt;
 use makima_providers::{Message, TokenUsage};
 use tracing::info;
 
+use crate::agent::isolated_turn::{IsolatedPrompt, IsolatedSnapshot, IsolatedTurnError};
 use crate::agent::{TurnAdmissionSnapshot, resolve_prompt_inputs};
 use crate::cancel::{CancelToken, PublicationGuard, ReasonedCancelToken, ReasonedCancelTrigger};
 use crate::context::ContextPolicy;
@@ -256,6 +257,7 @@ pub(crate) struct ActorInner {
     retained_tickets: Mutex<HashMap<TurnId, TurnTicket>>,
     latest_admitted: Mutex<Option<TurnId>>,
     history: SharedMessages,
+    isolated_prompt: Option<IsolatedPrompt>,
     coverage: Mutex<HashMap<TurnId, Option<(u64, usize)>>>,
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     pub(crate) journal: Option<Arc<SessionJournal>>,
@@ -1965,6 +1967,7 @@ impl AgentActorHandle {
             retained_tickets: Mutex::new(HashMap::new()),
             latest_admitted: Mutex::new(None),
             history: mirror,
+            isolated_prompt: backend.isolated_prompt(),
             coverage: Mutex::new(HashMap::new()),
             completion_policy: if managed_admission
                 .as_ref()
@@ -2247,6 +2250,29 @@ impl AgentActorHandle {
                 .parent_delivery_policy
                 .as_ref()
                 .is_some_and(|policy| policy.auto_deliver)
+    }
+
+    pub(crate) fn isolated_snapshot(&self) -> Result<IsolatedSnapshot, IsolatedTurnError> {
+        let state = self.inner.state.lock_unpoisoned();
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(lifecycle_error(state.lifecycle).into());
+        }
+        let config = state.policy.clone().ok_or(IsolatedTurnError::NoConfig)?;
+        Ok(IsolatedSnapshot {
+            config,
+            history: self.inner.history.load_full(),
+            prompt: self.inner.isolated_prompt.clone(),
+        })
+    }
+
+    pub(crate) async fn wait_closed(&self) {
+        loop {
+            let changed = self.inner.policy_changed.listen();
+            if self.lifecycle() != ActorLifecycle::Open {
+                return;
+            }
+            changed.await;
+        }
     }
 
     pub(crate) fn lifecycle(&self) -> ActorLifecycle {

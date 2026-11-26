@@ -25,7 +25,8 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use makima_agent::agent::PromptSlotSource;
-use makima_agent::cancel::{CancelToken, CancelTrigger};
+use makima_agent::agent::isolated_turn::collect_answer;
+use makima_agent::cancel::{CancelScope, CancelToken, CancelTrigger, SessionCancellation};
 use makima_agent::command::{
     CustomCommand, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
 };
@@ -35,10 +36,8 @@ use makima_agent::headless::{
     InteractiveParams, RootSubmission, WorkCancel,
 };
 use makima_agent::mcp;
-use makima_agent::permissions::{
-    PermissionAnswer, PermissionManager, PluginRuleStore, TaggedAnswer,
-};
-use makima_agent::session::{SessionEvent, SessionSubscription};
+use makima_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
+use makima_agent::session::{AnswerKey, AnswerRouter, SessionEvent, SessionSubscription};
 use makima_agent::session_coordinator::{SessionCoordinatorHandle, SessionReadHandle};
 use makima_agent::session_defaults;
 use makima_agent::session_options::{
@@ -110,7 +109,7 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
 ];
 
 /// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
-/// (message.id, assistant message.id).
+/// (message.id, assistant message.id, control request IDs).
 #[allow(clippy::disallowed_methods)]
 fn wire_uuid() -> String {
     uuid::Uuid::now_v7().to_string()
@@ -561,9 +560,10 @@ pub struct SdkParams {
 
 struct Shared {
     turn_start: Instant,
-    pending: HashMap<String, (String, Sender<String>)>,
-    /// One local operation or the turns carrying SDK user messages.
+    pending: HashMap<String, AnswerKey>,
+    /// The turns carrying SDK user messages.
     work: Vec<WorkCancel>,
+    local: Option<(LocalOperation, WorkCancel)>,
     /// A restored admission cancelled before it starts may not emit a wire result.
     restored_work: Vec<WorkCancel>,
     /// Counts the local operations begun, so one that ends after an
@@ -585,17 +585,28 @@ struct Shared {
     dispatch_end: (Sender<DispatchEnd>, Receiver<DispatchEnd>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalOperation {
+    Compaction,
+    Isolated,
+}
+
 struct DispatchEnd {
     completed: bool,
     reported: Sender<()>,
 }
 
 impl Shared {
+    fn idle(&self) -> bool {
+        self.work.is_empty() && self.local.is_none()
+    }
+
     fn new() -> Self {
         Self {
             turn_start: Instant::now(),
             pending: HashMap::new(),
             work: Vec::new(),
+            local: None,
             restored_work: Vec::new(),
             operation: 0,
             input_closed: false,
@@ -991,7 +1002,9 @@ impl SdkRuntime {
                     .keys()
                     .filter_map(|&id| actor.turn_ticket(id))
                     .filter(|ticket| ticket.peek().is_none())
-                    .map(|ticket| handle.input_tx.turn_cancel(ticket))
+                    .map(|ticket| {
+                        WorkCancel::Scope(CancelScope::Turn(ticket), handle.cancellation.clone())
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -1082,13 +1095,12 @@ impl SdkRuntime {
             shared: Arc::clone(&self.shared),
             read: self.coordinator.read(),
             permissions: Arc::clone(&self.handle.permissions),
-            answer_tx: self.handle.answer_tx.clone(),
+            answers: self.handle.answers.clone(),
             include_partial_messages: params.cli.include_partial_messages,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
             cost: None,
-            request_counter: 0,
             terminal_run_id: None,
         }
         .spawn(self.handle.events.subscribe());
@@ -1112,6 +1124,7 @@ impl SdkRuntime {
             root: self.root.clone(),
             commands: Arc::clone(&self.commands),
             input_tx: self.handle.input_tx.clone(),
+            cancellation: self.handle.cancellation.clone(),
             control_tx: self.handle.control_tx.clone(),
             writer: self.writer.clone(),
             shared: Arc::clone(&self.shared),
@@ -1202,6 +1215,9 @@ impl SdkSession {
             return Err(CommandError::StaleTarget);
         }
         let active_work = || {
+            if old.shared.lock_unpoisoned().local.is_some() {
+                return true;
+            }
             old.handle.manager.snapshot().iter().any(|node| {
                 node.actor
                     .as_ref()
@@ -1382,6 +1398,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let dispatched = smol::block_on(finish_in_flight(
         &ending.shared,
         &ending.handle.manager,
+        &ending.handle.answers,
         dispatcher,
     ));
     drop(ending);
@@ -1389,6 +1406,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let finished = smol::block_on(finish_in_flight(
         &runtime.shared,
         &runtime.handle.manager,
+        &runtime.handle.answers,
         async { Ok(()) },
     ));
     session.params.lua_handle.clear_orchestration_services();
@@ -1454,10 +1472,12 @@ fn handle_sdk_message(
             };
             let data = cr.response;
             if let Some(req_id) = data.get("request_id").and_then(Value::as_str)
-                && let Some((ask_id, answer_tx)) = shared.lock_unpoisoned().pending.remove(req_id)
+                && let Some(ask) = shared.lock_unpoisoned().pending.remove(req_id)
             {
-                let _ = answer_tx
-                    .send(TaggedAnswer::new(ask_id, decode_permission_response(&data)).encode());
+                let _ = runtime
+                    .handle
+                    .answers
+                    .answer(ask, decode_permission_response(&data).encode());
             }
         }
         InboundMessageType::ControlCancelRequest => {
@@ -1466,10 +1486,11 @@ fn handle_sdk_message(
             else {
                 return Ok(true);
             };
-            if let Some((ask_id, answer_tx)) =
-                shared.lock_unpoisoned().pending.remove(&ccr.request_id)
-            {
-                let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
+            if let Some(ask) = shared.lock_unpoisoned().pending.remove(&ccr.request_id) {
+                let _ = runtime
+                    .handle
+                    .answers
+                    .answer(ask, PermissionAnswer::Deny.encode());
             }
         }
         InboundMessageType::Unknown(message_type) => {
@@ -1488,6 +1509,7 @@ struct UserDispatch {
     root: TrustedTarget,
     commands: Arc<SdkCommands>,
     input_tx: InteractiveInputSender,
+    cancellation: SessionCancellation,
     control_tx: InteractiveControlSender,
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
@@ -1500,6 +1522,7 @@ impl UserDispatch {
             root,
             commands,
             input_tx,
+            cancellation,
             control_tx,
             writer,
             shared,
@@ -1539,27 +1562,34 @@ impl UserDispatch {
             }
             InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
                 let images = command_attachments::into_images(&turn.content.attachments)?;
-                let control = control_tx.clone();
-                spawn_sdk_operation(writer, shared, move |cancel| async move {
-                    control
-                        .ask_isolated_to(
-                            pinned.actor()?,
-                            turn.content.text.to_string(),
-                            images,
-                            cancel,
-                        )
-                        .await
-                })?;
+                spawn_sdk_operation(
+                    writer,
+                    shared,
+                    LocalOperation::Isolated,
+                    move |cancel| async move {
+                        pinned.validate()?;
+                        let events = pinned
+                            .target
+                            .ask_isolated(turn.content.text.to_string(), images, cancel)
+                            .map_err(|error| error.to_string())?;
+                        collect_answer(events).await
+                    },
+                )?;
                 return Ok(true);
             }
             InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
                 let control = control_tx.clone();
-                spawn_sdk_operation(writer, shared, move |cancel| async move {
-                    control
-                        .compact_to(pinned.actor()?, instructions, cancel)
-                        .await
-                        .map(|()| String::new())
-                })?;
+                spawn_sdk_operation(
+                    writer,
+                    shared,
+                    LocalOperation::Compaction,
+                    move |cancel| async move {
+                        control
+                            .compact_to(pinned.actor()?, instructions, cancel)
+                            .await
+                            .map(|()| String::new())
+                    },
+                )?;
                 return Ok(true);
             }
             InputDispatch::Dispatched(CommandOutcome::Failed(error)) => {
@@ -1570,7 +1600,7 @@ impl UserDispatch {
         let admitted = pinned.actor().and_then(|actor| {
             admit_sdk_submission(
                 shared,
-                input_tx,
+                cancellation,
                 input_tx.admitter().for_actor(actor),
                 input,
             )
@@ -1677,13 +1707,14 @@ fn set_permission_mode(
 fn spawn_sdk_operation<F>(
     writer: &SdkWriter,
     shared: &Arc<Mutex<Shared>>,
+    kind: LocalOperation,
     operation: impl FnOnce(CancelToken) -> F + Send + 'static,
 ) -> Result<()>
 where
     F: Future<Output = Result<String, String>> + Send + 'static,
 {
     let (trigger, cancel) = CancelToken::new();
-    let begun = match begin_sdk_operation(shared, trigger) {
+    let begun = match begin_sdk_operation(shared, kind, trigger) {
         Ok(begun) => begun,
         Err(error) => return emit_command_result(writer, shared, true, error.into()),
     };
@@ -1691,7 +1722,6 @@ where
     let shared = Arc::clone(shared);
     smol::spawn(async move {
         let result = operation(cancel).await;
-        end_sdk_operation(&shared, begun);
         let (is_error, text) = match result {
             Ok(text) => (false, text),
             Err(error) => (true, error),
@@ -1699,6 +1729,7 @@ where
         if let Err(error) = emit_command_result(&writer, &shared, is_error, text) {
             warn!(%error, "failed to report SDK command result");
         }
+        end_sdk_operation(&shared, begun);
     })
     .detach();
     Ok(())
@@ -1933,23 +1964,26 @@ type ModeSetter<'a> = dyn Fn(&str) -> Result<(), ConfigChangeError> + 'a;
 #[cfg(test)]
 async fn admit_sdk_turn(
     shared: &Mutex<Shared>,
-    input_tx: &InteractiveInputSender,
+    handle: &InteractiveHandle,
     input: AgentInput,
 ) -> Result<bool, String> {
-    let Ok(submission) = input_tx.admitter().ready().await else {
+    let Ok(submission) = handle.input_tx.admitter().ready().await else {
         return Ok(false);
     };
-    admit_sdk_submission(shared, input_tx, submission, input)
+    admit_sdk_submission(shared, &handle.cancellation, submission, input)
 }
 
 fn admit_sdk_submission(
     shared: &Mutex<Shared>,
-    input_tx: &InteractiveInputSender,
+    cancellation: &SessionCancellation,
     submission: RootSubmission,
     input: AgentInput,
 ) -> Result<bool, String> {
     let mut shared = shared.lock_unpoisoned();
-    check_sdk_work(&shared, |work| work.turn_id().is_none())?;
+    check_sdk_work(
+        &shared,
+        matches!(shared.local, Some((LocalOperation::Compaction, _))),
+    )?;
     let ticket = match submission.submit(input) {
         Ok((ticket, _)) => ticket,
         Err(error) if error.is_closed() => return Ok(false),
@@ -1960,17 +1994,25 @@ fn admit_sdk_submission(
         shared
             .restored_work
             .retain(|work| work.turn_id() != turn_id);
-        shared.work.push(input_tx.turn_cancel(ticket));
+        shared.work.push(WorkCancel::Scope(
+            CancelScope::Turn(ticket),
+            cancellation.clone(),
+        ));
     }
     Ok(true)
 }
 
-/// Starts a local operation as the SDK's only work in flight and returns
-/// its number.
-fn begin_sdk_operation(shared: &Mutex<Shared>, cancel: CancelTrigger) -> Result<u64, &'static str> {
+fn begin_sdk_operation(
+    shared: &Mutex<Shared>,
+    kind: LocalOperation,
+    cancel: CancelTrigger,
+) -> Result<u64, &'static str> {
     let mut shared = shared.lock_unpoisoned();
-    check_sdk_work(&shared, |_| true)?;
-    shared.work.push(WorkCancel::Control(cancel));
+    check_sdk_work(
+        &shared,
+        shared.local.is_some() || (kind == LocalOperation::Compaction && !shared.work.is_empty()),
+    )?;
+    shared.local = Some((kind, WorkCancel::Control(cancel)));
     shared.operation += 1;
     Ok(shared.operation)
 }
@@ -1980,18 +2022,18 @@ fn begin_sdk_operation(shared: &Mutex<Shared>, cancel: CancelTrigger) -> Result<
 fn end_sdk_operation(shared: &Mutex<Shared>, operation: u64) {
     let mut shared = shared.lock_unpoisoned();
     if shared.operation == operation {
-        shared.work.retain(|work| work.turn_id().is_some());
+        shared.local.take();
     }
-    if shared.work.is_empty() {
+    if shared.idle() {
         shared.idle.notify(usize::MAX);
     }
 }
 
-fn check_sdk_work(shared: &Shared, conflicts: fn(&WorkCancel) -> bool) -> Result<(), &'static str> {
+fn check_sdk_work(shared: &Shared, conflicts: bool) -> Result<(), &'static str> {
     if shared.output_closed {
         return Err(OUTPUT_CLOSED);
     }
-    if shared.work.iter().any(conflicts) {
+    if conflicts {
         return Err(WORK_ACTIVE);
     }
     Ok(())
@@ -2000,7 +2042,12 @@ fn check_sdk_work(shared: &Shared, conflicts: fn(&WorkCancel) -> bool) -> Result
 fn end_sdk_work(shared: &Mutex<Shared>) {
     let mut shared = shared.lock_unpoisoned();
     shared.work.clear();
-    shared.idle.notify(usize::MAX);
+    if matches!(shared.local, Some((LocalOperation::Compaction, _))) {
+        shared.local.take();
+    }
+    if shared.idle() {
+        shared.idle.notify(usize::MAX);
+    }
 }
 
 /// Returns whether {turn_id}'s result waits for the dispatch in flight.
@@ -2011,7 +2058,7 @@ fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
     shared
         .restored_work
         .retain(|work| work.turn_id() != Some(turn_id));
-    if shared.work.is_empty() {
+    if shared.idle() {
         shared.idle.notify(usize::MAX);
     }
     shared.dispatching && shared.work.len() == tracked
@@ -2019,14 +2066,15 @@ fn finish_sdk_turn(shared: &Mutex<Shared>, turn_id: TurnId) -> bool {
 
 /// Cancels the captured SDK work and restored root admissions.
 fn cancel_sdk_work(shared: &Mutex<Shared>) {
-    let (work, restored_work) = {
+    let (work, restored_work, local) = {
         let mut shared = shared.lock_unpoisoned();
         (
             mem::take(&mut shared.work),
             mem::take(&mut shared.restored_work),
+            shared.local.take().map(|(_, work)| work),
         )
     };
-    for work in work.into_iter().chain(restored_work) {
+    for work in work.into_iter().chain(restored_work).chain(local) {
         work.cancel();
     }
     shared.lock_unpoisoned().idle.notify(usize::MAX);
@@ -2069,6 +2117,7 @@ fn close_output(shared: &Mutex<Shared>) {
 async fn finish_in_flight(
     shared: &Mutex<Shared>,
     graph: &AgentManagerHandle,
+    answers: &AnswerRouter,
     dispatched: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let unanswered = {
@@ -2076,8 +2125,8 @@ async fn finish_in_flight(
         shared.input_closed = true;
         mem::take(&mut shared.pending)
     };
-    for (ask_id, answer_tx) in unanswered.into_values() {
-        let _ = answer_tx.send(TaggedAnswer::new(ask_id, PermissionAnswer::Deny).encode());
+    for ask in unanswered.into_values() {
+        let _ = answers.answer(ask, PermissionAnswer::Deny.encode());
     }
     let until = |done: fn(&Shared) -> bool| async move {
         loop {
@@ -2096,7 +2145,7 @@ async fn finish_in_flight(
         Ok(())
     })
     .await;
-    until(|shared| shared.work.is_empty()).await;
+    until(Shared::idle).await;
     smol::future::or(graph.wait_settled(), until(|shared| shared.output_closed)).await;
     dispatched
 }
@@ -2222,7 +2271,7 @@ struct EventPump {
     shared: Arc<Mutex<Shared>>,
     read: SessionReadHandle,
     permissions: Arc<PermissionManager>,
-    answer_tx: Sender<String>,
+    answers: AnswerRouter,
     include_partial_messages: bool,
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
@@ -2230,7 +2279,6 @@ struct EventPump {
     /// Summed as the turns land: rates move mid-prompt, and only a turn knows
     /// the rate it paid.
     cost: Option<f64>,
-    request_counter: u64,
     terminal_run_id: Option<u64>,
 }
 
@@ -2318,7 +2366,6 @@ impl EventPump {
         self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock_unpoisoned().pending.clear();
     }
 
     /// Emits a turn's result, or holds it for the dispatch in flight.
@@ -2417,7 +2464,7 @@ impl EventPump {
             | AgentEvent::QueueSettled
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
-            | AgentEvent::AuthRequired
+            | AgentEvent::AuthRequired { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::SubagentClosed
             | AgentEvent::Post(_)
@@ -2473,19 +2520,11 @@ impl EventPump {
                     parent_tool_use_id,
                 }))?;
             }
-            AgentEvent::PermissionRequest { id, tool, .. } => {
-                let answer_tx = if let Some(subagent) = &envelope.subagent {
-                    let Some(answer_tx) = &subagent.answer_tx else {
-                        warn!(agent_id = %subagent.agent_id, "subagent permission request has no answer channel");
-                        return Ok(());
-                    };
-                    answer_tx.clone()
-                } else {
-                    self.answer_tx.clone()
-                };
+            AgentEvent::PermissionRequest { ask, id, tool, .. } => {
                 if self.permissions.is_yolo() {
-                    let _ = answer_tx
-                        .send(TaggedAnswer::new(id, PermissionAnswer::AllowSession).encode());
+                    let _ = self
+                        .answers
+                        .answer(ask.clone(), PermissionAnswer::AllowSession.encode());
                     return Ok(());
                 }
 
@@ -2495,19 +2534,17 @@ impl EventPump {
                     .cloned()
                     .unwrap_or_else(|| (tool.to_string(), Value::Null));
 
-                self.request_counter += 1;
-                let req_id = format!("req_{}", self.request_counter);
+                let req_id = wire_uuid();
                 {
                     let mut shared = self.shared.lock_unpoisoned();
                     if shared.input_closed {
                         drop(shared);
-                        let _ =
-                            answer_tx.send(TaggedAnswer::new(id, PermissionAnswer::Deny).encode());
+                        let _ = self
+                            .answers
+                            .answer(ask.clone(), PermissionAnswer::Deny.encode());
                         return Ok(());
                     }
-                    shared
-                        .pending
-                        .insert(req_id.clone(), (id.clone(), answer_tx));
+                    shared.pending.insert(req_id.clone(), ask.clone());
                 }
 
                 self.writer
@@ -2521,8 +2558,14 @@ impl EventPump {
                         },
                     }))?;
             }
-            AgentEvent::TurnOutcome(_) if envelope.subagent.is_some() => {}
             AgentEvent::TurnOutcome(outcome) => {
+                self.shared
+                    .lock_unpoisoned()
+                    .pending
+                    .retain(|_, ask| ask.agent_id() != outcome.agent_id());
+                if envelope.subagent.is_some() {
+                    return Ok(());
+                }
                 let hold = finish_sdk_turn(&self.shared, outcome.turn_id());
                 self.terminal_run_id = envelope.presentation();
                 let result = mem::take(&mut self.result_text);
@@ -2717,6 +2760,56 @@ mod tests {
             session_options: Default::default(),
             lua_handle: makima_lua::EventHandle::disconnected_for_test(),
         }
+    }
+
+    #[test]
+    fn sdk_responses_and_cancels_route_to_distinct_asks() {
+        const ROOT_REQUEST: &str = "root_request";
+        const CHILD_REQUEST: &str = "child_request";
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_path_buf();
+        let (out_tx, _out_rx) = flume::unbounded();
+        let session = SdkSession::new(
+            reset_sdk_params(cwd.clone()),
+            StateDir::from_path(cwd),
+            out_tx,
+        )
+        .unwrap();
+        let runtime = session.current();
+        let root = runtime.handle.answers.register(runtime.root.target.id());
+        let child = runtime.handle.answers.register(AgentId::generate());
+        runtime.shared.lock_unpoisoned().pending.extend([
+            (ROOT_REQUEST.into(), root.key()),
+            (CHILD_REQUEST.into(), child.key()),
+        ]);
+        let (user_tx, _user_rx) = flume::unbounded();
+        let send = |message| {
+            assert!(
+                handle_sdk_message(&session, &user_tx, serde_json::from_value(message).unwrap())
+                    .unwrap()
+            );
+        };
+        send(serde_json::json!({
+            "type": "control_cancel_request",
+            "request_id": CHILD_REQUEST,
+        }));
+        assert_eq!(child.try_recv().unwrap(), PermissionAnswer::Deny.encode());
+        assert!(root.is_empty());
+        send(serde_json::json!({
+            "type": "control_response",
+            "response": {"request_id": CHILD_REQUEST, "behavior": "allow"},
+        }));
+        assert!(root.is_empty());
+        send(serde_json::json!({
+            "type": "control_response",
+            "response": {"request_id": ROOT_REQUEST, "behavior": "allow"},
+        }));
+        assert_eq!(
+            root.try_recv().unwrap(),
+            PermissionAnswer::AllowOnce.encode()
+        );
+        assert!(runtime.shared.lock_unpoisoned().pending.is_empty());
+        smol::block_on(runtime.close()).unwrap();
     }
 
     #[test_case(StateScope::Session, false; "fresh_session_scope")]
@@ -3858,13 +3951,12 @@ mod tests {
             shared: Arc::clone(&shared),
             read: coordinator.read(),
             permissions: Arc::clone(&handle.permissions),
-            answer_tx: handle.answer_tx.clone(),
+            answers: handle.answers.clone(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
             cost: None,
-            request_counter: 0,
             terminal_run_id: None,
         }
         .spawn(handle.events.subscribe());
@@ -3885,7 +3977,7 @@ mod tests {
         fn admit(&self) {
             let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
             assert_eq!(
-                smol::block_on(admit_sdk_turn(&self.shared, &self.handle.input_tx, input)),
+                smol::block_on(admit_sdk_turn(&self.shared, &self.handle, input)),
                 Ok(true)
             );
             self.entering.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
@@ -3907,6 +3999,7 @@ mod tests {
             let mut finishing = Box::pin(finish_in_flight(
                 &self.shared,
                 &self.handle.manager,
+                &self.handle.answers,
                 async { Ok(()) },
             ));
             assert!(
@@ -3950,22 +4043,20 @@ mod tests {
     /// left open is denied, since no answer can arrive any more.
     #[test]
     fn input_end_finishes_in_flight_turn_then_exits() {
-        const ASK_ID: &str = "open ask";
+        const REQUEST_ID: &str = "open ask";
         let session = pending_sdk_session();
-        let (answer_tx, answer_rx) = flume::unbounded();
+        let root = smol::block_on(session.handle.initialized_root()).unwrap();
+        let pending = session.handle.answers.register(root.id());
         session
             .shared
             .lock_unpoisoned()
             .pending
-            .insert(ASK_ID.into(), (ASK_ID.into(), answer_tx));
+            .insert(REQUEST_ID.into(), pending.key());
         let results = session.end_input();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["is_error"], false);
         assert_eq!(results[0]["result"], SDK_GATED_REPLY);
-        assert_eq!(
-            answer_rx.try_recv().unwrap(),
-            TaggedAnswer::new(ASK_ID, PermissionAnswer::Deny).encode()
-        );
+        assert_eq!(pending.try_recv().unwrap(), PermissionAnswer::Deny.encode());
     }
 
     /// The parent died mid-turn: stdout broke and the pump stopped before the
@@ -3989,12 +4080,13 @@ mod tests {
             input_tx,
             task,
             manager,
+            answers,
             ..
         } = handle;
         smol::block_on(futures_lite::future::or(
             async {
                 pump.await;
-                finish_in_flight(&shared, &manager, async {
+                finish_in_flight(&shared, &manager, &answers, async {
                     if stuck {
                         std::future::pending::<()>().await;
                     }
@@ -4011,7 +4103,7 @@ mod tests {
             },
         ));
         assert_eq!(
-            begin_sdk_operation(&shared, local_work()),
+            begin_sdk_operation(&shared, LocalOperation::Compaction, local_work()),
             Err(OUTPUT_CLOSED)
         );
         smol::block_on(coordinator.close()).unwrap();
@@ -4271,6 +4363,77 @@ mod tests {
     }
 
     #[test]
+    fn isolated_question_runs_during_primary_and_interrupt_cancels_both() {
+        const QUESTION: &str = "/btw explain this";
+        const INTERRUPT_ID: &str = "stop-primary-and-question";
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_path_buf();
+        let (entered, requests) = flume::unbounded();
+        let (_release, released) = flume::unbounded();
+        let (out_tx, out_rx) = flume::unbounded();
+        let mut params = reset_sdk_params(cwd.clone());
+        params.providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+            id: RESET_PROVIDER.into(),
+            display_name: RESET_PROVIDER.into(),
+            models: vec![ModelInfo::id_only(params.model.id.clone())],
+            backend: Arc::new(GatedSdkBackend(Arc::new(GatedProvider {
+                entered,
+                release: released,
+            }))),
+            auth: Default::default(),
+            docs: None,
+        }]));
+        let session = SdkSession::new(params, StateDir::from_path(cwd), out_tx).unwrap();
+        let (user_tx, dispatcher) = session.spawn_dispatcher();
+        let send = |message| {
+            assert!(
+                handle_sdk_message(&session, &user_tx, serde_json::from_value(message).unwrap())
+                    .unwrap()
+            );
+        };
+        let user =
+            |content| send(serde_json::json!({"type": "user", "message": {"content": content}}));
+        let read = || -> Value {
+            serde_json::from_str(&out_rx.recv_timeout(SDK_GATE_TIMEOUT).unwrap()).unwrap()
+        };
+        user(SDK_ROOT_PROMPT);
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        user(QUESTION);
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        user(QUESTION);
+        let rejection = loop {
+            let message = read();
+            if message["type"] == "result" {
+                break message;
+            }
+        };
+        assert_eq!(rejection["result"], WORK_ACTIVE);
+
+        send(serde_json::json!({
+            "type": "control_request",
+            "request_id": INTERRUPT_ID,
+            "request": {"subtype": "interrupt"},
+        }));
+        let mut cancelled = Vec::new();
+        while cancelled.len() < 2 {
+            let message = read();
+            if message["type"] == "result" {
+                assert_eq!(message["is_error"], true);
+                cancelled.push(message);
+            }
+        }
+        assert!(
+            cancelled
+                .iter()
+                .any(|message| message["result"] == "operation cancelled")
+        );
+        assert!(session.current().shared.lock_unpoisoned().idle());
+        drop(user_tx);
+        smol::block_on(dispatcher).unwrap();
+        smol::block_on(session.current().close()).unwrap();
+    }
+
+    #[test]
     fn interrupt_cancels_only_the_admitted_turn() {
         let session = pending_sdk_session();
         cancel_sdk_work(&session.shared);
@@ -4291,11 +4454,7 @@ mod tests {
         let running = tracked_turns(&session.shared);
         let input = AgentInput::new(FOLLOW_UP.into(), Vec::new());
         assert_eq!(
-            smol::block_on(admit_sdk_turn(
-                &session.shared,
-                &session.handle.input_tx,
-                input
-            )),
+            smol::block_on(admit_sdk_turn(&session.shared, &session.handle, input)),
             Ok(true)
         );
         assert_eq!(tracked_turns(&session.shared), running);
@@ -4316,11 +4475,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            smol::block_on(admit_sdk_turn(
-                &session.shared,
-                &session.handle.input_tx,
-                input
-            )),
+            smol::block_on(admit_sdk_turn(&session.shared, &session.handle, input)),
             Err(makima_agent::ActorError::InstructionOverflow.to_string())
         );
         let results = session.end_input();
@@ -4331,10 +4486,13 @@ mod tests {
     #[test]
     fn local_operations_run_one_at_a_time() {
         let shared = Mutex::new(Shared::new());
-        let first = begin_sdk_operation(&shared, local_work()).unwrap();
-        assert_eq!(begin_sdk_operation(&shared, local_work()), Err(WORK_ACTIVE));
+        let first = begin_sdk_operation(&shared, LocalOperation::Compaction, local_work()).unwrap();
+        assert_eq!(
+            begin_sdk_operation(&shared, LocalOperation::Compaction, local_work()),
+            Err(WORK_ACTIVE)
+        );
         end_sdk_operation(&shared, first);
-        assert!(begin_sdk_operation(&shared, local_work()).is_ok());
+        assert!(begin_sdk_operation(&shared, LocalOperation::Compaction, local_work()).is_ok());
     }
 
     /// An operation an interrupt dropped that ends late leaves the work
@@ -4342,16 +4500,17 @@ mod tests {
     #[test]
     fn late_operation_end_keeps_later_work() {
         let shared = Mutex::new(Shared::new());
-        let interrupted = begin_sdk_operation(&shared, local_work()).unwrap();
+        let interrupted =
+            begin_sdk_operation(&shared, LocalOperation::Compaction, local_work()).unwrap();
         cancel_sdk_work(&shared);
         let (trigger, later) = CancelToken::new();
-        let current = begin_sdk_operation(&shared, trigger).unwrap();
+        let current = begin_sdk_operation(&shared, LocalOperation::Compaction, trigger).unwrap();
         end_sdk_operation(&shared, interrupted);
-        assert_eq!(shared.lock_unpoisoned().work.len(), 1);
+        assert!(shared.lock_unpoisoned().local.is_some());
         cancel_sdk_work(&shared);
         assert!(later.is_cancelled());
         end_sdk_operation(&shared, current);
-        assert!(shared.lock_unpoisoned().work.is_empty());
+        assert!(shared.lock_unpoisoned().idle());
     }
 
     fn local_work() -> CancelTrigger {
@@ -5581,23 +5740,22 @@ mod tests {
             shared: Arc::clone(&shared),
             read: coordinator.read(),
             permissions: Arc::clone(&handle.permissions),
-            answer_tx: handle.answer_tx.clone(),
+            answers: handle.answers.clone(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
             cost: None,
-            request_counter: 0,
             terminal_run_id: None,
         }
         .spawn(handle.events.subscribe());
         let input = AgentInput::new(SDK_ROOT_PROMPT.into(), Vec::new());
         assert_eq!(
-            smol::block_on(admit_sdk_turn(&shared, &handle.input_tx, input)),
+            smol::block_on(admit_sdk_turn(&shared, &handle, input)),
             Ok(true)
         );
         let ticket = match &shared.lock_unpoisoned().work[..] {
-            [WorkCancel::Turn { ticket, .. }] => ticket.clone(),
+            [WorkCancel::Scope(CancelScope::Turn(ticket), _)] => ticket.clone(),
             _ => panic!("one SDK turn in flight"),
         };
         let permission = loop {
@@ -5609,14 +5767,12 @@ mod tests {
         };
         assert_eq!(permission["request"]["tool_name"], SDK_NESTED_TOOL);
         let request_id = permission["request_id"].as_str().unwrap();
-        let (ask_id, answer_tx) = shared.lock_unpoisoned().pending.remove(request_id).unwrap();
-        answer_tx
-            .send(
-                TaggedAnswer::new(
-                    ask_id,
-                    decode_permission_response(&serde_json::json!({ "behavior": "allow" })),
-                )
-                .encode(),
+        let ask = shared.lock_unpoisoned().pending.remove(request_id).unwrap();
+        handle
+            .answers
+            .answer(
+                ask,
+                decode_permission_response(&serde_json::json!({ "behavior": "allow" })).encode(),
             )
             .unwrap();
         grandchild_gate.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
@@ -6422,7 +6578,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let shared = Arc::new(Mutex::new(Shared::new()));
         let (trigger, cancel) = CancelToken::new();
-        begin_sdk_operation(&shared, trigger).unwrap();
+        begin_sdk_operation(&shared, LocalOperation::Compaction, trigger).unwrap();
         let mut pump = EventPump {
             writer: SdkWriter {
                 session_id: SessionRef::generate(),
@@ -6431,13 +6587,12 @@ mod tests {
             shared: Arc::clone(&shared),
             read: unbound_coordinator(MakimaId::generate()).read(),
             permissions: Arc::new(test_permissions()),
-            answer_tx: flume::unbounded().0,
+            answers: AnswerRouter::default(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
             cost: None,
-            request_counter: 0,
             terminal_run_id: None,
         };
         let outcome = || {
@@ -6459,7 +6614,6 @@ mod tests {
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             }),
             identity: None,
@@ -6467,7 +6621,7 @@ mod tests {
         .unwrap();
 
         assert!(!cancel.is_cancelled());
-        assert_eq!(shared.lock_unpoisoned().work.len(), 1);
+        assert!(shared.lock_unpoisoned().local.is_some());
         assert!(out_rx.is_empty());
         assert_eq!(pump.terminal_run_id, None);
 
@@ -6498,13 +6652,12 @@ mod tests {
             shared: Arc::new(Mutex::new(Shared::new())),
             read: unbound_coordinator(MakimaId::generate()).read(),
             permissions: Arc::new(test_permissions()),
-            answer_tx: flume::unbounded().0,
+            answers: AnswerRouter::default(),
             include_partial_messages: false,
             synth: StreamSynth::new(),
             tool_inputs: HashMap::new(),
             result_text: String::new(),
             cost: None,
-            request_counter: 0,
             terminal_run_id: None,
         };
         let agent_id = makima_agent::AgentId::generate();

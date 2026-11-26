@@ -17,8 +17,8 @@ use tracing::{info, warn};
 use crate::journal::{
     JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
 };
-use crate::types::{decode_ask_answer, encode_ask_answer};
-use crate::{AgentEvent, CancelToken, EventSender, Post, PostLevel};
+use crate::session::AnswerRouter;
+use crate::{AgentEvent, AgentId, CancelToken, EventSender, Post, PostLevel};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -199,38 +199,6 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
-    }
-}
-
-/// An answer together with the id of the ask it answers.
-///
-/// The name is what makes a late answer harmless. The answer channel is a
-/// queue with no receiver parked between turns, so an answer to a cancelled
-/// turn's ask can sit there until the next turn's first permission wait pops
-/// it. Untagged, that stale answer is applied to a different tool and scope,
-/// and an `allow_always_*` then installs a rule for something the user never
-/// saw. Tagged, the waiter can tell it apart and drop it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaggedAnswer {
-    pub request_id: String,
-    pub answer: PermissionAnswer,
-}
-
-impl TaggedAnswer {
-    pub fn new(request_id: impl Into<String>, answer: PermissionAnswer) -> Self {
-        Self {
-            request_id: request_id.into(),
-            answer,
-        }
-    }
-
-    pub fn encode(&self) -> String {
-        encode_ask_answer(&self.request_id, &self.answer.encode())
-    }
-
-    pub fn decode(raw: &str) -> Option<Self> {
-        let (request_id, answer) = decode_ask_answer(raw)?;
-        Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
 }
 
@@ -959,7 +927,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &crate::tools::PermissionScopes,
         event_tx: &EventSender,
-        user_response_rx: Option<&async_lock::Mutex<flume::Receiver<String>>>,
+        answer_scope: Option<(&AnswerRouter, AgentId)>,
         request_id: &str,
         cancel: &CancelToken,
         plan_path: Option<&Path>,
@@ -978,7 +946,7 @@ impl PermissionManager {
             None => PermissionError::new(&tool_string, &scope_display()),
         };
 
-        let (pt, ps, force_prompt) = match self.check_inner(
+        let (t2, s2) = match self.check_inner(
             tool,
             &scope_refs,
             &scopes.deny_scopes,
@@ -988,68 +956,27 @@ impl PermissionManager {
         ) {
             PermissionCheck::Allowed => return Ok(()),
             PermissionCheck::Denied => return Err(deny(None)),
-            PermissionCheck::NeedsPrompt {
-                tool,
-                scopes,
-                force_prompt,
-            } => (tool, scopes, force_prompt),
-        };
-
-        let Some(rx) = user_response_rx else {
-            warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
-            return Err(deny(None));
-        };
-
-        let guard = rx.lock().await;
-        let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match self.check_inner(
-            &pt,
-            &refs,
-            &scopes.deny_scopes,
-            force_prompt,
-            scopes.ignore_command_head_case,
-            plan_path,
-        ) {
-            PermissionCheck::Allowed => return Ok(()),
-            PermissionCheck::Denied => return Err(deny(None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
         };
 
-        let prompt_binding = self.session().binding.clone();
-        let _ = event_tx.send(AgentEvent::PermissionRequest {
-            id: request_id.to_owned(),
-            tool: t2.clone(),
-            scopes: s2.clone(),
-        });
-        // Only the answer naming this ask may be applied. Anything else is a
-        // leftover from a cancelled or reassigned ask, so it is dropped and the
-        // wait continues: consuming it would approve or deny this tool on a
-        // decision the user made about another one.
-        let answer = loop {
-            let response = cancel.race(guard.recv_async()).await;
-            match response {
-                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
-                    Some(tagged) if tagged.request_id == request_id => break tagged.answer,
-                    tagged => warn!(
-                        tool = %tool,
-                        scope = %scope_display(),
-                        request_id,
-                        answered = tagged.map(|t| t.request_id).unwrap_or_default(),
-                        "discarding a permission answer that does not name this request"
-                    ),
-                },
-                Ok(Err(_)) => {
-                    drop(guard);
-                    warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                    return Err(deny(None));
-                }
-                Err(_) => {
-                    drop(guard);
-                    return Err(deny(None));
-                }
-            }
+        let Some((answers, agent_id)) = answer_scope else {
+            warn!(tool = %tool, scope = %scope_display(), "no permission response route");
+            return Err(deny(None));
         };
-        drop(guard);
+        let pending = answers.register(agent_id);
+        let prompt_binding = self.session().binding.clone();
+        event_tx
+            .send(AgentEvent::PermissionRequest {
+                id: request_id.to_owned(),
+                ask: pending.key(),
+                tool: t2.clone(),
+                scopes: s2.clone(),
+            })
+            .map_err(|_| deny(None))?;
+        let answer = match cancel.race(pending.recv()).await {
+            Ok(Ok(raw)) => PermissionAnswer::decode(&raw).ok_or_else(|| deny(None))?,
+            _ => return Err(deny(None)),
+        };
         let journal = prompt_binding
             .as_ref()
             .map(|binding| Arc::clone(&binding.journal));
@@ -1311,8 +1238,14 @@ fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
+    use flume::Receiver;
+
     use super::*;
+    use crate::Envelope;
     use crate::journal::JournalChange;
+    use crate::session::AnswerKey;
     use makima_providers::{Message, TokenUsage};
     use makima_storage::id::AgentId;
     use makima_storage::session_state::StateChange;
@@ -2384,6 +2317,55 @@ mod tests {
         });
     }
 
+    async fn poll_permission_ask(pending: impl Future, events: &Receiver<Envelope>) -> AnswerKey {
+        assert!(futures_lite::future::poll_once(pending).await.is_none());
+        let AgentEvent::PermissionRequest { ask, .. } = events.try_recv().unwrap().event else {
+            panic!("expected permission request");
+        };
+        ask
+    }
+
+    #[test]
+    fn permission_asks_with_the_same_tool_id_keep_their_own_scope() {
+        const TOOL_ID: &str = "shared-tool-id";
+        const DENIED_SCOPE: &str = "git status";
+        const ALLOWED_SCOPE: &str = "cargo test";
+        smol::block_on(async {
+            let manager = default_mgr();
+            let answers = AnswerRouter::default();
+            let scope = Some((&answers, AgentId::generate()));
+            let tool = ToolKey::native(BASH_TOOL);
+            let denied = crate::tools::PermissionScopes::single(DENIED_SCOPE.into());
+            let allowed = crate::tools::PermissionScopes::single(ALLOWED_SCOPE.into());
+            let cancel = CancelToken::none();
+            let (tx, events) = flume::unbounded();
+            let tx = EventSender::new(tx);
+            let mut first =
+                Box::pin(manager.enforce(&tool, &denied, &tx, scope, TOOL_ID, &cancel, None));
+            let mut second =
+                Box::pin(manager.enforce(&tool, &allowed, &tx, scope, TOOL_ID, &cancel, None));
+            let first_ask = poll_permission_ask(first.as_mut(), &events).await;
+            let second_ask = poll_permission_ask(second.as_mut(), &events).await;
+
+            answers
+                .answer(second_ask, PermissionAnswer::AllowSession.encode())
+                .unwrap();
+            second.await.unwrap();
+            answers
+                .answer(first_ask, PermissionAnswer::Deny.encode())
+                .unwrap();
+            assert!(first.await.is_err());
+            assert!(matches!(
+                manager.check(&tool, ALLOWED_SCOPE, None),
+                PermissionCheck::Allowed
+            ));
+            assert!(matches!(
+                manager.check(&tool, DENIED_SCOPE, None),
+                PermissionCheck::NeedsPrompt { .. }
+            ));
+        });
+    }
+
     #[test]
     fn always_allow_config_failure_warns_and_keeps_session_grant() {
         const REQUEST: &str = "permission-test";
@@ -2396,27 +2378,25 @@ mod tests {
             let journal = Arc::new(SessionJournal::default());
             manager.bind_journal(Arc::clone(&journal), None).unwrap();
             let (event_tx, events) = flume::unbounded();
-            let (answers, receiver) = flume::unbounded();
-            answers
-                .send(TaggedAnswer::new(REQUEST, PermissionAnswer::AllowAlwaysProject).encode())
-                .unwrap();
+            let answers = AnswerRouter::default();
+            let event_tx = EventSender::new(event_tx);
             let tool = ToolKey::native(BASH_TOOL);
-            manager
-                .enforce(
-                    &tool,
-                    &crate::tools::PermissionScopes::single(SCOPE.into()),
-                    &EventSender::new(event_tx),
-                    Some(&async_lock::Mutex::new(receiver)),
-                    REQUEST,
-                    &CancelToken::none(),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                events.try_recv().unwrap().event,
-                AgentEvent::PermissionRequest { .. }
+            let scopes = crate::tools::PermissionScopes::single(SCOPE.into());
+            let cancel = CancelToken::none();
+            let mut pending = Box::pin(manager.enforce(
+                &tool,
+                &scopes,
+                &event_tx,
+                Some((&answers, AgentId::generate())),
+                REQUEST,
+                &cancel,
+                None,
             ));
+            let ask = poll_permission_ask(pending.as_mut(), &events).await;
+            answers
+                .answer(ask, PermissionAnswer::AllowAlwaysProject.encode())
+                .unwrap();
+            pending.await.unwrap();
             let AgentEvent::Post(post) = events.try_recv().unwrap().event else {
                 panic!("expected permission persistence warning");
             };
@@ -2441,8 +2421,7 @@ mod tests {
             manager.bind_journal(Arc::clone(&journal), None).unwrap();
             let (event_tx, events) = flume::unbounded();
             let event_tx = EventSender::new(event_tx);
-            let (answers, receiver) = flume::unbounded();
-            let receiver = async_lock::Mutex::new(receiver);
+            let answers = AnswerRouter::default();
             let tool = ToolKey::native(BASH_TOOL);
             let scopes = crate::tools::PermissionScopes::single("cargo test".into());
             let cancel = CancelToken::none();
@@ -2450,17 +2429,12 @@ mod tests {
                 &tool,
                 &scopes,
                 &event_tx,
-                Some(&receiver),
+                Some((&answers, AgentId::generate())),
                 "permission-test",
                 &cancel,
                 None,
             ));
-            assert!(
-                futures_lite::future::poll_once(pending.as_mut())
-                    .await
-                    .is_none()
-            );
-            assert!(!events.is_empty());
+            let ask = poll_permission_ask(pending.as_mut(), &events).await;
             let mut prepared = journal
                 .prepare(JournalCommit {
                     changes: vec![JournalChange {
@@ -2476,7 +2450,7 @@ mod tests {
                 .await
                 .unwrap();
             answers
-                .send(TaggedAnswer::new("permission-test", PermissionAnswer::AllowSession).encode())
+                .answer(ask, PermissionAnswer::AllowSession.encode())
                 .unwrap();
             assert!(
                 futures_lite::future::poll_once(pending.as_mut())
@@ -2510,25 +2484,19 @@ mod tests {
                 let (trigger, cancel) = CancelToken::new();
                 let (event_tx, events) = flume::unbounded();
                 let event_tx = EventSender::new(event_tx);
-                let (answers, receiver) = flume::unbounded();
-                let receiver = async_lock::Mutex::new(receiver);
+                let answers = AnswerRouter::default();
                 let tool = ToolKey::native(BASH_TOOL);
                 let scopes = crate::tools::PermissionScopes::single("cargo test".into());
                 let mut pending = Box::pin(manager.enforce(
                     &tool,
                     &scopes,
                     &event_tx,
-                    Some(&receiver),
+                    Some((&answers, agent)),
                     "permission-test",
                     &cancel,
                     None,
                 ));
-                assert!(
-                    futures_lite::future::poll_once(pending.as_mut())
-                        .await
-                        .is_none()
-                );
-                assert!(!events.is_empty());
+                let ask = poll_permission_ask(pending.as_mut(), &events).await;
                 match interruption {
                     0 => trigger.cancel(),
                     1 => journal.set_incarnation(agent, 2),
@@ -2540,9 +2508,7 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                answers
-                    .send(TaggedAnswer::new("permission-test", answer).encode())
-                    .unwrap();
+                answers.answer(ask, answer.encode()).unwrap();
                 assert!(pending.await.is_err());
                 assert!(manager.snapshot().rules.is_empty());
                 assert_eq!(journal.snapshot().revision, 0);
@@ -2605,22 +2571,6 @@ mod tests {
         let mgr = default_mgr();
         mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
         assert!(mgr.session_rules_snapshot().is_empty());
-    }
-
-    #[test_case(PermissionAnswer::AllowAlwaysLocal ; "allow")]
-    #[test_case(PermissionAnswer::Deny ; "deny")]
-    #[test_case(PermissionAnswer::DenyWithGuidance("no\u{1f}way".into()) ; "guidance_with_separator")]
-    fn tagged_answer_roundtrip(answer: PermissionAnswer) {
-        let tagged = TaggedAnswer::new("toolu_1", answer);
-        assert_eq!(TaggedAnswer::decode(&tagged.encode()), Some(tagged));
-    }
-
-    #[test_case("" ; "empty")]
-    #[test_case("allow" ; "untagged_answer")]
-    #[test_case("toolu_1" ; "id_only")]
-    #[test_case("{\"json\": true}" ; "elicitation_result")]
-    fn untagged_payloads_never_decode_to_an_answer(raw: &str) {
-        assert_eq!(TaggedAnswer::decode(raw), None);
     }
 
     #[test]

@@ -13,7 +13,71 @@ use std::sync::{Arc, Mutex, Weak};
 use event_listener::Event;
 use makima_storage::checkpoint::CheckpointPublication;
 
-use crate::types::TurnCancellationReason;
+use crate::actor::{ActorError, TurnTicket};
+use crate::manager::{AgentManagerHandle, ManagerError};
+use crate::types::{AgentId, TurnCancellationReason};
+
+pub enum CancelScope {
+    Turn(TurnTicket),
+    Subtree(AgentId),
+    ToolUse(String),
+}
+
+#[derive(Clone)]
+pub struct SessionCancellation {
+    manager: AgentManagerHandle,
+    root: AgentId,
+    tools: Arc<CancelMap<String>>,
+    startup: Arc<Mutex<Option<CancelTrigger>>>,
+}
+
+impl SessionCancellation {
+    pub fn new(
+        manager: AgentManagerHandle,
+        root: AgentId,
+        tools: Arc<CancelMap<String>>,
+        startup: Option<CancelTrigger>,
+    ) -> Self {
+        Self {
+            manager,
+            root,
+            tools,
+            startup: Arc::new(Mutex::new(startup)),
+        }
+    }
+
+    pub fn cancel(&self, scope: CancelScope) -> Result<(), ManagerError> {
+        match scope {
+            CancelScope::Turn(ticket) => Self::cancel_turn(&self.manager, &ticket),
+            CancelScope::Subtree(agent) => {
+                if agent == self.root {
+                    if let Some(trigger) = self.startup.lock_unpoisoned().take() {
+                        trigger.cancel();
+                    }
+                    self.tools.cancel_all();
+                }
+                self.manager.cancel_subtree(agent)
+            }
+            CancelScope::ToolUse(id) => {
+                self.tools.cancel_or_precancel(id);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn cancel_turn(
+        manager: &AgentManagerHandle,
+        ticket: &TurnTicket,
+    ) -> Result<(), ManagerError> {
+        let actor = manager.actor_for_ticket(ticket)?;
+        let agent_id = actor.agent_id();
+        let turn_id = ticket.turn_id();
+        actor.cancel_turn(turn_id).map_err(|error| match error {
+            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
+            _ => ManagerError::InactiveTurn { agent_id, turn_id },
+        })
+    }
+}
 
 #[derive(Default)]
 struct CancellationState {

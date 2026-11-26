@@ -685,7 +685,6 @@ fn managed_child_approval(
             prompt: None,
             model: None,
             opts: None,
-            answer_tx: None,
             cancel: None,
         };
         event_loop.handle_agent(

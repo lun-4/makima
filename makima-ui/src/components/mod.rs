@@ -231,9 +231,6 @@ pub enum Action {
         turn_id: Option<TurnId>,
         run_id: u64,
     },
-    CancelSubagent {
-        tool_use_id: String,
-    },
     /// Move the running tool call of this chat to the background.
     MoveToBackground {
         agent: Option<makima_agent::AgentId>,

@@ -6,6 +6,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use makima_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use makima_agent::session::AnswerKey;
+#[cfg(test)]
+use makima_agent::{AgentId, session::AnswerRouter};
 use makima_config::ToolKey;
 
 use crate::click::{ClickTarget, HitTarget};
@@ -115,12 +118,10 @@ pub enum PermissionPrompt {
     Closed,
     Open {
         guidance: Option<Box<GuidanceHit>>,
-        #[allow(dead_code)]
-        id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
-        subagent_id: Option<String>,
-        agent_id: Option<makima_agent::AgentId>,
+        is_subagent: bool,
         allow_scopes: Vec<String>,
         state: PromptState,
         buffer: TextBuffer,
@@ -147,23 +148,17 @@ impl PermissionPrompt {
     }
 
     #[cfg(test)]
-    pub fn open(
-        &mut self,
-        id: String,
-        tool: ToolKey,
-        scopes: Vec<String>,
-        subagent_id: Option<String>,
-    ) {
-        self.open_for_agent(id, tool, scopes, subagent_id, None);
+    pub fn open(&mut self, tool: ToolKey, scopes: Vec<String>, is_subagent: bool) {
+        let pending = AnswerRouter::default().register(AgentId::generate());
+        self.open_request(pending.key(), tool, scopes, is_subagent);
     }
 
-    pub fn open_for_agent(
+    pub(crate) fn open_request(
         &mut self,
-        id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
-        subagent_id: Option<String>,
-        agent_id: Option<makima_agent::AgentId>,
+        is_subagent: bool,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -172,11 +167,10 @@ impl PermissionPrompt {
             allow_scopes
         };
         *self = Self::Open {
-            id,
+            ask,
             tool,
             scopes,
-            subagent_id,
-            agent_id,
+            is_subagent,
             allow_scopes,
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
@@ -191,18 +185,9 @@ impl PermissionPrompt {
         }
     }
 
-    pub fn agent_id(&self) -> Option<makima_agent::AgentId> {
+    pub(crate) fn answer_key(&self) -> Option<&AnswerKey> {
         match self {
-            Self::Open { agent_id, .. } => *agent_id,
-            Self::Closed => None,
-        }
-    }
-
-    /// The ask the agent is parked on. Its answer has to name it, or the agent
-    /// refuses it as one meant for some other request.
-    pub fn request_id(&self) -> Option<&str> {
-        match self {
-            Self::Open { id, .. } => Some(id),
+            Self::Open { ask, .. } => Some(ask),
             Self::Closed => None,
         }
     }
@@ -303,7 +288,7 @@ impl PermissionPrompt {
         let Self::Open {
             tool,
             scopes,
-            subagent_id,
+            is_subagent,
             allow_scopes,
             state,
             buffer,
@@ -317,7 +302,7 @@ impl PermissionPrompt {
         let value_style = Style::new().fg(t.foreground);
 
         let mut tool_spans = vec![Span::raw("  "), Span::styled("tool  ", label_style)];
-        if subagent_id.is_some() {
+        if *is_subagent {
             tool_spans.push(Span::styled("[subtask] ", t.item_desc));
         }
         tool_spans.push(Span::styled(tool.to_string(), value_style));
@@ -640,12 +625,7 @@ mod tests {
 
     fn open_prompt() -> PermissionPrompt {
         let mut prompt = PermissionPrompt::new();
-        prompt.open(
-            "id".into(),
-            ToolKey::native("bash"),
-            vec!["execute".into()],
-            None,
-        );
+        prompt.open(ToolKey::native("bash"), vec!["execute".into()], false);
         prompt
     }
 
@@ -730,7 +710,7 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.open("id".into(), ToolKey::Wildcard, vec![], None);
+        prompt.open(ToolKey::Wildcard, vec![], false);
         assert!(matches!(prompt, PermissionPrompt::Open { .. }));
     }
 

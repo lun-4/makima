@@ -30,7 +30,8 @@ pub use agent::{
 };
 pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{
-    CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
+    CancelMap, CancelScope, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
+    SessionCancellation,
 };
 pub use mailbox::{
     BackgroundCallInfo, BackgroundMoveError, MailboxError, PreparedSessionMailbox, SessionMailbox,

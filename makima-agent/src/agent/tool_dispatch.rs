@@ -1087,7 +1087,7 @@ async fn enforce_permission(
                     &tool_key,
                     &scopes,
                     &ctx.event_tx,
-                    ctx.user_response_rx.as_deref(),
+                    ctx.answer_scope(),
                     id,
                     &ask_cancel,
                     ctx.restrict_write_to().as_deref(),
@@ -1145,7 +1145,7 @@ async fn execute_mcp_tool(
                 &perm_tool,
                 &perm_scopes,
                 &ctx.event_tx,
-                ctx.user_response_rx.as_deref(),
+                ctx.answer_scope(),
                 id,
                 &ask_cancel,
                 ctx.mode.plan_path(),
@@ -1562,9 +1562,8 @@ mod tests {
     use crate::journal::SessionJournal;
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
-    use crate::permissions::{
-        PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
-    };
+    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager};
+    use crate::session::AnswerRouter;
     use crate::session_coordinator::{
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
@@ -3833,38 +3832,44 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (response_tx, response_rx) = flume::unbounded();
+            let answers = AnswerRouter::default();
             let allowed = answer.is_allow();
-            response_tx
-                .send(TaggedAnswer::new(TEST_ID, answer).encode())
-                .unwrap();
             let mut ctx = stub_ctx_with_permissions(&plan, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            ctx.answers = Some(answers.clone());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
             let ctx = with_mcp(ctx, &mcp);
-            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            let input = json!({});
+            let mut call = Box::pin(dispatch(&ctx, PROBE_WIRE, &input));
+            assert!(
+                futures_lite::future::poll_once(call.as_mut())
+                    .await
+                    .is_none()
+            );
+            let (id, ask, tool, scopes) = rx
+                .try_iter()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::PermissionRequest {
+                        id,
+                        ask,
+                        tool,
+                        scopes,
+                    } => Some((id, ask, tool, scopes)),
+                    _ => None,
+                })
+                .expect("expected permission request");
+            assert_eq!(id, TEST_ID);
+            assert_eq!(tool, ToolKey::parse(PROBE_QUALIFIED).unwrap());
+            assert_eq!(scopes, [input.to_string()]);
+            answers.answer(ask, answer.encode()).unwrap();
+            let done = call.await;
             assert_eq!(done.is_error, !allowed);
             if allowed {
                 assert_eq!(done.output.as_text(), HOOK_OUTPUT_TEXT);
             } else {
                 assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
             }
-            let requests: Vec<_> = rx
-                .try_iter()
-                .filter_map(|envelope| match envelope.event {
-                    AgentEvent::PermissionRequest { id, tool, scopes } => Some((id, tool, scopes)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                requests,
-                [(
-                    TEST_ID.into(),
-                    ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                    vec![json!({}).to_string()]
-                )]
-            );
             let mut tools = json!([]);
             mcp.extend_tools(&mut tools);
             assert_eq!(tool_names(&tools).contains(&PROBE_WIRE), allowed);
@@ -5125,10 +5130,10 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (_response_tx, response_rx) = flume::unbounded::<String>();
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            ctx.answers = Some(AnswerRouter::default());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let (mut ctx, _hook) =
                 hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
             let (_run_trigger, run) = CancelToken::new();
@@ -5160,7 +5165,7 @@ mod tests {
     }
 
     #[test]
-    fn a_move_withdraws_the_permission_prompt_and_frees_the_channel() {
+    fn a_move_withdraws_the_permission_prompt() {
         smol::block_on(async {
             let permissions = Arc::new(PermissionManager::new(
                 PermissionsConfig::default(),
@@ -5169,11 +5174,11 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (response_tx, response_rx) = flume::unbounded::<String>();
-            let responses = Arc::new(async_lock::Mutex::new(response_rx));
+            let answers = AnswerRouter::default();
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::clone(&responses));
+            ctx.answers = Some(answers.clone());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let (mut ctx, _hook) =
                 hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
             let (_run_trigger, run) = CancelToken::new();
@@ -5193,24 +5198,19 @@ mod tests {
                 dispatch_pinned(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await
             });
             let prompt = async {
-                loop {
-                    match rx.recv_async().await {
-                        Ok(envelope)
-                            if matches!(envelope.event, AgentEvent::PermissionRequest { .. }) =>
-                        {
-                            break true;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => break false,
+                while let Ok(envelope) = rx.recv_async().await {
+                    if let AgentEvent::PermissionRequest { ask, .. } = envelope.event {
+                        return Some(ask);
                     }
                 }
+                None
             };
-            let prompted = futures_lite::future::or(prompt, async {
+            let ask = futures_lite::future::or(prompt, async {
                 smol::Timer::after(Duration::from_secs(2)).await;
-                false
+                None
             })
-            .await;
-            assert!(prompted, "the call must reach the prompt before the move");
+            .await
+            .expect("the call must reach the prompt before the move");
 
             let _trigger = scope
                 .move_to(CallHome {
@@ -5228,10 +5228,10 @@ mod tests {
                 done.output.as_text()
             );
             assert!(
-                responses.try_lock().is_some(),
-                "a withdrawn prompt must not hold the channel"
+                answers
+                    .answer(ask, PermissionAnswer::AllowOnce.encode())
+                    .is_err()
             );
-            drop(response_tx);
         });
     }
 

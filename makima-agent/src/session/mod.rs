@@ -11,8 +11,10 @@ use crate::{
     session_writer::{SessionWriter, StoredSession},
 };
 
+mod answers;
 mod events;
 
+pub use answers::{AnswerError, AnswerKey, AnswerRouter, PendingAnswer};
 pub use events::{SessionEvent, SessionEventPump, SessionSubscription};
 
 pub async fn set_title(

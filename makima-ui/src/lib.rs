@@ -50,7 +50,6 @@ use makima_storage::id::MakimaId;
 
 pub type AppSession = makima_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
-pub(crate) use agent::AgentCommand;
 pub use event_loop::{EventLoopParams, StartupSessions};
 
 pub enum RunOutcome {

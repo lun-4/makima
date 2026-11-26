@@ -4,13 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_lock::Mutex;
-
 use crossterm::event::{KeyCode, KeyModifiers};
 use makima_agent::agent::tool_dispatch;
 use makima_agent::context::RootContext;
 use makima_agent::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
 use makima_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use makima_agent::session::AnswerRouter;
 use makima_agent::template::{Vars, env_vars_for};
 use makima_agent::tools::hook::{
     HookCall, HookStage, OUTPUT_TEXT, OUTPUT_TRAILER, ToolHook, Verdict,
@@ -22,10 +21,9 @@ use makima_agent::tools::{
     ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource, TurnToolBindings,
     format_line_truncated_marker, test_support::stub_ctx_with, timeout_annotation,
 };
-use makima_agent::types::encode_ask_answer;
 use makima_agent::{
-    AgentEvent, AgentMode, CallScope, CancelToken, EventSender, Instructions, SessionMailbox,
-    SharedBuf, ToolOutput,
+    AgentEvent, AgentId, AgentMode, CallScope, CancelToken, EventSender, Instructions,
+    SessionMailbox, SharedBuf, ToolOutput,
 };
 use makima_commands::{CommandOutcome, InputDispatch, TargetCapabilities};
 use makima_config::{
@@ -4712,7 +4710,7 @@ fn configured_shell_is_used_when_builtins_load(
     ctx.config.rtk = false;
     ctx.registry = Arc::clone(&reg);
     ctx.turn_bindings = Arc::new(TurnToolBindings::capture(&reg, &ctx.local_tools, None));
-    assert!(ctx.user_response_rx.is_none());
+    assert!(ctx.answers.is_none());
 
     let native_windows_shell = shell != "bash";
     let (head, _) = simple.split_once(' ').unwrap();
@@ -5846,11 +5844,13 @@ fn question_tool_uses_the_host_reply(payload: &str, expected: &str) {
             { "question": "Pick many", "multiSelect": true, "options": [{ "label": "x" }, { "label": "y" }] },
         ]
     });
-    let (answer_tx, answer_rx) = flume::unbounded();
+    let answers = AnswerRouter::default();
+    let agent_id = AgentId::generate();
     let (event_tx, event_rx) = flume::unbounded();
     let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx)), None);
     ctx.question_mode = QuestionMode::Elicitation;
-    ctx.user_response_rx = Some(Arc::new(Mutex::new(answer_rx)));
+    ctx.execution_agent_id = Some(agent_id);
+    ctx.answers = Some(answers.clone());
     let invocation = reg.get("question").unwrap().tool.parse(&input).unwrap();
     let (result, ()) = smol::block_on(smol::future::zip(invocation.execute(&ctx), async {
         let event = smol::future::or(async { event_rx.recv_async().await.unwrap() }, async {
@@ -5858,10 +5858,11 @@ fn question_tool_uses_the_host_reply(payload: &str, expected: &str) {
             panic!("tool did not ask a question");
         })
         .await;
-        let AgentEvent::Question { ask_id, .. } = event.event else {
+        let AgentEvent::Question { ask, .. } = event.event else {
             panic!("expected a question, got {:?}", event.event);
         };
-        answer_tx.send(encode_ask_answer(&ask_id, payload)).unwrap();
+        assert_eq!(ask.agent_id(), agent_id);
+        answers.answer(ask, payload.to_owned()).unwrap();
     }));
     assert_eq!(result.output.unwrap().as_text(), expected);
 }

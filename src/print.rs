@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use makima_agent::agent::isolated_turn::collect_answer;
 use makima_agent::cancel::CancelToken;
 use makima_agent::command::{
     self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
@@ -662,7 +663,7 @@ pub fn run(
                                 | AgentEvent::QueueSettled
                                 | AgentEvent::AutoCompacting { .. }
                                 | AgentEvent::CompactionDone { .. }
-                                | AgentEvent::AuthRequired
+                                | AgentEvent::AuthRequired { .. }
                                 | AgentEvent::PermissionRequest { .. }
                                 | AgentEvent::Question { .. }
                                 | AgentEvent::SubagentHistory { .. }
@@ -759,12 +760,12 @@ pub fn run(
                 }
                 PrintWork::IsolatedTurn(turn) => {
                     let images = command_attachments::into_images(&turn.content.attachments)?;
-                    let answer = smol::block_on(handle.control_tx.ask_isolated_to(
-                        admission.actor().map_err(|error| eyre!(error))?,
-                        turn.content.text.to_string(),
-                        images,
-                        CancelToken::none(),
-                    ));
+                    admission.validate().map_err(|error| eyre!(error))?;
+                    let answer = admission
+                        .target
+                        .ask_isolated(turn.content.text.to_string(), images, CancelToken::none())
+                        .map_err(|error| error.to_string());
+                    let answer = smol::block_on(async { collect_answer(answer?).await });
                     (operation_result(answer, session_id), None)
                 }
                 PrintWork::Reply(text) => (operation_result(Ok(text), session_id), None),
@@ -933,7 +934,6 @@ mod tests {
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             }),
             identity: None,

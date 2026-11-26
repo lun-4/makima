@@ -27,6 +27,7 @@ use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
 use crate::context::RootContext;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::session::AnswerRouter;
 use crate::tools::offload::OffloadStore;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
@@ -188,7 +189,7 @@ pub struct Agent<'h> {
     tools: RequestTools,
     mode: AgentMode,
     mode_def: Option<Arc<crate::ModeDef>>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    answers: Option<AnswerRouter>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     turn_inbox: Option<Arc<dyn TurnInbox>>,
     instruction_consumed_callback: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -295,7 +296,7 @@ impl<'h> Agent<'h> {
             tools: run.tools,
             mode: AgentMode::default(),
             mode_def: None,
-            user_response_rx: None,
+            answers: None,
             interrupt_source: None,
             turn_inbox: None,
             instruction_consumed_callback: None,
@@ -344,11 +345,8 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_user_response_rx(
-        mut self,
-        rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
-    ) -> Self {
-        self.user_response_rx = rx;
+    pub fn with_answers(mut self, answers: Option<AnswerRouter>) -> Self {
+        self.answers = answers;
         self
     }
 
@@ -878,23 +876,21 @@ impl<'h> Agent<'h> {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
         }
-        let Some(rx) = &self.user_response_rx else {
+        let Some(answers) = &self.answers else {
             error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
             return Err(err);
         };
         self.reauth_attempts += 1;
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
-        self.event_tx.send(AgentEvent::AuthRequired)?;
-        let rx = rx.lock().await;
-        loop {
-            match self.cancel.race(rx.recv_async()).await {
-                Ok(Ok(answer)) if answer.is_empty() => {
-                    self.provider.refresh_auth().await?;
-                    return Ok(TurnProgress::Continue);
-                }
-                Ok(Ok(_)) => continue,
-                Ok(Err(_)) | Err(_) => return Err(AgentError::Cancelled),
+        let pending = answers.register(self.agent_id);
+        self.event_tx
+            .send(AgentEvent::AuthRequired { ask: pending.key() })?;
+        match self.cancel.race(pending.recv()).await {
+            Ok(Ok(answer)) if answer.is_empty() => {
+                self.provider.refresh_auth().await?;
+                Ok(TurnProgress::Continue)
             }
+            _ => Err(AgentError::Cancelled),
         }
     }
 
@@ -1017,7 +1013,7 @@ impl<'h> Agent<'h> {
             cwd,
             tool_use_id: None,
             call: None,
-            user_response_rx: self.user_response_rx.clone(),
+            answers: self.answers.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
@@ -1348,7 +1344,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use async_lock::Mutex as AsyncMutex;
 
     use crate::actor::{
         AgentContextSnapshot, EffectiveAgentConfig, PendingSubmission, SubmissionId,
@@ -1363,6 +1358,7 @@ mod tests {
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+    use crate::session::AnswerRouter;
     use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
     use std::fs::read_to_string;
@@ -2025,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_reauth_ignores_nonempty_answers() {
+    fn interactive_reauth_waits_for_its_own_answer() {
         smol::block_on(async {
             let provider = ScriptedProvider {
                 results: Mutex::new(VecDeque::from([
@@ -2035,24 +2031,35 @@ mod tests {
             };
             let mut history = History::new(Vec::new());
             let (agent, events) = make_agent(provider, &mut history);
-            let (answers, rx) = flume::unbounded();
-            answers
-                .send(String::from("not an auth acknowledgement"))
-                .unwrap();
-            answers.send(String::new()).unwrap();
-            drop(answers);
-            let mut agent =
-                agent.with_user_response_rx(Some(Arc::new(AsyncMutex::new(rx.clone()))));
-            let outcome = run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+            let answers = AnswerRouter::default();
+            let unrelated = answers.register(agent.agent_id);
+            let mut agent = agent.with_answers(Some(answers.clone()));
+            let mut run = Box::pin(run_admitted(
+                &mut agent,
+                TurnId::generate(),
+                default_input(),
+            ));
+            let ask = future::or(
+                async {
+                    let _ = run.as_mut().await;
+                    panic!("turn ended before authentication");
+                },
+                async {
+                    loop {
+                        if let AgentEvent::AuthRequired { ask } =
+                            events.recv_async().await.unwrap().event
+                        {
+                            break ask;
+                        }
+                    }
+                },
+            )
+            .await;
+            answers.answer(unrelated.key(), String::new()).unwrap();
+            assert!(future::poll_once(run.as_mut()).await.is_none());
+            answers.answer(ask, String::new()).unwrap();
+            let outcome = run.await;
             assert!(matches!(outcome, TurnOutcome::Completed { .. }));
-            assert!(rx.is_empty());
-            assert_eq!(
-                events
-                    .drain()
-                    .filter(|event| matches!(event.event, AgentEvent::AuthRequired))
-                    .count(),
-                1,
-            );
         });
     }
 

@@ -39,9 +39,9 @@ use crate::actor::{
     MAX_PENDING_PREVIEW_BYTES, PreparedTurn, TurnProvenance, TurnResult, graph_quiescence_barrier,
 };
 use crate::{
-    ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelToken,
-    ConfigChange, ConfigPatch, ControlWork, EventSender, History, PreparedModel,
-    TurnAdmissionOptions, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelMap,
+    CancelScope, CancelToken, ConfigChange, ConfigPatch, ControlWork, EventSender, History,
+    PreparedModel, SessionCancellation, TurnAdmissionOptions, TurnContext, TurnOutcome, WorkKind,
 };
 
 const GRAPH_SUBSCRIBER: u64 = 1;
@@ -5200,6 +5200,85 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
     root_gate.release(1);
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
     assert!(report.timed_out.is_empty());
+}
+
+#[test]
+fn scoped_cancellation_distinguishes_turn_subtree_and_tool_use() {
+    const TOOL_USE: &str = "cancel-before-registration";
+    const ACTIVE: &str = "active";
+    const QUEUED: &str = "queued";
+    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+    let root_ticket = root.turn_ticket(current.turn_id()).unwrap();
+    let (entered, entering) = flume::bounded(1);
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            Box::new(CancellableBackend {
+                entered: move |_: &TurnContext| {
+                    entered.send(()).unwrap();
+                },
+            }),
+        )
+        .unwrap();
+    let actor = child.actor().unwrap();
+    let active = actor.admit_turn(input(), None, ACTIVE.into()).unwrap();
+    entering.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    let queued = actor.admit_turn(input(), None, QUEUED.into()).unwrap();
+    let tools = Arc::new(CancelMap::new());
+    let (startup, initializing) = CancelToken::new();
+    let cancellation = SessionCancellation::new(
+        manager.clone(),
+        root.id(),
+        Arc::clone(&tools),
+        Some(startup),
+    );
+    let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    assert_eq!(
+        SessionCancellation::cancel_turn(&other, &queued),
+        Err(ManagerError::WrongManager)
+    );
+
+    cancellation
+        .cancel(CancelScope::Turn(queued.clone()))
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(queued.wait()),
+        TurnOutcome::Cancelled { .. }
+    ));
+    assert!(active.peek().is_none());
+    assert!(root_ticket.peek().is_none());
+
+    cancellation
+        .cancel(CancelScope::ToolUse(TOOL_USE.into()))
+        .unwrap();
+    let (trigger, token) = CancelToken::new();
+    let _registration = tools.insert(TOOL_USE.into(), trigger);
+    assert!(token.is_cancelled());
+    assert!(active.peek().is_none());
+
+    cancellation
+        .cancel(CancelScope::Subtree(child.id()))
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(active.wait()),
+        TurnOutcome::Cancelled { .. }
+    ));
+    assert!(root_ticket.peek().is_none());
+    assert!(!initializing.is_cancelled());
+
+    cancellation
+        .cancel(CancelScope::Subtree(root.id()))
+        .unwrap();
+    assert!(initializing.is_cancelled());
+    root_gate.release(1);
+    assert!(
+        smol::block_on(manager.shutdown(COMPLETION_TIMEOUT))
+            .timed_out
+            .is_empty()
+    );
 }
 
 #[test]

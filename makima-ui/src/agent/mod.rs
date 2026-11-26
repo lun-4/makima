@@ -1,4 +1,3 @@
-mod command_router;
 pub(crate) mod pending;
 #[cfg(test)]
 mod runtime_tests;
@@ -11,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
-use async_lock::Mutex;
 use makima_agent::actor::{ActorEvent, AgentContextSnapshot, EffectiveAgentConfig, PreparedModel};
 use makima_agent::headless::{FrontendProfile, HeadlessBackend, HeadlessBackendOptions};
 use makima_agent::journal::SessionJournal;
 use makima_agent::manager::ResidentAgent;
 use makima_agent::mcp::McpSession;
 use makima_agent::permissions::PermissionManager;
+use makima_agent::session::AnswerRouter;
 use makima_agent::session_coordinator::ModelPreparer;
 use makima_agent::session_recovery::RecoveredSession;
 use makima_agent::tools::offload::OffloadStore;
@@ -25,9 +24,9 @@ use makima_agent::tools::{
     FileReadTracker, FileWriteLocks, QuestionMode, ToolAudience, ToolContext, ToolRegistry,
 };
 use makima_agent::{
-    AgentConfig, AgentId, AgentLimits, AgentManagerHandle, AgentParams, CancelMap, CancelToken,
-    Envelope, HistorySnapshot, McpCommand, McpHandle, PreparedSessionMailbox, SessionMailbox,
-    SharedMessages, ToolOutputLines,
+    AgentConfig, AgentId, AgentLimits, AgentManagerHandle, AgentParams, CancelMap, CancelScope,
+    CancelToken, Envelope, HistorySnapshot, McpCommand, McpHandle, PreparedSessionMailbox,
+    SessionCancellation, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use makima_config::ModelPolicy;
 use makima_lua::EventHandle;
@@ -42,7 +41,6 @@ use tracing::{info, warn};
 use crate::app::App;
 use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
-use self::command_router::spawn_command_router;
 use self::shared_queue::actor_queue;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
@@ -250,11 +248,6 @@ pub(crate) struct SystemPromptOverride {
     pub(crate) append_text: Option<String>,
 }
 
-pub(crate) enum AgentCommand {
-    CancelAll,
-    CancelSubagent { tool_use_id: String },
-}
-
 type AgentHandlesBuilder = Box<dyn FnOnce(RecoveredSession) -> Result<AgentHandles, String> + Send>;
 
 /// Stale events on the output channel (`agent_tx`/`agent_rx`) are filtered
@@ -341,11 +334,11 @@ impl Drop for PreparedAgentHandles {
 }
 
 pub(crate) struct AgentHandles {
-    pub(crate) cmd_tx: flume::Sender<AgentCommand>,
+    cancellation: SessionCancellation,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) actor_rx: flume::Receiver<ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
-    pub(crate) answer_tx: flume::Sender<String>,
+    pub(crate) answers: AnswerRouter,
     pub(crate) history: SharedMessages,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: QueueSender,
@@ -359,6 +352,10 @@ pub(crate) struct AgentHandles {
 }
 
 impl AgentHandles {
+    pub(crate) fn cancel_root(&self) {
+        let _ = self.cancellation.cancel(CancelScope::Subtree(self.root_id));
+    }
+
     #[cfg(test)]
     pub(crate) fn runner_start_is_pending(&self) -> bool {
         self.runner_start.is_some()
@@ -563,8 +560,7 @@ impl AgentHandles {
         app.agent_chat_index.insert(self.root_id, 0);
         app.root_agent = Some(self.manager.reference(self.root_id));
         app.lua_event_handle.observe_agents(&self.manager);
-        app.answer_tx = Some(self.answer_tx.clone());
-        app.cmd_tx = Some(self.cmd_tx.clone());
+        app.answers = Some(self.answers.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.queue.set_shared(self.queue.clone());
         let restore_tx = makima_agent::EventSender::with_identity(
@@ -680,8 +676,7 @@ fn spawn_agent_internal(
     file_write_locks: Arc<FileWriteLocks>,
 ) -> Result<PreparedAgentHandles, String> {
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let answers = AnswerRouter::default();
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
     // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
@@ -750,7 +745,7 @@ fn spawn_agent_internal(
             mcp: mcp_handle
                 .clone()
                 .map(|handle| McpSession::new(handle, &initial_history)),
-            answer_rx: Some(Arc::new(Mutex::new(answer_rx))),
+            answers: Some(answers.clone()),
             ..Default::default()
         },
     );
@@ -780,21 +775,20 @@ fn spawn_agent_internal(
     let actor = Arc::new(root.actor().expect("committed root actor"));
     let queue_tx = actor_queue(Arc::clone(&actor));
 
-    spawn_command_router(
-        cmd_rx,
+    let cancellation = SessionCancellation::new(
         manager.clone(),
         root_id,
-        Arc::clone(&subagent_cancels),
-        init_trigger,
+        subagent_cancels,
+        Some(init_trigger),
     );
 
     Ok(PreparedAgentHandles {
         handles: Some(AgentHandles {
-            cmd_tx,
+            cancellation,
             agent_rx,
             actor_rx: actor.subscribe_events(),
             agent_tx,
-            answer_tx,
+            answers,
             history: shared_history,
             mcp_handle,
             queue: queue_tx,

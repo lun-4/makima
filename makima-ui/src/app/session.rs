@@ -21,8 +21,6 @@ use makima_providers::RequestOptions;
 
 use super::App;
 #[cfg(test)]
-use super::PendingInput;
-#[cfg(test)]
 use super::session_state::SessionState;
 #[cfg(test)]
 use makima_agent::permissions::PermissionSnapshot;
@@ -161,7 +159,7 @@ impl App {
         self.clear_exit_request();
         self.queue.clear_root_user_work();
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
+        self.pending_auth.clear();
         self.status_bar.clear_flash();
         self.task_picker_original = None;
         self.last_esc = None;
@@ -897,7 +895,6 @@ mod tests {
             prompt: None,
             model: None,
             opts: None,
-            answer_tx: None,
             cancel: None,
         };
         assert_eq!(app.resolve_or_create_chat(&info), index);
@@ -956,7 +953,6 @@ mod tests {
             prompt: None,
             model: None,
             opts: None,
-            answer_tx: None,
             cancel: None,
         };
         app.display_post(

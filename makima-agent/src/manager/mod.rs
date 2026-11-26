@@ -3661,6 +3661,19 @@ impl AgentManagerHandle {
             .ok_or(ManagerError::NonLiveAgent(incarnation.agent_id))
     }
 
+    pub(crate) fn actor_for_ticket(
+        &self,
+        ticket: &TurnTicket,
+    ) -> Result<AgentActorHandle, ManagerError> {
+        self.lock_graph()
+            .nodes
+            .values()
+            .filter_map(|node| node.actor.as_ref())
+            .find(|actor| actor.owns_ticket(ticket))
+            .cloned()
+            .ok_or(ManagerError::WrongManager)
+    }
+
     pub fn actor(&self, agent_id: AgentId) -> Result<AgentActorHandle, ManagerError> {
         let graph = self.lock_graph();
         let node = graph

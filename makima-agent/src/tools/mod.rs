@@ -42,6 +42,7 @@ use crate::mcp::{
     McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
 };
 use crate::permissions::PermissionManager;
+use crate::session::AnswerRouter;
 use crate::{
     AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
 };
@@ -486,7 +487,7 @@ pub struct ToolContext {
     /// The model call this context serves, shared by nested calls. `None`
     /// outside a model call and for calls a batch started.
     pub call: Option<Arc<crate::call_scope::CallScope>>,
-    pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub answers: Option<AnswerRouter>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
@@ -537,6 +538,10 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn answer_scope(&self) -> Option<(&AnswerRouter, AgentId)> {
+        Some((self.answers.as_ref()?, self.execution_agent_id?))
+    }
+
     /// Overlays an agent's committed configuration onto this template.
     pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
         self.cwd = config.context.cwd().to_path_buf();
@@ -896,7 +901,7 @@ pub fn interpreter_ctx(
         cwd,
         tool_use_id: None,
         call: None,
-        user_response_rx: None,
+        answers: None,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,

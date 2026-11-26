@@ -97,8 +97,8 @@ fn claim_lock(dir: &Path, id: &MakimaId) -> Result<ClaimedSessionLock> {
 use crate::AppSession;
 use crate::agent::pending::PendingProvider;
 use crate::agent::{
-    AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
-    SystemPromptOverride, shared_queue::QueueItem,
+    AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot, SystemPromptOverride,
+    shared_queue::QueueItem,
 };
 use crate::app::EMPTY_PROMPT_ERR;
 use crate::app::session_state::SessionState;
@@ -447,7 +447,7 @@ fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.end_plan_approval();
     runtime.app.flash(LOCK_LOST_MSG.into());
     runtime.app.exit_request = ExitRequest::Error;
-    let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
+    runtime.handles.cancel_root();
     warn!(id = %runtime.id(), "session lock lost to another process; stopping without saving");
 }
 
@@ -1670,7 +1670,6 @@ impl SpawnCtx {
         )?;
         app.app.state.warnings.extend(state.warnings);
         app.app.state.warnings.extend(model_warning);
-        app.app.btw_prompt = self.system_prompt.clone();
         let handles = AgentHandles::prepare_recovered(
             config,
             self.config.clone(),
@@ -4255,12 +4254,6 @@ impl<'t> EventLoop<'t> {
             }
             Action::CancelAgent { .. } => {
                 self.sessions[idx].notifications.reset();
-            }
-            Action::CancelSubagent { tool_use_id } => {
-                let _ = self.sessions[idx]
-                    .handles
-                    .cmd_tx
-                    .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
             Action::MoveToBackground { agent } => {
                 let moved = self.sessions[idx]
@@ -7425,7 +7418,6 @@ end })
                     prompt: None,
                     model: Some(config.model.spec()),
                     opts: None,
-                    answer_tx: None,
                     cancel: None,
                 }),
                 identity: None,

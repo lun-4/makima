@@ -67,12 +67,12 @@ pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
 };
-use makima_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
-use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
+use makima_agent::actor::EffectiveAgentConfig;
 use makima_agent::permissions::PermissionManager;
 #[cfg(test)]
 use makima_agent::permissions::PermissionSnapshot;
 use makima_agent::rewind::RewindGuard;
+use makima_agent::session::{AnswerKey, AnswerRouter};
 use makima_agent::tools::ToolFilter;
 use makima_agent::{
     AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, GraphLifecycle,
@@ -108,8 +108,6 @@ use makima_agent::journal::SessionJournal;
 use makima_agent::session_writer::SessionWriter;
 use ratatui::layout::Position;
 
-const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
-const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
 #[cfg(test)]
@@ -117,7 +115,6 @@ use crate::chat::{COMPLETION_PREVIEW_CHARS, COMPLETION_TRUNCATED};
 
 #[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
-use crate::agent::SystemPromptOverride;
 
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
@@ -330,15 +327,6 @@ fn truncate_snippet(text: &str) -> String {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(super) enum PendingInput {
-    #[default]
-    None,
-    AuthRetry {
-        agent_id: Option<makima_agent::AgentId>,
-    },
-}
-
 pub enum Msg {
     Key(KeyEvent),
     Paste(String),
@@ -358,10 +346,10 @@ pub(crate) enum InputKind {
 /// not opened (and does not contaminate overlay state) until activation.
 #[derive(Debug, Clone)]
 pub(crate) struct PermissionPayload {
-    id: String,
+    ask: AnswerKey,
     tool: ToolKey,
     scopes: Vec<String>,
-    agent_id: Option<makima_agent::AgentId>,
+    is_subagent: bool,
 }
 
 /// One entry in the input-arbitration queue. FIFO: only the head can activate.
@@ -425,10 +413,9 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answers: Option<AnswerRouter>,
     pub(crate) root_agent: Option<makima_agent::AgentRef>,
-    pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
-    pub(super) pending_input: PendingInput,
+    pending_auth: VecDeque<AnswerKey>,
     pub(crate) run_id: u64,
     /// The model the in-flight turn started on. A turn captures its provider
     /// when it starts, so a model changed part-way through applies to the next
@@ -464,7 +451,6 @@ pub struct App {
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_prompt: SystemPromptOverride,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     #[cfg(test)]
     fixture_journal: Option<Arc<SessionJournal>>,
@@ -484,8 +470,8 @@ pub struct App {
     pub(crate) suppress_status_content: Arc<AtomicBool>,
     pub(crate) restore_event_tx: Option<makima_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
-    /// Per-live-agent channels for interrupt replies and background input.
-    subagent_answers: HashMap<AgentId, Option<flume::Sender<String>>>,
+    /// The first live event for a restored chat reopens it.
+    observed_live_agents: HashSet<AgentId>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(makima_agent::AgentId, makima_agent::TurnId)>,
 }
@@ -641,10 +627,9 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
-            answer_tx: None,
+            answers: None,
             root_agent: None,
-            cmd_tx: None,
-            pending_input: PendingInput::None,
+            pending_auth: VecDeque::new(),
             run_id: 0,
             run_model: None,
             run_context_window: None,
@@ -668,7 +653,6 @@ impl App {
             available_models,
             model_picker_models,
             shared_history: None,
-            btw_prompt: SystemPromptOverride::default(),
             image_paste_rx: vec![],
             #[cfg(test)]
             fixture_journal: None,
@@ -687,7 +671,7 @@ impl App {
             status_content_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
-            subagent_answers: HashMap::new(),
+            observed_live_agents: HashSet::new(),
             stamped_subagent_outcomes: HashSet::new(),
             pending_dirty: Dirty::NO,
         };
@@ -1077,7 +1061,7 @@ impl App {
                 .and_then(|t| normalize_preview(&t.to_string()));
             return Some(Notification::PermissionRequested { tool });
         }
-        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+        if !self.pending_auth.is_empty() {
             return Some(Notification::AuthenticationRequired);
         }
         if self.status != Status::Streaming && self.plan_form_active() {
@@ -1201,9 +1185,9 @@ impl App {
         actions
     }
 
-    fn send_answer(&self, answer: String) {
-        if let Some(tx) = &self.answer_tx {
-            let _ = tx.try_send(answer);
+    fn send_answer(&self, ask: AnswerKey, answer: String) {
+        if let Some(answers) = &self.answers {
+            let _ = answers.answer(ask, answer);
         }
     }
 
@@ -1245,17 +1229,6 @@ impl App {
             .target_agent(&self.command_target)
             .filter(|target| target.id() == id)
             .or_else(|| self.root_agent.as_ref()?.manager().lookup(id).ok())
-    }
-
-    fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
-        let routed = agent_id
-            .and_then(|id| self.subagent_answers.get(&id))
-            .and_then(Option::as_ref);
-        if let Some(tx) = routed {
-            let _ = tx.try_send(answer);
-        } else {
-            self.send_answer(answer);
-        }
     }
 
     pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
@@ -1336,11 +1309,10 @@ impl App {
     }
 
     fn answer_permission(&mut self, answer: makima_agent::permissions::PermissionAnswer) {
-        let agent_id = self.permission_prompt.agent_id();
-        let request_id = self.permission_prompt.request_id().unwrap_or_default();
-        let encoded = makima_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
+        if let Some(ask) = self.permission_prompt.answer_key().cloned() {
+            self.send_answer(ask, answer.encode());
+        }
         self.permission_prompt.close();
-        self.send_to_agent(agent_id, encoded);
     }
 
     pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
@@ -2727,13 +2699,10 @@ impl App {
         // Any main-input submit releases a manual Alt+M hold, so the deferred
         // panel re-promotes once the user has placed their message.
         self.submit_released = true;
-        match std::mem::take(&mut self.pending_input) {
-            PendingInput::AuthRetry { agent_id } => {
-                self.send_to_agent(agent_id, String::new());
-                self.accept_submission(&sub);
-                return vec![];
-            }
-            PendingInput::None => {}
+        if let Some(ask) = self.pending_auth.pop_front() {
+            self.send_answer(ask, String::new());
+            self.accept_submission(&sub);
+            return vec![];
         }
         if sub.is_empty() {
             return vec![];
@@ -2826,6 +2795,7 @@ impl App {
                 return Vec::new();
             }
         };
+        self.clear_agent_auth(target.id());
         self.shell.cancel_for(target.id());
         self.active_chat().flush();
         self.active_chat().cancel_in_progress();
@@ -2837,7 +2807,6 @@ impl App {
         self.run_id = fence;
         self.queue.fence_cancelled_presentations(fence);
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
         self.input_queue.clear();
         self.active_input = None;
         self.main_chat()
@@ -3179,16 +3148,16 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+        if let ChatEventResult::PermissionRequest { ask, tool, scopes } = result {
             let demand = InputDemand {
                 kind: InputKind::Permission,
                 blocked_by_modal: self.has_blocking_modal(),
                 hold_until_submit: false,
                 perm: Some(PermissionPayload {
-                    id,
+                    ask,
                     tool,
                     scopes,
-                    agent_id: subagent_agent_id,
+                    is_subagent: subagent_agent_id.is_some(),
                 }),
             };
             let defer = self.begin_input_demand(demand);
@@ -3198,7 +3167,11 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::AuthRequired = result {
+        if let ChatEventResult::AuthRequired { ask } = result {
+            if self.pending_auth.contains(&ask) {
+                return vec![];
+            }
+            self.pending_auth.push_back(ask);
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
@@ -3209,9 +3182,6 @@ impl App {
                     AUTH_EXPIRED_MSG.into(),
                 ));
             }
-            self.pending_input = PendingInput::AuthRetry {
-                agent_id: subagent_agent_id,
-            };
             return vec![];
         }
 
@@ -3237,7 +3207,7 @@ impl App {
                         self.exit_request = ExitRequest::Error;
                     }
                 }
-                ChatEventResult::AuthRequired
+                ChatEventResult::AuthRequired { .. }
                 | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
                 ChatEventResult::ControlComplete => {
@@ -3303,11 +3273,9 @@ impl App {
         };
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.agent_chat_index.get(&subagent.agent_id) {
-            if self.subagent_answers.contains_key(&subagent.agent_id) {
+            if !self.observed_live_agents.insert(subagent.agent_id) {
                 return idx;
             }
-            self.subagent_answers
-                .insert(subagent.agent_id, subagent.answer_tx.clone());
             let name = name();
             let chat = &mut self.chats[idx];
             chat.name = name;
@@ -3321,8 +3289,7 @@ impl App {
         let idx = self.chats.len();
         self.chat_index.entry(id.clone()).or_insert(idx);
         self.agent_chat_index.insert(subagent.agent_id, idx);
-        self.subagent_answers
-            .insert(subagent.agent_id, subagent.answer_tx.clone());
+        self.observed_live_agents.insert(subagent.agent_id);
         let name = name();
         self.chats[0].update_tool_summary(id, &name);
         if let Some(ref model) = subagent.model {
@@ -3599,30 +3566,10 @@ impl App {
             self.flash(CommandError::StaleTarget.to_string());
             return vec![];
         };
-        let actor = match admission.actor() {
-            Ok(actor) => actor,
-            Err(error) => {
-                self.flash(error.to_string());
-                return vec![];
-            }
-        };
-        let history = match actor
-            .transcript(TranscriptRequest {
-                through_turn: None,
-                last_messages: COMMAND_TRANSCRIPT_MESSAGES,
-                max_bytes: COMMAND_TRANSCRIPT_BYTES,
-            })
-            .map_err(|error| error.to_string())
-            .and_then(|snapshot| {
-                serde_json::from_value::<Vec<Message>>(snapshot.messages)
-                    .map_err(|error| error.to_string())
-            }) {
-            Ok(history) => history,
-            Err(error) => {
-                self.flash(error);
-                return vec![];
-            }
-        };
+        if let Err(error) = admission.validate() {
+            self.flash(error);
+            return vec![];
+        }
         let images = turn
             .content
             .attachments
@@ -3632,28 +3579,7 @@ impl App {
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        let system = if self.chats[0].agent_id == Some(admission.target.id()) {
-            match self.btw_system(&admission.target, &admission.template.cwd) {
-                Ok(system) => system,
-                Err(error) => {
-                    self.flash(error.to_string());
-                    return vec![];
-                }
-            }
-        } else {
-            btw::BTW_FALLBACK_SYSTEM.into()
-        };
-        self.start_btw_request(IsolatedTurnRequest {
-            provider: Arc::clone(&admission.template.provider),
-            model: (*admission.template.model).clone(),
-            history,
-            previous: None,
-            system,
-            question: turn.content.text.to_string(),
-            images,
-            session_id: admission.template.session_id.clone(),
-            cancel: makima_agent::CancelToken::none(),
-        });
+        self.start_btw_on(&admission.target, turn.content.text.to_string(), images);
         vec![]
     }
 
@@ -3796,24 +3722,21 @@ impl App {
         }
     }
 
-    fn cleanup_subagent_input(&mut self, agent_id: makima_agent::AgentId) {
+    fn clear_agent_auth(&mut self, agent_id: AgentId) {
+        self.pending_auth.retain(|ask| ask.agent_id() != agent_id);
+    }
+
+    fn cleanup_subagent_input(&mut self, agent_id: AgentId) {
         self.input_queue.retain(|demand| {
             demand
                 .perm
                 .as_ref()
-                .is_none_or(|perm| perm.agent_id != Some(agent_id))
+                .is_none_or(|perm| perm.ask.agent_id() != agent_id)
         });
-        if self.permission_prompt.agent_id() == Some(agent_id) {
+        if self.permission_prompt.answer_key().map(AnswerKey::agent_id) == Some(agent_id) {
             self.permission_prompt.close();
         }
-        if matches!(
-            self.pending_input,
-            PendingInput::AuthRetry {
-                agent_id: Some(retry_agent_id)
-            } if retry_agent_id == agent_id
-        ) {
-            self.pending_input = PendingInput::None;
-        }
+        self.clear_agent_auth(agent_id);
         self.reconcile_active();
         let dirty = self.promote_deferred_if_ready();
         self.pending_dirty |= dirty;
@@ -3849,17 +3772,8 @@ impl App {
         }
         self.active_input = Some(demand.kind);
         if let Some(perm) = demand.perm {
-            self.permission_prompt.open_for_agent(
-                perm.id,
-                perm.tool,
-                perm.scopes,
-                perm.agent_id.and_then(|id| {
-                    self.agent_chat_index
-                        .get(&id)
-                        .and_then(|&index| self.chats[index].subagent_id.clone())
-                }),
-                perm.agent_id,
-            );
+            self.permission_prompt
+                .open_request(perm.ask, perm.tool, perm.scopes, perm.is_subagent);
         }
         false
     }
@@ -3906,16 +3820,11 @@ impl App {
         let bell = match d.kind {
             InputKind::Permission => {
                 if let Some(perm) = d.perm {
-                    self.permission_prompt.open_for_agent(
-                        perm.id,
+                    self.permission_prompt.open_request(
+                        perm.ask,
                         perm.tool,
                         perm.scopes,
-                        perm.agent_id.and_then(|id| {
-                            self.agent_chat_index
-                                .get(&id)
-                                .and_then(|&index| self.chats[index].subagent_id.clone())
-                        }),
-                        perm.agent_id,
+                        perm.is_subagent,
                     );
                 }
                 self.ui_config.bell.permission
@@ -3989,16 +3898,16 @@ impl App {
     fn active_permission_payload(&self) -> PermissionPayload {
         match &self.permission_prompt {
             PermissionPrompt::Open {
-                id,
+                ask,
                 tool,
                 scopes,
-                agent_id,
+                is_subagent,
                 ..
             } => PermissionPayload {
-                id: id.clone(),
+                ask: ask.clone(),
                 tool: tool.clone(),
                 scopes: scopes.clone(),
-                agent_id: *agent_id,
+                is_subagent: *is_subagent,
             },
             PermissionPrompt::Closed => unreachable!("permission_active requires an open prompt"),
         }
@@ -4037,9 +3946,7 @@ impl App {
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_active()
-            || self.pending_input != PendingInput::None
-            || self.question_active()
+        self.permission_active() || !self.pending_auth.is_empty() || self.question_active()
     }
 
     pub fn has_modal_overlay(&self) -> bool {

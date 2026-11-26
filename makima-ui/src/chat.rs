@@ -12,6 +12,7 @@ use crate::components::{DisplayMessage, DisplayRole, RetryInfo, ToolRole, ToolSt
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
+use makima_agent::session::AnswerKey;
 use makima_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use makima_agent::{
     AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, PostLevel, ToolDoneEvent, ToolOutput,
@@ -53,11 +54,13 @@ pub enum ChatEventResult {
     },
     Error(String),
     PermissionRequest {
-        id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
     },
-    AuthRequired,
+    AuthRequired {
+        ask: AnswerKey,
+    },
 }
 
 pub struct Chat {
@@ -223,12 +226,14 @@ impl Chat {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest {
+                ask, tool, scopes, ..
+            } => {
+                return ChatEventResult::PermissionRequest { ask, tool, scopes };
             }
             AgentEvent::Question { .. } => {}
-            AgentEvent::AuthRequired => {
-                return ChatEventResult::AuthRequired;
+            AgentEvent::AuthRequired { ask } => {
+                return ChatEventResult::AuthRequired { ask };
             }
             AgentEvent::ToolSnapshot {
                 id,

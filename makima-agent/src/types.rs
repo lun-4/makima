@@ -18,17 +18,10 @@ pub use makima_storage::id::{AgentId, TurnId};
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::session::AnswerKey;
+
 pub const NO_FILES_FOUND: &str = "No files found";
 const CHECKPOINT_FAILED_PREFIX: &str = "failed to checkpoint completed turn";
-const ASK_ANSWER_SEPARATOR: char = '\u{1f}';
-
-pub fn encode_ask_answer(ask_id: &str, payload: &str) -> String {
-    format!("{ask_id}{ASK_ANSWER_SEPARATOR}{payload}")
-}
-
-pub fn decode_ask_answer(raw: &str) -> Option<(&str, &str)> {
-    raw.split_once(ASK_ANSWER_SEPARATOR)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -882,6 +875,7 @@ pub enum AgentEvent {
     },
     PermissionRequest {
         id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
     },
@@ -889,10 +883,12 @@ pub enum AgentEvent {
     /// host (e.g. an ACP elicitation form) instead of the makima TUI.
     Question {
         id: String,
-        ask_id: String,
+        ask: AnswerKey,
         questions: serde_json::Value,
     },
-    AuthRequired,
+    AuthRequired {
+        ask: AnswerKey,
+    },
     Nudge,
     SubagentHistory {
         tool_use_id: String,
@@ -1225,8 +1221,6 @@ pub struct SubagentInfo {
     /// the parent's settings.
     #[serde(skip)]
     pub opts: Option<makima_providers::RequestOptions>,
-    #[serde(skip)]
-    pub answer_tx: Option<flume::Sender<String>>,
     /// Cancel currently executing and queued work without closing the session.
     #[serde(skip)]
     pub cancel: Option<SubagentCancel>,

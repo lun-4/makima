@@ -21,7 +21,6 @@ use handles::{
     spawn__register,
 };
 
-use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use makima_agent::actor::{
     ActorBackend, ActorHistory, AdmissionPreparation, AgentContextSnapshot, BackendResult,
@@ -152,7 +151,7 @@ fn session_model_preparer(
 /// Shared backend state, owned by the adapter and cloned into the actor's
 /// backend. Runs are transient: the [`actor::Runner`](makima_agent::actor) owns
 /// the [`History`], while every per-session capability that must outlive a
-/// run (MCP, answer channels, UI identity, cancel wiring) lives here.
+/// run (MCP, answer routing, UI identity, cancel wiring) lives here.
 ///
 /// Writes happen inside [the `ActorBackend::run_turn` future]
 /// (`LuaActorBackend`), which can only borrow `&mut self`, so every field is
@@ -167,10 +166,6 @@ struct LuaActorState {
     opts: RequestOptions,
     mcp: Option<McpSession>,
     chip_event_tx: EventSender,
-    /// `None` when the parent has no answer channel either (print), so the
-    /// child's asks are refused at once like its parent's.
-    answer_rx: Option<Arc<AsyncMutex<flume::Receiver<String>>>>,
-    answer_tx: Option<flume::Sender<String>>,
     ui_id: String,
     parent_event_tx: EventSender,
     cancel: SubagentCancel,
@@ -211,7 +206,6 @@ impl LuaActorState {
                         .spec(),
                 ),
                 opts: Some(self.opts),
-                answer_tx: self.answer_tx.clone(),
                 cancel: Some(self.cancel.clone()),
             });
         }
@@ -472,7 +466,12 @@ impl ActorBackend for LuaActorBackend {
                 &context,
                 loaded,
             )
-            .with_user_response_rx(state.answer_rx.clone())
+            .with_answers(
+                state
+                    .template
+                    .get()
+                    .and_then(|template| template.answers.clone()),
+            )
             .with_mcp(state.mcp.clone())
             .with_local_tools(Arc::clone(&state.local_tools))
             .with_local_tool_capture(Arc::clone(&state.commit));
@@ -1067,7 +1066,7 @@ async fn permission_prompt(
             &tool_key,
             &perm_scopes,
             &tctx.event_tx,
-            tctx.user_response_rx.as_deref(),
+            tctx.answer_scope(),
             tctx.tool_use_id.as_deref().unwrap_or(""),
             &tctx.cancel,
             tctx.restrict_write_to().as_deref(),
@@ -1742,8 +1741,9 @@ fn spawn_session_actor(
 fn register_session(
     lua: &Lua,
     sess: LuaSession,
-    child_template: ToolContext,
+    mut child_template: ToolContext,
 ) -> Result<LuaSession, String> {
+    child_template.execution_agent_id = Some(sess.agent_id);
     let _ = sess.state.template.set(child_template.clone());
     if let Some(service) = crate::orchestration::services(lua)
         && let Err(error) = service.register_child_target(
@@ -1845,13 +1845,6 @@ async fn build_session(
         Ok(())
     };
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
-    let (answer_tx, answer_rx) = match parent.context.user_response_rx {
-        Some(_) => {
-            let (answer_tx, answer_rx) = flume::unbounded::<String>();
-            (Some(answer_tx), Some(Arc::new(AsyncMutex::new(answer_rx))))
-        }
-        None => (None, None),
-    };
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let ui_id = parent
         .context
@@ -1899,8 +1892,6 @@ async fn build_session(
         opts: child.opts,
         mcp: child_template.mcp.as_ref().map(McpSession::fresh),
         chip_event_tx: EventSender::with_identity(sub_tx, parent.context.event_tx.identity()),
-        answer_rx,
-        answer_tx,
         ui_id,
         parent_event_tx: parent.context.event_tx.clone(),
         cancel,
@@ -2009,7 +2000,6 @@ pub(crate) fn send_post(lua: &Lua, target: &TrustedContext, post: Post) -> Resul
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             });
         (target.template.event_tx.clone(), subagent)
@@ -2295,12 +2285,6 @@ async fn activate_agent_with_guard(
                 prompt_slots,
             } = prepared;
             let (sub_tx, sub_rx) = flume::unbounded();
-            let (answer_tx, answer_rx) = if context.user_response_rx.is_some() {
-                let (tx, rx) = flume::unbounded();
-                (Some(tx), Some(Arc::new(AsyncMutex::new(rx))))
-            } else {
-                (None, None)
-            };
             let cancel_actor = Arc::new(Mutex::new(None::<AgentActorHandle>));
             let cancel = SubagentCancel::new({
                 let actor = cancel_actor.clone();
@@ -2325,8 +2309,6 @@ async fn activate_agent_with_guard(
                 opts: child.opts,
                 mcp: template.mcp.clone(),
                 chip_event_tx: EventSender::with_identity(sub_tx, context.event_tx.identity()),
-                answer_rx,
-                answer_tx,
                 ui_id: input.record.transcript_key.clone(),
                 parent_event_tx: context.event_tx.clone(),
                 cancel,
@@ -2627,6 +2609,7 @@ mod tests {
 
     use makima_agent::actor::ActorLifecycle;
     use makima_agent::cancel::CancelToken;
+    use makima_agent::session::AnswerRouter;
     use makima_agent::tools::test_support::stub_ctx;
     use makima_agent::{
         AgentId, AgentParams, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome, TurnResult,
@@ -2988,9 +2971,11 @@ mod tests {
             }
             None => (parent_raw_tx.clone(), None),
         };
-        let (answer_tx, answer_rx) = flume::unbounded();
         let ui_id = "task-1".to_owned();
-        let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
+        let mut template = stub_ctx(&AgentMode::Build);
+        template.answers = Some(AnswerRouter::default());
+        template.execution_agent_id = Some(agent_id);
+        let ctx = AgentContext::from(&template);
         let params = AgentParams {
             agent_id,
             provider,
@@ -3017,7 +3002,7 @@ mod tests {
             managed_turn: None,
         };
         let state = Arc::new(LuaActorState {
-            template: OnceLock::from(stub_ctx(&AgentMode::Build)),
+            template: OnceLock::from(template),
             params: OnceLock::from(params),
             prompt_slots: PromptSlotSource::default(),
             custom_system: String::new(),
@@ -3028,8 +3013,6 @@ mod tests {
             },
             mcp: None,
             chip_event_tx: EventSender::new(chip_raw_tx),
-            answer_rx: Some(Arc::new(AsyncMutex::new(answer_rx))),
-            answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
             parent_event_tx: EventSender::with_identity(
                 parent_raw_tx.clone(),
@@ -3891,7 +3874,6 @@ mod tests {
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             })
             .unwrap();
@@ -3962,7 +3944,6 @@ mod tests {
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             })
             .unwrap();
@@ -3975,7 +3956,6 @@ mod tests {
             prompt: None,
             model: None,
             opts: None,
-            answer_tx: None,
             cancel: None,
         };
         sub_tx

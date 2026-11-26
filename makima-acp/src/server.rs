@@ -18,6 +18,7 @@ use agent_client_protocol_schema::{
 };
 use event_listener::Event;
 use flume::{Receiver, Sender};
+use makima_agent::agent::isolated_turn::IsolatedTurnEvent;
 use makima_agent::config_change::ConfigChangeError;
 use makima_agent::headless::{
     self, FrontendProfile, InteractiveHandle, InteractiveParams, WorkCancel,
@@ -25,8 +26,8 @@ use makima_agent::headless::{
 use makima_agent::journal::SessionJournal;
 use makima_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use makima_agent::mcp::{self, McpHandle};
-use makima_agent::permissions::{PermissionAnswer, TaggedAnswer};
-use makima_agent::session::{SessionEvent, SessionEventPump};
+use makima_agent::permissions::PermissionAnswer;
+use makima_agent::session::{AnswerKey, AnswerRouter, SessionEvent, SessionEventPump};
 use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorError, SessionCoordinatorHandle,
 };
@@ -35,10 +36,10 @@ use makima_agent::session_options::{MODEL_OPTION_ID, SessionOptionError};
 use makima_agent::session_recovery::{OpenModel, OpenSessionError, SessionSource, open_session};
 use makima_agent::session_writer::SessionWriter;
 use makima_agent::tools::QuestionMode;
-use makima_agent::types::{AgentEvent, encode_ask_answer};
+use makima_agent::types::AgentEvent;
 use makima_agent::{
-    AgentId, AgentInput, AgentRef, ImageMediaType, ImageSource, ModeError, TurnFailureKind, TurnId,
-    TurnOutcome, TurnTicket,
+    AgentId, AgentInput, AgentRef, CancelScope, ImageMediaType, ImageSource, ModeError,
+    TurnFailureKind, TurnId, TurnOutcome, TurnTicket,
 };
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
@@ -117,23 +118,22 @@ impl PendingOperation {
 }
 
 struct PendingElicitation {
-    request_id: i64,
-    ask_id: String,
+    ask: AnswerKey,
     turn_id: TurnId,
 }
 
-/// What the client still owes us. Subagents have independent answer channels,
-/// so more than one permission request can be outstanding.
+/// Asks awaiting client responses, indexed by outgoing ACP request ID.
 #[derive(Default)]
 struct Pending {
     operation: Option<PendingOperation>,
+    isolated: Option<PendingOperation>,
     /// Prompts whose message started a turn of its own behind the running
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
     continuing_root: BTreeSet<TurnId>,
     cancelling_continuations: Vec<TurnTicket>,
-    permissions: HashMap<i64, (String, Sender<String>)>,
-    elicitation: Option<PendingElicitation>,
+    permissions: HashMap<i64, AnswerKey>,
+    elicitations: HashMap<i64, PendingElicitation>,
     ask_root: Option<AgentRef>,
     /// The client closed its input, so no answer to a new ask can arrive.
     input_closed: bool,
@@ -169,6 +169,10 @@ impl Pending {
                 .operation
                 .as_ref()
                 .is_some_and(|operation| operation.cancelling)
+            || self
+                .isolated
+                .as_ref()
+                .is_some_and(|operation| operation.cancelling)
     }
 
     fn refuses_asks(&self) -> bool {
@@ -198,6 +202,7 @@ impl Pending {
             .take()
             .into_iter()
             .chain(self.queued.drain(..))
+            .chain(self.isolated.take())
             .collect()
     }
 }
@@ -964,17 +969,17 @@ fn refuse_asks(session: &SessionState) {
     let permission_answers = {
         let mut pending = session.pending.lock().unwrap();
         pending.input_closed = true;
-        if let Some(elicitation) = pending.elicitation.take() {
+        for elicitation in std::mem::take(&mut pending.elicitations).into_values() {
             let _ = pending.with_live_root_turn(elicitation.turn_id, || {
-                let _ = session.handle.answer_tx.try_send(encode_ask_answer(
-                    &elicitation.ask_id,
-                    ELICITATION_DISMISSED,
-                ));
+                let _ = session
+                    .handle
+                    .answers
+                    .answer(elicitation.ask, ELICITATION_DISMISSED.into());
             });
         }
         std::mem::take(&mut pending.permissions)
     };
-    deny_permissions(permission_answers);
+    deny_permissions(&session.handle.answers, permission_answers);
 }
 
 /// The client closed its input but still reads the output: the work in
@@ -986,7 +991,7 @@ async fn finish_in_flight(session: &SessionState) {
     loop {
         let settled = {
             let pending = session.pending.lock().unwrap();
-            if pending.operation.is_none() {
+            if pending.operation.is_none() && pending.isolated.is_none() {
                 break;
             }
             pending.settled.listen()
@@ -1011,14 +1016,14 @@ async fn close_session(srv: &mut Server) {
     // have to be answered here or the client waits on them forever.
     let (operations, permission_answers) = {
         let mut pending = state.pending.lock().unwrap();
-        pending.elicitation = None;
+        pending.elicitations.clear();
         (pending.take_all(), std::mem::take(&mut pending.permissions))
     };
     for request_id in operations.iter().flat_map(PendingOperation::requests) {
         respond_prompt(&srv.out_tx, request_id, StopReason::Cancelled);
     }
     state.handle.manager.suspend(GRAPH_SHUTDOWN_TIMEOUT).await;
-    deny_permissions(permission_answers);
+    deny_permissions(&state.handle.answers, permission_answers);
     state.handle.manager.journal().invalidate_state_access();
     state.handle.task.cancel().await;
     if let Some(coordinator) = state.coordinator.take()
@@ -1278,7 +1283,7 @@ async fn install_session_with_lock(
         srv.out_tx.clone(),
         Arc::clone(&pending),
         srv.elicitation,
-        handle.answer_tx.clone(),
+        handle.answers.clone(),
         coordinator.read(),
         home,
         project_trusted,
@@ -1608,7 +1613,7 @@ async fn run_dispatch(
             send_command_turn(session, id, turn, admission).await
         }
         InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(turn)) => {
-            send_isolated_turn(session, &srv.out_tx, id, turn, admission).await
+            send_isolated_turn(session, &srv.out_tx, id, turn, admission)
         }
         InputDispatch::Dispatched(CommandOutcome::ManualCompaction(instructions)) => {
             send_manual_compaction(session, &srv.out_tx, id, instructions, admission).await
@@ -1632,16 +1637,13 @@ async fn send_manual_compaction(
     admission: &PinnedCommandTarget,
 ) -> Result<(), AcpError> {
     let actor = admission.actor().map_err(session_registration_error)?;
-    if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
-    }
     session.coordinator.as_ref().ok_or_else(no_session)?;
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let tool_id = format!("compact-{operation_id}");
     let (trigger, cancel) = makima_agent::cancel::CancelToken::new();
     {
         let mut pending = session.pending.lock().unwrap();
-        if pending.operation.is_some() {
+        if pending.operation.is_some() || pending.isolated.is_some() {
             return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
         }
         pending.operation = Some(PendingOperation {
@@ -1769,17 +1771,14 @@ async fn send_manual_compaction(
     Ok(())
 }
 
-async fn send_isolated_turn(
+fn send_isolated_turn(
     session: &SessionState,
     out_tx: &Sender<Value>,
     id: &RequestId,
     turn: makima_commands::IsolatedTurn,
     admission: &PinnedCommandTarget,
 ) -> Result<(), AcpError> {
-    let actor = admission.actor().map_err(session_registration_error)?;
-    if session.pending.lock().unwrap().operation.is_some() {
-        return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
-    }
+    admission.validate().map_err(session_registration_error)?;
     let images = turn
         .content
         .attachments
@@ -1794,12 +1793,21 @@ async fn send_isolated_turn(
     session.coordinator.as_ref().ok_or_else(no_session)?;
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let (trigger, cancel) = makima_agent::cancel::CancelToken::new();
-    {
+    let events = {
         let mut pending = session.pending.lock().unwrap();
-        if pending.operation.is_some() {
+        if pending.isolated.is_some()
+            || pending
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.kind != OperationKind::PrimaryTurn)
+        {
             return Err(AcpError::new(-32600, ACTIVE_OPERATION_MESSAGE));
         }
-        pending.operation = Some(PendingOperation {
+        let events = admission
+            .target
+            .ask_isolated(turn.content.text.to_string(), images, cancel)
+            .map_err(|error| AcpError::internal_error().data(Value::String(error.to_string())))?;
+        pending.isolated = Some(PendingOperation {
             id: operation_id,
             request_id: id.clone(),
             kind: OperationKind::IsolatedTurn,
@@ -1808,25 +1816,13 @@ async fn send_isolated_turn(
             cancel: Some(WorkCancel::Control(trigger)),
             joined: Vec::new(),
         });
-    }
-    let (output, events) = flume::unbounded();
-    if session
-        .handle
-        .control_tx
-        .send_isolated_to(actor, turn.content.text.to_string(), images, output, cancel)
-        .await
-        .is_err()
-    {
-        release_operation(&session.pending, operation_id, OperationKind::IsolatedTurn);
-        return Err(AcpError::new(-32603, SESSION_ENDED_MESSAGE));
-    }
+        events
+    };
     let pending = Arc::clone(&session.pending);
     let out_tx = out_tx.clone();
     let sid = SessionId::from(session.handle.session_id.to_string());
     smol::spawn(async move {
         while let Ok(event) = events.recv_async().await {
-            use makima_agent::agent::isolated_turn::IsolatedTurnEvent;
-
             match event {
                 IsolatedTurnEvent::TextDelta(text) => {
                     session_update(&out_tx, &sid, translate::text_delta(&text));
@@ -1949,7 +1945,10 @@ async fn send_command_turn(
         kind: OperationKind::PrimaryTurn,
         run_id: Some(run_id),
         cancelling: false,
-        cancel: Some(session.handle.input_tx.turn_cancel(ticket)),
+        cancel: Some(WorkCancel::Scope(
+            CancelScope::Turn(ticket),
+            session.handle.cancellation.clone(),
+        )),
         joined: Vec::new(),
     };
     if pending.operation.is_some() {
@@ -1997,14 +1996,20 @@ fn finish_operation(
 ) -> bool {
     let operation = {
         let mut pending = pending.lock().unwrap();
-        if !pending
-            .operation
-            .as_ref()
-            .is_some_and(|operation| operation.id == operation_id && operation.kind == kind)
-        {
+        let matches = |operation: &mut PendingOperation| {
+            operation.id == operation_id && operation.kind == kind
+        };
+        if kind == OperationKind::IsolatedTurn {
+            let Some(operation) = pending.isolated.take_if(matches) else {
+                return false;
+            };
+            pending.settled.notify(usize::MAX);
+            operation
+        } else if pending.operation.as_mut().is_some_and(matches) {
+            pending.settle()
+        } else {
             return false;
         }
-        pending.settle()
     };
     answer(operation, respond);
     true
@@ -2145,9 +2150,9 @@ fn effective_session_cwd(
     if cwd.is_absolute() { cwd } else { client }.to_path_buf()
 }
 
-fn deny_permissions(permission_answers: HashMap<i64, (String, Sender<String>)>) {
-    for (request_id, answer_tx) in permission_answers.into_values() {
-        let _ = answer_tx.send(TaggedAnswer::new(request_id, PermissionAnswer::Deny).encode());
+fn deny_permissions(answers: &AnswerRouter, permission_answers: HashMap<i64, AnswerKey>) {
+    for ask in permission_answers.into_values() {
+        let _ = answers.answer(ask, PermissionAnswer::Deny.encode());
     }
 }
 
@@ -2173,6 +2178,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                         .operation
                         .iter_mut()
                         .chain(&mut pending.queued)
+                        .chain(&mut pending.isolated)
                         .filter_map(PendingOperation::start_cancelling)
                         .collect();
                     pending.cancelling_continuations.clear();
@@ -2187,21 +2193,26 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                                     .iter()
                                     .any(|cancel| cancel.turn_id() == Some(turn_id))
                                 {
-                                    cancellations
-                                        .push(session.handle.input_tx.turn_cancel(ticket.clone()));
+                                    cancellations.push(WorkCancel::Scope(
+                                        CancelScope::Turn(ticket.clone()),
+                                        session.handle.cancellation.clone(),
+                                    ));
                                 }
                                 pending.cancelling_continuations.push(ticket);
                             }
                         }
                     }
-                    if pending.operation.is_none() && pending.cancelling_continuations.is_empty() {
+                    if cancellations.is_empty()
+                        && pending.operation.is_none()
+                        && pending.cancelling_continuations.is_empty()
+                    {
                         return;
                     }
                     let permission_answers = std::mem::take(&mut pending.permissions);
-                    pending.elicitation = None;
+                    pending.elicitations.clear();
                     (cancellations, permission_answers)
                 };
-                deny_permissions(permission_answers);
+                deny_permissions(&session.handle.answers, permission_answers);
                 for cancellation in cancellations {
                     cancellation.cancel();
                 }
@@ -2219,32 +2230,23 @@ fn ask_id(id: &Value) -> Option<i64> {
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
     let id_num = raw.get("id").and_then(ask_id);
-    let answer = {
-        let mut pending = session.pending.lock().unwrap();
-        if let Some(id) = id_num
-            && let Some(elicitation) = pending
-                .elicitation
-                .take_if(|elicitation| elicitation.request_id == id)
-        {
-            let answer = encode_ask_answer(&elicitation.ask_id, &elicitation_answer(raw));
-            let _ = pending.with_live_root_turn(elicitation.turn_id, || {
-                let _ = session.handle.answer_tx.try_send(answer);
-            });
-            None
-        } else if let Some(id) = id_num
-            && let Some((request_id, answer_tx)) = pending.permissions.remove(&id)
-        {
-            Some((
-                answer_tx,
-                TaggedAnswer::new(request_id, permission_answer(raw)).encode(),
-            ))
-        } else {
-            warn!(?id_num, "response for an unknown request id");
-            None
-        }
-    };
-    if let Some((answer_tx, answer)) = answer {
-        let _ = answer_tx.send(answer);
+    let mut pending = session.pending.lock().unwrap();
+    if let Some(id) = id_num
+        && let Some(elicitation) = pending.elicitations.remove(&id)
+    {
+        let answer = elicitation_answer(raw);
+        let _ = pending.with_live_root_turn(elicitation.turn_id, || {
+            let _ = session.handle.answers.answer(elicitation.ask, answer);
+        });
+    } else if let Some(id) = id_num
+        && let Some(ask) = pending.permissions.remove(&id)
+    {
+        let _ = session
+            .handle
+            .answers
+            .answer(ask, permission_answer(raw).encode());
+    } else {
+        warn!(?id_num, "response for an unknown request id");
     }
 }
 
@@ -2339,7 +2341,7 @@ fn start_event_pump(
     out_tx: Sender<Value>,
     pending: PendingState,
     elicitation: bool,
-    answer_tx: Sender<String>,
+    answers: AnswerRouter,
     session: makima_agent::session_coordinator::SessionReadHandle,
     home: Option<PathBuf>,
     project_trusted: bool,
@@ -2384,18 +2386,13 @@ fn start_event_pump(
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
             }
-            let permission_answer_tx = if let Some(subagent) = subagent {
-                if !matches!(&event, AgentEvent::PermissionRequest { .. }) {
-                    continue;
+            let is_root = subagent.is_none();
+            if !is_root && !matches!(&event, AgentEvent::PermissionRequest { .. }) {
+                if let AgentEvent::Question { ask, .. } = event {
+                    let _ = answers.answer(ask, ELICITATION_DISMISSED.into());
                 }
-                let Some(answer_tx) = subagent.answer_tx else {
-                    warn!(agent_id = %subagent.agent_id, "subagent permission request has no answer channel");
-                    continue;
-                };
-                Some(answer_tx)
-            } else {
-                None
-            };
+                continue;
+            }
 
             let update = match event {
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
@@ -2416,11 +2413,13 @@ fn start_event_pump(
                     translate::tool_done(&event, session.cwd().as_deref(), home.as_deref())
                 }
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
-                AgentEvent::PermissionRequest { id, tool, scopes } => {
-                    let raw_input = permission_answer_tx
-                        .is_none()
-                        .then(|| tool_inputs.get(&id))
-                        .flatten();
+                AgentEvent::PermissionRequest {
+                    id,
+                    ask,
+                    tool,
+                    scopes,
+                } => {
+                    let raw_input = is_root.then(|| tool_inputs.get(&id)).flatten();
                     let request =
                         AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
                             sid.clone(),
@@ -2447,11 +2446,8 @@ fn start_event_pump(
                             "/params/toolCall",
                         );
                     };
-                    let is_root = permission_answer_tx.is_none();
-                    let answer_tx = permission_answer_tx.unwrap_or_else(|| answer_tx.clone());
                     if pending.refuses_asks() {
-                        let _ =
-                            answer_tx.send(TaggedAnswer::new(&id, PermissionAnswer::Deny).encode());
+                        let _ = answers.answer(ask, PermissionAnswer::Deny.encode());
                     } else {
                         if let Some(turn_id) = turn_id.filter(|_| is_root) {
                             if pending.with_live_root_turn(turn_id, send_request).is_none() {
@@ -2460,15 +2456,11 @@ fn start_event_pump(
                         } else {
                             send_request();
                         }
-                        pending.permissions.insert(request_id, (id, answer_tx));
+                        pending.permissions.insert(request_id, ask);
                     }
                     continue;
                 }
-                AgentEvent::Question {
-                    id,
-                    ask_id,
-                    questions,
-                } => {
+                AgentEvent::Question { id, ask, questions } => {
                     let mut pending = pending.lock().unwrap();
                     if let Some(turn_id) = turn_id
                         && !pending.operation.as_ref().is_some_and(|operation| {
@@ -2498,20 +2490,16 @@ fn start_event_pump(
                                     );
                                     Some(outgoing_id)
                                 } else {
-                                    let _ = answer_tx.try_send(encode_ask_answer(
-                                        &ask_id,
-                                        ELICITATION_DISMISSED,
-                                    ));
+                                    let _ =
+                                        answers.answer(ask.clone(), ELICITATION_DISMISSED.into());
                                     None
                                 }
                             })
                             .flatten();
                         if let Some(request_id) = request_id {
-                            pending.elicitation = Some(PendingElicitation {
-                                request_id,
-                                ask_id,
-                                turn_id,
-                            });
+                            pending
+                                .elicitations
+                                .insert(request_id, PendingElicitation { ask, turn_id });
                         }
                     }
                     continue;
@@ -2522,13 +2510,9 @@ fn start_event_pump(
                         let mut pending = pending.lock().unwrap();
                         let turn_id = outcome.turn_id();
                         pending.continuing_root.remove(&turn_id);
-                        if pending
-                            .elicitation
-                            .as_ref()
-                            .is_some_and(|elicitation| elicitation.turn_id == turn_id)
-                        {
-                            pending.elicitation = None;
-                        }
+                        pending
+                            .elicitations
+                            .retain(|_, elicitation| elicitation.turn_id != turn_id);
                     }
                     finish_primary_run(&pending, run_id, |request_id| match &outcome {
                         TurnOutcome::Completed { reason, .. } => {
@@ -2580,7 +2564,7 @@ fn start_event_pump(
         }
         let unanswered = {
             let mut pending = pending.lock().unwrap();
-            pending.elicitation = None;
+            pending.elicitations.clear();
             if pending
                 .operation
                 .as_ref()
@@ -2703,6 +2687,7 @@ mod tests {
     use makima_agent::agent::PromptSlotSource;
     use makima_agent::journal::{JournalChange, JournalCommit};
     use makima_agent::manager::{AgentResidency, GraphLifecycle};
+    use makima_agent::session::PendingAnswer;
     use makima_agent::state::{StateError, StateRevision, StateScope, StateSlotSpec};
     use makima_agent::tools::ToolRegistry;
     use makima_agent::types::{ActorWorkIdentity, ActorWorkKind};
@@ -2733,7 +2718,6 @@ mod tests {
 
     use super::*;
 
-    const ASK_ID: &str = "test-ask";
     const QUESTION_TOOL: &str = "acp_ask_probe";
     const LATE_ANSWER: &str = "expired ask's answer";
     const CURRENT_ANSWER: &str = "current ask's answer";
@@ -3016,7 +3000,6 @@ mod tests {
     ) -> (
         makima_lua::PluginHost,
         Receiver<(&'static str, String, bool)>,
-        Receiver<String>,
         TempDir,
         Receiver<String>,
     ) {
@@ -3092,7 +3075,6 @@ mod tests {
             checkpoint,
         );
         let initial = Arc::clone(&provider);
-        let (root_answers_tx, root_answers_rx) = flume::bounded(1);
         let (binding, root_target) = makima_lua::orchestration::root_binding();
         let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
@@ -3136,21 +3118,7 @@ mod tests {
                 })
             }),
             None,
-            Some(Box::new(
-                move |manager, target, template, initialization| {
-                    Box::pin(async move {
-                        let answers = template
-                            .user_response_rx
-                            .as_ref()
-                            .unwrap()
-                            .lock()
-                            .await
-                            .clone();
-                        root_answers_tx.send_async(answers).await.unwrap();
-                        binding(manager, target, template, initialization).await
-                    })
-                },
-            )),
+            Some(binding),
         );
         let replacement = Arc::clone(&provider);
         let root = makima_lua::orchestration::bind_frontend_root(
@@ -3216,7 +3184,6 @@ mod tests {
         observer.install(root.target.clone());
         host.event_handle()
             .install_orchestration_services(services.clone());
-        let root_answers = root_answers_rx.recv_async().await.unwrap();
         let previous = std::mem::replace(&mut session.handle, handle);
         previous.task.cancel().await;
         session.command_root = root.clone();
@@ -3245,7 +3212,7 @@ mod tests {
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
             false,
-            session.handle.answer_tx.clone(),
+            session.handle.answers.clone(),
             coordinator.read(),
             None,
             PUMP_TRUSTED,
@@ -3254,7 +3221,7 @@ mod tests {
         )
         .detach();
         srv.lua_event_handle = host.event_handle();
-        (host, received, root_answers, state, notices)
+        (host, received, state, notices)
     }
 
     async fn prompt_terminal(out: &Receiver<Value>, id: i64) -> Value {
@@ -3858,20 +3825,14 @@ mod tests {
                             .template
                             .event_tx
                             .clone();
-                        let answers = Arc::clone(
-                            server
-                                .session
-                                .as_ref()
-                                .unwrap()
-                                .command_root
-                                .template
-                                .user_response_rx
-                                .as_ref()
-                                .unwrap(),
-                        );
-                        events.send_envelope(test_question(turn)).unwrap();
+                        let answers = server.session.as_ref().unwrap().handle.answers.clone();
+                        let old_answer = answers.register(root.id());
+                        let queued_answer = answers.register(root.id());
+                        events
+                            .send_envelope(test_question(turn, old_answer.key()))
+                            .unwrap();
                         let old_id = next_elicitation(&out_rx).await;
-                        Some((events, old_id, answers, test_question(turn)))
+                        Some((events, old_id, answers, old_answer, queued_answer))
                     } else {
                         None
                     };
@@ -3930,11 +3891,17 @@ mod tests {
                         .unwrap();
                     }
                     assert_eq!(turns.next_text().await, NEW_PROMPT);
-                    if let Some((events, old_id, answers, queued)) = questions {
-                        events.send_envelope(queued).unwrap();
-                        assert_no_ask_before_barrier(&events, &out_rx).await;
+                    if let Some((events, old_id, answers, old_answer, queued_answer)) = questions {
                         events
-                            .send_envelope(test_question(turns.latest().turn_id()))
+                            .send_envelope(test_question(turn, queued_answer.key()))
+                            .unwrap();
+                        assert_no_ask_before_barrier(&events, &out_rx).await;
+                        let next_answer = answers.register(root.id());
+                        events
+                            .send_envelope(test_question(
+                                turns.latest().turn_id(),
+                                next_answer.key(),
+                            ))
                             .unwrap();
                         let next_id = next_elicitation(&out_rx).await;
                         for (id, answer) in [(old_id, OLD_REPLY), (next_id, NEXT_ANSWER)] {
@@ -3944,15 +3911,12 @@ mod tests {
                             });
                             handle_line(&mut server, &response.to_string(), &params).await;
                         }
-                        let answers = answers.lock().await;
                         assert_eq!(
-                            answers.try_recv().unwrap(),
-                            encode_ask_answer(
-                                ASK_ID,
-                                &serde_json::json!({"answers": [[NEXT_ANSWER]]}).to_string()
-                            )
+                            next_answer.try_recv().unwrap(),
+                            serde_json::json!({"answers": [[NEXT_ANSWER]]}).to_string()
                         );
-                        assert!(answers.is_empty());
+                        assert!(old_answer.is_empty());
+                        assert!(queued_answer.is_empty());
                     }
                     turns.release();
                     let response = prompt_terminal(&out_rx, PROMPT_ID).await;
@@ -4412,7 +4376,7 @@ mod tests {
         supports_boolean_config(&raw)
     }
 
-    fn server_awaiting_answer() -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
+    fn server_awaiting_answer() -> (Server, PendingAnswer, Receiver<Value>, RootTurns) {
         server_awaiting_answer_with_checkpoint(successful_checkpoint())
     }
 
@@ -4422,8 +4386,7 @@ mod tests {
                     makima_agent::session_coordinator::SessionCheckpoint,
                 >,
         >,
-    ) -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
-        let (answer_tx, answer_rx) = flume::unbounded();
+    ) -> (Server, PendingAnswer, Receiver<Value>, RootTurns) {
         let (out_tx, out_rx) = flume::unbounded();
         let (requests, requests_rx) = flume::unbounded();
         let (release, released) = flume::unbounded();
@@ -4434,7 +4397,7 @@ mod tests {
         let prepared = Arc::clone(&provider);
         let session_id = MakimaId::generate();
         let (binding, root_target) = makima_lua::orchestration::root_binding();
-        let mut handle = headless::spawn_interactive_with_binding(
+        let handle = headless::spawn_interactive_with_binding(
             InteractiveParams {
                 model: spec_providers().model(OFFLINE_SPEC).unwrap(),
                 config: Default::default(),
@@ -4474,7 +4437,7 @@ mod tests {
         );
         let root = smol::block_on(handle.initialized_root()).unwrap();
         let command_root = root_target.recv().unwrap();
-        handle.answer_tx = answer_tx.clone();
+        let answer_rx = handle.answers.register(root.id());
         let turns = RootTurns {
             actor: root.actor().unwrap(),
             requests: requests_rx,
@@ -4537,7 +4500,7 @@ mod tests {
                 checkpoint: None,
                 mcp: None,
                 pending: Arc::new(Mutex::new(Pending {
-                    permissions: HashMap::from([(ANSWERED_ID, ("toolu_1".to_string(), answer_tx))]),
+                    permissions: HashMap::from([(ANSWERED_ID, answer_rx.key())]),
                     ask_root: Some(command_root.target.clone()),
                     ..Default::default()
                 })),
@@ -4800,17 +4763,14 @@ mod tests {
     #[test]
     fn close_denies_outstanding_permission_requests() {
         smol::block_on(async {
-            let (mut srv, ..) = server_awaiting_answer();
+            let (mut srv, permission_rx, ..) = server_awaiting_answer();
             let pending = Arc::clone(&srv.session.as_ref().unwrap().pending);
-            let (permission_tx, permission_rx) = flume::unbounded();
-            pending.lock().unwrap().permissions =
-                HashMap::from([(ANSWERED_ID, ("perm-id".to_string(), permission_tx))]);
 
             close_session(&mut srv).await;
 
             assert_eq!(
                 permission_rx.try_recv().ok(),
-                Some(TaggedAnswer::new("perm-id", PermissionAnswer::Deny).encode())
+                Some(PermissionAnswer::Deny.encode())
             );
             assert!(pending.lock().unwrap().permissions.is_empty());
         });
@@ -5216,7 +5176,7 @@ mod tests {
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert_eq!(
             answer_rx.try_recv().ok(),
-            Some(TaggedAnswer::new("toolu_1", PermissionAnswer::AllowOnce).encode())
+            Some(PermissionAnswer::AllowOnce.encode())
         );
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
@@ -5488,7 +5448,7 @@ mod tests {
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert_eq!(
             answer_rx.try_recv().ok(),
-            Some(TaggedAnswer::new("toolu_1", PermissionAnswer::AllowOnce).encode()),
+            Some(PermissionAnswer::AllowOnce.encode()),
             "stale cancellation must not cancel the active session"
         );
     }
@@ -5496,13 +5456,12 @@ mod tests {
     #[test]
     fn cancel_denies_all_outstanding_permission_requests() {
         let (srv, answer_rx, ..) = server_awaiting_answer();
-        let pending = &srv.session.as_ref().unwrap().pending;
-        let (subagent_answer_tx, subagent_answer_rx) = flume::unbounded();
-        let mut pending = pending.lock().unwrap();
-        pending.permissions.insert(
-            ANSWERED_ID + 1,
-            ("sub-perm".to_string(), subagent_answer_tx),
-        );
+        let session = srv.session.as_ref().unwrap();
+        let subagent_answer_rx = session.handle.answers.register(AgentId::generate());
+        let mut pending = session.pending.lock().unwrap();
+        pending
+            .permissions
+            .insert(ANSWERED_ID + 1, subagent_answer_rx.key());
         pending.operation = Some(PendingOperation {
             id: 1,
             request_id: RequestId::Number(41),
@@ -5525,11 +5484,11 @@ mod tests {
 
         assert_eq!(
             answer_rx.try_recv().ok(),
-            Some(TaggedAnswer::new("toolu_1", PermissionAnswer::Deny).encode())
+            Some(PermissionAnswer::Deny.encode())
         );
         assert_eq!(
             subagent_answer_rx.try_recv().ok(),
-            Some(TaggedAnswer::new("sub-perm", PermissionAnswer::Deny).encode())
+            Some(PermissionAnswer::Deny.encode())
         );
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert!(answer_rx.is_empty(), "the late answer must be ignored");
@@ -5538,17 +5497,20 @@ mod tests {
     #[test]
     fn cancel_during_permission_allows_the_next_prompt() {
         smol::block_on(async {
-            let (mut srv, answer_rx, out_rx, turns) = server_awaiting_answer();
+            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
             session.pending.lock().unwrap().permissions.clear();
+            let answers = session.handle.answers.clone();
+            let agent = session.command_root.target.id();
+            let answer_rx = answers.register(agent);
             start_event_pump(
                 &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),
                 false,
-                session.handle.answer_tx.clone(),
+                session.handle.answers.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 makima_storage::paths::home(),
                 PUMP_TRUSTED,
@@ -5571,6 +5533,7 @@ mod tests {
                 .send_async(Envelope {
                     event: AgentEvent::PermissionRequest {
                         id: "tool-1".to_string(),
+                        ask: answer_rx.key(),
                         tool: makima_config::ToolKey::Native(Arc::from("bash")),
                         scopes: vec!["echo first".to_string()],
                     },
@@ -5589,8 +5552,8 @@ mod tests {
                 &serde_json::json!({ "params": { "sessionId": session_id } }),
             );
             assert_eq!(
-                answer_rx.recv_async().await.unwrap(),
-                TaggedAnswer::new("tool-1", PermissionAnswer::Deny).encode()
+                answer_rx.recv().await.unwrap(),
+                PermissionAnswer::Deny.encode()
             );
             handle_incoming_response(&srv, &allow_once(permission_id));
             assert!(
@@ -5599,10 +5562,12 @@ mod tests {
             );
             turns.assert_cancelled(&first).await;
 
+            let stale_answer = answers.register(agent);
             event_tx
                 .send_async(Envelope {
                     event: AgentEvent::PermissionRequest {
                         id: "tool-stale".to_string(),
+                        ask: stale_answer.key(),
                         tool: makima_config::ToolKey::Native(Arc::from("bash")),
                         scopes: vec!["echo stale".to_string()],
                     },
@@ -5612,8 +5577,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                answer_rx.recv_async().await.unwrap(),
-                TaggedAnswer::new("tool-stale", PermissionAnswer::Deny).encode()
+                stale_answer.recv().await.unwrap(),
+                PermissionAnswer::Deny.encode()
             );
             assert!(
                 out_rx.is_empty(),
@@ -5980,7 +5945,7 @@ mod tests {
                     srv.out_tx.clone(),
                     Arc::clone(&session.pending),
                     false,
-                    session.handle.answer_tx.clone(),
+                    session.handle.answers.clone(),
                     session.coordinator.as_ref().unwrap().read(),
                     makima_storage::paths::home(),
                     PUMP_TRUSTED,
@@ -6116,7 +6081,7 @@ mod tests {
                 srv.out_tx.clone(),
                 Arc::clone(&pending),
                 false,
-                session.handle.answer_tx.clone(),
+                session.handle.answers.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -6223,7 +6188,7 @@ mod tests {
             assert!(smol::future::poll_once(&mut finishing).await.is_none());
             assert_eq!(
                 answer_rx.try_recv().unwrap(),
-                TaggedAnswer::new("toolu_1", PermissionAnswer::Deny).encode()
+                PermissionAnswer::Deny.encode()
             );
             assert!(session.pending.lock().unwrap().refuses_asks());
             take_active_operation(&session.pending, OperationKind::PrimaryTurn).unwrap();
@@ -6288,7 +6253,6 @@ mod tests {
         const QUEUED_TEXT: &str = "late background update";
         let (event_tx, event_rx) = flume::unbounded::<Envelope>();
         let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         let pump = start_event_pump(
@@ -6297,7 +6261,7 @@ mod tests {
             out_tx,
             Arc::default(),
             true,
-            answer_tx,
+            AnswerRouter::default(),
             coordinator.read(),
             makima_storage::paths::home(),
             PUMP_TRUSTED,
@@ -6327,10 +6291,10 @@ mod tests {
         drop(event_tx);
     }
 
-    fn question_identity(turn_id: TurnId) -> ActorWorkIdentity {
+    fn question_identity(agent_id: AgentId, turn_id: TurnId) -> ActorWorkIdentity {
         const QUESTION_RUN: u64 = 1;
         ActorWorkIdentity::new(
-            AgentId::generate(),
+            agent_id,
             ActorWorkKind::Turn {
                 operation_id: QUESTION_RUN,
                 turn_id,
@@ -6339,17 +6303,18 @@ mod tests {
         )
     }
 
-    fn test_question(turn_id: TurnId) -> Envelope {
+    fn test_question(turn_id: TurnId, ask: AnswerKey) -> Envelope {
         const QUESTION_ID: &str = "question-tool";
         const QUESTION_TEXT: &str = "Continue?";
+        let identity = question_identity(ask.agent_id(), turn_id);
         Envelope {
             event: AgentEvent::Question {
                 id: QUESTION_ID.into(),
-                ask_id: ASK_ID.into(),
+                ask,
                 questions: serde_json::json!([{ "question": QUESTION_TEXT }]),
             },
             subagent: None,
-            identity: Some(question_identity(turn_id)),
+            identity: Some(identity),
         }
     }
 
@@ -6393,9 +6358,8 @@ mod tests {
         .await;
     }
 
-    async fn server_with_parked_elicitation_turn()
-    -> (Server, Receiver<String>, Receiver<Value>, RootTurns) {
-        let (mut srv, answers, out, turns) = server_awaiting_answer();
+    async fn server_with_parked_elicitation_turn() -> (Server, Receiver<Value>, RootTurns) {
+        let (mut srv, _, out, turns) = server_awaiting_answer();
         let session = srv.session.as_mut().unwrap();
         session.pending.lock().unwrap().permissions.clear();
         session.event_pump = start_event_pump(
@@ -6404,7 +6368,7 @@ mod tests {
             srv.out_tx.clone(),
             Arc::clone(&session.pending),
             true,
-            session.handle.answer_tx.clone(),
+            session.handle.answers.clone(),
             session.coordinator.as_ref().unwrap().read(),
             None,
             PUMP_TRUSTED,
@@ -6412,7 +6376,7 @@ mod tests {
             test_observer(),
         );
         park_elicitation_turn(&mut srv, &turns, ELICITATION_PROMPT_ID).await;
-        (srv, answers, out, turns)
+        (srv, out, turns)
     }
 
     async fn park_elicitation_turn(srv: &mut Server, turns: &RootTurns, id: i64) {
@@ -6427,10 +6391,9 @@ mod tests {
         turns.next().await;
     }
 
-    fn parked_question(session: &SessionState, turns: &RootTurns) -> Envelope {
-        let mut question = test_question(turns.latest().turn_id());
-        let identity = question.identity.as_mut().unwrap();
-        identity.agent_id = session.command_root.target.id();
+    fn parked_turn_identity(session: &SessionState, turns: &RootTurns) -> ActorWorkIdentity {
+        let mut identity =
+            question_identity(session.command_root.target.id(), turns.latest().turn_id());
         identity.presentation_id = session
             .pending
             .lock()
@@ -6440,18 +6403,31 @@ mod tests {
             .unwrap()
             .run_id
             .unwrap();
-        question
+        identity
     }
 
-    async fn request_elicitation(srv: &Server, out: &Receiver<Value>, turns: &RootTurns) -> i64 {
+    fn parked_question(session: &SessionState, turns: &RootTurns) -> (Envelope, PendingAnswer) {
+        let identity = parked_turn_identity(session, turns);
+        let answer = session.handle.answers.register(identity.agent_id);
+        let mut question = test_question(turns.latest().turn_id(), answer.key());
+        question.identity = Some(identity);
+        (question, answer)
+    }
+
+    async fn request_elicitation(
+        srv: &Server,
+        out: &Receiver<Value>,
+        turns: &RootTurns,
+    ) -> (i64, PendingAnswer) {
         let session = srv.session.as_ref().unwrap();
+        let (question, answer) = parked_question(session, turns);
         session
             .command_root
             .template
             .event_tx
-            .send_envelope(parked_question(session, turns))
+            .send_envelope(question)
             .unwrap();
-        next_elicitation(out).await
+        (next_elicitation(out).await, answer)
     }
 
     fn cancel_elicitation_turn(srv: &Server) {
@@ -6463,26 +6439,34 @@ mod tests {
         );
     }
 
+    fn session_elicitations_contain(srv: &Server, id: i64) -> bool {
+        srv.session
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .elicitations
+            .contains_key(&id)
+    }
+
     #[test]
     fn close_dismisses_outstanding_elicitation() {
         smol::block_on(async {
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
-            request_elicitation(&srv, &out, &turns).await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
+            let (_, answer) = request_elicitation(&srv, &out, &turns).await;
             let session = srv.session.as_ref().unwrap();
 
             within(
                 smol::future::zip(finish_in_flight(session), async {
-                    assert_eq!(
-                        answers.recv_async().await.unwrap(),
-                        encode_ask_answer(ASK_ID, ELICITATION_DISMISSED)
-                    );
+                    assert_eq!(answer.recv().await.unwrap(), ELICITATION_DISMISSED);
                     turns.release();
                 }),
                 "client close did not unblock the turn",
             )
             .await;
 
-            assert!(session.pending.lock().unwrap().elicitation.is_none());
+            assert!(session.pending.lock().unwrap().elicitations.is_empty());
             assert_eq!(
                 prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
                 END_TURN
@@ -6494,40 +6478,28 @@ mod tests {
     #[test]
     fn cancel_dismisses_pending_elicitation_and_rejects_late_answer() {
         smol::block_on(async {
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
-            let id = request_elicitation(&srv, &out, &turns).await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
+            let (id, answer) = request_elicitation(&srv, &out, &turns).await;
             let session = srv.session.as_ref().unwrap();
 
             cancel_elicitation_turn(&srv);
-            assert!(session.pending.lock().unwrap().elicitation.is_none());
+            assert!(session.pending.lock().unwrap().elicitations.is_empty());
             assert_eq!(
                 prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
                 CANCELLED
             );
 
             park_elicitation_turn(&mut srv, &turns, NEXT_ELICITATION_PROMPT_ID).await;
-            let next_id = request_elicitation(&srv, &out, &turns).await;
+            let (next_id, next_answer) = request_elicitation(&srv, &out, &turns).await;
             handle_incoming_response(
                 &srv,
                 &serde_json::json!({"id": id, "result": {"action": "accept", "content": {"q1": "late answer"}}}),
             );
             assert!(
-                answers.is_empty(),
+                answer.is_empty() && next_answer.is_empty(),
                 "cancellation and the late reply must not enqueue an answer"
             );
-            assert_eq!(
-                srv.session
-                    .as_ref()
-                    .unwrap()
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .elicitation
-                    .as_ref()
-                    .unwrap()
-                    .request_id,
-                next_id
-            );
+            assert!(session_elicitations_contain(&srv, next_id));
             close_session(&mut srv).await;
         });
     }
@@ -6536,12 +6508,13 @@ mod tests {
     #[test_case(true; "root_permission")]
     fn cancelled_operation_drops_queued_ask(permission: bool) {
         smol::block_on(async {
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
             let session = srv.session.as_ref().unwrap();
-            let mut ask = parked_question(session, &turns);
+            let (mut ask, answer) = parked_question(session, &turns);
             if permission {
                 ask.event = AgentEvent::PermissionRequest {
                     id: QUESTION_TOOL.into(),
+                    ask: answer.key(),
                     tool: ToolKey::native(QUESTION_TOOL),
                     scopes: Vec::new(),
                 };
@@ -6560,13 +6533,10 @@ mod tests {
             let pending = &srv.session.as_ref().unwrap().pending;
             {
                 let pending = pending.lock().unwrap();
-                assert!(pending.elicitation.is_none());
+                assert!(pending.elicitations.is_empty());
                 assert!(pending.permissions.is_empty());
             }
-            assert!(
-                answers.is_empty(),
-                "a stale ask must not answer the next turn"
-            );
+            assert!(answer.is_empty(), "a stale ask must not be answered");
             close_session(&mut srv).await;
         });
     }
@@ -6594,15 +6564,14 @@ mod tests {
             .unwrap();
             let tool = registry.get(QUESTION_TOOL).unwrap().tool;
             let input = serde_json::json!({});
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
             let session = srv.session.as_ref().unwrap();
             let mut context = session.command_root.template.clone();
             context.event_tx = context
                 .event_tx
-                .with_identity_of(parked_question(session, &turns).identity);
+                .with_identity_of(Some(parked_turn_identity(session, &turns)));
             context.tool_use_id = Some(QUESTION_TOOL.into());
             context.question_mode = QuestionMode::Elicitation;
-            context.user_response_rx = Some(Arc::new(answers.clone().into()));
 
             let respond = |id, answer| {
                 handle_incoming_response(
@@ -6627,11 +6596,7 @@ mod tests {
             .await;
             assert!(first_result.output.is_err());
             respond(first_id, LATE_ANSWER);
-            assert_eq!(
-                answers.len(),
-                1,
-                "late reply must be queued while the turn is live"
-            );
+            assert!(!session_elicitations_contain(&srv, first_id));
 
             let second = tool.parse(&input).unwrap();
             let (second_result, ()) = within(
@@ -6642,7 +6607,6 @@ mod tests {
             )
             .await;
             assert_eq!(second_result.output.unwrap().as_text(), CURRENT_ANSWER);
-            assert!(answers.is_empty());
             close_session(&mut srv).await;
         });
     }
@@ -6651,42 +6615,56 @@ mod tests {
     #[test_case(serde_json::json!({"nonsense": true}), ELICITATION_DISMISSED; "malformed")]
     fn elicitation_answer_is_routed_by_id_and_decoded(result: Value, expected: &str) {
         smol::block_on(async {
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
-            let id = request_elicitation(&srv, &out, &turns).await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
+            let (id, answer) = request_elicitation(&srv, &out, &turns).await;
             let reply = |id| serde_json::json!({"id": id, "result": result});
 
             handle_incoming_response(&srv, &reply(id + 1));
             assert!(
-                answers.is_empty(),
+                answer.is_empty(),
                 "an unknown id must not answer the pending question"
             );
-            handle_incoming_response(&srv, &reply(id));
-            assert_eq!(
-                answers.try_recv().unwrap(),
-                encode_ask_answer(ASK_ID, expected)
+            let (overlapping_id, overlapping_answer) =
+                request_elicitation(&srv, &out, &turns).await;
+            handle_incoming_response(&srv, &reply(overlapping_id));
+            assert_eq!(overlapping_answer.try_recv().unwrap(), expected);
+            assert!(
+                answer.is_empty(),
+                "the overlapping reply must not answer the first ask"
             );
             handle_incoming_response(&srv, &reply(id));
-            assert!(answers.is_empty(), "a replayed answer must be ignored");
+            assert_eq!(answer.try_recv().unwrap(), expected);
+            handle_incoming_response(&srv, &reply(id));
+            assert!(answer.is_empty(), "a replayed answer must be ignored");
             close_session(&mut srv).await;
         });
     }
 
-    #[test]
-    fn malformed_question_in_elicitation_mode_unblocks_the_tool() {
+    #[test_case(false; "malformed_root_question")]
+    #[test_case(true; "child_question")]
+    fn suppressed_question_in_elicitation_mode_unblocks_the_tool(child: bool) {
         smol::block_on(async {
-            let (mut srv, answers, out, turns) = server_with_parked_elicitation_turn().await;
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
             let session = srv.session.as_ref().unwrap();
             let events = &session.command_root.template.event_tx;
-            let mut question = parked_question(session, &turns);
-            if let AgentEvent::Question { questions, .. } = &mut question.event {
-                *questions = Value::Null;
-            }
+            let (question, answer) = if child {
+                let agent = AgentId::generate();
+                let answer = session.handle.answers.register(agent);
+                let question = test_question(turns.latest().turn_id(), answer.key());
+                let mut envelope = subagent_activity(question.event);
+                envelope.subagent.as_mut().unwrap().agent_id = agent;
+                envelope.identity = question.identity;
+                (envelope, answer)
+            } else {
+                let (mut question, answer) = parked_question(session, &turns);
+                if let AgentEvent::Question { questions, .. } = &mut question.event {
+                    *questions = Value::Null;
+                }
+                (question, answer)
+            };
             events.send_envelope(question).unwrap();
             assert_no_ask_before_barrier(events, &out).await;
-            assert_eq!(
-                answers.try_recv().unwrap(),
-                encode_ask_answer(ASK_ID, ELICITATION_DISMISSED)
-            );
+            assert_eq!(answer.try_recv().unwrap(), ELICITATION_DISMISSED);
             close_session(&mut srv).await;
         });
     }
@@ -6699,7 +6677,6 @@ mod tests {
 
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let (out_tx, out_rx) = flume::unbounded::<Value>();
-            let (answer_tx, _) = flume::unbounded::<String>();
             let pending = Arc::new(Mutex::new(Pending {
                 operation: Some(PendingOperation {
                     id: 1,
@@ -6720,7 +6697,7 @@ mod tests {
                 out_tx,
                 Arc::clone(&pending),
                 true,
-                answer_tx,
+                AnswerRouter::default(),
                 coordinator.read(),
                 makima_storage::paths::home(),
                 PUMP_TRUSTED,
@@ -6800,7 +6777,7 @@ mod tests {
                 srv.out_tx.clone(),
                 Arc::clone(&pending),
                 false,
-                session.handle.answer_tx.clone(),
+                session.handle.answers.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -6931,7 +6908,7 @@ mod tests {
                 out_tx,
                 Arc::clone(&pending),
                 false,
-                flume::unbounded().0,
+                AnswerRouter::default(),
                 coordinator.read(),
                 None,
                 PUMP_TRUSTED,
@@ -6976,7 +6953,8 @@ mod tests {
     fn event_pump_projects_tool_permission_lifecycle_in_wire_order() {
         let (event_tx, event_rx) = flume::unbounded::<Envelope>();
         let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
+        let answers = AnswerRouter::default();
+        let answer = answers.register(AgentId::generate());
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
@@ -6988,7 +6966,7 @@ mod tests {
             out_tx,
             pending,
             true,
-            answer_tx,
+            answers,
             coordinator.read(),
             makima_storage::paths::home(),
             PUMP_TRUSTED,
@@ -7014,6 +6992,7 @@ mod tests {
             })),
             AgentEvent::PermissionRequest {
                 id: tool_id.to_string(),
+                ask: answer.key(),
                 tool: makima_config::ToolKey::native("bash"),
                 scopes: vec!["true".to_string()],
             },
@@ -7061,7 +7040,6 @@ mod tests {
 
         let (event_tx, event_rx) = flume::unbounded::<Envelope>();
         let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, _) = flume::unbounded::<String>();
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
         start_event_pump(
@@ -7070,7 +7048,7 @@ mod tests {
             out_tx,
             PendingState::default(),
             false,
-            answer_tx,
+            AnswerRouter::default(),
             coordinator.read(),
             None,
             PUMP_TRUSTED,
@@ -7117,7 +7095,7 @@ mod tests {
         let _plugins = MANAGED_PLUGIN_TEST.lock().unwrap();
         smol::block_on(async {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let (_host, received, root_answer_rx, _state, notices) =
+            let (_host, received, _state, notices) =
                 managed_test_session(&mut srv, true, true, None, None, successful_checkpoint())
                     .await;
             let session_id = srv.session.as_ref().unwrap().handle.session_id.to_string();
@@ -7152,16 +7130,9 @@ mod tests {
                 "acp_child_permission-1"
             );
             let request_id = request["id"].as_i64().unwrap();
-            assert!(
-                !srv.session
-                    .as_ref()
-                    .unwrap()
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .permissions
-                    .is_empty()
-            );
+            let session = srv.session.as_ref().unwrap();
+            let agent = session.pending.lock().unwrap().permissions[&request_id].agent_id();
+            assert_ne!(agent, session.command_root.target.id());
             handle_incoming_response(&srv, &allow_once(request_id));
             assert_eq!(
                 prompt_terminal(&out_rx, 93).await["result"]["stopReason"],
@@ -7171,7 +7142,6 @@ mod tests {
                 notices.recv_timeout(PRIMARY_TURN_TIMEOUT).unwrap(),
                 format!("{ACP_TURN_END}{session_id}")
             );
-            assert!(root_answer_rx.is_empty());
             assert!(
                 received.try_iter().count() >= 5,
                 "child did not continue after the answer"
@@ -7204,7 +7174,6 @@ mod tests {
     fn event_pump_emits_thinking_separator() {
         let (event_tx, event_rx) = flume::unbounded::<Envelope>();
         let (out_tx, out_rx) = flume::unbounded::<Value>();
-        let (answer_tx, _answer_rx) = flume::unbounded::<String>();
         let pending = Arc::new(Mutex::new(Pending::default()));
         let session_id = SessionRef::from(MakimaId::generate());
         let coordinator = test_coordinator(session_id.id(), OFFLINE_SPEC);
@@ -7215,7 +7184,7 @@ mod tests {
             out_tx,
             Arc::clone(&pending),
             true,
-            answer_tx,
+            AnswerRouter::default(),
             coordinator.read(),
             makima_storage::paths::home(),
             PUMP_TRUSTED,
@@ -7321,10 +7290,7 @@ mod tests {
             )
         });
         let permissions = pending.permissions.keys().copied().collect::<Vec<_>>();
-        let elicitation = pending
-            .elicitation
-            .as_ref()
-            .map(|elicitation| elicitation.request_id);
+        let elicitations = pending.elicitations.keys().copied().collect::<Vec<_>>();
         drop(pending);
         let coordinator = session.coordinator.as_ref().map(|coordinator| {
             let read = coordinator.read();
@@ -7337,7 +7303,7 @@ mod tests {
             )
         });
         format!(
-            "session={},operation={operation:?},permissions={permissions:?},elicitation={elicitation:?},coordinator={coordinator:?}",
+            "session={},operation={operation:?},permissions={permissions:?},elicitations={elicitations:?},coordinator={coordinator:?}",
             session.handle.session_id
         )
     }
@@ -7366,13 +7332,6 @@ mod tests {
     }
 
     fn subagent_activity(event: AgentEvent) -> Envelope {
-        subagent_activity_with_optional_answer(event, None)
-    }
-
-    fn subagent_activity_with_optional_answer(
-        event: AgentEvent,
-        answer_tx: Option<Sender<String>>,
-    ) -> Envelope {
         Envelope {
             event,
             subagent: Some(makima_agent::SubagentInfo {
@@ -7383,7 +7342,6 @@ mod tests {
                 prompt: Some("reuse actor".to_owned()),
                 model: Some(OFFLINE_SPEC.to_owned()),
                 opts: None,
-                answer_tx,
                 cancel: None,
             }),
             identity: None,
@@ -7646,7 +7604,7 @@ mod tests {
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),
                 false,
-                session.handle.answer_tx.clone(),
+                session.handle.answers.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -7742,7 +7700,7 @@ mod tests {
                     Ok(())
                 })
             });
-            let (_host, received, _, _state, _) = managed_test_session(
+            let (_host, received, _state, _) = managed_test_session(
                 &mut srv,
                 nested,
                 false,
@@ -8139,7 +8097,7 @@ mod tests {
                 srv.out_tx.clone(),
                 Arc::clone(&old.pending),
                 false,
-                old.handle.answer_tx.clone(),
+                old.handle.answers.clone(),
                 old.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -9285,7 +9243,7 @@ mod tests {
             }),
         );
 
-        let answered = TaggedAnswer::new("toolu_1", PermissionAnswer::AllowOnce).encode();
+        let answered = PermissionAnswer::AllowOnce.encode();
         assert_eq!(answer_rx.try_recv().ok(), delivered.then_some(answered));
         assert_eq!(
             srv.session
@@ -9307,13 +9265,17 @@ mod tests {
             let (mut srv, _, out_rx, turns) = server_awaiting_answer();
             let (event_tx, event_rx) = flume::unbounded::<Envelope>();
             let session = srv.session.as_ref().unwrap();
+            let answer = session
+                .handle
+                .answers
+                .register(session.command_root.target.id());
             start_event_pump(
                 &test_event_source(event_rx),
                 session.handle.session_id.clone(),
                 srv.out_tx.clone(),
                 Arc::clone(&session.pending),
                 false,
-                session.handle.answer_tx.clone(),
+                session.handle.answers.clone(),
                 session.coordinator.as_ref().unwrap().read(),
                 None,
                 PUMP_TRUSTED,
@@ -9357,6 +9319,7 @@ mod tests {
                 .send_async(Envelope {
                     event: AgentEvent::PermissionRequest {
                         id: "call_write".to_string(),
+                        ask: answer.key(),
                         tool: makima_config::ToolKey::Native(Arc::from("write")),
                         scopes: vec!["/project/file.txt".to_string()],
                     },
