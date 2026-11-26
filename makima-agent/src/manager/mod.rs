@@ -679,8 +679,7 @@ impl AgentManagerHandle {
             (view.agents.get(&parent)?.lifecycle == StoredAgentLifecycle::Open)
                 .then_some((parent, record.label.as_ref()))
         });
-        let mut changes = Vec::with_capacity(scope.admitted.len());
-        // Queue reports first so every durable terminal record follows its accepted report.
+        let mut count = 0;
         for (&turn, origin) in &scope.admitted {
             if scope.holds_input(origin) {
                 continue;
@@ -695,20 +694,27 @@ impl AgentManagerHandle {
                 },
                 duration_ms: 0,
             };
-            let stored = result
-                .to_stored(snapshot.epoch, None)
+            let report = parent
+                .map(|(parent, label)| {
+                    let work = self
+                        .0
+                        .work
+                        .restore_hold(agent_id)?
+                        .take_report()
+                        .ok_or_else(|| {
+                            ManagerError::InvalidGraph(
+                                "delivery source has no parent work reservation".into(),
+                            )
+                        })?;
+                    Ok::<_, ManagerError>((parent, label, work))
+                })
+                .transpose()?;
+            let terminal = self
+                .0
+                .journal
+                .stage_terminal(None, result.clone(), None, scope.generation)
                 .map_err(|error| ManagerError::Persistence(error.to_string()))?;
-            if let Some((parent, label)) = parent {
-                let work = self
-                    .0
-                    .work
-                    .restore_hold(agent_id)?
-                    .take_report()
-                    .ok_or_else(|| {
-                        ManagerError::InvalidGraph(
-                            "delivery source has no parent work reservation".into(),
-                        )
-                    })?;
+            if let Some((parent, label, work)) = report {
                 let delivery = Arc::new(ChildDelivery {
                     label: label.cloned(),
                     result,
@@ -723,24 +729,10 @@ impl AgentManagerHandle {
                     }
                 }
             }
-            changes.push(JournalChange {
-                agent: Some(agent_id),
-                generation: scope.generation,
-                change: StateChange::Turn {
-                    turn,
-                    result: stored,
-                },
-            });
+            drop(terminal);
+            count += 1;
         }
-        let count = changes.len();
         if count != 0 {
-            self.0
-                .journal
-                .commit(JournalCommit {
-                    changes,
-                    ..Default::default()
-                })
-                .map_err(|error| ManagerError::Persistence(error.to_string()))?;
             self.0.reaped.notify(usize::MAX);
         }
         Ok(count)

@@ -629,8 +629,10 @@ mod tests {
     use crate::{
         AgentEvent, AgentId, EventSender,
         agent::{InstructionSource, Instructions},
-        journal::{JournalCommit, JournalError, SessionJournal},
+        journal::{JournalCommit, JournalError, SessionJournal, StoredSession},
         prompt::{PromptId, PromptSource, ResolvedSlots, Slot},
+        session_recovery::tests::for_each_durable_prefix,
+        session_writer::SessionWriter,
         state::StateError,
     };
     use makima_domain::PostLevel;
@@ -1113,6 +1115,79 @@ mod tests {
         } else {
             assert_eq!(recorded.instructions.sources[0].content, CHANGED);
         }
+    }
+
+    #[test]
+    fn reload_context_recovers_complete_context_at_each_durable_prefix() {
+        const MODEL: &str = "test/model";
+        const CWD: &str = "/tmp";
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = StoredSession::new(MODEL, CWD);
+        let root = AgentId::generate();
+        session.bind_root_id(root).unwrap();
+        let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+        let fixture = Fixture {
+            journal: Arc::new(SessionJournal::from_session(&session).unwrap()),
+            root,
+        };
+        fixture.journal.bind_writer(writer.clone()).unwrap();
+
+        let (_, initial) = fixture.prepare(
+            &instructions(&[(FIRST, LABEL, FIRST)]),
+            &slots(&[(FIRST, Some(FIRST))]),
+            true,
+            ContextPolicy::Admission,
+        );
+        fixture.commit(initial);
+        let baseline = manifest_hash(&fixture.journal.snapshot(), root).unwrap();
+        smol::block_on(writer.append(Vec::new())).unwrap();
+        let (_, reload) = fixture.prepare(
+            &instructions(&[(FIRST, LABEL, CHANGED)]),
+            &slots(&[(FIRST, Some(CHANGED))]),
+            true,
+            ContextPolicy::Reload,
+        );
+        fixture.commit(reload);
+        let reloaded = manifest_hash(&fixture.journal.snapshot(), root).unwrap();
+        assert_ne!(baseline, reloaded);
+        smol::block_on(writer.append(Vec::new())).unwrap();
+        smol::block_on(writer.close()).unwrap();
+
+        let path = directory.path().join(format!("{}.jsonl", session.id));
+        let (mut saw_baseline, mut saw_reload) = (false, false);
+        for_each_durable_prefix(&path, false, |candidate| {
+            let session = candidate.session();
+            if session.root_agent_id() != Some(root) {
+                return;
+            }
+            let state = session.latest_state().unwrap();
+            let manifest = state
+                .scopes
+                .get(&Some(root))
+                .and_then(|scope| scope.context.get(CONTEXT_MANIFEST));
+            let context = root_context(&candidate.journal().state_access(root, None)).unwrap();
+            let Some(manifest) = manifest else {
+                assert!(context.is_none());
+                return;
+            };
+            let expected = if manifest.hash == baseline {
+                saw_baseline = true;
+                FIRST
+            } else {
+                assert_eq!(manifest.hash, reloaded);
+                saw_reload = true;
+                CHANGED
+            };
+            let context = context.unwrap();
+            assert_eq!(context.instructions.sources.len(), 1);
+            assert_eq!(context.instructions.sources[0].content, expected);
+            assert_eq!(context.slots.sources().len(), 1);
+            assert_eq!(
+                context.slots.sources()[0].content.as_deref(),
+                Some(expected)
+            );
+        });
+        assert!(saw_baseline && saw_reload);
     }
 
     #[test]

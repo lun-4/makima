@@ -251,8 +251,8 @@ pub fn continue_all_agents() -> bool {
 }
 
 pub struct RecoveryCandidate {
-    session: StoredSession,
-    journal: Arc<SessionJournal>,
+    pub(crate) session: StoredSession,
+    pub(crate) journal: Arc<SessionJournal>,
     records: Vec<SessionRecord<Message, TokenUsage, ToolOutput>>,
 }
 
@@ -363,12 +363,12 @@ impl RecoveryCandidate {
         if history.epoch != previous_epoch
             && let Some(root) = session.root_agent_id()
         {
-            records.push(SessionRecord::Compaction {
+            let compaction = SessionRecord::Compaction {
                 agent: root,
                 messages: history.messages.as_ref().clone(),
                 ids: history.ids.as_ref().clone(),
                 covered,
-            });
+            };
             seq = seq
                 .checked_add(1)
                 .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
@@ -384,7 +384,9 @@ impl RecoveryCandidate {
                 },
             };
             session.push_state(record.clone());
-            records.push(SessionRecord::State { d: record });
+            records.push(SessionRecord::Group {
+                records: vec![compaction, SessionRecord::State { d: record }],
+            });
         }
         let keys: BTreeSet<_> = session
             .subagent_messages()
@@ -413,12 +415,12 @@ impl RecoveryCandidate {
                 .find(|agent| agent.transcript_key == key)
                 && history.epoch != previous_epoch
             {
-                records.push(SessionRecord::Compaction {
+                let compaction = SessionRecord::Compaction {
                     agent: agent.id,
                     messages: history.messages.as_ref().clone(),
                     ids: history.ids.as_ref().clone(),
                     covered,
-                });
+                };
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
@@ -434,128 +436,104 @@ impl RecoveryCandidate {
                     },
                 };
                 session.push_state(record.clone());
-                records.push(SessionRecord::State { d: record });
+                records.push(SessionRecord::Group {
+                    records: vec![compaction, SessionRecord::State { d: record }],
+                });
             }
         }
-        // Queue failure reports before terminal results. Read historical queue records here
-        // because a parent can consume its report before the child's turn is settled.
-        let mut reported: BTreeMap<_, _> = session
-            .state()
-            .iter()
-            .filter_map(|record| {
-                let StateChange::Delivery {
-                    id: (child, turn),
-                    op: StoredDeliveryOp::Queued(delivery),
-                } = &record.change
-                else {
-                    return None;
-                };
-                (record.agent == Some(view.agents.get(child)?.parent?)
-                    && view.scopes.get(&Some(*child))?.admitted.contains_key(turn)
-                    && !matches!(
-                        delivery.result.outcome.status,
-                        StoredTurnStatus::Completed { .. }
-                    ))
-                .then(|| ((*child, *turn), delivery.result.clone()))
-            })
-            .collect();
         let mut inbox_usage = BTreeMap::new();
         for (&agent, scope) in &view.scopes {
             let Some(agent) = agent else { continue };
             for (&turn, origin) in &scope.admitted {
-                let result = if let Some(result) = reported.remove(&(agent, turn)) {
-                    result
-                } else if continue_turns || scope.holds_input(origin) {
+                if continue_turns || scope.holds_input(origin) {
                     continue;
-                } else {
-                    let child = view
-                        .agents
-                        .get(&agent)
-                        .filter(|record| record.parent.is_some());
-                    let status = if child.is_some() {
-                        StoredTurnStatus::Failed {
-                            failure: StoredTurnFailure {
-                                kind: StoredTurnFailureKind::Internal,
-                                diagnostic: CONTINUATION_DISABLED.into(),
-                                user_message: CONTINUATION_DISABLED.into(),
-                                retryable: false,
-                            },
-                        }
-                    } else {
-                        StoredTurnStatus::Cancelled {
-                            reason: StoredCancellationReason::Interrupted,
-                        }
-                    };
-                    let result = StoredTurnResult {
-                        outcome: StoredTurnOutcome {
-                            agent_id: agent,
-                            turn_id: turn,
-                            usage: Default::default(),
-                            num_turns: 0,
-                            cost: None,
-                            list_cost: None,
-                            context_size: 0,
-                            context_window: 0,
-                            status,
+                }
+                let child = view
+                    .agents
+                    .get(&agent)
+                    .filter(|record| record.parent.is_some());
+                let status = if child.is_some() {
+                    StoredTurnStatus::Failed {
+                        failure: StoredTurnFailure {
+                            kind: StoredTurnFailureKind::Internal,
+                            diagnostic: CONTINUATION_DISABLED.into(),
+                            user_message: CONTINUATION_DISABLED.into(),
+                            retryable: false,
                         },
-                        text: StoredPayload::Inline(String::new()),
-                        output: StoredPayload::Inline(Vec::new()),
-                        provenance: StoredTurnProvenance {
-                            origin: origin.clone(),
-                            plugin: None,
-                            plugin_generation: None,
-                            source_agent: None,
-                            source_turn: None,
-                        },
-                        duration_ms: 0,
-                    };
-                    if let Some(child) = child
-                        && let Some(parent) = child.parent
-                        && child
-                            .spec
-                            .as_ref()
-                            .is_some_and(|spec| spec.auto_deliver && !spec.silent)
-                    {
-                        let parent_scope = view.scopes.get(&Some(parent));
-                        let usage = inbox_usage.entry(parent).or_insert_with(|| {
-                            DeliveryInboxUsage::from_sizes(parent_scope.into_iter().flat_map(
-                                |scope| {
-                                    scope.deliveries.values().filter_map(|op| match op {
-                                        StoredDeliveryOp::Queued(delivery) => {
-                                            Some(restored_preview_bytes(delivery))
-                                        }
-                                        _ => None,
-                                    })
-                                },
-                            ))
-                        });
-                        let mut report = StoredDelivery {
-                            label: child.label.clone(),
-                            result: result.clone(),
-                            held: false,
-                            preview_bytes: None,
-                        };
-                        let bytes = restored_preview_bytes(&report);
-                        if usage.admit(bytes).is_ok() {
-                            report.preview_bytes = Some(bytes);
-                            seq = seq
-                                .checked_add(1)
-                                .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
-                            let delivery = StoredStateRecord {
-                                seq,
-                                agent: Some(parent),
-                                generation: parent_scope.map_or(0, |scope| scope.generation),
-                                change: StateChange::Delivery {
-                                    id: (agent, turn),
-                                    op: StoredDeliveryOp::Queued(Box::new(report)),
-                                },
-                            };
-                            session.push_state(delivery.clone());
-                            records.push(SessionRecord::State { d: delivery });
-                        }
                     }
-                    result
+                } else {
+                    StoredTurnStatus::Cancelled {
+                        reason: StoredCancellationReason::Interrupted,
+                    }
                 };
+                let result = StoredTurnResult {
+                    outcome: StoredTurnOutcome {
+                        agent_id: agent,
+                        turn_id: turn,
+                        usage: Default::default(),
+                        num_turns: 0,
+                        cost: None,
+                        list_cost: None,
+                        context_size: 0,
+                        context_window: 0,
+                        status,
+                    },
+                    text: StoredPayload::Inline(String::new()),
+                    output: StoredPayload::Inline(Vec::new()),
+                    provenance: StoredTurnProvenance {
+                        origin: origin.clone(),
+                        plugin: None,
+                        plugin_generation: None,
+                        source_agent: None,
+                        source_turn: None,
+                    },
+                    duration_ms: 0,
+                };
+                let mut commit = Vec::new();
+                if let Some(child) = child
+                    && let Some(parent) = child.parent
+                    && child
+                        .spec
+                        .as_ref()
+                        .is_some_and(|spec| spec.auto_deliver && !spec.silent)
+                {
+                    let parent_scope = view.scopes.get(&Some(parent));
+                    let usage = inbox_usage.entry(parent).or_insert_with(|| {
+                        DeliveryInboxUsage::from_sizes(parent_scope.into_iter().flat_map(|scope| {
+                            scope.deliveries.values().filter_map(|op| match op {
+                                StoredDeliveryOp::Queued(delivery) => {
+                                    Some(restored_preview_bytes(delivery))
+                                }
+                                _ => None,
+                            })
+                        }))
+                    });
+                    let mut report = StoredDelivery {
+                        label: child.label.clone(),
+                        result: result.clone(),
+                        held: false,
+                        preview_bytes: None,
+                    };
+                    let bytes = restored_preview_bytes(&report);
+                    if usage.admit(bytes).is_ok() {
+                        report.preview_bytes = Some(bytes);
+                        seq = seq
+                            .checked_add(1)
+                            .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
+                        let delivery = StoredStateRecord {
+                            seq,
+                            agent: Some(parent),
+                            generation: parent_scope.map_or(0, |scope| scope.generation),
+                            change: StateChange::Delivery {
+                                id: (agent, turn),
+                                op: StoredDeliveryOp::Queued(Box::new(report)),
+                            },
+                        };
+                        session.push_state(delivery.clone());
+                        commit.push(SessionRecord::State { d: delivery });
+                    }
+                }
+
                 seq = seq
                     .checked_add(1)
                     .ok_or_else(|| failure(SEQUENCE_EXHAUSTED.into()))?;
@@ -566,7 +544,8 @@ impl RecoveryCandidate {
                     change: StateChange::Turn { turn, result },
                 };
                 session.push_state(record.clone());
-                records.push(SessionRecord::State { d: record });
+                commit.push(SessionRecord::State { d: record });
+                records.extend(SessionRecord::group(commit));
             }
         }
         let journal = Arc::new(
@@ -779,7 +758,7 @@ fn complete_tool_results(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         AgentLimits, AgentManagerHandle,
@@ -794,6 +773,7 @@ mod tests {
         sessions::SESSIONS_DIR,
     };
     use serde_json::json;
+    use std::{fs, path::Path};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -808,6 +788,22 @@ mod tests {
     const STARTUP_MODEL: &str = "startup/default";
     const UNAVAILABLE_MODEL: &str = "unavailable/model";
     const POLICY_REJECTION: &str = "rejected by model policy";
+
+    pub(crate) fn for_each_durable_prefix(
+        path: &Path,
+        continue_turns: bool,
+        mut check: impl FnMut(RecoveryCandidate),
+    ) {
+        let bytes = fs::read(path).unwrap();
+        let id = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+        let directory = TempDir::new().unwrap();
+        let copy = directory.path().join(path.file_name().unwrap());
+        for (index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'\n') {
+            fs::write(&copy, &bytes[..=index]).unwrap();
+            let session = StoredSession::load_from(id, directory.path()).unwrap();
+            check(RecoveryCandidate::prepare_with_continuation(session, continue_turns).unwrap());
+        }
+    }
 
     #[test_case(MODEL, false, false, MODEL, None; "recorded")]
     #[test_case(MODEL, true, false, STARTUP_MODEL, None; "explicit")]

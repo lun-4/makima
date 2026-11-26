@@ -2363,6 +2363,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::{OpenOptions, read};
+    use std::slice::from_ref;
 
     use flume::Receiver;
     use makima_agent::actor::{ActorLifecycle, ActorStatus, TurnResult};
@@ -2649,19 +2650,24 @@ mod tests {
                 .filter(|line| !line.is_empty())
             {
                 let record: Value = serde_json::from_slice(line).map_err(std::io::Error::other)?;
-                if record["t"] == "state"
-                    && record["d"]["agent"] == root
-                    && record["d"]["change"]["kind"] == "turn"
-                    && matches!(
-                        record["d"]["change"]["result"]["text"]["value"].as_str(),
-                        Some("root result" | "done")
-                    )
-                    && let Some(turn) = record["d"]["change"]["turn"].as_str()
-                    && !self.turns.iter().any(|seen| seen == turn)
-                {
-                    self.turns.push(turn.to_owned());
-                    self.gate.0.send(()).map_err(std::io::Error::other)?;
-                    self.gate.1.recv().map_err(std::io::Error::other)?;
+                let records = record["records"]
+                    .as_array()
+                    .map_or_else(|| from_ref(&record), Vec::as_slice);
+                for record in records {
+                    if record["t"] == "state"
+                        && record["d"]["agent"] == root
+                        && record["d"]["change"]["kind"] == "turn"
+                        && matches!(
+                            record["d"]["change"]["result"]["text"]["value"].as_str(),
+                            Some("root result" | "done")
+                        )
+                        && let Some(turn) = record["d"]["change"]["turn"].as_str()
+                        && !self.turns.iter().any(|seen| seen == turn)
+                    {
+                        self.turns.push(turn.to_owned());
+                        self.gate.0.send(()).map_err(std::io::Error::other)?;
+                        self.gate.1.recv().map_err(std::io::Error::other)?;
+                    }
                 }
             }
             Ok(())

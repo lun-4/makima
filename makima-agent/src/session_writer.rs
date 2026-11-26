@@ -675,15 +675,13 @@ async fn run(
 
 fn encode_record(record: &Record, seq: &mut u64, encoded: &mut Vec<u8>) -> io::Result<()> {
     let mut record = serde_json::to_value(record)?;
-    let object = record
-        .as_object_mut()
-        .ok_or_else(|| io::Error::other("session records must be JSON objects"))?;
-    if object.get("t").and_then(Value::as_str) == Some("agent")
+    if record["t"] == "agent"
+        && let Some(object) = record.as_object_mut()
         && let Some(journal_seq) = object.remove("seq")
     {
         object.insert("journal_seq".into(), journal_seq);
     }
-    object.insert("seq".into(), Value::from(*seq));
+    record["seq"] = Value::from(*seq);
     *seq = seq
         .checked_add(1)
         .ok_or_else(|| io::Error::other("session sequence exhausted"))?;

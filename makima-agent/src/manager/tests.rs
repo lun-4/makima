@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
@@ -11,6 +12,7 @@ use test_case::test_case;
 
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
 use crate::rewind::{RewindError, RewindOutcome, RewindTargetId};
+use crate::session_recovery::tests::for_each_durable_prefix;
 use crate::session_writer::{Record, SessionIo, SessionWriter, StoredSession};
 use crate::test_util::poll_until;
 use event_listener::Event;
@@ -25,7 +27,7 @@ use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::session_state::{
     StateChange, StoredAgentLifecycle, StoredAgentSpec, StoredDelivery, StoredDeliveryOp,
-    StoredModeCeiling,
+    StoredModeCeiling, StoredTurnOrigin,
 };
 use makima_storage::sessions::Session;
 use serde_json::Value;
@@ -36,7 +38,8 @@ use super::{
 };
 use crate::actor::{
     ActorHistory, ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES,
-    MAX_PENDING_PREVIEW_BYTES, PreparedTurn, TurnProvenance, TurnResult, graph_quiescence_barrier,
+    MAX_PENDING_PREVIEW_BYTES, PreparedTurn, TurnOrigin, TurnProvenance, TurnResult,
+    graph_quiescence_barrier,
 };
 use crate::{
     ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelMap,
@@ -89,7 +92,11 @@ impl SessionIo for ReceiptGateIo {
                 .filter(|line| !line.is_empty())
             {
                 let record = serde_json::from_slice(line)?;
-                if (self.matches)(&record) {
+                let records = match &record {
+                    Record::Group { records } => records.as_slice(),
+                    _ => from_ref(&record),
+                };
+                if records.iter().any(self.matches) {
                     self.matched = true;
                     break;
                 }
@@ -284,6 +291,72 @@ fn synchronous_spawn_on_global_executor_receives_durable_acknowledgment() {
         manager.shutdown(COMPLETION_TIMEOUT).await;
     });
     smol::block_on(task);
+}
+
+#[test]
+fn durable_admission_prefix_preserves_user_input() {
+    const INPUT: &str = "admitted user input";
+    const MISSING_INPUT: &str = "admitted turn lost its input";
+
+    receipt_test(async {
+        let directory = tempfile::tempdir().unwrap();
+        let session = StoredSession::new(SPAWN_MODEL, ".");
+        let path = directory.path().join(format!("{}.jsonl", session.id));
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let journal = manager.journal();
+        journal
+            .bind_writer(SessionWriter::open_session(directory.path(), &session).unwrap())
+            .unwrap();
+        let (start, gate) = flume::bounded(1);
+        let root = manager
+            .create_root_deferred_with_config(
+                Some(config(SPAWN_MODEL, false)),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+                gate,
+            )
+            .unwrap();
+        let actor = root.actor().unwrap();
+        let root = root.id();
+        let turn = actor
+            .admit_turn_with_options(
+                AgentInput::new(INPUT.into(), Vec::new()),
+                None,
+                String::new(),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .turn_id();
+        journal.flush().await.unwrap();
+
+        let mut saw_admission = false;
+        for_each_durable_prefix(&path, true, |candidate| {
+            let view = candidate.journal.snapshot().fold().unwrap();
+            let Some(scope) = view.scopes.get(&Some(root)) else {
+                return;
+            };
+            if let Some(origin) = scope.admitted.get(&turn) {
+                assert_eq!(origin, &StoredTurnOrigin::User);
+                let input = scope.turn_inputs.get(&turn).expect(MISSING_INPUT);
+                let input: AgentInput = serde_json::from_value(input.clone()).unwrap();
+                assert_eq!(input.message, INPUT);
+                saw_admission = true;
+            } else {
+                assert!(!scope.turn_inputs.contains_key(&turn));
+            }
+            assert!(candidate.session.messages().is_empty());
+        });
+        assert!(saw_admission);
+        drop(start);
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+    });
 }
 
 #[test]

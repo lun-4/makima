@@ -52,7 +52,7 @@ const LEGACY_PLAN_SLOT: &str = "makima.plan";
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
-const SCAN_CACHE_VERSION: u32 = 3;
+const SCAN_CACHE_VERSION: u32 = 4;
 #[cfg(test)]
 const TAIL_BUF: u64 = 4096;
 pub const DEFAULT_TITLE: &str = "New session";
@@ -420,6 +420,8 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> Option<String> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum SessionRecord<M, U, T> {
+    #[serde(rename = "group")]
+    Group { records: Vec<Self> },
     #[serde(rename = "header")]
     Header {
         v: u32,
@@ -513,6 +515,16 @@ pub enum SessionRecord<M, U, T> {
         #[serde(flatten)]
         legacy_plan: LegacyPlan,
     },
+}
+
+impl<M, U, T> SessionRecord<M, U, T> {
+    pub fn group(mut records: Vec<Self>) -> Option<Self> {
+        match records.len() {
+            0 => None,
+            1 => records.pop(),
+            _ => Some(Self::Group { records }),
+        }
+    }
 }
 
 fn sync_dir_and_ancestors(path: &Path) -> Result<(), StorageError> {
@@ -1127,9 +1139,43 @@ where
                 });
             }
         }
-        let record: SessionRecord<M, U, T> = match serde_json::from_slice::<serde_json::Value>(line)
-            .and_then(|value| {
-                sequence_high_water = sequence_high_water.max(value["seq"].as_u64());
+        let mut physical = serde_json::from_slice::<serde_json::Value>(line);
+        let unreadable = |reason| SessionError::UnreadableRecord {
+            path: display_path.to_owned(),
+            line: line_count,
+            reason,
+        };
+        let grouped = if let Ok(value) = &mut physical {
+            sequence_high_water = sequence_high_water.max(value["seq"].as_u64());
+            if value["t"] == "group" {
+                let records = value["records"].take();
+                match records {
+                    serde_json::Value::Array(records) if !records.is_empty() => Some(records),
+                    _ => {
+                        return Err(unreadable(
+                            "group requires a non-empty records array".into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let in_group = grouped.is_some();
+        let records = (!in_group)
+            .then_some(physical)
+            .into_iter()
+            .chain(grouped.into_iter().flatten().map(Ok));
+        for value in records {
+            let (record, unified): (SessionRecord<M, U, T>, bool) = match value.and_then(|value| {
+                if in_group && matches!(value["t"].as_str(), Some("group" | "header")) {
+                    return Err(serde::de::Error::custom(
+                        "group cannot contain a group or header",
+                    ));
+                }
+                let unified = value.get("agent").is_some();
                 let mut value = decode_log_record(value);
                 if version == LEGACY_LOG_FORMAT_VERSION {
                     match value["t"].as_str() {
@@ -1159,179 +1205,170 @@ where
                 }
                 let record = serde_json::from_value(value.clone())?;
                 append_context_events(&mut context_events, value);
-                Ok(Some(record))
+                Ok(Some((record, unified)))
             }) {
-            Ok(Some(record)) => record,
-            Ok(None) => continue,
-            Err(e) if id.is_some() => {
-                return Err(SessionError::UnreadableRecord {
-                    path: display_path.to_owned(),
-                    line: line_count,
-                    reason: e.to_string(),
-                });
-            }
-            Err(e) => {
-                warn!(
-                    path = display_path,
-                    error = %e,
-                    line = line_count,
-                    "skipping torn JSONL record",
-                );
-                continue;
-            }
-        };
-        match record {
-            SessionRecord::Input { d, messages } => {
-                let agent = d.agent.ok_or_else(|| SessionError::UnreadableRecord {
-                    path: display_path.to_owned(),
-                    line: line_count,
-                    reason: "input record has no agent".into(),
-                })?;
-                for (id, message) in messages {
-                    agent_messages.entry(agent).or_default().push(message);
-                    agent_message_ids.entry(agent).or_default().push(id);
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(e) if id.is_some() || in_group => return Err(unreadable(e.to_string())),
+                Err(e) => {
+                    warn!(
+                        path = display_path,
+                        error = %e,
+                        line = line_count,
+                        "skipping torn JSONL record",
+                    );
+                    continue;
                 }
-                state.push(d);
-            }
-            SessionRecord::Header {
-                v,
-                id: h_id,
-                model: h_model,
-                cwd: h_cwd,
-                created_at: h_created,
-                parent: h_parent,
-                features: h_features,
-            } => {
-                if !matches!(v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION) {
-                    return Err(SessionError::VersionMismatch {
-                        found: v,
-                        expected: LOG_FORMAT_VERSION,
-                    });
-                }
-                if !h_features.is_empty() {
-                    return Err(SessionError::UnsupportedFeatures {
-                        features: h_features,
-                    });
-                }
-                version = v;
-                parent = h_parent;
-                features = h_features;
-                id = Some(h_id);
-                model = h_model;
-                cwd = h_cwd;
-                created_at = h_created;
-            }
-            SessionRecord::State { d } => state.push(d),
-            SessionRecord::Agent { seq, d } => agent_revisions.push((seq, d)),
-            SessionRecord::Msg {
-                id: message_id,
-                agent,
-                d,
-            } => {
-                let unified = serde_json::from_slice::<serde_json::Value>(line)
-                    .ok()
-                    .is_some_and(|v| v.get("agent").is_some());
-                if unified {
-                    agent_messages.entry(agent).or_default().push(d);
-                    agent_message_ids.entry(agent).or_default().push(message_id);
-                } else {
-                    if version == LOG_FORMAT_VERSION {
-                        let root = latest_agents(&agent_revisions)
-                            .values()
-                            .find(|agent| agent.parent.is_none())
-                            .map(|agent| agent.id)
-                            .or_else(|| id.and_then(|id| id.to_string().parse().ok()))
-                            .unwrap_or(agent);
-                        agent_messages.entry(root).or_default().push(d);
-                        agent_message_ids.entry(root).or_default().push(message_id);
-                    } else {
-                        messages.push(d);
-                        message_ids.push(message_id);
+            };
+            match record {
+                SessionRecord::Group { .. } => return Err(unreadable("unexpected group".into())),
+                SessionRecord::Input { d, messages } => {
+                    let agent = d
+                        .agent
+                        .ok_or_else(|| unreadable("input record has no agent".into()))?;
+                    for (id, message) in messages {
+                        agent_messages.entry(agent).or_default().push(message);
+                        agent_message_ids.entry(agent).or_default().push(id);
                     }
+                    state.push(d);
                 }
-            }
-            SessionRecord::Compaction {
-                agent,
-                messages: summary,
-                ids,
-                covered: _,
-            } => {
-                agent_message_ids.insert(
+                SessionRecord::Header {
+                    v,
+                    id: h_id,
+                    model: h_model,
+                    cwd: h_cwd,
+                    created_at: h_created,
+                    parent: h_parent,
+                    features: h_features,
+                } => {
+                    if !matches!(v, LEGACY_LOG_FORMAT_VERSION | LOG_FORMAT_VERSION) {
+                        return Err(SessionError::VersionMismatch {
+                            found: v,
+                            expected: LOG_FORMAT_VERSION,
+                        });
+                    }
+                    if !h_features.is_empty() {
+                        return Err(SessionError::UnsupportedFeatures {
+                            features: h_features,
+                        });
+                    }
+                    version = v;
+                    parent = h_parent;
+                    features = h_features;
+                    id = Some(h_id);
+                    model = h_model;
+                    cwd = h_cwd;
+                    created_at = h_created;
+                }
+                SessionRecord::State { d } => state.push(d),
+                SessionRecord::Agent { seq, d } => agent_revisions.push((seq, d)),
+                SessionRecord::Msg {
+                    id: message_id,
                     agent,
-                    if ids.len() == summary.len() {
-                        ids
+                    d,
+                } => {
+                    if unified {
+                        agent_messages.entry(agent).or_default().push(d);
+                        agent_message_ids.entry(agent).or_default().push(message_id);
                     } else {
-                        summary.iter().map(|_| MakimaId::generate()).collect()
-                    },
-                );
-                agent_messages.insert(agent, summary);
-            }
-            SessionRecord::History { .. } => {}
-            SessionRecord::Fork {
-                agent,
-                input_draft,
-                cleared_turns: turns,
-                ..
-            } => {
-                forked_agents.insert(agent);
-                cleared_turns.extend(turns.into_iter().map(|turn| (Some(agent), turn)));
-                if let Some(draft) = input_draft {
-                    meta.input_draft = (!draft.is_empty()).then_some(draft);
-                    if !legacy_queue.is_empty() {
-                        let root = agent_revisions
-                            .iter()
-                            .find(|(_, record)| record.parent.is_none())
-                            .map(|(_, record)| record.id)
-                            .or_else(|| id.and_then(|id| id.to_string().parse().ok()));
-                        if root == Some(agent) {
-                            legacy_queue.clear();
+                        if version == LOG_FORMAT_VERSION {
+                            let root = latest_agents(&agent_revisions)
+                                .values()
+                                .find(|agent| agent.parent.is_none())
+                                .map(|agent| agent.id)
+                                .or_else(|| id.and_then(|id| id.to_string().parse().ok()))
+                                .unwrap_or(agent);
+                            agent_messages.entry(root).or_default().push(d);
+                            agent_message_ids.entry(root).or_default().push(message_id);
+                        } else {
+                            messages.push(d);
+                            message_ids.push(message_id);
                         }
                     }
                 }
-            }
-            SessionRecord::Out { id: out_id, d } => {
-                tool_outputs.insert(out_id, Arc::new(d));
-            }
-            SessionRecord::Post { d } => posts.push(d),
-            SessionRecord::Draft { text } => meta.input_draft = text,
-            SessionRecord::Title { title: next_title } => {
-                title = next_title;
-                title_set = true;
-            }
-            SessionRecord::Usage {
-                token_usage: usage,
-                usage_by_model: by_model,
-            } => {
-                token_usage = usage;
-                usage_by_model = by_model;
-            }
-            SessionRecord::Meta {
-                title: m_title,
-                parent: m_parent,
-                parent_recorded,
-                message_count: _,
-                token_usage: m_usage,
-                updated_at: m_updated,
-                sequence_high_water: m_sequence_high_water,
-                history_epochs: m_history_epochs,
-                usage_by_model: m_usage_by_model,
-                meta: m_meta,
-                legacy_config: m_legacy_config,
-                legacy_plan: m_legacy_plan,
-            } => {
-                title = m_title;
-                title_set = false;
-                if parent_recorded {
-                    parent = m_parent;
+                SessionRecord::Compaction {
+                    agent,
+                    messages: summary,
+                    ids,
+                    covered: _,
+                } => {
+                    agent_message_ids.insert(
+                        agent,
+                        if ids.len() == summary.len() {
+                            ids
+                        } else {
+                            summary.iter().map(|_| MakimaId::generate()).collect()
+                        },
+                    );
+                    agent_messages.insert(agent, summary);
                 }
-                token_usage = m_usage;
-                updated_at = m_updated;
-                sequence_high_water = sequence_high_water.max(m_sequence_high_water);
-                history_epochs = m_history_epochs;
-                usage_by_model = m_usage_by_model;
-                meta = *m_meta;
-                legacy_config = m_legacy_config;
-                legacy_plan = m_legacy_plan;
+                SessionRecord::History { .. } => {}
+                SessionRecord::Fork {
+                    agent,
+                    input_draft,
+                    cleared_turns: turns,
+                    ..
+                } => {
+                    forked_agents.insert(agent);
+                    cleared_turns.extend(turns.into_iter().map(|turn| (Some(agent), turn)));
+                    if let Some(draft) = input_draft {
+                        meta.input_draft = (!draft.is_empty()).then_some(draft);
+                        if !legacy_queue.is_empty() {
+                            let root = agent_revisions
+                                .iter()
+                                .find(|(_, record)| record.parent.is_none())
+                                .map(|(_, record)| record.id)
+                                .or_else(|| id.and_then(|id| id.to_string().parse().ok()));
+                            if root == Some(agent) {
+                                legacy_queue.clear();
+                            }
+                        }
+                    }
+                }
+                SessionRecord::Out { id: out_id, d } => {
+                    tool_outputs.insert(out_id, Arc::new(d));
+                }
+                SessionRecord::Post { d } => posts.push(d),
+                SessionRecord::Draft { text } => meta.input_draft = text,
+                SessionRecord::Title { title: next_title } => {
+                    title = next_title;
+                    title_set = true;
+                }
+                SessionRecord::Usage {
+                    token_usage: usage,
+                    usage_by_model: by_model,
+                } => {
+                    token_usage = usage;
+                    usage_by_model = by_model;
+                }
+                SessionRecord::Meta {
+                    title: m_title,
+                    parent: m_parent,
+                    parent_recorded,
+                    message_count: _,
+                    token_usage: m_usage,
+                    updated_at: m_updated,
+                    sequence_high_water: m_sequence_high_water,
+                    history_epochs: m_history_epochs,
+                    usage_by_model: m_usage_by_model,
+                    meta: m_meta,
+                    legacy_config: m_legacy_config,
+                    legacy_plan: m_legacy_plan,
+                } => {
+                    title = m_title;
+                    title_set = false;
+                    if parent_recorded {
+                        parent = m_parent;
+                    }
+                    token_usage = m_usage;
+                    updated_at = m_updated;
+                    sequence_high_water = sequence_high_water.max(m_sequence_high_water);
+                    history_epochs = m_history_epochs;
+                    usage_by_model = m_usage_by_model;
+                    meta = *m_meta;
+                    legacy_config = m_legacy_config;
+                    legacy_plan = m_legacy_plan;
+                }
             }
         }
     }
@@ -1600,6 +1637,9 @@ struct JsonlHeader {
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ScanRecord {
+    Group {
+        records: Vec<Self>,
+    },
     Msg,
     Input {
         messages: Vec<serde::de::IgnoredAny>,
@@ -1642,6 +1682,33 @@ struct ScannedHeader {
     title: String,
     updated_at: u64,
     message_count: usize,
+}
+
+impl ScannedHeader {
+    fn apply(&mut self, record: ScanRecord) {
+        match record {
+            ScanRecord::Group { records } => {
+                for record in records {
+                    self.apply(record);
+                }
+            }
+            ScanRecord::Msg => self.message_count += 1,
+            ScanRecord::Input { messages } => self.message_count += messages.len(),
+            ScanRecord::Title { title } => self.title = normalize_title(&title),
+            ScanRecord::Meta {
+                title,
+                updated_at,
+                message_count,
+            } => {
+                self.title = title;
+                self.updated_at = updated_at;
+                if let Some(count) = message_count {
+                    self.message_count = count;
+                }
+            }
+            ScanRecord::Other => {}
+        }
+    }
 }
 
 type ScanCache = HashMap<String, ScanCacheEntry>;
@@ -1730,9 +1797,14 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
         return None;
     }
 
-    let mut title = DEFAULT_TITLE.to_string();
-    let mut updated_at = 0;
-    let mut message_count = 0;
+    let mut summary = ScannedHeader {
+        id: header.id,
+        parent: header.parent,
+        cwd: header.cwd,
+        title: DEFAULT_TITLE.to_string(),
+        updated_at: 0,
+        message_count: 0,
+    };
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
@@ -1743,42 +1815,17 @@ fn scan_jsonl_header(path: &Path) -> Option<ScannedHeader> {
             // rather than appearing with a bogus count.
             Err(_) => return None,
         }
-        if line.starts_with(MSG_PREFIX) && line.ends_with(b"\n") {
-            message_count += 1;
-        } else if line.ends_with(b"\n")
-            && let Ok(ScanRecord::Meta {
-                title: next_title,
-                updated_at: next_updated_at,
-                message_count: next_message_count,
-            }) = serde_json::from_slice(line.trim_ascii_end())
-        {
-            title = next_title;
-            updated_at = next_updated_at;
-            if let Some(count) = next_message_count {
-                message_count = count;
-            }
-        } else if line.ends_with(b"\n")
-            && let Ok(ScanRecord::Title { title: next_title }) =
-                serde_json::from_slice(line.trim_ascii_end())
-        {
-            title = normalize_title(&next_title);
-        } else if line.ends_with(b"\n") {
-            match serde_json::from_slice::<ScanRecord>(&line) {
-                Ok(ScanRecord::Msg) => message_count += 1,
-                Ok(ScanRecord::Input { messages }) => message_count += messages.len(),
-                _ => {}
-            }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        if line.starts_with(MSG_PREFIX) {
+            summary.message_count += 1;
+        } else if let Ok(record) = serde_json::from_slice::<ScanRecord>(&line) {
+            summary.apply(record);
         }
     }
 
-    Some(ScannedHeader {
-        id: header.id,
-        parent: header.parent,
-        cwd: header.cwd,
-        title,
-        updated_at,
-        message_count,
-    })
+    Some(summary)
 }
 
 fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
@@ -5591,6 +5638,50 @@ mod tests {
         assert_eq!(loaded.messages().len(), 2);
     }
 
+    #[test]
+    fn replay_and_scan_expand_group_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let mut session = TestSession::new("m", "/project");
+        session.save_to(tmp.path()).unwrap();
+        let agent = session.message_agent();
+        let first = MakimaId::generate();
+        let second = MakimaId::generate();
+        let revision_seq = 7;
+        let physical_seq = 42;
+        let path = jsonl_path(tmp.path(), session.id);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        let group = serde_json::json!({
+            "t": "group", "seq": physical_seq, "records": [
+                {"t": "agent", "journal_seq": revision_seq, "d": root_record(agent, revision_seq)},
+                {"t": "msg", "agent": agent, "id": first, "d": user_message("first")},
+                {"t": "title", "title": "Superseded"},
+                {"t": "msg", "agent": agent, "id": second, "d": user_message("second")},
+                {"t": "title", "title": "Grouped"},
+            ],
+        });
+        writeln!(file, "{group}").unwrap();
+        write!(file, "{group}").unwrap();
+        drop(file);
+
+        let loaded = TestSession::load_from(session.id, tmp.path()).unwrap();
+        assert_eq!(loaded.chat_message_ids(None), vec![first, second]);
+        assert_eq!(
+            super::context_message_ids(loaded.context_events(), agent),
+            vec![first, second]
+        );
+        assert_eq!(loaded.agent_revisions()[0].0, revision_seq);
+        assert_eq!(loaded.sequence_high_water(), Some(physical_seq));
+        assert_eq!(loaded.title, "Grouped");
+
+        let summaries = TestSession::list_all_in(tmp.path()).unwrap();
+        assert_eq!(summaries[0].message_count, 2);
+        assert_eq!(summaries[0].title, loaded.title);
+    }
+
+    #[test_case(b"{\"t\":\"group\",\"records\":{}}\n" ; "group_records_not_an_array")]
+    #[test_case(b"{\"t\":\"group\",\"records\":[]}\n" ; "empty_group")]
+    #[test_case(b"{\"t\":\"group\",\"records\":[{\"t\":\"title\",\"title\":\"valid\"},{\"t\":\"future_type\"}]}\n" ; "invalid_group_member")]
+    #[test_case(b"{\"t\":\"group\",\"records\":[{\"t\":\"group\",\"records\":[]}]}\n" ; "nested_group")]
     #[test_case(b"{\"t\":\"future_type\",\"d\":{}}\n" ; "unknown_record_type")]
     #[test_case(b"{\"t\":\"sub_msg\",\"sub\":\"child\",\"d\":null}\n" ; "v2_child_record_in_v3_log")]
     #[test_case(b"{\"t\":\"meta\",\"title\":7}\n" ; "record_with_a_field_of_the_wrong_shape")]

@@ -550,8 +550,9 @@ struct RuntimeResult {
 #[derive(Clone)]
 struct PendingResult {
     conversion: Arc<Mutex<RuntimeResult>>,
-    terminal: Option<JournalPending>,
-    deliveries: Vec<(JournalPending, AgentId, Option<String>, usize)>,
+    pending: JournalPending,
+    terminal_generation: Option<u64>,
+    delivery: Option<(AgentId, Option<String>, usize)>,
     released: bool,
     outcome: Option<TurnOutcome>,
     incarnation: Option<JournalIncarnation>,
@@ -1002,22 +1003,9 @@ impl SessionJournal {
                 state
                     .delivery_bytes
                     .retain(|(_, child, turn), _| (*child, *turn) != key);
-                let pending: Vec<_> = result
-                    .terminal
-                    .into_iter()
-                    .chain(
-                        result
-                            .deliveries
-                            .into_iter()
-                            .map(|(pending, _, _, _)| pending),
-                    )
-                    .collect();
-                state.staged.retain(|entry| {
-                    !entry
-                        .pending
-                        .as_ref()
-                        .is_some_and(|candidate| pending.contains(candidate))
-                });
+                state
+                    .staged
+                    .retain(|entry| entry.pending.as_ref() != Some(&result.pending));
                 state.conversion_errors.remove(&key);
             }
         }
@@ -1489,6 +1477,16 @@ impl SessionJournal {
         result: TurnResult,
         store: Option<Arc<OffloadStore>>,
     ) -> Result<Option<TerminalGuard>, JournalError> {
+        self.stage_terminal(incarnation, result, store, 0)
+    }
+
+    pub(crate) fn stage_terminal(
+        self: &Arc<Self>,
+        incarnation: Option<JournalIncarnation>,
+        result: TurnResult,
+        store: Option<Arc<OffloadStore>>,
+        generation: u64,
+    ) -> Result<Option<TerminalGuard>, JournalError> {
         if !self.persistent {
             return Ok(None);
         }
@@ -1509,7 +1507,7 @@ impl SessionJournal {
                 managed_histories: [key.0].into(),
                 ..Default::default()
             },
-            1,
+            2,
         )?;
         let revision = pending.revision;
         state.results.insert(
@@ -1521,8 +1519,9 @@ impl SessionJournal {
                     stored: None,
                     store,
                 })),
-                terminal: Some(pending),
-                deliveries: Vec::new(),
+                pending,
+                terminal_generation: Some(generation),
+                delivery: None,
                 released: false,
                 outcome: None,
                 incarnation,
@@ -1540,12 +1539,7 @@ impl SessionJournal {
         let Some(result) = state.results.get_mut(&key) else {
             return;
         };
-        if result.released
-            || result
-                .terminal
-                .as_ref()
-                .is_none_or(|pending| pending.revision != revision)
-        {
+        if result.released || result.pending.revision != revision {
             return;
         }
         result.released = true;
@@ -1631,16 +1625,18 @@ impl SessionJournal {
             .then_some(size)
         }))
         .admit(preview_bytes)?;
-        let pending = Self::stage_locked(&mut state, JournalCommit::default(), 1)
-            .map_err(|_| DeliveryRejection::ParentUnavailable)?;
-        let spawn;
-        if let Some(result) = state.results.get_mut(&key) {
-            result
-                .deliveries
-                .push((pending, parent, delivery.label.clone(), preview_bytes));
-            spawn = false;
+        let target = (parent, delivery.label.clone(), preview_bytes);
+        let (spawn, sequence) = if let Some(result) = state.results.get_mut(&key) {
+            if result.delivery.is_some() {
+                return Err(DeliveryRejection::ParentUnavailable);
+            }
+            result.delivery = Some(target);
+            (false, result.pending.first_seq + 1)
         } else {
             let stored = reduced.result(child, turn).cloned();
+            let pending = Self::stage_locked(&mut state, JournalCommit::default(), 1)
+                .map_err(|_| DeliveryRejection::ParentUnavailable)?;
+            let sequence = pending.first_seq;
             state.results.insert(
                 key,
                 PendingResult {
@@ -1650,19 +1646,19 @@ impl SessionJournal {
                         stored,
                         store: None,
                     })),
-                    terminal: None,
-                    deliveries: vec![(pending, parent, delivery.label.clone(), preview_bytes)],
+                    pending,
+                    terminal_generation: None,
+                    delivery: Some(target),
                     released: true,
                     outcome: None,
                     incarnation: None,
                 },
             );
-            spawn = true;
-        }
+            (true, sequence)
+        };
         state
             .delivery_bytes
             .insert((parent, child, turn), preview_bytes);
-        let sequence = state.snapshot.seq;
         state
             .delivery_envelopes
             .insert((parent, child, turn), (sequence, delivery));
@@ -1794,22 +1790,13 @@ impl SessionJournal {
         state.last_failed_conversion = Some((key, diagnostic));
         if let Err(error) = self.complete_conversion_locked(&mut state, key, stored) {
             tracing::error!(%error, agent_id = %key.0, turn_id = %key.1, "failed to install terminal failure record");
-            if let Some(result) = state.results.remove(&key) {
-                let pending = result.terminal.into_iter().chain(
-                    result
-                        .deliveries
-                        .into_iter()
-                        .map(|(pending, _, _, _)| pending),
-                );
-                for pending in pending {
-                    if let Some(entry) = state
-                        .staged
-                        .iter_mut()
-                        .find(|entry| entry.pending.as_ref() == Some(&pending))
-                    {
-                        entry.pending = None;
-                    }
-                }
+            if let Some(result) = state.results.remove(&key)
+                && let Some(entry) = state
+                    .staged
+                    .iter_mut()
+                    .find(|entry| entry.pending.as_ref() == Some(&result.pending))
+            {
+                entry.pending = None;
             }
             state
                 .delivery_envelopes
@@ -1872,49 +1859,37 @@ impl SessionJournal {
         if !failed && let Some(outcome) = &result.outcome {
             stored.outcome = outcome.clone().into();
         }
-        let mut commits = Vec::new();
-        if let Some(pending) = result.terminal.clone() {
-            commits.push((
-                pending,
-                JournalChange {
-                    agent: Some(key.0),
-                    generation: 0,
-                    change: StateChange::Turn {
-                        turn: key.1,
-                        result: stored.clone(),
-                    },
+        let mut changes = Vec::with_capacity(result.pending.count);
+        if let Some(generation) = result.terminal_generation {
+            changes.push(JournalChange {
+                agent: Some(key.0),
+                generation,
+                change: StateChange::Turn {
+                    turn: key.1,
+                    result: stored.clone(),
                 },
-            ));
+            });
         }
-        for (pending, parent, label, preview_bytes) in result.deliveries.clone() {
-            commits.push((
-                pending,
-                JournalChange {
-                    agent: Some(parent),
-                    generation: 0,
-                    change: StateChange::Delivery {
-                        id: key,
-                        op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
-                            label,
-                            preview_bytes: Some(preview_bytes),
-                            held: false,
-                            result: stored.clone(),
-                        })),
-                    },
+        if let Some((parent, label, preview_bytes)) = &result.delivery {
+            changes.push(JournalChange {
+                agent: Some(*parent),
+                generation: 0,
+                change: StateChange::Delivery {
+                    id: key,
+                    op: StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                        label: label.clone(),
+                        preview_bytes: Some(*preview_bytes),
+                        held: false,
+                        result: stored,
+                    })),
                 },
-            ));
+            });
         }
-        let previous_snapshot = state.snapshot.clone();
-        let previous_staged = state.staged.clone();
-        for (pending, change) in commits {
-            if let Err(error) = Self::complete_locked(state, pending, vec![change]) {
-                state.snapshot = previous_snapshot;
-                state.staged = previous_staged;
-                tracing::warn!(%error, agent_id = %key.0, turn_id = %key.1, "terminal journal conversion could not commit");
-                state.conversion_errors.insert(key, error.to_string());
-                self.conversion_changed.notify(usize::MAX);
-                return Err(error);
-            }
+        if let Err(error) = Self::complete_locked(state, result.pending.clone(), changes) {
+            tracing::warn!(%error, agent_id = %key.0, turn_id = %key.1, "terminal journal conversion could not commit");
+            state.conversion_errors.insert(key, error.to_string());
+            self.conversion_changed.notify(usize::MAX);
+            return Err(error);
         }
         if failed {
             state
@@ -2508,6 +2483,9 @@ impl SessionJournal {
         pending: JournalPending,
         changes: Vec<JournalChange>,
     ) -> Result<(), JournalError> {
+        if changes.len() != pending.count {
+            return Err(JournalError::InvalidPending);
+        }
         let mut state = self.lock();
         Self::complete_locked(&mut state, pending, changes)?;
         Self::advance_ready(&mut state);
@@ -2525,7 +2503,7 @@ impl SessionJournal {
             .iter()
             .position(|entry| entry.pending.as_ref() == Some(&pending))
             .ok_or(JournalError::InvalidPending)?;
-        if pending.epoch != state.snapshot.epoch || changes.len() != pending.count {
+        if pending.epoch != state.snapshot.epoch || changes.len() > pending.count {
             return Err(JournalError::InvalidPending);
         }
         for change in &changes {
@@ -2610,16 +2588,21 @@ impl SessionJournal {
 
     fn emit_unwritten(state: &mut JournalState) {
         for record in &state.unwritten[state.captured_unwritten.min(state.unwritten.len())..] {
-            if matches!(
-                record,
-                SessionRecord::Msg { .. }
-                    | SessionRecord::Compaction { .. }
-                    | SessionRecord::History { .. }
-                    | SessionRecord::Input { .. }
-            ) && let Ok(event) = serde_json::to_value(record)
-            {
-                let snapshot = Arc::make_mut(&mut state.ready);
-                append_context_events(Arc::make_mut(&mut snapshot.context_events), event);
+            let records = match record {
+                SessionRecord::Group { records } => records.as_slice(),
+                _ => from_ref(record),
+            };
+            for record in records {
+                if matches!(
+                    record,
+                    SessionRecord::Msg { .. }
+                        | SessionRecord::Compaction { .. }
+                        | SessionRecord::History { .. }
+                ) && let Ok(event) = serde_json::to_value(record)
+                {
+                    let snapshot = Arc::make_mut(&mut state.ready);
+                    append_context_events(Arc::make_mut(&mut snapshot.context_events), event);
+                }
             }
         }
         state.captured_unwritten = state.unwritten.len();
@@ -2690,25 +2673,7 @@ impl SessionJournal {
                 {
                     entry.snapshot.set_root_header(config);
                 }
-                let mut consumed_input = match records.last() {
-                    Some((_, SessionRecord::State { d }))
-                        if matches!(
-                            d.change,
-                            StateChange::JoinedInput { input: None, .. }
-                                | StateChange::TurnInput { input: None, .. }
-                        ) && d
-                            .agent
-                            .is_some_and(|agent| entry.histories.contains(&agent)) =>
-                    {
-                        let d = d.clone();
-                        records.pop();
-                        Some(d)
-                    }
-                    _ => None,
-                };
-                state
-                    .unwritten
-                    .extend(records.into_iter().map(|(_, record)| record));
+                let mut records: Vec<_> = records.into_iter().map(|(_, record)| record).collect();
                 for agent in entry.histories {
                     let Some(history) = entry.snapshot.histories.get(&agent) else {
                         continue;
@@ -2720,29 +2685,13 @@ impl SessionJournal {
                     if appended {
                         let start = previous.map_or(0, |previous| previous.len);
                         let messages = history.ids.iter().zip(history.messages.iter()).skip(start);
-                        if consumed_input
-                            .as_ref()
-                            .is_some_and(|d| d.agent == Some(agent))
-                            && let Some(d) = consumed_input.take()
-                        {
-                            // A complete log line must contain both the messages and the inbox retirement.
-                            state.unwritten.push(SessionRecord::Input {
-                                d,
-                                messages: messages
-                                    .map(|(id, message)| (*id, message.clone()))
-                                    .collect(),
-                            });
-                        } else {
-                            state.unwritten.extend(messages.map(|(id, message)| {
-                                SessionRecord::Msg {
-                                    id: *id,
-                                    agent,
-                                    d: message.clone(),
-                                }
-                            }));
-                        }
+                        records.extend(messages.map(|(id, message)| SessionRecord::Msg {
+                            id: *id,
+                            agent,
+                            d: message.clone(),
+                        }));
                     } else {
-                        state.unwritten.push(SessionRecord::Compaction {
+                        records.push(SessionRecord::Compaction {
                             agent,
                             messages: history.messages.as_ref().clone(),
                             ids: history.ids.as_ref().clone(),
@@ -2753,7 +2702,7 @@ impl SessionJournal {
                         previous.compacted != history.compacted
                             || previous.conversation != history.conversation
                     }) {
-                        state.unwritten.push(SessionRecord::History {
+                        records.push(SessionRecord::History {
                             agent,
                             compacted: history.compacted,
                             conversation: history.conversation.clone(),
@@ -2767,7 +2716,7 @@ impl SessionJournal {
                         && let Some(title) = generate_title(&history.messages)
                     {
                         entry.snapshot.title = Some(Arc::from(title.as_str()));
-                        state.unwritten.push(SessionRecord::Title { title });
+                        records.push(SessionRecord::Title { title });
                     }
                     state.emitted_histories.insert(
                         agent,
@@ -2779,9 +2728,7 @@ impl SessionJournal {
                         },
                     );
                 }
-                state
-                    .unwritten
-                    .extend(consumed_input.map(|d| SessionRecord::State { d }));
+                state.unwritten.extend(SessionRecord::group(records));
                 state.ready = Arc::new(entry.snapshot);
             }
         }
@@ -3109,7 +3056,12 @@ mod tests {
             let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
             let titles: Vec<_> = log
                 .lines()
-                .filter_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
+                .map(|line| serde_json::from_str::<Record>(line).unwrap())
+                .flat_map(|record| match record {
+                    Record::Group { records } => records,
+                    _ => vec![record],
+                })
+                .filter_map(|record| match record {
                     Record::Title { title } => Some(title),
                     _ => None,
                 })
@@ -3317,12 +3269,15 @@ mod tests {
             })
             .unwrap();
         let state = journal.lock();
-        assert_eq!(state.unwritten.len(), 3);
+        let [super::SessionRecord::Group { records }, compaction] = state.unwritten.as_slice()
+        else {
+            panic!("expected grouped history and subsequent compaction");
+        };
         assert!(
-            matches!(&state.unwritten[0], super::SessionRecord::Msg { id, agent: saved, .. } if *id == first_id && *saved == agent)
+            matches!(&records[0], super::SessionRecord::Msg { id, agent: saved, .. } if *id == first_id && *saved == agent)
         );
         assert!(
-            matches!(&state.unwritten[2], super::SessionRecord::Compaction { ids, covered, .. } if ids == &[summary_id] && *covered == Some(first_id))
+            matches!(compaction, super::SessionRecord::Compaction { ids, covered, .. } if ids == &[summary_id] && *covered == Some(first_id))
         );
     }
 
