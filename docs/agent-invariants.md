@@ -29,7 +29,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 18. Explicit admission allocates and registers the ticket before work can finalize. Exact waits must handle both finalization-before-wait and wait-before-finalization.
 19. Removing, clearing, closing, or shutting down must terminalize every affected queued explicit admission and resolve its waiter. Never drop accepted turn work silently.
-20. TUI main input, child input, Lua `when = "join"` sends and headless prompts (print, SDK, ACP) use `AgentActorHandle::submit`, so input sent while a turn runs joins it in every frontend. Compatible submissions share the ticket for their execution; a closed admission or intervening operation requires a new turn.
+20. TUI input, child input, Lua `when = "join"` sends, and print, SDK, and ACP prompts use shared submit semantics. Compatible submissions share a turn ticket. A closed admission or intervening operation requires a new turn.
 21. A pending ordinary message has a stable `SubmissionId` distinct from its `TurnId`. Consumption or removal addresses that submission without changing another message or creating an extra terminal result for a shared turn.
 22. Controls and compaction are not turns. They have no `TurnId`, no managed turn admission, and no retained `TurnOutcome`.
 23. `AgentInput` has one ownership transfer from queue to backend. Do not clone input payloads to avoid fixing ownership or lifetime design.
@@ -104,7 +104,7 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 70. Agent revisions and state changes share one session journal sequence. Config, rules, context, plugin state, admissions, outcomes, and deliveries must not acquire independent competing orders.
 71. Teardown never records Closed or Retired for an open durable agent. Detachment revokes the old incarnation and retains ownership through tool completion and cleanup before making resources reusable.
-72. TUI, SDK, and ACP open saved sessions through `open_session`. The session lease protects loading and publication. Recovery installs the recovered journal before runtime activation.
+72. TUI, SDK, ACP, and print use the [shared session pipeline](agent-system.md#opening-and-continuing-a-session) and backend. For saved sessions, the lease protects loading and publication. The pipeline installs the recovered journal before activating the runtime.
 73. Delivery deduplication keys by `(AgentId, TurnId)` and records consumed, withdrawn, or dropped disposition durably. Restart and compaction must not redeliver a terminally disposed result from retained state.
 74. Plugin state uses registered, versioned JSON slots in explicit agent or session scope. Mutations validate authority and expected revision. Migration changes publish with the same journal transaction before observers run.
 75. Session saves write v3; v2 import has no downgrade path. The first v3 release writes an empty header feature set. Unknown versions, unsupported feature names, and complete unsupported record schemas fail closed.
@@ -112,6 +112,12 @@ These invariants cover the actor, manager and agent frontends as they are curren
 
 77. One `SessionWriter` per open saved session appends records in sequence order and acknowledges durability after fsync. Write failures retain pending records for retry. A torn final line is discarded before appending again. Compaction and forks cannot rewrite complete message records.
 78. Rewind requires the selected agent to be idle. It holds that agent's idle guard and appends a fork with a stable target and a stored note. The fork changes only that agent's conversation and pending input. Other agents are unaffected. Non-conversation state retains its latest revision, and child-report delivery dispositions do not roll back.
+
+## Frontend boundary
+
+79. Frontends read the shared journal projection and call agent-layer operations. They never write session records or keep a competing session copy. Each session fact has one write path in the agent layer. Event observers do not derive or persist session facts from presentation events.
+80. Isolated questions never enter the actor queue or conversation history. They can run alongside an active turn.
+81. Held input never continues automatically, including during recovery or a mailbox wake. An accepted user submission releases the hold. Cancellation can discard held input.
 
 ## Lock order
 

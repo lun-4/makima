@@ -1,6 +1,14 @@
 # Frontends as clients of one session interface
 
-Status: approved by the user as a large refactor on top of PR 6 (`luna.24-pr-6-persistent-agents.md`).
+Status: done (`0fb4af4a` through `8b2ac33f`).
+
+## Result
+
+- TUI, SDK, ACP, and print use one [session pipeline](../../docs/agent-system.md#opening-and-continuing-a-session) and one backend.
+- The [session journal](../../docs/agent-system.md#session-journal-and-recovery) records session facts once and shares its projection. Frontends use shared operations for input, shell commands, cancellation, answers, isolated questions, rewind, and reset where supported.
+- The TUI still schedules lease heartbeats, coordinates tab replacement and teardown, and keeps `ProviderSlot` for discovery and usage. The SDK still selects fork sources. A failed open can leave a fresh log without an active tab. A draft change copies the projection snapshot.
+
+The sections below record the original plan and step notes.
 
 ## Goal
 

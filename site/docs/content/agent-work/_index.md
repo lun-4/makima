@@ -31,7 +31,7 @@ Instruction changes on disk do not silently replace the session's recorded conte
 
 ### Session storage
 
-The session log is append-only. It keeps every saved message, including cut-off branches and the original messages from before compaction, until the session is deleted.
+The session log is append-only. It keeps every saved message, including cut-off branches and the original messages from before compaction, until the session is deleted. Saved TUI, SDK, and ACP sessions also retain tool outputs, posts, and usage, including recorded cost.
 
 If a write fails, the terminal UI shows an unsaved warning. Makima keeps the records in memory and retries while agents keep working. If any records remain unsaved at quit, Makima warns before exiting. Unsaved records may be lost on exit or crash.
 
@@ -57,6 +57,10 @@ A queued configuration change, working-directory change, control operation, or e
 Acceptance does not mean the model has received the message. A pending message can be recalled or removed before consumption. Removing one message does not cancel its turn or other messages in that turn. A stale queue selection cannot remove a different message after consumption. Queue limits reject further input without cancelling accepted work.
 
 In the TUI, a failed turn or compaction holds the agent's queued user messages. They stay visible in the queue. The next message releases them in order and starts a separate turn behind them. Cancelling the agent discards the held messages.
+
+## Isolated questions
+
+`/btw` asks a question using a snapshot of the selected agent's conversation. It can run while the agent is busy. It uses no tools, skips the message queue, and leaves the conversation unchanged.
 
 ## Focused controls
 
