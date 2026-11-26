@@ -327,8 +327,11 @@ impl Fixture {
         let (spawned, ready) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
         let held_context = Arc::new(Mutex::new(None));
-        let root = manager
-            .create_root_with_config(Some(policy(&context)), Vec::new(), None, |_| {
+        let root = smol::block_on(manager.create_root_with_config(
+            Some(policy(&context)),
+            Vec::new(),
+            None,
+            |_| {
                 Ok::<_, String>(Box::new(ManagedDriver {
                     context: context.clone(),
                     registry: Arc::clone(&registry),
@@ -337,8 +340,9 @@ impl Fixture {
                     started: true,
                     held_context: Some(Arc::clone(&held_context)),
                 }) as Box<dyn ActorBackend>)
-            })
-            .unwrap();
+            },
+        ))
+        .unwrap();
         host.event_handle()
             .install_orchestration_services(Arc::new(Targets(Mutex::new(vec![TrustedTarget {
                 target: root.clone(),
@@ -1241,6 +1245,7 @@ fn automatic_graph_continuations(extra_continuation: bool) {
                     held_context: None,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let driver = root
             .actor()

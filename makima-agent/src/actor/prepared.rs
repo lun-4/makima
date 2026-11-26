@@ -1304,6 +1304,7 @@ mod tests {
                     None,
                     Box::new(ScriptedBackend::new()),
                 )
+                .await
                 .unwrap();
             let actor = agent.actor().unwrap();
             actor

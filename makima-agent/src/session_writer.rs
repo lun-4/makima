@@ -119,6 +119,7 @@ enum Payload {
     Records(Vec<Record>),
     Fork(Box<Record>),
     Recovery(Vec<Record>),
+    AgentRevision(Box<Record>),
 }
 
 impl Payload {
@@ -126,12 +127,15 @@ impl Payload {
         match self {
             Self::Close => 0,
             Self::Records(records) | Self::Recovery(records) => records.len(),
-            Self::Fork(_) => 1,
+            Self::Fork(_) | Self::AgentRevision(_) => 1,
         }
     }
 
     fn is_atomic(&self) -> bool {
-        matches!(self, Self::Fork(_) | Self::Recovery(_))
+        matches!(
+            self,
+            Self::Fork(_) | Self::Recovery(_) | Self::AgentRevision(_)
+        )
     }
 }
 
@@ -276,6 +280,10 @@ impl SessionWriter {
         self.enqueue(Payload::Fork(Box::new(record)), None)
     }
 
+    pub(crate) fn append_agent_revision(&self, record: Record) -> Receipt {
+        self.enqueue(Payload::AgentRevision(Box::new(record)), None)
+    }
+
     pub(crate) fn append_recovery(
         &self,
         records: Vec<Record>,
@@ -347,7 +355,7 @@ fn writer_error(session_id: MakimaId, error: impl ToString) -> WriterError {
     }
 }
 
-fn open_log(path: &Path) -> io::Result<(File, u64)> {
+pub(crate) fn open_log(path: &Path) -> io::Result<(File, u64)> {
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -508,7 +516,7 @@ async fn run(
                     }));
                     return;
                 }
-                payload @ (Payload::Fork(_) | Payload::Recovery(_)) => {
+                payload @ (Payload::Fork(_) | Payload::Recovery(_) | Payload::AgentRevision(_)) => {
                     let count = payload.count();
                     if let Some(error) = &ordinary_error {
                         status.lock_unpoisoned().unsaved_records -= count;
@@ -526,8 +534,11 @@ async fn run(
                     let mut candidate_seq = next_seq;
                     let mut encoded = Vec::new();
                     let fork = matches!(payload, Payload::Fork(_));
+                    let accept_visible = fork || matches!(payload, Payload::AgentRevision(_));
                     let records = match &payload {
-                        Payload::Fork(record) => std::slice::from_ref(record.as_ref()),
+                        Payload::Fork(record) | Payload::AgentRevision(record) => {
+                            std::slice::from_ref(record.as_ref())
+                        }
                         Payload::Recovery(records) => records.as_slice(),
                         _ => unreachable!(),
                     };
@@ -555,7 +566,7 @@ async fn run(
                     .await;
                     io = returned_io;
                     let fenced = matches!(&result, Err(AtomicWriteError::Rollback { .. }));
-                    let visible_fork = fork
+                    let visible = accept_visible
                         && matches!(
                             &result,
                             Err(AtomicWriteError::Rollback {
@@ -565,7 +576,7 @@ async fn run(
                         );
                     let error = result.err().map(|error| writer_error(session_id, error));
                     let receipt = if let Some(error) = &error
-                        && !visible_fork
+                        && !visible
                     {
                         Err(error.clone())
                     } else {

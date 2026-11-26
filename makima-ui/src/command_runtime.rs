@@ -413,10 +413,12 @@ mod tests {
     fn plugin_run_command_hands_its_turn_to_the_loop(close: bool) {
         let runtime = pinned_runtime();
         let handle = runtime.bind_target();
-        let root = AgentManagerHandle::new(Default::default())
-            .unwrap()
-            .create_root(Vec::new(), None, Box::new(IdleBackend))
-            .unwrap();
+        let root = smol::block_on(
+            AgentManagerHandle::new(Default::default())
+                .unwrap()
+                .create_root(Vec::new(), None, Box::new(IdleBackend)),
+        )
+        .unwrap();
         let admission = PinnedCommandTarget::pin(TrustedTarget {
             target: root.clone(),
             template: makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),
@@ -455,10 +457,12 @@ mod tests {
         let prepared = runtime.prepare_target();
         let host = Arc::clone(&prepared.host);
         let handle = prepared.activate();
-        let root = AgentManagerHandle::new(Default::default())
-            .unwrap()
-            .create_root(Vec::new(), None, Box::new(IdleBackend))
-            .unwrap();
+        let root = smol::block_on(
+            AgentManagerHandle::new(Default::default())
+                .unwrap()
+                .create_root(Vec::new(), None, Box::new(IdleBackend)),
+        )
+        .unwrap();
         runtime.sync_admissions(HashMap::from([(
             handle.id(),
             TrustedTarget {
@@ -481,13 +485,14 @@ mod tests {
         let runtime = pinned_runtime();
         let handle = runtime.bind_target();
         let manager = AgentManagerHandle::new(Default::default()).unwrap();
-        let first = manager
-            .create_root(Vec::new(), None, Box::new(IdleBackend))
-            .unwrap();
-        let second = AgentManagerHandle::new(Default::default())
-            .unwrap()
-            .create_root(Vec::new(), None, Box::new(IdleBackend))
-            .unwrap();
+        let first =
+            smol::block_on(manager.create_root(Vec::new(), None, Box::new(IdleBackend))).unwrap();
+        let second = smol::block_on(
+            AgentManagerHandle::new(Default::default())
+                .unwrap()
+                .create_root(Vec::new(), None, Box::new(IdleBackend)),
+        )
+        .unwrap();
         let admission = TrustedTarget {
             target: first.clone(),
             template: makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()),

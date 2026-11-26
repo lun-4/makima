@@ -1615,6 +1615,7 @@ pub(crate) fn spawn_session_runner(
                             |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend)),
                             started,
                         )
+                        .await
                         .map_err(|error| error.to_string())?;
                     template.execution_agent_id = Some(reference.id());
                     let journal = manager.journal();

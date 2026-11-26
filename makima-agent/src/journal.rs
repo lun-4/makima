@@ -33,7 +33,7 @@ use crate::actor::{
     MAX_PENDING_PREVIEW_BYTES, StoredTurnProgress, TurnResult, TurnResultStorageError,
 };
 use crate::context::{CONTEXT_MANIFEST, ContextUpdate, manifest_hash};
-use crate::session_writer::SessionWriter;
+use crate::session_writer::{Receipt, SessionWriter, WriterError};
 use crate::state::{
     StateChangeEvent, StateChangeReason, StateEdit, StateError, StateRevision, StateRuntime,
     StateScope, read_slot, validate_access, validate_record,
@@ -158,8 +158,10 @@ pub enum JournalError {
     StaleIncarnation(AgentId),
     #[error("journal preparation failed: {0}")]
     Preparation(String),
-    #[error("cannot publish spawn while an earlier journal change is pending")]
-    SpawnPublicationPending,
+    #[error("cannot publish agent revision while an earlier journal change is pending")]
+    AgentPublicationPending,
+    #[error(transparent)]
+    Writer(#[from] WriterError),
     #[error("prepared journal commits cannot add agent identities")]
     PreparedAgents,
     #[error("pending journal conversion does not match its reserved records")]
@@ -525,6 +527,13 @@ pub struct JournalPending {
     count: usize,
 }
 
+pub(crate) struct AgentRevision {
+    pending: JournalPending,
+    candidate: SessionJournalSnapshot,
+    commit: JournalCommit,
+    receipt: Receipt,
+}
+
 #[derive(Clone)]
 struct StagedCommit {
     snapshot: SessionJournalSnapshot,
@@ -570,7 +579,6 @@ pub(crate) struct JournalState {
     delivery_bytes: BTreeMap<(AgentId, AgentId, TurnId), usize>,
     delivery_envelopes: BTreeMap<(AgentId, AgentId, TurnId), (u64, Arc<ChildDelivery>)>,
     checkpoint_error: Option<String>,
-    writer_error: Option<String>,
     conversion_errors: BTreeMap<(AgentId, TurnId), String>,
     last_failed_conversion: Option<((AgentId, TurnId), String)>,
     incarnations: BTreeMap<AgentId, u64>,
@@ -825,6 +833,7 @@ pub struct SessionJournal {
     publication: Arc<RwLock<()>>,
     persistent: bool,
     state: Mutex<JournalState>,
+    writer_error: Mutex<Option<String>>,
     conversion_changed: Event,
 }
 
@@ -846,7 +855,6 @@ impl Default for SessionJournal {
                 delivery_bytes: BTreeMap::new(),
                 delivery_envelopes: BTreeMap::new(),
                 checkpoint_error: None,
-                writer_error: None,
                 conversion_errors: BTreeMap::new(),
                 last_failed_conversion: None,
                 incarnations: BTreeMap::new(),
@@ -855,6 +863,7 @@ impl Default for SessionJournal {
                 emitted_histories: BTreeMap::new(),
                 captured_unwritten: 0,
             }),
+            writer_error: Mutex::default(),
             conversion_changed: Event::new(),
         }
     }
@@ -1097,24 +1106,6 @@ impl SessionJournal {
         self.lock().writer.is_some()
     }
 
-    pub fn flush_spawn(&self, target: u64) -> Result<(), String> {
-        let (writer, target) = {
-            let mut state = self.lock();
-            let Some(writer) = state.writer.clone() else {
-                return Ok(());
-            };
-            if state.ready.revision < target {
-                return Err(JournalError::SpawnPublicationPending.to_string());
-            }
-            Self::emit_unwritten(&mut state);
-            (writer, state.ready.revision)
-        };
-        smol::block_on(writer.append(Vec::new())).map_err(|error| error.to_string())?;
-        let mut state = self.lock();
-        state.published_revision = state.published_revision.max(target);
-        Ok(())
-    }
-
     pub async fn flush(&self) -> Result<(), String> {
         if !self.persistent {
             return Ok(());
@@ -1329,7 +1320,7 @@ impl SessionJournal {
                     .as_ref()
                     .and_then(|writer| writer.status().error.map(|error| error.to_string()))
             })
-            .or_else(|| state.writer_error.clone())
+            .or_else(|| self.writer_error.lock_unpoisoned().clone())
             .or_else(|| state.checkpoint_error.clone())
             .or_else(|| {
                 state
@@ -1340,7 +1331,7 @@ impl SessionJournal {
     }
 
     pub(crate) fn set_writer_error(&self, error: Option<String>) {
-        self.lock().writer_error = error;
+        *self.writer_error.lock_unpoisoned() = error;
     }
 
     pub fn set_checkpoint_error(&self, error: Option<String>) {
@@ -2142,18 +2133,142 @@ impl SessionJournal {
         build: impl FnOnce(&SessionJournalSnapshot) -> JournalCommit,
         apply: impl FnOnce(),
     ) -> Result<u64, JournalError> {
-        self.commit_with_receipts(false, build, apply)
+        self.commit_with_receipts(build, apply)
             .map(|(revision, _)| revision)
     }
 
-    pub(crate) fn commit_spawn(&self, commit: JournalCommit) -> Result<u64, JournalError> {
-        self.commit_with_receipts(true, |_| commit, || ())
-            .map(|(revision, _)| revision)
+    pub(crate) fn begin_agent_revision(
+        &self,
+        mut commit: JournalCommit,
+    ) -> Result<Option<AgentRevision>, JournalError> {
+        let mut state = self.lock();
+        let Some(writer) = state.writer.clone() else {
+            let (_, events) = self.commit_locked(&mut state, commit)?;
+            state.plugin_state.enqueue_notices(events);
+            drop(state);
+            self.drain_state_notices();
+            return Ok(None);
+        };
+        if !state.staged.is_empty() {
+            return Err(JournalError::AgentPublicationPending);
+        }
+        self.resolve_state_edits(&mut state, &mut commit)?;
+        let candidate = Self::apply_commit(&state.snapshot, commit.clone())?;
+        let mut persisted = state.clone();
+        Self::collect_entry(
+            &mut persisted,
+            StagedCommit {
+                snapshot: candidate.clone(),
+                pending: None,
+                histories: commit.histories.keys().copied().collect(),
+            },
+        );
+        let record = persisted
+            .unwritten
+            .pop()
+            .ok_or(JournalError::InvalidPending)?;
+        let pending = JournalPending {
+            epoch: candidate.epoch,
+            revision: candidate.revision,
+            first_seq: state.snapshot.seq + 1,
+            count: 0,
+        };
+        // Reserve the sequence range without making the agent visible. Later commits
+        // can stage behind this entry; only the writer can publish the reserved range.
+        state.snapshot.revision = candidate.revision;
+        state.snapshot.seq = candidate.seq;
+        let snapshot = state.snapshot.clone();
+        state.staged.push_back(StagedCommit {
+            snapshot,
+            pending: Some(pending.clone()),
+            histories: BTreeSet::new(),
+        });
+        state.plugin_state.reservations.extend(
+            Self::state_addresses(&commit)
+                .into_iter()
+                .map(|address| (address, pending.revision)),
+        );
+        Ok(Some(AgentRevision {
+            pending,
+            candidate,
+            commit,
+            receipt: writer.append_agent_revision(record),
+        }))
+    }
+
+    pub(crate) async fn finish_agent_revision(
+        &self,
+        revision: AgentRevision,
+    ) -> Result<(), JournalError> {
+        let AgentRevision {
+            pending,
+            candidate,
+            commit,
+            receipt,
+        } = revision;
+        let ack = receipt.await;
+        let mut state = self.lock();
+        let entry = state.staged.pop_front().expect("reserved agent revision");
+        debug_assert_eq!(entry.pending.as_ref(), Some(&pending));
+        for address in Self::state_addresses(&commit) {
+            state.plugin_state.reservations.remove(&address);
+        }
+        if let Ok(ack) = &ack {
+            if let Some(error) = &ack.warning {
+                tracing::warn!(%error, "agent revision is visible but durability is uncertain");
+            }
+            let histories = commit.histories.keys().copied().collect();
+            let history_epochs = Self::changed_history_epochs(&entry.snapshot, &commit);
+            let merge = |snapshot: &mut SessionJournalSnapshot| {
+                snapshot
+                    .state
+                    .extend(candidate.state.after(pending.first_seq - 1).cloned());
+                snapshot.agent_revisions.extend(
+                    candidate
+                        .agent_revisions
+                        .after(pending.first_seq - 1)
+                        .cloned(),
+                );
+                snapshot.histories.extend(commit.histories.clone());
+                snapshot.reducer = None;
+            };
+            merge(&mut state.snapshot);
+            for entry in &mut state.staged {
+                merge(&mut entry.snapshot);
+            }
+            for agent in history_epochs {
+                state
+                    .plugin_state
+                    .agent_epochs
+                    .insert(agent, MakimaId::generate());
+            }
+            let later = take(&mut state.unwritten);
+            let captured = take(&mut state.captured_unwritten);
+            Self::collect_entry(
+                &mut state,
+                StagedCommit {
+                    snapshot: candidate.clone(),
+                    pending: None,
+                    histories,
+                },
+            );
+            Self::capture_unwritten(&mut state);
+            state.unwritten = later;
+            state.captured_unwritten = captured;
+            state.published_revision = pending.revision;
+            state
+                .plugin_state
+                .enqueue_notices(Self::state_events(&candidate, &commit.changes));
+        }
+        Self::advance_ready(&mut state);
+        drop(state);
+        self.conversion_changed.notify(usize::MAX);
+        self.drain_state_notices();
+        ack.map(|_| ()).map_err(Into::into)
     }
 
     pub(crate) fn commit_state_edit(&self, edit: StateEdit) -> Result<StateRevision, JournalError> {
         let (_, events) = self.commit_with_receipts(
-            false,
             |_| JournalCommit {
                 state_edits: vec![edit],
                 ..Default::default()
@@ -2168,17 +2283,26 @@ impl SessionJournal {
 
     fn commit_with_receipts(
         &self,
-        spawn: bool,
         build: impl FnOnce(&SessionJournalSnapshot) -> JournalCommit,
         apply: impl FnOnce(),
     ) -> Result<(u64, Vec<StateChangeEvent>), JournalError> {
         let mut state = self.lock();
-        if spawn && state.writer.is_some() && !state.staged.is_empty() {
-            return Err(JournalError::SpawnPublicationPending);
-        }
-        let mut commit = build(&state.snapshot);
-        Self::validate_incarnations(&state, &commit.incarnations)?;
-        self.resolve_state_edits(&mut state, &mut commit)?;
+        let commit = build(&state.snapshot);
+        let (revision, events) = self.commit_locked(&mut state, commit)?;
+        apply();
+        state.plugin_state.enqueue_notices(events.clone());
+        drop(state);
+        self.drain_state_notices();
+        Ok((revision, events))
+    }
+
+    fn commit_locked(
+        &self,
+        state: &mut JournalState,
+        mut commit: JournalCommit,
+    ) -> Result<(u64, Vec<StateChangeEvent>), JournalError> {
+        Self::validate_incarnations(state, &commit.incarnations)?;
+        self.resolve_state_edits(state, &mut commit)?;
         let history_epochs = Self::changed_history_epochs(&state.snapshot, &commit);
         let changes = commit.changes.clone();
         let retired_deliveries: Vec<_> = commit
@@ -2204,7 +2328,6 @@ impl SessionJournal {
             state.delivery_envelopes.remove(&key);
         }
         if candidate.revision == state.snapshot.revision {
-            apply();
             return Ok((candidate.revision, Vec::new()));
         }
         let revision = candidate.revision;
@@ -2221,11 +2344,7 @@ impl SessionJournal {
             pending: None,
             histories,
         });
-        Self::advance_ready(&mut state);
-        apply();
-        state.plugin_state.enqueue_notices(events.clone());
-        drop(state);
-        self.drain_state_notices();
+        Self::advance_ready(state);
         Ok((revision, events))
     }
 
@@ -2600,6 +2719,16 @@ impl SessionJournal {
     }
 
     fn emit_unwritten(state: &mut JournalState) {
+        Self::capture_unwritten(state);
+        if let Some(writer) = &state.writer
+            && !state.unwritten.is_empty()
+        {
+            drop(writer.append(take(&mut state.unwritten)));
+            state.captured_unwritten = 0;
+        }
+    }
+
+    fn capture_unwritten(state: &mut JournalState) {
         for record in &state.unwritten[state.captured_unwritten.min(state.unwritten.len())..] {
             let records = match record {
                 SessionRecord::Group { records } => records.as_slice(),
@@ -2619,12 +2748,6 @@ impl SessionJournal {
             }
         }
         state.captured_unwritten = state.unwritten.len();
-        if let Some(writer) = &state.writer
-            && !state.unwritten.is_empty()
-        {
-            drop(writer.append(take(&mut state.unwritten)));
-            state.captured_unwritten = 0;
-        }
     }
 
     fn collect_ready(state: &mut JournalState) {
@@ -2633,118 +2756,122 @@ impl SessionJournal {
             .front()
             .is_some_and(|entry| entry.pending.is_none())
         {
-            if let Some(mut entry) = state.staged.pop_front() {
-                entry.snapshot.id = state.ready.id;
-                entry.snapshot.updated_at = now_epoch();
-                entry.snapshot.draft.clone_from(&state.ready.draft);
-                entry.snapshot.draft_changed = state.ready.draft_changed;
-                entry.snapshot.context_events = Arc::clone(&state.ready.context_events);
-                entry.snapshot.title = state.ready.title.clone();
-                entry.snapshot.cwd = Arc::clone(&state.ready.cwd);
-                entry.snapshot.model = Arc::clone(&state.ready.model);
-                entry.snapshot.root = state.ready.root;
-                entry.snapshot.usage = Arc::clone(&state.ready.usage);
-                entry.snapshot.tool_outputs = Arc::clone(&state.ready.tool_outputs);
-                entry.snapshot.posts = Arc::clone(&state.ready.posts);
-                let mut records: Vec<_> = entry
-                    .snapshot
-                    .state
-                    .after(state.ready.seq)
-                    .map(|record| (record.seq, SessionRecord::State { d: record.clone() }))
-                    .chain(entry.snapshot.agent_revisions.after(state.ready.seq).map(
-                        |(seq, agent)| {
-                            (
-                                *seq,
-                                SessionRecord::Agent {
-                                    seq: *seq,
-                                    d: agent.clone(),
-                                },
-                            )
-                        },
-                    ))
-                    .collect();
-                records.sort_by_key(|(seq, _)| *seq);
-                if let Some(root) = records.iter().rev().find_map(|(_, record)| match record {
-                    SessionRecord::Agent { d, .. } if d.parent.is_none() => Some(d.id),
-                    _ => None,
-                }) && Some(root) != entry.snapshot.root
-                {
-                    entry.snapshot.root = Some(root);
-                    entry.snapshot.refresh_root_header();
-                } else if let Some(config) =
-                    records.iter().rev().find_map(|(_, record)| match record {
-                        SessionRecord::State { d }
-                            if d.agent.is_some() && d.agent == entry.snapshot.root =>
-                        {
-                            match &d.change {
-                                StateChange::Config(config) => Some(config),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    })
-                {
-                    entry.snapshot.set_root_header(config);
-                }
-                let mut records: Vec<_> = records.into_iter().map(|(_, record)| record).collect();
-                for agent in entry.histories {
-                    let Some(history) = entry.snapshot.histories.get(&agent) else {
-                        continue;
-                    };
-                    let previous = state.emitted_histories.get(&agent);
-                    let appended = previous.is_none_or(|previous| {
-                        previous.epoch == history.epoch && previous.len <= history.messages.len()
-                    });
-                    if appended {
-                        let start = previous.map_or(0, |previous| previous.len);
-                        let messages = history.ids.iter().zip(history.messages.iter()).skip(start);
-                        records.extend(messages.map(|(id, message)| SessionRecord::Msg {
-                            id: *id,
-                            agent,
-                            d: message.clone(),
-                        }));
-                    } else {
-                        records.push(SessionRecord::Compaction {
-                            agent,
-                            messages: history.messages.as_ref().clone(),
-                            ids: history.ids.as_ref().clone(),
-                            covered: history.covered,
-                        });
-                    }
-                    if previous.is_none_or(|previous| {
-                        previous.compacted != history.compacted
-                            || previous.conversation != history.conversation
-                    }) {
-                        records.push(SessionRecord::History {
-                            agent,
-                            compacted: history.compacted,
-                            conversation: history.conversation.clone(),
-                        });
-                    }
-                    if entry.snapshot.title.is_none()
-                        && entry
-                            .snapshot
-                            .latest_agent(agent)
-                            .is_some_and(|record| record.parent.is_none())
-                        && let Some(title) = generate_title(&history.messages)
-                    {
-                        entry.snapshot.title = Some(Arc::from(title.as_str()));
-                        records.push(SessionRecord::Title { title });
-                    }
-                    state.emitted_histories.insert(
-                        agent,
-                        EmittedHistory {
-                            epoch: history.epoch,
-                            len: history.messages.len(),
-                            compacted: history.compacted,
-                            conversation: history.conversation.clone(),
-                        },
-                    );
-                }
-                state.unwritten.extend(SessionRecord::group(records));
-                state.ready = Arc::new(entry.snapshot);
+            if let Some(entry) = state.staged.pop_front() {
+                Self::collect_entry(state, entry);
             }
         }
+    }
+
+    fn collect_entry(state: &mut JournalState, mut entry: StagedCommit) {
+        entry.snapshot.id = state.ready.id;
+        entry.snapshot.updated_at = now_epoch();
+        entry.snapshot.draft.clone_from(&state.ready.draft);
+        entry.snapshot.draft_changed = state.ready.draft_changed;
+        entry.snapshot.context_events = Arc::clone(&state.ready.context_events);
+        entry.snapshot.title = state.ready.title.clone();
+        entry.snapshot.cwd = Arc::clone(&state.ready.cwd);
+        entry.snapshot.model = Arc::clone(&state.ready.model);
+        entry.snapshot.root = state.ready.root;
+        entry.snapshot.usage = Arc::clone(&state.ready.usage);
+        entry.snapshot.tool_outputs = Arc::clone(&state.ready.tool_outputs);
+        entry.snapshot.posts = Arc::clone(&state.ready.posts);
+        let mut records: Vec<_> = entry
+            .snapshot
+            .state
+            .after(state.ready.seq)
+            .map(|record| (record.seq, SessionRecord::State { d: record.clone() }))
+            .chain(
+                entry
+                    .snapshot
+                    .agent_revisions
+                    .after(state.ready.seq)
+                    .map(|(seq, agent)| {
+                        (
+                            *seq,
+                            SessionRecord::Agent {
+                                seq: *seq,
+                                d: agent.clone(),
+                            },
+                        )
+                    }),
+            )
+            .collect();
+        records.sort_by_key(|(seq, _)| *seq);
+        if let Some(root) = records.iter().rev().find_map(|(_, record)| match record {
+            SessionRecord::Agent { d, .. } if d.parent.is_none() => Some(d.id),
+            _ => None,
+        }) && Some(root) != entry.snapshot.root
+        {
+            entry.snapshot.root = Some(root);
+            entry.snapshot.refresh_root_header();
+        } else if let Some(config) = records.iter().rev().find_map(|(_, record)| match record {
+            SessionRecord::State { d } if d.agent.is_some() && d.agent == entry.snapshot.root => {
+                match &d.change {
+                    StateChange::Config(config) => Some(config),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }) {
+            entry.snapshot.set_root_header(config);
+        }
+        let mut records: Vec<_> = records.into_iter().map(|(_, record)| record).collect();
+        for agent in entry.histories {
+            let Some(history) = entry.snapshot.histories.get(&agent) else {
+                continue;
+            };
+            let previous = state.emitted_histories.get(&agent);
+            let appended = previous.is_none_or(|previous| {
+                previous.epoch == history.epoch && previous.len <= history.messages.len()
+            });
+            if appended {
+                let start = previous.map_or(0, |previous| previous.len);
+                let messages = history.ids.iter().zip(history.messages.iter()).skip(start);
+                records.extend(messages.map(|(id, message)| SessionRecord::Msg {
+                    id: *id,
+                    agent,
+                    d: message.clone(),
+                }));
+            } else {
+                records.push(SessionRecord::Compaction {
+                    agent,
+                    messages: history.messages.as_ref().clone(),
+                    ids: history.ids.as_ref().clone(),
+                    covered: history.covered,
+                });
+            }
+            if previous.is_none_or(|previous| {
+                previous.compacted != history.compacted
+                    || previous.conversation != history.conversation
+            }) {
+                records.push(SessionRecord::History {
+                    agent,
+                    compacted: history.compacted,
+                    conversation: history.conversation.clone(),
+                });
+            }
+            if entry.snapshot.title.is_none()
+                && entry
+                    .snapshot
+                    .latest_agent(agent)
+                    .is_some_and(|record| record.parent.is_none())
+                && let Some(title) = generate_title(&history.messages)
+            {
+                entry.snapshot.title = Some(Arc::from(title.as_str()));
+                records.push(SessionRecord::Title { title });
+            }
+            state.emitted_histories.insert(
+                agent,
+                EmittedHistory {
+                    epoch: history.epoch,
+                    len: history.messages.len(),
+                    compacted: history.compacted,
+                    conversation: history.conversation.clone(),
+                },
+            );
+        }
+        state.unwritten.extend(SessionRecord::group(records));
+        state.ready = Arc::new(entry.snapshot);
     }
 
     fn apply_commit(
@@ -3192,26 +3319,6 @@ mod tests {
             assert!(journal.pending_revision().is_none());
             assert_eq!(journal.snapshot().state.iter().len(), 3);
         });
-    }
-
-    #[test]
-    fn spawn_flush_rejects_pending_changes_without_waiting_or_reordering() {
-        let directory = tempfile::tempdir().unwrap();
-        let session = Session::new(FIRST, "/");
-        let journal = SessionJournal::from_session(&session).unwrap();
-        let writer =
-            crate::session_writer::SessionWriter::open_session(directory.path(), &session).unwrap();
-        journal.bind_writer(writer).unwrap();
-        let pending = journal.stage(JournalCommit::default(), 1).unwrap();
-        assert_eq!(
-            journal.flush_spawn(pending.revision).unwrap_err(),
-            JournalError::SpawnPublicationPending.to_string()
-        );
-        journal
-            .complete(pending, vec![admitted(AgentId::generate())])
-            .unwrap();
-        journal.flush_spawn(journal.snapshot().revision).unwrap();
-        assert_eq!(journal.published_revision(), journal.snapshot().revision);
     }
 
     #[test]

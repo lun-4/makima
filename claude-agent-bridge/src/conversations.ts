@@ -260,6 +260,7 @@ export class Conversations {
     record.seen = messages.length
     record.interrupted = undefined
     record.launch = launchHash(request)
+    const boundaryCount = record.boundaries.length
     try {
       const end = await opened.session.readStep((message) => {
         this.checkToolServer(message, request)
@@ -291,6 +292,19 @@ export class Conversations {
       throw error
     } finally {
       await this.save(conversation)
+      if (signal.aborted && !record.interrupted) {
+        // The SDK consumed the input, but Makima disconnected before `done`.
+        record.seen = messages.length
+        record.boundaries.length = boundaryCount
+        record.interrupted = { tools: record.waiting ?? [] }
+        record.waiting = undefined
+        if (opened.session.running) {
+          await opened.session.interrupt().catch(() => {})
+          opened.pending.clear()
+        }
+        await this.save(conversation)
+        signal.throwIfAborted()
+      }
     }
   }
 

@@ -470,27 +470,31 @@ pub(crate) fn test_app() -> App {
 /// The root's runner never starts, so queued work stays put for assertions.
 fn parked_root() -> AgentRef {
     let (start_tx, start_rx) = flume::bounded(1);
-    AgentManagerHandle::new(Default::default())
-        .unwrap()
-        .create_root_deferred_with_config(
-            Some(root_config()),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(ParkedBackend(start_tx)) as Box<dyn ActorBackend>),
-            start_rx,
-        )
-        .unwrap()
+    smol::block_on(
+        AgentManagerHandle::new(Default::default())
+            .unwrap()
+            .create_root_deferred_with_config(
+                Some(root_config()),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(Box::new(ParkedBackend(start_tx)) as Box<dyn ActorBackend>),
+                start_rx,
+            ),
+    )
+    .unwrap()
 }
 
 /// A root whose first turn is running and never finishes.
 fn running_root_app() -> (App, flume::Receiver<AgentInput>) {
     let (tx, rx) = flume::unbounded();
-    let root = AgentManagerHandle::new(Default::default())
-        .unwrap()
-        .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
+    let root = smol::block_on(
+        AgentManagerHandle::new(Default::default())
+            .unwrap()
+            .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
+            }),
+    )
+    .unwrap();
     let actor = root.actor().unwrap();
     let mut app = app_with_root(root);
     let run_id = actor.reserve_presentation(app.run_id);
@@ -517,12 +521,14 @@ fn running_root_app() -> (App, flume::Receiver<AgentInput>) {
 #[test]
 fn starting_submit_follows_the_turn_it_folds_into() {
     let (tx, rx) = flume::unbounded();
-    let root = AgentManagerHandle::new(Default::default())
-        .unwrap()
-        .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
+    let root = smol::block_on(
+        AgentManagerHandle::new(Default::default())
+            .unwrap()
+            .create_root_with_config(Some(root_config()), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>)
+            }),
+    )
+    .unwrap();
     let mut app = app_with_root(root.clone());
     let message = |text: &str| QueuedMessage {
         text: text.into(),
@@ -7272,14 +7278,13 @@ fn bind_history_actor(app: &mut App, messages: Vec<Message>) -> AgentRef {
         },
         AgentMode::Build,
     );
-    let target = manager
-        .create_root_with_config(
-            Some(config),
-            messages.clone(),
-            Some(Arc::clone(&shared)),
-            |_| Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let target = smol::block_on(manager.create_root_with_config(
+        Some(config),
+        messages.clone(),
+        Some(Arc::clone(&shared)),
+        |_| Ok::<_, String>(Box::new(FocusedInputBackend(tx)) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     app.chats[0].agent_id = Some(target.id());
     app.shared_history = Some(shared);
     app.edit_session_fixture(|session| session.replace_messages(messages));
@@ -12199,16 +12204,18 @@ fn spawn_input_child_under(
     let root = parent.unwrap_or_else(|| {
         let manager = AgentManagerHandle::new(Default::default()).unwrap();
         let (unused_tx, _) = flume::unbounded();
-        manager
-            .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-                Ok::<_, String>(Box::new(FocusedInputBackend(unused_tx)) as Box<dyn ActorBackend>)
-            })
-            .unwrap()
+        smol::block_on(manager.create_root_with_config(
+            Some(config.clone()),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(FocusedInputBackend(unused_tx)) as Box<dyn ActorBackend>),
+        ))
+        .unwrap()
     });
     let manager = root.manager();
     let (tx, rx) = flume::unbounded();
-    let target = manager
-        .spawn_child_trusted_with_config(
+    let target =
+        smol::block_on(manager.spawn_child_trusted_with_config(
             &root,
             config,
             Default::default(),
@@ -12219,7 +12226,7 @@ fn spawn_input_child_under(
                     Box::new(FocusedInputBackend(tx)) as Box<dyn makima_agent::ActorBackend>
                 )
             },
-        )
+        ))
         .unwrap();
     target
         .actor()
@@ -12318,14 +12325,16 @@ fn shared_submission_preserves_images(child: bool) {
         app_with_subagent_actor(TASK_ID)
     } else {
         let (tx, rx) = flume::unbounded();
-        let root = AgentManagerHandle::new(Default::default())
-            .unwrap()
-            .create_root_with_config(None, Vec::new(), None, |_| {
-                Ok::<_, String>(
-                    Box::new(FocusedInputBackend(tx)) as Box<dyn makima_agent::ActorBackend>
-                )
-            })
-            .unwrap();
+        let root = smol::block_on(
+            AgentManagerHandle::new(Default::default())
+                .unwrap()
+                .create_root_with_config(None, Vec::new(), None, |_| {
+                    Ok::<_, String>(
+                        Box::new(FocusedInputBackend(tx)) as Box<dyn makima_agent::ActorBackend>
+                    )
+                }),
+        )
+        .unwrap();
         (app_with_root(root), rx)
     };
     let data: Arc<str> = Arc::from("A".repeat(IMAGE_BYTES));

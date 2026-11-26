@@ -693,6 +693,7 @@ impl ActorBackend for SpawnManagedChildBackend {
                     None,
                     self.child_backend.take().unwrap(),
                 )
+                .await
                 .unwrap();
             let ticket = child
                 .actor()
@@ -812,6 +813,7 @@ async fn spawn_managed_parent(
                 child: child_tx,
             }) as Box<dyn ActorBackend>)
         })
+        .await
         .unwrap();
     let root_ticket = root
         .actor()
@@ -969,6 +971,7 @@ fn managed_lua_requests_follow_resolved_and_updated_configuration() {
                     tool_name: TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let ticket = root
             .actor()
@@ -2160,6 +2163,7 @@ fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
                     tool_name: RETAIN_ASYNC_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let first_ticket = root
             .actor()
@@ -2256,6 +2260,7 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
                     tool_name: CAPTURE_UNMANAGED_CTX_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let capture = origin
             .actor()
@@ -2279,6 +2284,7 @@ fn managed_scope_rejects_foreign_unmanaged_ctx_before_side_effects() {
                     tool_name: REJECT_FOREIGN_CTX_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let before = manager.node(root.id()).unwrap();
         assert_eq!(manager.snapshot().len(), 1);
@@ -2337,6 +2343,7 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
                     tool_name: TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let ticket = root
             .actor()
@@ -2388,6 +2395,7 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
                     tool_name: SILENT_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let ticket = root
             .actor()
@@ -2435,6 +2443,7 @@ fn retained_managed_prompt_outside_turn_is_rejected_without_mutation() {
                     tool_name: RETAIN_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let ticket = root
             .actor()
@@ -2501,6 +2510,7 @@ fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
                     tool_name: TIMEOUT_TOOL_NAME,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         context.managed_turn = None;
         let ticket = root

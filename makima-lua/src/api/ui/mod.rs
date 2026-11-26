@@ -1303,6 +1303,7 @@ mod tests {
             let (release_tx, release_rx) = flume::bounded(1);
             let root = manager
                 .create_root(Vec::new(), None, Box::new(Backend(entered_tx, release_rx)))
+                .await
                 .unwrap();
             let ticket = manager
                 .actor(root.id())

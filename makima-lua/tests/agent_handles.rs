@@ -893,19 +893,21 @@ impl Fixture {
         let (completed_tx, completed) = flume::bounded(1);
         let (observations_tx, observations) = flume::unbounded();
         let template = context.clone();
-        let root = manager
-            .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-                Ok::<_, String>(Box::new(LuaInvocationBackend {
-                    registry: Arc::clone(&registry),
-                    context,
-                    tool,
-                    completed: completed_tx,
-                    observations: observations_tx,
-                    invocation_cancel,
-                    sibling,
-                    setup,
-                }) as Box<dyn ActorBackend>)
-            })
+        let root =
+            smol::block_on(
+                manager.create_root_with_config(Some(policy), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(LuaInvocationBackend {
+                        registry: Arc::clone(&registry),
+                        context,
+                        tool,
+                        completed: completed_tx,
+                        observations: observations_tx,
+                        invocation_cancel,
+                        sibling,
+                        setup,
+                    }) as Box<dyn ActorBackend>)
+                }),
+            )
             .unwrap();
         let target = TrustedTarget {
             target: root.clone(),
@@ -2325,6 +2327,7 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                     }) as Box<dyn ActorBackend>)
                 },
             )
+            .await
             .unwrap();
         let ticket = child
             .actor()

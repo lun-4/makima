@@ -668,17 +668,19 @@ fn agent_close(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Re
 /// @param ctx LuaCtx Invocation context.
 /// @return (boolean?, string?) Success or a retirement error.
 #[lua_fn(name = "retire")]
-fn agent_retire(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<bool>> {
-    let active = try_pair!(authorize(lua, &ctx, this));
-    if let Some(active) = active {
-        try_pair!(this.manager.retire(&active, this.id));
-    } else {
-        try_pair!(
-            this.manager
-                .retire_trusted(&this.manager.reference(this.id))
-        );
-    }
-    retire_closed(lua);
+async fn agent_retire(
+    lua: Lua,
+    this: UserDataRef<LuaAgent>,
+    ctx: UserDataRef<LuaCtx>,
+) -> mlua::Result<Pair<bool>> {
+    let active = try_pair!(authorize(&lua, &ctx, &this));
+    let manager = this.manager.clone();
+    let id = this.id;
+    try_pair!(match active {
+        Some(active) => manager.retire(&active, id).await,
+        None => manager.retire_trusted(&manager.reference(id)).await,
+    });
+    retire_closed(&lua);
     Ok((Some(true), None))
 }
 

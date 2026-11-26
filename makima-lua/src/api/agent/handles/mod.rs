@@ -368,7 +368,7 @@ mod tests {
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             let spawn_child = lua.load(
                 r#"
                 return assert(agent_api.spawn(ctx, { inherit_provider = true, silent = true }))
@@ -433,7 +433,7 @@ mod tests {
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             let result: String = scope
                 .scope_future(
                     lua.load(
@@ -502,7 +502,8 @@ mod tests {
                     max_concurrent_agent_turns: 1,
                     ..AgentLimits::default()
                 },
-            );
+            )
+            .await;
             let manager = root.manager.clone();
             let config = makima_agent::actor::EffectiveAgentConfig::new(
                 makima_agent::RunSettings {
@@ -515,7 +516,7 @@ mod tests {
                 AgentMode::Build,
             );
             let mut fixtures = Vec::new();
-            let mut spawn = |parent: &AgentRef| {
+            let mut spawn = async |parent: &AgentRef| {
                 let config = config.clone();
                 manager
                     .spawn_child_trusted_with_config(
@@ -531,12 +532,13 @@ mod tests {
                             Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
                         },
                     )
+                    .await
                     .unwrap()
             };
-            let parent = spawn(&root.target.target);
-            let sibling = spawn(&root.target.target);
-            let child = spawn(&parent);
-            let leaf = spawn(&child);
+            let parent = spawn(&root.target.target).await;
+            let sibling = spawn(&root.target.target).await;
+            let child = spawn(&parent).await;
+            let leaf = spawn(&child).await;
             let parent_actor = parent.actor().unwrap();
             let child_actor = child.actor().unwrap();
             let leaf_actor = leaf.actor().unwrap();
@@ -595,7 +597,7 @@ mod tests {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let replacement_manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let mut fixtures = Vec::new();
-            let mut create = |manager: &AgentManagerHandle| {
+            let mut create = async |manager: &AgentManagerHandle| {
                 manager
                     .create_root_with_config(None, Vec::new(), None, |id| {
                         let (_, state, session, _) =
@@ -603,10 +605,11 @@ mod tests {
                         fixtures.push(session);
                         Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
                     })
+                    .await
                     .unwrap()
             };
-            let original = create(&manager);
-            let replacement = create(&replacement_manager);
+            let original = create(&manager).await;
+            let replacement = create(&replacement_manager).await;
             let (handle, host) = spawn_host_for_tests(&[]);
             handle.install_orchestration_services(Arc::new(TestServices(TrustedTarget {
                 target: original.clone(),
@@ -709,11 +712,11 @@ mod tests {
     /// Installs a managed root whose trusted context becomes the global `ctx`.
     /// Children spawned through it are real manager nodes, which is the only
     /// way `makima.agent.spawn` authorises a parent.
-    fn install_managed_root(lua: &Lua, context: &ToolContext) -> ManagedRoot {
-        install_managed_root_with(lua, context, AgentLimits::default())
+    async fn install_managed_root(lua: &Lua, context: &ToolContext) -> ManagedRoot {
+        install_managed_root_with(lua, context, AgentLimits::default()).await
     }
 
-    fn install_managed_root_with(
+    async fn install_managed_root_with(
         lua: &Lua,
         context: &ToolContext,
         limits: AgentLimits,
@@ -730,6 +733,7 @@ mod tests {
                 fixture = Some(session);
                 Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
             })
+            .await
             .unwrap();
         let trusted_target = TrustedTarget {
             target: root,
@@ -762,7 +766,7 @@ mod tests {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
             let context = stub_ctx_with(&AgentMode::Build, None, tool_use_id);
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -796,7 +800,7 @@ mod tests {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
             let context = stub_ctx_with(&AgentMode::Build, None, Some(TOOL_USE_ID));
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -852,7 +856,7 @@ mod tests {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
             let context = stub_ctx(&AgentMode::Build);
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -993,7 +997,7 @@ mod tests {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
             let context = stub_ctx(&AgentMode::Build);
-            let root = install_managed_root(&lua, &context);
+            let root = install_managed_root(&lua, &context).await;
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -1176,6 +1180,7 @@ mod tests {
                     root_fixture = Some(session);
                     Ok::<_, String>(Box::new(LuaActorBackend::new(state)))
                 })
+                .await
                 .unwrap();
             let trusted_target = TrustedTarget {
                 target,
@@ -1236,7 +1241,7 @@ mod tests {
         smol::block_on(async {
             let lua = Lua::new();
             let scope = plugin_scope(&lua, PLUGIN);
-            let root = install_managed_root(&lua, &stub_ctx(&AgentMode::Build));
+            let root = install_managed_root(&lua, &stub_ctx(&AgentMode::Build)).await;
             lua.globals()
                 .set("agent_api", create_agent_table(&lua).unwrap())
                 .unwrap();
@@ -1310,6 +1315,7 @@ mod tests {
                     managed_fixture = Some((actor, Arc::clone(&root_state), session, events));
                     Ok::<_, String>(Box::new(LuaActorBackend::new(root_state)))
                 })
+                .await
                 .unwrap();
             let lua = Lua::new();
             crate::orchestration::install_plugin_authority(&lua, Arc::from("agent-test"));

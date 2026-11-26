@@ -424,6 +424,7 @@ mod context_tests {
                         ScriptedBackend::new(),
                     ))
                 })
+                .await
                 .unwrap();
             let target = if child {
                 manager
@@ -439,6 +440,7 @@ mod context_tests {
                             ))
                         },
                     )
+                    .await
                     .unwrap()
             } else {
                 root.clone()
@@ -516,6 +518,7 @@ mod context_tests {
                         ScriptedBackend::new(),
                     ))
                 })
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             let before = actor.effective_config().unwrap();

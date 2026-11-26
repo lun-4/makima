@@ -3065,7 +3065,7 @@ fn event_sink_failure_still_retains() {
     });
 }
 
-fn managed_actor(
+async fn managed_actor(
     backend: ScriptedBackend,
     start: Option<flume::Receiver<()>>,
 ) -> (AgentManagerHandle, AgentActorHandle) {
@@ -3077,9 +3077,15 @@ fn managed_actor(
     let factory = |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend));
     let root = match start {
         Some(start) => {
-            manager.create_root_deferred_with_config(config, Vec::new(), None, factory, start)
+            manager
+                .create_root_deferred_with_config(config, Vec::new(), None, factory, start)
+                .await
         }
-        None => manager.create_root_with_config(config, Vec::new(), None, factory),
+        None => {
+            manager
+                .create_root_with_config(config, Vec::new(), None, factory)
+                .await
+        }
     }
     .unwrap();
     (manager, root.actor().unwrap())
@@ -3127,7 +3133,7 @@ fn managed_ticket_journals_origin_once_and_join_adds_no_admission(
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
-        let (manager, actor) = managed_actor(backend, None);
+        let (manager, actor) = managed_actor(backend, None).await;
         let journal = manager.journal();
         let provenance = TurnProvenance {
             plugin: (origin == TurnOrigin::Plugin).then(|| PLUGIN.into()),
@@ -3201,7 +3207,7 @@ fn managed_queued_cancellation_keeps_admission_and_terminal_origin(origin: TurnO
         let (start, wait) = flume::bounded(1);
         let backend = ScriptedBackend::new();
         let state = Arc::clone(&backend.state);
-        let (manager, actor) = managed_actor(backend, Some(wait));
+        let (manager, actor) = managed_actor(backend, Some(wait)).await;
         let journal = manager.journal();
         let provenance = TurnProvenance {
             origin: origin.clone(),
@@ -3258,7 +3264,7 @@ fn managed_prepared_turn_journals_internal_admission_only_at_commit() {
     smol::block_on(async {
         const PREPARED: &str = "prepared journaled input";
         let (start, wait) = flume::bounded(1);
-        let (manager, actor) = managed_actor(ScriptedBackend::new(), Some(wait));
+        let (manager, actor) = managed_actor(ScriptedBackend::new(), Some(wait)).await;
         let journal = manager.journal();
         let operation = actor
             .reserve_prepared_operation(Some(super::PreparedTurn {
@@ -3309,7 +3315,7 @@ fn managed_child_result_continuation_journals_one_internal_admission() {
         let gate = Gate::new();
         let backend = ScriptedBackend::gated(Arc::clone(&gate));
         let state = Arc::clone(&backend.state);
-        let (manager, actor) = managed_actor(backend, None);
+        let (manager, actor) = managed_actor(backend, None).await;
         let journal = manager.journal();
         let events = actor.subscribe_events();
         let child_turn = TurnId::generate();
@@ -5877,6 +5883,7 @@ fn nonpersistent_graph_descendants_deliver_oversized_results_without_journaling(
                 .unwrap();
         let root = manager
             .create_root(Vec::new(), None, Box::new(ScriptedBackend::new()))
+            .await
             .unwrap();
         let child = manager
             .spawn_child_trusted_with_config(
@@ -5887,6 +5894,7 @@ fn nonpersistent_graph_descendants_deliver_oversized_results_without_journaling(
                 None,
                 |_| Ok::<_, String>(Box::new(ScriptedBackend::new()) as Box<dyn ActorBackend>),
             )
+            .await
             .unwrap();
         let descendant = manager
             .spawn_child_trusted_with_config(
@@ -5897,6 +5905,7 @@ fn nonpersistent_graph_descendants_deliver_oversized_results_without_journaling(
                 None,
                 |_| Ok::<_, String>(Box::new(ScriptedBackend::new()) as Box<dyn ActorBackend>),
             )
+            .await
             .unwrap();
         for agent in [&root, &child, &descendant] {
             assert!(agent.actor().unwrap().inner.journal.is_none());

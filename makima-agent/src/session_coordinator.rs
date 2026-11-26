@@ -3045,9 +3045,9 @@ pub(crate) mod tests {
         installed: Arc<Mutex<Vec<String>>>,
     ) -> AgentRef {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-        let agent = manager
-            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
-            .unwrap();
+        let agent =
+            smol::block_on(manager.create_root(Vec::new(), None, Box::new(MockBackend::STRICT)))
+                .unwrap();
         agent.actor().unwrap().initialize_config(config).unwrap();
         bind_test_permissions(coordinator, &agent);
         coordinator
@@ -3792,6 +3792,7 @@ pub(crate) mod tests {
                         None,
                         |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
+                    .await
                     .unwrap();
                 second
                     .bind_actor(
@@ -4368,6 +4369,7 @@ pub(crate) mod tests {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let agent = manager
                 .create_root(Vec::new(), None, Box::new(ContextBackend(setup)))
+                .await
                 .unwrap();
             let actor = agent.actor().unwrap();
             actor.initialize_config(config).unwrap();
@@ -4471,6 +4473,7 @@ pub(crate) mod tests {
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let agent = manager
                 .create_root(Vec::new(), None, Box::new(ContextBackend(setup)))
+                .await
                 .unwrap();
             agent.actor().unwrap().initialize_config(config).unwrap();
             bind_test_permissions(&coordinator, &agent);
@@ -5444,6 +5447,7 @@ pub(crate) mod tests {
                         None,
                         |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
+                    .await
                     .unwrap();
                 assert!(root.actor().unwrap().inner.journal.is_none());
                 let cwd = PathBuf::from("/project");
@@ -5536,6 +5540,7 @@ pub(crate) mod tests {
                     None,
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                 )
+                .await
                 .unwrap();
             let cwd = PathBuf::from("/project");
             let permissions = Arc::new(PermissionManager::new(

@@ -2348,23 +2348,23 @@ fn folded_legacy_identities_are_readable_but_exempt_from_retention_quota() {
                 |_| Ok::<_, String>(Box::new(MockBackend::STRICT) as Box<dyn ActorBackend>),
             )
         };
-        let child = spawn().unwrap();
+        let child = spawn().await.unwrap();
         assert!(manager.lookup(records[2].id).is_ok());
         assert_eq!(
             manager.node(records[2].id).unwrap().graph_lifecycle,
             GraphLifecycle::Closed
         );
         assert_eq!(
-            spawn().unwrap_err(),
+            spawn().await.unwrap_err(),
             ManagerError::RetentionLimit { max: quota }
         );
         child.close_subtree().unwrap();
         assert_eq!(
-            spawn().unwrap_err(),
+            spawn().await.unwrap_err(),
             ManagerError::RetentionLimit { max: quota }
         );
-        manager.retire_trusted(&child).unwrap();
-        let replacement = spawn().unwrap();
+        manager.retire_trusted(&child).await.unwrap();
+        let replacement = spawn().await.unwrap();
         assert_ne!(replacement.id(), child.id());
         assert_eq!(
             journal.agent(child.id()).unwrap().lifecycle,
@@ -2412,6 +2412,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
                     panic!("retention failure must precede backend construction")
                 },
             )
+            .await
             .unwrap_err();
         assert_eq!(
             error,
@@ -2421,7 +2422,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
         );
         assert_checkpoint(&journal, &before);
         assert_eq!(
-            manager.retire_trusted(&root),
+            manager.retire_trusted(&root).await,
             Err(ManagerError::NotLeaf(root.id()))
         );
         let turn = TurnId::generate();
@@ -2443,7 +2444,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
             state.active = None;
         }
         assert_eq!(
-            manager.retire(&current, id),
+            manager.retire(&current, id).await,
             Err(ManagerError::InactiveTurn {
                 agent_id: root.id(),
                 turn_id: turn
@@ -2451,7 +2452,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
         );
         assert_checkpoint(&journal, &before);
         let child = manager.lookup(id).unwrap();
-        manager.retire_trusted(&child).unwrap();
+        manager.retire_trusted(&child).await.unwrap();
         let retired = journal.agent(id).unwrap();
         assert_eq!(retired.lifecycle, StoredAgentLifecycle::Retired);
         assert_eq!(
@@ -2459,7 +2460,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
             GraphLifecycle::Retired
         );
         let before = journal.checkpoint_snapshot().unwrap();
-        manager.retire_trusted(&child).unwrap();
+        manager.retire_trusted(&child).await.unwrap();
         assert_eq!(
             manager
                 .ensure_resident_with(id, |_| async {
@@ -2479,6 +2480,7 @@ fn retirement_preserves_identity_and_releases_retention_capacity() {
                 None,
                 |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
             )
+            .await
             .unwrap();
         assert_ne!(replacement.id(), id);
         assert_eq!(manager.list().len(), RETAINED_AGENTS + 1);

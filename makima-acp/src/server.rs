@@ -2679,6 +2679,10 @@ mod tests {
             Ok(bytes.len())
         }
 
+        fn position(&mut self) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
         fn sync(&mut self) -> std::io::Result<()> {
             let root = self.root.to_string();
             for line in self

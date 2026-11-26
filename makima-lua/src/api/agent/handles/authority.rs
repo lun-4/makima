@@ -224,7 +224,7 @@ mod tests {
     const QUEUED_COMPACT_COMMAND: &str = "/queued-compact";
     const COMPACT_INSTRUCTIONS: &str = "retain the authority boundary";
 
-    fn inactive_target() -> (TrustedTarget, EffectiveAgentConfig) {
+    async fn inactive_target() -> (TrustedTarget, EffectiveAgentConfig) {
         let template = stub_ctx(&AgentMode::Build);
         let config = EffectiveAgentConfig::new(
             RunSettings {
@@ -245,6 +245,7 @@ mod tests {
                 None,
                 |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
             )
+            .await
             .unwrap();
         (TrustedTarget { target, template }, config)
     }
@@ -287,7 +288,7 @@ mod tests {
     #[test]
     fn queued_command_cannot_compact_replacement_but_fresh_pin_can() {
         smol::block_on(async {
-            let (target, config) = inactive_target();
+            let (target, config) = inactive_target().await;
             let agent = &target.target;
             let manager = agent.manager();
             let pin = PinnedCommandTarget::pin(target.clone()).unwrap();
@@ -411,7 +412,7 @@ mod tests {
         const OWNER: &str = "agent-owner";
         const OBSERVER: &str = "independent-observer";
         smol::block_on(async {
-            let (target, config) = inactive_target();
+            let (target, config) = inactive_target().await;
             let agent = &target.target;
             let manager = agent.manager();
             let old = agent.incarnation().unwrap();
@@ -724,6 +725,7 @@ mod tests {
                         release: release_rx,
                     }))
                 })
+                .await
                 .unwrap();
             let _root_fixture = root_fixture.unwrap();
             let actor = target.actor().unwrap();

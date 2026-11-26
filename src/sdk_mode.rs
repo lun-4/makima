@@ -2643,6 +2643,10 @@ mod tests {
             Ok(written)
         }
 
+        fn position(&mut self) -> std::io::Result<u64> {
+            self.file.metadata().map(|metadata| metadata.len())
+        }
+
         fn sync(&mut self) -> std::io::Result<()> {
             if String::from_utf8_lossy(&self.buffered).contains(self.response)
                 && let Some((entered, release)) = self.gate.take()

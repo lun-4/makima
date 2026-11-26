@@ -1559,7 +1559,7 @@ mod tests {
         }
     }
 
-    fn option_target(coordinator: &SessionCoordinatorHandle) -> TrustedTarget {
+    async fn option_target(coordinator: &SessionCoordinatorHandle) -> TrustedTarget {
         let mut template =
             stub_ctx_with_session(&AgentMode::Build, None, None, coordinator.session_id());
         template.permissions = Arc::new(PermissionManager::new(
@@ -1584,6 +1584,7 @@ mod tests {
             .create_root_with_config(Some(config), Vec::new(), None, |_| {
                 Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT))
             })
+            .await
             .unwrap();
         template
             .permissions
@@ -2020,7 +2021,7 @@ mod tests {
             let handle = host.event_handle();
             let (coordinator, writer, entered, release) =
                 staged_option_coordinator(handle.session_option_catalog(), claim_first);
-            let target = option_target(&coordinator);
+            let target = option_target(&coordinator).await;
             handle.install_orchestration_services(Arc::new(OptionTarget(target.clone())));
             let (trigger, cancel) = CancelToken::new();
             let (owner_tx, owner_rx) = flume::bounded(1);
@@ -2038,6 +2039,7 @@ mod tests {
                         None,
                         |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
                     )
+                    .await
                     .unwrap();
                 TrustedTarget {
                     target: child,
@@ -2176,7 +2178,7 @@ mod tests {
             let handle = host.event_handle();
             let (coordinator, writer, entered, release) =
                 staged_option_coordinator(handle.session_option_catalog(), claim_first);
-            let target = option_target(&coordinator);
+            let target = option_target(&coordinator).await;
             let mut request = Box::pin(handle.set_session_option(
                 coordinator.clone(),
                 YOLO_OPTION_ID,
@@ -3620,9 +3622,9 @@ mod tests {
         const CHANGED: &str = "later unaccepted prompt contribution";
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-        let root = manager
-            .create_root(Vec::new(), None, Box::new(MockBackend::STRICT))
-            .unwrap();
+        let root =
+            smol::block_on(manager.create_root(Vec::new(), None, Box::new(MockBackend::STRICT)))
+                .unwrap();
         let source = |value: &str| {
             format!(
                 r#"

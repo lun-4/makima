@@ -593,6 +593,7 @@ mod tests {
                 .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT))
                 })
+                .await
                 .unwrap();
             let old = agent.incarnation().unwrap();
             let (events, host) = spawn_host_for_tests(&[]);

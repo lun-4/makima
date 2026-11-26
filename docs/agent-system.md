@@ -227,10 +227,10 @@ A resident idle actor remains allocated during normal execution. The active-work
 
 ```rust
 let manager = AgentManagerHandle::new(limits)?;
-let root = manager.create_root(initial_messages, mirror, backend)?;
+let root = manager.create_root(initial_messages, mirror, backend).await?;
 
 // Only from a currently active managed turn:
-let child = manager.spawn_child(&current, metadata, initial_messages, mirror, backend)?;
+let child = manager.spawn_child(&current, metadata, initial_messages, mirror, backend).await?;
 ```
 
 `create_root` succeeds once; frontends use `create_root_deferred_with_config` so the root factory can run after the manager exists. `spawn_child` requires `CurrentManagedTurn`, a manager-issued capability for a specific active `(AgentId, TurnId)` and manager generation/nonce. `spawn_child_trusted_with_config` is the host-only path for trusted plugin handlers; it validates a live parent reference instead and must not be exposed as tool authority. The manager reserves topology and capacity under its graph lock, runs the caller's factory without that lock, then commits or rolls back. Returned factory errors and panics restore the reservation and capacity.

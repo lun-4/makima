@@ -418,8 +418,8 @@ impl RestartHost {
         context.model = Arc::new(Model::from_spec(&session.model).unwrap());
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let history: SharedMessages = Arc::default();
-        let root = manager
-            .create_root_with_config(
+        let root = smol::block_on(
+            manager.create_root_with_config(
                 Some(
                     effective_config(&context)
                         .with_context(AgentContextSnapshot::new(context.cwd.clone())),
@@ -427,8 +427,9 @@ impl RestartHost {
                 session.messages().to_vec(),
                 Some(Arc::clone(&history)),
                 |_| Ok::<_, String>(Box::new(idle_root()) as Box<dyn ActorBackend>),
-            )
-            .unwrap();
+            ),
+        )
+        .unwrap();
         context.execution_agent_id = Some(root.id());
         let root = install_root(&host, root, with_request_tools(&registry, &context));
         let root_manager = manager.clone();
@@ -841,28 +842,30 @@ pub fn bind_parked_root(
     let manager = AgentManagerHandle::new(limits).unwrap();
     let (turn_tx, turn_rx) = flume::bounded(1);
     let cancel = ctx.cancel.clone();
-    let root = manager
-        .create_root_with_config(Some(config), Vec::new(), None, |_| {
-            let backend =
-                MockBackend::STRICT
-                    .with_noop_controls()
-                    .with_turn(move |_, ctx, _, _| {
-                        let turn_tx = turn_tx.clone();
-                        let cancel = cancel.clone();
-                        Box::pin(async move {
-                            turn_tx.send(ctx.managed_turn.unwrap()).unwrap();
-                            cancel.cancelled().await;
-                            BackendResult::EnteredRun(TurnOutcome::cancelled(
-                                ctx.agent_id,
-                                ctx.turn_id.unwrap(),
-                                TokenUsage::default(),
-                                0,
-                                TurnCancellationReason::User,
-                            ))
-                        })
-                    });
-            Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
-        })
+    let root =
+        smol::block_on(
+            manager.create_root_with_config(Some(config), Vec::new(), None, |_| {
+                let backend =
+                    MockBackend::STRICT
+                        .with_noop_controls()
+                        .with_turn(move |_, ctx, _, _| {
+                            let turn_tx = turn_tx.clone();
+                            let cancel = cancel.clone();
+                            Box::pin(async move {
+                                turn_tx.send(ctx.managed_turn.unwrap()).unwrap();
+                                cancel.cancelled().await;
+                                BackendResult::EnteredRun(TurnOutcome::cancelled(
+                                    ctx.agent_id,
+                                    ctx.turn_id.unwrap(),
+                                    TokenUsage::default(),
+                                    0,
+                                    TurnCancellationReason::User,
+                                ))
+                            })
+                        });
+                Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
+            }),
+        )
         .unwrap();
     ctx.execution_agent_id = Some(root.id());
     root.actor()
@@ -903,11 +906,13 @@ pub fn install_root(host: &PluginHost, root: AgentRef, template: ToolContext) ->
 pub fn install_command_root(host: &PluginHost, runner: CommandRunner) -> AgentManagerHandle {
     let (template, _events, _cancel) = ctx_with_canned_provider();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root_with_config(Some(effective_config(&template)), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(idle_root()) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(effective_config(&template)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     let services = AgentOrchestration::bind_root(
         Arc::default(),
         TrustedTarget {

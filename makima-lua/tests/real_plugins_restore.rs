@@ -679,21 +679,23 @@ fn task_retire_command_rejects_busy_nonleaf_and_recovers_retained_quota() {
     let manager = AgentManagerHandle::new(limits).unwrap();
     let (context, _events, _cancel) = common::ctx_with_canned_provider();
     let config = common::effective_config(&context);
-    let root = manager
-        .create_root_with_config(Some(config.clone()), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(config.clone()),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     let target = common::install_root(&host, root.clone(), context);
     let spawn = |parent| {
-        manager.spawn_child_trusted_with_config(
+        smol::block_on(manager.spawn_child_trusted_with_config(
             parent,
             config.clone(),
             Default::default(),
             Vec::new(),
             None,
             |_| Ok::<_, String>(Box::new(retirement_backend()) as Box<dyn ActorBackend>),
-        )
+        ))
     };
     let child = spawn(&root).unwrap();
     let leaf = spawn(&child).unwrap();
@@ -2166,14 +2168,16 @@ fn exec_bash_real(
     let manager = AgentManagerHandle::new(Default::default()).unwrap();
     let (completed_tx, completed) = flume::bounded(1);
     let template = ctx.clone();
-    let root = manager
-        .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(BashInvocationBackend {
-                context: ctx,
-                input,
-                completed: completed_tx,
-            }) as Box<dyn ActorBackend>)
-        })
+    let root =
+        smol::block_on(
+            manager.create_root_with_config(Some(policy), Vec::new(), None, |_| {
+                Ok::<_, String>(Box::new(BashInvocationBackend {
+                    context: ctx,
+                    input,
+                    completed: completed_tx,
+                }) as Box<dyn ActorBackend>)
+            }),
+        )
         .unwrap();
     session
         .bind_permissions(Arc::clone(&template.permissions))

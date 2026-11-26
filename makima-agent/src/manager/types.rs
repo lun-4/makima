@@ -245,8 +245,8 @@ impl AgentRef {
         self.manager.incarnation(self.agent_id)
     }
 
-    pub fn retire(&self, current: &CurrentManagedTurn) -> Result<(), super::ManagerError> {
-        self.manager.retire(current, self.agent_id)
+    pub async fn retire(&self, current: &CurrentManagedTurn) -> Result<(), super::ManagerError> {
+        self.manager.retire(current, self.agent_id).await
     }
 
     pub fn validate_live(&self) -> Result<(), super::ManagerError> {
@@ -361,7 +361,7 @@ impl CurrentManagedTurn {
         self.token.manager.node(self.token.agent_id)
     }
 
-    pub fn spawn_child(
+    pub async fn spawn_child(
         &self,
         metadata: AgentMetadata,
         initial_messages: Vec<makima_providers::Message>,
@@ -371,9 +371,10 @@ impl CurrentManagedTurn {
         self.token
             .manager
             .spawn_child(self, metadata, initial_messages, shared_messages, backend)
+            .await
     }
 
-    pub fn spawn_child_with_config(
+    pub async fn spawn_child_with_config(
         &self,
         config: crate::actor::EffectiveAgentConfig,
         metadata: AgentMetadata,
@@ -381,14 +382,17 @@ impl CurrentManagedTurn {
         shared_messages: Option<crate::SharedMessages>,
         backend: Box<dyn crate::ActorBackend>,
     ) -> Result<AgentRef, super::ManagerError> {
-        self.token.manager.spawn_child_with_config(
-            self,
-            config,
-            metadata,
-            initial_messages,
-            shared_messages,
-            |_| Ok::<_, String>(backend),
-        )
+        self.token
+            .manager
+            .spawn_child_with_config(
+                self,
+                config,
+                metadata,
+                initial_messages,
+                shared_messages,
+                |_| Ok::<_, String>(backend),
+            )
+            .await
     }
 
     pub fn tool_call(&self) -> Option<&CallScope> {

@@ -328,7 +328,6 @@ mod tests {
             );
             let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
             let journal = manager.journal();
-            journal.bind_writer(writer.clone()).unwrap();
             let (started, running) = flume::bounded(1);
             let (finish, running_gate) = flume::bounded(1);
             let root = manager
@@ -351,7 +350,9 @@ mod tests {
                         })
                     })),
                 )
+                .await
                 .unwrap();
+            journal.bind_writer(writer.clone()).unwrap();
             let actor = root.actor().unwrap();
             let target = journal.snapshot().histories[&root.id()].ids[0];
             let guard = root.begin_rewind().unwrap();
@@ -480,6 +481,7 @@ mod tests {
                         })
                     })),
                 )
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             let mut compacted = actor.committed_history_snapshot();
@@ -582,7 +584,9 @@ mod tests {
         });
     }
 
-    fn fixture(parent: Option<ParentLink>) -> (AgentManagerHandle, crate::AgentRef, StoredSession) {
+    async fn fixture(
+        parent: Option<ParentLink>,
+    ) -> (AgentManagerHandle, crate::AgentRef, StoredSession) {
         let root_id = AgentId::generate();
         let mut session = StoredSession::new("test", "/");
         session.set_parent(parent);
@@ -601,6 +605,7 @@ mod tests {
             .create_root_with_id_and_config(root_id, None, Vec::new(), None, |_| {
                 Ok::<_, String>(Box::new(MockBackend::STRICT))
             })
+            .await
             .unwrap();
         let mut history = session.history_snapshot();
         history.epoch = manager.journal().projection().histories[&root_id].epoch;
@@ -621,7 +626,7 @@ mod tests {
                 session: MakimaId::generate(),
                 message: None,
             };
-            let (manager, root, _) = fixture(Some(parent.clone()));
+            let (manager, root, _) = fixture(Some(parent.clone())).await;
             let before = manager.journal().snapshot();
             let events = manager.journal().context_events();
             let guard = root.begin_rewind().unwrap();
@@ -646,7 +651,7 @@ mod tests {
     #[test_case(2; "later_user_turn")]
     fn fork_cuts_before_prompt_preserves_state_and_supports_redo(index: usize) {
         smol::block_on(async {
-            let (manager, root, session) = fixture(None);
+            let (manager, root, session) = fixture(None).await;
             let child = AgentId::generate();
             let turn = TurnId::generate();
             manager
@@ -730,7 +735,7 @@ mod tests {
     #[test]
     fn queued_messages_wait_and_nonidle_rewind_fails() {
         smol::block_on(async {
-            let (_, root, _) = fixture(None);
+            let (_, root, _) = fixture(None).await;
             let guard = root.begin_rewind().unwrap();
             let actor = root.actor().unwrap();
             let ticket = actor

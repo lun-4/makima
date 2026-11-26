@@ -1677,7 +1677,7 @@ fn agent_params(
 }
 
 /// Spawn under the active managed turn or trusted target.
-fn spawn_session_actor(
+async fn spawn_session_actor(
     lua: &Lua,
     parent: &SessionParent,
     state: &Arc<LuaActorState>,
@@ -1703,15 +1703,18 @@ fn spawn_session_actor(
         spawned_by_tool_use_id: parent.context.tool_use_id.clone(),
     };
     let child = if let Some(current) = &parent.managed_turn {
-        current.manager().spawn_child_with_config_and_restoration(
-            current,
-            initial_config,
-            metadata,
-            Vec::new(),
-            None,
-            Some(restoration),
-            |_| Ok::<_, String>(backend()),
-        )
+        current
+            .manager()
+            .spawn_child_with_config_and_restoration(
+                current,
+                initial_config,
+                metadata,
+                Vec::new(),
+                None,
+                Some(restoration),
+                |_| Ok::<_, String>(backend()),
+            )
+            .await
     } else {
         let trusted = parent.trusted.as_ref().expect("trusted spawn checked");
         trusted.validate_target(lua, &trusted.target)?;
@@ -1727,6 +1730,7 @@ fn spawn_session_actor(
                 Some(restoration),
                 |_| Ok::<_, String>(backend()),
             )
+            .await
     }
     .map_err(|error| error.to_string())?;
     init_params(child.id());
@@ -1909,20 +1913,23 @@ async fn build_session(
         relay_snapshot: Mutex::default(),
         detached: AtomicBool::new(false),
     });
-    let (actor, agent) = try_pair!(spawn_session_actor(
-        &lua,
-        &parent,
-        &state,
-        initial_config,
-        SpawnRestoration { spec, restorable },
-        |agent_id| agent_params(
-            &parent.context,
-            agent_id,
-            child.model,
-            child.provider,
-            &options
-        ),
-    ));
+    let (actor, agent) = try_pair!(
+        spawn_session_actor(
+            &lua,
+            &parent,
+            &state,
+            initial_config,
+            SpawnRestoration { spec, restorable },
+            |agent_id| agent_params(
+                &parent.context,
+                agent_id,
+                child.model,
+                child.provider,
+                &options
+            ),
+        )
+        .await
+    );
     let incarnation = try_pair!(agent.manager().incarnation(agent.id()));
     // A standalone task shows its model via SubagentInfo on the header;
     // a dispatching caller (batch) gets the same thing as a live annotation.
@@ -3170,6 +3177,7 @@ mod tests {
                         Arc::clone(&state),
                     ))) as Box<dyn ActorBackend>)
                 })
+                .await
                 .unwrap();
             let ticket = admit(&root.actor().unwrap(), "missing policy");
             let outcome = ticket.wait().await;

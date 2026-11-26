@@ -344,6 +344,7 @@ mod tests {
                     None,
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
                 )
+                .await
                 .unwrap();
             let journal = manager.journal();
             let actor = root.actor().unwrap();
@@ -447,6 +448,7 @@ mod tests {
                     None,
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
                 )
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             let before_config = actor.config_snapshot().unwrap();
@@ -606,6 +608,7 @@ mod tests {
                     None,
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
                 )
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             assert!(actor.inner.journal.is_none());
@@ -680,6 +683,7 @@ mod tests {
                     None,
                     |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(IdleBackend)),
                 )
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             assert!(actor.inner.journal.is_none());

@@ -307,14 +307,13 @@ fn trusted_dormant_state_and_nonveto_install_notifications() {
     host.load_source(PLUGIN, DORMANT_SOURCE).unwrap();
     let (template, _events, _cancel) = common::ctx_with_canned_provider();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root_with_config(
-            Some(common::effective_config(&template)),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(common::effective_config(&template)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     let target = common::install_root(&host, root.clone(), template);
     struct DormantTarget(makima_lua::orchestration::TrustedTarget);
     impl makima_lua::orchestration::OrchestrationServices for DormantTarget {
@@ -439,11 +438,13 @@ fn start_and_restore_read_only_migrate_copies_of_captured_target() {
         .set(&target.state_access(), json!({ "count": 31 }), None)
         .unwrap();
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let focused = other
-        .create_root_with_config(Some(config), Vec::new(), None, |_| {
-            Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>)
-        })
-        .unwrap();
+    let focused = smol::block_on(other.create_root_with_config(
+        Some(config),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     common::install_root(&host, focused, ctx.clone());
 
     let restore = |input: Value, captured| {
@@ -600,16 +601,15 @@ fn retained_fixture() -> (PluginHost, ToolContext, CancelTrigger, AgentRef, Agen
     let current = ctx.managed_turn.as_ref().unwrap();
     let manager = current.manager();
     let parent = manager.reference(current.agent_id());
-    let child = manager
-        .spawn_child_trusted_with_config(
-            &parent,
-            config.clone(),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child_trusted_with_config(
+        &parent,
+        config.clone(),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     let slot = manager
         .journal()
         .register_state::<Value>(StateSlotSpec {
@@ -699,22 +699,21 @@ fn retained_reads_reject_unrelated_agent_topology() {
         .unwrap()
         .unwrap();
     let (entered, current) = flume::bounded(1);
-    let caller = manager
-        .spawn_child_trusted_with_config(
-            &parent,
-            common::effective_config(&ctx),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| {
-                let backend = common::MockBackend::STRICT.with_turn(move |_, context, _, _| {
-                    entered.send(context.managed_turn.unwrap()).unwrap();
-                    Box::pin(std::future::pending())
-                });
-                Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
-            },
-        )
-        .unwrap();
+    let caller = smol::block_on(manager.spawn_child_trusted_with_config(
+        &parent,
+        common::effective_config(&ctx),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| {
+            let backend = common::MockBackend::STRICT.with_turn(move |_, context, _, _| {
+                entered.send(context.managed_turn.unwrap()).unwrap();
+                Box::pin(std::future::pending())
+            });
+            Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
+        },
+    ))
+    .unwrap();
     caller
         .actor()
         .unwrap()
@@ -767,17 +766,15 @@ fn retained_reads_after_restart_leave_child_dormant() {
         vec![PLUGIN.into()],
         Arc::new(common::CannedProvider::new(Vec::new())),
     );
-    let child = host
-        .manager
-        .spawn_child_trusted_with_config(
-            &host.root.target,
-            common::effective_config(&host.root.template),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let child = smol::block_on(host.manager.spawn_child_trusted_with_config(
+        &host.root.target,
+        common::effective_config(&host.root.template),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     host.manager
         .journal()
         .register_state::<Value>(StateSlotSpec {
@@ -974,14 +971,13 @@ fn resume_callback_keeps_replayed_revision_and_host_notices_keep_commit_order() 
     host.load_source(PLUGIN, RESUME_SOURCE).unwrap();
     let (template, _events, _cancel) = common::ctx_with_canned_provider();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root_with_config(
-            Some(common::effective_config(&template)),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(common::effective_config(&template)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     let journal = manager.journal();
     let old = journal
         .register_state::<Value>(StateSlotSpec {

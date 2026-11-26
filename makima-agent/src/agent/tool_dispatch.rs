@@ -4300,6 +4300,7 @@ mod tests {
                 .create_root_with_config(Some(plan_config(&root_path)), Vec::new(), None, |_| {
                     Ok::<_, String>(backend)
                 })
+                .await
                 .unwrap();
             let target: AgentRef;
             let current = if child {
@@ -4313,6 +4314,7 @@ mod tests {
                         None,
                         |_| Ok::<_, String>(backend),
                     )
+                    .await
                     .unwrap();
                 (child_current, child_release)
             } else {

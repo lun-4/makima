@@ -5678,19 +5678,18 @@ end })
             let (manager, root) = runtime.handles.manager_and_root();
             let root = manager.lookup(root).unwrap();
             let config = (*root.effective_config().unwrap().unwrap()).clone();
-            let child = manager
-                .spawn_child_trusted_with_config(
-                    &root,
-                    config.clone(),
-                    makima_agent::manager::AgentMetadata {
-                        transcript_key: Some(OBSERVATION.into()),
-                        ..Default::default()
-                    },
-                    Vec::new(),
-                    None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
-                )
-                .unwrap();
+            let child = smol::block_on(manager.spawn_child_trusted_with_config(
+                &root,
+                config.clone(),
+                makima_agent::manager::AgentMetadata {
+                    transcript_key: Some(OBSERVATION.into()),
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+            ))
+            .unwrap();
             let reserve = runtime_config_mutations(runtime, Arc::clone(&event_loop.orchestration));
             if close_before_reservation {
                 child.close_subtree().unwrap();
@@ -5858,16 +5857,15 @@ end })
             let before = root_context(&access).unwrap().unwrap();
             assert!(!before.instructions.text.contains(UPDATED_INSTRUCTIONS));
             std::fs::write(config.context.cwd().join("AGENTS.md"), UPDATED_INSTRUCTIONS).unwrap();
-            let child = manager
-                .spawn_child_trusted_with_config(
-                    &root,
-                    (*config).clone(),
-                    Default::default(),
-                    Vec::new(),
-                    None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
-                )
-                .unwrap();
+            let child = smol::block_on(manager.spawn_child_trusted_with_config(
+                &root,
+                (*config).clone(),
+                Default::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+            ))
+            .unwrap();
             let admission = PinnedCommandTarget::pin(TrustedTarget {
                 target: child.clone(),
                 template: runtime.handles.orchestration_template.clone(),
@@ -7421,19 +7419,18 @@ end })
                 let root = manager.lookup(root_id).unwrap();
                 let root_actor = root.actor().unwrap();
                 let config = (*root_actor.effective_config().unwrap()).clone();
-                let child = manager
-                    .spawn_child_trusted_with_config(
-                        &root,
-                        config,
-                        AgentMetadata {
-                            transcript_key: Some(CHILD_KEY.into()),
-                            ..Default::default()
-                        },
-                        vec![Message::user(CHILD_PROMPT.into())],
-                        None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
-                    )
-                    .unwrap();
+                let child = smol::block_on(manager.spawn_child_trusted_with_config(
+                    &root,
+                    config,
+                    AgentMetadata {
+                        transcript_key: Some(CHILD_KEY.into()),
+                        ..Default::default()
+                    },
+                    vec![Message::user(CHILD_PROMPT.into())],
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                ))
+                .unwrap();
                 let root_idle = root_actor.prepare_idle().unwrap();
                 let ticket = root_actor
                     .admit_turn(
@@ -7785,20 +7782,19 @@ end })
             let (manager, root_id) = runtime.handles.manager_and_root();
             let root = manager.lookup(root_id).unwrap();
             let config = (*root.actor().unwrap().effective_config().unwrap()).clone();
-            let child = manager
-                .spawn_child_trusted_with_config(
-                    &root,
-                    config,
-                    AgentMetadata {
-                        label: Some(CHILD_LABEL.into()),
-                        transcript_key: Some(CHILD_KEY.into()),
-                        ..Default::default()
-                    },
-                    Vec::new(),
-                    None,
-                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
-                )
-                .unwrap();
+            let child = smol::block_on(manager.spawn_child_trusted_with_config(
+                &root,
+                config,
+                AgentMetadata {
+                    label: Some(CHILD_LABEL.into()),
+                    transcript_key: Some(CHILD_KEY.into()),
+                    ..Default::default()
+                },
+                Vec::new(),
+                None,
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+            ))
+            .unwrap();
             let child_id = child.id();
             event_loop.sync_orchestration();
             assert!(
@@ -9084,19 +9080,18 @@ end })
                 let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
                 let root = manager.lookup(root_id).unwrap();
                 let config = (*root.actor().unwrap().effective_config().unwrap()).clone();
-                let child = manager
-                    .spawn_child_trusted_with_config(
-                        &root,
-                        config,
-                        AgentMetadata {
-                            transcript_key: Some(CHILD_KEY.into()),
-                            ..Default::default()
-                        },
-                        Vec::new(),
-                        None,
-                        |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
-                    )
-                    .unwrap();
+                let child = smol::block_on(manager.spawn_child_trusted_with_config(
+                    &root,
+                    config,
+                    AgentMetadata {
+                        transcript_key: Some(CHILD_KEY.into()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                    None,
+                    |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(ForwardedCommandBackend)),
+                ))
+                .unwrap();
                 event_loop.sync_orchestration();
                 select_child_chat(event_loop, child.id(), CHILD_NAME);
                 let child_chat = event_loop.sessions[0].app.active_chat;

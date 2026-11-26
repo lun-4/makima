@@ -4762,7 +4762,7 @@ The returned table:
 ```lua
 {
   id,
-  title,             -- nil under headless drivers
+  title,
   status = "idle" | "working" | "needs_input",
   updated_at,        -- unix seconds
   usage = {
@@ -4774,8 +4774,7 @@ The returned table:
 
 `usage` includes subagent spend. Costs are the values recorded when each
 turn was billed and stay nil when unpriced. `models` is sorted by total
-tokens, descending, then spec; headless drivers do not split usage by
-model and leave it empty. Model, mode and options are on the agent:
+tokens, descending, then spec. Model, mode and options are on the agent:
 `Agent:config(ctx)`; per-turn context size and list price are on the
 `TurnEnd` autocmd.
 

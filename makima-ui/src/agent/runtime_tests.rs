@@ -106,6 +106,7 @@ fn explicit_actual_root_turn_uses_current_ui_run_and_cancel_alias(cancel: bool, 
                 None,
                 |agent_id| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id))),
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         // The prior UI turn already displayed RUN_ID - 1, so the explicit
@@ -450,6 +451,7 @@ fn ui_cancel_targets_buffered_active_root_without_cancelling_future_turn(deferre
                         Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id)))
                     },
                 )
+                .await
                 .unwrap();
             let actor = root.actor().unwrap();
             // Seat the actor where the app believes the display is, so the
@@ -643,6 +645,7 @@ fn ordinary_submission_paths_have_runtime_parity(child: bool) {
                     .create_root_with_config(Some(config.clone()), Vec::new(), None, |id| {
                         Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend.build(id)))
                     })
+                    .await
                     .unwrap();
                 manager
                     .spawn_child_trusted_with_config(
@@ -657,12 +660,14 @@ fn ordinary_submission_paths_have_runtime_parity(child: bool) {
                             ))
                         },
                     )
+                    .await
                     .unwrap()
             } else {
                 manager
                     .create_root_with_config(Some(config), Vec::new(), None, |agent_id| {
                         Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id)))
                     })
+                    .await
                     .unwrap()
             };
             let actor = target.actor().unwrap();
@@ -781,7 +786,7 @@ fn ordinary_submission_paths_have_runtime_parity(child: bool) {
     ));
 }
 
-fn provider_target(
+async fn provider_target(
     manager: &AgentManagerHandle,
     backend: BackendFixture,
     provider: Arc<dyn makima_providers::provider::Provider>,
@@ -804,6 +809,7 @@ fn provider_target(
             .create_root_with_config(Some(config.clone()), Vec::new(), None, |id| {
                 Ok::<Box<dyn ActorBackend>, String>(Box::new(parent_backend.build(id)))
             })
+            .await
             .unwrap();
         manager
             .spawn_child_trusted_with_config(
@@ -814,12 +820,14 @@ fn provider_target(
                 None,
                 |id| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build_child(id))),
             )
+            .await
             .unwrap()
     } else {
         manager
             .create_root_with_config(Some(config), Vec::new(), None, |id| {
                 Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(id)))
             })
+            .await
             .unwrap()
     }
 }
@@ -849,7 +857,8 @@ fn shared_instruction_failure_and_budget_outcomes(child: bool, budget: bool) {
                     fail: !budget,
                 }),
                 child,
-            );
+            )
+            .await;
             let actor = target.actor().unwrap();
             let first = actor
                 .submit(input, None, String::new(), Default::default())
@@ -956,7 +965,8 @@ fn completion_policy_main_vs_nonmain(child: bool) {
                     requests: requests_tx,
                 }),
                 child,
-            );
+            )
+            .await;
             let actor = target.actor().unwrap();
             let ticket = actor
                 .submit(input, None, String::new(), Default::default())
@@ -986,6 +996,7 @@ fn completion_policy_main_vs_nonmain(child: bool) {
                         ))
                     },
                 )
+                .await
                 .unwrap();
             let reporter_actor = reporter.actor().unwrap();
             reporter_actor.configure_parent_delivery(true).unwrap();
@@ -1093,6 +1104,7 @@ fn ui_submission_fires_one_turn_start() {
                 None,
                 |agent_id| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id))),
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let lifecycle = actor.subscribe_events();
@@ -1234,6 +1246,7 @@ fn command_spawn_uses_production_mcp_template(enabled: bool, restricted: bool, p
             .create_root_with_id_and_config(root_id, Some(config), Vec::new(), None, |_| {
                 Ok::<Box<dyn ActorBackend>, String>(Box::new(backend))
             })
+            .await
             .unwrap();
         let orchestration = Arc::new(makima_lua::orchestration::AgentOrchestration::new(
             Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1419,7 +1432,7 @@ fn child_completion_reaches_production_tui_presentation(active: bool) {
                 Some(config.clone()), Vec::new(), None, |agent_id| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id)))
                 },
-            ).unwrap();
+            ).await.unwrap();
             let actor = root.actor().unwrap();
             actor.observe_presentation(RUN_ID - 1);
             let mut app =
@@ -1445,7 +1458,7 @@ fn child_completion_reaches_production_tui_presentation(active: bool) {
                 &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend.build_child(agent_id)))
                 },
-            ).unwrap();
+            ).await.unwrap();
             let child_actor = child.actor().unwrap();
             child_actor.configure_parent_delivery(true).unwrap();
             let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
@@ -1518,7 +1531,7 @@ fn shared_consumption_wrapper_and_request_order(child: bool) {
                 }, AgentMode::Build,
             ).with_mode_def(makima_agent::ModeRegistry::builtin().get(&makima_agent::ModeId::Build));
             let manager = makima_agent::AgentManagerHandle::new(Default::default()).unwrap();
-            let root = provider_target(&manager, backend, Arc::clone(&config.settings.provider), child);
+            let root = provider_target(&manager, backend, Arc::clone(&config.settings.provider), child).await;
             let actor = root.actor().unwrap();
             let actor_events = actor.subscribe_events();
             let parent = actor.submit(input, None, String::new(), Default::default()).unwrap();
@@ -1537,7 +1550,7 @@ fn shared_consumption_wrapper_and_request_order(child: bool) {
                 &root, child_config, Default::default(), Vec::new(), None, |agent_id| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(child_backend.build_child(agent_id)))
                 },
-            ).unwrap();
+            ).await.unwrap();
             let child_actor = child.actor().unwrap();
             child_actor.configure_parent_delivery(true).unwrap();
             let child_ticket = child_actor.admit_turn(child_input, None, String::new()).unwrap();
@@ -1757,6 +1770,7 @@ fn idle_compaction_adopts_presentation_and_displays_progress(cancel: bool) {
                 None,
                 |agent_id| Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id))),
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         actor.observe_presentation(PREVIOUS_PRESENTATION);
@@ -1842,6 +1856,7 @@ fn managed_tui_turns_keep_recorded_instructions_and_notice_once(remove: bool, re
                 .create_root_with_config(Some(config.clone()), Vec::new(), None, |agent_id| {
                     Ok::<Box<dyn ActorBackend>, String>(Box::new(backend.build(agent_id)))
                 })
+                .await
                 .unwrap();
             let mut actor = root.actor().unwrap();
             let mut settlements = actor.subscribe_events();

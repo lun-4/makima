@@ -50,7 +50,8 @@ use crate::actor::{
     TranscriptSnapshot, TurnProvenance, TurnResult,
 };
 use crate::journal::{
-    JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
+    AgentRevision, JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
+    SessionJournalSnapshot,
 };
 use crate::tools::offload::OffloadStore;
 use crate::{
@@ -228,6 +229,7 @@ struct Node {
     residency: AgentResidency,
     activation: Option<Arc<ActivationAttempt>>,
     activation_finishing: bool,
+    revision_pending: bool,
     actor: Option<AgentActorHandle>,
     task: Option<RunnerTask>,
     metadata: AgentMetadata,
@@ -501,6 +503,7 @@ impl AgentManagerHandle {
                     residency: AgentResidency::Dormant,
                     activation: None,
                     activation_finishing: false,
+                    revision_pending: false,
                     actor: None,
                     task: None,
                     metadata: AgentMetadata {
@@ -815,7 +818,7 @@ impl AgentManagerHandle {
                 .nodes
                 .get(&agent_id)
                 .ok_or(ManagerError::UnknownAgent(agent_id))?;
-            if node.detach_pending {
+            if node.detach_pending || node.revision_pending {
                 return Err(ReactivationError::Cancelled.into());
             }
             if node.lifecycle == GraphLifecycle::Retired {
@@ -1524,28 +1527,28 @@ impl AgentManagerHandle {
         Ok(())
     }
 
-    pub fn retire(
+    pub async fn retire(
         &self,
         current: &CurrentManagedTurn,
         agent_id: AgentId,
     ) -> Result<(), ManagerError> {
         self.validate_manager(current)?;
-        self.retire_inner(agent_id, Some(current))
+        self.retire_inner(agent_id, Some(current)).await
     }
 
-    pub fn retire_trusted(&self, agent: &AgentRef) -> Result<(), ManagerError> {
+    pub async fn retire_trusted(&self, agent: &AgentRef) -> Result<(), ManagerError> {
         if !self.same_manager(&agent.manager) {
             return Err(ManagerError::WrongManager);
         }
-        self.retire_inner(agent.agent_id, None)
+        self.retire_inner(agent.agent_id, None).await
     }
 
-    fn retire_inner(
+    async fn retire_inner(
         &self,
         agent_id: AgentId,
         current: Option<&CurrentManagedTurn>,
     ) -> Result<(), ManagerError> {
-        let actor = {
+        let result = {
             let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
@@ -1606,6 +1609,7 @@ impl AgentManagerHandle {
                 return Err(ManagerError::NotLeaf(agent_id));
             }
             if node.reservation_pending
+                || node.revision_pending
                 || self.0.work.is_busy(agent_id)
                 || node
                     .actor
@@ -1615,7 +1619,7 @@ impl AgentManagerHandle {
                 return Err(ManagerError::BusySubtree(agent_id));
             }
             let work_idle = self.0.work.freeze_if_idle(agent_id)?;
-            let mut record = self
+            let record = self
                 .0
                 .journal
                 .agent(agent_id)
@@ -1636,24 +1640,53 @@ impl AgentManagerHandle {
             }) {
                 return Err(ManagerError::BusySubtree(agent_id));
             }
-            record.lifecycle = StoredAgentLifecycle::Retired;
-            self.0
+            let revision = self
+                .0
                 .journal
-                .commit(JournalCommit {
-                    agents: vec![record],
+                .begin_agent_revision(JournalCommit {
+                    agents: vec![StoredAgentRecord {
+                        lifecycle: StoredAgentLifecycle::Retired,
+                        ..record
+                    }],
                     ..Default::default()
                 })
-                .map_err(|error| ManagerError::Policy(error.to_string()))?;
-            let node = graph
-                .nodes
-                .get_mut(&agent_id)
-                .ok_or(ManagerError::UnknownAgent(agent_id))?;
-            node.lifecycle = GraphLifecycle::Retired;
-            work_idle.commit();
-            let actor = node.actor.clone();
-            graph.revision += 1;
-            actor
+                .map_err(Self::agent_revision_error)?;
+            let Some(revision) = revision else {
+                return self.finish_retirement(graph, agent_id, work_idle, Ok(()));
+            };
+            graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
+            let manager = self.clone();
+            let (done, result) = flume::bounded(1);
+            smol::spawn(async move {
+                let ack = manager.0.journal.finish_agent_revision(revision).await;
+                let finished =
+                    manager.finish_retirement(manager.lock_graph(), agent_id, work_idle, ack);
+                let _ = done.send(finished);
+            })
+            .detach();
+            result
         };
+        result
+            .recv_async()
+            .await
+            .map_err(|_| ManagerError::GraphShutdown)?
+    }
+
+    fn finish_retirement(
+        &self,
+        mut graph: MutexGuard<'_, GraphState>,
+        agent_id: AgentId,
+        work_idle: work::WorkIdleGuard,
+        ack: Result<(), JournalError>,
+    ) -> Result<(), ManagerError> {
+        let node = graph.nodes.get_mut(&agent_id).unwrap();
+        node.revision_pending = false;
+        ack.map_err(Self::agent_revision_error)?;
+        node.lifecycle = GraphLifecycle::Retired;
+        work_idle.commit();
+        let actor = node.actor.clone();
+        graph.revision += 1;
+        drop(graph);
         if let Some(actor) = actor {
             actor.close();
         }
@@ -1741,6 +1774,9 @@ impl AgentManagerHandle {
             }
             if node.detach_pending {
                 return Ok(None);
+            }
+            if node.revision_pending {
+                return Err(ManagerError::BusySubtree(incarnation.agent_id));
             }
             self.0.work.set_open_for_incarnation(
                 incarnation.agent_id,
@@ -1962,14 +1998,15 @@ impl AgentManagerHandle {
         source_incarnation: Option<JournalIncarnation>,
     ) -> Result<(), DeliveryRejection> {
         let target = if let Some(node) = graph.nodes.get(&parent_id) {
-            if !graph.shutting_down
-                && matches!(
-                    node.lifecycle,
-                    GraphLifecycle::Closing
-                        | GraphLifecycle::Closed
-                        | GraphLifecycle::Retired
-                        | GraphLifecycle::Removed
-                )
+            if node.revision_pending
+                || (!graph.shutting_down
+                    && matches!(
+                        node.lifecycle,
+                        GraphLifecycle::Closing
+                            | GraphLifecycle::Closed
+                            | GraphLifecycle::Retired
+                            | GraphLifecycle::Removed
+                    ))
             {
                 return Err(DeliveryRejection::ParentClosed);
             }
@@ -2048,6 +2085,7 @@ impl AgentManagerHandle {
             residency: AgentResidency::Resident,
             activation: None,
             activation_finishing: false,
+            revision_pending: false,
             actor: Some(actor.clone()),
             task: None,
             metadata: AgentMetadata::default(),
@@ -2531,7 +2569,7 @@ impl AgentManagerHandle {
         self.lock_graph().root_id.ok_or(ManagerError::MissingRoot)
     }
 
-    pub fn create_root(
+    pub async fn create_root(
         &self,
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
@@ -2540,9 +2578,10 @@ impl AgentManagerHandle {
         self.create_root_with(initial_messages, shared_messages, |_| {
             Ok::<_, String>(backend)
         })
+        .await
     }
 
-    pub fn create_root_with<F, E>(
+    pub async fn create_root_with<F, E>(
         &self,
         initial_messages: Vec<Message>,
         shared_messages: Option<SharedMessages>,
@@ -2553,9 +2592,10 @@ impl AgentManagerHandle {
         E: ToString,
     {
         self.create_root_with_config(None, initial_messages, shared_messages, factory)
+            .await
     }
 
-    pub fn create_root_with_config<F, E>(
+    pub async fn create_root_with_config<F, E>(
         &self,
         config: Option<crate::actor::EffectiveAgentConfig>,
         initial_messages: Vec<Message>,
@@ -2573,9 +2613,10 @@ impl AgentManagerHandle {
             shared_messages,
             factory,
         )
+        .await
     }
 
-    pub fn create_root_deferred_with_config<F, E>(
+    pub async fn create_root_deferred_with_config<F, E>(
         &self,
         config: Option<crate::actor::EffectiveAgentConfig>,
         initial_messages: Vec<Message>,
@@ -2595,9 +2636,10 @@ impl AgentManagerHandle {
             factory,
             start,
         )
+        .await
     }
 
-    pub fn create_root_with_id_and_config<F, E>(
+    pub async fn create_root_with_id_and_config<F, E>(
         &self,
         agent_id: AgentId,
         config: Option<crate::actor::EffectiveAgentConfig>,
@@ -2617,9 +2659,10 @@ impl AgentManagerHandle {
             factory,
             None,
         )
+        .await
     }
 
-    pub fn create_root_deferred_with_id_and_config<F, E>(
+    pub async fn create_root_deferred_with_id_and_config<F, E>(
         &self,
         agent_id: AgentId,
         config: Option<crate::actor::EffectiveAgentConfig>,
@@ -2640,9 +2683,10 @@ impl AgentManagerHandle {
             factory,
             Some(start),
         )
+        .await
     }
 
-    fn create_root_inner<F, E>(
+    async fn create_root_inner<F, E>(
         &self,
         agent_id: AgentId,
         config: Option<crate::actor::EffectiveAgentConfig>,
@@ -2692,6 +2736,7 @@ impl AgentManagerHandle {
                     residency: AgentResidency::Activating,
                     activation: None,
                     activation_finishing: false,
+                    revision_pending: false,
                     actor: None,
                     task: None,
                     metadata: AgentMetadata::default(),
@@ -2728,9 +2773,10 @@ impl AgentManagerHandle {
                 start,
             )
         })
+        .await
     }
 
-    pub fn spawn_child(
+    pub async fn spawn_child(
         &self,
         current: &CurrentManagedTurn,
         metadata: AgentMetadata,
@@ -2741,9 +2787,10 @@ impl AgentManagerHandle {
         self.spawn_child_with(current, metadata, initial_messages, shared_messages, |_| {
             Ok::<_, String>(backend)
         })
+        .await
     }
 
-    pub fn spawn_child_with<F, E>(
+    pub async fn spawn_child_with<F, E>(
         &self,
         current: &CurrentManagedTurn,
         metadata: AgentMetadata,
@@ -2778,9 +2825,10 @@ impl AgentManagerHandle {
             shared_messages,
             factory,
         )
+        .await
     }
 
-    pub fn spawn_child_with_config<F, E>(
+    pub async fn spawn_child_with_config<F, E>(
         &self,
         current: &CurrentManagedTurn,
         config: crate::actor::EffectiveAgentConfig,
@@ -2802,10 +2850,11 @@ impl AgentManagerHandle {
             None,
             factory,
         )
+        .await
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub fn spawn_child_with_config_and_restoration<F, E>(
+    pub async fn spawn_child_with_config_and_restoration<F, E>(
         &self,
         current: &CurrentManagedTurn,
         config: crate::actor::EffectiveAgentConfig,
@@ -2830,10 +2879,11 @@ impl AgentManagerHandle {
             restoration,
             factory,
         )
+        .await
     }
 
     /// Host-only admission. Do not expose this as model tool authority.
-    pub fn spawn_child_trusted_with_config<F, E>(
+    pub async fn spawn_child_trusted_with_config<F, E>(
         &self,
         parent: &AgentRef,
         config: crate::actor::EffectiveAgentConfig,
@@ -2855,10 +2905,11 @@ impl AgentManagerHandle {
             None,
             factory,
         )
+        .await
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub fn spawn_child_trusted_with_config_and_restoration<F, E>(
+    pub async fn spawn_child_trusted_with_config_and_restoration<F, E>(
         &self,
         parent: &AgentRef,
         config: crate::actor::EffectiveAgentConfig,
@@ -2883,10 +2934,11 @@ impl AgentManagerHandle {
             restoration,
             factory,
         )
+        .await
     }
 
     #[expect(clippy::too_many_arguments)]
-    fn spawn_child_inner<F, E>(
+    async fn spawn_child_inner<F, E>(
         &self,
         parent_id: AgentId,
         current: Option<&CurrentManagedTurn>,
@@ -2928,6 +2980,7 @@ impl AgentManagerHandle {
                     .get(&parent_id)
                     .ok_or(ManagerError::UnknownAgent(parent_id))?;
                 if parent.lifecycle != GraphLifecycle::Live
+                    || parent.revision_pending
                     || parent.detach_pending
                     || parent
                         .actor
@@ -2990,6 +3043,7 @@ impl AgentManagerHandle {
                     residency: AgentResidency::Activating,
                     activation: None,
                     activation_finishing: false,
+                    revision_pending: false,
                     actor: None,
                     task: None,
                     metadata,
@@ -3026,6 +3080,7 @@ impl AgentManagerHandle {
                 None,
             )
         })
+        .await
     }
 
     fn validate_manager(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
@@ -3245,6 +3300,7 @@ impl AgentManagerHandle {
             if let Some(node) = graph.nodes.get_mut(&agent_id)
                 && node.reservation == reservation
                 && !node.reservation_pending
+                && !node.revision_pending
                 && !node.detach_pending
                 && node.lifecycle == GraphLifecycle::Live
             {
@@ -3273,6 +3329,7 @@ impl AgentManagerHandle {
                 && node.reservation == reservation
                 && node.lifecycle == GraphLifecycle::Closing
                 && !node.reservation_pending
+                && !node.revision_pending
                 && !node.detach_pending
             {
                 node.lifecycle = GraphLifecycle::Dormant;
@@ -3284,7 +3341,7 @@ impl AgentManagerHandle {
         })
     }
 
-    fn commit_actor(
+    async fn commit_actor(
         &self,
         agent_id: AgentId,
         reservation: u64,
@@ -3318,35 +3375,37 @@ impl AgentManagerHandle {
         }
         let (actor, task) = spawn(admission);
         let task = self.track_runner(agent_id, reservation, actor.clone(), task);
-        let mut graph = self.lock_graph();
-        let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
-            node.reservation == reservation
-                && node.reservation_pending
-                && matches!(
-                    node.lifecycle,
-                    GraphLifecycle::Reserved | GraphLifecycle::Closing
-                )
-        });
-        if !can_commit {
-            drop(graph);
-            actor.shutdown();
-            task.detach();
-            self.rollback_reservation(agent_id, reservation);
-            return Err(ManagerError::NonLiveAgent(agent_id));
-        }
-        let shutting_down = graph.shutting_down;
-        let node = graph.nodes.get_mut(&agent_id).unwrap();
-        let closing = node.lifecycle == GraphLifecycle::Closing;
-        let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
-        node.actor = Some(actor.clone());
-        node.task = Some(task);
-        graph
-            .observers
-            .retain(|(_, sender)| !sender.is_disconnected());
-        for (_, observer) in &graph.observers {
-            actor.attach_graph_observer(observer.clone());
-        }
-        drop(graph);
+        let (closing, shutting_down, cancel_on_commit) = {
+            let mut graph = self.lock_graph();
+            let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
+                node.reservation == reservation
+                    && node.reservation_pending
+                    && matches!(
+                        node.lifecycle,
+                        GraphLifecycle::Reserved | GraphLifecycle::Closing
+                    )
+            });
+            if !can_commit {
+                drop(graph);
+                actor.shutdown();
+                task.detach();
+                self.rollback_reservation(agent_id, reservation);
+                return Err(ManagerError::NonLiveAgent(agent_id));
+            }
+            let shutting_down = graph.shutting_down;
+            let node = graph.nodes.get_mut(&agent_id).unwrap();
+            let closing = node.lifecycle == GraphLifecycle::Closing;
+            let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
+            node.actor = Some(actor.clone());
+            node.task = Some(task);
+            graph
+                .observers
+                .retain(|(_, sender)| !sender.is_disconnected());
+            for (_, observer) in &graph.observers {
+                actor.attach_graph_observer(observer.clone());
+            }
+            (closing, shutting_down, cancel_on_commit)
+        };
         if closing {
             if shutting_down {
                 actor.shutdown();
@@ -3365,73 +3424,104 @@ impl AgentManagerHandle {
             #[cfg(test)]
             self.wait_at_commit_gate();
         }
-        let graph = self.lock_graph();
-        let can_publish = !graph.shutting_down
-            && graph.nodes.get(&agent_id).is_some_and(|node| {
-                node.reservation == reservation
-                    && node.reservation_pending
-                    && node.lifecycle == GraphLifecycle::Reserved
-                    && node.actor.is_some()
-                    && node.task.is_some()
-            });
-        if !can_publish {
-            let shutting_down = graph.shutting_down;
-            drop(graph);
-            if shutting_down {
-                actor.shutdown();
-            } else {
-                actor.close();
+        let result = {
+            let mut graph = self.lock_graph();
+            let can_publish = !graph.shutting_down
+                && graph.nodes.get(&agent_id).is_some_and(|node| {
+                    node.reservation == reservation
+                        && node.reservation_pending
+                        && node.lifecycle == GraphLifecycle::Reserved
+                        && node.actor.is_some()
+                        && node.task.is_some()
+                });
+            if !can_publish {
+                let shutting_down = graph.shutting_down;
+                drop(graph);
+                if shutting_down {
+                    actor.shutdown();
+                } else {
+                    actor.close();
+                }
+                self.finish_failed_commit(agent_id, reservation);
+                return Err(if shutting_down {
+                    ManagerError::GraphShutdown
+                } else {
+                    ManagerError::NonLiveAgent(agent_id)
+                });
             }
-            self.finish_failed_commit(agent_id, reservation);
-            return Err(if shutting_down {
-                ManagerError::GraphShutdown
-            } else {
-                ManagerError::NonLiveAgent(agent_id)
-            });
-        }
-        let revision =
             match self.journal_node(agent_id, &graph.nodes[&agent_id], &actor, restoration) {
-                Ok(revision) => revision,
+                Ok(None) => return self.finish_spawn(graph, agent_id, reservation, &actor, Ok(())),
+                Ok(Some(revision)) => {
+                    graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
+                    let manager = self.clone();
+                    let (done, result) = flume::bounded(1);
+                    smol::spawn(async move {
+                        let ack = manager.0.journal.finish_agent_revision(revision).await;
+                        let finished = manager.finish_spawn(
+                            manager.lock_graph(),
+                            agent_id,
+                            reservation,
+                            &actor,
+                            ack,
+                        );
+                        let _ = done.send(finished);
+                    })
+                    .detach();
+                    result
+                }
                 Err(error) => {
                     drop(graph);
                     actor.close();
                     self.finish_failed_commit(agent_id, reservation);
                     return Err(error);
                 }
-            };
-        drop(graph);
-        if let Err(error) = self.0.journal.flush_spawn(revision) {
+            }
+        };
+        result
+            .recv_async()
+            .await
+            .map_err(|_| ManagerError::GraphShutdown)?
+    }
+
+    fn finish_spawn(
+        &self,
+        mut graph: MutexGuard<'_, GraphState>,
+        agent_id: AgentId,
+        reservation: u64,
+        actor: &AgentActorHandle,
+        ack: Result<(), JournalError>,
+    ) -> Result<AgentRef, ManagerError> {
+        let node = graph.nodes.get_mut(&agent_id).unwrap();
+        node.revision_pending = false;
+        if let Err(error) = ack {
+            drop(graph);
             actor.close();
             self.finish_failed_commit(agent_id, reservation);
-            return Err(ManagerError::Persistence(error));
+            return Err(Self::agent_revision_error(error));
         }
-        let mut graph = self.lock_graph();
-        let can_publish = !graph.shutting_down
-            && graph.nodes.get(&agent_id).is_some_and(|node| {
-                node.reservation == reservation
-                    && node.reservation_pending
-                    && node.lifecycle == GraphLifecycle::Reserved
-            });
-        if !can_publish {
-            let shutting_down = graph.shutting_down;
-            drop(graph);
-            if shutting_down {
-                actor.shutdown();
-            } else {
-                actor.close();
+        let closing = node.lifecycle == GraphLifecycle::Closing;
+        if closing
+            && actor.lifecycle() == ActorLifecycle::Closed
+            && let Some(mut record) = self.0.journal.agent(agent_id)
+            && record.lifecycle == StoredAgentLifecycle::Open
+        {
+            record.lifecycle = StoredAgentLifecycle::Closed;
+            if let Err(error) = self.0.journal.commit(JournalCommit {
+                agents: vec![record],
+                ..Default::default()
+            }) {
+                warn!(%agent_id, %error, "could not record close during agent publication");
             }
-            self.finish_failed_commit(agent_id, reservation);
-            return Err(if shutting_down {
-                ManagerError::GraphShutdown
-            } else {
-                ManagerError::NonLiveAgent(agent_id)
-            });
         }
-        self.0.work.set_open(agent_id, true)?;
-        let node = graph.nodes.get_mut(&agent_id).unwrap();
+        if !closing {
+            self.0
+                .work
+                .set_open(agent_id, true)
+                .expect("reserved agent has work admission");
+            node.lifecycle = GraphLifecycle::Live;
+            node.residency = AgentResidency::Resident;
+        }
         node.reservation_pending = false;
-        node.lifecycle = GraphLifecycle::Live;
-        node.residency = AgentResidency::Resident;
         graph.revision += 1;
         let revision = graph.revision;
         let depth = graph.nodes[&agent_id].depth;
@@ -3457,7 +3547,7 @@ impl AgentManagerHandle {
         node: &Node,
         actor: &AgentActorHandle,
         restoration: Option<SpawnRestoration>,
-    ) -> Result<u64, ManagerError> {
+    ) -> Result<Option<AgentRevision>, ManagerError> {
         let existing = self.0.journal.agent(agent_id);
         if existing
             .as_ref()
@@ -3551,13 +3641,17 @@ impl AgentManagerHandle {
         }
         self.0
             .journal
-            .commit_spawn(commit)
-            .map_err(|error| match error {
-                crate::journal::JournalError::SpawnPublicationPending => {
-                    ManagerError::Persistence(error.to_string())
-                }
-                _ => ManagerError::Policy(error.to_string()),
-            })
+            .begin_agent_revision(commit)
+            .map_err(Self::agent_revision_error)
+    }
+
+    fn agent_revision_error(error: JournalError) -> ManagerError {
+        match error {
+            JournalError::AgentPublicationPending | JournalError::Writer(_) => {
+                ManagerError::Persistence(error.to_string())
+            }
+            _ => ManagerError::Policy(error.to_string()),
+        }
     }
 
     #[cfg(test)]
@@ -3571,7 +3665,9 @@ impl AgentManagerHandle {
             return Err(ManagerError::GraphShutdown);
         }
         if let Some(node) = graph.nodes.get(&agent_id)
-            && (node.reservation_pending || node.lifecycle != GraphLifecycle::Live)
+            && (node.reservation_pending
+                || node.revision_pending
+                || node.lifecycle != GraphLifecycle::Live)
         {
             return Err(ManagerError::NonLiveAgent(agent_id));
         }
@@ -3624,7 +3720,10 @@ impl AgentManagerHandle {
         if graph.shutting_down {
             return Err(ManagerError::GraphShutdown);
         }
-        if node.reservation_pending || node.lifecycle != GraphLifecycle::Live {
+        if node.reservation_pending
+            || node.revision_pending
+            || node.lifecycle != GraphLifecycle::Live
+        {
             return Err(ManagerError::NonLiveAgent(incarnation.agent_id));
         }
         let mut record = self
@@ -3676,10 +3775,9 @@ impl AgentManagerHandle {
     pub fn runner_finished(&self, agent_id: AgentId) -> Result<bool, ManagerError> {
         let mut graph = self.lock_graph();
         Self::reclaim_finished_closings(&mut graph, &self.0.journal);
-        Ok(graph
-            .nodes
-            .get(&agent_id)
-            .is_none_or(|node| !node.reservation_pending && node.task.is_none()))
+        Ok(graph.nodes.get(&agent_id).is_none_or(|node| {
+            !node.reservation_pending && !node.revision_pending && node.task.is_none()
+        }))
     }
 
     pub fn actor_for_incarnation(
@@ -4080,6 +4178,7 @@ impl AgentManagerHandle {
                     .filter_map(|(&id, node)| {
                         let pending = node.lifecycle.consumes_capacity()
                             || node.reservation_pending
+                            || node.revision_pending
                             || node.task.as_ref().is_some_and(|task| !task.is_finished());
                         if pending {
                             let _ = self.0.work.set_open(id, false);
@@ -4114,6 +4213,7 @@ impl AgentManagerHandle {
                 .filter_map(|(&id, node)| {
                     (node.lifecycle.consumes_capacity()
                         || node.reservation_pending
+                        || node.revision_pending
                         || node.task.as_ref().is_some_and(|task| !task.is_finished()))
                     .then_some(id)
                 })
@@ -4162,6 +4262,7 @@ impl AgentManagerHandle {
                 .filter(|node| {
                     !node.lifecycle.consumes_capacity()
                         && !node.reservation_pending
+                        && !node.revision_pending
                         && node.task.as_ref().is_some_and(smol::Task::is_finished)
                 })
                 .filter_map(|node| node.task.take())
@@ -4247,7 +4348,8 @@ impl AgentManagerHandle {
                     .nodes
                     .iter()
                     .filter_map(|(&id, node)| {
-                        (node.reservation_pending || node.task.is_some()).then_some(id)
+                        (node.reservation_pending || node.revision_pending || node.task.is_some())
+                            .then_some(id)
                     })
                     .collect::<Vec<_>>()
             };
@@ -4270,11 +4372,9 @@ impl AgentManagerHandle {
     async fn wait_until_reaped(&self) {
         loop {
             let listener = self.0.reaped.listen();
-            let done = self
-                .lock_graph()
-                .nodes
-                .values()
-                .all(|node| !node.reservation_pending && node.task.is_none());
+            let done = self.lock_graph().nodes.values().all(|node| {
+                !node.reservation_pending && !node.revision_pending && node.task.is_none()
+            });
             if done && self.cleanup_finished() {
                 return;
             }
@@ -4285,6 +4385,7 @@ impl AgentManagerHandle {
     fn reclaim_finished_closings(graph: &mut GraphState, journal: &SessionJournal) {
         for (&id, node) in &mut graph.nodes {
             if node.reservation_pending
+                || node.revision_pending
                 || node.detach_pending
                 || node.task.as_ref().is_some_and(|task| !task.is_finished())
             {
@@ -4323,6 +4424,7 @@ impl AgentManagerHandle {
             .filter(|id| {
                 graph.nodes.get(id).is_none_or(|node| {
                     !node.reservation_pending
+                        && !node.revision_pending
                         && node.task.as_ref().is_none_or(smol::Task::is_finished)
                 })
             })
@@ -4442,10 +4544,9 @@ impl AgentManagerHandle {
             ids.remove(0);
         }
         if ids.iter().any(|id| {
-            graph
-                .nodes
-                .get(id)
-                .is_some_and(|node| node.activation_finishing)
+            graph.nodes.get(id).is_some_and(|node| {
+                node.activation_finishing || (node.revision_pending && !node.reservation_pending)
+            })
         }) {
             return Err(ManagerError::BusySubtree(agent_id));
         }

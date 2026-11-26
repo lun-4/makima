@@ -1,5 +1,6 @@
+use std::fs::File;
 use std::future::Future;
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::pin::Pin;
 use std::slice::from_ref;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use test_case::test_case;
 use crate::journal::{JournalChange, JournalCommit, JournalError, SessionJournal};
 use crate::rewind::{RewindError, RewindOutcome, RewindTargetId};
 use crate::session_recovery::tests::for_each_durable_prefix;
-use crate::session_writer::{Record, SessionIo, SessionWriter, StoredSession};
+use crate::session_writer::{Record, SessionIo, SessionWriter, StoredSession, open_log};
 use crate::test_util::poll_until;
 use event_listener::Event;
 use flume::{Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -33,8 +34,8 @@ use makima_storage::sessions::Session;
 use serde_json::Value;
 
 use super::{
-    AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
-    SpawnRestoration,
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentRef, AgentResidency, GraphLifecycle,
+    ManagerError, SpawnRestoration,
 };
 use crate::actor::{
     ActorHistory, ChildDelivery, DeliveryRejection, MAX_PENDING_DELIVERIES,
@@ -56,29 +57,47 @@ const SUSPEND_PUBLICATION_VERSION: u32 = 1;
 const RECEIPT_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIPT_TEST_TIMED_OUT: &str = "receipt test did not finish";
 const RECEIPT_GATE_TIMED_OUT: &str = "receipt gate was not released";
+const EXPECTED_PERSISTENCE_ERROR: &str = "expected persistence error";
+const RECEIPT_SYNC_FAILED: &str = "injected fsync failure";
 const SPAWN_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
 const PRIVATE_TOOLS_REASON: &str = "private tools cannot be restored";
 
 struct ReceiptGateIo {
     entered: Sender<()>,
-    release: Option<Receiver<()>>,
+    release: Option<Receiver<bool>>,
+    file: File,
     matches: fn(&Record) -> bool,
     matched: bool,
 }
 
 impl ReceiptGateIo {
-    fn writer(matches: fn(&Record) -> bool) -> (SessionWriter, Receiver<()>, Sender<()>) {
+    fn writer(matches: fn(&Record) -> bool) -> (SessionWriter, Receiver<()>, Sender<bool>) {
+        Self::file_writer(
+            MakimaId::generate(),
+            tempfile::tempfile().unwrap(),
+            0,
+            matches,
+        )
+    }
+
+    fn file_writer(
+        id: MakimaId,
+        file: File,
+        next_seq: u64,
+        matches: fn(&Record) -> bool,
+    ) -> (SessionWriter, Receiver<()>, Sender<bool>) {
         let (entered, syncing) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
         let writer = SessionWriter::with_io(
-            MakimaId::generate(),
+            id,
             Self {
                 entered,
                 release: Some(gate),
+                file,
                 matches,
                 matched: false,
             },
-            0,
+            next_seq,
         );
         (writer, syncing, release)
     }
@@ -102,7 +121,17 @@ impl SessionIo for ReceiptGateIo {
                 }
             }
         }
-        Ok(bytes.len())
+        self.file.write(bytes)
+    }
+
+    fn position(&mut self) -> io::Result<u64> {
+        self.file.seek(SeekFrom::End(0))
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)?;
+        self.file.seek(SeekFrom::Start(len))?;
+        Ok(())
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -110,14 +139,18 @@ impl SessionIo for ReceiptGateIo {
             && let Some(release) = self.release.take()
         {
             let _ = self.entered.try_send(());
-            if release.recv_timeout(RECEIPT_TEST_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    RECEIPT_GATE_TIMED_OUT,
-                ));
+            match release.recv_timeout(RECEIPT_TEST_TIMEOUT) {
+                Ok(true) => return Err(io::Error::other(RECEIPT_SYNC_FAILED)),
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        RECEIPT_GATE_TIMED_OUT,
+                    ));
+                }
+                Ok(false) | Err(RecvTimeoutError::Disconnected) => (),
             }
         }
-        Ok(())
+        self.file.sync_all()
     }
 }
 
@@ -137,17 +170,16 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
         manager.journal().bind_writer(writer).unwrap();
         let spawning = manager.clone();
         let (done, spawned) = flume::bounded(1);
-        thread::spawn(move || {
-            let _ = done.send(spawning.create_root(Vec::new(), None, TestBackend::boxed()));
-        });
+        smol::spawn(async move {
+            let _ = done.send(
+                spawning
+                    .create_root(Vec::new(), None, TestBackend::boxed())
+                    .await,
+            );
+        })
+        .detach();
         syncing.recv_async().await.unwrap();
         assert!(matches!(spawned.try_recv(), Err(TryRecvError::Empty)));
-        let root_id = manager.root_id().unwrap();
-        assert_eq!(
-            manager.node(root_id).unwrap().graph_lifecycle,
-            GraphLifecycle::Reserved
-        );
-        assert!(manager.actor(root_id).is_err());
         drop(release);
         let root = spawned.recv_async().await.unwrap().unwrap();
         assert!(root.actor().is_ok());
@@ -157,52 +189,57 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
 
 #[test]
 fn blocked_spawn_leaves_no_agent_to_publish_later() {
-    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let journal = manager.journal();
-    let directory = tempfile::tempdir().unwrap();
-    let session = crate::session_writer::StoredSession::new("spawn-test", "/");
-    journal
-        .bind_writer(SessionWriter::open_session(directory.path(), &session).unwrap())
-        .unwrap();
-    let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
-    let error = manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap_err();
-    assert!(matches!(error, ManagerError::Persistence(_)));
-    assert!(manager.root_id().is_err());
-    journal
-        .complete(
-            barrier,
-            vec![JournalChange {
-                agent: None,
-                generation: 0,
-                change: StateChange::Rules {
-                    rules: Vec::new(),
-                    yolo: None,
-                },
-            }],
-        )
-        .unwrap();
-    assert!(journal.snapshot().agent_revisions.iter().next().is_none());
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
-    smol::block_on(manager.shutdown(COMPLETION_TIMEOUT));
-    let reloaded =
-        crate::session_writer::StoredSession::load_from(session.id, directory.path()).unwrap();
-    assert_eq!(
-        reloaded.agents().keys().copied().collect::<Vec<_>>(),
-        [root.id()]
-    );
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let journal = manager.journal();
+        let directory = tempfile::tempdir().unwrap();
+        let session = crate::session_writer::StoredSession::new("spawn-test", "/");
+        journal
+            .bind_writer(SessionWriter::open_session(directory.path(), &session).unwrap())
+            .unwrap();
+        let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
+        let error = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ManagerError::Persistence(_)));
+        assert!(manager.root_id().is_err());
+        journal
+            .complete(
+                barrier,
+                vec![JournalChange {
+                    agent: None,
+                    generation: 0,
+                    change: StateChange::Rules {
+                        rules: Vec::new(),
+                        yolo: None,
+                    },
+                }],
+            )
+            .unwrap();
+        assert!(journal.snapshot().agent_revisions.iter().next().is_none());
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
+            .unwrap();
+        manager.shutdown(COMPLETION_TIMEOUT).await;
+        let reloaded =
+            crate::session_writer::StoredSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(
+            reloaded.agents().keys().copied().collect::<Vec<_>>(),
+            [root.id()]
+        );
+    });
 }
 
 #[test_case(false; "restorable")]
 #[test_case(true; "private_tools")]
-fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_tools: bool) {
+fn child_spawn_spec_and_config_exist_in_first_durable_revision(private_tools: bool) {
     receipt_test(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let spec = StoredAgentSpec {
             model: Default::default(),
@@ -234,20 +271,43 @@ fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_to
         manager.journal().bind_writer(writer).unwrap();
         let spawning = manager.clone();
         let (done, spawned) = flume::bounded(1);
-        thread::spawn(move || {
-            let result = spawning.spawn_child_trusted_with_config_and_restoration(
-                &root,
-                config(SPAWN_MODEL, false),
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                Some(SpawnRestoration { spec, restorable }),
-                |_| Ok::<_, String>(TestBackend::boxed()),
-            );
+        smol::spawn(async move {
+            let result = spawning
+                .spawn_child_trusted_with_config_and_restoration(
+                    &root,
+                    config(SPAWN_MODEL, false),
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    Some(SpawnRestoration { spec, restorable }),
+                    |_| Ok::<_, String>(TestBackend::boxed()),
+                )
+                .await;
             let _ = done.send(result);
-        });
+        })
+        .detach();
         syncing.recv_async().await.unwrap();
+        assert!(matches!(spawned.try_recv(), Err(TryRecvError::Empty)));
+        let journal = manager.journal();
+        let (done, projected) = flume::bounded(1);
+        thread::spawn(move || {
+            let before = journal.projection();
+            let usage = TokenUsage {
+                input: 1,
+                ..Default::default()
+            };
+            journal.record_usage(SPAWN_MODEL, usage, None);
+            let after = journal.projection();
+            let _ = done.send((before, after, usage));
+        });
+        let (before, after, usage) = projected.recv_async().await.unwrap();
+        assert_eq!(before.agent_revisions.iter().len(), 1);
+        assert_eq!(after.agent_revisions.iter().len(), 1);
+        assert_eq!(after.usage().tokens, usage);
+        release.send(false).unwrap();
+        let handle = spawned.recv_async().await.unwrap().unwrap();
         let snapshot = manager.journal().snapshot();
+        assert_eq!(snapshot.usage().tokens, usage);
         let children: Vec<_> = snapshot
             .agent_revisions
             .iter()
@@ -267,17 +327,108 @@ fn child_spawn_spec_and_config_exist_in_first_revision_before_receipt(private_to
                 .any(|state| state.agent == Some(child.id)
                     && matches!(&state.change, StateChange::Config(saved) if saved.model == SPAWN_MODEL))
         );
-        assert!(manager.actor(child.id).is_err());
-        assert!(matches!(spawned.try_recv(), Err(TryRecvError::Empty)));
-        drop(release);
-        let child = spawned.recv_async().await.unwrap().unwrap();
-        assert!(child.actor().is_ok());
+        assert_eq!(child.id, handle.id());
+        assert!(handle.actor().is_ok());
         manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
     });
 }
 
+#[test_case(false; "spawn")]
+#[test_case(true; "retirement")]
+fn agent_revision_is_not_retried_after_failed_receipt(retire: bool) {
+    receipt_test(async {
+        let directory = tempfile::tempdir().unwrap();
+        let session = StoredSession::new(SPAWN_MODEL, ".");
+        let path = directory.path().join(format!("{}.jsonl", session.id));
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let journal = manager.journal();
+        let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+        journal.bind_writer(writer.clone()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
+            .unwrap();
+        let spawn = async |manager: &AgentManagerHandle, root: &AgentRef| {
+            manager
+                .spawn_child_trusted_with_config(
+                    root,
+                    config(SPAWN_MODEL, false),
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<_, String>(TestBackend::boxed()),
+                )
+                .await
+        };
+        let child = if retire {
+            Some(spawn(&manager, &root).await.unwrap())
+        } else {
+            None
+        };
+        let child_id = child.as_ref().map(AgentRef::id);
+        let root_id = root.id();
+        writer.close().await.unwrap();
+        let (file, seq) = open_log(&path).unwrap();
+        let (writer, syncing, release) = ReceiptGateIo::file_writer(
+            session.id,
+            file,
+            seq,
+            |record| matches!(record, Record::Agent { d, .. } if d.parent.is_some()),
+        );
+        writer.attach_journal(&journal);
+        journal.replace_writer_for_test(writer.clone());
+        let operating = manager.clone();
+        let (done, result) = flume::bounded(1);
+        smol::spawn(async move {
+            let result = match child {
+                Some(child) => operating.retire_trusted(&child).await,
+                None => spawn(&operating, &root).await.map(|_| ()),
+            };
+            let _ = done.send(result);
+        })
+        .detach();
+        syncing.recv_async().await.unwrap();
+        assert!(matches!(result.try_recv(), Err(TryRecvError::Empty)));
+        release.send(true).unwrap();
+        let Err(ManagerError::Persistence(message)) = result.recv_async().await.unwrap() else {
+            panic!("{EXPECTED_PERSISTENCE_ERROR}");
+        };
+        assert!(message.contains(RECEIPT_SYNC_FAILED));
+        if let Some(id) = child_id {
+            assert!(manager.is_live(id));
+            assert_eq!(
+                journal.agent(id).unwrap().lifecycle,
+                StoredAgentLifecycle::Open
+            );
+        }
+        writer.append(Vec::new()).await.unwrap();
+        for_each_durable_prefix(&path, true, |candidate| {
+            let agents = candidate.session.agents();
+            for (&id, record) in agents {
+                if id != root_id {
+                    assert_eq!(Some(id), child_id);
+                    assert_eq!(record.lifecycle, StoredAgentLifecycle::Open);
+                }
+            }
+        });
+        if let Some(id) = child_id {
+            manager
+                .retire_trusted(&manager.reference(id))
+                .await
+                .unwrap();
+            let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+            assert_eq!(
+                reopened.agents()[&id].lifecycle,
+                StoredAgentLifecycle::Retired
+            );
+        }
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
+        writer.close().await.unwrap();
+    });
+}
+
 #[test]
-fn synchronous_spawn_on_global_executor_receives_durable_acknowledgment() {
+fn spawn_on_global_executor_receives_durable_acknowledgment() {
     let task = smol::spawn(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -286,6 +437,7 @@ fn synchronous_spawn_on_global_executor_receives_durable_acknowledgment() {
         manager.journal().bind_writer(writer).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         assert!(root.actor().is_ok());
         manager.shutdown(COMPLETION_TIMEOUT).await;
@@ -316,6 +468,7 @@ fn durable_admission_prefix_preserves_user_input() {
                 |_| Ok::<_, String>(TestBackend::boxed()),
                 gate,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let root = root.id();
@@ -365,6 +518,7 @@ fn generic_terminal_waits_for_writer_receipt_before_end() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let events = actor.subscribe_events();
@@ -391,9 +545,8 @@ fn generic_terminal_waits_for_writer_receipt_before_end() {
     });
 }
 
-#[test_case(false; "closed")]
-#[test_case(true; "retired")]
-fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool) {
+#[test]
+fn closed_resident_transcript_uses_journal_before_writer_receipt() {
     const HISTORY_TEXT: &str = "retained child transcript";
     receipt_test(async {
         let (manager, _, current, root_gate) = active_root_async(AgentLimits::default()).await;
@@ -404,6 +557,7 @@ fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool)
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
@@ -431,11 +585,7 @@ fn non_live_resident_transcript_uses_journal_before_writer_receipt(retire: bool)
                 task.await;
             }));
         }
-        if retire {
-            manager.retire(&current, child.id()).unwrap();
-        } else {
-            child.close_subtree().unwrap();
-        }
+        child.close_subtree().unwrap();
         assert!(!manager.is_live(child.id()));
         assert_eq!(
             child.snapshot().unwrap().residency,
@@ -477,6 +627,7 @@ fn held_ticket_observation_checks_manager_and_survives_graph_removal() {
         let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let ticket = root
             .actor()
@@ -528,6 +679,7 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
         let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         assert!(root.manager().same_manager(&manager));
         assert!(root.same_manager(&manager.root().unwrap()));
@@ -538,28 +690,32 @@ fn trusted_spawn_checks_runtime_identity_and_parent_liveness(close_parent: bool)
             Err(ManagerError::WrongManager)
         ));
         assert!(matches!(
-            other.spawn_child_trusted_with_config(
-                &root,
-                config(MODEL, false),
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                |_| Ok::<_, String>(TestBackend::boxed())
-            ),
+            other
+                .spawn_child_trusted_with_config(
+                    &root,
+                    config(MODEL, false),
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    |_| Ok::<_, String>(TestBackend::boxed())
+                )
+                .await,
             Err(ManagerError::WrongManager)
         ));
         if close_parent {
             root.actor().unwrap().close();
             yield_until(|| manager.runner_finished(root.id()).unwrap()).await;
         }
-        let result = manager.spawn_child_trusted_with_config(
-            &root,
-            config(MODEL, false),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(TestBackend::boxed()),
-        );
+        let result = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(MODEL, false),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(TestBackend::boxed()),
+            )
+            .await;
         if close_parent {
             assert!(matches!(result, Err(ManagerError::NonLiveAgent(id)) if id == root.id()));
             let retained = manager.lookup(root.id()).unwrap();
@@ -610,6 +766,7 @@ fn deferred_runtime_does_not_execute_before_activation() {
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
@@ -643,6 +800,7 @@ fn deferred_runtime_drop_settles_admissions() {
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
@@ -689,6 +847,7 @@ fn deferred_runtime_terminal_lifecycle_exits_with_start_sender_retained(shutdown
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
@@ -719,6 +878,7 @@ fn idle_guard_rejects_popped_work() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let (popped, release) = actor.pause_after_next_pop();
@@ -765,6 +925,7 @@ fn correlation_cancel_settles_popped_work_without_backend_entry(
             .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(entered_tx, None))
             })
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let identity = actor.identity();
@@ -917,6 +1078,7 @@ fn correlation_cancel_drops_popped_batch_when_earlier_root_matches(
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let identity = actor.identity();
@@ -1001,6 +1163,7 @@ fn queued_only_correlation_cancel_does_not_precancel_later_work() {
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let cancelled = actor.admit_turn(input(), None, CORRELATION.into()).unwrap();
@@ -1058,6 +1221,7 @@ fn idle_guard_permission_for_retired_turn_does_not_hold_actor(permitted_first: b
                 |_| Ok::<_, String>(TestBackend::reporting(entered_tx, None)),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let guard = manager.prepare_idle_subtree(root.id()).unwrap();
@@ -1094,6 +1258,7 @@ fn graph_events_tag_every_actor_and_end_with_the_graph() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let events = manager.subscribe_events(GRAPH_SUBSCRIBER).unwrap();
         assert!(manager.subscribe_events(GRAPH_SUBSCRIBER).is_none());
@@ -1106,6 +1271,7 @@ fn graph_events_tag_every_actor_and_end_with_the_graph() {
                 None,
                 |_| Ok::<_, String>(TestBackend::boxed()),
             )
+            .await
             .unwrap();
         for agent in [&child, &root] {
             agent.actor().unwrap().close();
@@ -1143,6 +1309,7 @@ fn idle_guard_reports_closed_actor_as_non_live(managed: bool) {
                 |_| Ok::<_, String>(TestBackend::boxed()),
                 start_rx,
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let guard = manager.prepare_idle_subtree(root.id()).unwrap();
@@ -1172,9 +1339,12 @@ fn root_cancelled_before_managed_admission_has_no_start_and_resolves_end() {
     const CORRELATION: &str = "root-before-permit";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::bounded(1);
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
-        .unwrap();
+    let root = smol::block_on(manager.create_root(
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered_tx, None),
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     let events = actor.subscribe_events();
     let (acquire_tx, acquire_rx) = flume::bounded(1);
@@ -1219,9 +1389,12 @@ fn idle_acquisition_rejects_turn_awaiting_managed_registration() {
     const CORRELATION: &str = "before-registration";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
-        .unwrap();
+    let root = smol::block_on(manager.create_root(
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered_tx, None),
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     let (acquire_tx, acquire_rx) = flume::bounded(1);
     let (acquire_release_tx, acquire_release_rx) = flume::bounded(1);
@@ -1274,9 +1447,12 @@ fn cancel_cut_prevents_late_managed_registration_before_trigger(
     })
     .unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
-        .unwrap();
+    let root = smol::block_on(manager.create_root(
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered_tx, None),
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     let (acquire_tx, acquire_rx) = flume::bounded(1);
     let (acquire_release_tx, acquire_release_rx) = flume::bounded(1);
@@ -1331,24 +1507,22 @@ fn cancel_cut_prevents_late_managed_registration_before_trigger(
 fn turn_cancel_preserves_trusted_child(nominal: bool) {
     const CORRELATION: &str = "root";
     let (manager, root, current, gate) = active_root(AgentLimits::default());
-    let delegated = current
-        .spawn_child(
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
-    let trusted = manager
-        .spawn_child_trusted_with_config(
-            &root,
-            config("anthropic/claude-sonnet-4-20250514", false),
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(TestBackend::boxed()),
-        )
-        .unwrap();
+    let delegated = smol::block_on(current.spawn_child(
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
+    let trusted = smol::block_on(manager.spawn_child_trusted_with_config(
+        &root,
+        config("anthropic/claude-sonnet-4-20250514", false),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(TestBackend::boxed()),
+    ))
+    .unwrap();
     if nominal {
         manager
             .cancel_turn(
@@ -1383,14 +1557,13 @@ fn runner_finished_observes_reclaimed_resources_after_gated_close() {
     let (manager, _, current, root_gate) = active_root(AgentLimits::default());
     let child_gate = Gate::new();
     let (entered, running) = flume::bounded(1);
-    let child = current
-        .spawn_child(
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
-        )
-        .unwrap();
+    let child = smol::block_on(current.spawn_child(
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
+    ))
+    .unwrap();
     let actor = child.actor().unwrap();
     let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
     smol::block_on(async {
@@ -1430,14 +1603,13 @@ fn spawn_close_cycles_reclaim_tasks_and_retain_terminal_nodes() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let mut children = Vec::new();
     for _ in 0..CYCLES {
-        let child = current
-            .spawn_child(
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            )
-            .unwrap();
+        let child = smol::block_on(current.spawn_child(
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        ))
+        .unwrap();
         let held = child.clone();
         let terminal = Arc::downgrade(&child.terminal);
         child.close_subtree().unwrap();
@@ -1499,20 +1671,19 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
     let (current_tx, current_rx) = flume::bounded(1);
     let (cancel_tx, cancel_rx) = flume::bounded(1);
     let root_gate = Gate::new();
-    let root = manager
-        .create_root_with_config(
-            Some(config("anthropic/claude-sonnet-4-20250514", false)),
-            Vec::new(),
-            None,
-            |_| {
-                Ok::<_, String>(Box::new(TestBackend {
-                    current: Some(current_tx),
-                    cancel: Some(cancel_tx),
-                    gate: Some(Arc::clone(&root_gate)),
-                }))
-            },
-        )
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(config("anthropic/claude-sonnet-4-20250514", false)),
+        Vec::new(),
+        None,
+        |_| {
+            Ok::<_, String>(Box::new(TestBackend {
+                current: Some(current_tx),
+                cancel: Some(cancel_tx),
+                gate: Some(Arc::clone(&root_gate)),
+            }))
+        },
+    ))
+    .unwrap();
     let root_actor = root.actor().unwrap();
     let ticket = root_actor
         .admit_turn(input(), None, CORRELATION.into())
@@ -1529,15 +1700,14 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
     independent_operation
         .register_publication(&independent_publication)
         .unwrap();
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     let child_actor = child.actor().unwrap();
     let operation = child_actor.reserve_prepared_operation(None).unwrap();
     let publication = CheckpointPublication::default();
@@ -1576,13 +1746,13 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
     assert!(operation.register_publication(&late_publication).is_err());
     assert!(late_publication.is_cancelled());
     assert!(child_actor.reserve_prepared_operation(None).is_err());
-    let post_cut_spawn = manager.spawn_child(
+    let post_cut_spawn = smol::block_on(manager.spawn_child(
         &current,
         AgentMetadata::default(),
         Vec::new(),
         None,
         TestBackend::boxed(),
-    );
+    ));
     release_tx.send(()).unwrap();
     cancel.join().unwrap().unwrap();
     assert!(matches!(
@@ -1609,15 +1779,14 @@ fn cancel_cut_retires_authority_and_captures_children_before_close(nominal: bool
         .admit_turn(input(), None, "later".into())
         .unwrap();
     let later_current = current_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    let later_child = manager
-        .spawn_child(
-            &later_current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let later_child = smol::block_on(manager.spawn_child(
+        &later_current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert_eq!(later_child.snapshot().unwrap().parent_id, Some(root.id()));
     root_gate.release(1);
     assert!(matches!(
@@ -1642,9 +1811,12 @@ fn exact_cancel_pop_gap_preserves_same_correlation_successor(
     const CORRELATION: &str = "reused";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::reporting(entered_tx, None))
-        .unwrap();
+    let root = smol::block_on(manager.create_root(
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered_tx, None),
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     assert_eq!(actor.processing_turn_id(), None);
     let (popped, release) = actor.pause_after_next_pop();
@@ -1700,8 +1872,11 @@ fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
-    let root = manager
-        .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(config(MODEL, false)),
+        Vec::new(),
+        None,
+        |_| {
             Ok::<Box<dyn ActorBackend>, String>(Box::new(CancellableBackend {
                 entered: move |context: &TurnContext| {
                     entered_tx
@@ -1709,20 +1884,20 @@ fn late_exact_cancel_closes_children_of_a_turn_cut_first() {
                         .unwrap();
                 },
             }))
-        })
-        .unwrap();
+        },
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     let ticket = actor.admit_turn(input(), None, "cut".into()).unwrap();
     let current = entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     actor.cancel_turn(ticket.turn_id()).unwrap();
     smol::block_on(ticket.wait());
     assert_eq!(
@@ -1746,8 +1921,11 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submis
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let (entered_tx, entered_rx) = flume::unbounded();
-    let root = manager
-        .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(config(MODEL, false)),
+        Vec::new(),
+        None,
+        |_| {
             Ok::<Box<dyn ActorBackend>, String>(Box::new(CancellableBackend {
                 entered: move |context: &TurnContext| {
                     entered_tx
@@ -1755,8 +1933,9 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submis
                         .unwrap();
                 },
             }))
-        })
-        .unwrap();
+        },
+    ))
+    .unwrap();
     let actor = root.actor().unwrap();
     let first = if shared_submission {
         actor
@@ -1800,15 +1979,14 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submis
     };
     let current = entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
     let successor = successor.unwrap_or_else(|| actor.turn_ticket(current.turn_id()).unwrap());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     let stale = manager.cancel_turn(root.id(), captured, crate::TurnCancellationReason::User);
     assert_eq!(
         stale,
@@ -1827,15 +2005,14 @@ fn delayed_exact_cancel_preserves_successor_authority_and_children(shared_submis
         child.actor().unwrap().snapshot().lifecycle,
         crate::ActorLifecycle::Open
     );
-    let another = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let another = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     let another_actor = another.actor().unwrap();
     let child_turn = child
         .actor()
@@ -1875,11 +2052,17 @@ fn idle_guard_rejects_child_factory_reservation() {
     let (release_tx, release_rx) = flume::bounded(1);
     let creating = manager.clone();
     let child = std::thread::spawn(move || {
-        creating.spawn_child_with(&current, AgentMetadata::default(), Vec::new(), None, |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok::<_, String>(TestBackend::boxed())
-        })
+        smol::block_on(creating.spawn_child_with(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        ))
     });
     entered_rx.recv().unwrap();
     assert!(matches!(
@@ -1896,15 +2079,14 @@ fn idle_root_with_child(
     child_backend: Box<dyn ActorBackend>,
 ) -> (AgentManagerHandle, super::AgentRef, super::AgentRef) {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            child_backend,
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        child_backend,
+    ))
+    .unwrap();
     let root_actor = root.actor().unwrap();
     let events = root_actor.subscribe_events();
     gate.release(1);
@@ -1946,6 +2128,7 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
                     ))
                 },
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let initial = actor.admit_turn(input(), None, "root".into()).unwrap();
@@ -1960,6 +2143,7 @@ fn idle_guard_allows_idle_live_child(abort: bool, explicit: bool) {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let events = actor.subscribe_events();
         root_gate.release(1);
@@ -2497,6 +2681,7 @@ async fn active_root_async(
             None,
             |_| Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate)))),
         )
+        .await
         .unwrap();
     root.actor()
         .unwrap()
@@ -2688,6 +2873,7 @@ fn nonpersistent_actor_history_fences_old_invocation_and_accepts_new(compact: bo
                     ))
                 },
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         assert!(actor.inner.journal.is_none());
@@ -2761,6 +2947,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
             .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -2778,6 +2965,7 @@ fn actor_owned_config_inherits_and_isolates_nodes() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let inherited = child.effective_config().unwrap().unwrap();
         assert_eq!(inherited.model.id, initial.model.id);
@@ -2804,11 +2992,13 @@ fn agent_config_isolation_and_failed_switch() {
             .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx.clone(), Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         let second_root = second
             .create_root_with_config(Some(other.clone()), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx.clone(), None))
             })
+            .await
             .unwrap();
         let first_actor = first_root.actor().unwrap();
         let second_actor = second_root.actor().unwrap();
@@ -2823,6 +3013,7 @@ fn agent_config_isolation_and_failed_switch() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let second_ticket = second_actor
             .admit_turn(input(), None, "second".into())
@@ -2876,13 +3067,12 @@ fn child_spawn_without_parent_policy_fails_closed() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (tx, rx) = flume::bounded(1);
         let gate = Gate::new();
-        let root = manager
-            .create_root(
-                Vec::new(),
-                None,
-                TestBackend::reporting(tx, Some(Arc::clone(&gate))),
-            )
-            .unwrap();
+        let root = smol::block_on(manager.create_root(
+            Vec::new(),
+            None,
+            TestBackend::reporting(tx, Some(Arc::clone(&gate))),
+        ))
+        .unwrap();
         root.actor()
             .unwrap()
             .admit_turn(input(), None, "root".into())
@@ -2891,13 +3081,13 @@ fn child_spawn_without_parent_policy_fails_closed() {
         (manager, root, current, gate)
     };
     assert!(matches!(
-        manager.spawn_child(
+        smol::block_on(manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed()
-        ),
+        )),
         Err(ManagerError::Policy(_))
     ));
     assert!(root.snapshot().unwrap().children.is_empty());
@@ -2916,6 +3106,7 @@ fn child_configuration_can_change_independently() {
             .create_root_with_config(Some(initial.clone()), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -2929,18 +3120,21 @@ fn child_configuration_can_change_independently() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let before = manager.snapshot().len();
         let mut invalid = initial.clone();
         invalid.mode = AgentMode::Custom(crate::ModeId::Custom("missing-definition".into()));
         assert!(matches!(
-            current.spawn_child_with_config(
-                invalid,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            ),
+            current
+                .spawn_child_with_config(
+                    invalid,
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+                .await,
             Err(ManagerError::Policy(_))
         ));
         assert_eq!(manager.snapshot().len(), before);
@@ -2990,6 +3184,7 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
             .create_root_with_config(Some(root_config), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         actor.admit_turn(input(), None, "root".into()).unwrap();
@@ -3001,6 +3196,7 @@ fn restrictive_parent_delegates_without_broadening_child_mode() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let child_actor = child.actor().unwrap();
         assert_eq!(child_actor.effective_config().unwrap().mode, plan_mode);
@@ -3029,6 +3225,7 @@ fn custom_parent_mode_is_admitted_by_managed_child() {
             .create_root_with_config(Some(root_config), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         actor
@@ -3042,6 +3239,7 @@ fn custom_parent_mode_is_admitted_by_managed_child() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let child_actor = child.actor().unwrap();
         assert_eq!(child_actor.effective_config().unwrap().mode, custom_mode);
@@ -3105,6 +3303,7 @@ fn backend_poll_holds_physical_permit_while_suspension_races() {
                     checked: checked_tx,
                 }),
             )
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -3132,13 +3331,15 @@ fn backend_poll_holds_physical_permit_while_suspension_races() {
             smol::future::yield_now().await;
         }
         assert!(matches!(
-            manager.spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            ),
+            manager
+                .spawn_child(
+                    &current,
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+                .await,
             Err(ManagerError::InactiveTurn { .. })
         ));
         let permit = manager.0.limiter.acquire_arc().await;
@@ -3176,6 +3377,7 @@ fn local_cancel_retires_unpolled_turn_authority_without_closing_live_child() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let turn_id = crate::TurnId::generate();
         install_active_turn(&manager, root.id(), turn_id);
@@ -3199,6 +3401,7 @@ fn local_cancel_retires_unpolled_turn_authority_without_closing_live_child() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let child_turn = crate::TurnId::generate();
         install_active_turn(&manager, child.id(), child_turn);
@@ -3227,7 +3430,7 @@ fn local_cancel_retires_unpolled_turn_authority_without_closing_live_child() {
                 Vec::new(),
                 None,
                 TestBackend::boxed(),
-            ),
+            ).await,
             Err(error) if error == inactive
         ));
         assert_eq!(
@@ -3246,6 +3449,7 @@ fn local_cancel_retires_unpolled_turn_authority_without_closing_live_child() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
 
         drop(execution);
@@ -3267,6 +3471,7 @@ fn local_cancel_preserves_successor_authority_after_retired_execution_drops() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let turn_id = crate::TurnId::generate();
         install_active_turn(&manager, root.id(), turn_id);
@@ -3303,6 +3508,7 @@ fn local_cancel_preserves_successor_authority_after_retired_execution_drops() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         assert_eq!(
             child.snapshot().unwrap().graph_lifecycle,
@@ -3325,6 +3531,7 @@ fn completed_waiter_observes_ownership_during_backend_poll() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let turn_id = crate::TurnId::generate();
         install_active_turn(&manager, root.id(), turn_id);
@@ -3381,6 +3588,7 @@ fn cancellation_wakes_pending_managed_execution_and_runs_cleanup() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let turn_id = crate::TurnId::generate();
         install_active_turn(&manager, root.id(), turn_id);
@@ -3466,6 +3674,7 @@ fn dropping_pending_managed_execution_closes_lease_and_releases_permit() {
         let manager = AgentManagerHandle::new(limits).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let turn_id = crate::TurnId::generate();
         install_active_turn(&manager, root.id(), turn_id);
@@ -3519,6 +3728,7 @@ fn child_spawn_inherits_running_turn_cwd_not_later_config() {
             .create_root_with_config(Some(initial), Vec::new(), None, |_| {
                 Ok::<_, String>(TestBackend::reporting(tx, Some(Arc::clone(&gate))))
             })
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         actor
@@ -3543,6 +3753,7 @@ fn child_spawn_inherits_running_turn_cwd_not_later_config() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         assert_eq!(
             child.effective_config().unwrap().unwrap().context.cwd(),
@@ -3564,30 +3775,28 @@ fn root_and_nested_children_use_one_factory() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let (tx, rx) = flume::bounded(1);
     let child_gate = Gate::new();
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::reporting(tx, Some(Arc::clone(&child_gate))),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::reporting(tx, Some(Arc::clone(&child_gate))),
+    ))
+    .unwrap();
     child
         .actor()
         .unwrap()
         .admit_turn(input(), None, "child".into())
         .unwrap();
     let child_turn = smol::block_on(rx.recv_async()).unwrap();
-    let grandchild = manager
-        .spawn_child(
-            &child_turn,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let grandchild = smol::block_on(manager.spawn_child(
+        &child_turn,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     let root_node = root.snapshot().unwrap();
     let child_node = child.snapshot().unwrap();
     let grandchild_node = grandchild.snapshot().unwrap();
@@ -3617,7 +3826,7 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
     let messages = vec![makima_providers::Message::user(INITIAL.into())];
     let (start, wait) = flume::bounded(1);
     let root = if deferred {
-        manager.create_root_deferred_with_id_and_config(
+        smol::block_on(manager.create_root_deferred_with_id_and_config(
             id,
             Some(config(MODEL, false)),
             messages,
@@ -3627,9 +3836,9 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
                 Ok::<_, String>(TestBackend::boxed())
             },
             wait,
-        )
+        ))
     } else {
-        manager.create_root_with_id_and_config(
+        smol::block_on(manager.create_root_with_id_and_config(
             id,
             Some(config(MODEL, false)),
             messages,
@@ -3638,7 +3847,7 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
                 assert_eq!(actual, id);
                 Ok::<_, String>(TestBackend::boxed())
             },
-        )
+        ))
     }
     .unwrap();
     assert_eq!(root.id(), id);
@@ -3680,15 +3889,14 @@ fn supplied_root_identity_journals_config_and_reopens_without_recreating(deferre
     assert_ne!(journal.snapshot().epoch, snapshot.epoch);
     let restored =
         AgentManagerHandle::new_with_journal(AgentLimits::default(), Arc::clone(&journal)).unwrap();
-    restored
-        .create_root_with_id_and_config(
-            id,
-            Some(config(MODEL, true)),
-            session.messages().to_vec(),
-            None,
-            |_| Ok::<_, String>(TestBackend::boxed()),
-        )
-        .unwrap();
+    smol::block_on(restored.create_root_with_id_and_config(
+        id,
+        Some(config(MODEL, true)),
+        session.messages().to_vec(),
+        None,
+        |_| Ok::<_, String>(TestBackend::boxed()),
+    ))
+    .unwrap();
     let reopened = journal.snapshot();
     assert_eq!(reopened.state, snapshot.state);
     assert_eq!(reopened.agent_revisions.iter().len(), 2);
@@ -3753,6 +3961,7 @@ fn explicit_close_racing_shutdown_preserves_first_durable_lifecycle(close_first:
                 |_| Ok::<_, String>(TestBackend::boxed()),
                 wait,
             )
+            .await
             .unwrap();
         if close_first {
             manager.close_subtree(root.id()).unwrap();
@@ -3983,18 +4192,17 @@ fn transcript_key_query_includes_reservations_and_hidden_logical_agents() {
     let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
     let pending_revision = journal.pending_revision();
     assert!(pending_revision.is_some());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata {
-                transcript_key: Some(KEY.into()),
-                ..Default::default()
-            },
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata {
+            transcript_key: Some(KEY.into()),
+            ..Default::default()
+        },
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert!(
         !journal
             .snapshot()
@@ -4008,22 +4216,21 @@ fn transcript_key_query_includes_reservations_and_hidden_logical_agents() {
     assert!(hidden.transcript_key_in_use(KEY));
     assert!(!hidden.transcript_key_in_use(AVAILABLE));
     assert_eq!(journal.pending_revision(), pending_revision);
-    let reserved_child = manager
-        .spawn_child_with(
-            &current,
-            AgentMetadata {
-                transcript_key: Some(RESERVED.into()),
-                ..Default::default()
-            },
-            Vec::new(),
-            None,
-            |_| {
-                assert!(manager.transcript_key_in_use(RESERVED));
-                assert!(!hidden.transcript_key_in_use(RESERVED));
-                Ok::<_, String>(TestBackend::boxed())
-            },
-        )
-        .unwrap();
+    let reserved_child = smol::block_on(manager.spawn_child_with(
+        &current,
+        AgentMetadata {
+            transcript_key: Some(RESERVED.into()),
+            ..Default::default()
+        },
+        Vec::new(),
+        None,
+        |_| {
+            assert!(manager.transcript_key_in_use(RESERVED));
+            assert!(!hidden.transcript_key_in_use(RESERVED));
+            Ok::<_, String>(TestBackend::boxed())
+        },
+    ))
+    .unwrap();
     assert!(hidden.transcript_key_in_use(RESERVED));
     assert!(matches!(
         manager.set_agent_transcript_key(reserved_child.id(), KEY.into()),
@@ -4052,23 +4259,22 @@ fn child_graph_metadata_is_persisted_and_explicit_close_is_durable() {
     const TOOL: &str = "spawn-tool";
     const INITIAL: &str = "child history";
     let (manager, root, current, gate) = active_root(AgentLimits::default());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata {
-                label: Some(LABEL.into()),
-                spawned_by_tool_use_id: Some(TOOL.into()),
-                transcript_key: Some(TOOL.into()),
-            },
-            vec![makima_providers::Message::user(INITIAL.into())],
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata {
+            label: Some(LABEL.into()),
+            spawned_by_tool_use_id: Some(TOOL.into()),
+            transcript_key: Some(TOOL.into()),
+        },
+        vec![makima_providers::Message::user(INITIAL.into())],
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     let journal = manager.journal();
     let before_collision = journal.snapshot();
     assert!(matches!(
-        manager.spawn_child_with(
+        smol::block_on(manager.spawn_child_with(
             &current,
             AgentMetadata {
                 label: None,
@@ -4080,7 +4286,7 @@ fn child_graph_metadata_is_persisted_and_explicit_close_is_durable() {
             |_| -> Result<Box<dyn ActorBackend>, String> {
                 panic!("duplicate transcript key reached the actor factory")
             },
-        ),
+        )),
         Err(ManagerError::Policy(_))
     ));
     let after_collision = journal.snapshot();
@@ -4095,19 +4301,18 @@ fn child_graph_metadata_is_persisted_and_explicit_close_is_durable() {
         before_collision.histories.len()
     );
     const SIBLING_KEY: &str = "session-sibling";
-    let sibling = manager
-        .spawn_child(
-            &current,
-            AgentMetadata {
-                label: None,
-                spawned_by_tool_use_id: Some(TOOL.into()),
-                transcript_key: Some(SIBLING_KEY.into()),
-            },
-            vec![makima_providers::Message::user(SIBLING_KEY.into())],
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let sibling = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata {
+            label: None,
+            spawned_by_tool_use_id: Some(TOOL.into()),
+            transcript_key: Some(SIBLING_KEY.into()),
+        },
+        vec![makima_providers::Message::user(SIBLING_KEY.into())],
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert_eq!(
         journal.agent(sibling.id()).unwrap().transcript_key,
         SIBLING_KEY
@@ -4225,9 +4430,11 @@ fn failed_root_factory_leaves_no_durable_agent_or_history() {
     const FAILURE: &str = "injected root failure";
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
     let id = crate::AgentId::generate();
-    assert!(matches!(manager.create_root_with_id_and_config(
+    assert!(
+        matches!(smol::block_on(manager.create_root_with_id_and_config(
         id, None, Vec::new(), None, |_| Err::<Box<dyn ActorBackend>, _>(FAILURE),
-    ), Err(ManagerError::Factory(message)) if message == FAILURE));
+    )), Err(ManagerError::Factory(message)) if message == FAILURE)
+    );
     assert!(
         manager
             .journal()
@@ -4238,11 +4445,12 @@ fn failed_root_factory_leaves_no_durable_agent_or_history() {
             .is_none()
     );
     assert!(manager.journal().snapshot().histories.is_empty());
-    manager
-        .create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
+    smol::block_on(
+        manager.create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
             Ok::<_, String>(TestBackend::boxed())
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     smol::block_on(manager.shutdown(Duration::from_secs(1)));
 }
 
@@ -4257,12 +4465,17 @@ fn unresolved_root_config_fails_without_publishing_agent_or_history() {
         .unwrap_err()
         .to_string();
     let factory_called = AtomicUsize::new(0);
-    let error = manager
-        .create_root_with_id_and_config(id, Some(unresolved), Vec::new(), None, |_| {
+    let error = smol::block_on(manager.create_root_with_id_and_config(
+        id,
+        Some(unresolved),
+        Vec::new(),
+        None,
+        |_| {
             factory_called.fetch_add(1, Ordering::SeqCst);
             Ok::<_, String>(TestBackend::boxed())
-        })
-        .unwrap_err();
+        },
+    ))
+    .unwrap_err();
     assert_eq!(error, ManagerError::Policy(expected));
     assert_eq!(factory_called.load(Ordering::SeqCst), 0);
     assert!(manager.snapshot().is_empty());
@@ -4270,24 +4483,22 @@ fn unresolved_root_config_fails_without_publishing_agent_or_history() {
     assert!(journal.agent_revisions.iter().next().is_none());
     assert!(journal.histories.is_empty());
     assert!(journal.state.iter().next().is_none());
-    manager
-        .create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
+    smol::block_on(
+        manager.create_root_with_id_and_config(id, None, Vec::new(), None, |_| {
             Ok::<_, String>(TestBackend::boxed())
-        })
-        .unwrap();
+        }),
+    )
+    .unwrap();
     smol::block_on(manager.shutdown(Duration::from_secs(1)));
 }
 
 #[test]
 fn duplicate_root_is_rejected_without_mutating_graph() {
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
+    let root = smol::block_on(manager.create_root(Vec::new(), None, TestBackend::boxed())).unwrap();
 
-    let error = manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap_err();
+    let error =
+        smol::block_on(manager.create_root(Vec::new(), None, TestBackend::boxed())).unwrap_err();
 
     assert_eq!(error, ManagerError::DuplicateRoot);
     assert_eq!(manager.snapshot().len(), 1);
@@ -4299,15 +4510,14 @@ fn duplicate_root_is_rejected_without_mutating_graph() {
 fn wrong_manager_capability_is_rejected() {
     let (manager, _, current, gate) = active_root(AgentLimits::default());
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let error = other
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap_err();
+    let error = smol::block_on(other.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap_err();
     assert_eq!(error, ManagerError::WrongManager);
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
@@ -4329,15 +4539,14 @@ fn retained_context_clone_cannot_spawn_after_guard_drop() {
             smol::future::yield_now().await;
         }
     });
-    let error = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap_err();
+    let error = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap_err();
     assert!(matches!(error, ManagerError::InactiveTurn { .. }));
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
 }
@@ -4345,37 +4554,31 @@ fn retained_context_clone_cannot_spawn_after_guard_drop() {
 #[test]
 fn factory_failure_rolls_back_reservation() {
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let error = manager
-        .create_root_with(Vec::new(), None, |_| {
-            Err::<Box<dyn ActorBackend>, _>("boom")
-        })
-        .unwrap_err();
+    let error = smol::block_on(manager.create_root_with(Vec::new(), None, |_| {
+        Err::<Box<dyn ActorBackend>, _>("boom")
+    }))
+    .unwrap_err();
     assert_eq!(error, ManagerError::Factory("boom".into()));
     assert!(manager.snapshot().is_empty());
-    manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
+    smol::block_on(manager.create_root(Vec::new(), None, TestBackend::boxed())).unwrap();
 }
 
 #[test]
 fn panicking_root_factory_rolls_back_reservation() {
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let error = manager
-        .create_root_with(
-            Vec::new(),
-            None,
-            |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
-        )
-        .unwrap_err();
+    let error = smol::block_on(manager.create_root_with(
+        Vec::new(),
+        None,
+        |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
+    ))
+    .unwrap_err();
 
     assert_eq!(
         error,
         ManagerError::Factory("agent factory panicked".into())
     );
     assert!(manager.snapshot().is_empty());
-    manager
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
+    smol::block_on(manager.create_root(Vec::new(), None, TestBackend::boxed())).unwrap();
 }
 
 #[test]
@@ -4386,15 +4589,14 @@ fn panicking_child_factory_restores_capacity() {
         ..AgentLimits::default()
     };
     let (manager, root, current, gate) = active_root(limits);
-    let error = manager
-        .spawn_child_with(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
-        )
-        .unwrap_err();
+    let error = smol::block_on(manager.spawn_child_with(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
+    ))
+    .unwrap_err();
 
     assert_eq!(
         error,
@@ -4402,15 +4604,14 @@ fn panicking_child_factory_restores_capacity() {
     );
     assert_eq!(manager.snapshot().len(), 1);
     assert!(root.snapshot().unwrap().children.is_empty());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert_eq!(manager.snapshot().len(), 2);
 
     child.close_subtree().unwrap();
@@ -4438,6 +4639,7 @@ fn suspend_preserves_active_and_queued_root_and_child_admissions(
                 None,
                 TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let root_actor = root.actor().unwrap();
         let child_actor = child.actor().unwrap();
@@ -4551,6 +4753,7 @@ fn shutdown_still_terminalizes_active_and_queued_turns() {
                     entered: move |_: &TurnContext| entered.send(()).unwrap(),
                 }),
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let active = actor.admit_turn(input(), None, "active".into()).unwrap();
@@ -4585,11 +4788,11 @@ fn shutdown_does_not_join_reserved_root_before_factory_completes() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.create_root_with(Vec::new(), None, |agent_id| {
+        smol::block_on(creating.create_root_with(Vec::new(), None, |agent_id| {
             reserved_tx.send(agent_id).unwrap();
             release_rx.recv().unwrap();
             Ok::<_, String>(TestBackend::boxed())
-        })
+        }))
     });
     let root_id = reserved_rx.recv().unwrap();
     assert!(!manager.runner_finished(root_id).unwrap());
@@ -4614,11 +4817,11 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.create_root_with(Vec::new(), None, |agent_id| {
+        smol::block_on(creating.create_root_with(Vec::new(), None, |agent_id| {
             reserved_tx.send(agent_id).unwrap();
             release_rx.recv().unwrap();
             Ok::<_, String>(TestBackend::boxed())
-        })
+        }))
     });
     let root_id = reserved_rx.recv().unwrap();
 
@@ -4640,15 +4843,14 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
 #[test]
 fn shutdown_excludes_finished_child_runner_and_preserves_retained_node() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     child.close_subtree().unwrap();
     smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert_eq!(
@@ -4680,11 +4882,11 @@ fn close_and_factory_failure_remove_never_committed_root() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.create_root_with(Vec::new(), None, |agent_id| {
+        smol::block_on(creating.create_root_with(Vec::new(), None, |agent_id| {
             reserved_tx.send(agent_id).unwrap();
             release_rx.recv().unwrap();
             Err::<Box<dyn ActorBackend>, _>("factory failed")
-        })
+        }))
     });
     let root_id = reserved_rx.recv().unwrap();
 
@@ -4709,43 +4911,40 @@ fn idle_spawn_ignores_active_and_child_limits_but_enforces_depth() {
     let (manager, root, current, gate) = active_root(limits);
     let child_gate = Gate::new();
     let (entered, contexts) = flume::bounded(1);
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::reporting(entered, Some(Arc::clone(&child_gate))),
+    ))
+    .unwrap();
     child
         .actor()
         .unwrap()
         .admit_turn(input(), None, "child".into())
         .unwrap();
     let child_current = smol::block_on(contexts.recv_async()).unwrap();
-    let idle = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let idle = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert_eq!(
         root.snapshot().unwrap().children,
         vec![child.id(), idle.id()]
     );
-    let error = manager
-        .spawn_child(
-            &child_current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap_err();
+    let error = smol::block_on(manager.spawn_child(
+        &child_current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap_err();
     assert_eq!(error, ManagerError::DepthExceeded { depth: 2, max: 1 });
     assert_eq!(manager.snapshot().len(), 3);
     child_gate.release(1);
@@ -4772,6 +4971,7 @@ fn completed_children_preserve_early_open_actor(task_count: usize, retained_quot
                     None,
                     TestBackend::boxed(),
                 )
+                .await
                 .unwrap();
             let actor = child.actor().unwrap();
             let ticket = actor.admit_turn(input(), None, String::new()).unwrap();
@@ -4803,7 +5003,7 @@ fn completed_children_preserve_early_open_actor(task_count: usize, retained_quot
                 )
             };
             assert_eq!(
-                spawn().unwrap_err(),
+                spawn().await.unwrap_err(),
                 ManagerError::RetentionLimit { max: quota }
             );
             let (closed, _) = children.last().unwrap();
@@ -4814,11 +5014,11 @@ fn completed_children_preserve_early_open_actor(task_count: usize, retained_quot
                 GraphLifecycle::Closed
             );
             assert_eq!(
-                spawn().unwrap_err(),
+                spawn().await.unwrap_err(),
                 ManagerError::RetentionLimit { max: quota }
             );
-            manager.retire(&current, closed.id()).unwrap();
-            let replacement = spawn().unwrap();
+            manager.retire(&current, closed.id()).await.unwrap();
+            let replacement = spawn().await.unwrap();
             assert_ne!(replacement.id(), closed.id());
             assert_eq!(manager.snapshot().len(), quota + 1);
         }
@@ -4840,25 +5040,23 @@ fn retained_agent_limit_is_atomic() {
         ..AgentLimits::default()
     };
     let (manager, _, current, gate) = active_root(limits);
-    manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
 
-    let error = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap_err();
+    let error = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap_err();
 
     assert_eq!(error, ManagerError::RetentionLimit { max: 2 });
     assert_eq!(manager.snapshot().len(), 2);
@@ -4873,42 +5071,40 @@ fn closing_idle_child_retains_identity_quota_until_retired() {
         ..AgentLimits::default()
     };
     let (manager, root, current, gate) = active_root(limits);
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     manager.close_subtree(child.id()).unwrap();
     smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert!(matches!(
-        manager.spawn_child(
+        smol::block_on(manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
-        ),
+        )),
         Err(ManagerError::RetentionLimit { max: 2 })
     ));
     assert_eq!(root.snapshot().unwrap().children, vec![child.id()]);
-    manager.retire(&current, child.id()).unwrap();
+    smol::block_on(manager.retire(&current, child.id())).unwrap();
     assert_eq!(
         child.snapshot().unwrap().graph_lifecycle,
         GraphLifecycle::Retired
     );
-    let replacement = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let replacement = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     assert_ne!(child.id(), replacement.id());
     assert_eq!(
         root.snapshot().unwrap().children,
@@ -4930,15 +5126,14 @@ fn closing_idle_child_retains_identity_quota_until_retired() {
 #[test]
 fn closing_descendants_does_not_resurrect_closed_tombstones() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
     child.close_subtree().unwrap();
     smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
     assert_eq!(
@@ -4966,15 +5161,14 @@ fn direct_actor_close_retains_identity_quota_when_runner_finishes() {
         ..AgentLimits::default()
     };
     let (manager, _, current, gate) = active_root(limits);
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            TestBackend::boxed(),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        TestBackend::boxed(),
+    ))
+    .unwrap();
 
     child.actor().unwrap().close();
     smol::block_on(yield_until(|| manager.runner_finished(child.id()).unwrap()));
@@ -4983,13 +5177,13 @@ fn direct_actor_close_retains_identity_quota_when_runner_finishes() {
         GraphLifecycle::Closed
     );
     assert!(matches!(
-        manager.spawn_child(
+        smol::block_on(manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
-        ),
+        )),
         Err(ManagerError::RetentionLimit { max: 2 })
     ));
     assert_eq!(manager.lookup(child.id()).unwrap().id(), child.id());
@@ -5016,6 +5210,7 @@ fn closing_active_child_retains_identity_quota_after_runner_finishes() {
                 None,
                 TestBackend::reporting(entered_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let ticket = child
             .actor()
@@ -5034,13 +5229,15 @@ fn closing_active_child_retains_identity_quota_after_runner_finishes() {
             GraphLifecycle::Closing
         );
         assert!(matches!(
-            manager.spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            ),
+            manager
+                .spawn_child(
+                    &current,
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+                .await,
             Err(ManagerError::RetentionLimit { max: 2 })
         ));
 
@@ -5056,13 +5253,15 @@ fn closing_active_child_retains_identity_quota_after_runner_finishes() {
         ));
         assert!(events.is_empty());
         assert!(matches!(
-            manager.spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            ),
+            manager
+                .spawn_child(
+                    &current,
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    TestBackend::boxed(),
+                )
+                .await,
             Err(ManagerError::RetentionLimit { max: 2 })
         ));
         assert_eq!(
@@ -5109,6 +5308,7 @@ fn managed_child_cancelled_while_waiting_for_permit_never_enters_backend() {
                     },
                 }),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let (event_tx, event_rx) = flume::unbounded();
@@ -5169,6 +5369,7 @@ fn cancel_agent_is_reusable_and_isolates_siblings() {
                     },
                 }),
             )
+            .await
             .unwrap();
         let (second_tx, second_rx) = flume::bounded(1);
         let second = manager
@@ -5183,6 +5384,7 @@ fn cancel_agent_is_reusable_and_isolates_siblings() {
                     },
                 }),
             )
+            .await
             .unwrap();
         let first_ticket = first
             .actor()
@@ -5237,7 +5439,7 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.spawn_child_with(
+        smol::block_on(creating.spawn_child_with(
             &child_current,
             AgentMetadata::default(),
             Vec::new(),
@@ -5247,7 +5449,7 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
                 release_rx.recv().unwrap();
                 Ok::<_, String>(TestBackend::boxed())
             },
-        )
+        ))
     });
     let child_id = reserved_rx.recv().unwrap();
     let revision = manager.lock_graph().revision;
@@ -5283,19 +5485,18 @@ fn scoped_cancellation_distinguishes_turn_subtree_and_tool_use() {
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
     let root_ticket = root.turn_ticket(current.turn_id()).unwrap();
     let (entered, entering) = flume::bounded(1);
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            Box::new(CancellableBackend {
-                entered: move |_: &TurnContext| {
-                    entered.send(()).unwrap();
-                },
-            }),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        Box::new(CancellableBackend {
+            entered: move |_: &TurnContext| {
+                entered.send(()).unwrap();
+            },
+        }),
+    ))
+    .unwrap();
     let actor = child.actor().unwrap();
     let active = actor.admit_turn(input(), None, ACTIVE.into()).unwrap();
     entering.recv_timeout(COMPLETION_TIMEOUT).unwrap();
@@ -5383,13 +5584,13 @@ fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
 
     let cut_entered = cut_entered_rx.recv_timeout(COMPLETION_TIMEOUT);
     let spawn = if cut_entered.is_ok() {
-        Some(manager.spawn_child(
+        Some(smol::block_on(manager.spawn_child(
             &current,
             AgentMetadata::default(),
             Vec::new(),
             None,
             TestBackend::boxed(),
-        ))
+        )))
     } else {
         None
     };
@@ -5425,7 +5626,7 @@ fn close_descendants_rejects_reserved_child_and_preserves_root() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (release_tx, release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.spawn_child_with(
+        smol::block_on(creating.spawn_child_with(
             &child_current,
             AgentMetadata::default(),
             Vec::new(),
@@ -5435,7 +5636,7 @@ fn close_descendants_rejects_reserved_child_and_preserves_root() {
                 release_rx.recv().unwrap();
                 Ok::<_, String>(TestBackend::boxed())
             },
-        )
+        ))
     });
     let child_id = reserved_rx.recv().unwrap();
 
@@ -5468,7 +5669,7 @@ fn reserved_cancellation_precedes_live_publication() {
     let (reserved_tx, reserved_rx) = flume::bounded(1);
     let (factory_release_tx, factory_release_rx) = flume::bounded(1);
     let factory = std::thread::spawn(move || {
-        creating.spawn_child_with(
+        smol::block_on(creating.spawn_child_with(
             &child_current,
             AgentMetadata::default(),
             Vec::new(),
@@ -5478,7 +5679,7 @@ fn reserved_cancellation_precedes_live_publication() {
                 factory_release_rx.recv().unwrap();
                 Ok::<_, String>(TestBackend::boxed())
             },
-        )
+        ))
     });
     let child_id = reserved_rx.recv().unwrap();
 
@@ -5532,9 +5733,8 @@ fn reserved_cancellation_precedes_live_publication() {
 fn descendant_preflight_rejects_before_suspension() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let other_root = other
-        .create_root(Vec::new(), None, TestBackend::boxed())
-        .unwrap();
+    let other_root =
+        smol::block_on(other.create_root(Vec::new(), None, TestBackend::boxed())).unwrap();
 
     assert!(matches!(
         current.validate_descendant(root.id()),
@@ -5570,6 +5770,7 @@ fn unauthorized_descendant_wait_does_not_cancel_child_turn() {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, "child".into()).unwrap();
@@ -5617,6 +5818,7 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let second_gate = Gate::new();
         let second = manager
@@ -5631,6 +5833,7 @@ fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
                     gate: Some(Arc::clone(&second_gate)),
                 }),
             )
+            .await
             .unwrap();
         let ticket = second
             .actor()
@@ -5681,6 +5884,7 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
                 None,
                 |_| Ok::<_, String>(TestBackend::boxed()),
             )
+            .await
             .unwrap();
         let parent_actor = parent.actor().unwrap();
         let barrier = parent_actor.reserve_prepared_operation(None).unwrap();
@@ -5695,6 +5899,7 @@ fn real_nested_child_completion_targets_recorded_parent(closed: bool) {
                 None,
                 |_| Ok::<_, String>(TestBackend::boxed()),
             )
+            .await
             .unwrap();
         let child_actor = child.actor().unwrap();
         child_actor.configure_parent_delivery(true).unwrap();
@@ -5773,6 +5978,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let root = manager
             .create_root(Vec::new(), None, TestBackend::boxed())
+            .await
             .unwrap();
         let parent = root.actor().unwrap();
         let barrier = parent.reserve_prepared_operation(None).unwrap();
@@ -5786,6 +5992,7 @@ fn real_child_settlement_reports_parent_delivery_overflow() {
                 None,
                 |_| Ok::<_, String>(TestBackend::boxed()),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         actor.configure_parent_delivery(true).unwrap();
@@ -5887,6 +6094,7 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
                     Some(Arc::clone(&root_gate)),
                 ))
             })
+            .await
             .unwrap();
         let parent = root.actor().unwrap();
         let root_ticket = parent.admit_turn(input(), None, "root".into()).unwrap();
@@ -5902,6 +6110,7 @@ fn managed_delivery_wait_capacity_one_drains_into_active_parent_once() {
                 None,
                 TestBackend::reporting(tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let child_actor = child.actor().unwrap();
         child_actor.configure_parent_delivery(true).unwrap();
@@ -5977,6 +6186,7 @@ fn managed_observation_waits_for_a_closing_child(exact: bool) {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let (popped, release) = actor.pause_after_next_pop();
@@ -6040,6 +6250,7 @@ fn managed_observation_preserves_child_on_timeout_or_drop(drop_wait: bool) {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let ticket = actor
@@ -6122,6 +6333,7 @@ fn moved_call_retires_only_its_suspension(stop: bool) {
                 None,
                 TestBackend::reporting(tx, Some(child_gate.clone())),
             )
+            .await
             .unwrap();
         let actor = child.actor().unwrap();
         let ticket = actor.admit_turn(input(), None, "child".into()).unwrap();
@@ -6197,6 +6409,7 @@ fn parent_waiting_for_child_yields_permit() {
                     ))
                 },
             )
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -6213,6 +6426,7 @@ fn parent_waiting_for_child_yields_permit() {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let ticket = child
             .actor()
@@ -6243,19 +6457,18 @@ fn parent_cancellation_seals_descendant_wait_registration() {
     };
     let (manager, root, current, root_gate) = active_root(limits);
     let child_gate = Gate::new();
-    let child = manager
-        .spawn_child(
-            &current,
-            AgentMetadata::default(),
-            Vec::new(),
-            None,
-            Box::new(TestBackend {
-                current: None,
-                cancel: None,
-                gate: Some(Arc::clone(&child_gate)),
-            }),
-        )
-        .unwrap();
+    let child = smol::block_on(manager.spawn_child(
+        &current,
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        Box::new(TestBackend {
+            current: None,
+            cancel: None,
+            gate: Some(Arc::clone(&child_gate)),
+        }),
+    ))
+    .unwrap();
     let child_actor = child.actor().unwrap();
     let child_ticket = child_actor
         .admit_turn(input(), None, "child".into())
@@ -6329,6 +6542,7 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
                     }) as Box<dyn ActorBackend>)
                 },
             )
+            .await
             .unwrap();
         let root_ticket = root
             .actor()
@@ -6346,6 +6560,7 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
                 None,
                 TestBackend::reporting(child_entered_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let child_ticket = child
             .actor()
@@ -6435,6 +6650,7 @@ fn two_child_waits_share_one_parent_suspension() {
                     ))
                 },
             )
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -6452,6 +6668,7 @@ fn two_child_waits_share_one_parent_suspension() {
                 None,
                 TestBackend::reporting(first_tx, Some(Arc::clone(&first_gate))),
             )
+            .await
             .unwrap();
         let first_ticket = first
             .actor()
@@ -6474,6 +6691,7 @@ fn two_child_waits_share_one_parent_suspension() {
                 None,
                 TestBackend::reporting(second_tx, Some(Arc::clone(&second_gate))),
             )
+            .await
             .unwrap();
         let second_ticket = second
             .actor()
@@ -6538,6 +6756,7 @@ fn shutdown_timeout_reaper_eventually_joins_timed_out_node() {
                 None,
                 TestBackend::reporting(entered_tx, Some(Arc::clone(&gate))),
             )
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -6577,6 +6796,7 @@ fn active_turns_never_exceed_manager_limit() {
                 None,
                 |_| Ok::<_, String>(TestBackend::reporting(root_tx, Some(Arc::clone(&gate)))),
             )
+            .await
             .unwrap();
         root.actor()
             .unwrap()
@@ -6592,6 +6812,7 @@ fn active_turns_never_exceed_manager_limit() {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&gate))),
             )
+            .await
             .unwrap();
         child
             .actor()
@@ -6711,6 +6932,7 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
                 .create_root_with_config(Some(config(MODEL, false)), Vec::new(), None, |_| {
                     Ok::<_, String>(joiner_backend())
                 })
+                .await
                 .unwrap();
             let ticket = root
                 .actor()
@@ -6728,6 +6950,7 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
                         Some(Arc::clone(&root_gate)),
                     ))
                 })
+                .await
                 .unwrap();
             let root_ticket = root
                 .actor()
@@ -6743,6 +6966,7 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
                     None,
                     joiner_backend(),
                 )
+                .await
                 .unwrap();
             root_gate.release(1);
             root_ticket.wait().await;
@@ -6764,6 +6988,7 @@ fn subagent_turn_joins_reporting_children_at_capacity_one(case: JoinCase) {
                 None,
                 TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
             )
+            .await
             .unwrap();
         let child_actor = child.actor().unwrap();
         child_actor
@@ -6845,6 +7070,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
                     ))
                 },
             )
+            .await
             .unwrap();
         let actor = root.actor().unwrap();
         let initial = actor.admit_turn(input(), None, String::new()).unwrap();
@@ -6875,8 +7101,9 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
                     ))
                 },
             )
+            .await
             .unwrap();
-        let spawn = |parent, label: &str| {
+        let spawn = async |parent: &AgentRef, label: &str| {
             manager
                 .spawn_child_trusted_with_config(
                     parent,
@@ -6889,13 +7116,14 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
                     None,
                     |_| Ok::<_, String>(TestBackend::boxed()),
                 )
+                .await
                 .unwrap()
         };
-        let idle = spawn(&root, IDLE_LABEL);
-        let done = spawn(&root, DONE_LABEL);
+        let idle = spawn(&root, IDLE_LABEL).await;
+        let done = spawn(&root, DONE_LABEL).await;
         done.close_subtree().unwrap();
         manager.drain_graph_for_test().await.unwrap();
-        spawn(&idle, GRANDCHILD_LABEL);
+        spawn(&idle, GRANDCHILD_LABEL).await;
         let child_actor = child.actor().unwrap();
         child_actor.configure_parent_delivery(false).unwrap();
         let child_ticket = child_actor
@@ -7036,8 +7264,9 @@ fn rewinding_a_child_preserves_root_history_and_reopens() {
                 None,
                 TestBackend::boxed(),
             )
+            .await
             .unwrap();
-        let spawn = |parent, label: &str, messages| {
+        let spawn = async |parent: &AgentRef, label: &str, messages| {
             manager
                 .spawn_child_trusted_with_config(
                     parent,
@@ -7050,14 +7279,16 @@ fn rewinding_a_child_preserves_root_history_and_reopens() {
                     None,
                     |_| Ok::<_, String>(TestBackend::boxed()),
                 )
+                .await
                 .unwrap()
         };
         let child = spawn(
             &root,
             CHILD_PROMPT,
             vec![Message::user(CHILD_PROMPT.into())],
-        );
-        let grandchild = spawn(&child, GRANDCHILD_LABEL, Vec::new());
+        )
+        .await;
+        let grandchild = spawn(&child, GRANDCHILD_LABEL, Vec::new()).await;
         let before = journal.snapshot();
         let guard = child.begin_rewind().unwrap();
         let target = RewindTargetId::Message(before.histories[&child.id()].ids[0]);

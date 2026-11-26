@@ -76,57 +76,70 @@ test("a step streams events and ends with one done frame", async () => {
   assert.equal(frames.length, 2)
 })
 
-test("a disconnect during save replays the original input and restored follow-up", async (t) => {
-  const h = harness([[textTurn("hi"), textTurn("undelivered")], [textTurn("replayed")]])
-  const greeting = user(text("hello"))
-  const original = user(text("original input"))
-  const followUp = user(text("restored follow-up"))
-  await h.step(request("c", [greeting]))
-  const boundary = h.records.saved.get("c")!.boundaries[0]!
-  const history = [greeting, assistant(text("hi")), original]
+for (const cancelled of [false, true]) {
+  test(`a disconnect during save ${cancelled ? "does not replay a cancelled input" : "replays the original input and restored follow-up"}`, async (t) => {
+    const reply = "undelivered"
+    const h = harness([[textTurn("hi"), textTurn(reply), textTurn("continued")], [textTurn("replayed")]])
+    const greeting = user(text("hello"))
+    const original = user(text("original input"))
+    const followUp = user(text("restored follow-up"))
+    await h.step(request("c", [greeting]))
+    const boundary = h.records.saved.get("c")!.boundaries[0]!
+    const history = [greeting, assistant(text("hi")), original]
 
-  const saving = Promise.withResolvers<void>()
-  const releaseSave = Promise.withResolvers<void>()
-  const save = h.records.save
-  const blockedSave: Records["save"] = async (id, record) => {
-    saving.resolve()
-    await releaseSave.promise
-    await save(id, record)
-  }
-  t.mock.method(h.records, "save", blockedSave)
+    const saving = Promise.withResolvers<void>()
+    const releaseSave = Promise.withResolvers<void>()
+    const save = h.records.save
+    const blockedSave: Records["save"] = async (id, record) => {
+      saving.resolve()
+      await releaseSave.promise
+      await save(id, record)
+    }
+    t.mock.method(h.records, "save", blockedSave)
 
-  const disconnected = Promise.withResolvers<void>()
-  const handled = Promise.withResolvers<void>()
-  const handle = handler(h.conversations, async () => LOGGED_IN, fetchUsage)
-  const path = join(dir, "disconnect.sock")
-  const server = await listen(path, async (req, res) => {
-    res.once("close", disconnected.resolve)
-    try {
-      await handle(req, res)
-    } finally {
-      handled.resolve()
+    const disconnected = Promise.withResolvers<void>()
+    const handled = Promise.withResolvers<void>()
+    const handle = handler(h.conversations, async () => LOGGED_IN, fetchUsage)
+    const path = join(dir, "disconnect.sock")
+    const server = await listen(path, async (req, res) => {
+      res.once("close", disconnected.resolve)
+      try {
+        await handle(req, res)
+      } finally {
+        handled.resolve()
+      }
+    })
+    t.after(async () => {
+      releaseSave.resolve()
+      server.close()
+      await h.conversations.close()
+    })
+    const req = httpRequest({ socketPath: path, method: "POST", path: "/v1/steps" })
+    req.on("error", () => {})
+    req.end(JSON.stringify({ protocol_version: 1, request: request("c", history) }))
+    await saving.promise
+    req.destroy()
+    await disconnected.promise
+    releaseSave.resolve()
+    await handled.promise
+
+    if (cancelled) {
+      await h.step(
+        request("next", [...history, assistant(text(reply)), followUp], {
+          previous: { id: "c", relation: "continues", shared: history.length, cancelled: true },
+        }),
+      )
+      assert.equal(h.sessions.length, 1)
+      assert.deepEqual(h.sessions[0]!.sent.at(-1), { content: followUp.content, next: false })
+    } else {
+      await h.conversations.close()
+      await h.step(request("c", [...history, followUp]))
+      const reopened = h.sessions[1]!
+      assert.equal(reopened.options.resumeSessionAt, boundary.uuid)
+      assert.deepEqual(reopened.sent, [{ content: [...original.content, ...followUp.content], next: false }])
     }
   })
-  t.after(async () => {
-    releaseSave.resolve()
-    server.close()
-    await h.conversations.close()
-  })
-  const req = httpRequest({ socketPath: path, method: "POST", path: "/v1/steps" })
-  req.on("error", () => {})
-  req.end(JSON.stringify({ protocol_version: 1, request: request("c", history) }))
-  await saving.promise
-  req.destroy()
-  await disconnected.promise
-  releaseSave.resolve()
-  await handled.promise
-  await h.conversations.close()
-
-  await h.step(request("c", [...history, followUp]))
-  const reopened = h.sessions[1]!
-  assert.equal(reopened.options.resumeSessionAt, boundary.uuid)
-  assert.deepEqual(reopened.sent, [{ content: [...original.content, ...followUp.content], next: false }])
-})
+}
 
 test("a refused step answers with a status and an error table", async () => {
   const response = await call("POST", "/v1/steps", { protocol_version: 9, request: {} })

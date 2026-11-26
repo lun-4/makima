@@ -907,6 +907,90 @@ fn sdk_resume_restores_the_saved_mode(
 
 #[test_case(Frontend::Sdk; "sdk")]
 #[test_case(Frontend::Acp; "acp")]
+fn resumed_lua_snapshot_includes_saved_and_new_usage(frontend: Frontend) {
+    const SAVED_INPUT: u32 = 12;
+    const SAVED_COST: f64 = 0.25;
+    const REPLY_INPUT: u32 = 1;
+    const REPLY_OUTPUT: u32 = 1;
+    const TURN_START: &str = "TurnStart";
+
+    let home = TempDir::new().unwrap();
+    let (release, gate) = mpsc::channel();
+    let (base_url, bodies) = mock_server_with_gate(Some(gate));
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().canonicalize().unwrap().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+    let active_model = format!("{PROVIDER}/{MODEL}");
+    let saved_model = format!("{PROVIDER}/{OTHER_MODEL}");
+    let mut session =
+        Session::<Message, TokenUsage, ToolOutput>::new(&active_model, &work.to_string_lossy());
+    session.bind_root_id(AgentId::generate()).unwrap();
+    session.token_usage.input = SAVED_INPUT;
+    session.add_model_usage(&saved_model, session.token_usage.billed(Some(SAVED_COST)));
+    session.save(&storage).unwrap();
+    let mut init = OpenOptions::new()
+        .append(true)
+        .open(home.path().join(".config").join(APP_DIR).join("init.lua"))
+        .unwrap();
+    writeln!(
+        init,
+        r#"
+assert(makima.api.create_autocmd({{ "{TURN_START}", "{TURN_END}" }}, {{
+  callback = function(ev)
+    local snapshot, err = makima.session.read({{ session = "{id}" }})
+    assert(snapshot, err)
+    makima.ui.flash(assert(makima.json.encode({{ event = ev.event, usage = snapshot.usage }})))
+  end,
+}}))
+"#,
+        id = session.id
+    )
+    .unwrap();
+
+    let mut args = frontend_args(frontend);
+    if matches!(frontend, Frontend::Sdk) {
+        args.extend(["-c".into(), session.id.to_string()]);
+    }
+    let mut child = spawn_makima(home.path(), &work, args);
+    let notifications = json_lines(child.stderr.take().unwrap());
+    let output = json_lines(child.stdout.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    if matches!(frontend, Frontend::Acp) {
+        acp_load(&mut stdin, &output, &work, session.id);
+        send(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+            "params": {"sessionId": session.id.to_string(), "prompt": [{"type": "text", "text": PROMPT}]}}),
+        );
+    } else {
+        send(&mut stdin, sdk_user(PROMPT));
+    }
+    bodies.recv_timeout(TIMEOUT).expect(NO_REQUEST);
+    let before = expect(&notifications, |message| message["event"] == TURN_START);
+    release.send(()).unwrap();
+    let after = expect(&notifications, |message| message["event"] == TURN_END);
+    drop(stdin);
+    assert!(wait_exit(child).success());
+
+    let saved = json!({"model": saved_model, "input": SAVED_INPUT, "output": 0,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST});
+    assert_eq!(
+        before["usage"],
+        json!({"total": {"input": SAVED_INPUT, "output": 0,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST}, "models": [saved]})
+    );
+    assert_eq!(
+        after["usage"],
+        json!({"total": {"input": SAVED_INPUT + REPLY_INPUT, "output": REPLY_OUTPUT,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST}, "models": [saved,
+        {"model": MODEL, "input": REPLY_INPUT, "output": REPLY_OUTPUT,
+         "cache_creation": 0, "cache_read": 0}]})
+    );
+}
+
+#[test_case(Frontend::Sdk; "sdk")]
+#[test_case(Frontend::Acp; "acp")]
 fn resumed_tool_start_can_run_a_command(frontend: Frontend) {
     let home = TempDir::new().unwrap();
     let (base_url, bodies) = mock_server();
@@ -1022,24 +1106,28 @@ fn resume_until_eof(
     let output = json_lines(child.stdout.take().unwrap());
     let mut stdin = child.stdin.take().unwrap();
     if matches!(frontend, Frontend::Acp) {
-        send(
-            &mut stdin,
-            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                   "params": {"protocolVersion": 1, "clientCapabilities": {}}}),
-        );
-        send(
-            &mut stdin,
-            json!({"jsonrpc": "2.0", "id": 2, "method": "session/load",
-                   "params": {"sessionId": id.to_string(), "cwd": work, "mcpServers": []}}),
-        );
-        let loaded = expect(&output, |message| message["id"] == 2);
-        assert!(loaded.get("result").is_some(), "{loaded}");
+        acp_load(&mut stdin, &output, work, id);
     }
     if let Some(notification) = notification {
         expect(&notifications, |message| message == notification);
     }
     drop(stdin);
     assert!(wait_exit(child).success());
+}
+
+fn acp_load(stdin: &mut ChildStdin, output: &Receiver<Value>, work: &Path, id: MakimaId) {
+    send(
+        stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": 1, "clientCapabilities": {}}}),
+    );
+    send(
+        stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "session/load",
+                   "params": {"sessionId": id.to_string(), "cwd": work, "mcpServers": []}}),
+    );
+    let loaded = expect(output, |message| message["id"] == 2);
+    assert!(loaded.get("result").is_some(), "{loaded}");
 }
 
 /// Waits for {child} to exit, killing it if it outlives the bound.
@@ -1396,6 +1484,10 @@ fn reply_to(body: &Value) -> &'static str {
 
 /// Serves chat completions on loopback and forwards each request body.
 fn mock_server() -> (String, Receiver<Value>) {
+    mock_server_with_gate(None)
+}
+
+fn mock_server_with_gate(mut gate: Option<Receiver<()>>) -> (String, Receiver<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
@@ -1425,6 +1517,11 @@ fn mock_server() -> (String, Receiver<Value>) {
                 let json: Value = serde_json::from_slice(&body).unwrap_or_default();
                 let reply = reply_to(&json);
                 let _ = tx.send(json);
+                if let Some(gate) = gate.take()
+                    && gate.recv_timeout(TIMEOUT).is_err()
+                {
+                    break;
+                }
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
