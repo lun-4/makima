@@ -9,11 +9,12 @@
 
 use makima_domain::LockExt;
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, pending, poll_fn};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
@@ -23,6 +24,7 @@ use arc_swap::ArcSwap;
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use futures_lite::future::or;
 use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, PreparedModel, PreparedTransaction,
 };
@@ -42,7 +44,7 @@ use makima_agent::permissions::PermissionManager;
 use makima_agent::rewind::RewindOutcome;
 use makima_agent::session::{
     self, Durability, FrontendServices, OpenRequest, PrepareOptions, PreparedSession, ResetSeed,
-    SessionPersistence, SessionSource, set_title,
+    SessionEvent, SessionPersistence, SessionSource, set_title,
 };
 use makima_agent::session_coordinator::{
     ModelPreparer, SessionCoordinatorHandle, canonical_directory, publication_claim,
@@ -139,6 +141,8 @@ use approval::{ApprovalStep, PendingPlanApproval};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
+const GLOBAL_WAKE_SOURCES: usize = 6;
+const SESSION_WAKE_SOURCES: usize = 3;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_OP_TIMEOUT_ERR: &str = "session operation timed out";
@@ -1153,7 +1157,7 @@ impl SpawnCtx {
         } else {
             options.expected_cwd = Some(self.workspace_cwd.clone());
         }
-        self.prepare_runtime_with_options(session, provider, options)
+        self.prepare_runtime_with_options(session, provider, options, None)
             .map_err(|error| error.to_string())
     }
 
@@ -1178,6 +1182,7 @@ impl SpawnCtx {
                 expected_cwd: Some(self.workspace_cwd.clone()),
                 ..Default::default()
             },
+            None,
         )
     }
 
@@ -1186,6 +1191,7 @@ impl SpawnCtx {
         mut session: AppSession,
         provider: Option<PreparedProvider>,
         mut options: PrepareOptions,
+        pending: Option<Arc<PendingProvider>>,
     ) -> Result<PreparedSessionRuntime> {
         let startup = self.model_slot.load();
         let fallback = PreparedModel {
@@ -1199,6 +1205,7 @@ impl SpawnCtx {
             self.model_slot.change_tx(),
         );
         let supplied = provider;
+        let deferred = pending.is_some();
         options.startup = Some(fallback.clone());
         let supplied_model = supplied.as_ref().map(|p| p.model.clone());
         let prepare_provider = Arc::clone(&self.prepare_provider);
@@ -1210,6 +1217,8 @@ impl SpawnCtx {
                     prepared
                 } else if fallback.model.spec() == spec {
                     fallback
+                } else if let Some(provider) = pending {
+                    PreparedModel { model, provider }
                 } else {
                     prepare_provider(Arc::from(spec)).await.map_err(|error| {
                         makima_providers::AgentError::Config {
@@ -1304,9 +1313,11 @@ impl SpawnCtx {
             .ok_or_else(|| eyre!(NOT_LIVE_ERR))?;
         let startup_provider: Arc<dyn Provider> = self.model_slot.load().provider.clone();
         let provider =
-            (!Arc::ptr_eq(&config.provider, &startup_provider)).then(|| PreparedProvider {
-                model: config.model.clone(),
-                provider: Arc::clone(&config.provider),
+            (!deferred && !Arc::ptr_eq(&config.provider, &startup_provider)).then(|| {
+                PreparedProvider {
+                    model: config.model.clone(),
+                    provider: Arc::clone(&config.provider),
+                }
             });
         model_slot.project(config.model.clone(), Arc::clone(&config.provider));
         cwd.store(Arc::new(config.context.cwd().to_path_buf()));
@@ -1539,6 +1550,7 @@ pub(crate) struct EventLoop<'t> {
     sessions_dir: PathBuf,
     last_heartbeat: Instant,
     input: InputReader,
+    next_wake_source: usize,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
@@ -1550,6 +1562,7 @@ pub(crate) struct EventLoop<'t> {
     internal_tx: flume::Sender<InternalEvent>,
     internal_rx: flume::Receiver<InternalEvent>,
     model_discovery: Discovery,
+    startup_prepares: Vec<smol::Task<()>>,
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -1578,7 +1591,11 @@ struct StartupPrepare {
 }
 
 impl StartupPrepare {
-    fn spawn(self, prepare: ModelPreparer, internal_tx: flume::Sender<InternalEvent>) {
+    fn spawn(
+        self,
+        prepare: ModelPreparer,
+        internal_tx: flume::Sender<InternalEvent>,
+    ) -> smol::Task<()> {
         smol::spawn(async move {
             let result = prepare(Arc::clone(&self.spec))
                 .await
@@ -1598,7 +1615,6 @@ impl StartupPrepare {
                 result,
             });
         })
-        .detach();
     }
 }
 
@@ -1641,6 +1657,16 @@ impl<'t> EventLoop<'t> {
     pub(crate) fn new(
         terminal: &'t mut ratatui::DefaultTerminal,
         params: EventLoopParams,
+    ) -> Result<Self> {
+        let prepare = default_model_preparer(Arc::clone(&params.providers));
+        Self::new_with(terminal, params, prepare, InputReader::spawn)
+    }
+
+    fn new_with(
+        terminal: &'t mut ratatui::DefaultTerminal,
+        params: EventLoopParams,
+        prepare_provider: ModelPreparer,
+        input: impl FnOnce() -> InputReader,
     ) -> Result<Self> {
         let EventLoopParams {
             cwd,
@@ -1741,7 +1767,7 @@ impl<'t> EventLoop<'t> {
             initial_model_override: explicit_model,
             workspace_cwd: cwd.to_string_lossy().into_owned(),
             file_write_locks: Arc::new(FileWriteLocks::new()),
-            prepare_provider: default_model_preparer(Arc::clone(&providers)),
+            prepare_provider,
             providers,
             storage,
             sessions_dir: sessions_dir.clone(),
@@ -1781,7 +1807,9 @@ impl<'t> EventLoop<'t> {
         };
         let mut runtimes = Vec::with_capacity(sessions.len());
         let mut on_startup_provider = Vec::new();
+        let mut prepares = Vec::new();
         for session in sessions {
+            let pending = Arc::new(PendingProvider::default());
             let runtime = ctx
                 .prepare_runtime_with_options(
                     session,
@@ -1790,6 +1818,7 @@ impl<'t> EventLoop<'t> {
                         expected_cwd: (!reloading).then(|| ctx.workspace_cwd.clone()),
                         ..Default::default()
                     },
+                    Some(Arc::clone(&pending)),
                 )
                 .and_then(|prepared| prepared.activate(&ctx.model_slot, None));
             let runtime = match runtime {
@@ -1799,32 +1828,44 @@ impl<'t> EventLoop<'t> {
                     return Err(error);
                 }
             };
-            if let Some(config) = runtime.config()
-                && config.model.spec() == model.spec()
-            {
-                on_startup_provider.push((
+            if let Some(config) = runtime.config() {
+                let seeded = (
                     runtime.id(),
                     PreparedModel {
                         model: config.model.clone(),
                         provider: Arc::clone(&config.provider),
                     },
-                ));
+                );
+                let spec = config.model.spec();
+                if spec == model.spec() {
+                    on_startup_provider.push(seeded);
+                } else {
+                    prepares.push(StartupPrepare {
+                        spec: Arc::from(spec),
+                        pending,
+                        root: false,
+                        targets: vec![seeded],
+                    });
+                }
             }
             runtimes.push(runtime);
         }
         ctx.initial_model_override = false;
         if let Some(pending) = startup_pending {
-            StartupPrepare {
+            prepares.push(StartupPrepare {
                 spec: Arc::from(model.spec()),
                 pending,
                 root: true,
                 targets: on_startup_provider,
-            }
-            .spawn(Arc::clone(&ctx.prepare_provider), internal_tx.clone());
+            });
         }
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
+        let startup_prepares = prepares
+            .into_iter()
+            .map(|prepare| prepare.spawn(Arc::clone(&ctx.prepare_provider), internal_tx.clone()))
+            .collect();
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
@@ -1867,7 +1908,7 @@ impl<'t> EventLoop<'t> {
             orchestration_focus: None,
             sessions_dir,
             last_heartbeat: Instant::now(),
-            input: InputReader::spawn(),
+            input: input(),
             warn_rx,
             warn_tx,
             ui_action_rx,
@@ -1878,7 +1919,9 @@ impl<'t> EventLoop<'t> {
             pending_status_invalidation: None,
             internal_tx,
             internal_rx,
+            next_wake_source: 0,
             model_discovery,
+            startup_prepares,
         };
         event_loop.sync_orchestration();
         for runtime in &mut event_loop.sessions {
@@ -2103,36 +2146,108 @@ impl<'t> EventLoop<'t> {
     /// Wait for the next event from any source, or time out so animations
     /// and periodic polls keep running. `Duration::ZERO` drains whatever is
     /// already pending.
-    fn next_wake(&self, timeout: Duration) -> Option<Wake> {
-        let mut sel = flume::Selector::new().recv(self.input.receiver(), |res| match res {
-            Ok(ev) => Some(Wake::Input(ev)),
-            Err(_) => Some(Wake::InputGone),
+    fn next_wake(&mut self, timeout: Duration) -> Option<Wake> {
+        let count = GLOBAL_WAKE_SOURCES + SESSION_WAKE_SOURCES * self.sessions.len();
+        let ready = (0..count).find_map(|offset| {
+            let source = (self.next_wake_source + offset) % count;
+            self.try_wake(source).map(|wake| (source, wake))
         });
-        if !self.ui_action_rx.is_disconnected() {
-            sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
+        let (source, wake) = match ready {
+            Some(ready) => ready,
+            None if timeout.is_zero() => return None,
+            None => smol::block_on(or(async { Some(self.wait_for_wake(count).await) }, async {
+                smol::Timer::after(timeout).await;
+                None
+            }))?,
+        };
+        self.next_wake_source = (source + 1) % count;
+        Some(wake)
+    }
+
+    fn try_wake(&self, source: usize) -> Option<Wake> {
+        match source {
+            0 => match self.input.receiver().try_recv() {
+                Ok(event) => Some(Wake::Input(event)),
+                Err(flume::TryRecvError::Disconnected) => Some(Wake::InputGone),
+                Err(flume::TryRecvError::Empty) => None,
+            },
+            1 => self.ui_action_rx.try_recv().ok().map(Wake::Ui),
+            2 => self.warn_rx.try_recv().ok().map(Wake::Warn),
+            3 => self.command_rx.try_recv().ok().map(Wake::Command),
+            4 => self
+                .provider_change_rx
+                .try_recv()
+                .ok()
+                .map(Wake::ProviderChanged),
+            5 => self.internal_rx.try_recv().ok().map(Wake::Internal),
+            _ => {
+                let source = source - GLOBAL_WAKE_SOURCES;
+                let i = source / SESSION_WAKE_SOURCES;
+                let rt = &self.sessions[i];
+                match source % SESSION_WAKE_SOURCES {
+                    0 => rt
+                        .handles
+                        .events
+                        .try_next()
+                        .map(|SessionEvent::Agent(envelope)| Wake::Agent(i, Box::new(envelope))),
+                    1 => rt
+                        .handles
+                        .actor_rx
+                        .try_recv()
+                        .ok()
+                        .map(|ev| Wake::Actor(i, ev)),
+                    _ => rt.shell_rx.try_recv().ok().map(|ev| Wake::Shell(i, ev)),
+                }
+            }
         }
-        sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
-        sel = sel.recv(&self.command_rx, |res| res.ok().map(Wake::Command));
-        sel = sel.recv(&self.provider_change_rx, |res| {
-            res.ok().map(Wake::ProviderChanged)
-        });
-        sel = sel.recv(&self.internal_rx, |res| res.ok().map(Wake::Internal));
+    }
+
+    async fn wait_for_wake(&self, count: usize) -> (usize, Wake) {
+        async fn recv<T>(rx: &flume::Receiver<T>, wake: impl FnOnce(T) -> Wake) -> Wake {
+            match rx.recv_async().await {
+                Ok(event) => wake(event),
+                Err(_) => pending().await,
+            }
+        }
+
+        let input = self.input.receiver();
+        let mut sources: Vec<BoxFuture<'_, Wake>> = Vec::with_capacity(count);
+        sources.extend([
+            Box::pin(async {
+                input
+                    .recv_async()
+                    .await
+                    .map_or(Wake::InputGone, Wake::Input)
+            }) as BoxFuture<'_, Wake>,
+            Box::pin(recv(&self.ui_action_rx, Wake::Ui)),
+            Box::pin(recv(&self.warn_rx, Wake::Warn)),
+            Box::pin(recv(&self.command_rx, Wake::Command)),
+            Box::pin(recv(&self.provider_change_rx, Wake::ProviderChanged)),
+            Box::pin(recv(&self.internal_rx, Wake::Internal)),
+        ]);
         for (i, rt) in self.sessions.iter().enumerate() {
-            if !rt.handles.agent_rx.is_disconnected() {
-                sel = sel.recv(&rt.handles.agent_rx, move |res| {
-                    res.ok().map(|env| Wake::Agent(i, Box::new(env)))
-                });
-            }
-            if !rt.handles.actor_rx.is_disconnected() {
-                sel = sel.recv(&rt.handles.actor_rx, move |res| {
-                    res.ok().map(|event| Wake::Actor(i, event))
-                });
-            }
-            sel = sel.recv(&rt.shell_rx, move |res| {
-                res.ok().map(|ev| Wake::Shell(i, ev))
-            });
+            let events = &rt.handles.events;
+            sources.push(Box::pin(async move {
+                match events.next().await {
+                    Some(SessionEvent::Agent(envelope)) => Wake::Agent(i, Box::new(envelope)),
+                    None => pending().await,
+                }
+            }));
+            sources.push(Box::pin(recv(&rt.handles.actor_rx, move |ev| {
+                Wake::Actor(i, ev)
+            })));
+            sources.push(Box::pin(recv(&rt.shell_rx, move |ev| Wake::Shell(i, ev))));
         }
-        sel.wait_timeout(timeout).ok().flatten()
+        poll_fn(|cx| {
+            for offset in 0..count {
+                let i = (self.next_wake_source + offset) % count;
+                if let Poll::Ready(wake) = sources[i].as_mut().poll(cx) {
+                    return Poll::Ready((i, wake));
+                }
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     fn handle_wake(&mut self, wake: Wake) -> Result<()> {
@@ -2716,7 +2831,7 @@ impl<'t> EventLoop<'t> {
             rt.app.exit_request != ExitRequest::None
                 && rt.notifications.waiting_for_drain()
                 && rt.handles.is_finished()
-                && rt.handles.agent_rx.is_empty()
+                && rt.handles.events.is_empty()
         }) {
             return Err(eyre!(
                 "agent for session {} stopped before queue drain",
@@ -3466,6 +3581,7 @@ impl<'t> EventLoop<'t> {
                     expected_cwd: Some(self.ctx.workspace_cwd.clone()),
                     ..Default::default()
                 },
+                None,
             )
             .map_err(|error| error.to_string())?
         } else {
@@ -4814,6 +4930,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> ShutdownReport {
+        self.startup_prepares.clear();
         self.model_discovery = Discovery::idle();
         let outputs = self.provider_usage.handle(ProviderUsageInput::Shutdown);
         self.handle_provider_usage_outputs(outputs);
@@ -5294,17 +5411,21 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::poll_once;
     use makima_agent::actor::{
         ActorError, ActorHistory, ConfigPatch, TurnAdmissionOptions, TurnContext, TurnOrigin,
         TurnProvenance,
     };
     use makima_agent::manager::{AgentMetadata, ResidentAgent};
     use makima_agent::plan_state::content_sha256;
-    use makima_agent::{ActorBackend, AgentInput, BackendResult, ControlWork, WorkKind};
+    use makima_agent::{
+        ActorBackend, ActorWorkIdentity, ActorWorkKind, AgentInput, BackendResult, BufferSnapshot,
+        ControlWork, WorkKind,
+    };
     use makima_domain::ThinkingConfig as DomainThinkingConfig;
     use makima_providers::provider::BoxFuture;
     use makima_providers::{
-        AgentError, Invocation, RequestDelivery, RequestOptions, StreamResponse,
+        AgentError, ContentBlock, Invocation, RequestDelivery, RequestOptions, Role, StreamResponse,
     };
     use makima_storage::sessions::HistorySnapshot;
 
@@ -6798,7 +6919,9 @@ end })
                 event_loop.handle_internal(event);
             }
             for index in 0..event_loop.sessions.len() {
-                while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+                while let Some(SessionEvent::Agent(envelope)) =
+                    event_loop.sessions[index].handles.events.try_next()
+                {
                     event_loop
                         .handle_wake(Wake::Agent(index, Box::new(envelope)))
                         .unwrap();
@@ -6851,6 +6974,63 @@ end })
         with_event_loop_runtime(|harness| harness.runtime(harness.session()), test);
     }
 
+    #[test_case(false; "queued_actor_wake")]
+    #[test_case(true; "waiting_for_actor_wake")]
+    fn actor_queue_settlement_flows_through_the_session_pump(waiting: bool) {
+        with_event_loop(|event_loop| {
+            let (_input_tx, input_rx) = flume::unbounded();
+            event_loop.input = InputReader::from_receiver(input_rx);
+            let (actor_tx, actor_rx) = flume::unbounded();
+            let runtime = &mut event_loop.sessions[0];
+            runtime.handles.actor_rx = actor_rx;
+            while runtime.handles.events.try_next().is_some() {}
+            let observer = runtime.handles.session.events.subscribe();
+            let (_, root) = runtime.handles.manager_and_root();
+            let identity = ActorWorkIdentity::new(
+                root,
+                ActorWorkKind::Control { operation_id: 0 },
+                runtime.app.run_id,
+            );
+            runtime.notifications.pending_completion = Some(
+                PendingCompletion::WaitingForQueueDrain(Notification::error_completion()),
+            );
+            let settled = ActorEvent::Idle {
+                agent_id: root,
+                settled: Some(identity),
+            };
+            let wake = if waiting {
+                smol::block_on(async {
+                    let mut wake = Box::pin(
+                        event_loop.wait_for_wake(GLOBAL_WAKE_SOURCES + SESSION_WAKE_SOURCES),
+                    );
+                    assert!(poll_once(&mut wake).await.is_none());
+                    actor_tx.send(settled).unwrap();
+                    bounded_session_op(async { Ok(wake.await.1) }, PUMP_TIMEOUT)
+                        .await
+                        .unwrap()
+                })
+            } else {
+                actor_tx.send(settled).unwrap();
+                event_loop.next_wake(Duration::ZERO).unwrap()
+            };
+            assert!(matches!(wake, Wake::Actor(0, ActorEvent::Idle { .. })));
+            event_loop.handle_wake(wake).unwrap();
+            assert!(!event_loop.sessions[0].handles.events.is_empty());
+
+            let wake = event_loop.next_wake(Duration::ZERO).unwrap();
+            assert!(
+                matches!(&wake, Wake::Agent(0, event) if event.identity == Some(identity)
+                && matches!(event.event, AgentEvent::QueueSettled))
+            );
+            event_loop.handle_wake(wake).unwrap();
+            assert!(!event_loop.sessions[0].notifications.waiting_for_drain());
+            assert!(
+                matches!(observer.try_next(), Some(SessionEvent::Agent(event))
+                if event.identity == Some(identity) && matches!(event.event, AgentEvent::QueueSettled))
+            );
+        });
+    }
+
     fn reopen_app(
         harness: RuntimeHarness,
         session_id: MakimaId,
@@ -6886,6 +7066,17 @@ end })
         run_event_loop(RuntimeHarness::new(), runtime, test);
     }
 
+    fn test_tty() -> ratatui::DefaultTerminal {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
     fn run_event_loop(
         mut harness: RuntimeHarness,
         runtime: impl FnOnce(&mut RuntimeHarness) -> SessionRuntime,
@@ -6894,14 +7085,7 @@ end })
         let runtime = runtime(&mut harness);
         let ctx = harness.ctx.take().unwrap();
         let initial_provider = ctx.model_slot.load().provider.identity();
-        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-        let mut terminal = ratatui::Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .unwrap();
+        let mut terminal = test_tty();
         let (internal_tx, internal_rx) = flume::unbounded();
         let (warn_tx, warn_rx) = flume::unbounded();
         let mut event_loop = EventLoop {
@@ -6923,6 +7107,7 @@ end })
             ctx,
             last_heartbeat: Instant::now(),
             input: InputReader::disconnected(),
+            next_wake_source: 0,
             warn_rx,
             warn_tx,
             ui_action_rx: flume::unbounded().1,
@@ -6934,6 +7119,7 @@ end })
             internal_tx,
             internal_rx,
             model_discovery: Discovery::idle(),
+            startup_prepares: Vec::new(),
         };
         test(&mut event_loop);
         smol::block_on(
@@ -8066,6 +8252,7 @@ end })
                         offload: Some(Arc::clone(&store)),
                         ..Default::default()
                     },
+                    None,
                 )
                 .unwrap();
             let runtime = prepared.activate(&event_loop.ctx.model_slot, None).unwrap();
@@ -8381,6 +8568,7 @@ end })
                     offload: Some(Arc::clone(&store)),
                     ..Default::default()
                 },
+                None,
             )
             .unwrap();
         let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
@@ -9152,6 +9340,96 @@ end })
     }
 
     #[test]
+    fn startup_draws_and_quits_while_saved_model_is_preparing() {
+        let (started_tx, started) = flume::bounded(1);
+        let (release, gate) = flume::bounded::<()>(1);
+        let (finished_tx, finished) = flume::bounded(1);
+        let (keys, input) = flume::unbounded();
+        let worker = std::thread::spawn(move || {
+            let mut harness = RuntimeHarness::new();
+            let mut session = harness.session();
+            session.model = PREPARED_MODEL.into();
+            session.push_message(Message::user(STARTUP_PROMPT.into()));
+            let ctx = harness.ctx.take().unwrap();
+            session.save(&ctx.storage).unwrap();
+            let prepare: ModelPreparer = Arc::new(move |spec| {
+                let gate = gate.clone();
+                let started = started_tx.clone();
+                Box::pin(async move {
+                    if spec.as_ref() == PREPARED_MODEL {
+                        started.send(()).unwrap();
+                        let _ = gate.recv_async().await;
+                    }
+                    Ok(PreparedModel {
+                        model: Model::from_spec(&spec).unwrap(),
+                        provider: Arc::new(StubProvider),
+                    })
+                })
+            });
+            let mut terminal = test_tty();
+            let event_loop = EventLoop::new_with(
+                &mut terminal,
+                EventLoopParams {
+                    cwd: PathBuf::from(ctx.workspace_cwd),
+                    model: ctx.model_slot.load().model.clone(),
+                    needs_login: false,
+                    explicit_model: false,
+                    commands: Vec::new(),
+                    sessions: StartupSessions::Open(Box::new(session)),
+                    focused: 0,
+                    startup_warnings: Vec::new(),
+                    storage: ctx.storage,
+                    config: ctx.config,
+                    ui_config: ctx.ui_config,
+                    input_history_size: ctx.input_history_size,
+                    permissions: ctx.permissions,
+                    timeouts: ctx.timeouts,
+                    exit_on_done: false,
+                    command_registry: makima_commands::CommandRegistry::new(),
+                    session_picker: false,
+                    keymap_reader: ctx.keymap_reader,
+                    hint_reader: ctx.hint_reader,
+                    status_content_reader: ctx.status_content_reader,
+                    ui_action_rx: harness._host.ui_action_rx(),
+                    lua_event_handle: ctx.lua_event_handle,
+                    model_policy: ctx.model_policy,
+                    providers: ctx.providers,
+                    session_defaults: ctx.session_defaults,
+                    project_config: ctx.project_config,
+                    trust_question: None,
+                    startup_notice: None,
+                    system_prompt_override: None,
+                    append_system_prompt: None,
+                },
+                prepare,
+                || InputReader::from_receiver(input),
+            )
+            .unwrap();
+            assert_eq!(
+                event_loop.sessions[0].app.root_config().model.spec(),
+                PREPARED_MODEL
+            );
+            let report = event_loop.run(None).unwrap();
+            finished_tx
+                .send((report.exit, terminal.get_frame().count()))
+                .unwrap();
+        });
+        let preparing = started.recv_timeout(PUMP_TIMEOUT);
+        let _ = keys.send(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        let result = finished.recv_timeout(PUMP_TIMEOUT);
+        drop(release);
+        drop(keys);
+        worker.join().unwrap();
+        preparing.unwrap();
+        let (exit, frames) = result.unwrap();
+        assert_eq!(exit, ExitRequest::Success);
+        assert!(frames > 0);
+    }
+
+    #[test]
     fn gated_tab_open_prepare_keeps_loop_running_then_opens_tab() {
         with_event_loop(|event_loop| {
             let (prepare, started, release) = gated_preparer(Arc::new(StubProvider));
@@ -9230,7 +9508,8 @@ end })
                 root: false,
                 targets: vec![(event_loop.sessions[index].id(), seeded)],
             }
-            .spawn(prepare, event_loop.internal_tx.clone());
+            .spawn(prepare, event_loop.internal_tx.clone())
+            .detach();
             started.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
             assert!(requests_rx.is_empty());
 
@@ -10341,25 +10620,71 @@ end })
 
     #[test]
     fn replacement_restore_effects_activate_once_after_publication() {
-        let harness = RuntimeHarness::new();
-        let mut session = harness.session();
-        session.push_message(Message::user("history".into()));
-        session.meta.input_draft = Some("restored".into());
-        let prepared = harness.ctx().prepare_runtime(session).unwrap();
-        let mut runtime = prepared.activate(&harness.ctx().model_slot, None).unwrap();
+        const TOOL_ID: &str = "restored-tool";
+        const TOOL_NAME: &str = "test_tool";
+        const TOOL_RESULT: &str = "saved output";
+        const HEADER: &str = "restored header";
+        const DRAFT: &str = "restored draft";
+        with_event_loop_runtime(
+            |harness| {
+                let mut session = harness.session();
+                session.push_message(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(TOOL_ID, TOOL_NAME, json!({}))],
+                    ..Default::default()
+                });
+                session.push_message(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: TOOL_ID.into(),
+                        content: TOOL_RESULT.into(),
+                        is_error: false,
+                    }],
+                    ..Default::default()
+                });
+                session.meta.input_draft = Some(DRAFT.into());
+                let prepared = harness.ctx().prepare_runtime(session).unwrap();
+                prepared.activate(&harness.ctx().model_slot, None).unwrap()
+            },
+            |event_loop| {
+                let (_input_tx, input_rx) = flume::unbounded();
+                event_loop.input = InputReader::from_receiver(input_rx);
+                let runtime = &mut event_loop.sessions[0];
+                assert!(runtime.handles.queue.is_empty());
+                assert!(runtime.restore_pending);
+                let header = BufferSnapshot::plain_text(HEADER.into());
+                runtime
+                    .app
+                    .restore_event_tx
+                    .as_ref()
+                    .unwrap()
+                    .send(AgentEvent::ToolHeaderSnapshot {
+                        id: TOOL_ID.into(),
+                        snapshot: header.clone(),
+                        theme_gen: None,
+                    })
+                    .unwrap();
+                runtime.activate_deferred();
+                runtime.activate_deferred();
 
-        assert!(runtime.handles.queue.is_empty());
-        assert!(runtime.restore_pending);
-        runtime.activate_deferred();
-        runtime.activate_deferred();
-
-        assert!(runtime.handles.queue.is_empty());
-        assert_eq!(runtime.app.input_box.buffer.value(), "restored");
-        let (manager, root_id) = runtime.handles.manager_and_root();
-        assert!(manager.actor(root_id).unwrap().latest_ticket().is_none());
-        assert!(!runtime.restore_pending);
-
-        release_runtime(runtime);
+                assert!(runtime.handles.queue.is_empty());
+                assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
+                let (manager, root_id) = runtime.handles.manager_and_root();
+                assert!(manager.actor(root_id).unwrap().latest_ticket().is_none());
+                assert!(!runtime.restore_pending);
+                assert!(runtime.app.chats[0].has_tool(TOOL_ID));
+                while let Some(wake) = event_loop.next_wake(Duration::ZERO) {
+                    let restored = matches!(&wake, Wake::Agent(0, event)
+                        if matches!(&event.event, AgentEvent::ToolHeaderSnapshot { id, .. } if id == TOOL_ID));
+                    event_loop.handle_wake(wake).unwrap();
+                    if restored {
+                        break;
+                    }
+                }
+                let tool = event_loop.sessions[0].app.chats[0].message_at(0).unwrap();
+                assert_eq!(tool.render_header.as_ref(), Some(&header));
+            },
+        );
     }
 
     #[test]
@@ -11701,11 +12026,21 @@ end })
             drop(child_guard);
             let deadline = Instant::now() + SESSION_OP_TIMEOUT;
             loop {
-                let envelope = event_loop.sessions[0]
-                    .handles
-                    .agent_rx
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .expect("child input must reach the production envelope channel");
+                let SessionEvent::Agent(envelope) = smol::block_on(bounded_session_op(
+                    async {
+                        event_loop.sessions[0]
+                            .handles
+                            .events
+                            .next()
+                            .await
+                            .ok_or_else(|| {
+                                "session event stream closed before consuming child input"
+                                    .to_owned()
+                            })
+                    },
+                    deadline.saturating_duration_since(Instant::now()),
+                ))
+                .expect("child input must reach the session event stream");
                 let consumed = matches!(
                     &envelope.event,
                     AgentEvent::QueueItemConsumed { text, .. } if text == INPUT

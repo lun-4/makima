@@ -77,7 +77,7 @@ drop(guard)             releases the lock and writes nothing
 
 ### System note
 
-The runtime builds the system note at commit and stores it in the fork record so context replay does not need to rebuild it. (Q4, Q16) The note tells the selected agent that its conversation was rewound. It also includes the current mode, a warning that files may differ from the conversation, and the existing tasks from the same code as `task_list`.
+The runtime builds the system note at commit and stores it in the fork record so context replay does not need to rebuild it. (Q4, Q16) The note tells the selected agent that its conversation was rewound. It also includes the current mode, a warning that files may differ from the conversation, and all descendants of the selected agent present in the agent graph at commit. Each entry shows the agent ID, graph label (if set), and status (running, idle or done). The note does not read the task plugin's private state or include tasks whose agents are absent from the graph.
 
 ### UI
 
@@ -117,7 +117,7 @@ Escape interrupts the agent the user is looking at. Interrupting a subagent this
 
 ## Task plugin
 
-- `task_list` shows the ID, description and status (running, idle or done) of the caller's descendant tasks. It reads the `policy` slot and the agent graph. If an agent is missing from the graph, `task_list` shows its task as done only if the caller appears in the task's stored ancestry. The rewind note uses the same code. (Q34)
+- `task_list` shows the ID, description and status (running, idle or done) of the caller's descendant tasks. It reads the `policy` slot and the agent graph. If an agent is missing from the graph, `task_list` shows its task as done only if the caller appears in the task's stored ancestry. The rewind note uses the agent graph instead of the task plugin's private state. (This revises Q34.)
 
 ## Single writer
 
@@ -181,7 +181,7 @@ Review ("current agent, not root") and hands-on testing of the TUI led to more w
 
 A reviewer asked to aim for "current agent" instead of "root only" wherever possible, so the PR does not build a root/guest split into the design.
 
-- Any idle agent can be rewound, including a subagent. The `Fork` record names its agent. The note lists that agent's own children. In the TUI, `Esc Esc` works in any tab and rewinds the agent you are looking at. (This revises Q6.)
+- Any idle agent can be rewound, including a subagent. The `Fork` record names its agent. The note lists that agent's graph descendants. In the TUI, `Esc Esc` works in any tab and rewinds the agent you are looking at. (This revises Q6.)
 - `task_list` shows a task whose agent is gone to any ancestor. Each task stores the chain of agents that started it.
 - `/reload-context` runs from any agent and reloads the session's recorded context.
 - What stays root-specific is structural: one parentless agent per graph, and ACP/SDK expose one conversation per session.

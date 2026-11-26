@@ -12,6 +12,7 @@ use makima_agent::actor::{
 use makima_agent::config_change::ConfigChangeError;
 use makima_agent::journal::{JournalChange, JournalCommit};
 use makima_agent::manager::ManagerError;
+use makima_agent::session::SessionEvent;
 use makima_agent::session_options::{FAST_PENDING_MODEL_OPTION_ID, SessionOptionError};
 use makima_agent::tools::ToolRegistry;
 use makima_agent::{AgentInput, AgentMode, ModeId};
@@ -382,7 +383,7 @@ fn rejects_active_managed_child_without_cancelling_it(drop_preparation: Option<b
             pump_until(event_loop, |event_loop| {
                 provider.root_requests.load(Ordering::SeqCst) == initial_calls + 1
                     && manager.prepare_idle_subtree(root).is_ok()
-                    && event_loop.sessions[index].handles.agent_rx.is_empty()
+                    && event_loop.sessions[index].handles.events.is_empty()
                     && event_loop.sessions[index].app.status == Status::Idle
             });
             approve(event_loop, index, true);
@@ -940,7 +941,9 @@ fn managed_child_approval(
             shutdown_manager(&manager);
             return;
         }
-        while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+        while let Some(SessionEvent::Agent(envelope)) =
+            event_loop.sessions[index].handles.events.try_next()
+        {
             event_loop.handle_agent(index, Box::new(envelope));
         }
         let (checkpoint_release, checkpoint_gate) = flume::bounded(1);
@@ -1106,7 +1109,9 @@ fn managed_child_approval(
             assert!(event_loop.sessions[index].pending_approval.is_some());
             assert!(requests.is_empty());
             assert!(matches!(child.snapshot().status, ActorStatus::Idle));
-            while let Ok(envelope) = event_loop.sessions[index].handles.agent_rx.try_recv() {
+            while let Some(SessionEvent::Agent(envelope)) =
+                event_loop.sessions[index].handles.events.try_next()
+            {
                 assert!(!matches!(
                     envelope.event,
                     makima_agent::AgentEvent::TextDelta { .. }

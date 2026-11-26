@@ -251,19 +251,21 @@ impl RewindGuard {
 mod tests {
     use super::{REWIND_NOTE, RewindError, RewindOutcome, RewindTargetId, context_entries};
     use crate::{
-        AgentInput, AgentLimits, AgentManagerHandle, BackendResult, DoneReason, HistorySnapshot,
-        TurnCancellationReason, TurnOutcome, TurnProvenance, TurnResult,
-        actor::TurnAdmissionOptions,
+        AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata, AgentMode, AgentRef,
+        BackendResult, DoneReason, HistorySnapshot, RunSettings, TurnCancellationReason,
+        TurnOutcome, TurnProvenance, TurnResult,
+        actor::{EffectiveAgentConfig, TurnAdmissionOptions},
         journal::{JournalChange, JournalCommit, SessionJournal},
         session_writer::{SessionIo, SessionWriter, StoredSession},
         test_util::MockBackend,
+        tools::NullProvider,
     };
     use futures_lite::future::poll_once;
-    use makima_providers::{Message, TokenUsage};
+    use makima_providers::{Message, Model, TokenUsage};
     use makima_storage::{
         id::{AgentId, MakimaId, TurnId},
         session_state::{ParentLink, StateChange, StoredDeliveryOp},
-        sessions::initialize_session_log,
+        sessions::{ContextEntry, initialize_session_log},
     };
     use std::{
         fs::{File, OpenOptions, read_to_string},
@@ -284,6 +286,16 @@ mod tests {
     const TORN_DRAFT: &[u8] = br#"{"t":"draft","text":"incomplete"#;
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
     const LATE_PROMPT_CANCELLED: &str = "prompt submitted during fork write did not run";
+    const CHILD: &str = "child";
+    const SIBLING: &str = "sibling";
+    const GRANDCHILD: &str = "grandchild";
+    const RETIRED: &str = "retired descendant";
+    const TEST_MODEL: &str = "test/model";
+    const SUBAGENTS_HEADING: &str = "\n\nExisting subagents:\n";
+    const IDLE: &str = "idle";
+    const RUNNING: &str = "running";
+    const DONE: &str = "done";
+    const NO_SUBAGENTS: &str = "No subagents.";
 
     struct ForkGateIo {
         file: File,
@@ -581,6 +593,118 @@ mod tests {
                 reopened.meta.input_draft.as_deref(),
                 Some(if redo { REPLACEMENT } else { SECOND })
             );
+        });
+    }
+
+    #[test_case(false; "root")]
+    #[test_case(true; "child")]
+    fn fork_note_lists_only_graph_descendants(rewind_child: bool) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let session = StoredSession::new(TEST_MODEL, ".");
+            let writer = SessionWriter::open_session(directory.path(), &session).unwrap();
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let journal = manager.journal();
+            journal.bind_writer(writer.clone()).unwrap();
+            let root = manager
+                .create_root(
+                    vec![Message::user(FIRST.into())],
+                    None,
+                    Box::new(MockBackend::STRICT),
+                )
+                .await
+                .unwrap();
+            let config = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::new(NullProvider),
+                    model: Model::from_spec(TEST_MODEL).unwrap(),
+                    fast: false,
+                    workflow: false,
+                    thinking: Default::default(),
+                },
+                AgentMode::Build,
+            );
+            let spawn = async |parent: &AgentRef, label: &str| {
+                manager
+                    .spawn_child_trusted_with_config(
+                        parent,
+                        config.clone(),
+                        AgentMetadata {
+                            label: Some(label.into()),
+                            ..Default::default()
+                        },
+                        vec![Message::user(FIRST.into())],
+                        None,
+                        |_| Ok::<_, String>(Box::new(MockBackend::STRICT)),
+                    )
+                    .await
+                    .unwrap()
+            };
+            let child = spawn(&root, CHILD).await;
+            let sibling = spawn(&root, SIBLING).await;
+            let grandchild = spawn(&child, GRANDCHILD).await;
+            let retired = spawn(&grandchild, RETIRED).await;
+            manager.retire_trusted(&retired).await.unwrap();
+
+            let idle = grandchild.begin_rewind().unwrap();
+            let actor = grandchild.actor().unwrap();
+            let queued = actor
+                .admit_turn(
+                    AgentInput::new(OLD_QUEUE.into(), Vec::new()),
+                    None,
+                    String::new(),
+                )
+                .unwrap();
+            let selected = if rewind_child { &child } else { &root };
+            let mut expected = vec![
+                format!("{}: {GRANDCHILD} ({RUNNING})", grandchild.id()),
+                format!("{}: {RETIRED} ({DONE})", retired.id()),
+            ];
+            if !rewind_child {
+                expected.extend([
+                    format!("{}: {CHILD} ({IDLE})", child.id()),
+                    format!("{}: {SIBLING} ({IDLE})", sibling.id()),
+                ]);
+            }
+            for (agent, mut expected) in
+                [(selected, expected), (&sibling, vec![NO_SUBAGENTS.into()])]
+            {
+                let target = journal.snapshot().histories[&agent.id()].ids[0];
+                let RewindOutcome::Fork { history, .. } = agent
+                    .begin_rewind()
+                    .unwrap()
+                    .commit(RewindTargetId::Message(target))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected fork");
+                };
+                let note = history
+                    .messages
+                    .last()
+                    .unwrap()
+                    .first_text_content()
+                    .unwrap();
+                let mut actual: Vec<_> = note
+                    .split_once(SUBAGENTS_HEADING)
+                    .unwrap()
+                    .1
+                    .lines()
+                    .collect();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected);
+                let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+                assert!(matches!(
+                    context_entries(reopened.context_events(), agent.id()).unwrap().as_slice(),
+                    [ContextEntry::Note { note: stored, .. }] if stored == note
+                ));
+            }
+            assert_eq!(actor.snapshot().queued, 1);
+            actor.remove(queued.turn_id()).unwrap();
+            drop(idle);
+            manager.shutdown(SHUTDOWN_TIMEOUT).await;
+            writer.close().await.unwrap();
         });
     }
 

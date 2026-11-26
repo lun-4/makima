@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use makima_agent::actor::{ActorEvent, PreparedModel};
-use makima_agent::session::SessionHandle;
+use makima_agent::session::{SessionHandle, SessionSubscription};
 use makima_agent::session_coordinator::ModelPreparer;
 use makima_agent::tools::{ToolContext, offload::OffloadStore};
 use makima_agent::{
@@ -238,7 +238,7 @@ pub(crate) struct SystemPromptOverride {
 
 pub(crate) struct RuntimeChannels {
     pub(crate) session: SessionHandle,
-    pub(crate) agent_rx: flume::Receiver<Envelope>,
+    pub(crate) events: SessionSubscription,
     pub(crate) actor_rx: flume::Receiver<ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) history: SharedMessages,
@@ -258,7 +258,7 @@ impl RuntimeChannels {
         mcp_handle: Option<McpHandle>,
     ) -> Self {
         Self {
-            agent_rx: session.agent_receiver(),
+            events: session.events.subscribe(),
             agent_tx: session.agent_sender(),
             history: session.shared_history(),
             offload: session.offload(),

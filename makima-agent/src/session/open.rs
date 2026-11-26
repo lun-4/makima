@@ -122,7 +122,6 @@ pub struct SessionHandle {
     mailbox: SessionMailbox,
     template: ToolContext,
     agent_tx: flume::Sender<Envelope>,
-    agent_rx: flume::Receiver<Envelope>,
     history: SharedMessages,
     offload: Option<Arc<OffloadStore>>,
     start: Mutex<Option<flume::Sender<()>>>,
@@ -150,9 +149,6 @@ impl SessionHandle {
     }
     pub fn agent_sender(&self) -> flume::Sender<Envelope> {
         self.agent_tx.clone()
-    }
-    pub fn agent_receiver(&self) -> flume::Receiver<Envelope> {
-        self.agent_rx.clone()
     }
     pub fn shared_history(&self) -> SharedMessages {
         Arc::clone(&self.history)
@@ -723,7 +719,6 @@ pub async fn prepare(
         task,
         offload_cleanup,
         agent_tx,
-        agent_rx,
         runner_start,
         history,
         offload,
@@ -796,7 +791,6 @@ pub async fn prepare(
         mailbox,
         template,
         agent_tx,
-        agent_rx,
         history,
         offload,
         start: Mutex::new(runner_start),

@@ -5,10 +5,7 @@ const NO_SUBAGENTS: &str = "No subagents.";
 
 pub(crate) fn format_subagents(manager: &AgentManagerHandle, parent: AgentId) -> String {
     let mut output = String::new();
-    for node in manager.snapshot() {
-        if node.parent_id != Some(parent) {
-            continue;
-        }
+    for node in manager.descendant_snapshots(parent) {
         let status = if matches!(
             node.graph_lifecycle,
             GraphLifecycle::Closed | GraphLifecycle::Retired | GraphLifecycle::Removed

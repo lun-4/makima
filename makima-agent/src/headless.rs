@@ -422,8 +422,6 @@ pub struct InteractiveHandle {
     pub root: RootReadiness,
     pub events: Arc<SessionEventPump>,
     pub(crate) agent_tx: Sender<Envelope>,
-    // An alternative to the event pump, not a second stream.
-    pub(crate) agent_rx: Receiver<Envelope>,
     pub(crate) runner_start: Option<Sender<()>>,
     pub(crate) template: Receiver<ToolContext>,
     pub(crate) history: SharedMessages,
@@ -1661,20 +1659,21 @@ pub(crate) fn spawn_session_runner(
         }
     });
     let raw_events = events.into_receiver();
-    let events = SessionEventPump::new(raw_events.clone());
+    #[cfg(test)]
+    let event_rx = raw_events.clone();
+    let events = SessionEventPump::new(raw_events);
     InteractiveHandle {
         manager,
         cancellation,
         root,
         events,
         agent_tx,
-        agent_rx: raw_events.clone(),
         runner_start,
         template,
         history,
         offload,
         #[cfg(test)]
-        event_rx: raw_events,
+        event_rx,
         tool_names,
         input_tx,
         answers,

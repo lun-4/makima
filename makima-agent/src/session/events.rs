@@ -47,7 +47,7 @@ impl PumpState {
     }
 }
 
-/// A single reader and ordered fan-out for a headless session. Subscribers drive
+/// A single reader and ordered fan-out for a session. Subscribers drive
 /// the pump so a synchronous drain also sees events already in the raw FIFO.
 pub struct SessionEventPump {
     raw: Receiver<Envelope>,
@@ -87,13 +87,23 @@ pub struct SessionSubscription {
 }
 
 impl SessionSubscription {
+    /// Checks both the subscriber backlog and events that have not been published yet.
+    pub fn is_empty(&self) -> bool {
+        let state = self.pump.state.lock_unpoisoned();
+        self.rx.is_empty() && (state.subscribers.is_none() || self.pump.raw.is_empty())
+    }
+
     pub fn try_next(&self) -> Option<SessionEvent> {
         let mut state = self.pump.state.lock_unpoisoned();
         if let Ok(event) = self.rx.try_recv() {
             return Some(event);
         }
         state.subscribers.as_ref()?;
-        state.publish(Some(self.pump.raw.try_recv().ok()?));
+        match self.pump.raw.try_recv() {
+            Ok(envelope) => state.publish(Some(envelope)),
+            Err(flume::TryRecvError::Disconnected) => state.publish(None),
+            Err(flume::TryRecvError::Empty) => return None,
+        }
         self.rx.try_recv().ok()
     }
 
@@ -145,6 +155,8 @@ mod tests {
                     .send(AgentEvent::TextDelta { text: text.into() })
                     .unwrap();
             }
+            assert!(!first.is_empty());
+            assert!(!second.is_empty());
             for text in TEXT {
                 let SessionEvent::Agent(event) = first.try_next().unwrap();
                 assert!(
@@ -152,6 +164,8 @@ mod tests {
                 );
                 assert_eq!(observations.try_recv().unwrap(), text);
             }
+            assert!(first.is_empty());
+            assert!(!second.is_empty());
             let mut event = waiting.await;
             for text in TEXT {
                 let Some(SessionEvent::Agent(envelope)) = event else {
@@ -163,11 +177,15 @@ mod tests {
                 event = second.try_next();
             }
             assert!(event.is_none());
+            let retained_sender = guard.sender();
             drop(guard);
+            retained_sender.send(AgentEvent::QueueSettled).unwrap();
             for sub in [&first, &second] {
+                assert!(!sub.is_empty());
                 assert!(
                     matches!(sub.next().await, Some(SessionEvent::Agent(event)) if matches!(event.event, AgentEvent::StreamClosed))
                 );
+                assert!(sub.is_empty());
                 assert!(sub.next().await.is_none());
             }
         });

@@ -3867,6 +3867,28 @@ impl AgentManagerHandle {
         nodes
     }
 
+    pub(crate) fn descendant_snapshots(&self, parent: AgentId) -> Vec<AgentNodeSnapshot> {
+        let nodes = {
+            let graph = self.lock_graph();
+            Self::subtree_ids(&graph, parent)
+                .into_iter()
+                .skip(1)
+                .filter_map(|id| {
+                    graph
+                        .nodes
+                        .get(&id)
+                        .map(|node| Self::capture_node_snapshot(id, node))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut nodes = nodes
+            .into_iter()
+            .map(CapturedNodeSnapshot::snapshot)
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| (node.depth, node.agent_id.to_string()));
+        nodes
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub async fn drain_graph_for_test(
         &self,

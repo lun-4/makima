@@ -7049,7 +7049,11 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
     const RUNNING_LABEL: &str = "inspect running child";
     const IDLE_LABEL: &str = "inspect idle child";
     const DONE_LABEL: &str = "inspect closed child";
-    const GRANDCHILD_LABEL: &str = "exclude nested child";
+    const GRANDCHILD_LABEL: &str = "inspect nested child";
+    const SUBAGENTS_HEADING: &str = "Existing subagents:";
+    const RUNNING: &str = "running";
+    const IDLE: &str = "idle";
+    const DONE: &str = "done";
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -7123,7 +7127,7 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
         let done = spawn(&root, DONE_LABEL).await;
         done.close_subtree().unwrap();
         manager.drain_graph_for_test().await.unwrap();
-        spawn(&idle, GRANDCHILD_LABEL).await;
+        let grandchild = spawn(&idle, GRANDCHILD_LABEL).await;
         let child_actor = child.actor().unwrap();
         child_actor.configure_parent_delivery(false).unwrap();
         let child_ticket = child_actor
@@ -7173,18 +7177,18 @@ fn rewind_admission_preserves_running_children_and_delivery_consumption() {
             .unwrap()
             .first_text_content()
             .unwrap();
-        assert!(note.contains("Existing subagents:"));
+        assert!(note.contains(SUBAGENTS_HEADING));
         for (agent, label, status) in [
-            (&child, RUNNING_LABEL, "running"),
-            (&idle, IDLE_LABEL, "idle"),
-            (&done, DONE_LABEL, "done"),
+            (&child, RUNNING_LABEL, RUNNING),
+            (&idle, IDLE_LABEL, IDLE),
+            (&done, DONE_LABEL, DONE),
+            (&grandchild, GRANDCHILD_LABEL, IDLE),
         ] {
             assert!(
                 note.contains(&format!("{}: {label} ({status})", agent.id())),
                 "{note}"
             );
         }
-        assert!(!note.contains(GRANDCHILD_LABEL));
         root_rx.recv_async().await.unwrap();
         assert!(child_ticket.peek().is_none());
         assert_eq!(
