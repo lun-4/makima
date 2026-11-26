@@ -26,6 +26,7 @@
 //! temp dir, which is not how Windows finds its config.
 #![cfg(unix)]
 
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -104,6 +105,10 @@ const NO_RESULT: &str = "the turn's result never arrived";
 const NO_EXIT: &str = "makima did not exit after its input ended";
 const NO_RESPONSE: &str = "makima never answered the request";
 const REPLY: &str = "ok";
+const TURN_END: &str = "TurnEnd";
+const TURN_COMPLETED: &str = "completed";
+const ACP_END_TURN: &str = "end_turn";
+const NO_TURN_END: &str = "the root TurnEnd autocmd did not emit a notification";
 const PROMPT_ID: u64 = 3;
 const NO_INIT: &str = "the SDK never emitted its init event";
 const PLAN_CONTENT: &str = "Implement the saved plan.";
@@ -459,7 +464,7 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
             send(&mut stdin, sdk_user(PROMPT));
             output
         }
-        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work),
+        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work).0,
         Frontend::Print => unreachable!("print reads its whole input before it starts"),
     };
     drop(stdin);
@@ -476,9 +481,70 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
             assert_eq!(result["subtype"], "success", "{result}");
             assert_eq!(result["result"], REPLY);
         }
-        _ => assert_eq!(result["result"]["stopReason"], "end_turn", "{result}"),
+        _ => assert_eq!(result["result"]["stopReason"], ACP_END_TURN, "{result}"),
     }
     assert!(wait_exit(child).success());
+}
+
+#[test_case(Frontend::Sdk ; "sdk_delivers_turn_end_to_lua")]
+#[test_case(Frontend::Acp ; "acp_delivers_turn_end_to_lua")]
+fn root_turn_fires_autocmd(frontend: Frontend) {
+    let (base_url, _bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let mut init = OpenOptions::new()
+        .append(true)
+        .open(home.path().join(".config").join(APP_DIR).join("init.lua"))
+        .unwrap();
+    writeln!(
+        init,
+        r#"
+assert(makima.api.create_autocmd("{TURN_END}", {{
+  callback = function(ev)
+    if ev.data.parent_id then return end
+    makima.ui.flash(assert(makima.json.encode({{
+      event = ev.event,
+      session_id = ev.data.session_id,
+      status = ev.data.status,
+      text = ev.data.text,
+    }})))
+  end,
+}}))
+"#
+    )
+    .unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut child = spawn_makima(home.path(), &work, frontend_args(frontend));
+    let notifications = json_lines(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    let (_output, session_id) = match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(PROMPT));
+            let result = expect(&output, |message| message["type"] == "result");
+            assert_eq!(result["is_error"], false, "{result}");
+            assert_eq!(result["result"], REPLY);
+            (output, result["session_id"].clone())
+        }
+        Frontend::Acp => {
+            let (output, session_id) = acp_prompt(&mut child, &mut stdin, &work);
+            let response = expect(&output, |message| message["id"] == PROMPT_ID);
+            assert_eq!(response["result"]["stopReason"], ACP_END_TURN, "{response}");
+            (output, session_id)
+        }
+        Frontend::Print => unreachable!("print does not have an interactive session"),
+    };
+
+    // TurnEnd delivery is asynchronous with respect to the protocol result.
+    let notification = notifications.recv_timeout(TIMEOUT);
+    drop(stdin);
+    assert!(wait_exit(child).success());
+    assert_eq!(
+        notification.expect(NO_TURN_END),
+        json!({"event": TURN_END, "session_id": session_id, "status": TURN_COMPLETED, "text": REPLY}),
+    );
 }
 
 /// A command whose handler runs two turns gets one result, the last turn's
@@ -688,7 +754,7 @@ fn message_sent_mid_turn_joins_it(frontend: Frontend) {
             );
             for id in [PROMPT_ID, FOLLOW_UP_ID] {
                 let response = expect(&output, |message| message["id"] == id);
-                assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+                assert_eq!(response["result"]["stopReason"], ACP_END_TURN, "{response}");
             }
             drop(stdin);
         }
@@ -971,15 +1037,15 @@ fn frontend_args(frontend: Frontend) -> Vec<String> {
 }
 
 /// `initialize`, `session/new`, then `session/prompt` on the new session id.
-/// Returns the rest of the server's output.
-fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> Receiver<Value> {
+/// Returns the rest of the server's output and the session id.
+fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> (Receiver<Value>, Value) {
     let (responses, session) = acp_session(child, stdin, cwd);
     send(
         stdin,
         json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
                "params": {"sessionId": session, "prompt": [{"type": "text", "text": PROMPT}]}}),
     );
-    responses
+    (responses, session)
 }
 
 /// `initialize` and `session/new`. Returns the server's output and the new

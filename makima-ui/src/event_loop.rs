@@ -5362,6 +5362,7 @@ mod tests {
     use makima_config::PermissionsConfig;
     use makima_lua::BuiltinAction;
     use makima_lua::PluginHost;
+    use makima_lua::agent_autocmd::TURN_END_EVENT;
     use makima_providers::model::FastSupport;
     use makima_providers::{Effort, ModelCapabilities, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
@@ -5385,6 +5386,8 @@ mod tests {
     const BUSY_MODEL_ID: &str = "tui-discovery-busy";
     const DISCOVERED_WINDOW: u32 = 524_000;
     const CWD_OBSERVER_PLUGIN: &str = "cwd-observer";
+    const SESSION_STATUS_CHANGED: &str = "SessionStatusChanged";
+    const STATUS_COMPLETED: &str = "completed";
     const CWD_OBSERVED_PREFIX: &str = "/cwd-observed-";
     const CWD_OBSERVER: &str = r#"
 local fires = 0
@@ -8949,6 +8952,92 @@ end })
                 })
             })
         }
+    }
+
+    #[test]
+    fn real_turn_autocmds_reach_the_tui() {
+        const PROMPT: &str = "run a turn through the TUI";
+        const OBSERVER: &str = r#"
+            assert(makima.api.create_autocmd("TurnEnd", { callback = function(ev)
+                local data = ev.data
+                makima.ui.flash(table.concat({ ev.event, data.agent_id, data.turn_id, data.status }, ":"))
+            end }))
+            assert(makima.api.create_autocmd("SessionStatusChanged", { callback = function(ev)
+                local data = ev.data
+                makima.ui.flash(table.concat({ ev.event, data.session_id, data.status }, ":"))
+            end }))
+        "#;
+
+        let harness = RuntimeHarness::new();
+        harness
+            ._host
+            .load_source("turn_observer", OBSERVER)
+            .unwrap();
+        let actions = harness._host.ui_action_rx();
+        let pending = Arc::new(PendingProvider::default());
+        let receive_flash = |event_loop: &mut EventLoop<'_>| {
+            let action = actions
+                .recv_timeout(PUMP_TIMEOUT)
+                .expect("autocmd did not send a UI action");
+            assert!(matches!(action, UiAction::Flash(_)));
+            event_loop.handle_wake(Wake::Ui(action)).unwrap();
+            event_loop.focused_app().flash_text().unwrap().to_owned()
+        };
+        run_event_loop(
+            harness,
+            |harness| {
+                let runtime = harness
+                    .ctx()
+                    .spawn_runtime_with_provider(
+                        harness.session(),
+                        Some(PreparedProvider {
+                            model: crate::components::test_model(),
+                            provider: pending.clone(),
+                        }),
+                    )
+                    .unwrap();
+                harness._host.wait_for_worker_barrier_for_test();
+                runtime
+            },
+            |event_loop| {
+                event_loop
+                    .ctx
+                    .lua_event_handle
+                    .install_orchestration_services(event_loop.orchestration.clone());
+                let session = event_loop.sessions[0].id();
+                let (manager, root) = event_loop.sessions[0].handles.manager_and_root();
+                let actor = manager.actor(root).unwrap();
+
+                event_loop.start(Some(PROMPT.into()));
+                event_loop.emit_status_changes();
+                assert_eq!(
+                    receive_flash(event_loop),
+                    format!("{SESSION_STATUS_CHANGED}:{session}:{STATUS_WORKING}")
+                );
+
+                let (requests, _received) = flume::unbounded();
+                smol::block_on(pending.fill(Ok(Arc::new(AnsweringProvider {
+                    requests,
+                    usage: TokenUsage::default(),
+                }))));
+                pump_until(event_loop, |event_loop| {
+                    SessionStatus::of(&event_loop.sessions[0].app) == SessionStatus::Idle
+                        && matches!(actor.snapshot().latest, Some(TurnOutcome::Completed { .. }))
+                });
+                let turn = actor.snapshot().latest.unwrap().turn_id();
+
+                event_loop.emit_status_changes();
+                let mut flashes = [receive_flash(event_loop), receive_flash(event_loop)];
+                flashes.sort();
+                assert_eq!(
+                    flashes,
+                    [
+                        format!("{SESSION_STATUS_CHANGED}:{session}:{STATUS_IDLE}"),
+                        format!("{TURN_END_EVENT}:{root}:{turn}:{STATUS_COMPLETED}"),
+                    ]
+                );
+            },
+        );
     }
 
     #[test]

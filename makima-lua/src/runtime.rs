@@ -28,8 +28,8 @@ use makima_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use makima_agent::{
-    AgentId, AgentManagerHandle, AgentReactivator, BufferSnapshot, CurrentManagedTurn, MovedBy,
-    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, WakeError,
+    AgentId, AgentManagerHandle, AgentReactivator, AgentRef, BufferSnapshot, CurrentManagedTurn,
+    MovedBy, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, WakeError,
 };
 use makima_providers::{ProviderRegistry, Timeouts};
 use makima_storage::checkpoint::CheckpointPublication;
@@ -1256,6 +1256,12 @@ impl TaskScope {
 /// [detached]: TaskScope::detached
 pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
+}
+
+fn dispatch_host_autocmd(lua: &Lua, event: &str, data: &Value, agent: Option<&AgentRef>) {
+    let _scope = TaskScope::detached(lua);
+    let data = json_to_lua(lua, data).unwrap_or(LuaValue::Nil);
+    autocmd::dispatch(lua, event, None, data, agent);
 }
 
 async fn run_callback<F: Future>(lua: &Lua, fut: F) -> F::Output {
@@ -5804,8 +5810,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
                             }
                         }
                         Request::FireAutocmd { event, data, agent } => {
-                            let data = json_to_lua(&rt.lua, &data).unwrap_or(LuaValue::Nil);
-                            crate::api::autocmd::dispatch(&rt.lua, &event, None, data, agent.as_ref());
+                            dispatch_host_autocmd(&rt.lua, &event, &data, agent.as_ref());
                             let root = agent.as_ref().is_none_or(|agent| {
                                 agent.snapshot().is_ok_and(|node| node.parent_id.is_none())
                             });
@@ -6127,6 +6132,7 @@ pub fn spawn(registry: Arc<ToolRegistry>, config: SpawnConfig) -> Result<LuaThre
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::autocmd::{AutocmdEntry, next_autocmd_id};
     use crate::api::tool::ToolCallReply;
     use futures_lite::future::poll_once;
     use makima_agent::cancel::CancelTrigger;
@@ -8201,6 +8207,52 @@ mod tests {
         drop(scope);
 
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn host_autocmd_runs_after_an_unrelated_task_is_cancelled() {
+        const EVENT: &str = crate::agent_autocmd::TURN_END_EVENT;
+        const PLUGIN: &str = "test_autocmd";
+
+        let lua = enqueue_test_lua();
+        let (ran, observed) = flume::bounded(1);
+        let callback = lua
+            .create_function(move |_, (event, _): (Table, LuaValue)| {
+                let _ = ran.try_send(event.get::<String>("event")?);
+                Ok(())
+            })
+            .unwrap();
+        let mut store = AutocmdStore::default();
+        store.register(
+            EVENT.into(),
+            AutocmdEntry::new(
+                next_autocmd_id(),
+                callback,
+                Arc::from(PLUGIN),
+                false,
+                None,
+                None,
+            ),
+        );
+        lua.set_app_data(store);
+        lua.set_app_data::<TaskHandle>(expired_cancelled_handle());
+        lua.exec_raw_lua(|raw| store_interrupt(raw.state(), Some(watchdog_interrupt)));
+
+        dispatch_host_autocmd(&lua, EVENT, &Value::Null, None);
+        let task = lua
+            .app_data_ref::<SpawnQueue>()
+            .unwrap()
+            .rx
+            .try_recv()
+            .unwrap();
+        let ex = Rc::new(smol::LocalExecutor::new());
+        let gate = Rc::new(InflightGate::new(lua.clone()));
+        let callbacks = Rc::new(InflightGate::new(lua.clone()));
+        smol::block_on(ex.run(async {
+            spawn_async_task(&lua, &ex, &gate, &callbacks, task);
+            callbacks.drain().await;
+        }));
+        assert_eq!(observed.try_recv().unwrap(), EVENT);
     }
 
     /// Session reset mid-turn leaves the cancelled handle of the doomed tool
