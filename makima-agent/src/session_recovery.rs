@@ -210,6 +210,11 @@ impl SessionOpening {
         {
             tracing::warn!(%warning, "legacy mode restoration fell back to read-only");
         }
+        let writer = Arc::new(SessionWriter::open_leased(
+            &self.directory,
+            &self.session,
+            &mut self.lease,
+        )?);
         let lock = Arc::new(LockHeartbeat::spawn(self.lease, move || {
             if let Ok(coordinator) = SessionCoordinatorHandle::resolve(id) {
                 coordinator.retire();
@@ -217,8 +222,6 @@ impl SessionOpening {
         }));
         let candidate =
             RecoveryCandidate::prepare_with_continuation(self.session.clone(), continue_turns)?;
-        let writer = Arc::new(SessionWriter::open_session(&self.directory, &self.session)?);
-        writer.bind_publication_guard(Some(lock.publication_guard()));
         let recovered = candidate
             .publish(
                 &writer,

@@ -3604,9 +3604,7 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
-    /// Releases the outgoing session's lock now. The returned future shuts
-    /// its agents down, then drops `held`, then closes a replaced session's
-    /// coordinator and forgets its cached snapshot.
+    /// Retains the outgoing lease until agent shutdown and the final writer drain.
     fn retire_runtime(
         &self,
         idx: usize,
@@ -3618,6 +3616,7 @@ impl<'t> EventLoop<'t> {
             mut app,
             handles,
             coordinator,
+            checkpoint,
             session_lock,
             lock_lost,
             ..
@@ -3637,13 +3636,23 @@ impl<'t> EventLoop<'t> {
                     conversation.id,
                 )
             });
-        if let Err(error) = release_lock_state(session_lock) {
-            warn!(%error, "old session lock release failed");
-        }
         drop(app);
         let shutdown = handles.shutdown();
         async move {
             shutdown.await;
+            if !lock_lost
+                && session_lock.is_some()
+                && let Err(error) = bounded_session_op(
+                    async { checkpoint.drain().await.map_err(|error| error.to_string()) },
+                    AGENT_SHUTDOWN_TIMEOUT,
+                )
+                .await
+            {
+                warn!(%error, "old session writer drain failed");
+            }
+            if let Err(error) = smol::unblock(move || release_lock_state(session_lock)).await {
+                warn!(%error, "old session lock release failed");
+            }
             drop(held);
             if replaced_session {
                 if let Some((provider, conversation_id)) = ended_conversation {
@@ -7288,9 +7297,9 @@ end })
             test_storage: _storage,
             ..
         } = runtime;
-        release_lock_state(session_lock).unwrap();
         let manager = handles.manager_and_root().0;
         shutdown_manager(&manager);
+        release_lock_state(session_lock).unwrap();
         drop(handles);
     }
 

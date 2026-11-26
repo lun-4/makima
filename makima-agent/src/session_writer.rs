@@ -6,7 +6,7 @@ use makima_providers::{Message, TokenUsage};
 use makima_storage::{
     StorageError,
     id::MakimaId,
-    session_lock::SessionPublicationGuard,
+    session_lock::{ClaimedSessionLock, SessionPublicationGuard},
     sessions::{Session, SessionError, SessionRecord, append_record, initialize_session_log},
     sync_directory,
 };
@@ -28,8 +28,7 @@ use tracing::warn;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const CLOSED: &str = "session writer closed";
-type WriterSlot = Arc<OnceLock<Result<Arc<WriterHandle>, WriterError>>>;
-static WRITERS: OnceLock<Mutex<HashMap<PathBuf, WriterSlot>>> = OnceLock::new();
+static WRITERS: OnceLock<Mutex<HashMap<PathBuf, SessionWriter>>> = OnceLock::new();
 
 pub(crate) type OpenedSessionIo = (Box<dyn SessionIo>, u64);
 
@@ -167,9 +166,8 @@ impl SessionWriter {
         self.0.session_id
     }
 
-    /// Opens a JSONL log once per absolute path.
     pub fn open(path: &Path, session_id: MakimaId) -> Result<Self, WriterError> {
-        Self::open_initialized(path, session_id, None)
+        Self::open_initialized(path, session_id, None, None)
     }
 
     pub fn open_session(directory: &Path, session: &StoredSession) -> Result<Self, WriterError> {
@@ -177,6 +175,20 @@ impl SessionWriter {
             &directory.join(format!("{}.jsonl", session.id)),
             session.id,
             Some(session),
+            None,
+        )
+    }
+
+    pub fn open_leased(
+        directory: &Path,
+        session: &StoredSession,
+        lease: &mut ClaimedSessionLock,
+    ) -> Result<Self, WriterError> {
+        Self::open_initialized(
+            &directory.join(format!("{}.jsonl", session.id)),
+            session.id,
+            Some(session),
+            Some(lease),
         )
     }
 
@@ -184,33 +196,43 @@ impl SessionWriter {
         path: &Path,
         session_id: MakimaId,
         session: Option<&StoredSession>,
+        lease: Option<&mut ClaimedSessionLock>,
     ) -> Result<Self, WriterError> {
         let path = absolute(path).map_err(|error| writer_error(session_id, error))?;
-        let slot = {
-            let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
-            Arc::clone(writers.entry(path.clone()).or_default())
-        };
+        let guard = lease.as_deref().map(ClaimedSessionLock::publication_guard);
+        let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
+        if let Some(writer) = writers.get(&path)
+            && (guard.is_none() || *writer.0.publication_guard.lock_unpoisoned() == guard)
+        {
+            return Ok(writer.clone());
+        }
         let session = session.cloned();
-        slot.get_or_init(|| {
-            Ok(Self::with_factory(session_id, move || {
-                let directory = path.parent().unwrap_or_else(|| Path::new("."));
-                create_dir_all(directory)?;
-                if let Some(session) = &session {
-                    initialize_session_log(directory, session).map_err(io::Error::other)?;
-                }
-                let (file, next_seq) = open_log(&path)?;
-                Ok((
-                    Box::new(SessionFile {
-                        file,
-                        unsynced_directory: Some(directory.to_owned()),
-                    }),
-                    next_seq,
-                ))
-            })
-            .0)
-        })
-        .clone()
-        .map(Self)
+        let log_path = path.clone();
+        let writer = Self::with_factory(session_id, move || {
+            let directory = log_path.parent().unwrap_or_else(|| Path::new("."));
+            create_dir_all(directory)?;
+            if let Some(session) = &session {
+                initialize_session_log(directory, session).map_err(io::Error::other)?;
+            }
+            let (file, next_seq) = open_log(&log_path)?;
+            Ok((
+                Box::new(SessionFile {
+                    file,
+                    unsynced_directory: Some(directory.to_owned()),
+                }),
+                next_seq,
+            ))
+        });
+        writer.bind_publication_guard(guard);
+        writers.insert(path.clone(), writer.clone());
+        if let Some(lease) = lease {
+            let leased_writer = writer.clone();
+            lease.on_release(move || {
+                evict(&path, &leased_writer);
+                drop(leased_writer.close());
+            });
+        }
+        Ok(writer)
     }
 
     pub(crate) fn with_factory(
@@ -380,8 +402,7 @@ async fn initialize(
             .position(|request| matches!(request.payload, Payload::Close))
         {
             let request = pending.swap_remove(index);
-            drop(rx);
-            status.lock_unpoisoned().unsaved_records = 0;
+            disconnect(rx, &status);
             let _ = request.reply.send(Ok(AppendAck {
                 next_seq: 0,
                 warning: None,
@@ -480,8 +501,7 @@ async fn run(
             match payload {
                 Payload::Close => {
                     drop(io);
-                    drop(rx);
-                    status.lock_unpoisoned().unsaved_records = 0;
+                    disconnect(rx, &status);
                     let _ = reply.send(Ok(AppendAck {
                         next_seq,
                         warning: None,
@@ -719,6 +739,13 @@ fn write_atomic(io: &mut dyn SessionIo, bytes: &[u8]) -> Result<(), AtomicWriteE
     Ok(())
 }
 
+fn disconnect(rx: flume::Receiver<Request>, status: &Mutex<WriterStatus>) {
+    let mut status = status.lock_unpoisoned();
+    drop(rx.drain());
+    drop(rx);
+    status.unsaved_records = 0;
+}
+
 fn update_journals(journals: &Mutex<Vec<Weak<SessionJournal>>>, error: Option<String>) {
     let attached = {
         let mut journals = journals.lock_unpoisoned();
@@ -746,30 +773,35 @@ pub fn delete(directory: &Path, session_id: MakimaId) -> Result<(), SessionError
 pub fn forget(directory: &Path, session_id: MakimaId) -> Result<(), SessionError> {
     let path =
         absolute(directory.join(format!("{session_id}.jsonl"))).map_err(StorageError::from)?;
-    let slot = WRITERS
+    let writer = WRITERS
         .get_or_init(Mutex::default)
         .lock_unpoisoned()
         .get(&path)
         .cloned();
-    if let Some(slot) = slot {
-        if let Some(Ok(handle)) = slot.get() {
-            smol::block_on(SessionWriter(Arc::clone(handle)).enqueue(Payload::Close, None))
-                .map_err(|error| StorageError::from(io::Error::other(error)))?;
-        }
-        let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
-        if writers
-            .get(&path)
-            .is_some_and(|current| Arc::ptr_eq(current, &slot))
-        {
-            writers.remove(&path);
-        }
+    if let Some(writer) = writer {
+        smol::block_on(writer.close())
+            .map_err(|error| StorageError::from(io::Error::other(error)))?;
+        evict(&path, &writer);
     }
     Ok(())
 }
 
+fn evict(path: &Path, writer: &SessionWriter) {
+    let mut writers = WRITERS.get_or_init(Mutex::default).lock_unpoisoned();
+    if writers
+        .get(path)
+        .is_some_and(|current| Arc::ptr_eq(&current.0, &writer.0))
+    {
+        writers.remove(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Record, SessionIo, SessionWriter, StoredSession, WriterStatus, forget, open_log};
+    use super::{
+        CLOSED, Record, SessionFile, SessionIo, SessionWriter, StoredSession, WriterStatus, forget,
+        open_log,
+    };
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
     use makima_storage::conversation::ConversationState;
@@ -782,10 +814,12 @@ mod tests {
         fs::{create_dir, read, remove_file, write},
         io,
         sync::{Arc, Mutex},
+        time::Duration,
     };
     use test_case::test_case;
 
     const DISK_FULL: i32 = libc::ENOSPC;
+    const RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn output(id: &str) -> Record {
         Record::Out {
@@ -1315,6 +1349,75 @@ mod tests {
     }
 
     #[test]
+    fn lease_handoff_reopens_log_and_preserves_record_order() {
+        const FIRST: &str = "first";
+        const OTHER_OWNER: &str = "another owner's longer record";
+        const LAST: &str = "last";
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let dir = dir.path();
+            let session = StoredSession::new("writer-test-model", "/writer-test");
+            let id = session.id;
+            let path = dir.join(format!("{id}.jsonl"));
+            let mut first_lease = session_lock::claim(dir, &id).unwrap().unwrap();
+            let first = SessionWriter::open_leased(dir, &session, &mut first_lease).unwrap();
+            let shared = SessionWriter::open_leased(dir, &session, &mut first_lease).unwrap();
+            assert!(Arc::ptr_eq(&first.0, &shared.0));
+            let first_ack = first.append(vec![output(FIRST)]).await.unwrap();
+            first_lease.release().unwrap();
+            assert_eq!(
+                first.append(Vec::new()).await.unwrap_err().message.as_ref(),
+                CLOSED
+            );
+
+            let other_lease = session_lock::claim(dir, &id).unwrap().unwrap();
+            let (file, next_seq) = open_log(&path).unwrap();
+            let mut opened = Some((
+                Box::new(SessionFile {
+                    file,
+                    unsynced_directory: None,
+                }) as Box<dyn SessionIo>,
+                next_seq,
+            ));
+            let other = SessionWriter::with_factory(id, move || {
+                opened.take().ok_or_else(|| io::Error::other(CLOSED))
+            });
+            other
+                .append_owned(vec![output(OTHER_OWNER)], other_lease.publication_guard())
+                .await
+                .unwrap();
+            other.close().await.unwrap();
+            other_lease.release().unwrap();
+            let prefix = read(&path).unwrap();
+
+            let mut lease = session_lock::claim(dir, &id).unwrap().unwrap();
+            let stored = StoredSession::load_from(id, dir).unwrap();
+            let reopened = SessionWriter::open_leased(dir, &stored, &mut lease).unwrap();
+            let last_ack = reopened.append(vec![output(LAST)]).await.unwrap();
+            assert_eq!(last_ack.next_seq, first_ack.next_seq + 2);
+            lease.release().unwrap();
+
+            let bytes = read(&path).unwrap();
+            assert!(bytes.starts_with(&prefix));
+            let records: Vec<Value> = bytes
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .filter(|record: &Value| record["t"] == "out")
+                .collect();
+            assert_eq!(records.len(), 3);
+            for (offset, (record, name)) in
+                records.iter().zip([FIRST, OTHER_OWNER, LAST]).enumerate()
+            {
+                assert_eq!(record["id"], name);
+                assert_eq!(record["seq"], first_ack.next_seq - 1 + offset as u64);
+            }
+            let loaded = StoredSession::load_from(id, dir).unwrap();
+            assert_eq!(loaded.tool_outputs().len(), records.len());
+        });
+    }
+
+    #[test]
     fn explicitly_forgotten_session_can_be_recreated_at_same_path() {
         let dir = tempfile::tempdir().unwrap();
         let session = StoredSession::new("writer-test-model", "/writer-test");
@@ -1354,6 +1457,46 @@ mod tests {
         fn sync(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test_case(false; "initializing")]
+    #[test_case(true; "writing")]
+    fn close_resolves_queued_append_receipts(initialized: bool) {
+        smol::block_on(async {
+            let (entered, blocked) = flume::bounded(1);
+            let (release, wait) = flume::bounded(1);
+            let writer = if initialized {
+                SessionWriter::with_io(
+                    MakimaId::generate(),
+                    BlockedIo {
+                        entered,
+                        release: wait,
+                    },
+                    0,
+                )
+            } else {
+                SessionWriter::with_factory(MakimaId::generate(), move || {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Err(io::Error::from_raw_os_error(DISK_FULL))
+                })
+            };
+            let first = writer.append(vec![output("first")]);
+            blocked.recv_timeout(RECEIPT_TIMEOUT).unwrap();
+            let close = writer.close();
+            let late = writer.append(Vec::new());
+            release.send(()).unwrap();
+            assert_eq!(first.await.is_ok(), initialized);
+            close.await.unwrap();
+            let error = smol::future::or(async { late.await.err() }, async {
+                smol::Timer::after(RECEIPT_TIMEOUT).await;
+                None
+            })
+            .await
+            .unwrap();
+            assert_eq!(error.message.as_ref(), CLOSED);
+            assert_eq!(writer.status().unsaved_records, 0);
+        });
     }
 
     #[test]

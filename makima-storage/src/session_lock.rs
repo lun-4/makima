@@ -12,6 +12,7 @@
 
 #[cfg(test)]
 use makima_domain::LockExt;
+use std::fmt::{self, Debug, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -205,14 +206,24 @@ fn run_release_before_write_hook(path: &Path) {
 }
 
 /// The sole identity-bearing lease for a claimed session lock.
-#[derive(Debug)]
 pub struct ClaimedSessionLock {
     path: PathBuf,
     owner: LockOwner,
     released: bool,
+    release_hooks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
-#[derive(Debug, Clone)]
+impl Debug for ClaimedSessionLock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedSessionLock")
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPublicationGuard {
     path: PathBuf,
     owner: LockOwner,
@@ -238,6 +249,10 @@ impl SessionPublicationGuard {
 }
 
 impl ClaimedSessionLock {
+    pub fn on_release(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.release_hooks.push(Box::new(hook));
+    }
+
     pub fn publication_guard(&self) -> SessionPublicationGuard {
         SessionPublicationGuard {
             path: self.path.clone(),
@@ -265,6 +280,9 @@ impl ClaimedSessionLock {
     }
 
     fn release_inner(&mut self) -> io::Result<()> {
+        for hook in self.release_hooks.drain(..) {
+            hook();
+        }
         let Some(mut file) = open_existing_locked_blocking(&self.path)? else {
             self.released = true;
             return Ok(());
@@ -455,6 +473,7 @@ pub fn claim(dir: &Path, id: &MakimaId) -> io::Result<Option<ClaimedSessionLock>
         path,
         owner,
         released: false,
+        release_hooks: Vec::new(),
     }))
 }
 

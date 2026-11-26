@@ -2362,6 +2362,7 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs::{OpenOptions, read};
 
     use flume::Receiver;
     use makima_agent::actor::{ActorLifecycle, ActorStatus, TurnResult};
@@ -4276,6 +4277,70 @@ mod tests {
             drop(lock);
             assert!(session_lock::claim(&sessions_dir, &id).unwrap().is_some());
             turns.assert_untouched();
+        });
+    }
+
+    #[test]
+    fn switching_back_to_session_preserves_intervening_append() {
+        const OTHER_TITLE: &str = "title written by another owner";
+        const NEW_DRAFT: &str = "draft after loading again";
+        smol::block_on(async {
+            let cwd = TempDir::new().unwrap();
+            let mut params = test_params(
+                spec_providers().model(OFFLINE_SPEC).unwrap(),
+                cwd.path().to_path_buf(),
+            );
+            params.providers = spec_providers();
+            let (mut srv, _, _, _) = server_awaiting_answer();
+            let request = serde_json::json!({ "params": { "cwd": cwd.path(), "mcpServers": [] }});
+            new_session(&mut srv, &request, &params).await.unwrap();
+            let id = srv.session.as_ref().unwrap().handle.session_id.id();
+            new_session(&mut srv, &request, &params).await.unwrap();
+
+            let dir = params.storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let lease = session_lock::claim(&dir, &id).unwrap().unwrap();
+            let path = dir.join(format!("{id}.jsonl"));
+            lease
+                .publication_guard()
+                .publish(|| {
+                    let next_seq = read(&path)
+                        .unwrap()
+                        .split(|&byte| byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .filter_map(|line| {
+                            serde_json::from_slice::<Value>(line).unwrap()["seq"].as_u64()
+                        })
+                        .max()
+                        .unwrap()
+                        + 1;
+                    let mut record = serde_json::to_vec(
+                        &serde_json::json!({"t": "title", "seq": next_seq, "title": OTHER_TITLE}),
+                    )
+                    .unwrap();
+                    record.push(b'\n');
+                    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+                    file.write_all(&record).unwrap();
+                    file.sync_all().unwrap();
+                })
+                .unwrap()
+                .unwrap();
+            lease.release().unwrap();
+            let prefix = read(&path).unwrap();
+
+            let load = serde_json::json!({ "params": {
+                "sessionId": id.to_string(), "cwd": cwd.path(), "mcpServers": []
+            }});
+            load_session(&mut srv, &load, &params).await.unwrap();
+            let handle = &srv.session.as_ref().unwrap().handle;
+            assert_eq!(handle.projection().title(), OTHER_TITLE);
+            handle.manager.journal().set_draft(Some(NEW_DRAFT.into()));
+            handle.drain().await.unwrap();
+            close_session(&mut srv).await;
+
+            assert!(read(&path).unwrap().starts_with(&prefix));
+            let loaded = StoredSession::load(id, &params.storage).unwrap();
+            assert_eq!(loaded.title, OTHER_TITLE);
+            assert_eq!(loaded.meta.input_draft.as_deref(), Some(NEW_DRAFT));
         });
     }
 

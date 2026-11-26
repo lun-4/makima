@@ -67,16 +67,13 @@ pub async fn set_title(
     id: MakimaId,
     title: String,
 ) -> Result<(), OpenSessionError> {
-    let lease = session_lock::claim(directory, &id)?.ok_or(OpenSessionError::Busy(id))?;
+    let mut lease = session_lock::claim(directory, &id)?.ok_or(OpenSessionError::Busy(id))?;
     let session = StoredSession::load_from(id, directory)?;
-    let writer = SessionWriter::open_session(directory, &session)?;
+    let writer = SessionWriter::open_leased(directory, &session, &mut lease)?;
     writer
-        .append_owned(
-            vec![SessionRecord::Title {
-                title: normalize_title(&title),
-            }],
-            lease.publication_guard(),
-        )
+        .append(vec![SessionRecord::Title {
+            title: normalize_title(&title),
+        }])
         .await?;
     Ok(())
 }

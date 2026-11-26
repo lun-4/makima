@@ -118,7 +118,7 @@ pub struct SessionHandle {
     offload_cleanup: Option<OffloadCleanup>,
     mcp: Option<McpHandle>,
     checkpoint: Option<Arc<SessionWriter>>,
-    lock: Option<LockHeartbeat>,
+    lock: Mutex<Option<LockHeartbeat>>,
     mailbox: SessionMailbox,
     template: ToolContext,
     agent_tx: flume::Sender<Envelope>,
@@ -253,6 +253,8 @@ impl SessionHandle {
         if let Some(mcp) = &self.mcp {
             mcp.shutdown().await;
         }
+        let lock = self.lock.lock_unpoisoned().take();
+        drop(lock);
         closed?;
         drained
     }
@@ -360,7 +362,7 @@ impl PreparedSession {
 
     pub async fn publish(self) -> Result<SessionHandle, OpenSessionError> {
         let Self {
-            mut session,
+            session,
             coordinator,
             publication,
             ..
@@ -382,10 +384,10 @@ impl PreparedSession {
                 .publish(|| ())?
                 .ok_or(OpenSessionError::LockLost(id))?;
             recovery.publish_staged(writer, guard.clone()).await?;
-            writer.bind_publication_guard(Some(guard));
             if let Some(lease) = lease {
                 let coordinator = session.coordinator.clone();
-                session.lock = Some(LockHeartbeat::spawn(lease, move || coordinator.retire()));
+                *session.lock.lock_unpoisoned() =
+                    Some(LockHeartbeat::spawn(lease, move || coordinator.retire()));
             }
             replacing = current;
         }
@@ -459,7 +461,7 @@ pub async fn prepare(
         let expected_cwd = expected_cwd
             .as_deref()
             .or_else(|| require_matching_cwd.then_some(working_dir.as_ref()));
-        let (mut stored, guard, lease, writer, replacing) = if let Some(reuse) = reuse {
+        let (mut stored, guard, mut lease, writer, replacing) = if let Some(reuse) = reuse {
             offload = reuse.offload;
             let (model, warning) = OpenModel {
                 startup: &params.model,
@@ -620,8 +622,11 @@ pub async fn prepare(
             Some(writer) => writer,
             None => {
                 let directory = storage.ensure_subdir(SESSIONS_DIR)?;
-                let writer = Arc::new(SessionWriter::open_session(&directory, &stored)?);
-                writer.append_owned(Vec::new(), guard.clone()).await?;
+                let lease = lease
+                    .as_mut()
+                    .ok_or_else(|| OpenSessionError::Compose(REUSE_UNAVAILABLE.into()))?;
+                let writer = Arc::new(SessionWriter::open_leased(&directory, &stored, lease)?);
+                writer.append(Vec::new()).await?;
                 writer
             }
         };
@@ -787,7 +792,7 @@ pub async fn prepare(
         offload_cleanup,
         mcp,
         checkpoint,
-        lock: None,
+        lock: Mutex::new(None),
         mailbox,
         template,
         agent_tx,
