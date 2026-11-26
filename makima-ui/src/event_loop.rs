@@ -154,6 +154,8 @@ const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_MAILBOX_ERR: &str = "no live session to move a tool call in";
 const MOVED_BACKGROUND_PREFIX: &str = "Moved to the background: ";
+const STARTUP_FALLBACK_NOT_ADOPTED: &str =
+    "startup model fallback did not replace the pending provider";
 const UNKNOWN_PROVIDER: &str = "Unknown";
 #[cfg(test)]
 const RECOVERY_ACTIVATION_FAILED: &str = "recovery activation failed";
@@ -1437,6 +1439,7 @@ enum InternalEvent {
         root: bool,
         targets: Vec<(MakimaId, PreparedModel)>,
         result: Result<PreparedModel, String>,
+        fallback_waiter: Option<Arc<PendingProvider>>,
     },
     /// A session's model finished preparing off the loop; see
     /// [`EventLoop::bring_up`].
@@ -1600,19 +1603,23 @@ impl StartupPrepare {
             let result = prepare(Arc::clone(&self.spec))
                 .await
                 .map_err(|error| error.to_string());
-            self.pending
-                .fill(
-                    result
-                        .as_ref()
-                        .map(|prepared| Arc::clone(&prepared.provider))
-                        .map_err(|error| Arc::from(error.as_str())),
-                )
-                .await;
+            let fallback_waiter = match &result {
+                Ok(prepared) => {
+                    self.pending.fill(Ok(prepared.clone())).await;
+                    None
+                }
+                Err(error) if self.root => {
+                    self.pending.fill(Err(Arc::from(error.as_str()))).await;
+                    None
+                }
+                Err(_) => Some(self.pending),
+            };
             let _ = internal_tx.send(InternalEvent::StartupPrepared {
                 spec: self.spec,
                 root: self.root,
                 targets: self.targets,
                 result,
+                fallback_waiter,
             });
         })
     }
@@ -2337,7 +2344,8 @@ impl<'t> EventLoop<'t> {
                 root,
                 targets,
                 result,
-            } => self.complete_startup_prepare(spec, root, targets, result),
+                fallback_waiter,
+            } => self.complete_startup_prepare(spec, root, targets, result, fallback_waiter),
             InternalEvent::RuntimePrepared {
                 target,
                 session,
@@ -4743,7 +4751,7 @@ impl<'t> EventLoop<'t> {
         let prepare = self.sessions[idx]
             .model_slot
             .track_preparation(Arc::clone(&self.ctx.prepare_provider));
-        self.refresh_root_model(idx, None, async move {
+        self.refresh_root_model(idx, None, None, async move {
             prepare_model(&spec, &policy, &prepare).await
         });
     }
@@ -4756,6 +4764,7 @@ impl<'t> EventLoop<'t> {
         root: bool,
         targets: Vec<(MakimaId, PreparedModel)>,
         result: Result<PreparedModel, String>,
+        fallback_waiter: Option<Arc<PendingProvider>>,
     ) {
         let replacement = match result {
             Ok(prepared) => {
@@ -4783,16 +4792,35 @@ impl<'t> EventLoop<'t> {
                 fallback
             }
         };
+        let mut fallback_waiter = fallback_waiter;
         for (session, expected) in targets {
             if expected.model.spec() != spec.as_ref() {
                 continue;
             }
             if let Some(idx) = self.position(session) {
-                let replacement = self.sessions[idx]
-                    .model_slot
-                    .track_model(replacement.clone());
-                self.refresh_root_model(idx, Some(expected), async move { Ok(replacement) });
+                let replacement = replacement.clone();
+                let slot = Arc::clone(&self.sessions[idx].model_slot);
+                self.refresh_root_model(idx, Some(expected), fallback_waiter.take(), async move {
+                    let replacement =
+                        match PendingProvider::from_provider(replacement.provider.as_ref()) {
+                            Some(startup) => startup
+                                .prepared()
+                                .await
+                                .map_err(|error| {
+                                    ConfigChangeError::ModelPreparation(error.user_message().into())
+                                })?
+                                .clone(),
+                            None => replacement,
+                        };
+                    Ok(slot.track_model(replacement))
+                });
             }
+        }
+        if let Some(waiter) = fallback_waiter {
+            smol::spawn(async move {
+                waiter.fill(Err(CLOSED_TARGET_ERR.into())).await;
+            })
+            .detach();
         }
     }
 
@@ -4802,6 +4830,7 @@ impl<'t> EventLoop<'t> {
         &self,
         idx: usize,
         expected: Option<PreparedModel>,
+        fallback_waiter: Option<Arc<PendingProvider>>,
         replacement: impl Future<Output = Result<PreparedModel, ConfigChangeError>> + Send + 'static,
     ) {
         let (manager, root) = self.sessions[idx].handles.manager_and_root();
@@ -4830,21 +4859,42 @@ impl<'t> EventLoop<'t> {
         let internal_tx = self.internal_tx.clone();
         smol::spawn(async move {
             let result = match reserved {
-                Ok((ticket, expected)) => prepare_config_change(
-                    ticket,
-                    async move {
-                        Ok(ConfigChange::Refresh {
-                            expected,
-                            replacement: replacement.await?,
-                        })
-                    },
-                    async { smol::Timer::after(SESSION_OP_TIMEOUT).await },
-                )
-                .await
-                .map(|_| ()),
+                Ok((ticket, expected)) => {
+                    prepare_config_change(
+                        ticket,
+                        async move {
+                            Ok(ConfigChange::Refresh {
+                                expected,
+                                replacement: replacement.await?,
+                            })
+                        },
+                        async { smol::Timer::after(SESSION_OP_TIMEOUT).await },
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             }
             .map_err(|error| error.to_string());
+            let result = if let Some(waiter) = fallback_waiter {
+                // The config-only commit can publish while a turn is waiting for this provider.
+                let prepared = result.and_then(|commit| {
+                    if PendingProvider::from_provider(commit.config.provider.as_ref()).is_some() {
+                        return Err(STARTUP_FALLBACK_NOT_ADOPTED.into());
+                    }
+                    Ok(PreparedModel {
+                        model: commit.config.model.clone(),
+                        provider: Arc::clone(&commit.config.provider),
+                    })
+                });
+                waiter
+                    .fill(prepared.clone().map_err(|error| {
+                        Arc::from(format!("could not commit startup model fallback: {error}"))
+                    }))
+                    .await;
+                prepared.map(|_| ())
+            } else {
+                result.map(|_| ())
+            };
             let _ = internal_tx.send(InternalEvent::SessionOp {
                 session,
                 runtime: identity,
@@ -5427,6 +5477,7 @@ mod tests {
     use makima_providers::{
         AgentError, ContentBlock, Invocation, RequestDelivery, RequestOptions, Role, StreamResponse,
     };
+    use makima_storage::session_state::{StateChange, StoredStateRecord, StoredTurnOrigin};
     use makima_storage::sessions::HistorySnapshot;
 
     /// A preparer for tests, from a blocking one over the resolved model,
@@ -9209,10 +9260,13 @@ end })
                 );
 
                 let (requests, _received) = flume::unbounded();
-                smol::block_on(pending.fill(Ok(Arc::new(AnsweringProvider {
-                    requests,
-                    usage: TokenUsage::default(),
-                }))));
+                smol::block_on(pending.fill(Ok(PreparedModel {
+                    model: event_loop.sessions[0].app.root_config().model.clone(),
+                    provider: Arc::new(AnsweringProvider {
+                        requests,
+                        usage: TokenUsage::default(),
+                    }),
+                })));
                 pump_until(event_loop, |event_loop| {
                     SessionStatus::of(&event_loop.sessions[0].app) == SessionStatus::Idle
                         && matches!(actor.snapshot().latest, Some(TurnOutcome::Completed { .. }))
@@ -9536,6 +9590,143 @@ end })
             });
             shutdown_manager(&manager);
         });
+    }
+
+    #[test_case(false; "startup_model_ready")]
+    #[test_case(true; "startup_model_still_preparing")]
+    fn recovered_turn_waits_for_committed_startup_model_fallback(startup_pending: bool) {
+        const RESTORE_FAILURE: &str = "saved model credentials unavailable";
+        const PREPARED_WINDOW: u32 = 123_456;
+        let (waiting_tx, waiting_rx) = flume::bounded(1);
+        let waiter = Arc::new(PendingProvider::with_request_probe(waiting_tx));
+        let runtime_waiter = Arc::clone(&waiter);
+        let (requests_tx, requests_rx) = flume::unbounded();
+        let fallback: Arc<dyn Provider> = Arc::new(AnsweringProvider {
+            requests: requests_tx,
+            usage: TokenUsage::default(),
+        });
+        let startup = Arc::new(PendingProvider::default());
+        let root = AgentId::generate();
+        let turn = TurnId::generate();
+        with_event_loop_runtime(
+            |harness| {
+                if startup_pending {
+                    let ctx = harness.ctx.as_mut().unwrap();
+                    let model = ctx.model_slot.load().model.clone();
+                    ctx.model_slot = ProviderSlot::new(model, startup.clone()).0;
+                }
+                let ctx = harness.ctx();
+                let mut session = harness.session();
+                session.model = PREPARED_MODEL.into();
+                session.bind_root_id(root).unwrap();
+                session.push_message(Message::user(STARTUP_PROMPT.into()));
+                session.push_state(StoredStateRecord {
+                    seq: session.next_state_seq(),
+                    agent: Some(root),
+                    generation: 0,
+                    change: StateChange::Admitted {
+                        turn,
+                        origin: StoredTurnOrigin::User,
+                    },
+                });
+                session.save(&ctx.storage).unwrap();
+                let mut runtime = ctx
+                    .prepare_runtime_with_options(
+                        session,
+                        None,
+                        PrepareOptions::default(),
+                        Some(runtime_waiter),
+                    )
+                    .unwrap()
+                    .activate(&ctx.model_slot, None)
+                    .unwrap();
+                runtime.activate_deferred();
+                runtime
+            },
+            |event_loop| {
+                waiting_rx.recv_timeout(PUMP_TIMEOUT).unwrap();
+                let runtime = &event_loop.sessions[0];
+                let session = runtime.id();
+                let actor = runtime.handles.manager_and_root().0.actor(root).unwrap();
+                let ticket = actor.turn_ticket(turn).unwrap();
+                let config = actor.effective_config().unwrap();
+                assert_eq!(config.model.spec(), PREPARED_MODEL);
+                let mut startup_model = event_loop.ctx.model_slot.load().model.clone();
+                startup_model.context_window = PREPARED_WINDOW;
+                let startup_spec = startup_model.spec();
+                let prepared_startup = PreparedModel {
+                    model: startup_model,
+                    provider: fallback,
+                };
+                if !startup_pending {
+                    event_loop.ctx.model_slot.install(
+                        prepared_startup.model.clone(),
+                        prepared_startup.provider.clone(),
+                    );
+                }
+                StartupPrepare {
+                    spec: Arc::from(PREPARED_MODEL),
+                    pending: waiter,
+                    root: false,
+                    targets: vec![(
+                        session,
+                        PreparedModel {
+                            model: config.model.clone(),
+                            provider: config.provider.clone(),
+                        },
+                    )],
+                }
+                .spawn(
+                    sync_preparer(|_| Err(Arc::from(RESTORE_FAILURE))),
+                    event_loop.internal_tx.clone(),
+                )
+                .detach();
+                let event = event_loop.internal_rx.recv_timeout(PUMP_TIMEOUT).unwrap();
+                assert!(matches!(event, InternalEvent::StartupPrepared { .. }));
+                event_loop.handle_internal(event);
+                assert_eq!(
+                    event_loop.sessions[0].app.flash_text(),
+                    Some(
+                        restore_warning(
+                            PREPARED_MODEL,
+                            &ConfigChangeError::ModelPreparation(RESTORE_FAILURE.into())
+                                .to_string(),
+                            &prepared_startup.model,
+                        )
+                        .as_str()
+                    ),
+                );
+                if startup_pending {
+                    assert_eq!(
+                        actor.effective_config().unwrap().model.spec(),
+                        PREPARED_MODEL
+                    );
+                    assert!(requests_rx.is_empty());
+                    smol::block_on(startup.fill(Ok(prepared_startup)));
+                }
+                assert_eq!(
+                    requests_rx.recv_timeout(PUMP_TIMEOUT).unwrap(),
+                    startup_spec
+                );
+                let outcome = smol::block_on(bounded_session_op(
+                    async { Ok(ticket.wait().await) },
+                    PUMP_TIMEOUT,
+                ))
+                .unwrap();
+                assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+                assert_eq!(outcome.turn_id(), turn);
+                assert_eq!(
+                    actor.effective_config().unwrap().model.context_window,
+                    PREPARED_WINDOW
+                );
+                let saved = AppSession::load(session, &event_loop.ctx.storage).unwrap();
+                let state = saved.latest_state().unwrap();
+                assert_eq!(
+                    state.scopes[&Some(root)].config.as_ref().unwrap().model,
+                    startup_spec
+                );
+            },
+        );
     }
 
     #[test]
@@ -10270,6 +10461,7 @@ end })
                     model: Model::from_spec(STALE_SPEC).unwrap(),
                     provider: Arc::new(StubProvider),
                 }),
+                None,
             );
             let settled = smol::block_on(settled_config(&actor));
             assert_eq!(settled.model.spec(), current.model.spec());

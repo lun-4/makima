@@ -125,8 +125,8 @@ struct PendingElicitation {
 struct Pending {
     operation: Option<PendingOperation>,
     isolated: Option<PendingOperation>,
-    /// A root turn already visible on the wire, including automatic turns without a prompt.
-    projected_root: Option<TurnId>,
+    /// Root turns already visible on the wire, including automatic turns without a prompt.
+    projected_root: BTreeSet<TurnId>,
     /// Prompts whose message started a turn of its own behind the running
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
@@ -208,6 +208,43 @@ impl Pending {
 }
 
 type PendingState = Arc<Mutex<Pending>>;
+
+/// The primary work visible or admitted when the isolated question starts.
+struct IsolatedBarrier {
+    runs: BTreeSet<u64>,
+    root_turns: BTreeSet<TurnId>,
+}
+
+impl IsolatedBarrier {
+    fn capture(pending: &Pending) -> Self {
+        Self {
+            runs: pending
+                .operation
+                .iter()
+                .chain(&pending.queued)
+                .filter(|operation| operation.kind == OperationKind::PrimaryTurn)
+                .filter_map(|operation| operation.run_id)
+                .collect(),
+            root_turns: pending
+                .continuing_root
+                .iter()
+                .copied()
+                .chain(pending.projected_root.iter().copied())
+                .collect(),
+        }
+    }
+
+    fn is_clear(&self, pending: &Pending) -> bool {
+        !pending
+            .operation
+            .iter()
+            .chain(&pending.queued)
+            .filter_map(|operation| operation.run_id)
+            .any(|run_id| self.runs.contains(&run_id))
+            && self.root_turns.is_disjoint(&pending.projected_root)
+            && self.root_turns.is_disjoint(&pending.continuing_root)
+    }
+}
 
 struct OptionProjection {
     out_tx: Sender<Value>,
@@ -1502,7 +1539,7 @@ fn send_isolated_turn(
         .collect();
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let (trigger, cancel) = makima_agent::cancel::CancelToken::new();
-    let events = {
+    let (events, barrier) = {
         let mut pending = session.pending.lock().unwrap();
         if pending.isolated.is_some()
             || pending
@@ -1525,13 +1562,13 @@ fn send_isolated_turn(
             cancel: Some(WorkCancel::Control(trigger)),
             joined: Vec::new(),
         });
-        events
+        (events, IsolatedBarrier::capture(&pending))
     };
     let pending = Arc::clone(&session.pending);
     let out_tx = out_tx.clone();
     let sid = SessionId::from(session.handle.session_id.to_string());
     smol::spawn(async move {
-        project_isolated_turn(events, &pending, operation_id, &out_tx, &sid).await;
+        project_isolated_turn(events, &pending, operation_id, barrier, &out_tx, &sid).await;
     })
     .detach();
     Ok(())
@@ -1541,6 +1578,7 @@ async fn project_isolated_turn(
     events: Receiver<IsolatedTurnEvent>,
     pending: &PendingState,
     operation_id: u64,
+    barrier: IsolatedBarrier,
     out_tx: &Sender<Value>,
     sid: &SessionId,
 ) {
@@ -1569,7 +1607,7 @@ async fn project_isolated_turn(
                 return;
             };
             // The primary response and the isolated batch share this lock and the wire queue.
-            if pending.operation.is_none() && pending.projected_root.is_none() {
+            if barrier.is_clear(&pending) {
                 let result = if operation.cancelling {
                     Ok(StopReason::Cancelled)
                 } else {
@@ -1739,12 +1777,12 @@ fn finish_primary_run(
 ) {
     let mut pending = pending.lock().unwrap();
     if let Some(turn_id) = turn_id {
-        pending.continuing_root.remove(&turn_id);
+        let continued = pending.continuing_root.remove(&turn_id);
         pending
             .elicitations
             .retain(|_, elicitation| elicitation.turn_id != turn_id);
-        if pending.projected_root == Some(turn_id) {
-            pending.projected_root = None;
+        let projected = pending.projected_root.remove(&turn_id);
+        if continued || projected {
             pending.settled.notify(usize::MAX);
         }
     }
@@ -1754,6 +1792,7 @@ fn finish_primary_run(
     let operation = if pending.operation.as_ref().is_some_and(primary) {
         Some(pending.settle())
     } else if let Some(index) = pending.queued.iter().position(primary) {
+        pending.settled.notify(usize::MAX);
         pending.queued.remove(index)
     } else {
         None
@@ -1909,6 +1948,7 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     if !pending.continuing_root.is_empty()
                         && let Ok(actor) = session.command_root.target.actor()
                     {
+                        pending.settled.notify(usize::MAX);
                         for turn_id in std::mem::take(&mut pending.continuing_root) {
                             if let Some(ticket) = actor.turn_ticket(turn_id)
                                 && ticket.peek().is_none()
@@ -2280,14 +2320,14 @@ fn start_event_pump(
             };
             let mut pending = pending.lock().unwrap();
             if let Some(turn_id) = turn_id {
-                pending.projected_root = Some(turn_id);
+                pending.projected_root.insert(turn_id);
             }
             session_update(&out_tx, &sid, update);
         }
         let unanswered = {
             let mut pending = pending.lock().unwrap();
             pending.elicitations.clear();
-            pending.projected_root = None;
+            pending.projected_root.clear();
             if pending
                 .operation
                 .as_ref()
@@ -7172,11 +7212,19 @@ mod tests {
                 joined: Vec::new(),
             });
             let project = smol::spawn({
+                let barrier = IsolatedBarrier::capture(&pending.lock().unwrap());
                 let pending = Arc::clone(pending);
                 let out_tx = srv.out_tx.clone();
                 async move {
-                    project_isolated_turn(isolated_rx, &pending, ISOLATED_OPERATION, &out_tx, &sid)
-                        .await;
+                    project_isolated_turn(
+                        isolated_rx,
+                        &pending,
+                        ISOLATED_OPERATION,
+                        barrier,
+                        &out_tx,
+                        &sid,
+                    )
+                    .await;
                 }
             });
             let turn_id = turns.latest().turn_id();
@@ -7239,6 +7287,157 @@ mod tests {
             assert_eq!(terminal["result"]["stopReason"], END_TURN);
             within(project, "isolated projector did not exit").await;
             assert!(out_rx.is_empty());
+            close_session(&mut srv).await;
+        });
+    }
+
+    #[test]
+    fn btw_barrier_keeps_projected_and_restored_roots_but_ignores_later_roots() {
+        let projected = TurnId::generate();
+        let restored = TurnId::generate();
+        let later = TurnId::generate();
+        let pending = Arc::new(Mutex::new(Pending {
+            projected_root: BTreeSet::from([projected]),
+            continuing_root: BTreeSet::from([restored]),
+            ..Pending::default()
+        }));
+        let barrier = IsolatedBarrier::capture(&pending.lock().unwrap());
+        pending.lock().unwrap().projected_root.insert(later);
+        assert!(!barrier.is_clear(&pending.lock().unwrap()));
+        finish_primary_run(&pending, 1, Some(projected), |_| unreachable!());
+        assert!(!barrier.is_clear(&pending.lock().unwrap()));
+        finish_primary_run(&pending, 2, Some(restored), |_| unreachable!());
+        assert!(barrier.is_clear(&pending.lock().unwrap()));
+    }
+
+    #[test]
+    fn btw_waits_for_admitted_runs_but_not_a_later_client_ask() {
+        const QUEUED_ID: i64 = 43;
+        const JOINED_ID: i64 = 44;
+        const ISOLATED_ID: i64 = 45;
+        const ISOLATED_ANSWER: &str = "isolated answer";
+        const TURN_BOUNDARY: &str = "separate prompt runs";
+        const LATER_PROMPT: &str = "later prompt";
+
+        smol::block_on(async {
+            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
+            let separate_turn = || {
+                turns
+                    .actor
+                    .push_control(TURN_BOUNDARY.into(), TURN_BOUNDARY.into(), None)
+                    .unwrap();
+            };
+            separate_turn();
+            dispatch_prompt(
+                &mut srv,
+                "already queued",
+                false,
+                &RequestId::Number(QUEUED_ID),
+            )
+            .await
+            .unwrap();
+            let queued = turns.latest().turn_id();
+            let session = srv.session.as_ref().unwrap();
+            let pending = Arc::clone(&session.pending);
+            let sid = SessionId::from(session.handle.session_id.to_string());
+            let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+            let barrier = {
+                let mut pending = pending.lock().unwrap();
+                pending.isolated = Some(PendingOperation {
+                    id: operation_id,
+                    request_id: RequestId::Number(ISOLATED_ID),
+                    kind: OperationKind::IsolatedTurn,
+                    run_id: None,
+                    cancelling: false,
+                    cancel: None,
+                    joined: Vec::new(),
+                });
+                IsolatedBarrier::capture(&pending)
+            };
+            let out_tx = srv.out_tx.clone();
+            let (isolated_tx, isolated_rx) = flume::unbounded();
+            isolated_tx
+                .send(IsolatedTurnEvent::TextDelta(ISOLATED_ANSWER.into()))
+                .unwrap();
+            isolated_tx.send(IsolatedTurnEvent::Done).unwrap();
+            let mut project = Box::pin(project_isolated_turn(
+                isolated_rx,
+                &pending,
+                operation_id,
+                barrier,
+                &out_tx,
+                &sid,
+            ));
+            assert!(poll_once(&mut project).await.is_none());
+
+            dispatch_prompt(
+                &mut srv,
+                "joins queued",
+                false,
+                &RequestId::Number(JOINED_ID),
+            )
+            .await
+            .unwrap();
+            assert_eq!(turns.latest().turn_id(), queued);
+            separate_turn();
+            dispatch_prompt(
+                &mut srv,
+                LATER_PROMPT,
+                false,
+                &RequestId::Number(NEXT_ELICITATION_PROMPT_ID),
+            )
+            .await
+            .unwrap();
+            assert_ne!(turns.latest().turn_id(), queued);
+
+            turns.release();
+            assert_eq!(
+                prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
+                END_TURN
+            );
+            assert!(
+                poll_once(&mut project).await.is_none(),
+                "queued run is still in flight"
+            );
+            turns.next().await;
+            turns.release();
+            for id in [QUEUED_ID, JOINED_ID] {
+                assert_eq!(
+                    prompt_terminal(&out, id).await["result"]["stopReason"],
+                    END_TURN
+                );
+            }
+
+            assert_eq!(turns.next_text().await, LATER_PROMPT);
+            let (ask_id, answer) = request_elicitation(&srv, &out, &turns).await;
+            let mut finish_later = Box::pin(async {
+                assert_eq!(answer.recv().await.unwrap(), ELICITATION_DISMISSED);
+                turns.release();
+            });
+            assert!(poll_once(&mut finish_later).await.is_none());
+            within(project, "a later client ask blocked the isolated answer").await;
+            assert_eq!(
+                out.try_recv().unwrap()["params"]["update"]["content"]["text"],
+                ISOLATED_ANSWER
+            );
+            assert_eq!(
+                prompt_terminal(&out, ISOLATED_ID).await["result"]["stopReason"],
+                END_TURN
+            );
+            assert!(session_elicitations_contain(&srv, ask_id));
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({ "id": ask_id, "result": { "action": "decline" } }),
+            );
+            within(
+                finish_later,
+                "client answer did not unblock the later prompt",
+            )
+            .await;
+            assert_eq!(
+                prompt_terminal(&out, NEXT_ELICITATION_PROMPT_ID).await["result"]["stopReason"],
+                END_TURN
+            );
             close_session(&mut srv).await;
         });
     }

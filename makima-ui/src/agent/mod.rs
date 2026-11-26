@@ -29,6 +29,7 @@ use tracing::{info, warn};
 use crate::app::App;
 use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
+use self::pending::PendingProvider;
 use self::shared_queue::QueueSender;
 pub(crate) use self::shared_queue::QueuedMessage;
 
@@ -56,6 +57,11 @@ impl TrackedProvider {
                 change_tx: change_tx.clone(),
             })
         })
+    }
+
+    pub(crate) fn pending(&self) -> Option<&PendingProvider> {
+        let inner: &dyn Any = self.inner.as_ref();
+        inner.downcast_ref()
     }
 
     pub(crate) fn identity(&self) -> ProviderIdentity {

@@ -18,7 +18,7 @@ use crate::session_writer::{Record, SessionIo, SessionWriter, StoredSession, ope
 use crate::test_util::poll_until;
 use event_listener::Event;
 use flume::{Receiver, RecvTimeoutError, Sender, TryRecvError};
-use futures_lite::future::or;
+use futures_lite::future::{or, poll_once, zip};
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     Invocation, Message, Model, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse,
@@ -43,7 +43,7 @@ use crate::actor::{
     graph_quiescence_barrier,
 };
 use crate::{
-    ActorBackend, ActorError, AgentEvent, AgentInput, AgentMode, BackendResult, CancelMap,
+    ActorBackend, ActorError, AgentEvent, AgentId, AgentInput, AgentMode, BackendResult, CancelMap,
     CancelScope, CancelToken, ConfigChange, ConfigPatch, ControlWork, EventSender, History,
     PreparedModel, SessionCancellation, TurnAdmissionOptions, TurnContext, TurnOutcome, WorkKind,
 };
@@ -187,23 +187,36 @@ fn root_spawn_waits_for_writer_receipt_before_opening_admission() {
     });
 }
 
-#[test]
-fn blocked_spawn_leaves_no_agent_to_publish_later() {
-    smol::block_on(async {
+#[test_case(false; "stage_completes")]
+#[test_case(true; "waiting_spawn_is_dropped")]
+fn spawn_waits_for_staged_journal_change(cancelled: bool) {
+    receipt_test(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let journal = manager.journal();
-        let directory = tempfile::tempdir().unwrap();
-        let session = crate::session_writer::StoredSession::new("spawn-test", "/");
-        journal
-            .bind_writer(SessionWriter::open_session(directory.path(), &session).unwrap())
-            .unwrap();
+        let (writer, _, _) = ReceiptGateIo::writer(|_| false);
+        journal.bind_writer(writer.clone()).unwrap();
         let barrier = journal.stage(JournalCommit::default(), 1).unwrap();
-        let error = manager
-            .create_root(Vec::new(), None, TestBackend::boxed())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ManagerError::Persistence(_)));
-        assert!(manager.root_id().is_err());
+        let root_id = AgentId::generate();
+        let mut spawn = Box::pin(manager.create_root_with_id_and_config(
+            root_id,
+            None,
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(TestBackend::boxed()),
+        ));
+        assert!(poll_once(&mut spawn).await.is_none());
+        assert_eq!(
+            manager.node(root_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Reserved
+        );
+        let spawn = if cancelled {
+            drop(spawn);
+            assert!(manager.root_id().is_err());
+            assert!(manager.node(root_id).is_err());
+            None
+        } else {
+            Some(spawn)
+        };
         journal
             .complete(
                 barrier,
@@ -217,18 +230,19 @@ fn blocked_spawn_leaves_no_agent_to_publish_later() {
                 }],
             )
             .unwrap();
-        assert!(journal.snapshot().agent_revisions.iter().next().is_none());
-        let root = manager
-            .create_root(Vec::new(), None, TestBackend::boxed())
-            .await
-            .unwrap();
-        manager.shutdown(COMPLETION_TIMEOUT).await;
-        let reloaded =
-            crate::session_writer::StoredSession::load_from(session.id, directory.path()).unwrap();
-        assert_eq!(
-            reloaded.agents().keys().copied().collect::<Vec<_>>(),
-            [root.id()]
-        );
+        if let Some(spawn) = spawn {
+            assert_eq!(spawn.await.unwrap().id(), root_id);
+        } else {
+            assert!(journal.agent(root_id).is_none());
+            assert!(
+                manager
+                    .create_root(Vec::new(), None, TestBackend::boxed())
+                    .await
+                    .is_ok()
+            );
+        }
+        manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
+        writer.close().await.unwrap();
     });
 }
 
@@ -333,9 +347,17 @@ fn child_spawn_spec_and_config_exist_in_first_durable_revision(private_tools: bo
     });
 }
 
-#[test_case(false; "spawn")]
-#[test_case(true; "retirement")]
-fn agent_revision_is_not_retried_after_failed_receipt(retire: bool) {
+#[test_case(false, false, false; "concurrent_spawns")]
+#[test_case(false, false, true; "failed_spawn_then_spawn")]
+#[test_case(true, true, false; "concurrent_retirements")]
+#[test_case(true, true, true; "failed_retirement_then_retirement")]
+#[test_case(false, true, false; "retirement_behind_spawn")]
+#[test_case(true, false, false; "spawn_behind_retirement")]
+fn lifecycle_revision_waits_for_earlier_receipt(
+    first_retires: bool,
+    second_retires: bool,
+    fail_first: bool,
+) {
     receipt_test(async {
         let directory = tempfile::tempdir().unwrap();
         let session = StoredSession::new(SPAWN_MODEL, ".");
@@ -348,25 +370,33 @@ fn agent_revision_is_not_retried_after_failed_receipt(retire: bool) {
             .create_root(Vec::new(), None, TestBackend::boxed())
             .await
             .unwrap();
-        let spawn = async |manager: &AgentManagerHandle, root: &AgentRef| {
+        let spawn = async |entered: &Sender<AgentId>| {
             manager
                 .spawn_child_trusted_with_config(
-                    root,
+                    &root,
                     config(SPAWN_MODEL, false),
                     AgentMetadata::default(),
                     Vec::new(),
                     None,
-                    |_| Ok::<_, String>(TestBackend::boxed()),
+                    |id| {
+                        entered.send(id).unwrap();
+                        Ok::<_, String>(TestBackend::boxed())
+                    },
                 )
                 .await
         };
-        let child = if retire {
-            Some(spawn(&manager, &root).await.unwrap())
+        let (first_id_tx, first_id_rx) = flume::bounded(1);
+        let (second_id_tx, second_id_rx) = flume::bounded(1);
+        let first = if first_retires {
+            Some(spawn(&first_id_tx).await.unwrap())
         } else {
             None
         };
-        let child_id = child.as_ref().map(AgentRef::id);
-        let root_id = root.id();
+        let second = if second_retires {
+            Some(spawn(&second_id_tx).await.unwrap())
+        } else {
+            None
+        };
         writer.close().await.unwrap();
         let (file, seq) = open_log(&path).unwrap();
         let (writer, syncing, release) = ReceiptGateIo::file_writer(
@@ -377,50 +407,84 @@ fn agent_revision_is_not_retried_after_failed_receipt(retire: bool) {
         );
         writer.attach_journal(&journal);
         journal.replace_writer_for_test(writer.clone());
-        let operating = manager.clone();
-        let (done, result) = flume::bounded(1);
-        smol::spawn(async move {
-            let result = match child {
-                Some(child) => operating.retire_trusted(&child).await,
-                None => spawn(&operating, &root).await.map(|_| ()),
-            };
-            let _ = done.send(result);
-        })
-        .detach();
-        syncing.recv_async().await.unwrap();
-        assert!(matches!(result.try_recv(), Err(TryRecvError::Empty)));
-        release.send(true).unwrap();
-        let Err(ManagerError::Persistence(message)) = result.recv_async().await.unwrap() else {
-            panic!("{EXPECTED_PERSISTENCE_ERROR}");
+
+        let operate = async |child: Option<&AgentRef>, entered: &Sender<AgentId>| {
+            if let Some(child) = child {
+                manager.retire_trusted(child).await
+            } else {
+                spawn(entered).await.map(|_| ())
+            }
         };
-        assert!(message.contains(RECEIPT_SYNC_FAILED));
-        if let Some(id) = child_id {
-            assert!(manager.is_live(id));
+        let mut first_operation = Box::pin(operate(first.as_ref(), &first_id_tx));
+        assert!(poll_once(&mut first_operation).await.is_none());
+        syncing.recv_async().await.unwrap();
+        let first_id = first_id_rx.try_recv().unwrap();
+        if let Some(child) = &second {
+            let mut cancelled = Box::pin(manager.retire_trusted(child));
+            assert!(poll_once(&mut cancelled).await.is_none());
+            drop(cancelled);
+            assert!(!manager.lock_graph().nodes[&child.id()].revision_pending);
+        }
+        let mut second_operation = Box::pin(operate(second.as_ref(), &second_id_tx));
+        assert!(poll_once(&mut second_operation).await.is_none());
+        let second_id = second_id_rx.try_recv().unwrap();
+
+        for (id, retires) in [(first_id, first_retires), (second_id, second_retires)] {
             assert_eq!(
-                journal.agent(id).unwrap().lifecycle,
-                StoredAgentLifecycle::Open
+                manager.node(id).unwrap().graph_lifecycle,
+                if retires {
+                    GraphLifecycle::Live
+                } else {
+                    GraphLifecycle::Reserved
+                }
+            );
+            assert_eq!(
+                journal.agent(id).map(|agent| agent.lifecycle),
+                retires.then_some(StoredAgentLifecycle::Open)
             );
         }
-        writer.append(Vec::new()).await.unwrap();
-        for_each_durable_prefix(&path, true, |candidate| {
-            let agents = candidate.session.agents();
-            for (&id, record) in agents {
-                if id != root_id {
-                    assert_eq!(Some(id), child_id);
-                    assert_eq!(record.lifecycle, StoredAgentLifecycle::Open);
-                }
-            }
-        });
-        if let Some(id) = child_id {
+        assert_eq!(writer.status().unsaved_records, 1);
+        release.send(fail_first).unwrap();
+        let (first_result, second_result) = zip(first_operation, second_operation).await;
+        if fail_first {
+            let Err(ManagerError::Persistence(message)) = first_result else {
+                panic!("{EXPECTED_PERSISTENCE_ERROR}");
+            };
+            assert!(message.contains(RECEIPT_SYNC_FAILED));
+        } else {
+            first_result.unwrap();
+        }
+        second_result.unwrap();
+        assert!(journal.persistence_error().is_none());
+        let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
+        let expected_first = match (first_retires, fail_first) {
+            (true, true) | (false, false) => Some(StoredAgentLifecycle::Open),
+            (true, false) => Some(StoredAgentLifecycle::Retired),
+            (false, true) => None,
+        };
+        let expected_second = if second_retires {
+            StoredAgentLifecycle::Retired
+        } else {
+            StoredAgentLifecycle::Open
+        };
+        for (id, expected) in [
+            (first_id, expected_first),
+            (second_id, Some(expected_second)),
+        ] {
+            assert_eq!(
+                reopened
+                    .agents()
+                    .get(&id)
+                    .map(|agent| agent.lifecycle.clone()),
+                expected
+            );
+            assert_eq!(journal.agent(id).map(|agent| agent.lifecycle), expected);
+        }
+        if fail_first && first_retires {
             manager
-                .retire_trusted(&manager.reference(id))
+                .retire_trusted(first.as_ref().unwrap())
                 .await
                 .unwrap();
-            let reopened = StoredSession::load_from(session.id, directory.path()).unwrap();
-            assert_eq!(
-                reopened.agents()[&id].lifecycle,
-                StoredAgentLifecycle::Retired
-            );
         }
         manager.shutdown(RECEIPT_TEST_TIMEOUT).await;
         writer.close().await.unwrap();

@@ -33,7 +33,7 @@ use crate::actor::{
     MAX_PENDING_PREVIEW_BYTES, StoredTurnProgress, TurnResult, TurnResultStorageError,
 };
 use crate::context::{CONTEXT_MANIFEST, ContextUpdate, manifest_hash};
-use crate::session_writer::{Receipt, SessionWriter, WriterError};
+use crate::session_writer::{AppendAck, Receipt, SessionWriter, WriterError};
 use crate::state::{
     StateChangeEvent, StateChangeReason, StateEdit, StateError, StateRevision, StateRuntime,
     StateScope, read_slot, validate_access, validate_record,
@@ -531,7 +531,6 @@ pub(crate) struct AgentRevision {
     pending: JournalPending,
     candidate: SessionJournalSnapshot,
     commit: JournalCommit,
-    receipt: Receipt,
 }
 
 #[derive(Clone)]
@@ -1338,7 +1337,7 @@ impl SessionJournal {
         self.lock().checkpoint_error = error;
     }
 
-    pub(crate) fn listen_for_terminal_conversion(&self) -> EventListener {
+    pub(crate) fn listen_for_progress(&self) -> EventListener {
         self.conversion_changed.listen()
     }
 
@@ -2137,10 +2136,15 @@ impl SessionJournal {
             .map(|(revision, _)| revision)
     }
 
+    pub(crate) fn agent_revision_blocked(&self) -> bool {
+        let state = self.lock();
+        state.writer.is_some() && !state.staged.is_empty()
+    }
+
     pub(crate) fn begin_agent_revision(
         &self,
         mut commit: JournalCommit,
-    ) -> Result<Option<AgentRevision>, JournalError> {
+    ) -> Result<Option<(AgentRevision, Receipt)>, JournalError> {
         let mut state = self.lock();
         let Some(writer) = state.writer.clone() else {
             let (_, events) = self.commit_locked(&mut state, commit)?;
@@ -2188,25 +2192,26 @@ impl SessionJournal {
                 .into_iter()
                 .map(|address| (address, pending.revision)),
         );
-        Ok(Some(AgentRevision {
-            pending,
-            candidate,
-            commit,
-            receipt: writer.append_agent_revision(record),
-        }))
+        Ok(Some((
+            AgentRevision {
+                pending,
+                candidate,
+                commit,
+            },
+            writer.append_agent_revision(record),
+        )))
     }
 
-    pub(crate) async fn finish_agent_revision(
+    pub(crate) fn finish_agent_revision(
         &self,
         revision: AgentRevision,
+        ack: Result<AppendAck, WriterError>,
     ) -> Result<(), JournalError> {
         let AgentRevision {
             pending,
             candidate,
             commit,
-            receipt,
         } = revision;
-        let ack = receipt.await;
         let mut state = self.lock();
         let entry = state.staged.pop_front().expect("reserved agent revision");
         debug_assert_eq!(entry.pending.as_ref(), Some(&pending));
@@ -2263,7 +2268,6 @@ impl SessionJournal {
         Self::advance_ready(&mut state);
         drop(state);
         self.conversion_changed.notify(usize::MAX);
-        self.drain_state_notices();
         ack.map(|_| ()).map_err(Into::into)
     }
 

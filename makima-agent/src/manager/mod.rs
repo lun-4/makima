@@ -50,7 +50,7 @@ use crate::actor::{
     TranscriptSnapshot, TurnProvenance, TurnResult,
 };
 use crate::journal::{
-    AgentRevision, JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
+    JournalChange, JournalCommit, JournalError, JournalIncarnation, SessionJournal,
     SessionJournalSnapshot,
 };
 use crate::tools::offload::OffloadStore;
@@ -114,6 +114,23 @@ impl Drop for ActivationGuard {
         if !self.committed {
             self.manager
                 .rollback_activation(&self.incarnation, Some(ReactivationError::Cancelled.into()));
+        }
+    }
+}
+
+struct SpawnPublicationGuard<'a> {
+    manager: &'a AgentManagerHandle,
+    actor: &'a AgentActorHandle,
+    reservation: u64,
+    armed: bool,
+}
+
+impl Drop for SpawnPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.actor.close();
+            self.manager
+                .finish_failed_commit(self.actor.agent_id(), self.reservation);
         }
     }
 }
@@ -1548,128 +1565,155 @@ impl AgentManagerHandle {
         agent_id: AgentId,
         current: Option<&CurrentManagedTurn>,
     ) -> Result<(), ManagerError> {
-        let result = {
-            let mut graph = self.lock_graph();
-            if graph.shutting_down {
-                return Err(ManagerError::GraphShutdown);
-            }
-            if let Some(current) = current {
-                if graph
-                    .nodes
-                    .get(&current.agent_id())
-                    .is_some_and(|node| node.detach_pending)
-                {
-                    return Err(ManagerError::NonLiveAgent(current.agent_id()));
+        let result = loop {
+            let progress = self.0.journal.listen_for_progress();
+            {
+                let mut graph = self.lock_graph();
+                if graph.shutting_down {
+                    return Err(ManagerError::GraphShutdown);
                 }
-                if graph
-                    .active_turns
-                    .get(&(current.agent_id(), current.turn_id()))
-                    != Some(&current.token.nonce)
-                {
-                    return Err(ManagerError::InactiveTurn {
-                        agent_id: current.agent_id(),
-                        turn_id: current.turn_id(),
-                    });
-                }
-                let mut cursor = agent_id;
-                loop {
-                    let parent = graph
-                        .nodes
-                        .get(&cursor)
-                        .ok_or(ManagerError::UnknownAgent(cursor))?
-                        .parent_id
-                        .ok_or(ManagerError::NotDescendant {
-                            parent_id: current.agent_id(),
-                            child_id: agent_id,
-                        })?;
-                    if parent == current.agent_id() {
-                        break;
+                if !self.0.journal.agent_revision_blocked() {
+                    let Some((commit, work_idle)) =
+                        self.prepare_retirement(&graph, agent_id, current)?
+                    else {
+                        return Ok(());
+                    };
+                    match self.0.journal.begin_agent_revision(commit) {
+                        Ok(None) => {
+                            return self.finish_retirement(graph, agent_id, work_idle, Ok(()));
+                        }
+                        Ok(Some((revision, receipt))) => {
+                            graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
+                            let manager = self.clone();
+                            let (done, result) = flume::bounded(1);
+                            smol::spawn(async move {
+                                let ack = receipt.await;
+                                let graph = manager.lock_graph();
+                                let ack = manager.0.journal.finish_agent_revision(revision, ack);
+                                let finished =
+                                    manager.finish_retirement(graph, agent_id, work_idle, ack);
+                                manager.0.journal.drain_state_notices();
+                                let _ = done.send(finished);
+                            })
+                            .detach();
+                            break result;
+                        }
+                        Err(JournalError::AgentPublicationPending) => (),
+                        Err(error) => return Err(Self::agent_revision_error(error)),
                     }
-                    cursor = parent;
                 }
             }
-            let node = graph
-                .nodes
-                .get(&agent_id)
-                .ok_or(ManagerError::UnknownAgent(agent_id))?;
-            if node.detach_pending {
-                return Err(ReactivationError::Cancelled.into());
-            }
-            if node.lifecycle == GraphLifecycle::Retired {
-                return Ok(());
-            }
-            if node.parent_id.is_none()
-                || node.children.iter().any(|id| {
-                    graph
-                        .nodes
-                        .get(id)
-                        .is_some_and(|child| child.lifecycle != GraphLifecycle::Retired)
-                })
-            {
-                return Err(ManagerError::NotLeaf(agent_id));
-            }
-            if node.reservation_pending
-                || node.revision_pending
-                || self.0.work.is_busy(agent_id)
-                || node
-                    .actor
-                    .as_ref()
-                    .is_some_and(AgentActorHandle::has_pending_work)
-            {
-                return Err(ManagerError::BusySubtree(agent_id));
-            }
-            let work_idle = self.0.work.freeze_if_idle(agent_id)?;
-            let record = self
-                .0
-                .journal
-                .agent(agent_id)
-                .ok_or(ManagerError::UnknownAgent(agent_id))?;
-            let snapshot = self
-                .0
-                .journal
-                .checkpoint_snapshot()
-                .map_err(ManagerError::InvalidGraph)?;
-            let view = snapshot
-                .fold()
-                .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
-            if view.scopes.iter().any(|(target, scope)| {
-                scope.deliveries.iter().any(|((source, _), delivery)| {
-                    (*source == agent_id || *target == Some(agent_id))
-                        && matches!(delivery, StoredDeliveryOp::Queued(_))
-                })
-            }) {
-                return Err(ManagerError::BusySubtree(agent_id));
-            }
-            let revision = self
-                .0
-                .journal
-                .begin_agent_revision(JournalCommit {
-                    agents: vec![StoredAgentRecord {
-                        lifecycle: StoredAgentLifecycle::Retired,
-                        ..record
-                    }],
-                    ..Default::default()
-                })
-                .map_err(Self::agent_revision_error)?;
-            let Some(revision) = revision else {
-                return self.finish_retirement(graph, agent_id, work_idle, Ok(()));
-            };
-            graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
-            let manager = self.clone();
-            let (done, result) = flume::bounded(1);
-            smol::spawn(async move {
-                let ack = manager.0.journal.finish_agent_revision(revision).await;
-                let finished =
-                    manager.finish_retirement(manager.lock_graph(), agent_id, work_idle, ack);
-                let _ = done.send(finished);
-            })
-            .detach();
-            result
+            progress.await;
         };
         result
             .recv_async()
             .await
             .map_err(|_| ManagerError::GraphShutdown)?
+    }
+
+    fn prepare_retirement(
+        &self,
+        graph: &GraphState,
+        agent_id: AgentId,
+        current: Option<&CurrentManagedTurn>,
+    ) -> Result<Option<(JournalCommit, work::WorkIdleGuard)>, ManagerError> {
+        if let Some(current) = current {
+            if graph
+                .nodes
+                .get(&current.agent_id())
+                .is_some_and(|node| node.detach_pending)
+            {
+                return Err(ManagerError::NonLiveAgent(current.agent_id()));
+            }
+            if graph
+                .active_turns
+                .get(&(current.agent_id(), current.turn_id()))
+                != Some(&current.token.nonce)
+            {
+                return Err(ManagerError::InactiveTurn {
+                    agent_id: current.agent_id(),
+                    turn_id: current.turn_id(),
+                });
+            }
+            let mut cursor = agent_id;
+            loop {
+                let parent = graph
+                    .nodes
+                    .get(&cursor)
+                    .ok_or(ManagerError::UnknownAgent(cursor))?
+                    .parent_id
+                    .ok_or(ManagerError::NotDescendant {
+                        parent_id: current.agent_id(),
+                        child_id: agent_id,
+                    })?;
+                if parent == current.agent_id() {
+                    break;
+                }
+                cursor = parent;
+            }
+        }
+        let node = graph
+            .nodes
+            .get(&agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?;
+        if node.detach_pending {
+            return Err(ReactivationError::Cancelled.into());
+        }
+        if node.lifecycle == GraphLifecycle::Retired {
+            return Ok(None);
+        }
+        if node.parent_id.is_none()
+            || node.children.iter().any(|id| {
+                graph
+                    .nodes
+                    .get(id)
+                    .is_some_and(|child| child.lifecycle != GraphLifecycle::Retired)
+            })
+        {
+            return Err(ManagerError::NotLeaf(agent_id));
+        }
+        if node.reservation_pending
+            || node.revision_pending
+            || self.0.work.is_busy(agent_id)
+            || node
+                .actor
+                .as_ref()
+                .is_some_and(AgentActorHandle::has_pending_work)
+        {
+            return Err(ManagerError::BusySubtree(agent_id));
+        }
+        let work_idle = self.0.work.freeze_if_idle(agent_id)?;
+        let record = self
+            .0
+            .journal
+            .agent(agent_id)
+            .ok_or(ManagerError::UnknownAgent(agent_id))?;
+        let snapshot = self
+            .0
+            .journal
+            .checkpoint_snapshot()
+            .map_err(ManagerError::InvalidGraph)?;
+        let view = snapshot
+            .fold()
+            .map_err(|error| ManagerError::InvalidGraph(error.to_string()))?;
+        if view.scopes.iter().any(|(target, scope)| {
+            scope.deliveries.iter().any(|((source, _), delivery)| {
+                (*source == agent_id || *target == Some(agent_id))
+                    && matches!(delivery, StoredDeliveryOp::Queued(_))
+            })
+        }) {
+            return Err(ManagerError::BusySubtree(agent_id));
+        }
+        Ok(Some((
+            JournalCommit {
+                agents: vec![StoredAgentRecord {
+                    lifecycle: StoredAgentLifecycle::Retired,
+                    ..record
+                }],
+                ..Default::default()
+            },
+            work_idle,
+        )))
     }
 
     fn finish_retirement(
@@ -1681,7 +1725,11 @@ impl AgentManagerHandle {
     ) -> Result<(), ManagerError> {
         let node = graph.nodes.get_mut(&agent_id).unwrap();
         node.revision_pending = false;
-        ack.map_err(Self::agent_revision_error)?;
+        if let Err(error) = ack {
+            drop(work_idle);
+            self.0.reaped.notify(usize::MAX);
+            return Err(Self::agent_revision_error(error));
+        }
         node.lifecycle = GraphLifecycle::Retired;
         work_idle.commit();
         let actor = node.actor.clone();
@@ -1830,7 +1878,7 @@ impl AgentManagerHandle {
                     while events.recv_async().await.is_ok() {}
                 }
                 loop {
-                    let changed = manager.0.journal.listen_for_terminal_conversion();
+                    let changed = manager.0.journal.listen_for_progress();
                     if manager
                         .0
                         .journal
@@ -2097,7 +2145,8 @@ impl AgentManagerHandle {
             terminal: Arc::new(Mutex::new(None)),
         };
         self.0.work.register(id, None, 0, true);
-        self.journal_node(id, &node, actor, None).unwrap();
+        let commit = self.agent_spawn_commit(id, &node, actor, None).unwrap();
+        self.0.journal.commit(commit).unwrap();
         self.lock_graph().nodes.insert(id, node);
     }
 
@@ -2320,7 +2369,7 @@ impl AgentManagerHandle {
     ) -> Result<TurnTicket, ManagerError> {
         loop {
             let changed = self.0.reaped.listen();
-            let converted = self.0.journal.listen_for_terminal_conversion();
+            let converted = self.0.journal.listen_for_progress();
             match self.observe_retained_turn(agent, Some(turn), &mut resolve)? {
                 Some(RetainedTurn::Ticket(ticket)) => return Ok(ticket),
                 Some(RetainedTurn::Restoring(_)) => {
@@ -3375,7 +3424,7 @@ impl AgentManagerHandle {
         }
         let (actor, task) = spawn(admission);
         let task = self.track_runner(agent_id, reservation, actor.clone(), task);
-        let (closing, shutting_down, cancel_on_commit) = {
+        let (closing, shutting_down) = {
             let mut graph = self.lock_graph();
             let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
                 node.reservation == reservation
@@ -3395,7 +3444,6 @@ impl AgentManagerHandle {
             let shutting_down = graph.shutting_down;
             let node = graph.nodes.get_mut(&agent_id).unwrap();
             let closing = node.lifecycle == GraphLifecycle::Closing;
-            let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
             node.actor = Some(actor.clone());
             node.task = Some(task);
             graph
@@ -3404,7 +3452,7 @@ impl AgentManagerHandle {
             for (_, observer) in &graph.observers {
                 actor.attach_graph_observer(observer.clone());
             }
-            (closing, shutting_down, cancel_on_commit)
+            (closing, shutting_down)
         };
         if closing {
             if shutting_down {
@@ -3419,63 +3467,79 @@ impl AgentManagerHandle {
                 ManagerError::NonLiveAgent(agent_id)
             });
         }
-        if cancel_on_commit {
-            actor.cancel_existing();
-            #[cfg(test)]
-            self.wait_at_commit_gate();
-        }
-        let result = {
-            let mut graph = self.lock_graph();
-            let can_publish = !graph.shutting_down
-                && graph.nodes.get(&agent_id).is_some_and(|node| {
-                    node.reservation == reservation
-                        && node.reservation_pending
-                        && node.lifecycle == GraphLifecycle::Reserved
-                        && node.actor.is_some()
-                        && node.task.is_some()
-                });
-            if !can_publish {
-                let shutting_down = graph.shutting_down;
-                drop(graph);
-                if shutting_down {
-                    actor.shutdown();
-                } else {
-                    actor.close();
-                }
-                self.finish_failed_commit(agent_id, reservation);
-                return Err(if shutting_down {
-                    ManagerError::GraphShutdown
-                } else {
-                    ManagerError::NonLiveAgent(agent_id)
-                });
-            }
-            match self.journal_node(agent_id, &graph.nodes[&agent_id], &actor, restoration) {
-                Ok(None) => return self.finish_spawn(graph, agent_id, reservation, &actor, Ok(())),
-                Ok(Some(revision)) => {
-                    graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
-                    let manager = self.clone();
-                    let (done, result) = flume::bounded(1);
-                    smol::spawn(async move {
-                        let ack = manager.0.journal.finish_agent_revision(revision).await;
-                        let finished = manager.finish_spawn(
-                            manager.lock_graph(),
-                            agent_id,
-                            reservation,
-                            &actor,
-                            ack,
-                        );
-                        let _ = done.send(finished);
-                    })
-                    .detach();
-                    result
-                }
-                Err(error) => {
+        let mut publication = SpawnPublicationGuard {
+            manager: self,
+            actor: &actor,
+            reservation,
+            armed: true,
+        };
+        let result = loop {
+            let progress = self.0.journal.listen_for_progress();
+            {
+                let mut graph = self.lock_graph();
+                let can_publish = !graph.shutting_down
+                    && graph.nodes.get(&agent_id).is_some_and(|node| {
+                        node.reservation == reservation
+                            && node.reservation_pending
+                            && node.lifecycle == GraphLifecycle::Reserved
+                            && node.actor.is_some()
+                            && node.task.is_some()
+                    });
+                if !can_publish {
+                    let shutting_down = graph.shutting_down;
                     drop(graph);
-                    actor.close();
-                    self.finish_failed_commit(agent_id, reservation);
-                    return Err(error);
+                    if shutting_down {
+                        actor.shutdown();
+                    }
+                    return Err(if shutting_down {
+                        ManagerError::GraphShutdown
+                    } else {
+                        ManagerError::NonLiveAgent(agent_id)
+                    });
+                }
+                if std::mem::take(&mut graph.nodes.get_mut(&agent_id).unwrap().cancel_on_commit) {
+                    drop(graph);
+                    actor.cancel_existing();
+                    #[cfg(test)]
+                    self.wait_at_commit_gate();
+                    continue;
+                }
+                if !self.0.journal.agent_revision_blocked() {
+                    let commit = self.agent_spawn_commit(
+                        agent_id,
+                        &graph.nodes[&agent_id],
+                        &actor,
+                        restoration.as_ref(),
+                    )?;
+                    match self.0.journal.begin_agent_revision(commit) {
+                        Ok(None) => {
+                            publication.armed = false;
+                            return self.finish_spawn(graph, agent_id, reservation, &actor, Ok(()));
+                        }
+                        Ok(Some((revision, receipt))) => {
+                            graph.nodes.get_mut(&agent_id).unwrap().revision_pending = true;
+                            publication.armed = false;
+                            drop(publication);
+                            let manager = self.clone();
+                            let (done, result) = flume::bounded(1);
+                            smol::spawn(async move {
+                                let ack = receipt.await;
+                                let graph = manager.lock_graph();
+                                let ack = manager.0.journal.finish_agent_revision(revision, ack);
+                                let finished =
+                                    manager.finish_spawn(graph, agent_id, reservation, &actor, ack);
+                                manager.0.journal.drain_state_notices();
+                                let _ = done.send(finished);
+                            })
+                            .detach();
+                            break result;
+                        }
+                        Err(JournalError::AgentPublicationPending) => (),
+                        Err(error) => return Err(Self::agent_revision_error(error)),
+                    }
                 }
             }
+            progress.await;
         };
         result
             .recv_async()
@@ -3494,9 +3558,9 @@ impl AgentManagerHandle {
         let node = graph.nodes.get_mut(&agent_id).unwrap();
         node.revision_pending = false;
         if let Err(error) = ack {
+            self.finish_failed_commit_locked(&mut graph, agent_id, reservation);
             drop(graph);
             actor.close();
-            self.finish_failed_commit(agent_id, reservation);
             return Err(Self::agent_revision_error(error));
         }
         let closing = node.lifecycle == GraphLifecycle::Closing;
@@ -3541,13 +3605,13 @@ impl AgentManagerHandle {
         })
     }
 
-    fn journal_node(
+    fn agent_spawn_commit(
         &self,
         agent_id: AgentId,
         node: &Node,
         actor: &AgentActorHandle,
-        restoration: Option<SpawnRestoration>,
-    ) -> Result<Option<AgentRevision>, ManagerError> {
+        restoration: Option<&SpawnRestoration>,
+    ) -> Result<JournalCommit, ManagerError> {
         let existing = self.0.journal.agent(agent_id);
         if existing
             .as_ref()
@@ -3595,8 +3659,8 @@ impl AgentManagerHandle {
         });
         record.lifecycle = StoredAgentLifecycle::Open;
         if let Some(restoration) = restoration {
-            record.spec = Some(restoration.spec);
-            record.restorable = restoration.restorable;
+            record.spec = Some(restoration.spec.clone());
+            record.restorable.clone_from(&restoration.restorable);
         }
         if node.parent_id.is_some() {
             record.label.clone_from(&node.metadata.label);
@@ -3639,10 +3703,7 @@ impl AgentManagerHandle {
         {
             commit.state_edits.push(edit);
         }
-        self.0
-            .journal
-            .begin_agent_revision(commit)
-            .map_err(Self::agent_revision_error)
+        Ok(commit)
     }
 
     fn agent_revision_error(error: JournalError) -> ManagerError {
@@ -3744,7 +3805,15 @@ impl AgentManagerHandle {
     }
 
     fn finish_failed_commit(&self, agent_id: AgentId, reservation: u64) {
-        let mut graph = self.lock_graph();
+        self.finish_failed_commit_locked(&mut self.lock_graph(), agent_id, reservation);
+    }
+
+    fn finish_failed_commit_locked(
+        &self,
+        graph: &mut GraphState,
+        agent_id: AgentId,
+        reservation: u64,
+    ) {
         if self.0.journal.agent(agent_id).is_none() {
             if let Some(node) = graph.nodes.get(&agent_id)
                 && node.reservation == reservation
@@ -3767,7 +3836,7 @@ impl AgentManagerHandle {
         {
             node.reservation_pending = false;
         }
-        Self::reclaim_finished_closings(&mut graph, &self.0.journal);
+        Self::reclaim_finished_closings(graph, &self.0.journal);
         self.0.reaped.notify(usize::MAX);
     }
 

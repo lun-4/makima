@@ -749,13 +749,9 @@ impl FrontendServices for SdkServices<'_> {
     fn configure<'a>(
         &'a mut self,
         params: &'a mut InteractiveParams,
-        continuing_root: bool,
+        _continuing_root: bool,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if self.params.cli.permission_mode.is_some() && continuing_root {
-                // Do not let the requested mode seed the policy it will be checked against.
-                params.yolo = self.params.cli.yolo;
-            }
             let (handle, errors) = mcp::start_with_commands(
                 &params.initial_wd,
                 params.project_config.clone(),
@@ -857,6 +853,9 @@ impl SdkRuntime {
             cli.permission_mode.as_deref(),
             cli.yolo || params.permissions_config.yolo,
         );
+        let bypass = permission_mode == PermissionMode::BypassPermissions;
+        let mut permissions_config = params.permissions_config.clone();
+        permissions_config.yolo = bypass;
         let providers = &params.providers;
         let catalog = ModelCatalog::offline(Arc::clone(providers), &params.model_policy);
         let mut services = SdkServices {
@@ -871,7 +870,7 @@ impl SdkRuntime {
                 params: InteractiveParams {
                     model: params.model.clone(),
                     config: params.config.clone(),
-                    permissions_config: params.permissions_config.clone(),
+                    permissions_config,
                     timeouts: params.timeouts,
                     prompt_slots: params.prompt_slots.clone(),
                     profile: FrontendProfile {
@@ -884,7 +883,7 @@ impl SdkRuntime {
                     root_id: None,
                     journal: None,
                     initial_history: Vec::new(),
-                    yolo: permission_mode == PermissionMode::BypassPermissions,
+                    yolo: bypass,
                     system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
                     append_system_prompt: cli
                         .append_system_prompt
@@ -4169,16 +4168,18 @@ mod tests {
         assert_eq!(result["result"], SDK_AUTH_FAILURE);
     }
 
-    #[test_case(PermissionMode::Default; "same_explicit_mode")]
-    #[test_case(PermissionMode::BypassPermissions; "conflicting_explicit_mode")]
-    fn sdk_explicit_permission_mode_with_pending_root(resume_mode: PermissionMode) {
+    #[test_case(PermissionMode::Default, false; "same_explicit_mode")]
+    #[test_case(PermissionMode::BypassPermissions, false; "conflicting_explicit_mode")]
+    #[test_case(PermissionMode::Default, true; "explicit_default_overrides_yolo_without_saved_override")]
+    fn sdk_explicit_permission_mode_with_pending_root(resume_mode: PermissionMode, yolo: bool) {
         let directory = tempfile::tempdir().unwrap();
         let cwd = directory.path();
         let (entered, requests) = flume::unbounded();
         let (release, released) = flume::unbounded();
-        let launch = |cli| {
+        let launch = |cli: Cli| {
             let (out_tx, out_rx) = flume::unbounded();
             let mut params = reset_sdk_params(cwd.to_path_buf());
+            params.permissions_config.yolo = cli.yolo;
             params.cli = cli;
             params.providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
                 id: RESET_PROVIDER.into(),
@@ -4195,11 +4196,11 @@ mod tests {
             (session, out_rx)
         };
         let startup_mode = PermissionMode::Default.as_str();
-        let (session, _output) = launch(Cli::parse_from([
-            "makima",
-            "--permission-mode",
-            startup_mode,
-        ]));
+        let mut startup_args = vec!["makima"];
+        if !yolo {
+            startup_args.extend(["--permission-mode", startup_mode]);
+        }
+        let (session, _output) = launch(Cli::parse_from(startup_args));
         let session = session.unwrap();
         let runtime = session.current();
         let id = runtime.handle.session_id.id();
@@ -4220,13 +4221,18 @@ mod tests {
         drop(runtime);
         drop(session);
 
-        let (resumed, output) = launch(Cli::parse_from([
+        let id = id.to_string();
+        let mut resume_args = vec![
             "makima",
             "-c",
-            &id.to_string(),
+            &id,
             "--permission-mode",
             resume_mode.as_str(),
-        ]));
+        ];
+        if yolo {
+            resume_args.push("--yolo");
+        }
+        let (resumed, output) = launch(Cli::parse_from(resume_args));
         if resume_mode != PermissionMode::Default {
             let error = resumed
                 .err()
@@ -4248,6 +4254,9 @@ mod tests {
         assert_eq!(init["permissionMode"], startup_mode);
         assert!(runtime.handle.continuing_root().contains(&turn));
         requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        if yolo {
+            assert_eq!(runtime.handle.permissions.persisted_yolo(), None);
+        }
         assert!(!runtime.handle.permissions.is_yolo());
         release.send(()).unwrap();
         loop {

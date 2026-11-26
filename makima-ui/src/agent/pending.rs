@@ -1,9 +1,11 @@
 //! A provider that exists before it is prepared, so startup never waits on a
 //! prepare: requests wait for it instead.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_lock::OnceCell;
+use makima_agent::actor::PreparedModel;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
     AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderUsage,
@@ -12,19 +14,38 @@ use makima_providers::{
 use makima_storage::id::SessionRef;
 use serde_json::Value;
 
+use super::TrackedProvider;
+
 #[derive(Default)]
 pub(crate) struct PendingProvider {
-    ready: OnceCell<Result<Arc<dyn Provider>, Arc<str>>>,
+    ready: OnceCell<Result<PreparedModel, Arc<str>>>,
+    #[cfg(test)]
+    request_probe: Option<flume::Sender<()>>,
 }
 
 impl PendingProvider {
+    pub(crate) fn from_provider(provider: &dyn Provider) -> Option<&Self> {
+        let provider: &dyn Any = provider;
+        provider
+            .downcast_ref::<Self>()
+            .or_else(|| provider.downcast_ref::<TrackedProvider>()?.pending())
+    }
+
     /// Settles the provider every waiting and later request uses. Only the
     /// first call counts.
-    pub(crate) async fn fill(&self, result: Result<Arc<dyn Provider>, Arc<str>>) {
+    pub(crate) async fn fill(&self, result: Result<PreparedModel, Arc<str>>) {
         let _ = self.ready.set(result).await;
     }
 
-    async fn provider(&self) -> Result<&Arc<dyn Provider>, AgentError> {
+    #[cfg(test)]
+    pub(crate) fn with_request_probe(request_probe: flume::Sender<()>) -> Self {
+        Self {
+            request_probe: Some(request_probe),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) async fn prepared(&self) -> Result<&PreparedModel, AgentError> {
         self.ready
             .wait()
             .await
@@ -38,7 +59,7 @@ impl PendingProvider {
 impl Provider for PendingProvider {
     fn stream_message<'a>(
         &'a self,
-        model: &'a Model,
+        _model: &'a Model,
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
@@ -49,10 +70,22 @@ impl Provider for PendingProvider {
         delivery: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.provider()
-                .await?
+            #[cfg(test)]
+            if let Some(probe) = &self.request_probe {
+                let _ = probe.try_send(());
+            }
+            let prepared = self.prepared().await?;
+            prepared
+                .provider
                 .stream_message(
-                    model, messages, system, tools, event_tx, opts, session_id, invocation,
+                    &prepared.model,
+                    messages,
+                    system,
+                    tools,
+                    event_tx,
+                    opts.clamped(&prepared.model),
+                    session_id,
+                    invocation,
                     delivery,
                 )
                 .await
@@ -60,28 +93,28 @@ impl Provider for PendingProvider {
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
-        Box::pin(async { self.provider().await?.fetch_usage().await })
+        Box::pin(async { self.prepared().await?.provider.fetch_usage().await })
     }
 
     fn refresh_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async { self.provider().await?.refresh_auth().await })
+        Box::pin(async { self.prepared().await?.provider.refresh_auth().await })
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        Box::pin(async { self.provider().await?.reload_auth().await })
+        Box::pin(async { self.prepared().await?.provider.reload_auth().await })
     }
 
     fn key_count(&self) -> usize {
         match self.ready.get() {
-            Some(Ok(provider)) => provider.key_count(),
+            Some(Ok(prepared)) => prepared.provider.key_count(),
             _ => 1,
         }
     }
 
     fn rotate_key(&self) -> BoxFuture<'_, bool> {
         Box::pin(async {
-            match self.provider().await {
-                Ok(provider) => provider.rotate_key().await,
+            match self.prepared().await {
+                Ok(prepared) => prepared.provider.rotate_key().await,
                 Err(_) => false,
             }
         })
@@ -94,8 +127,11 @@ impl Provider for PendingProvider {
     ) -> BoxFuture<'_, ()> {
         let conversation_id = conversation_id.to_owned();
         Box::pin(async move {
-            if let Ok(provider) = self.provider().await {
-                provider.end_conversation(&conversation_id, reason).await;
+            if let Ok(prepared) = self.prepared().await {
+                prepared
+                    .provider
+                    .end_conversation(&conversation_id, reason)
+                    .await;
             }
         })
     }
@@ -103,7 +139,7 @@ impl Provider for PendingProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AgentError, Arc, PendingProvider, Provider};
 
     const FAILURE: &str = "prepare failed";
 
