@@ -14,12 +14,12 @@ use agent_client_protocol_schema::{
     RequestPermissionResponse, Response, SessionConfigOptionValue, SessionId, SessionModeId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallStatus, UnstructuredCommandInput,
+    TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolKind, UnstructuredCommandInput,
 };
 use event_listener::Event;
 use flume::{Receiver, Sender};
 use makima_agent::agent::isolated_turn::IsolatedTurnEvent;
-use makima_agent::cancel::SessionCancellation;
+use makima_agent::cancel::{CancelToken, SessionCancellation};
 use makima_agent::config_change::ConfigChangeError;
 use makima_agent::headless::{
     self, FrontendProfile, InteractiveInputSender, InteractiveParams, RootBinding, WorkCancel,
@@ -44,7 +44,7 @@ use makima_agent::{
 };
 use makima_commands::{
     AgentTurn, CommandAttachment, CommandContent, CommandFuture, CommandOutcome, CommandRegistry,
-    InputDispatch, PresentedCommand, TargetHandle,
+    InputDispatch, IsolatedTurn, PresentedCommand, TargetHandle,
 };
 use makima_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use makima_config::{MAX_SERVER_NAME_LEN, PermissionsConfig, ProjectConfig, TrustConfig};
@@ -73,6 +73,8 @@ const CANCELLATION_IN_PROGRESS_MESSAGE: &str =
 const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 const ACTIVE_OPERATION_MESSAGE: &str = "session already has an active operation";
 const SESSION_ENDED_MESSAGE: &str = "session ended";
+const BTW_TITLE_QUESTION_LIMIT: usize = 80;
+const ISOLATED_EVENT_STREAM_ENDED: &str = "isolated turn event stream ended";
 const EVENT_STREAM_ENDED: &str = "session event stream ended";
 const GRAPH_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_FAILED_MSG: &str =
@@ -125,8 +127,6 @@ struct PendingElicitation {
 struct Pending {
     operation: Option<PendingOperation>,
     isolated: Option<PendingOperation>,
-    /// Root turns already visible on the wire, including automatic turns without a prompt.
-    projected_root: BTreeSet<TurnId>,
     /// Prompts whose message started a turn of its own behind the running
     /// one, as typing does in the TUI when it cannot join.
     queued: VecDeque<PendingOperation>,
@@ -208,43 +208,6 @@ impl Pending {
 }
 
 type PendingState = Arc<Mutex<Pending>>;
-
-/// The primary work visible or admitted when the isolated question starts.
-struct IsolatedBarrier {
-    runs: BTreeSet<u64>,
-    root_turns: BTreeSet<TurnId>,
-}
-
-impl IsolatedBarrier {
-    fn capture(pending: &Pending) -> Self {
-        Self {
-            runs: pending
-                .operation
-                .iter()
-                .chain(&pending.queued)
-                .filter(|operation| operation.kind == OperationKind::PrimaryTurn)
-                .filter_map(|operation| operation.run_id)
-                .collect(),
-            root_turns: pending
-                .continuing_root
-                .iter()
-                .copied()
-                .chain(pending.projected_root.iter().copied())
-                .collect(),
-        }
-    }
-
-    fn is_clear(&self, pending: &Pending) -> bool {
-        !pending
-            .operation
-            .iter()
-            .chain(&pending.queued)
-            .filter_map(|operation| operation.run_id)
-            .any(|run_id| self.runs.contains(&run_id))
-            && self.root_turns.is_disjoint(&pending.projected_root)
-            && self.root_turns.is_disjoint(&pending.continuing_root)
-    }
-}
 
 struct OptionProjection {
     out_tx: Sender<Value>,
@@ -1522,7 +1485,7 @@ fn send_isolated_turn(
     session: &SessionState,
     out_tx: &Sender<Value>,
     id: &RequestId,
-    turn: makima_commands::IsolatedTurn,
+    turn: IsolatedTurn,
     admission: &PinnedCommandTarget,
 ) -> Result<(), AcpError> {
     admission.validate().map_err(session_registration_error)?;
@@ -1538,8 +1501,8 @@ fn send_isolated_turn(
         })
         .collect();
     let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
-    let (trigger, cancel) = makima_agent::cancel::CancelToken::new();
-    let (events, barrier) = {
+    let (trigger, cancel) = CancelToken::new();
+    let events = {
         let mut pending = session.pending.lock().unwrap();
         if pending.isolated.is_some()
             || pending
@@ -1562,13 +1525,24 @@ fn send_isolated_turn(
             cancel: Some(WorkCancel::Control(trigger)),
             joined: Vec::new(),
         });
-        (events, IsolatedBarrier::capture(&pending))
+        events
     };
     let pending = Arc::clone(&session.pending);
     let out_tx = out_tx.clone();
     let sid = SessionId::from(session.handle.session_id.to_string());
+    let mut question = turn.content.text.trim().chars();
+    let mut title = format!(
+        "/btw: {}",
+        question
+            .by_ref()
+            .take(BTW_TITLE_QUESTION_LIMIT)
+            .collect::<String>()
+    );
+    if question.next().is_some() {
+        title.push('…');
+    }
     smol::spawn(async move {
-        project_isolated_turn(events, &pending, operation_id, barrier, &out_tx, &sid).await;
+        project_isolated_turn(events, &pending, operation_id, title, &out_tx, &sid).await;
     })
     .detach();
     Ok(())
@@ -1578,71 +1552,57 @@ async fn project_isolated_turn(
     events: Receiver<IsolatedTurnEvent>,
     pending: &PendingState,
     operation_id: u64,
-    barrier: IsolatedBarrier,
+    title: String,
     out_tx: &Sender<Value>,
     sid: &SessionId,
 ) {
-    let mut chunks: Vec<(bool, String)> = Vec::new();
+    let mut answer = String::new();
     let result = loop {
-        let (thinking, text) = match events.recv_async().await {
-            Ok(IsolatedTurnEvent::TextDelta(text)) => (false, text),
-            Ok(IsolatedTurnEvent::ThinkingDelta(text)) => (true, text),
+        match events.recv_async().await {
+            Ok(IsolatedTurnEvent::TextDelta(text)) => answer.push_str(&text),
+            Ok(IsolatedTurnEvent::ThinkingDelta(_)) => {}
             Ok(IsolatedTurnEvent::Done) => break Ok(StopReason::EndTurn),
             Ok(IsolatedTurnEvent::Cancelled) => break Ok(StopReason::Cancelled),
             Ok(IsolatedTurnEvent::Error(message)) => break Err(message),
-            Err(_) => break Err("isolated turn event stream ended".into()),
-        };
-        if let Some((_, previous)) = chunks.last_mut().filter(|(kind, _)| *kind == thinking) {
-            previous.push_str(&text);
-        } else {
-            chunks.push((thinking, text));
+            Err(_) => break Err(ISOLATED_EVENT_STREAM_ENDED.into()),
         }
     };
 
-    loop {
-        let settled = {
-            let mut pending = pending.lock().unwrap();
-            let Some(operation) = pending.isolated.as_ref().filter(|op| op.id == operation_id)
-            else {
-                return;
-            };
-            // The primary response and the isolated batch share this lock and the wire queue.
-            if barrier.is_clear(&pending) {
-                let result = if operation.cancelling {
-                    Ok(StopReason::Cancelled)
-                } else {
-                    result
-                };
-                let operation = pending.isolated.take().unwrap();
-                if !matches!(&result, Ok(StopReason::Cancelled)) {
-                    for (thinking, text) in chunks {
-                        let update = if thinking {
-                            translate::thinking_delta(&text)
-                        } else {
-                            translate::text_delta(&text)
-                        };
-                        session_update(out_tx, sid, update);
-                    }
-                }
-                let request_id = operation.request_id.clone();
-                drop(operation);
-                match result {
-                    Ok(reason) => respond_prompt(out_tx, request_id, reason),
-                    Err(message) => send(
-                        out_tx,
-                        Response::<AgentResponse>::new(
-                            request_id,
-                            Err(AcpError::internal_error().data(Value::String(message))),
-                        ),
-                    ),
-                }
-                pending.settled.notify(usize::MAX);
-                return;
-            }
-            pending.settled.listen()
+    let mut pending = pending.lock().unwrap();
+    let Some(operation) = pending.isolated.take_if(|op| op.id == operation_id) else {
+        return;
+    };
+    let result = if operation.cancelling {
+        Ok(StopReason::Cancelled)
+    } else {
+        result
+    };
+    let request_id = operation.request_id.clone();
+    drop(operation);
+    if !matches!(result, Ok(StopReason::Cancelled)) {
+        let (status, text) = match &result {
+            Ok(_) => (ToolCallStatus::Completed, answer),
+            Err(message) => (ToolCallStatus::Failed, message.clone()),
         };
-        settled.await;
+        let call = ToolCall::new(format!("btw-{operation_id}"), title)
+            .kind(ToolKind::Think)
+            .status(status)
+            .content(vec![ToolCallContent::from(ContentBlock::Text(
+                TextContent::new(text),
+            ))]);
+        session_update(out_tx, sid, SessionUpdate::ToolCall(call));
     }
+    match result {
+        Ok(reason) => respond_prompt(out_tx, request_id, reason),
+        Err(message) => send(
+            out_tx,
+            Response::<AgentResponse>::new(
+                request_id,
+                Err(AcpError::internal_error().data(Value::String(message))),
+            ),
+        ),
+    }
+    pending.settled.notify(usize::MAX);
 }
 
 async fn send_command_turn(
@@ -1777,14 +1737,10 @@ fn finish_primary_run(
 ) {
     let mut pending = pending.lock().unwrap();
     if let Some(turn_id) = turn_id {
-        let continued = pending.continuing_root.remove(&turn_id);
+        pending.continuing_root.remove(&turn_id);
         pending
             .elicitations
             .retain(|_, elicitation| elicitation.turn_id != turn_id);
-        let projected = pending.projected_root.remove(&turn_id);
-        if continued || projected {
-            pending.settled.notify(usize::MAX);
-        }
     }
     let primary = |operation: &PendingOperation| {
         operation.kind == OperationKind::PrimaryTurn && operation.run_id == Some(run_id)
@@ -1792,7 +1748,6 @@ fn finish_primary_run(
     let operation = if pending.operation.as_ref().is_some_and(primary) {
         Some(pending.settle())
     } else if let Some(index) = pending.queued.iter().position(primary) {
-        pending.settled.notify(usize::MAX);
         pending.queued.remove(index)
     } else {
         None
@@ -1948,7 +1903,6 @@ fn handle_notification(srv: &Server, method: &str, raw: &Value) {
                     if !pending.continuing_root.is_empty()
                         && let Ok(actor) = session.command_root.target.actor()
                     {
-                        pending.settled.notify(usize::MAX);
                         for turn_id in std::mem::take(&mut pending.continuing_root) {
                             if let Some(ticket) = actor.turn_ticket(turn_id)
                                 && ticket.peek().is_none()
@@ -2318,16 +2272,11 @@ fn start_event_pump(
                 }
                 _ => continue,
             };
-            let mut pending = pending.lock().unwrap();
-            if let Some(turn_id) = turn_id {
-                pending.projected_root.insert(turn_id);
-            }
             session_update(&out_tx, &sid, update);
         }
         let unanswered = {
             let mut pending = pending.lock().unwrap();
             pending.elicitations.clear();
-            pending.projected_root.clear();
             if pending
                 .operation
                 .as_ref()
@@ -2468,7 +2417,8 @@ mod tests {
         AgentError, PreparedProvider, ProviderBackend, ProviderRegistry, RegisteredProvider,
     };
     use makima_providers::{
-        ContentBlock as MsgBlock, FastSupport, Invocation, ModelInfo, RequestDelivery, Role,
+        ContentBlock as MsgBlock, FastSupport, Invocation, InvocationPurpose, ModelInfo,
+        RequestDelivery, Role,
     };
     use makima_storage::checkpoint::{ClaimingWriter, accept_all};
     use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
@@ -2495,6 +2445,11 @@ mod tests {
     const NEXT_ELICITATION_PROMPT_ID: i64 = 42;
     const QUESTION_BARRIER: &str = "question pump barrier";
     const SESSION_CANCEL_METHOD: &str = "session/cancel";
+    const BTW_PROMPT_ID: i64 = 31;
+    const BTW_QUESTION: &str = "why?";
+    const BTW_PROMPT: &str = "/btw why?";
+    const COMPLETED: &str = "completed";
+    const FAILED: &str = "failed";
     const CANCELLED: &str = "cancelled";
     const END_TURN: &str = "end_turn";
     const ANSWERED_ID: i64 = 1001;
@@ -3063,6 +3018,7 @@ mod tests {
     struct ParkedProvider {
         requests: Sender<Message>,
         release: Receiver<Result<(), AgentError>>,
+        isolated_release: Option<Receiver<Result<(), AgentError>>>,
     }
 
     impl makima_providers::provider::Provider for ParkedProvider {
@@ -3075,7 +3031,7 @@ mod tests {
             events: &'a Sender<makima_providers::ProviderEvent>,
             _: makima_providers::RequestOptions,
             _: Option<&'a SessionRef>,
-            _invocation: &'a Invocation,
+            invocation: &'a Invocation,
             _delivery: RequestDelivery,
         ) -> makima_providers::provider::BoxFuture<
             'a,
@@ -3089,7 +3045,13 @@ mod tests {
                     .cloned()
                     .unwrap_or_default();
                 let _ = self.requests.send(asked);
-                self.release.recv_async().await.unwrap_or(Ok(()))?;
+                let release = match invocation.purpose {
+                    InvocationPurpose::Isolated => {
+                        self.isolated_release.as_ref().unwrap_or(&self.release)
+                    }
+                    _ => &self.release,
+                };
+                release.recv_async().await.unwrap_or(Ok(()))?;
                 for event in [
                     makima_providers::ProviderEvent::ThinkingDelta {
                         text: PARKED_THOUGHT.into(),
@@ -3402,7 +3364,11 @@ mod tests {
             let storage = StateDir::from_path(directory.path().to_path_buf());
             let (requests, received) = flume::unbounded();
             let (_release, release) = flume::unbounded();
-            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
+            let providers = spawn_test_providers(Arc::new(ParkedProvider {
+                requests,
+                release,
+                isolated_release: None,
+            }));
             let mut params = test_params(
                 providers.model(SPAWN_TEST_SPEC).unwrap(),
                 directory.path().to_path_buf(),
@@ -3500,6 +3466,7 @@ mod tests {
             let providers = spawn_test_providers(Arc::new(ParkedProvider {
                 requests,
                 release: permits,
+                isolated_release: None,
             }));
             let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.into());
             params.providers = providers;
@@ -3802,7 +3769,11 @@ mod tests {
             let storage = StateDir::from_path(tmp.path().to_path_buf());
             let (requests, received) = flume::unbounded();
             let (_release, release) = flume::unbounded();
-            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
+            let providers = spawn_test_providers(Arc::new(ParkedProvider {
+                requests,
+                release,
+                isolated_release: None,
+            }));
             let mut session = StoredSession::new(SPAWN_TEST_SPEC, &tmp.path().to_string_lossy());
             let root_id = AgentId::generate();
             let child_id = AgentId::generate();
@@ -4151,12 +4122,24 @@ mod tests {
                 >,
         >,
     ) -> (Server, PendingAnswer, Receiver<Value>, RootTurns) {
+        server_with_parked_provider(checkpoint, None)
+    }
+
+    fn server_with_parked_provider(
+        checkpoint: Arc<
+            dyn makima_storage::checkpoint::CheckpointWriter<
+                    makima_agent::session_coordinator::SessionCheckpoint,
+                >,
+        >,
+        isolated_release: Option<Receiver<Result<(), AgentError>>>,
+    ) -> (Server, PendingAnswer, Receiver<Value>, RootTurns) {
         let (out_tx, out_rx) = flume::unbounded();
         let (requests, requests_rx) = flume::unbounded();
         let (release, released) = flume::unbounded();
         let provider: Arc<dyn makima_providers::provider::Provider> = Arc::new(ParkedProvider {
             requests,
             release: released,
+            isolated_release,
         });
         let prepared = Arc::clone(&provider);
         let catalog = ModelCatalog::default();
@@ -6050,6 +6033,12 @@ mod tests {
 
     async fn server_with_parked_elicitation_turn() -> (Server, Receiver<Value>, RootTurns) {
         let (mut srv, _, out, turns) = server_awaiting_answer();
+        attach_parked_event_pump(&mut srv);
+        park_elicitation_turn(&mut srv, &turns, ELICITATION_PROMPT_ID).await;
+        (srv, out, turns)
+    }
+
+    fn attach_parked_event_pump(srv: &mut Server) {
         let session = srv.session.as_mut().unwrap();
         session.pending.lock().unwrap().permissions.clear();
         session.event_pump = start_event_pump(
@@ -6064,8 +6053,6 @@ mod tests {
             PUMP_TRUSTED,
             None,
         );
-        park_elicitation_turn(&mut srv, &turns, ELICITATION_PROMPT_ID).await;
-        (srv, out, turns)
     }
 
     async fn park_elicitation_turn(srv: &mut Server, turns: &RootTurns, id: i64) {
@@ -7173,267 +7160,170 @@ mod tests {
         });
     }
 
+    async fn next_btw_tool_call(out: &Receiver<Value>, status: &str, text: &str) -> Value {
+        let frame = within(out.recv_async(), "missing /btw tool call")
+            .await
+            .unwrap();
+        let update = &frame["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["title"], format!("/btw: {BTW_QUESTION}"));
+        assert_eq!(update["kind"], "think");
+        assert_eq!(update["status"], status);
+        assert_eq!(
+            update["content"],
+            serde_json::json!([
+                {"type": "content", "content": {"type": "text", "text": text}}
+            ])
+        );
+        assert!(
+            update["toolCallId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        update["toolCallId"].clone()
+    }
+
     #[test]
-    fn btw_chunks_follow_primary_response() {
+    fn btw_tool_call_is_separate_from_primary_chunks() {
+        const PRIMARY_ID: i64 = 30;
+        const PRIMARY_TOOL_ID: &str = "primary-tool";
+        const PRIMARY_TOOL_NAME: &str = "read";
+        const FIRST_CHUNK: &str = "primary one";
+        const SECOND_CHUNK: &str = "primary two";
+
         smol::block_on(async {
-            const PRIMARY_ID: i64 = 30;
-            const ISOLATED_ID: i64 = 31;
-            const ISOLATED_OPERATION: u64 = 2;
-            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
-            dispatch_prompt(&mut srv, "primary", false, &RequestId::Number(PRIMARY_ID))
-                .await
-                .unwrap();
-            turns.next().await;
-            let session = srv.session.as_mut().unwrap();
-            let pending = &session.pending;
-            let sid = SessionId::from(session.handle.session_id.to_string());
-            let (root_tx, root_rx) = flume::unbounded();
-            let (isolated_tx, isolated_rx) = flume::bounded(0);
-            session.event_pump = start_event_pump(
-                &test_event_source(root_rx),
-                session.handle.session_id.clone(),
-                srv.out_tx.clone(),
-                Arc::clone(pending),
-                false,
-                session.answers().clone(),
-                session.coordinator().read(),
-                None,
-                PUMP_TRUSTED,
-                None,
-            );
-            let pending = &session.pending;
-            pending.lock().unwrap().isolated = Some(PendingOperation {
-                id: ISOLATED_OPERATION,
-                request_id: RequestId::Number(ISOLATED_ID),
-                kind: OperationKind::IsolatedTurn,
-                run_id: None,
-                cancelling: false,
-                cancel: None,
-                joined: Vec::new(),
-            });
-            let project = smol::spawn({
-                let barrier = IsolatedBarrier::capture(&pending.lock().unwrap());
-                let pending = Arc::clone(pending);
-                let out_tx = srv.out_tx.clone();
-                async move {
-                    project_isolated_turn(
-                        isolated_rx,
-                        &pending,
-                        ISOLATED_OPERATION,
-                        barrier,
-                        &out_tx,
-                        &sid,
-                    )
-                    .await;
-                }
-            });
-            let turn_id = turns.latest().turn_id();
-            let agent_id = session.command_root.target.id();
-            let envelope = |event| {
-                let mut envelope = primary_envelope(pending, event);
-                let identity = envelope.identity.as_mut().unwrap();
-                identity.kind = ActorWorkKind::Turn {
-                    operation_id: identity.presentation_id,
-                    turn_id,
-                };
-                envelope
-            };
-            let next = || within(out_rx.recv_async(), "missing ACP output");
-            for (primary, isolated) in [
-                ("primary one", "isolated one "),
-                ("primary two", "isolated two"),
-            ] {
-                root_tx
-                    .send(envelope(AgentEvent::TextDelta {
-                        text: primary.into(),
-                    }))
+            let (release, released) = flume::bounded(1);
+            let (mut srv, _, out, turns) =
+                server_with_parked_provider(successful_checkpoint(), Some(released));
+            attach_parked_event_pump(&mut srv);
+            park_elicitation_turn(&mut srv, &turns, PRIMARY_ID).await;
+            let send = |srv: &Server, event| {
+                let session = srv.session.as_ref().unwrap();
+                let identity = parked_turn_identity(session, &turns);
+                session
+                    .command_root
+                    .template
+                    .event_tx
+                    .send_envelope(Envelope {
+                        event,
+                        subagent: None,
+                        identity: Some(identity),
+                    })
                     .unwrap();
-                assert_eq!(
-                    next().await.unwrap()["params"]["update"]["content"]["text"],
-                    primary
-                );
-                within(
-                    isolated_tx.send_async(IsolatedTurnEvent::TextDelta(isolated.into())),
-                    "isolated projector did not consume the chunk",
-                )
+            };
+            let assert_chunk = |text| {
+                let out = &out;
+                async move {
+                    let frame = within(out.recv_async(), "missing primary chunk")
+                        .await
+                        .unwrap();
+                    let update = &frame["params"]["update"];
+                    assert_eq!(update["sessionUpdate"], "agent_message_chunk");
+                    assert_eq!(update["content"]["text"], text);
+                }
+            };
+            send(
+                &srv,
+                AgentEvent::ToolPending {
+                    id: PRIMARY_TOOL_ID.into(),
+                    name: PRIMARY_TOOL_NAME.into(),
+                },
+            );
+            let primary_tool = within(out.recv_async(), "missing primary tool call")
                 .await
                 .unwrap();
-            }
-            within(
-                isolated_tx.send_async(IsolatedTurnEvent::Done),
-                "isolated projector did not finish",
+            assert_eq!(
+                primary_tool["params"]["update"]["toolCallId"],
+                PRIMARY_TOOL_ID
+            );
+            send(
+                &srv,
+                AgentEvent::TextDelta {
+                    text: FIRST_CHUNK.into(),
+                },
+            );
+            assert_chunk(FIRST_CHUNK).await;
+
+            dispatch_prompt(
+                &mut srv,
+                BTW_PROMPT,
+                true,
+                &RequestId::Number(BTW_PROMPT_ID),
             )
             .await
             .unwrap();
-            root_tx
-                .send(envelope(AgentEvent::TurnOutcome(TurnOutcome::completed(
-                    agent_id,
-                    turn_id,
-                    TokenUsage::default(),
-                    1,
-                    DoneReason::EndTurn,
-                ))))
-                .unwrap();
-
-            let terminal = next().await.unwrap();
-            assert_eq!(terminal["id"], PRIMARY_ID);
-            assert_eq!(terminal["result"]["stopReason"], END_TURN);
-            assert_eq!(
-                next().await.unwrap()["params"]["update"]["content"]["text"],
-                "isolated one isolated two"
+            let asked = turns.next().await;
+            assert!(text_of(&asked).ends_with(BTW_QUESTION), "{asked:?}");
+            assert_eq!(images_of(&asked).len(), 1);
+            release.send(Ok(())).unwrap();
+            assert_ne!(
+                next_btw_tool_call(&out, COMPLETED, PARKED_REPLY).await,
+                PRIMARY_TOOL_ID
             );
-            let terminal = next().await.unwrap();
-            assert_eq!(terminal["id"], ISOLATED_ID);
-            assert_eq!(terminal["result"]["stopReason"], END_TURN);
-            within(project, "isolated projector did not exit").await;
-            assert!(out_rx.is_empty());
+            assert_btw_terminal(&out, END_TURN).await;
+
+            send(
+                &srv,
+                AgentEvent::TextDelta {
+                    text: SECOND_CHUNK.into(),
+                },
+            );
+            assert_chunk(SECOND_CHUNK).await;
+            assert!(out.is_empty());
+            turns.release();
+            assert_eq!(
+                prompt_terminal(&out, PRIMARY_ID).await["result"]["stopReason"],
+                END_TURN
+            );
             close_session(&mut srv).await;
         });
     }
 
-    #[test]
-    fn btw_barrier_keeps_projected_and_restored_roots_but_ignores_later_roots() {
-        let projected = TurnId::generate();
-        let restored = TurnId::generate();
-        let later = TurnId::generate();
-        let pending = Arc::new(Mutex::new(Pending {
-            projected_root: BTreeSet::from([projected]),
-            continuing_root: BTreeSet::from([restored]),
-            ..Pending::default()
-        }));
-        let barrier = IsolatedBarrier::capture(&pending.lock().unwrap());
-        pending.lock().unwrap().projected_root.insert(later);
-        assert!(!barrier.is_clear(&pending.lock().unwrap()));
-        finish_primary_run(&pending, 1, Some(projected), |_| unreachable!());
-        assert!(!barrier.is_clear(&pending.lock().unwrap()));
-        finish_primary_run(&pending, 2, Some(restored), |_| unreachable!());
-        assert!(barrier.is_clear(&pending.lock().unwrap()));
+    async fn assert_btw_terminal(out: &Receiver<Value>, stop_reason: &str) {
+        let terminal = within(out.recv_async(), "missing /btw prompt response")
+            .await
+            .unwrap();
+        assert_eq!(terminal["id"], BTW_PROMPT_ID);
+        assert_eq!(terminal["result"]["stopReason"], stop_reason);
     }
 
     #[test]
-    fn btw_waits_for_admitted_runs_but_not_a_later_client_ask() {
-        const QUEUED_ID: i64 = 43;
-        const JOINED_ID: i64 = 44;
-        const ISOLATED_ID: i64 = 45;
-        const ISOLATED_ANSWER: &str = "isolated answer";
-        const TURN_BOUNDARY: &str = "separate prompt runs";
-        const LATER_PROMPT: &str = "later prompt";
-
+    fn btw_finishes_during_later_elicitation() {
         smol::block_on(async {
-            let (mut srv, out, turns) = server_with_parked_elicitation_turn().await;
-            let separate_turn = || {
-                turns
-                    .actor
-                    .push_control(TURN_BOUNDARY.into(), TURN_BOUNDARY.into(), None)
-                    .unwrap();
-            };
-            separate_turn();
+            let (release, released) = flume::bounded(1);
+            let (mut srv, _, out, turns) =
+                server_with_parked_provider(successful_checkpoint(), Some(released));
+            attach_parked_event_pump(&mut srv);
             dispatch_prompt(
                 &mut srv,
-                "already queued",
+                BTW_PROMPT,
                 false,
-                &RequestId::Number(QUEUED_ID),
+                &RequestId::Number(BTW_PROMPT_ID),
             )
             .await
             .unwrap();
-            let queued = turns.latest().turn_id();
-            let session = srv.session.as_ref().unwrap();
-            let pending = Arc::clone(&session.pending);
-            let sid = SessionId::from(session.handle.session_id.to_string());
-            let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
-            let barrier = {
-                let mut pending = pending.lock().unwrap();
-                pending.isolated = Some(PendingOperation {
-                    id: operation_id,
-                    request_id: RequestId::Number(ISOLATED_ID),
-                    kind: OperationKind::IsolatedTurn,
-                    run_id: None,
-                    cancelling: false,
-                    cancel: None,
-                    joined: Vec::new(),
-                });
-                IsolatedBarrier::capture(&pending)
-            };
-            let out_tx = srv.out_tx.clone();
-            let (isolated_tx, isolated_rx) = flume::unbounded();
-            isolated_tx
-                .send(IsolatedTurnEvent::TextDelta(ISOLATED_ANSWER.into()))
-                .unwrap();
-            isolated_tx.send(IsolatedTurnEvent::Done).unwrap();
-            let mut project = Box::pin(project_isolated_turn(
-                isolated_rx,
-                &pending,
-                operation_id,
-                barrier,
-                &out_tx,
-                &sid,
-            ));
-            assert!(poll_once(&mut project).await.is_none());
-
-            dispatch_prompt(
-                &mut srv,
-                "joins queued",
-                false,
-                &RequestId::Number(JOINED_ID),
-            )
-            .await
-            .unwrap();
-            assert_eq!(turns.latest().turn_id(), queued);
-            separate_turn();
-            dispatch_prompt(
-                &mut srv,
-                LATER_PROMPT,
-                false,
-                &RequestId::Number(NEXT_ELICITATION_PROMPT_ID),
-            )
-            .await
-            .unwrap();
-            assert_ne!(turns.latest().turn_id(), queued);
-
-            turns.release();
-            assert_eq!(
-                prompt_terminal(&out, ELICITATION_PROMPT_ID).await["result"]["stopReason"],
-                END_TURN
-            );
-            assert!(
-                poll_once(&mut project).await.is_none(),
-                "queued run is still in flight"
-            );
             turns.next().await;
-            turns.release();
-            for id in [QUEUED_ID, JOINED_ID] {
-                assert_eq!(
-                    prompt_terminal(&out, id).await["result"]["stopReason"],
-                    END_TURN
-                );
-            }
-
-            assert_eq!(turns.next_text().await, LATER_PROMPT);
+            assert!(turns.actor.latest_ticket().is_none());
+            park_elicitation_turn(&mut srv, &turns, NEXT_ELICITATION_PROMPT_ID).await;
             let (ask_id, answer) = request_elicitation(&srv, &out, &turns).await;
-            let mut finish_later = Box::pin(async {
-                assert_eq!(answer.recv().await.unwrap(), ELICITATION_DISMISSED);
-                turns.release();
-            });
-            assert!(poll_once(&mut finish_later).await.is_none());
-            within(project, "a later client ask blocked the isolated answer").await;
-            assert_eq!(
-                out.try_recv().unwrap()["params"]["update"]["content"]["text"],
-                ISOLATED_ANSWER
-            );
-            assert_eq!(
-                prompt_terminal(&out, ISOLATED_ID).await["result"]["stopReason"],
-                END_TURN
-            );
+
+            release.send(Ok(())).unwrap();
+            next_btw_tool_call(&out, COMPLETED, PARKED_REPLY).await;
+            assert_btw_terminal(&out, END_TURN).await;
             assert!(session_elicitations_contain(&srv, ask_id));
+            assert!(out.is_empty());
+
             handle_incoming_response(
                 &srv,
                 &serde_json::json!({ "id": ask_id, "result": { "action": "decline" } }),
             );
-            within(
-                finish_later,
-                "client answer did not unblock the later prompt",
-            )
-            .await;
+            assert_eq!(
+                within(answer.recv(), "later elicitation did not resolve")
+                    .await
+                    .unwrap(),
+                ELICITATION_DISMISSED
+            );
+            turns.release();
             assert_eq!(
                 prompt_terminal(&out, NEXT_ELICITATION_PROMPT_ID).await["result"]["stopReason"],
                 END_TURN
@@ -7442,39 +7332,41 @@ mod tests {
         });
     }
 
-    #[test]
-    fn btw_streams_and_completes_active_prompt() {
+    #[test_case(false ; "failure")]
+    #[test_case(true ; "cancellation")]
+    fn btw_unsuccessful_terminal(cancel: bool) {
+        const PROVIDER_ERROR: &str = "isolated provider failed";
+
         smol::block_on(async {
-            let (mut srv, _, out_rx, turns) = server_awaiting_answer();
-            install_registry(&mut srv, test_registry(&[]));
-
-            dispatch_prompt(&mut srv, "/btw why?", true, &RequestId::Number(31))
-                .await
-                .unwrap();
-            let asked = turns.next().await;
-            assert!(text_of(&asked).ends_with("\n\nwhy?"), "{asked:?}");
-            assert_eq!(images_of(&asked).len(), 1);
-            turns.release();
-
-            let thought = out_rx.recv_async().await.unwrap();
-            let answer = out_rx.recv_async().await.unwrap();
-            let terminal = out_rx.recv_async().await.unwrap();
-            assert_eq!(
-                thought["params"]["update"]["sessionUpdate"],
-                "agent_thought_chunk"
-            );
-            assert_eq!(
-                answer["params"]["update"]["sessionUpdate"],
-                "agent_message_chunk"
-            );
-            assert_eq!(answer["params"]["update"]["content"]["text"], PARKED_REPLY);
-            assert_eq!(terminal["id"], 31);
-            assert_eq!(terminal["result"]["stopReason"], "end_turn");
-            assert!(out_rx.is_empty(), "operation terminates exactly once");
-            assert!(
-                turns.actor.latest_ticket().is_none(),
-                "isolated turns bypass primary input"
-            );
+            let (mut srv, _, out, turns) = server_awaiting_answer();
+            dispatch_prompt(
+                &mut srv,
+                BTW_PROMPT,
+                false,
+                &RequestId::Number(BTW_PROMPT_ID),
+            )
+            .await
+            .unwrap();
+            turns.next().await;
+            if cancel {
+                cancel_elicitation_turn(&srv);
+                assert_btw_terminal(&out, CANCELLED).await;
+            } else {
+                turns
+                    .release
+                    .send(Err(AgentError::Config {
+                        message: PROVIDER_ERROR.into(),
+                    }))
+                    .unwrap();
+                next_btw_tool_call(&out, FAILED, PROVIDER_ERROR).await;
+                let terminal = within(out.recv_async(), "missing /btw error response")
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["id"], BTW_PROMPT_ID);
+                assert_eq!(terminal["error"]["data"], PROVIDER_ERROR);
+            }
+            assert!(out.is_empty());
+            close_session(&mut srv).await;
         });
     }
 
@@ -7817,7 +7709,11 @@ mod tests {
             let (mut srv, _, out_rx, _) = server_awaiting_answer();
             let (requests, received) = flume::unbounded();
             let (_release, release) = flume::unbounded();
-            let providers = spawn_test_providers(Arc::new(ParkedProvider { requests, release }));
+            let providers = spawn_test_providers(Arc::new(ParkedProvider {
+                requests,
+                release,
+                isolated_release: None,
+            }));
             let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.clone());
             params.providers = providers;
             let request = serde_json::json!({
@@ -9045,6 +8941,7 @@ mod tests {
             let providers = spawn_test_providers(Arc::new(ParkedProvider {
                 requests,
                 release: permits,
+                isolated_release: None,
             }));
             let mut params = test_params(providers.model(SPAWN_TEST_SPEC).unwrap(), cwd.into());
             params.providers = providers;

@@ -46,7 +46,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - The editor receives the target-scoped command list. The list updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text is rejected with an error. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Agent-turn commands preserve images and text resources. Local commands reject non-text content.
 - A `session/prompt` sent while a turn runs can [join that turn](/docs/agent-work/#messages-and-turns). Joined prompts resolve with the same stop reason. If a prompt cannot join, it resolves with its own turn. While `/compact` runs, ACP rejects new prompts.
 - `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
-- `/btw` can run during an active turn. ACP buffers the isolated answer until the question finishes and the primary prompts ahead of it have received their responses. Prompts can still join the active turn. See [Isolated questions](/docs/agent-work/#isolated-questions).
+- `/btw` can run during an active turn. ACP shows the answer as a completed tool call as soon as the side question finishes. Prompts can still join the active turn. See [Isolated questions](/docs/agent-work/#isolated-questions).
 - `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
 - `/reload-context` reloads the session's recorded context and can run from any agent. Normal resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
 
