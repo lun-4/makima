@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ impl From<&ProviderConfig> for Timeouts {
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-pub trait Provider: Send + Sync {
+pub trait Provider: Any + Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
         &'a self,

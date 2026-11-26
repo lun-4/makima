@@ -688,6 +688,7 @@ pub fn default_model_preparer(providers: Arc<ProviderRegistry>) -> ModelPreparer
 #[derive(Default)]
 pub struct HeadlessBackendOptions {
     pub persist_turn_results: bool,
+    pub child: bool,
     pub system_override: Option<String>,
     pub append_system: Option<String>,
     pub prompt_slots: PromptSlotSource,
@@ -728,7 +729,7 @@ impl HeadlessBackend {
                 mcp: options.mcp,
                 slots: options.prompt_slots,
                 modes: Arc::clone(&params.modes),
-                instructions: true,
+                instructions: !options.child,
             },
             params,
             persist_turn_results: options.persist_turn_results,
@@ -1603,6 +1604,7 @@ fn spawn_interactive(
                     raw_tx.clone(),
                     HeadlessBackendOptions {
                         persist_turn_results,
+                        child: false,
                         system_override: params.system_prompt_override,
                         append_system: params.append_system_prompt,
                         prompt_slots: params.prompt_slots,
@@ -2705,7 +2707,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tui_template_and_admitted_prompt_use_the_pinned_environment() {
+    fn admitted_prompt_inputs_survive_cwd_change() {
         smol::block_on(async {
             let lines = ToolOutputLines {
                 bash: OUTPUT_LINES,

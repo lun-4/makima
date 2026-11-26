@@ -19,9 +19,8 @@
 //! by a Lua command) and
 //! `event_loop::focus_tests::blank_session_sends_always_thinking_to_the_provider`
 //! (session defaults) and
-//! `agent::agent_loop::tests::ordinary_submission_paths_have_runtime_parity`
-//! (a message sent mid-turn joins it). The UI round-trip has no TUI counterpart: the TUI is
-//! the UI.
+//! `agent::runtime_tests::ordinary_submission_paths_have_runtime_parity`
+//! (a message sent mid-turn joins it). The TUI handles the UI round-trip directly.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
 //! temp dir, which is not how Windows finds its config.

@@ -1,10 +1,15 @@
+use std::path::Path;
 use std::sync::Arc;
 
+use makima_agent::agent::build_system_prompt_with_def;
 use makima_agent::agent::isolated_turn::{
     IsolatedTurnEvent, IsolatedTurnRequest, run_isolated_turn,
 };
-use makima_providers::provider::Provider;
-use makima_providers::{ConversationRelation, ImageSource, Model};
+use makima_agent::context::root_context;
+use makima_agent::state::StateError;
+use makima_agent::template::env_vars_for;
+use makima_agent::{AgentMode, AgentRef, CancelToken};
+use makima_providers::{ConversationRelation, ImageSource};
 use makima_storage::id::SessionRef;
 
 use crate::components::btw_modal::BtwEvent;
@@ -15,13 +20,39 @@ pub(super) const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant
 from the conversation context.";
 
 impl App {
-    pub(crate) fn start_btw(
-        &mut self,
-        question: String,
-        images: Vec<ImageSource>,
-        provider: Arc<dyn Provider>,
-        model: Model,
-    ) {
+    pub(super) fn btw_system(&self, root: &AgentRef, cwd: &Path) -> Result<String, StateError> {
+        let mut system = match &self.btw_prompt.override_text {
+            Some(system) => system.clone(),
+            None => match root_context(&root.state_access())? {
+                Some(recorded) => {
+                    let mode = AgentMode::Build;
+                    build_system_prompt_with_def(
+                        &env_vars_for(cwd),
+                        &self.lua_event_handle.mode_registry().current(&mode),
+                        &mode,
+                        &recorded.instructions.text,
+                        &recorded.slots,
+                    )
+                }
+                None => BTW_FALLBACK_SYSTEM.into(),
+            },
+        };
+        if let Some(append) = &self.btw_prompt.append_text {
+            system.push('\n');
+            system.push_str(append);
+        }
+        Ok(system)
+    }
+
+    pub(crate) fn start_btw(&mut self, question: String, images: Vec<ImageSource>) {
+        let Some(root) = &self.root_agent else {
+            return;
+        };
+        let config = self.root_config();
+        let system = match self.btw_system(root, config.context.cwd()) {
+            Ok(system) => system,
+            Err(error) => return self.flash(error.to_string()),
+        };
         let projection = self.session_projection();
         let live = self
             .shared_history
@@ -35,22 +66,16 @@ impl App {
                 .link(ConversationRelation::Branches, snapshot.messages.len())
         });
         let history = snapshot.map_or_else(Vec::new, |snapshot| Vec::clone(&snapshot.messages));
-        let system = self
-            .btw_system
-            .as_ref()
-            .map(|system| String::clone(&system.load()))
-            .filter(|system| !system.is_empty())
-            .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
         self.start_btw_request(IsolatedTurnRequest {
-            provider,
-            model,
+            provider: Arc::clone(&config.provider),
+            model: config.model.clone(),
             history,
             previous,
             system,
             question,
             images,
             session_id: Some(SessionRef::from(projection.id)),
-            cancel: makima_agent::CancelToken::none(),
+            cancel: CancelToken::none(),
         });
     }
 

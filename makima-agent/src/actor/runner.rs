@@ -117,7 +117,7 @@ impl Runner {
                 super::delivery::schedule(&self.inner, &mut state);
                 let guarded = state.idle.is_some();
                 let work = if self.inner.terminal_checkpoint.is_some()
-                    && state.pending_publications != 0
+                    && state.pending_terminal_publications != 0
                 {
                     None
                 } else {

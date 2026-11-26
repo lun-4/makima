@@ -1,23 +1,33 @@
-mod agent_loop;
 mod command_router;
 pub(crate) mod pending;
+#[cfg(test)]
+mod runtime_tests;
 pub(crate) mod shared_queue;
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use async_lock::Mutex;
+use makima_agent::actor::{ActorEvent, AgentContextSnapshot, EffectiveAgentConfig, PreparedModel};
+use makima_agent::headless::{FrontendProfile, HeadlessBackend, HeadlessBackendOptions};
 use makima_agent::journal::SessionJournal;
 use makima_agent::manager::ResidentAgent;
+use makima_agent::mcp::McpSession;
 use makima_agent::permissions::PermissionManager;
+use makima_agent::session_coordinator::ModelPreparer;
 use makima_agent::session_recovery::RecoveredSession;
-use makima_agent::tools::FileWriteLocks;
 use makima_agent::tools::offload::OffloadStore;
+use makima_agent::tools::{
+    FileReadTracker, FileWriteLocks, QuestionMode, ToolAudience, ToolContext, ToolRegistry,
+};
 use makima_agent::{
-    AgentConfig, AgentId, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot,
-    McpCommand, McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, AgentId, AgentLimits, AgentManagerHandle, AgentParams, CancelMap, CancelToken,
+    Envelope, HistorySnapshot, McpCommand, McpHandle, PreparedSessionMailbox, SessionMailbox,
+    SharedMessages, ToolOutputLines,
 };
 use makima_config::ModelPolicy;
 use makima_lua::EventHandle;
@@ -32,7 +42,6 @@ use tracing::{info, warn};
 use crate::app::App;
 use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
-use self::agent_loop::new_backend;
 use self::command_router::spawn_command_router;
 use self::shared_queue::actor_queue;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
@@ -51,17 +60,16 @@ pub(crate) struct TrackedProvider {
 }
 
 impl TrackedProvider {
-    fn new(
-        inner: Arc<dyn Provider>,
-        instance: ProviderInstanceGeneration,
-        change_tx: flume::Sender<ProviderChange>,
-    ) -> Self {
-        Self {
-            inner,
-            instance,
-            auth_generation: AtomicU64::new(0),
-            change_tx,
-        }
+    fn wrap(provider: Arc<dyn Provider>, change_tx: &flume::Sender<ProviderChange>) -> Arc<Self> {
+        let erased: Arc<dyn Any + Send + Sync> = provider.clone();
+        Arc::downcast(erased).unwrap_or_else(|_| {
+            Arc::new(Self {
+                inner: provider,
+                instance: next_provider_instance(),
+                auth_generation: AtomicU64::new(0),
+                change_tx: change_tx.clone(),
+            })
+        })
     }
 
     pub(crate) fn identity(&self) -> ProviderIdentity {
@@ -177,11 +185,7 @@ impl ProviderSlot {
         provider: Arc<dyn Provider>,
         change_tx: flume::Sender<ProviderChange>,
     ) -> Arc<Self> {
-        let tracked = Arc::new(TrackedProvider::new(
-            provider,
-            next_provider_instance(),
-            change_tx.clone(),
-        ));
+        let tracked = TrackedProvider::wrap(provider, &change_tx);
         Arc::new(Self {
             current: ArcSwap::from_pointee(ProviderSnapshot {
                 model,
@@ -199,6 +203,20 @@ impl ProviderSlot {
         self.change_tx.clone()
     }
 
+    pub(crate) fn track_model(&self, mut prepared: PreparedModel) -> PreparedModel {
+        prepared.provider = TrackedProvider::wrap(prepared.provider, &self.change_tx);
+        prepared
+    }
+
+    pub(crate) fn track_preparation(self: &Arc<Self>, prepare: ModelPreparer) -> ModelPreparer {
+        let slot = Arc::clone(self);
+        Arc::new(move |spec| {
+            let prepare = Arc::clone(&prepare);
+            let slot = Arc::clone(&slot);
+            Box::pin(async move { Ok(slot.track_model(prepare(spec).await?)) })
+        })
+    }
+
     pub(crate) fn project(&self, model: Model, provider: Arc<dyn Provider>) {
         let current = self.load();
         let tracked = Arc::clone(&current.provider) as Arc<dyn Provider>;
@@ -214,12 +232,7 @@ impl ProviderSlot {
     }
 
     pub(crate) fn install(&self, model: Model, provider: Arc<dyn Provider>) -> ProviderIdentity {
-        let instance = next_provider_instance();
-        let tracked = Arc::new(TrackedProvider::new(
-            provider,
-            instance,
-            self.change_tx.clone(),
-        ));
+        let tracked = TrackedProvider::wrap(provider, &self.change_tx);
         let identity = tracked.identity();
         self.current.store(Arc::new(ProviderSnapshot {
             model,
@@ -330,17 +343,16 @@ impl Drop for PreparedAgentHandles {
 pub(crate) struct AgentHandles {
     pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
-    pub(crate) actor_rx: flume::Receiver<makima_agent::actor::ActorEvent>,
+    pub(crate) actor_rx: flume::Receiver<ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: QueueSender,
     mailbox: Option<SessionMailbox>,
     cwd: Arc<ArcSwap<PathBuf>>,
     pub(crate) offload: Option<Arc<OffloadStore>>,
-    pub(crate) orchestration_template: makima_agent::tools::ToolContext,
+    pub(crate) orchestration_template: ToolContext,
     manager: AgentManagerHandle,
     root_id: makima_agent::AgentId,
     runner_start: Option<flume::Sender<()>>,
@@ -390,7 +402,6 @@ impl AgentHandles {
         );
         drop(selected);
         let mut handles = Self::prepare(
-            model_slot,
             initial_config,
             HistorySnapshot::new(initial_history),
             config,
@@ -416,8 +427,7 @@ impl AgentHandles {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
-        model_slot: &Arc<ProviderSlot>,
-        initial_config: makima_agent::EffectiveAgentConfig,
+        initial_config: EffectiveAgentConfig,
         initial_history: HistorySnapshot,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
@@ -435,7 +445,6 @@ impl AgentHandles {
         system_prompt: SystemPromptOverride,
     ) -> PreparedAgentHandles {
         spawn_agent_internal(
-            model_slot,
             initial_config,
             initial_history,
             config,
@@ -461,8 +470,7 @@ impl AgentHandles {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_recovered(
-        model_slot: &Arc<ProviderSlot>,
-        initial_config: makima_agent::EffectiveAgentConfig,
+        initial_config: EffectiveAgentConfig,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -479,7 +487,6 @@ impl AgentHandles {
     ) -> PreparedAgentHandles {
         let prepared_mailbox = SessionMailbox::prepare(session_id.id());
         let mailbox = prepared_mailbox.mailbox();
-        let model_slot = Arc::clone(model_slot);
         let permissions = Arc::clone(permissions);
         let cwd = Arc::new(ArcSwap::from_pointee(initial_cwd));
         PreparedAgentHandles {
@@ -507,7 +514,6 @@ impl AgentHandles {
                         .map_err(|error| error.to_string())?;
                 }
                 let mut prepared = spawn_agent_internal(
-                    &model_slot,
                     initial_config,
                     session.history_snapshot(),
                     config,
@@ -560,7 +566,6 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
         let restore_tx = makima_agent::EventSender::with_identity(
             self.agent_tx.clone(),
@@ -654,8 +659,7 @@ fn agent_limits(config: &AgentConfig) -> AgentLimits {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_internal(
-    model_slot: &Arc<ProviderSlot>,
-    initial_config: makima_agent::EffectiveAgentConfig,
+    initial_config: EffectiveAgentConfig,
     initial_history: HistorySnapshot,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -682,7 +686,6 @@ fn spawn_agent_internal(
     // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
     let initial_history = Arc::unwrap_or_clone(initial_history.messages);
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let prepared_mailbox = session_id
         .as_ref()
@@ -694,7 +697,7 @@ fn spawn_agent_internal(
             .map(PreparedSessionMailbox::mailbox)
     });
 
-    let (init_trigger, init_cancel) = makima_agent::CancelToken::new();
+    let (init_trigger, init_cancel) = CancelToken::new();
 
     let restored = restored_manager.is_some();
     let manager = match restored_manager {
@@ -708,44 +711,54 @@ fn spawn_agent_internal(
             .map_err(|error| error.to_string())?;
     }
     let (runner_start, start_rx) = flume::bounded(1);
-    let mut orchestration_template = None;
-    let initial_config = initial_config.with_context(
-        makima_agent::actor::AgentContextSnapshot::new((**cwd.load()).clone()),
-    );
-    let factory_history = initial_history.clone();
-    let factory = |agent_id| {
-        let backend = new_backend(
-            agent_id,
-            Arc::clone(model_slot),
-            Arc::clone(&cwd),
+    let initial_config =
+        initial_config.with_context(AgentContextSnapshot::new((**cwd.load()).clone()));
+    let root_id = root_id.unwrap_or_else(AgentId::generate);
+    let backend = HeadlessBackend::new(
+        AgentParams {
+            agent_id: root_id,
+            provider: Arc::clone(&initial_config.provider),
+            model: initial_config.model.clone(),
             config,
             tool_output_lines,
-            Arc::clone(&btw_system),
-            mcp_handle.clone(),
-            &factory_history,
-            Arc::clone(permissions),
-            agent_tx.clone(),
-            answer_rx,
+            permissions: Arc::clone(permissions),
             session_id,
-            mailbox.clone(),
+            mailbox: mailbox.clone(),
             timeouts,
-            lua_handle,
-            Arc::clone(&subagent_cancels),
-            Arc::clone(&model_policy),
-            Arc::clone(&providers),
-            system_prompt.clone(),
+            file_tracker: FileReadTracker::fresh(),
+            prompt_slots: Arc::default(),
+            root_context: None,
+            modes: lua_handle.mode_registry(),
+            subagent_cancels: Arc::clone(&subagent_cancels),
+            registry: Arc::clone(ToolRegistry::global_arc()),
+            audience: ToolAudience::MAIN,
+            question_mode: QuestionMode::Tui,
+            interactive_reauth: true,
+            model_policy,
+            providers,
             file_write_locks,
-            offload.clone(),
-            init_cancel,
-        );
-        orchestration_template = Some(backend.orchestration_template());
-        Box::new(backend) as Box<dyn makima_agent::ActorBackend>
-    };
-    let root_id = root_id.unwrap_or_else(AgentId::generate);
+            offload: offload.clone(),
+            managed_turn: None,
+        },
+        FrontendProfile::tui(tool_output_lines, init_cancel),
+        agent_tx.clone(),
+        HeadlessBackendOptions {
+            persist_turn_results: true,
+            system_override: system_prompt.override_text,
+            append_system: system_prompt.append_text,
+            prompt_slots: lua_handle.prompt_slot_source(),
+            mcp: mcp_handle
+                .clone()
+                .map(|handle| McpSession::new(handle, &initial_history)),
+            answer_rx: Some(Arc::new(Mutex::new(answer_rx))),
+            ..Default::default()
+        },
+    );
+    let orchestration_template = backend.template(&initial_config);
     let root = if restored {
         smol::block_on(manager.ensure_resident_with(root_id, |_| async {
             Ok(ResidentAgent {
-                backend: factory(root_id),
+                backend: Box::new(backend),
                 config: initial_config,
                 shared_messages: Some(Arc::clone(&shared_history)),
                 start: Some(start_rx),
@@ -756,9 +769,9 @@ fn spawn_agent_internal(
         manager.create_root_deferred_with_id_and_config(
             root_id,
             Some(initial_config),
-            initial_history.clone(),
+            initial_history,
             Some(Arc::clone(&shared_history)),
-            |id| Ok::<_, String>(factory(id)),
+            |_| Ok::<_, String>(Box::new(backend)),
             start_rx,
         )
     }
@@ -783,14 +796,12 @@ fn spawn_agent_internal(
             agent_tx,
             answer_tx,
             history: shared_history,
-            btw_system,
             mcp_handle,
             queue: queue_tx,
             mailbox,
             cwd,
             offload,
-            orchestration_template: orchestration_template
-                .expect("root factory prepares orchestration template"),
+            orchestration_template,
             manager,
             root_id,
             runner_start: Some(runner_start),
@@ -811,10 +822,15 @@ mod tests {
         AgentError, Invocation, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse,
     };
 
-    use super::*;
+    use super::{
+        AgentConfig, AgentHandles, Arc, Duration, EventHandle, Message, Model, ModelPolicy,
+        PermissionManager, Provider, ProviderAuthGeneration, ProviderChange, ProviderSlot,
+        SessionRef, SystemPromptOverride, ToolOutputLines, join_all,
+    };
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
+    const TEST_CWD: &str = "/tmp";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
 
     struct StubProvider;
@@ -885,8 +901,8 @@ mod tests {
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
-            PathBuf::from("/tmp"),
-            makima_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
+            PathBuf::from(TEST_CWD),
+            makima_config::ProjectConfig::for_project(std::path::Path::new(TEST_CWD)),
             Arc::default(),
         ));
         AgentHandles::spawn(
@@ -895,7 +911,7 @@ mod tests {
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,
-            PathBuf::from("/tmp"),
+            PathBuf::from(TEST_CWD),
             None,
             makima_providers::Timeouts::default(),
             EventHandle::disconnected_for_test(),
@@ -904,6 +920,19 @@ mod tests {
             Arc::default(),
             SystemPromptOverride::default(),
         )
+    }
+
+    #[test]
+    fn inherited_template_has_environment_before_initialization() {
+        let handles = stub_spawn(Vec::new());
+        let template = &handles.orchestration_template;
+        assert_eq!(template.cwd, PathBuf::from(TEST_CWD));
+        let tools = template.request_tools.as_ref().unwrap().definitions();
+        let tools = serde_json::to_string(tools).unwrap();
+        for unresolved in ["{cwd}", "{platform}", "{date}"] {
+            assert!(!tools.contains(unresolved));
+        }
+        smol::block_on(handles.shutdown());
     }
 
     #[test]

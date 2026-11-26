@@ -543,6 +543,7 @@ pub(crate) struct ActorState {
     suspended: bool,
     publication_registrations: Vec<Weak<PublicationGuard>>,
     pending_publications: usize,
+    pending_terminal_publications: usize,
     idle_pending: bool,
     /// The runner took work and has not run out yet; set across the whole
     /// batch, so a child's result is with its parent before this clears.
@@ -1229,6 +1230,7 @@ impl ActorState {
             suspended: false,
             publication_registrations: Vec::new(),
             pending_publications: 0,
+            pending_terminal_publications: 0,
             idle_pending: false,
             runner_busy: false,
             status: ActorStatus::Idle,
@@ -1404,6 +1406,7 @@ fn retire_turn(
     }
     state.usage += outcome.usage();
     state.pending_publications += 1;
+    state.pending_terminal_publications += 1;
     let ticket = tickets.remove(&turn_id);
     if let Some(ticket) = &ticket {
         inner
@@ -1608,6 +1611,7 @@ fn publish_terminal(
     }
     state.turn_work.remove(&turn_id);
     state.pending_publications -= 1;
+    state.pending_terminal_publications -= 1;
     state.finish_close(inner);
     state.publish_idle(inner);
     inner.queue.notify();

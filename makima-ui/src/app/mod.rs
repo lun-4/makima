@@ -61,7 +61,7 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::is_newline_key;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{
@@ -117,6 +117,7 @@ use crate::chat::{COMPLETION_PREVIEW_CHARS, COMPLETION_TRUNCATED};
 
 #[cfg(test)]
 pub(crate) use crate::agent::QueuedMessage;
+use crate::agent::SystemPromptOverride;
 
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
@@ -463,7 +464,7 @@ pub struct App {
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
+    pub(crate) btw_prompt: SystemPromptOverride,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     #[cfg(test)]
     fixture_journal: Option<Arc<SessionJournal>>,
@@ -667,7 +668,7 @@ impl App {
             available_models,
             model_picker_models,
             shared_history: None,
-            btw_system: None,
+            btw_prompt: SystemPromptOverride::default(),
             image_paste_rx: vec![],
             #[cfg(test)]
             fixture_journal: None,
@@ -3632,14 +3633,16 @@ impl App {
             })
             .collect();
         let system = if self.chats[0].agent_id == Some(admission.target.id()) {
-            self.btw_system
-                .as_ref()
-                .map(|system| String::clone(&system.load()))
-                .filter(|system| !system.is_empty())
+            match self.btw_system(&admission.target, &admission.template.cwd) {
+                Ok(system) => system,
+                Err(error) => {
+                    self.flash(error.to_string());
+                    return vec![];
+                }
+            }
         } else {
-            None
-        }
-        .unwrap_or_else(|| btw::BTW_FALLBACK_SYSTEM.to_string());
+            btw::BTW_FALLBACK_SYSTEM.into()
+        };
         self.start_btw_request(IsolatedTurnRequest {
             provider: Arc::clone(&admission.template.provider),
             model: (*admission.template.model).clone(),

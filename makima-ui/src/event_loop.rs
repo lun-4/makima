@@ -30,6 +30,7 @@ use makima_agent::command::{CONTEXT_RELOADED, CustomCommand};
 use makima_agent::config_change::{
     ConfigChangeError, ConfigChangeTicket, prepare_model, prepare_selection,
 };
+#[cfg(test)]
 use makima_agent::context::root_context;
 use makima_agent::end_conversation_detached;
 use makima_agent::headless::{checkpoint_deferred_startup_config, default_model_preparer};
@@ -50,11 +51,10 @@ use makima_agent::session_options::{
 use makima_agent::session_recovery::{
     OpenModel, RecoveryCandidate, SessionSource, open_session, prepare_session_recovery,
 };
-use makima_agent::template::env_vars_for;
 use makima_agent::tools::FileWriteLocks;
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::{
-    AgentConfig, AgentEvent, AgentId, AgentMode, AgentRef, CancelToken, CancelTrigger, Envelope,
+    AgentConfig, AgentEvent, AgentId, AgentRef, CancelToken, CancelTrigger, Envelope,
     GraphLifecycle, McpCommand, McpConfigErrors, McpHandle, McpSnapshotReader, mcp,
 };
 use makima_commands::{BuiltinOperation, CommandError, HostResponse};
@@ -728,7 +728,7 @@ fn observe_config_commits(
             .and_then(|target| {
                 coordinator.bind_actor(
                     target,
-                    prepare,
+                    model_slot.track_preparation(prepare),
                     Arc::new(move |commit| {
                         model_slot.project(
                             commit.config.model.clone(),
@@ -1670,8 +1670,8 @@ impl SpawnCtx {
         )?;
         app.app.state.warnings.extend(state.warnings);
         app.app.state.warnings.extend(model_warning);
+        app.app.btw_prompt = self.system_prompt.clone();
         let handles = AgentHandles::prepare_recovered(
-            &model_slot,
             config,
             self.config.clone(),
             self.ui_config.tool_output_lines,
@@ -4466,17 +4466,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question, images) => {
-                if let Err(error) = self.refresh_recorded_btw(idx) {
-                    self.sessions[idx].app.flash(error);
-                    return;
-                }
-                let slot = self.sessions[idx].model_slot.load();
-                self.sessions[idx].app.start_btw(
-                    question,
-                    images,
-                    Arc::clone(&slot.provider) as Arc<dyn Provider>,
-                    slot.model.clone(),
-                );
+                self.sessions[idx].app.start_btw(question, images);
             }
             Action::Suspend => {
                 self.prepare_terminal_handoff();
@@ -4533,13 +4523,7 @@ impl<'t> EventLoop<'t> {
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::ContextReloaded => match result {
-                Ok(()) => {
-                    if let Err(error) = self.refresh_recorded_btw(idx) {
-                        self.sessions[idx].app.flash(error);
-                    } else {
-                        self.sessions[idx].app.flash(CONTEXT_RELOADED.into());
-                    }
-                }
+                Ok(()) => self.sessions[idx].app.flash(CONTEXT_RELOADED.into()),
                 Err(error) => self.sessions[idx].app.flash(error),
             },
             SessionOpKind::DirectoryChanged { adopted } => match result {
@@ -4663,40 +4647,6 @@ impl<'t> EventLoop<'t> {
             .validate_live()
             .map_err(|error| error.to_string())?;
         pinned.actor()
-    }
-
-    fn refresh_recorded_btw(&self, idx: usize) -> Result<(), String> {
-        let runtime = &self.sessions[idx];
-        let (manager, root) = runtime.handles.manager_and_root();
-        let target = manager.lookup(root).map_err(|error| error.to_string())?;
-        let Some(recorded) =
-            root_context(&target.state_access()).map_err(|error| error.to_string())?
-        else {
-            return Ok(());
-        };
-        let config = runtime.config().ok_or(NOT_LIVE_ERR)?;
-        let mode = AgentMode::Build;
-        let vars = env_vars_for(config.context.cwd());
-        let mut system = self
-            .ctx
-            .system_prompt
-            .override_text
-            .clone()
-            .unwrap_or_else(|| {
-                makima_agent::agent::build_system_prompt_with_def(
-                    &vars,
-                    &self.ctx.lua_event_handle.mode_registry().current(&mode),
-                    &mode,
-                    &recorded.instructions.text,
-                    &recorded.slots,
-                )
-            });
-        if let Some(append) = &self.ctx.system_prompt.append_text {
-            system.push('\n');
-            system.push_str(append);
-        }
-        runtime.handles.btw_system.store(Arc::new(system));
-        Ok(())
     }
 
     fn dispatch_context_reload(
@@ -4980,7 +4930,9 @@ impl<'t> EventLoop<'t> {
                 Ok(ticket)
             });
         let policy = target_policy.unwrap_or_else(|| Arc::clone(&self.ctx.model_policy));
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = self.sessions[idx]
+            .model_slot
+            .track_preparation(Arc::clone(&self.ctx.prepare_provider));
         let internal_tx = self.internal_tx.clone();
         let session = self.sessions[idx].id();
         let runtime = self.sessions[idx].handles.identity();
@@ -5025,7 +4977,9 @@ impl<'t> EventLoop<'t> {
     /// Re-prepares the root's current model, for instance after logging in to its provider.
     fn reprepare_root_model(&self, idx: usize, spec: String) {
         let policy = Arc::clone(&self.ctx.model_policy);
-        let prepare = Arc::clone(&self.ctx.prepare_provider);
+        let prepare = self.sessions[idx]
+            .model_slot
+            .track_preparation(Arc::clone(&self.ctx.prepare_provider));
         self.refresh_root_model(idx, None, async move {
             prepare_model(&spec, &policy, &prepare).await
         });
@@ -5071,7 +5025,9 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             if let Some(idx) = self.position(session) {
-                let replacement = replacement.clone();
+                let replacement = self.sessions[idx]
+                    .model_slot
+                    .track_model(replacement.clone());
                 self.refresh_root_model(idx, Some(expected), async move { Ok(replacement) });
             }
         }
@@ -13678,7 +13634,6 @@ end })
         with_event_loop(|event_loop| {
             let (requests, received) = flume::unbounded();
             let provider: Arc<dyn Provider> = Arc::new(RecordingProvider(requests));
-            let committed_provider = Arc::clone(&provider);
             event_loop.ctx.prepare_provider = sync_preparer(move |model| {
                 Ok(PreparedModel {
                     model: adjusted(model),
@@ -13735,8 +13690,9 @@ end })
             drain_config_commits(&mut event_loop.sessions[0]);
             let after = actor.config_snapshot().unwrap();
             assert_eq!(after.generation, before.generation + 1);
-            assert!(Arc::ptr_eq(&after.config.provider, &committed_provider));
             let runtime = &event_loop.sessions[0];
+            let tracked = Arc::clone(&runtime.model_slot.load().provider) as Arc<dyn Provider>;
+            assert!(Arc::ptr_eq(&after.config.provider, &tracked));
             let view = runtime.app.state.projection.fold().unwrap();
             let projected = view.scopes[&Some(root)].config.as_ref().unwrap();
             assert_eq!(runtime.app.state.projection.model(), MODEL);
