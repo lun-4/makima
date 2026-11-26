@@ -1351,6 +1351,19 @@ impl SessionJournal {
         self.conversion_changed.listen()
     }
 
+    pub(crate) fn incarnation_terminals_ready(&self, agent: AgentId, reservation: u64) -> bool {
+        let state = self.lock();
+        let binding = JournalIncarnation { agent, reservation };
+        // Reactivation reads the ready prefix, which can still lag converted results.
+        !state
+            .results
+            .values()
+            .any(|result| result.incarnation.as_ref() == Some(&binding))
+            && !state.snapshot.state.after(state.ready.seq).any(|record| {
+                record.agent == Some(agent) && matches!(record.change, StateChange::Turn { .. })
+            })
+    }
+
     pub async fn wait_terminal_conversion(
         &self,
         agent: AgentId,

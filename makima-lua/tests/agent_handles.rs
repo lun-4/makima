@@ -578,6 +578,7 @@ struct FixtureOptions {
     modes: Vec<makima_agent::ModeDefSpec>,
     limits: AgentLimits,
     bundled_tasks: bool,
+    real_orchestration: bool,
     authority_probes: bool,
     audience_ceiling: bool,
     nested_capture: bool,
@@ -659,6 +660,7 @@ struct Fixture {
     completed: flume::Receiver<Result<(), String>>,
     observations: flume::Receiver<(TurnId, TurnProvenance, Vec<Message>)>,
     root_ticket: makima_agent::TurnTicket,
+    root_target: TrustedTarget,
 }
 
 impl Fixture {
@@ -683,6 +685,7 @@ impl Fixture {
             modes,
             limits,
             bundled_tasks,
+            real_orchestration,
             authority_probes,
             audience_ceiling,
             nested_capture,
@@ -904,14 +907,22 @@ impl Fixture {
                 }) as Box<dyn ActorBackend>)
             })
             .unwrap();
-        let mut services = RegisteredOrchestrationTargets::new(vec![TrustedTarget {
+        let target = TrustedTarget {
             target: root.clone(),
             template,
-        }]);
-        services.config_mutations = config_mutations;
-        services.completion = completion;
-        host.event_handle()
-            .install_orchestration_services(Arc::new(services));
+        };
+        let services: Arc<dyn OrchestrationServices> = if real_orchestration {
+            let services = AgentOrchestration::new(Arc::default());
+            services.register_root(target.clone(), config_mutations);
+            services.select(Some(root.clone()));
+            Arc::new(services)
+        } else {
+            let mut services = RegisteredOrchestrationTargets::new(vec![target.clone()]);
+            services.config_mutations = config_mutations;
+            services.completion = completion;
+            Arc::new(services)
+        };
+        host.event_handle().install_orchestration_services(services);
         host.wait_for_worker_barrier_for_test();
         let root_ticket = root
             .actor()
@@ -936,6 +947,7 @@ impl Fixture {
             completed,
             observations,
             root_ticket,
+            root_target: target,
         }
     }
 
@@ -4121,6 +4133,117 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
             "accepted reload retains detached owned agents",
         )
         .await;
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
+fn reload_settles_running_child_once_before_wake() {
+    const OWNER: &str = "reload_running_child";
+    const START: &str = "/reload_running_child_start";
+    const WAKE: &str = "/reload_running_child_wake";
+    const NEXT_PROMPT: &str = "fresh turn after reload";
+    smol::block_on(async {
+        let fixture = Fixture::start_with_options(
+            "reload_running_child_root",
+            FixtureOptions {
+                real_orchestration: true,
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "root completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        fixture._host.load_source(OWNER, r#"
+            makima.api.register_command({
+                name = "/reload_running_child_start", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    assert(child:send(ctx, "running before reload", { when = "idle" }))
+                end,
+            })
+        "#).unwrap();
+        let run = |command: &str| {
+            run_command(
+                &fixture._host.command_registry(),
+                command,
+                0,
+                Some(fixture.root_target.clone()),
+            )
+        };
+        assert_eq!(run(START).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let active_request = fixture.request().await;
+        let child_id = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id.is_some())
+            .unwrap()
+            .agent_id;
+        let child = fixture.manager.lookup(child_id).unwrap();
+        let ticket = fixture
+            .manager
+            .latest_retained_turn_ticket(&child)
+            .unwrap()
+            .unwrap();
+        let turn = ticket.turn_id();
+        assert!(ticket.peek().is_none());
+        fixture._host.queue_load_source_for_test(OWNER, &format!(r#"
+            makima.api.register_command({{
+                name = "{WAKE}", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.get(ctx, "{child_id}"))
+                    assert(child:send(ctx, "{NEXT_PROMPT}", {{ when = "idle", after_turn = "{turn}" }}))
+                end,
+            }})
+        "#)).unwrap().recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
+        wait_for_gate_drop(&active_request, "reload cancellation").await;
+        let result = bounded(ticket.wait_result(), "retained child ticket").await;
+        assert!(matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Shutdown,
+                ..
+            }
+        ));
+        wait_for_retained_children(
+            &fixture.manager,
+            &[child_id],
+            GraphLifecycle::Dormant,
+            StoredAgentLifecycle::Open,
+            "reload detach",
+        )
+        .await;
+        assert_eq!(
+            child.turn_ticket(turn).unwrap().peek_result(),
+            Some(result.clone())
+        );
+
+        let command = run(WAKE);
+        let fresh = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "fresh request after wake",
+        )
+        .await;
+        assert_eq!(
+            fresh.messages.last().and_then(Message::first_text_content),
+            Some(NEXT_PROMPT)
+        );
+        fresh.reply.send(common::canned_reply(FIRST_REPLY)).unwrap();
+        assert_eq!(command.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let next = child.actor().unwrap().latest_ticket().unwrap();
+        assert_ne!(next.turn_id(), turn);
+        assert!(matches!(
+            bounded(next.wait(), "fresh turn settlement").await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(child.turn_ticket(turn).unwrap().peek_result(), Some(result));
+        assert!(fixture.requests.is_empty());
         shutdown_manager(&fixture.manager).await;
     });
 }

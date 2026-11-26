@@ -1692,7 +1692,15 @@ impl AgentManagerHandle {
         let Some(_publication) = self.0.journal.try_publication_read() else {
             return self.defer_incarnation_cleanup(incarnation, false, None);
         };
-        self.detach_incarnation_held(incarnation)
+        let Some(actor) = self.begin_incarnation_cleanup(incarnation, false, None)? else {
+            return Ok(());
+        };
+        if self.detach_ready(incarnation, actor.as_ref()) {
+            self.detach_incarnation_held(incarnation)
+        } else {
+            self.schedule_incarnation_cleanup(incarnation, false, actor);
+            Ok(())
+        }
     }
 
     fn defer_incarnation_cleanup(
@@ -1701,6 +1709,18 @@ impl AgentManagerHandle {
         rollback: bool,
         abandonment: Option<ManagerError>,
     ) -> Result<(), ManagerError> {
+        if let Some(actor) = self.begin_incarnation_cleanup(incarnation, rollback, abandonment)? {
+            self.schedule_incarnation_cleanup(incarnation, rollback, actor);
+        }
+        Ok(())
+    }
+
+    fn begin_incarnation_cleanup(
+        &self,
+        incarnation: &AgentIncarnation,
+        rollback: bool,
+        abandonment: Option<ManagerError>,
+    ) -> Result<Option<Option<AgentActorHandle>>, ManagerError> {
         if incarnation.manager_generation != self.generation() {
             return Err(ManagerError::WrongManager);
         }
@@ -1717,10 +1737,10 @@ impl AgentManagerHandle {
                 && (!node.reservation_pending
                     || (abandonment.is_some() && node.activation_finishing))
             {
-                return Ok(());
+                return Ok(None);
             }
             if node.detach_pending {
-                return Ok(());
+                return Ok(None);
             }
             self.0.work.set_open_for_incarnation(
                 incarnation.agent_id,
@@ -1739,13 +1759,52 @@ impl AgentManagerHandle {
             graph.revision += 1;
             actor
         };
-        if let Some(actor) = actor {
+        if let Some(actor) = &actor {
             actor.shutdown();
         }
+        Ok(Some(actor))
+    }
+
+    fn detach_ready(
+        &self,
+        incarnation: &AgentIncarnation,
+        actor: Option<&AgentActorHandle>,
+    ) -> bool {
+        actor.is_none_or(AgentActorHandle::close_emitted)
+            && self
+                .0
+                .journal
+                .incarnation_terminals_ready(incarnation.agent_id, incarnation.reservation)
+            && self.tool_completions_finished(Some(incarnation.agent_id))
+    }
+
+    fn schedule_incarnation_cleanup(
+        &self,
+        incarnation: &AgentIncarnation,
+        rollback: bool,
+        actor: Option<AgentActorHandle>,
+    ) {
         let manager = self.clone();
         let incarnation = incarnation.clone();
         self.retain_cleanup_task(smol::spawn(async move {
             manager.drain_tool_completions(incarnation.agent_id).await;
+            if !rollback {
+                if let Some(actor) = actor {
+                    let events = actor.subscribe_events();
+                    while events.recv_async().await.is_ok() {}
+                }
+                loop {
+                    let changed = manager.0.journal.listen_for_terminal_conversion();
+                    if manager
+                        .0
+                        .journal
+                        .incarnation_terminals_ready(incarnation.agent_id, incarnation.reservation)
+                    {
+                        break;
+                    }
+                    changed.await;
+                }
+            }
             let _completion = manager.0.activation_completion.write_arc().await;
             let _publication = manager.0.journal.publication_read().await;
             if rollback {
@@ -1757,17 +1816,12 @@ impl AgentManagerHandle {
             }
             manager.0.reaped.notify(usize::MAX);
         }));
-        Ok(())
     }
 
     fn detach_incarnation_held(&self, incarnation: &AgentIncarnation) -> Result<(), ManagerError> {
         self.validate_incarnation(incarnation)?;
         let resources = {
             let mut graph = self.lock_graph();
-            if !self.tool_completions_finished(Some(incarnation.agent_id)) {
-                drop(graph);
-                return self.defer_incarnation_cleanup(incarnation, false, None);
-            }
             let replacement = Self::next_reservation(&mut graph);
             let node = graph
                 .nodes

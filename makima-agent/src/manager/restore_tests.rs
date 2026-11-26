@@ -592,76 +592,121 @@ fn close_pending_factory_settles_closed_without_resources(drop_factory: bool) {
     });
 }
 
-#[test]
-fn detached_backend_cleanup_cannot_overwrite_replacement_history() {
+#[test_case(false; "direct_detach")]
+#[test_case(true; "publication_blocked")]
+fn detached_running_child_settles_retained_ticket_before_wake(publication_blocked: bool) {
     smol::block_on(async {
         let records = records();
-        let id = records[0].id;
+        let id = records[1].id;
         let journal = journal(&records);
         let manager = restore(&journal, AgentLimits::default()).unwrap();
         let (entered, running) = flume::bounded(1);
         let (release, wait) = flume::bounded(1);
         let (cleaned, cleanup) = flume::bounded(1);
-        let old = manager
+        let child = manager
             .ensure_resident_with(id, |_| async move {
-                let mut resident = resident();
-                resident.backend = Box::new(GatedCleanupBackend {
-                    entered,
-                    release: wait,
-                    cleaned,
-                });
-                Ok(resident)
+                Ok(ResidentAgent {
+                    backend: Box::new(GatedCleanupBackend {
+                        entered,
+                        release: wait,
+                        cleaned,
+                    }),
+                    ..resident()
+                })
             })
             .await
             .unwrap();
-        let actor = old.actor().unwrap();
-        actor
+        let actor = child.actor().unwrap();
+        let ticket = actor
             .submit(
-                AgentInput {
-                    message: HISTORY_TEXT.into(),
-                    images: Vec::new(),
-                    preamble: Vec::new(),
-                    prompt: None,
-                },
+                AgentInput::new(HISTORY_TEXT.into(), Vec::new()),
                 None,
                 HISTORY_TEXT.into(),
-                crate::TurnAdmissionOptions::default(),
+                TurnAdmissionOptions::default(),
             )
             .unwrap();
-        running.recv_async().await.unwrap();
+        running.recv_timeout(DETACH_TIMEOUT).unwrap();
+        let retained = manager
+            .retained_turn_ticket(&child, ticket.turn_id())
+            .unwrap();
+        let binding = journal.incarnation(id);
+        let publication = if publication_blocked {
+            Some(journal.reserve_publication().await)
+        } else {
+            None
+        };
         manager
-            .detach_incarnation(&manager.incarnation(id).unwrap())
+            .detach_incarnation(&child.incarnation().unwrap())
             .unwrap();
-        let replacement = manager
-            .ensure_resident_with(id, |_| async { Ok(resident()) })
-            .await
-            .unwrap();
-        let expected = journal.checkpoint_snapshot().unwrap().histories[&id].clone();
-        let identity = replacement.actor().unwrap().identity();
-        release.send(()).unwrap();
-        cleanup.recv_async().await.unwrap();
-        assert_history(
-            &journal.checkpoint_snapshot().unwrap().histories[&id],
-            &expected,
-        );
-        assert_history(
-            &replacement.actor().unwrap().committed_history_snapshot(),
-            &expected,
-        );
-        assert!(Arc::ptr_eq(
-            &identity,
-            &manager.actor(id).unwrap().identity()
+        assert_eq!(journal.incarnation(id), binding);
+        assert!(matches!(
+            child.wake().await,
+            Err(WakeError::Manager(ManagerError::Reactivation(
+                ReactivationError::Cancelled
+            )))
         ));
+        assert!(retained.peek().is_none());
+        drop(publication);
+        release.send(()).unwrap();
+        cleanup.recv_timeout(DETACH_TIMEOUT).unwrap();
+        wait_for_incarnation_cleanup(&journal, &binding).await;
+        assert_dormant(&manager, id);
+        let result = retained.wait_result().await;
+        assert!(matches!(
+            result.outcome,
+            crate::TurnOutcome::Cancelled {
+                reason: crate::TurnCancellationReason::Shutdown,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .retained_turn_ticket(&child, ticket.turn_id())
+                .unwrap()
+                .peek_result(),
+            Some(result.clone())
+        );
+
+        manager.set_reactivator(Some(Arc::new(
+            |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async { Ok(resident()) })
+                        .await?;
+                    Ok(())
+                })
+            },
+        )));
+        child.wake().await.unwrap();
+        let replacement = child.actor().unwrap();
+        assert!(!replacement.same_actor(&actor));
+        assert!(
+            graph_quiescence_barrier(slice::from_ref(&replacement))
+                .await
+                .unwrap()[0]
+                .is_quiescent()
+        );
+        assert_eq!(
+            replacement
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .peek_result(),
+            Some(result)
+        );
+        let snapshot = journal.snapshot();
+        let view = snapshot.fold().unwrap();
+        assert!(
+            !view.scopes[&Some(id)]
+                .admitted
+                .contains_key(&ticket.turn_id())
+        );
+        assert_eq!(snapshot.state.iter().filter(|record| record.agent == Some(id) && matches!(&record.change, StateChange::Turn { turn, .. } if *turn == ticket.turn_id())).count(), 1);
         assert!(
             manager
                 .shutdown(SHUTDOWN_TIMEOUT)
                 .await
                 .timed_out
                 .is_empty()
-        );
-        assert_history(
-            &journal.checkpoint_snapshot().unwrap().histories[&id],
-            &expected,
         );
     });
 }

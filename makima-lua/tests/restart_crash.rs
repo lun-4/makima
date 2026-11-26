@@ -3,7 +3,8 @@ mod common;
 
 use common::{RestartHost, TestSession};
 use makima_agent::{
-    AgentEvent, AgentId, AgentInput, TurnAdmissionOptions, TurnId, TurnOutcome, actor::ActorStatus,
+    ActorLifecycle, AgentEvent, AgentId, AgentInput, TurnAdmissionOptions, TurnCancellationReason,
+    TurnId, TurnOutcome, actor::ActorStatus,
 };
 use makima_lua::test_support::{InMemoryFs, run_command};
 use makima_providers::{
@@ -14,7 +15,7 @@ use makima_providers::{
 use makima_storage::{
     StateDir,
     id::SessionRef,
-    session_state::{StateChange, StoredDoneReason, StoredTurnStatus},
+    session_state::{StateChange, StoredCancellationReason, StoredDoneReason, StoredTurnStatus},
 };
 use serde_json::{Value, json};
 use std::{
@@ -153,9 +154,24 @@ struct Request {
     reply: flume::Sender<StreamResponse>,
 }
 
+struct StreamGate {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+struct StreamDropGate<'a>(&'a StreamGate);
+
+impl Drop for StreamDropGate<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.entered.send(());
+        let _ = self.0.release.recv_timeout(RESTORED_REQUEST_TIMEOUT);
+    }
+}
+
 struct GatedProvider {
     requests: flume::Sender<Request>,
     calls: AtomicUsize,
+    first_stream_drop: Option<StreamGate>,
 }
 
 impl Provider for GatedProvider {
@@ -172,7 +188,12 @@ impl Provider for GatedProvider {
         _: RequestDelivery,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let _drop_gate = self
+                .first_stream_drop
+                .as_ref()
+                .filter(|_| call == 0)
+                .map(StreamDropGate);
             let _ = events.send(ProviderEvent::TextDelta {
                 text: PARTIAL.into(),
             });
@@ -297,6 +318,7 @@ fn published_crash_prefix_continues_exact_lua_tickets(continuation: bool) {
     let provider = Arc::new(GatedProvider {
         requests: send,
         calls: AtomicUsize::new(0),
+        first_stream_drop: None,
     });
     let host = RestartHost::open_with_provider(
         tmp.path(),
@@ -426,6 +448,121 @@ fn published_crash_prefix_continues_exact_lua_tickets(continuation: bool) {
     }
 }
 
+#[test_case(true; "cancel_then_suspend")]
+#[test_case(false; "suspend_only")]
+fn suspend_reopens_only_the_turn_that_was_not_cancelled(cancel: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = StateDir::from_path(tmp.path().into());
+    let mut session = TestSession::new(
+        &common::default_model().spec(),
+        tmp.path().to_str().unwrap(),
+    );
+    session.save(&state).unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        &tmp.path().join("plugins").join(format!("{PLUGIN}.lua")),
+        SOURCE
+            .replace("__IDS_PATH__", &json!(tmp.path().join(IDS)).to_string())
+            .into_bytes(),
+    );
+    let (send, requests) = flume::unbounded();
+    let (entered, dropped) = flume::bounded(1);
+    let (release, gate) = flume::bounded(1);
+    let host = RestartHost::open_with_provider(
+        tmp.path(),
+        session.id,
+        fs,
+        vec![PLUGIN.into()],
+        Arc::new(GatedProvider {
+            requests: send,
+            calls: AtomicUsize::new(0),
+            first_stream_drop: Some(StreamGate {
+                entered,
+                release: gate,
+            }),
+        }),
+    );
+    command(&host, "joined_parent");
+    let child: AgentId = ids(&host)["parent"].as_str().unwrap().parse().unwrap();
+    let actor = host.manager.actor(child).unwrap();
+    let ticket = actor
+        .admit_turn(
+            AgentInput::new(RUNNING.into(), Vec::new()),
+            None,
+            RUNNING.into(),
+        )
+        .unwrap();
+    let parked = request(&requests, "initial child request");
+    assert!(contains(&parked, RUNNING));
+    if cancel {
+        actor.cancel_turn(ticket.turn_id()).unwrap();
+        dropped.recv_timeout(RESTORED_REQUEST_TIMEOUT).unwrap();
+    }
+    let (report, ()) = smol::block_on(futures_lite::future::zip(
+        host.manager.suspend(RESTORED_REQUEST_TIMEOUT),
+        async {
+            poll_until(RESTORED_REQUEST_TIMEOUT, || {
+                (actor.snapshot().lifecycle == ActorLifecycle::Shutdown).then_some(())
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+        },
+    ));
+    assert!(report.timed_out.is_empty());
+    let turn = ticket.turn_id();
+    if cancel {
+        assert!(matches!(
+            ticket.peek_result().unwrap().outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        ));
+    } else {
+        assert!(ticket.peek_result().is_none());
+    }
+    let host = host.restart_host(tmp.path());
+    if cancel {
+        let saved = TestSession::load(session.id, &state)
+            .unwrap()
+            .latest_state()
+            .unwrap();
+        let child = &saved.scopes[&Some(child)];
+        assert!(!child.admitted.contains_key(&turn));
+        assert_eq!(
+            child
+                .results
+                .iter()
+                .find(|(id, _)| *id == turn)
+                .unwrap()
+                .1
+                .outcome
+                .status,
+            StoredTurnStatus::Cancelled {
+                reason: StoredCancellationReason::User
+            }
+        );
+    } else {
+        let resumed = restored_request(&host, &requests, "child request after suspend");
+        assert!(contains(&resumed, RUNNING));
+        let ticket = host
+            .manager
+            .actor(child)
+            .unwrap()
+            .turn_ticket(turn)
+            .unwrap();
+        resumed.reply.send(common::canned_reply(REPLY)).unwrap();
+        let outcome = smol::block_on(common::bounded_at("resumed child ticket", ticket.wait()));
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+    }
+    smol::block_on(common::bounded_at(
+        "settle reopened graph",
+        host.manager.wait_settled(),
+    ));
+    assert!(requests.is_empty());
+}
+
 #[test_case(false; "crash")]
 #[test_case(true; "graceful_suspend")]
 fn published_task_wait_resumes_parent_and_child_without_respawning(graceful: bool) {
@@ -503,6 +640,7 @@ register({{
     let provider = Arc::new(GatedProvider {
         requests: send,
         calls: AtomicUsize::new(0),
+        first_stream_drop: None,
     });
     let host = RestartHost::open_with_provider(
         tmp.path(),
@@ -817,6 +955,7 @@ fn joined_input_survives_crash_exactly_once(consumed: bool) {
         Arc::new(GatedProvider {
             requests: send,
             calls: AtomicUsize::new(0),
+            first_stream_drop: None,
         }),
     );
     command(&host, "joined_parent");

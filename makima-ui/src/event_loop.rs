@@ -12980,13 +12980,12 @@ end })
     #[test_case(Event::Resize(MIDDLE_SCROLL_WIDTH, MIDDLE_SCROLL_HEIGHT) ; "resize")]
     fn middle_scroll_lifecycle_routing(event: Event) {
         let mut outgoing = middle_scroll_app();
-        let baseline = outgoing.cadence();
         let now = activate_middle_scroll(&mut outgoing);
         route_terminal_lifecycle(&mut outgoing, &event);
         route_terminal_lifecycle(&mut outgoing, &Event::FocusGained);
         let _ = tick_session(&mut outgoing, true, now + MIDDLE_SCROLL_STEP);
         assert_eq!(outgoing.main_chat().scroll_top(), MIDDLE_SCROLL_START);
-        assert_eq!(outgoing.cadence(), baseline);
+        assert_eq!(outgoing.cancel_middle_scroll(), Dirty::NO);
 
         let now = activate_middle_scroll(&mut outgoing);
         let mut focused = 0;
@@ -12998,7 +12997,7 @@ end })
         assign_session_focus(&mut incoming, &mut focused, 0);
         let _ = tick_session(&mut outgoing, true, now + MIDDLE_SCROLL_STEP);
         assert_eq!(outgoing.main_chat().scroll_top(), MIDDLE_SCROLL_START);
-        assert_eq!(outgoing.cadence(), baseline);
+        assert_eq!(outgoing.cancel_middle_scroll(), Dirty::NO);
 
         let now = activate_middle_scroll(&mut outgoing);
         activate_middle_scroll(&mut incoming);
@@ -13009,7 +13008,7 @@ end })
             route_terminal_lifecycle(app, &Event::FocusGained);
             let _ = tick_session(app, true, now + MIDDLE_SCROLL_STEP);
             assert_eq!(app.main_chat().scroll_top(), MIDDLE_SCROLL_START);
-            assert_eq!(app.cadence(), baseline);
+            assert_eq!(app.cancel_middle_scroll(), Dirty::NO);
         }
     }
 

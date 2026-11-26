@@ -154,6 +154,14 @@ impl PermissionMode {
         }
     }
 
+    fn agent_mode(self) -> ModeId {
+        if self == Self::Plan {
+            ModeId::Plan
+        } else {
+            ModeId::Build
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -745,7 +753,8 @@ impl FrontendServices for SdkServices<'_> {
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             if self.params.cli.permission_mode.is_some() && continuing_root {
-                return Err(CONTINUING_PERMISSION_MODE.into());
+                // Do not let the requested mode seed the policy it will be checked against.
+                params.yolo = self.params.cli.yolo;
             }
             let (handle, errors) = mcp::start_with_commands(
                 &params.initial_wd,
@@ -767,6 +776,19 @@ impl FrontendServices for SdkServices<'_> {
     fn bind_root<'a>(&'a mut self, handle: &'a SessionHandle) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let explicit = self.params.cli.permission_mode.is_some();
+            if explicit && !handle.continuing_root().is_empty() {
+                let config = handle
+                    .root()
+                    .effective_config()
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "recovered root has no effective config".to_owned())?;
+                if config.mode.id() != self.permission_mode.agent_mode()
+                    || handle.permissions.is_yolo()
+                        != (self.permission_mode == PermissionMode::BypassPermissions)
+                {
+                    return Err(CONTINUING_PERMISSION_MODE.into());
+                }
+            }
             self.lua.bind_root(handle).await?;
             self.permission_mode = restored_permission_mode(
                 handle.permissions.persisted_yolo(),
@@ -784,7 +806,7 @@ impl FrontendServices for SdkServices<'_> {
 
 impl SdkServices<'_> {
     async fn apply_startup_permission_mode(&self, handle: &SessionHandle) -> Result<(), String> {
-        if self.params.cli.permission_mode.is_some() {
+        if self.params.cli.permission_mode.is_some() && handle.continuing_root().is_empty() {
             let bypass = self.permission_mode == PermissionMode::BypassPermissions;
             handle
                 .coordinator
@@ -798,16 +820,11 @@ impl SdkServices<'_> {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let key = if self.permission_mode == PermissionMode::Plan {
-                ModeId::Plan.key()
-            } else {
-                ModeId::Build.key()
-            };
             makima_lua::orchestration::set_mode(
                 &*self.lua.bound()?.orchestration,
                 handle.root(),
                 &self.params.lua_handle.mode_registry(),
-                key,
+                self.permission_mode.agent_mode().key(),
                 self.storage,
             )
             .await
@@ -1602,11 +1619,7 @@ fn set_permission_mode(
         DISABLED_VALUE
     };
     smol::block_on(coordinator.set_option(YOLO_OPTION_ID, value))?;
-    set_mode(if mode == PermissionMode::Plan {
-        ModeId::Plan.key()
-    } else {
-        ModeId::Build.key()
-    })
+    set_mode(mode.agent_mode().key())
 }
 
 /// Runs {operation} as the SDK's active work, so an interrupt cancels it,
@@ -2534,6 +2547,7 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use makima_lua::orchestration::AgentOrchestration;
     use makima_storage::id::MakimaId;
 
@@ -4149,6 +4163,98 @@ mod tests {
         assert_eq!(result["is_error"], true);
         assert_eq!(result["subtype"], SDK_ERROR_RESULT_SUBTYPE);
         assert_eq!(result["result"], SDK_AUTH_FAILURE);
+    }
+
+    #[test_case(PermissionMode::Default; "same_explicit_mode")]
+    #[test_case(PermissionMode::BypassPermissions; "conflicting_explicit_mode")]
+    fn sdk_explicit_permission_mode_with_pending_root(resume_mode: PermissionMode) {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        let (entered, requests) = flume::unbounded();
+        let (release, released) = flume::unbounded();
+        let launch = |cli| {
+            let (out_tx, out_rx) = flume::unbounded();
+            let mut params = reset_sdk_params(cwd.to_path_buf());
+            params.cli = cli;
+            params.providers = Arc::new(ProviderRegistry::new(vec![RegisteredProvider {
+                id: RESET_PROVIDER.into(),
+                display_name: RESET_PROVIDER.into(),
+                models: vec![ModelInfo::id_only(params.model.id.clone())],
+                backend: Arc::new(GatedSdkBackend(Arc::new(GatedProvider {
+                    entered: entered.clone(),
+                    release: released.clone(),
+                }))),
+                auth: Default::default(),
+                docs: None,
+            }]));
+            let session = SdkSession::new(params, StateDir::from_path(cwd.to_path_buf()), out_tx);
+            (session, out_rx)
+        };
+        let startup_mode = PermissionMode::Default.as_str();
+        let (session, _output) = launch(Cli::parse_from([
+            "makima",
+            "--permission-mode",
+            startup_mode,
+        ]));
+        let session = session.unwrap();
+        let runtime = session.current();
+        let id = runtime.handle.session_id.id();
+        let (user_tx, dispatcher) = session.spawn_dispatcher();
+        user_tx.send((SDK_ROOT_PROMPT.into(), Vec::new())).unwrap();
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        let turn = runtime
+            .root
+            .target
+            .actor()
+            .unwrap()
+            .snapshot()
+            .active_turn
+            .unwrap();
+        drop(user_tx);
+        smol::block_on(dispatcher).unwrap();
+        smol::block_on(runtime.close()).unwrap();
+        drop(runtime);
+        drop(session);
+
+        let (resumed, output) = launch(Cli::parse_from([
+            "makima",
+            "-c",
+            &id.to_string(),
+            "--permission-mode",
+            resume_mode.as_str(),
+        ]));
+        if resume_mode != PermissionMode::Default {
+            let error = resumed
+                .err()
+                .expect("conflicting permission mode must fail");
+            assert!(error.to_string().contains(CONTINUING_PERMISSION_MODE));
+            assert!(output.is_empty());
+            assert!(requests.is_empty());
+            return;
+        }
+
+        let resumed = resumed.unwrap();
+        let runtime = resumed.current();
+        let read = || -> Value {
+            serde_json::from_str(&output.recv_timeout(SDK_GATE_TIMEOUT).unwrap()).unwrap()
+        };
+        let init = read();
+        assert_eq!(init["type"], "system");
+        assert_eq!(init["subtype"], "init");
+        assert_eq!(init["permissionMode"], startup_mode);
+        assert!(runtime.handle.continuing_root().contains(&turn));
+        requests.recv_timeout(SDK_GATE_TIMEOUT).unwrap();
+        assert!(!runtime.handle.permissions.is_yolo());
+        release.send(()).unwrap();
+        loop {
+            let message = read();
+            if message["type"] == "result" {
+                assert_eq!(message["is_error"], false);
+                assert_eq!(message["result"], SDK_GATED_REPLY);
+                break;
+            }
+        }
+        smol::block_on(runtime.close()).unwrap();
     }
 
     #[test]

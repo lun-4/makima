@@ -1344,7 +1344,21 @@ fn retire_turn(
 ) -> Option<Option<TurnTicket>> {
     let mut outcomes = inner.outcomes.lock_unpoisoned();
     let mut state = inner.state.lock_unpoisoned();
-    if state.suspended {
+    let cancellation_reason = state
+        .processing
+        .as_ref()
+        .filter(|processing| processing.turn_id == Some(turn_id))
+        .and_then(|processing| processing.cancellation_reason);
+    if state.suspended
+        && cancellation_reason != Some(TurnCancellationReason::User)
+        && !matches!(
+            outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::User,
+                ..
+            }
+        )
+    {
         state.instructions.remove(&turn_id);
         state.turn_work.remove(&turn_id);
         if settle_runner {
@@ -1353,12 +1367,8 @@ fn retire_turn(
         inner.tickets.lock_unpoisoned().remove(&turn_id);
         return None;
     }
-    if let Some(reason) = state
-        .processing
-        .as_ref()
-        .filter(|processing| processing.turn_id == Some(turn_id))
-        .and_then(|processing| processing.cancellation_reason)
-        && !matches!(outcome, TurnOutcome::Cancelled { .. })
+    if let Some(reason) = cancellation_reason
+        && !matches!(outcome, TurnOutcome::Cancelled { reason: actual, .. } if reason != TurnCancellationReason::User || *actual == reason)
     {
         *outcome = TurnOutcome::Cancelled {
             agent_id: outcome.agent_id(),
