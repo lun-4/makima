@@ -559,14 +559,12 @@ const HIGHLIGHTED_CODE: &str = "fn main() {}";
 /// on 3 cores can stretch by orders of magnitude. Only a hang guard.
 const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Only `view` advances a typewriter, and collapsed thinking is never drawn,
-/// so its reveal can never finish. Believing it would hold the loop at full
-/// frame rate for as long as the model reasons.
-#[test_case(true  => Cadence::SMOOTH ; "expanded_thinking_reveals")]
-#[test_case(false => Cadence::IDLE   ; "collapsed_thinking_reveals_nothing")]
-fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence {
+#[test_case(-1 => Cadence::SMOOTH ; "expanded_thinking_reveals")]
+#[test_case(3 => Cadence::SMOOTH ; "tail_thinking_reveals")]
+#[test_case(0 => Cadence::IDLE ; "header_only_reveals_nothing")]
+fn thinking_animates_only_while_it_is_on_screen(thinking_lines: i64) -> Cadence {
     let config = UiConfig {
-        show_thinking,
+        thinking_lines,
         ..UiConfig::default()
     };
     let mut panel = MessagesPanel::new(
@@ -2304,7 +2302,7 @@ fn rebake_without_channel_is_noop() {
 fn hide_collapses_streaming_thinking() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2337,7 +2335,7 @@ fn hide_collapses_streaming_thinking() {
 fn hide_click_expands_streaming_thinking() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2367,7 +2365,7 @@ fn hide_click_expands_streaming_thinking() {
 fn hide_keeps_cached_thinking_as_indicator() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2400,9 +2398,12 @@ fn hide_keeps_cached_thinking_as_indicator() {
 }
 
 #[test]
-fn full_default_renders_streaming_thinking() {
+fn full_config_renders_streaming_thinking() {
     let mut panel = MessagesPanel::new(
-        UiConfig::default(),
+        UiConfig {
+            thinking_lines: -1,
+            ..UiConfig::default()
+        },
         EventHandle::disconnected_for_test(),
         Arc::new(InMemoryThemesProvider::bundled()),
     );
@@ -2419,7 +2420,7 @@ fn full_default_renders_streaming_thinking() {
 fn hide_cached_thinking_persists_as_indicator() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2457,7 +2458,7 @@ fn hide_cached_thinking_persists_as_indicator() {
 fn hide_cached_thinking_click_expands() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2487,7 +2488,7 @@ fn hide_cached_thinking_click_expands() {
 fn stream_reset_clears_thinking_expand_state() {
     let mut panel = MessagesPanel::new(
         UiConfig {
-            show_thinking: false,
+            thinking_lines: 0,
             ..UiConfig::default()
         },
         EventHandle::disconnected_for_test(),
@@ -2517,6 +2518,118 @@ fn stream_reset_clears_thinking_expand_state() {
         !text.contains("fresh reasoning"),
         "new stream must stay hidden; got: {text}"
     );
+}
+
+#[test_case(-1 ; "full")]
+#[test_case(0 ; "header")]
+#[test_case(2 ; "tail")]
+fn live_click_toggles_and_preserves_state_through_flush(thinking_lines: i64) {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            thinking_lines,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel
+        .streaming_thinking
+        .set_buffer("one\ntwo\nthree\nfour\nfive\nsix");
+    let area = Rect::new(0, 0, 80, 12);
+    render(&mut panel, 80, 12);
+    let initial = panel.thinking_collapsed;
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.thinking_collapsed, !initial);
+    render(&mut panel, 80, 12);
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.thinking_collapsed, initial);
+    panel.end_thinking_block();
+    assert_eq!(panel.messages[0].thinking_collapsed, initial);
+    render(&mut panel, 80, 12);
+    assert!(panel.handle_click(0, area));
+    assert_eq!(panel.messages[0].thinking_collapsed, !initial);
+}
+
+#[test]
+fn global_thinking_actions_apply_to_current_and_future_blocks() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            thinking_lines: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel.thinking_delta("first");
+    panel.end_thinking_block();
+    panel.thinking_delta("second");
+    render(&mut panel, 80, 12);
+    panel.show_all_thinking();
+    assert!(!panel.messages[0].thinking_collapsed);
+    assert!(!panel.thinking_collapsed);
+    panel.end_thinking_block();
+    panel.thinking_delta("third");
+    assert!(!panel.messages[1].thinking_collapsed);
+    assert!(!panel.thinking_collapsed);
+    panel.collapse_all_thinking();
+    assert!(panel.messages.iter().all(|msg| msg.thinking_collapsed));
+    assert!(panel.thinking_collapsed);
+    panel.end_thinking_block();
+    panel.stream_reset();
+    assert!(panel.thinking_collapsed);
+    panel.thinking_delta("fourth");
+    panel.end_thinking_block();
+    assert!(panel.messages[3].thinking_collapsed);
+    let text = buffer_text(&render(&mut panel, 80, 12));
+    assert!(!text.contains("first"));
+}
+
+#[test]
+fn collapsed_tail_shows_last_rows_live_and_settled() {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            thinking_lines: 2,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel
+        .streaming_thinking
+        .set_buffer("first\n\nsecond\n\nthird\n\nfourth\n\nfifth");
+    let live = buffer_text(&render(&mut panel, 80, 12));
+    assert!(live.contains("thinking> ..."), "{live}");
+    assert!(live.contains("fifth"), "{live}");
+    assert!(!live.contains("first"), "{live}");
+    panel.end_thinking_block();
+    let settled = buffer_text(&render(&mut panel, 80, 12));
+    assert!(settled.contains("fifth"), "{settled}");
+    assert!(!settled.contains("first"), "{settled}");
+}
+
+#[test_case(false ; "settled")]
+#[test_case(true ; "live")]
+fn expanding_thinking_keeps_clicked_block_visible(live: bool) {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            thinking_lines: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+        Arc::new(InMemoryThemesProvider::bundled()),
+    );
+    panel
+        .streaming_thinking
+        .set_buffer(&(0..30).map(|n| format!("line {n}\n\n")).collect::<String>());
+    if !live {
+        panel.end_thinking_block();
+    }
+    let area = Rect::new(0, 0, 80, 8);
+    render(&mut panel, 80, 8);
+    assert!(panel.handle_click(0, area));
+    let text = buffer_text(&render(&mut panel, 80, 8));
+    assert!(text.contains("line 0"), "{text}");
+    assert!(!panel.auto_scroll());
 }
 
 #[test]
@@ -2652,7 +2765,8 @@ fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
         EventHandle::disconnected_for_test(),
         Arc::new(InMemoryThemesProvider::bundled()),
     );
-    panel.show_thinking = false;
+    panel.thinking_lines = 0;
+    panel.default_thinking_collapsed = true;
     let mut m = DisplayMessage::new(DisplayRole::Thinking, "one\ntwo".to_string());
     m.thinking_collapsed = true;
     panel.push(m);

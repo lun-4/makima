@@ -80,7 +80,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `autocomplete_height` | number | `0.7` | - | Fraction of terminal height used for slash command-argument suggestions; must be finite and in (0, 1] |
-| `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `thinking_lines` | integer | `3` | - | Thinking display: -1 shows all lines, 0 shows only the header, and positive values show that many trailing rows. Legacy show_thinking values true and false map to -1 and 0; do not set both keys |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 
 ### `ui.theme`

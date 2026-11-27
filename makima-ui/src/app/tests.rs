@@ -9609,6 +9609,56 @@ const OVERRIDE_ID: u64 = 1;
 const OVERRIDE_DISPATCHED: &str = "override callback must be dispatched";
 const OVERRIDE_NOT_DISPATCHED: &str = "override callback must not be dispatched";
 
+#[test_case(kb::SHOW_ALL_THINKING ; "show")]
+#[test_case(kb::COLLAPSE_ALL_THINKING ; "collapse")]
+fn thinking_key_allows_lua_override(bind: crate::components::keybindings::Bind) {
+    let mut app = test_app();
+    let _probe = install_override(&mut app, bind.code, bind.modifiers);
+    let actions = app.update(Msg::Key(bind.to_key_event()));
+    assert!(matches!(actions[..], [Action::RunKeybind(OVERRIDE_ID)]));
+}
+
+#[test_case(false ; "key")]
+#[test_case(true ; "builtin")]
+fn thinking_actions_affect_only_focused_chat(builtin: bool) {
+    const THINKING_TEXT: &str = "reasoning";
+    let mut app = test_app();
+    let mut other = Chat::new(
+        "other".into(),
+        app.ui_config.clone(),
+        app.lua_event_handle.clone(),
+        Arc::clone(&app.theme_provider),
+    );
+    let messages = || {
+        vec![DisplayMessage::new(
+            DisplayRole::Thinking,
+            THINKING_TEXT.into(),
+        )]
+    };
+    app.main_chat().load_messages(messages());
+    other.load_messages(messages());
+    app.chats.push(other);
+    app.active_chat = 1;
+
+    for _ in 0..2 {
+        if builtin {
+            app.run_builtin(BuiltinAction::ShowAllThinking);
+        } else {
+            app.update(Msg::Key(kb::SHOW_ALL_THINKING.to_key_event()));
+        }
+        assert!(!app.chats[1].message_at(0).unwrap().thinking_collapsed);
+        assert!(app.chats[0].message_at(0).unwrap().thinking_collapsed);
+    }
+    for _ in 0..2 {
+        if builtin {
+            app.run_builtin(BuiltinAction::CollapseAllThinking);
+        } else {
+            app.update(Msg::Key(kb::COLLAPSE_ALL_THINKING.to_key_event()));
+        }
+        assert!(app.chats[1].message_at(0).unwrap().thinking_collapsed);
+    }
+}
+
 #[test]
 fn override_shadows_builtin_ctrl_when_no_overlay_open() {
     let mut app = test_app();

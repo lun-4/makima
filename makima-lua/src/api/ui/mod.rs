@@ -467,7 +467,9 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"plan_submit"`, `"edit_input"`,
-/// `"pop_queue"`, `"prev_chat"`, `"next_chat"`.
+/// `"pop_queue"`, `"prev_chat"`, `"next_chat"`, `"model_picker"`,
+/// `"show_all_thinking"`, `"collapse_all_thinking"`. The thinking actions
+/// affect the focused chat's transcript.
 ///
 /// For slash commands rather than keybound actions, see
 /// `makima.api.run_command`.
@@ -1214,6 +1216,15 @@ mod tests {
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
+
+    #[test_case("show_all_thinking", BuiltinAction::ShowAllThinking ; "show")]
+    #[test_case("collapse_all_thinking", BuiltinAction::CollapseAllThinking ; "collapse")]
+    fn thinking_action_sends_builtin(name: &str, expected: BuiltinAction) {
+        let lua = Lua::new();
+        let (tx, rx) = flume::unbounded();
+        assert_eq!(action(&lua, tx, name.into()).unwrap(), (Some(true), None));
+        assert!(matches!(rx.try_recv(), Ok(UiAction::Builtin(actual)) if actual == expected));
+    }
 
     #[test_case(false ; "no_target")]
     #[test_case(true ; "delegated")]

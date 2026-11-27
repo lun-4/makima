@@ -105,6 +105,22 @@ impl Line {
     }
 }
 
+pub fn code_block_start(text: &str, offset: usize) -> usize {
+    let mut base = 0;
+    while let Some(fence) = crate::find_code_fence(&text[base..]) {
+        let open = base + fence.before_end;
+        if offset <= open {
+            break;
+        }
+        if offset < base + fence.block_end {
+            return open;
+        }
+        base += fence.block_end;
+        base += text[base..].len() - text[base..].trim_start_matches('\n').len();
+    }
+    offset
+}
+
 pub fn render(text: &str, width: u16) -> Vec<Line> {
     Renderer::new().render(text, width)
 }
@@ -151,6 +167,13 @@ impl Renderer {
     pub fn streaming() -> Self {
         Self {
             wrap_paragraphs: false,
+            incremental: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn streaming_wrapped() -> Self {
+        Self {
             incremental: true,
             ..Self::default()
         }
@@ -810,6 +833,14 @@ mod tests {
     use test_case::test_case;
 
     const TEST_WIDTH: u16 = 80;
+
+    #[test_case("intro\n```rust\nlet a = 1;\n```\nafter", 14 => 6; "inside_fence")]
+    #[test_case("intro\n```rust\nlet a = 1;\n```\nafter", 29 => 29; "after_fence")]
+    #[test_case("````\n```\ninside\n", 9 => 0; "nested_ticks")]
+    #[test_case("  ```\nnot code\n", 6 => 6; "indented_ticks")]
+    fn code_block_start_matches_parser(text: &str, offset: usize) -> usize {
+        code_block_start(text, offset)
+    }
 
     fn lines_text(lines: &[Line]) -> Vec<String> {
         lines

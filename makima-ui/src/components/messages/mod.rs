@@ -26,7 +26,7 @@ use crate::splash::{ColorTransition, Splash};
 use crate::terminal_image;
 use crate::theme::{self, ThemesProvider};
 use crate::update;
-use makima_config::{ClockFormat, ToolOutputLines, UiConfig};
+use makima_config::{ClockFormat, DEFAULT_THINKING_LINES, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -103,8 +103,10 @@ pub struct MessagesPanel {
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     restore_target: Option<AgentRef>,
-    show_thinking: bool,
+    thinking_lines: i64,
+    default_thinking_collapsed: bool,
     thinking_collapsed: bool,
+    streaming_thinking_height: u16,
     clock_format: ClockFormat,
     /// Last-seen reported latest version; drives the Lua-side version store and
     /// a one-shot repull when a newer version arrives.
@@ -183,8 +185,10 @@ impl MessagesPanel {
             lua_event_handle,
             restore_event_tx: None,
             restore_target: None,
-            show_thinking: ui_config.show_thinking,
-            thinking_collapsed: !ui_config.show_thinking,
+            thinking_lines: ui_config.thinking_lines,
+            default_thinking_collapsed: ui_config.thinking_lines != -1,
+            thinking_collapsed: ui_config.thinking_lines != -1,
+            streaming_thinking_height: 0,
             clock_format: ui_config.clock_format,
             last_seen_latest: None,
             force_pull_once: false,
@@ -207,7 +211,10 @@ impl MessagesPanel {
         self.restore_target = target;
     }
 
-    pub fn push(&mut self, msg: DisplayMessage) {
+    pub fn push(&mut self, mut msg: DisplayMessage) {
+        if matches!(msg.role, DisplayRole::Thinking) {
+            msg.thinking_collapsed = self.default_thinking_collapsed;
+        }
         self.messages.push(msg);
     }
 
@@ -224,11 +231,9 @@ impl MessagesPanel {
     }
 
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
-        if !self.show_thinking {
-            for msg in &mut msgs {
-                if matches!(msg.role, DisplayRole::Thinking) {
-                    msg.thinking_collapsed = true;
-                }
+        for msg in &mut msgs {
+            if matches!(msg.role, DisplayRole::Thinking) {
+                msg.thinking_collapsed = self.default_thinking_collapsed;
             }
         }
         self.messages = msgs;
@@ -240,7 +245,26 @@ impl MessagesPanel {
         self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
-        self.thinking_collapsed = !self.show_thinking;
+        self.thinking_collapsed = self.default_thinking_collapsed;
+    }
+
+    pub fn show_all_thinking(&mut self) {
+        self.set_all_thinking_collapsed(false);
+    }
+
+    pub fn collapse_all_thinking(&mut self) {
+        self.set_all_thinking_collapsed(true);
+    }
+
+    fn set_all_thinking_collapsed(&mut self, collapsed: bool) {
+        self.default_thinking_collapsed = collapsed;
+        self.thinking_collapsed = collapsed;
+        for msg in &mut self.messages {
+            if matches!(msg.role, DisplayRole::Thinking) {
+                msg.thinking_collapsed = collapsed;
+            }
+        }
+        self.cache.clear();
     }
 
     pub fn thinking_delta(&mut self, text: &str) {
@@ -467,7 +491,7 @@ impl MessagesPanel {
     pub fn stream_reset(&mut self) {
         self.streaming_thinking.clear();
         self.streaming_text.clear();
-        self.thinking_collapsed = !self.show_thinking;
+        self.thinking_collapsed = self.default_thinking_collapsed;
         self.cancel_in_progress();
     }
 
@@ -792,7 +816,7 @@ impl MessagesPanel {
                 }
                 return true;
             }
-            return self.try_toggle_cached_thinking(msg_idx, width);
+            return self.try_toggle_cached_thinking(msg_idx, width, seg_start);
         };
 
         if self.has_snapshot(tool_id) {
@@ -1025,13 +1049,10 @@ impl MessagesPanel {
     }
 
     pub fn cadence(&self) -> Cadence {
-        // Collapsed thinking draws a line count, not the text, so its
-        // typewriter reveals nothing and never advances either, since only
-        // `view` ticks it. Believing it would pin the loop at full frame rate
-        // for the whole reasoning phase.
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+            || (self.streaming_thinking.is_animating()
+                && (!self.streaming_thinking_collapsed() || self.thinking_lines != 0));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
@@ -1111,22 +1132,26 @@ impl MessagesPanel {
 
         let thinking_collapsed = self.streaming_thinking_collapsed();
         let collapsed_thinking_lines = if thinking_collapsed {
-            self.build_streaming_collapsed_lines()
+            self.build_streaming_collapsed_lines(width, theme_gen)
         } else {
             Vec::new()
         };
 
+        self.streaming_thinking_height = 0;
         if thinking_collapsed {
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(collapsed_thinking_lines.len() as u16);
+            self.streaming_thinking_height =
+                crate::wrap::total_rows(&collapsed_thinking_lines, width);
+            streaming_heights.push(self.streaming_thinking_height);
         } else if !self.streaming_thinking.is_empty() {
             let lines = self.streaming_thinking.render_lines(width, theme_gen);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(crate::wrap::total_rows(lines, width));
+            self.streaming_thinking_height = crate::wrap::total_rows(lines, width);
+            streaming_heights.push(self.streaming_thinking_height);
         }
 
         if !self.streaming_text.is_empty() {
@@ -1538,37 +1563,85 @@ impl MessagesPanel {
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
         msg.thinking_collapsed = self.thinking_collapsed;
-        self.thinking_collapsed = !self.show_thinking;
+        self.thinking_collapsed = self.default_thinking_collapsed;
         self.messages.push(msg);
     }
 
-    fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
-        thinking_indicator(self.streaming_thinking.line_count(), &self.role_names)
+    fn thinking_tail_rows(&self) -> usize {
+        usize::try_from(self.thinking_lines).unwrap_or(DEFAULT_THINKING_LINES as usize)
     }
 
-    fn build_cached_thinking_indicator(&self, text: &str) -> Vec<Line<'static>> {
-        thinking_indicator(logical_line_count(text), &self.role_names)
+    fn build_streaming_collapsed_lines(
+        &mut self,
+        width: u16,
+        theme_gen: u64,
+    ) -> Vec<Line<'static>> {
+        let mut lines = thinking_indicator(self.streaming_thinking.line_count(), &self.role_names);
+        let rows = self.thinking_tail_rows();
+        if rows > 0 {
+            if let Some(tail) = self.streaming_thinking.render_tail(rows, width, theme_gen) {
+                lines.extend_from_slice(tail);
+            } else {
+                return self
+                    .streaming_thinking
+                    .render_lines(width, theme_gen)
+                    .to_vec();
+            }
+        }
+        lines
+    }
+
+    fn build_cached_thinking_indicator(&self, text: &str, width: u16) -> Vec<Line<'static>> {
+        let mut lines = thinking_indicator(logical_line_count(text), &self.role_names);
+        let rows = self.thinking_tail_rows();
+        if rows > 0 {
+            let style = thinking_style(&self.role_names);
+            if let Some(tail) =
+                super::thinking::render_tail(text, rows, width, style.text_style, None)
+            {
+                lines.extend(tail);
+            } else {
+                return text_to_lines(
+                    text,
+                    &style.prefix,
+                    style.text_style,
+                    style.prefix_style,
+                    width,
+                    None,
+                );
+            }
+        }
+        lines
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
-        if !self.streaming_thinking_collapsed() {
+        if self.streaming_thinking.is_empty() {
             return false;
         }
         let cached_height = self.cache.total_height(width);
         let spacer = if self.cache.len() > 0 { 1 } else { 0 };
         let thinking_start = cached_height + spacer;
-        let height = self.build_streaming_collapsed_lines().len() as u32;
-        if doc_row >= thinking_start && doc_row < thinking_start + height {
-            self.thinking_collapsed = false;
+        if doc_row >= thinking_start
+            && doc_row < thinking_start + u32::from(self.streaming_thinking_height)
+        {
+            self.thinking_collapsed = !self.thinking_collapsed;
+            self.anchor_thinking_click(thinking_start);
             return true;
         }
         false
     }
 
-    fn try_toggle_cached_thinking(&mut self, msg_idx: Option<usize>, width: u16) -> bool {
-        if self.show_thinking {
-            return false;
-        }
+    fn anchor_thinking_click(&mut self, start: u32) {
+        self.scroll_top = self.scroll_top.min(start.min(u32::from(u16::MAX)) as u16);
+        self.auto_scroll = false;
+    }
+
+    fn try_toggle_cached_thinking(
+        &mut self,
+        msg_idx: Option<usize>,
+        width: u16,
+        start: u32,
+    ) -> bool {
         let Some(idx) = msg_idx else { return false };
         let Some(msg) = self.messages.get_mut(idx) else {
             return false;
@@ -1578,6 +1651,7 @@ impl MessagesPanel {
         }
         msg.thinking_collapsed = !msg.thinking_collapsed;
         self.rebuild_thinking_segment(idx, width);
+        self.anchor_thinking_click(start);
         true
     }
 
@@ -1590,7 +1664,7 @@ impl MessagesPanel {
             return;
         };
         let lines = if collapsed {
-            self.build_cached_thinking_indicator(&text)
+            self.build_cached_thinking_indicator(&text, width)
         } else {
             let style = thinking_style(&self.role_names);
             text_to_lines(
@@ -1706,7 +1780,7 @@ impl MessagesPanel {
             } else {
                 if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
                     let text = msg.text.clone();
-                    let lines = self.build_cached_thinking_indicator(&text);
+                    let lines = self.build_cached_thinking_indicator(&text, self.viewport_width);
                     self.cache.push_spacer_if_needed();
                     self.cache.push(Segment::with_lines(lines, Some(i)));
                     continue;

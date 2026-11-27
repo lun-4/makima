@@ -1,4 +1,5 @@
 use crate::animation::Typewriter;
+use crate::components::thinking::{self, LiveTail};
 use crate::markdown::paint_semantic;
 
 use makima_markdown::render::Renderer;
@@ -78,9 +79,13 @@ impl StreamingCache {
     }
 }
 
+type TailCache = Option<((CacheKey, usize), Option<Vec<Line<'static>>>)>;
+
 pub(crate) struct StreamingContent {
     typewriter: Typewriter,
     cache: StreamingCache,
+    tail: TailCache,
+    live_tail: LiveTail,
     renderer: Renderer,
     prefix: Arc<str>,
     text_style: Style,
@@ -97,6 +102,8 @@ impl StreamingContent {
         Self {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
+            tail: None,
+            live_tail: LiveTail::default(),
             renderer: Renderer::streaming(),
             prefix: prefix.into(),
             text_style,
@@ -111,11 +118,15 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
+        self.tail = None;
+        self.live_tail = LiveTail::default();
         self.renderer = Renderer::streaming();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
+        self.tail = None;
+        self.live_tail = LiveTail::default();
         self.renderer = Renderer::streaming();
         self.typewriter.take_all()
     }
@@ -142,6 +153,7 @@ impl StreamingContent {
         self.text_style = text_style;
         self.prefix_style = prefix_style;
         self.cache.invalidate();
+        self.tail = None;
     }
 
     pub fn render_lines(&mut self, width: u16, theme_gen: u64) -> &[Line<'static>] {
@@ -156,6 +168,28 @@ impl StreamingContent {
             theme_gen,
         );
         &self.cache.lines
+    }
+
+    pub fn render_tail(
+        &mut self,
+        rows: usize,
+        width: u16,
+        theme_gen: u64,
+    ) -> Option<&[Line<'static>]> {
+        self.typewriter.tick();
+        let visible = self.typewriter.visible();
+        let key = (CacheKey::for_text(visible, width, theme_gen), rows);
+        if self.tail.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            let lines = thinking::render_tail(
+                visible,
+                rows,
+                width,
+                self.text_style,
+                Some(&mut self.live_tail),
+            );
+            self.tail = Some((key, lines));
+        }
+        self.tail.as_ref().and_then(|(_, lines)| lines.as_deref())
     }
 
     pub fn cached_lines(&self) -> &[Line<'static>] {
@@ -191,6 +225,33 @@ mod tests {
     use crate::markdown::text_to_lines;
     use ratatui::style::Style;
     use test_case::test_case;
+
+    #[test]
+    fn tail_cache_keys_and_resets() {
+        const INSTANT: u64 = 0;
+        const WIDTH: u16 = 24;
+        const ROWS: usize = 2;
+        const TEXT: &str = "one\ntwo\nthree\nfour\nfive";
+        let style = Style::default();
+        let mut sc = StreamingContent::new("", style, style, INSTANT);
+        sc.push(TEXT);
+        assert!(sc.render_tail(ROWS, WIDTH, GEN0).is_some());
+        let key = sc.tail.as_ref().unwrap().0;
+        assert!(sc.render_tail(ROWS, WIDTH, GEN0).is_some());
+        assert!(sc.tail.as_ref().unwrap().0 == key);
+        assert!(sc.render_tail(ROWS, WIDTH, GEN0 + 1).is_some());
+        assert!(sc.tail.as_ref().unwrap().0 != key);
+        sc.set_style("", Style::default().fg(ratatui::style::Color::Red), style);
+        assert!(sc.tail.is_none());
+        assert!(sc.render_tail(ROWS, WIDTH, GEN0).is_some());
+        assert_eq!(sc.take_all(), TEXT);
+        assert!(sc.tail.is_none());
+        sc.push("short");
+        assert!(sc.render_tail(ROWS, WIDTH, GEN0).is_none());
+        assert!(sc.tail.as_ref().unwrap().1.is_none());
+        sc.clear();
+        assert!(sc.tail.is_none());
+    }
 
     fn cache_lines_text(cache: &StreamingCache) -> Vec<String> {
         cache

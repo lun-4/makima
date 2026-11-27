@@ -21,6 +21,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
 | `Ctrl+M` | Model picker |
+| `Alt+S` | Show all thinking |
+| `Alt+H` | Collapse all thinking |
 | `Alt+M` | Defer an input prompt, press again to restore |
 
 ## Editing
