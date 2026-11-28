@@ -10,6 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
+  # Backtraces keep file:line; full debug info only slows the link and grows the cache.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # Only push runs save rust-cache. Their pull_request twins would store a second
 # copy of every cache and push the repo past its 10 GB cache budget.
