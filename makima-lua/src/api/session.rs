@@ -3,11 +3,13 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use makima_agent::SessionMailbox;
+use makima_agent::live_history;
 use makima_lua_macro::{lua_fn, lua_table};
-use makima_providers::parse_thinking;
+use makima_providers::{ContentBlock, Message, MessageKind, Role, parse_thinking};
 use makima_storage::id::MakimaId;
 use makima_storage::sessions::{Prefs, write_prefs};
 use mlua::{Lua, Result as LuaResult, Table, Value};
+use serde_json::json;
 
 use crate::agent_errors::{
     DELEGATED_FOREIGN_SESSION, DELEGATED_HOST_MUTATION, DELEGATED_SESSION_LIFECYCLE,
@@ -31,6 +33,8 @@ pub(crate) struct NoPreferences;
 
 const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const NO_PREFERENCES_ERR: &str = "print saves no preferences";
+const NOT_LIVE_ERR: &str = "session not live";
+const NO_FOCUSED_SESSION_ERR: &str = "no focused session";
 
 async fn roundtrip(
     lua: Lua,
@@ -185,6 +189,129 @@ async fn read(
     .await
 }
 
+/// The focused tab's id. A headless driver has no focused session, so a
+/// plugin running there has to name one.
+async fn focused_session(
+    lua: Lua,
+    tx: Option<flume::Sender<UiAction>>,
+) -> Result<MakimaId, String> {
+    let (raw, error) = roundtrip(lua, tx, SessionRequest::Current)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let raw = raw
+        .as_ref()
+        .and_then(|value| value.as_string())
+        .and_then(|text| text.to_str().ok())
+        .ok_or_else(|| NO_FOCUSED_SESSION_ERR.to_owned())?;
+    raw.parse::<MakimaId>().map_err(|error| error.to_string())
+}
+
+fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
+    Some(match block {
+        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "text": thinking }),
+        ContentBlock::RedactedThinking { .. } => return None,
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
+            json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        }
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+        ContentBlock::Image { source } => {
+            json!({ "type": "image", "media_type": source.media_type.mime() })
+        }
+    })
+}
+
+/// An image keeps only its media type. A plugin reading history wants to know
+/// one was there, and the base64 payload would cost megabytes per call.
+fn message_json(message: &Message) -> serde_json::Value {
+    let content: Vec<_> = message.content.iter().filter_map(block_json).collect();
+    json!({
+        "role": match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        },
+        "kind": match message.kind {
+            MessageKind::Turn => "turn",
+            MessageKind::Observation => "observation",
+        },
+        "hidden": message.display_text.as_deref() == Some(""),
+        "content": content,
+    })
+}
+
+/// Reads a live session's transcript, oldest first: everything the model has
+/// been sent so far, tool calls and results included. Read only.
+///
+/// Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
+/// `"assistant"`. `kind` is `"turn"` for something the user or the model said
+/// and `"observation"` for a report sent to the model as a user message, like
+/// `makima.session.notify`. `hidden` marks a message only the model sees, such
+/// as a nudge or a compaction note. `content` lists blocks:
+///
+/// ```text
+/// { type = "text", text }
+/// { type = "thinking", text }
+/// { type = "tool_use", id, name, input }
+/// { type = "tool_result", tool_use_id, content, is_error }
+/// { type = "image", media_type }
+/// ```
+///
+/// Works in the TUI and in the drivers that keep a live session, `makima -p`
+/// and SDK included. A headless driver has no focused session, so pass
+/// `session` there; hook and event payloads carry the `session_id` to pass.
+///
+/// @param opts table? Options:
+///   `session` (string?) id of a live session, defaults to the focused one.
+///   `last` (integer?) only the newest `last` messages.
+/// @return (table|nil, string|nil) Array of messages, or nil and an error.
+/// @example
+/// local msgs = makima.session.messages({ last = 1 })
+/// local last = msgs and msgs[1]
+/// if last and last.role == "assistant" then
+///   makima.ui.notify(last.content[1].text)
+/// end
+#[lua_fn]
+async fn messages(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let (id, last) = match &opts {
+        Some(opts) => (
+            opts.get::<Option<String>>("session")?,
+            opts.get::<Option<usize>>("last")?,
+        ),
+        None => (None, None),
+    };
+    let session: MakimaId = match id {
+        Some(id) => try_pair!(id.parse::<MakimaId>()),
+        None => try_pair!(focused_session(lua.clone(), tx).await),
+    };
+    let Some(history) = live_history(session) else {
+        return Ok(err_pair(format!("{NOT_LIVE_ERR}: {session}")));
+    };
+    let skip = last.map_or(0, |count| history.len().saturating_sub(count));
+    let out = lua.create_table()?;
+    for message in &history[skip..] {
+        out.push(json_to_lua(&lua, &message_json(message))?)?;
+    }
+    Ok((Some(out), None))
+}
+
 /// Starts a new session in the current project.
 ///
 /// @param opts table? Optional fields: prompt (string) first user message
@@ -312,7 +439,7 @@ lua_table! {
     /// changes one session takes it explicitly; `ctx:session_id()` names the
     /// invocation's session.
     "makima.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), read(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
+    DOCS [list(tx), list_all(tx), live(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), notify(), set_title(tx), set_default_thinking]
 }
 
 #[cfg(test)]
@@ -320,6 +447,9 @@ mod tests {
     use super::*;
     use crate::api::util::command::NO_UI_ERR;
     use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
+    use makima_agent::{HistorySnapshot, SharedMessages, publish_live_history};
 
     use makima_agent::session_coordinator::{
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
@@ -473,6 +603,108 @@ mod tests {
             .eval()
             .unwrap();
         assert!(invalid.is_some_and(|error| error.contains("invalid base58")));
+    }
+
+    const FOCUSED_TEXT: &str = "focused";
+    const OTHER_TEXT: &str = "other";
+    const FIRST: &str = "first";
+
+    fn published(id: MakimaId, messages: Vec<Message>) -> SharedMessages {
+        let mirror: SharedMessages =
+            Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(messages)));
+        publish_live_history(id, &mirror);
+        mirror
+    }
+
+    fn first_text(messages: &Table) -> String {
+        messages
+            .get::<Table>(1)
+            .unwrap()
+            .get::<Table>("content")
+            .unwrap()
+            .get::<Table>(1)
+            .unwrap()
+            .get::<String>("text")
+            .unwrap()
+    }
+
+    /// Answers `Current` with {id}, the way the UI does.
+    fn ui_focused_on(id: MakimaId) -> Lua {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Current,
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected current request");
+            };
+            reply_tx.send(Ok(json!(id.to_string()))).unwrap();
+        });
+        lua_with_session(Some(tx))
+    }
+
+    /// Two live sessions, one focused: the transcript read is the focused
+    /// one's alone.
+    #[test]
+    fn messages_reads_only_the_focused_session() {
+        let focused = MakimaId::generate();
+        let other = MakimaId::generate();
+        let _focused = published(focused, vec![Message::user(FOCUSED_TEXT.into())]);
+        let _other = published(other, vec![Message::user(OTHER_TEXT.into())]);
+        let lua = ui_focused_on(focused);
+
+        let (messages, error): (Table, Option<String>) =
+            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        assert_eq!(error, None);
+        assert_eq!(messages.raw_len(), 1);
+        assert_eq!(first_text(&messages), FOCUSED_TEXT);
+    }
+
+    #[test]
+    fn messages_takes_an_explicit_session_and_keeps_the_newest() {
+        let id = MakimaId::generate();
+        let _mirror = published(
+            id,
+            vec![
+                Message::user(FIRST.into()),
+                Message::user(OTHER_TEXT.into()),
+            ],
+        );
+        let lua = lua_with_session(None);
+
+        let code = format!("return session.messages({{ session = '{id}', last = 1 }})");
+        let (messages, error): (Table, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert_eq!(error, None);
+        assert_eq!(messages.raw_len(), 1);
+        assert_eq!(first_text(&messages), OTHER_TEXT);
+    }
+
+    #[test]
+    fn messages_of_a_session_that_is_not_live_is_an_error_pair() {
+        let id = MakimaId::generate();
+        let lua = lua_with_session(None);
+        let code = format!("return session.messages({{ session = '{id}' }})");
+        let (value, error): (Value, Option<String>) =
+            smol::block_on(lua.load(&code).eval_async()).unwrap();
+        assert!(value.is_nil());
+        assert_eq!(error, Some(format!("{NOT_LIVE_ERR}: {id}")));
+    }
+
+    #[test]
+    fn messages_without_a_focused_session_is_an_error_pair() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        std::thread::spawn(move || {
+            let Ok(UiAction::Session { reply_tx, .. }) = rx.recv() else {
+                panic!("expected session request");
+            };
+            reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
+        });
+        let (_, error): (Value, Option<String>) =
+            smol::block_on(lua.load("return session.messages()").eval_async()).unwrap();
+        assert_eq!(error.as_deref(), Some(NO_FOCUSED_SESSION_ERR));
     }
 
     #[test]

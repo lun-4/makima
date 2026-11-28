@@ -3,7 +3,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use makima_agent::AgentMode;
 use makima_agent::agent::tool_dispatch;
 use makima_agent::cancel::CancelToken;
 use makima_agent::mcp::test_support::stub_session_with_result;
@@ -11,8 +10,14 @@ use makima_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use makima_agent::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadStore};
 use makima_agent::tools::test_support::stub_ctx;
 use makima_agent::tools::{CallOrigin, Deadline, ToolRegistry, TurnToolBindings};
+use makima_agent::{
+    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, AgentRef,
+    Envelope, ToolDoneEvent, ToolOutput, ToolStartEvent,
+};
 use makima_lua::{Permission, PluginHost, PluginPermissions, UiAction};
 use test_case::test_case;
+
+mod common;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
 const MCP_WIRE_TOOL: &str = "srv__probe";
@@ -23,6 +28,14 @@ const MCP_PREVIEW_LINES: usize = 10;
 const MCP_SENTINEL: &str = "private sentinel beyond the preview";
 const MCP_REDACTED: &str = "[redacted]";
 const OFFLOAD_SAVED_TO: &str = "saved to ";
+const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+const NO_EVENT: &str = "the autocmd never fired";
+const NOT_EVENT: &str = "expected an event, got another UI action";
+const EVENT_TOOL_ID: &str = "call-1";
+const TOOL_COMMAND: &str = "cargo test";
+const TOOL_TEXT: &str = "ok";
+const SUMMARY: &str = "earlier we fixed the build";
+const PROMPT: &str = "fix the build";
 /// Generous on purpose. A bound a slow machine can trip is a bound that fails
 /// for the wrong reason, and this one is only reached when something is stuck.
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1592,4 +1605,154 @@ fn slot_reload_semantics() {
         "ok:<hello world>",
         "surviving filler re-attaches after owner reload"
     );
+}
+
+// ------------------------------------------- agent event payloads
+
+/// A root that never finishes its turn, so lifecycle events arrive without a
+/// provider and a test can read `TurnStart` before anything else happens.
+fn event_root(host: &PluginHost) -> AgentRef {
+    let (template, _events, _cancel) = common::ctx_with_canned_provider();
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root_with_config(
+            Some(common::effective_config(&template)),
+            Vec::new(),
+            None,
+            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
+        )
+        .unwrap();
+    host.event_handle().observe_agents(&manager);
+    host.wait_for_worker_barrier_for_test();
+    root
+}
+
+fn flash(flashes: &flume::Receiver<UiAction>) -> String {
+    match flashes.recv_timeout(EVENT_TIMEOUT).expect(NO_EVENT) {
+        UiAction::Flash(text) => text,
+        _ => panic!("{NOT_EVENT}"),
+    }
+}
+
+fn envelope(event: AgentEvent) -> Envelope {
+    Envelope {
+        event,
+        subagent: None,
+        identity: None,
+    }
+}
+
+fn tool_start() -> AgentEvent {
+    AgentEvent::ToolStart(Box::new(ToolStartEvent {
+        id: EVENT_TOOL_ID.into(),
+        tool: "bash".into(),
+        summary: String::new(),
+        render_header: None,
+        annotation: None,
+        input: None,
+        raw_input: Some(serde_json::json!({ "command": TOOL_COMMAND })),
+        output: None,
+    }))
+}
+
+fn tool_done() -> AgentEvent {
+    AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+        id: EVENT_TOOL_ID.into(),
+        tool: "bash".into(),
+        output: ToolOutput::Plain(TOOL_TEXT.into()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    }))
+}
+
+/// A `ToolDone` plugin gets the call the model made, the text the model read,
+/// whether it failed, and how long it took, all without correlating events
+/// itself.
+#[test]
+fn tool_done_payload_carries_the_call() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let root = event_root(&host);
+    load(
+        &host,
+        "tool_done",
+        r#"
+        makima.api.create_autocmd("ToolDone", { callback = function(ev)
+            makima.ui.flash(table.concat({
+                tostring(ev.data.bytes),
+                tostring(ev.data.is_error),
+                tostring(ev.data.input.command),
+                tostring(ev.data.duration_ms ~= nil),
+            }, "|"))
+        end })
+        "#,
+    );
+    let flashes = host.ui_action_rx();
+    let handle = host.event_handle();
+    makima_lua::agent_autocmd::dispatch(&handle, &root, &envelope(tool_start()));
+    makima_lua::agent_autocmd::dispatch(&handle, &root, &envelope(tool_done()));
+
+    assert_eq!(
+        flash(&flashes),
+        format!("{}|false|{TOOL_COMMAND}|true", TOOL_TEXT.len())
+    );
+}
+
+#[test]
+fn compaction_done_payload_carries_the_summary() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let root = event_root(&host);
+    load(
+        &host,
+        "compaction_done",
+        r#"
+        makima.api.create_autocmd("CompactionDone", { callback = function(ev)
+            makima.ui.flash(ev.data.status .. "|" .. ev.data.summary)
+        end })
+        "#,
+    );
+    let flashes = host.ui_action_rx();
+    makima_lua::agent_autocmd::dispatch(
+        &host.event_handle(),
+        &root,
+        &envelope(AgentEvent::CompactionDone {
+            context_size_before: 100_000,
+            context_size_after: 30_000,
+            context_window: 200_000,
+            summary: SUMMARY.into(),
+        }),
+    );
+
+    assert_eq!(flash(&flashes), format!("completed|{SUMMARY}"));
+}
+
+#[test]
+fn turn_start_payload_carries_the_message_that_started_it() {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let root = event_root(&host);
+    load(
+        &host,
+        "turn_start",
+        r#"
+        makima.api.create_autocmd("TurnStart", { callback = function(ev)
+            makima.ui.flash(ev.data.text)
+        end })
+        "#,
+    );
+    let flashes = host.ui_action_rx();
+    root.actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput {
+                message: PROMPT.into(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                prompt: None,
+            },
+            None,
+            PROMPT.into(),
+        )
+        .unwrap();
+
+    assert_eq!(flash(&flashes), PROMPT);
 }

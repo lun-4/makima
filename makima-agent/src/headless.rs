@@ -1070,18 +1070,19 @@ pub fn spawn_interactive_with_binding(
                     root: root.clone(),
                 };
                 let mut template = backend.template(&config);
-                let mirror =
-                    history.map(|snapshot| Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)));
-                let initial_history = mirror
-                    .as_ref()
-                    .map(|mirror| mirror.load().messages.as_ref().clone())
-                    .unwrap_or(params.initial_history);
+                let mirror: crate::SharedMessages = match history {
+                    Some(snapshot) => Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
+                    None => Arc::new(arc_swap::ArcSwap::from_pointee(
+                        crate::HistorySnapshot::new(params.initial_history.clone()),
+                    )),
+                };
+                let initial_history = mirror.load().messages.as_ref().clone();
                 let (start, started) = flume::bounded(1);
                 let reference = manager
                     .create_root_deferred_with_config(
                         Some(config),
                         initial_history,
-                        mirror,
+                        Some(Arc::clone(&mirror)),
                         |agent_id| {
                             let mut backend = backend;
                             backend.params.agent_id = agent_id;
@@ -1094,10 +1095,11 @@ pub fn spawn_interactive_with_binding(
                 if let Some(binding) = binding {
                     binding(manager.clone(), reference.clone(), template).await?;
                 }
-                root.finish(Ok(reference.clone()));
                 start
                     .send(())
                     .map_err(|_| INITIALIZATION_CLOSED.to_owned())?;
+                crate::publish_live_history(session_ref.id(), &mirror);
+                root.finish(Ok(reference.clone()));
                 Ok::<_, String>(reference)
             }
             .await;
@@ -1933,6 +1935,102 @@ pub(crate) mod tests {
             assert!(received.is_empty());
             handle.task.cancel().await;
             coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test_case(false, false ; "preparation_without_previous_session")]
+    #[test_case(false, true ; "preparation_preserves_previous_session")]
+    #[test_case(true, false ; "binding_without_previous_session")]
+    #[test_case(true, true ; "binding_preserves_previous_session")]
+    fn failed_initialization_does_not_publish_history(binding_failure: bool, previous: bool) {
+        const FAILURE: &str = "initialization failed";
+        const OLD: &str = "previous session";
+        const NEW: &str = "replacement session";
+        smol::block_on(async {
+            let session_id = MakimaId::generate();
+            let old = Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::HistorySnapshot::new(vec![Message::user(OLD.into())]),
+            ));
+            if previous {
+                crate::publish_live_history(session_id, &old);
+            }
+            let (entered, seen) = flume::bounded(1);
+            let (release, released) = flume::bounded(1);
+            let (provider, _) = recording();
+            let prepare = Box::new(move |model| {
+                Box::pin(async move {
+                    if !binding_failure {
+                        entered.send_async(()).await.unwrap();
+                        released.recv_async().await.unwrap();
+                        return Err(crate::AgentError::Config {
+                            message: FAILURE.into(),
+                        });
+                    }
+                    Ok(PreparedModel { model, provider })
+                }) as BoxFuture<'static, _>
+            });
+            let (bound, binding_seen) = flume::bounded(1);
+            let (finish, finished) = flume::bounded(1);
+            let binding: RootBinding = Box::new(move |_, _, _| {
+                Box::pin(async move {
+                    bound.send_async(()).await.unwrap();
+                    finished.recv_async().await.unwrap();
+                    Err(FAILURE.into())
+                })
+            });
+            let handle = spawn_interactive_with_binding(
+                interactive_params(session_id, vec![Message::user(NEW.into())]),
+                prepare,
+                None,
+                Some(binding),
+            );
+            if binding_failure {
+                bounded(binding_seen.recv_async()).await.unwrap();
+            } else {
+                bounded(seen.recv_async()).await.unwrap();
+            }
+            let assert_previous = || {
+                let live = crate::live_history(session_id);
+                if previous {
+                    assert_eq!(live.unwrap().as_ref(), old.load().messages.as_ref());
+                } else {
+                    assert!(live.is_none());
+                }
+            };
+            assert_previous();
+            if binding_failure {
+                finish.send_async(()).await.unwrap();
+            } else {
+                release.send_async(()).await.unwrap();
+            }
+            assert!(bounded(handle.initialized_root()).await.is_err());
+            bounded(handle.task).await;
+            assert_previous();
+        });
+    }
+
+    #[test]
+    fn successful_binding_replaces_live_history() {
+        smol::block_on(async {
+            let session_id = MakimaId::generate();
+            let old = Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::HistorySnapshot::new(vec![Message::user("old".into())]),
+            ));
+            crate::publish_live_history(session_id, &old);
+            let messages = vec![Message::user("new".into())];
+            let (provider, _) = recording();
+            let handle = spawn_interactive_with_binding(
+                interactive_params(session_id, messages.clone()),
+                Box::new(move |model| {
+                    Box::pin(async move { Ok(PreparedModel { model, provider }) })
+                }),
+                None,
+                None,
+            );
+            bounded(handle.initialized_root()).await.unwrap();
+            assert_eq!(crate::live_history(session_id).unwrap().as_ref(), &messages);
+            drop(handle.input_tx);
+            bounded(handle.task).await;
         });
     }
 

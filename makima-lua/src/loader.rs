@@ -818,6 +818,7 @@ impl PluginHost {
             command_arguments: self.inner.command_arguments.clone(),
             command_argument_lifecycle: self.inner.command_argument_lifecycle.clone(),
             splash_frames: self.inner.splash_frames.clone(),
+            tool_calls: self.inner.tool_calls.clone(),
         }
     }
 
@@ -869,6 +870,9 @@ pub struct EventHandle {
     command_arguments: CoalescedLatest<CommandArgumentRequest>,
     command_argument_lifecycle: CoalescedLatest<CommandArgumentLifecycleRequest>,
     splash_frames: CoalescedLatest<SplashFrameRequest>,
+    /// Calls whose `ToolStart` was dispatched and whose `ToolDone` has not
+    /// arrived yet, so the done payload can name the input and the duration.
+    tool_calls: crate::agent_autocmd::ToolCalls,
 }
 
 /// In-memory completion/expander store for tests with no running Lua thread.
@@ -964,6 +968,7 @@ impl EventHandle {
             splash_frames: CoalescedLatest::new(move |work| {
                 tx.send(Request::SplashFrame(work)).is_ok()
             }),
+            tool_calls: crate::agent_autocmd::ToolCalls::default(),
         }
     }
 
@@ -1072,6 +1077,7 @@ impl EventHandle {
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             splash_frames: CoalescedLatest::new(|_| false),
+            tool_calls: crate::agent_autocmd::ToolCalls::default(),
         }
     }
 
@@ -1091,6 +1097,7 @@ impl EventHandle {
             command_arguments: CoalescedLatest::new(|_| false),
             command_argument_lifecycle: CoalescedLatest::new(|_| false),
             splash_frames: CoalescedLatest::new(|_| false),
+            tool_calls: crate::agent_autocmd::ToolCalls::default(),
         }
     }
 
@@ -1136,6 +1143,7 @@ impl EventHandle {
             splash_frames: CoalescedLatest::new(move |work| {
                 shared.send(Request::SplashFrame(work)).is_ok()
             }),
+            tool_calls: crate::agent_autocmd::ToolCalls::default(),
         }
     }
 
@@ -1329,6 +1337,10 @@ impl EventHandle {
     }
 
     /// Fires {event} as {agent}'s, so callbacks get its handle and a ctx.
+    pub(crate) fn tool_calls(&self) -> &crate::agent_autocmd::ToolCalls {
+        &self.tool_calls
+    }
+
     pub fn fire_agent_autocmd(&self, event: &str, agent: AgentRef, data: serde_json::Value) {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),

@@ -2774,6 +2774,11 @@ impl App {
         }
         // A moved call reports after the turn that took its receipt is gone,
         // so these skip the run filter like posts do.
+        if matches!(&envelope.event, AgentEvent::ToolMoved { .. })
+            && let Some(root) = &self.root_agent
+        {
+            makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+        }
         match &envelope.event {
             AgentEvent::ToolMoved { id, tool, summary } => {
                 let chat_idx = envelope
@@ -2874,6 +2879,9 @@ impl App {
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                if let Some(root) = &self.root_agent {
+                    makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+                }
                 self.finish_child_plan_approval(subagent.agent_id);
                 if self.plan_picker_edits(Some(subagent.agent_id))
                     || self
@@ -2905,6 +2913,9 @@ impl App {
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
             (&envelope.subagent, &envelope.event)
         {
+            if let Some(root) = &self.root_agent {
+                makima_lua::agent_autocmd::dispatch(&self.lua_event_handle, root, &envelope);
+            }
             let agent_id = subagent.agent_id;
             let turn_id = match outcome {
                 makima_agent::TurnOutcome::Completed { turn_id, .. }

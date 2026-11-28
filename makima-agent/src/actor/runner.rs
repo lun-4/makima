@@ -417,6 +417,11 @@ impl Runner {
                 agent_id,
                 turn_id,
                 provenance: admission.ticket.provenance().clone(),
+                text: admission
+                    .input
+                    .as_ref()
+                    .map(|input| input.message.clone())
+                    .unwrap_or_default(),
                 config: admission.policy.as_ref().map(|config| super::ConfigCommit {
                     identity: Arc::clone(&self.inner.identity),
                     generation: admission.generation,

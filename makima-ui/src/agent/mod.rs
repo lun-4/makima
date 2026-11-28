@@ -293,6 +293,7 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
+    history_session_id: Option<makima_storage::id::MakimaId>,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: QueueSender,
@@ -307,6 +308,12 @@ pub(crate) struct AgentHandles {
 }
 
 impl AgentHandles {
+    pub(crate) fn publish_history(&self) {
+        if let Some(session_id) = self.history_session_id {
+            makima_agent::publish_live_history(session_id, &self.history);
+        }
+    }
+
     pub(crate) fn release_runner(&mut self) {
         if let Some(start) = self.runner_start.take() {
             let _ = start.send(());
@@ -362,6 +369,7 @@ impl AgentHandles {
             system_prompt,
         )
         .activate();
+        handles.publish_history();
         handles.release_runner();
         handles
     }
@@ -532,6 +540,7 @@ fn spawn_agent_internal(
     // Seeded empty because `AgentActorHandle::spawn` publishes the real
     // snapshot synchronously, before any handle escapes.
     let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
+    let history_session_id = session_id.as_ref().map(SessionRef::id);
     let initial_history = Arc::unwrap_or_clone(initial_history.messages);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
@@ -613,6 +622,7 @@ fn spawn_agent_internal(
             agent_tx,
             answer_tx,
             history: shared_history,
+            history_session_id,
             btw_system,
             mcp_handle,
             queue: queue_tx,

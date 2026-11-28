@@ -364,18 +364,22 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `ctx` is a trusted context pinned to it, and `ev.data` carries `agent_id`,
 /// `session_id` and `parent_id` (nil for a root, so `if ev.data.parent_id then
 /// return end` keeps a listener on roots). `"TurnStart"` adds `turn_id`,
-/// `origin` and `selection`; `"TurnEnd"` carries the same fields as
+/// `text` (the message that started the turn), `origin` and `selection`;
+/// `"TurnEnd"` carries the same fields as
 /// `AgentTurn:result` plus `reason`, `cost`, `list_cost`, `context_size`,
 /// `context_window` and `num_turns`; `"AgentIdle"` fires once work (a turn,
 /// a compaction) settled, not after a config change alone, and adds `settled`;
 /// `"ConfigChanged"` adds `generation`, `selection` and `mode`;
-/// `"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`.
+/// `"AgentClosed"` adds `lifecycle`. Tool events add `tool_id` and `tool`;
+/// `"ToolDone"` adds `is_error` and `bytes`, the size of the text the model
+/// reads, and, for a call that ran, `input` (the input the tool received) and
+/// `duration_ms`. A call that never ran, like a cancelled one, has neither.
 /// `"AutoCompacting"` adds `context_size` and `context_window`.
 /// `"CompactionDone"` adds `status` (`"completed"`, `"failed"` or
 /// `"cancelled"`), and after a compaction inside a turn also
-/// `context_size_before`, `context_size_after` and `context_window`; a
-/// compaction inside a turn that fails ends the turn, so it reports as a
-/// failed `"TurnEnd"`.
+/// `context_size_before`, `context_size_after`, `context_window` and
+/// `summary`, the text that replaced the history; a compaction inside a turn
+/// that fails ends the turn, so it reports as a failed `"TurnEnd"`.
 ///
 /// Host events with no agent, where `ctx` is nil: `"SessionReset"`,
 /// `"SessionFocusChanged"`, `"SessionCwdChanged"`, `"ProviderChanged"`,

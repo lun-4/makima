@@ -69,7 +69,7 @@ pub(super) async fn compact_history(
     config: &AgentConfig,
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<(TokenUsage, String), AgentError> {
     let event_tx = event_tx.without_output();
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
@@ -174,7 +174,7 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> Result<TokenUsage, AgentError> {
+) -> Result<(TokenUsage, String), AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -186,9 +186,9 @@ fn finish_compact(
 
     // Swapping the history for a summary the model never wrote would throw the
     // session away for nothing.
-    if response.message.first_text_content().is_none() {
+    let Some(summary) = response.message.first_text_content().map(str::to_owned) else {
         return Err(AgentError::EmptySummary);
-    }
+    };
 
     let new_history = vec![
         Message::user("What did we do so far?".into()),
@@ -203,7 +203,7 @@ fn finish_compact(
         "compaction completed"
     );
 
-    Ok(response.usage)
+    Ok((response.usage, summary))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,7 +218,7 @@ pub async fn compact(
     instructions: Option<&str>,
     session_id: Option<&SessionRef>,
 ) -> Result<(), AgentError> {
-    let usage = compact_history(
+    let (usage, _summary) = compact_history(
         provider,
         agent_provider,
         model,
