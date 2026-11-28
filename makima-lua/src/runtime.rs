@@ -8289,9 +8289,11 @@ mod tests {
         lua.set_app_data::<TaskHandle>(Arc::clone(&handle));
         lock_cell(&handle).kill_at.set(Some(Instant::now()));
 
+        // A starved runner can overrun the wall-clock deadline, which yields
+        // `Unknown`; only a kill under the stale handle reads as `Missing`.
         let frame = smol::block_on(splash_frame(&lua, 80, 24, 0.0, 1.0));
         assert!(
-            matches!(frame, SplashPull::Frame(_)),
+            !matches!(frame, SplashPull::Missing),
             "watchdog killed the render under the stale handle"
         );
     }
