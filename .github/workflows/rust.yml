@@ -11,6 +11,8 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
 
+# Only push runs save rust-cache. Their pull_request twins would store a second
+# copy of every cache and push the repo past its 10 GB cache budget.
 jobs:
   changes:
     name: Detect changes
@@ -73,6 +75,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just
@@ -88,6 +92,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
@@ -118,6 +124,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just
@@ -131,6 +139,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
@@ -171,6 +181,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
