@@ -81,7 +81,7 @@ local function cmd_read(path, dir, ctx)
     return nil, "read error: " .. err
   end
   local formatted =
-    helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE)
+    helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
   return {
     llm_output = formatted,
     body = render_content(formatted, path, ctx),
@@ -222,10 +222,10 @@ makima.api.register_tool({
 
     local result, err
     if cmd == "list" then
-      result, err = helpers.format_list(dir, input.tags)
+      result, err = helpers.format_list(dir, input.tags, ctx)
     elseif cmd == "read" then
       if input.tags and #input.tags > 0 then
-        result, err = helpers.format_read(dir, input.tags)
+        result, err = helpers.format_read(dir, input.tags, ctx)
       else
         result, err = cmd_read(input.path, dir, ctx)
       end

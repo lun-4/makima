@@ -449,6 +449,9 @@ function Batch:run_child(c, ctx)
   c.status = STATUS.RUNNING
   self:rerender()
   local text, err, state = makima.agent.call_tool(ctx, c.tool, c.params, {
+    -- A model batch keeps the child output compact; a batch a script asked
+    -- for hands its own full mode down.
+    output_mode = ctx:output_mode(),
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)

@@ -486,7 +486,9 @@ impl OutputLimitOptions {
     pub fn prepare_for_output_hook(&mut self, body: &mut String) {
         if let Some(trailer) = self.trailer.as_mut() {
             trailer.truncate(trailer.trim_end_matches('\n').len());
-            *body = with_trailer(body.trim_end_matches('\n'), Some(trailer));
+            if !trailer.is_empty() {
+                *body = with_trailer(body, Some(trailer));
+            }
         }
     }
 
@@ -523,6 +525,19 @@ impl OutputLimitOptions {
             )
         })
         .await
+    }
+
+    /// Full results skip the limits but keep the trailer, which carries text
+    /// the tool never put in the body, like an exit code or a partial marker.
+    pub fn apply_trailer(self, body: String) -> String {
+        match self
+            .trailer
+            .as_deref()
+            .filter(|trailer| !trailer.is_empty())
+        {
+            Some(trailer) => with_trailer(&body, Some(trailer)),
+            None => body,
+        }
     }
 }
 
@@ -854,6 +869,49 @@ mod tests {
             limit_output("one\ntwo\n", &options, None),
             format!("one\ntwo\n{TRAILER}")
         );
+    }
+
+    #[test_case("", None; "empty_body")]
+    #[test_case("body\n", None; "single_newline")]
+    #[test_case("body\n\n", None; "multiple_newlines")]
+    #[test_case("\n\n", None; "only_newlines")]
+    #[test_case("body\n\n", Some(TRAILER); "with_trailer")]
+    #[test_case("body\n\n", Some(""); "empty_trailer")]
+    fn full_output_preserves_body(body: &str, trailer: Option<&str>) {
+        let options = OutputLimitOptions {
+            deadline: None,
+            trailer: trailer.map(str::to_owned),
+            shape: PreviewShape::Head,
+            lines_clipped: false,
+            limits: opts(PreviewShape::Head, 10, 100).limits,
+        };
+        let expected = match trailer.filter(|trailer| !trailer.is_empty()) {
+            Some(trailer) if body.is_empty() => trailer.to_owned(),
+            Some(trailer) => format!("{body}\n{trailer}"),
+            None => body.to_owned(),
+        };
+        assert_eq!(options.apply_trailer(body.to_owned()), expected);
+    }
+
+    #[test_case("body\n\n", Some(TRAILER); "with_trailer")]
+    #[test_case("body\n\n", None; "without_trailer")]
+    #[test_case("body\n\n", Some(""); "empty_trailer")]
+    fn full_output_preserves_body_through_hook(body: &str, trailer: Option<&str>) {
+        let mut options = OutputLimitOptions {
+            deadline: None,
+            trailer: trailer.map(str::to_owned),
+            shape: PreviewShape::Head,
+            lines_clipped: false,
+            limits: opts(PreviewShape::Head, 10, 100).limits,
+        };
+        let mut filtered = body.to_owned();
+        options.prepare_for_output_hook(&mut filtered);
+        options.recover_filtered_trailer(&mut filtered);
+        let expected = match trailer.filter(|trailer| !trailer.is_empty()) {
+            Some(trailer) => format!("{body}\n{trailer}"),
+            None => body.to_owned(),
+        };
+        assert_eq!(options.apply_trailer(filtered), expected);
     }
 
     #[test]

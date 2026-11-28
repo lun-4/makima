@@ -590,7 +590,7 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 /// `lines`, where every line has `line_nr`, `text`, and `is_match`.
 ///
 /// @param pattern string Regular expression to search for.
-/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): skip lines longer than this.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `unlimited` (boolean): remove the default match group limit when `limit` is absent. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 /// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
 /// @example
 /// local hits, err = makima.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
@@ -620,6 +620,8 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
         if let Ok(v) = opts.get::<usize>("limit") {
             params.limit = v;
+        } else if opt_bool(opts, "unlimited").unwrap_or(false) {
+            params.limit = usize::MAX;
         }
         if let Ok(v) = opts.get::<usize>("max_line_bytes") {
             params.max_line_bytes = v;
@@ -1479,6 +1481,45 @@ mod tests {
     fn grep_call(tbl: &Table, pattern: &str, opts: Table) -> (mlua::Value, mlua::Value) {
         let grep: mlua::Function = tbl.get("grep").unwrap();
         smol::block_on(grep.call_async((pattern, opts))).unwrap()
+    }
+
+    #[test_case(None, false, None, 100 ; "default_cap")]
+    #[test_case(Some(0), false, None, 100 ; "unlimited_line_bytes_preserves_default_cap")]
+    #[test_case(Some(0), true, None, 1200 ; "unlimited")]
+    #[test_case(Some(0), true, Some(1100), 1100 ; "explicit_above_compact_clamp")]
+    #[test_case(Some(0), true, Some(3), 3 ; "explicit_small")]
+    #[test_case(Some(0), true, Some(0), 0 ; "explicit_zero")]
+    #[test_case(Some(500), false, Some(1100), 1100 ; "bounded_line_explicit_limit")]
+    fn grep_limit_options(
+        line_bytes: Option<usize>,
+        unlimited: bool,
+        limit: Option<usize>,
+        expected: usize,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("data.txt"), "needle\n".repeat(1200)).unwrap();
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("path", tmp.path().to_str().unwrap()).unwrap();
+        opts.set("max_line_bytes", line_bytes).unwrap();
+        opts.set("unlimited", unlimited).unwrap();
+        opts.set("limit", limit).unwrap();
+        let (val, err) = grep_call(&tbl, "needle", opts);
+        assert_eq!(err, mlua::Value::Nil);
+        let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
+        let count = if result.len().unwrap() == 0 {
+            0
+        } else {
+            result
+                .get::<Table>(1)
+                .unwrap()
+                .get::<Table>("groups")
+                .unwrap()
+                .len()
+                .unwrap() as usize
+        };
+        assert_eq!(count, expected);
     }
 
     #[test]

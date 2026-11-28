@@ -32,8 +32,8 @@ use crate::session_coordinator::{ModelPreparer, SessionCoordinatorHandle};
 use crate::template;
 use crate::tools::offload::{OffloadCleanup, OffloadStore};
 use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext, ToolRegistry,
-    TurnToolBindings,
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext, ToolOutputMode,
+    ToolRegistry, TurnToolBindings,
 };
 use crate::{
     ActorBackend, Agent, AgentConfig, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle,
@@ -535,6 +535,7 @@ impl HeadlessBackend {
             tool_filter: Arc::clone(tools.filter()),
             request_tools: Some(tools),
             tool_output_lines: self.params.tool_output_lines,
+            output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.params.permissions),
             timeouts: self.params.timeouts,
             file_tracker: Arc::clone(&self.params.file_tracker),
