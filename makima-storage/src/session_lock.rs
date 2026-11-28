@@ -261,6 +261,8 @@ impl ClaimedSessionLock {
     }
 
     /// Refresh the lease only while the on-disk lock still has this lease's identity.
+    /// Liveness is the mtime alone and a lost beat after a crash only makes the
+    /// lease stale, so the beat touches the mtime without rewriting or syncing.
     pub fn heartbeat(&mut self) -> io::Result<LockBeat> {
         let Some(mut file) = open_existing_locked(&self.path)? else {
             return Ok(LockBeat::Lost);
@@ -269,7 +271,7 @@ impl ClaimedSessionLock {
             file.unlock()?;
             return Ok(LockBeat::Lost);
         }
-        write_record(&mut file, self.owner.pid.to_string().as_bytes())?;
+        file.set_modified(SystemTime::now())?;
         file.unlock()?;
         Ok(LockBeat::Held)
     }
@@ -766,6 +768,22 @@ mod tests {
         );
         blocker.unlock().unwrap();
         assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+    }
+
+    #[test]
+    fn heartbeat_refreshes_backdated_lease_without_rewriting_it() {
+        let dir = tempdir().unwrap();
+        let id = MakimaId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let record = fs::read(&path).unwrap();
+        backdate(&path, STALE_AFTER + Duration::from_secs(5));
+
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(is_fresh(mtime, SystemTime::now()));
+        assert_eq!(fs::read(&path).unwrap(), record);
+        lease.release().unwrap();
     }
 
     #[test]
