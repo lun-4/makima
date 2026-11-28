@@ -17,7 +17,7 @@ use std::{
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf, absolute},
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{Arc, Mutex, OnceLock, Weak},
     task::{Context, Poll},
     thread,
@@ -27,7 +27,14 @@ use tracing::warn;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+const MAX_INITIALIZE_ATTEMPTS: u32 = 5;
+#[cfg(not(test))]
+const STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STALL_WARNING_AFTER: Duration = Duration::from_millis(50);
 const CLOSED: &str = "session writer closed";
+const ABANDONED: &str = "restart makima to retry";
+const STALLED: &str = "the disk has not confirmed a write";
 static WRITERS: OnceLock<Mutex<HashMap<PathBuf, SessionWriter>>> = OnceLock::new();
 
 pub(crate) type OpenedSessionIo = (Box<dyn SessionIo>, u64);
@@ -396,6 +403,7 @@ async fn initialize(
     let mut pending = Vec::new();
     let mut backoff = INITIAL_BACKOFF;
     let mut ordinary_error: Option<WriterError> = None;
+    let mut failed_attempts = 0;
     loop {
         if pending.is_empty() {
             let Ok(request) = rx.recv_async().await else {
@@ -428,11 +436,11 @@ async fn initialize(
             });
         }
         let guard = pending.iter().find_map(|request| request.guard.clone());
-        let (returned_factory, opened) = smol::unblock(move || {
+        let opening = smol::unblock(move || {
             let result = publish(guard.as_ref(), &mut factory);
             (factory, result)
-        })
-        .await;
+        });
+        let (returned_factory, opened) = flag_stall(opening, session_id, &status, &journals).await;
         factory = returned_factory;
         match opened {
             Ok((io, next_seq)) => {
@@ -449,6 +457,11 @@ async fn initialize(
                 return;
             }
             Err(error) => {
+                failed_attempts += 1;
+                if failed_attempts == MAX_INITIALIZE_ATTEMPTS {
+                    give_up(session_id, error, pending, rx, &status, &journals).await;
+                    return;
+                }
                 let error = writer_error(session_id, error);
                 status.lock_unpoisoned().error = Some(error.clone());
                 update_journals(&journals, Some(error.to_string()));
@@ -473,6 +486,47 @@ async fn initialize(
                 }
             }
         }
+    }
+}
+
+/// Each initialization reads and parses the whole log, so a failure that does not
+/// clear on its own stops retrying. Ordinary records stay counted as unsaved.
+async fn give_up(
+    session_id: MakimaId,
+    error: io::Error,
+    pending: Vec<Request>,
+    rx: flume::Receiver<Request>,
+    status: &Mutex<WriterStatus>,
+    journals: &Mutex<Vec<Weak<SessionJournal>>>,
+) {
+    let error = writer_error(
+        session_id,
+        format!("{error}; gave up after {MAX_INITIALIZE_ATTEMPTS} attempts, {ABANDONED}"),
+    );
+    warn!(%session_id, %error, attempts = MAX_INITIALIZE_ATTEMPTS, "session initialization abandoned");
+    status.lock_unpoisoned().error = Some(error.clone());
+    update_journals(journals, Some(error.to_string()));
+    let mut pending = pending.into_iter();
+    loop {
+        let request = match pending.next() {
+            Some(request) => request,
+            None => match rx.recv_async().await {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
+        if matches!(request.payload, Payload::Close) {
+            disconnect(rx, status);
+            let _ = request.reply.send(Ok(AppendAck {
+                next_seq: 0,
+                warning: None,
+            }));
+            return;
+        }
+        if request.payload.is_atomic() {
+            status.lock_unpoisoned().unsaved_records -= request.payload.count();
+        }
+        let _ = request.reply.send(Err(error.clone()));
     }
 }
 
@@ -559,11 +613,12 @@ async fn run(
                         let _ = reply.send(Err(writer_error(session_id, error)));
                         continue;
                     }
-                    let (returned_io, result) = smol::unblock(move || {
+                    let writing = smol::unblock(move || {
                         let result = publish(guard.as_ref(), || write_atomic(&mut *io, &encoded));
                         (io, result)
-                    })
-                    .await;
+                    });
+                    let (returned_io, result) =
+                        flag_stall(writing, session_id, &status, &journals).await;
                     io = returned_io;
                     let fenced = matches!(&result, Err(AtomicWriteError::Rollback { .. }));
                     let visible = accept_visible
@@ -638,13 +693,13 @@ async fn run(
         if !needs_sync {
             continue;
         }
-        let result = smol::unblock(move || {
+        let writing = smol::unblock(move || {
             let result = publish(publication_guard.as_ref(), || {
                 write_and_sync(&mut *io, &bytes, &mut written)
             });
             (io, bytes, written, publication_guard, result)
-        })
-        .await;
+        });
+        let result = flag_stall(writing, session_id, &status, &journals).await;
         (io, bytes, written, publication_guard) = (result.0, result.1, result.2, result.3);
         match result.4 {
             Ok(()) => {
@@ -670,8 +725,12 @@ async fn run(
             }
             Err(error) => {
                 let error = writer_error(session_id, error);
-                status.lock_unpoisoned().error = Some(error.clone());
-                update_journals(&journals, Some(error.to_string()));
+                let degraded = writer_error(
+                    session_id,
+                    format!("{}; retrying {retained} records", error.message),
+                );
+                status.lock_unpoisoned().error = Some(degraded.clone());
+                update_journals(&journals, Some(degraded.to_string()));
                 warn!(%session_id, %error, retained, "session has unsaved records; retrying");
                 for reply in replies.drain(..) {
                     let _ = reply.send(Err(error.clone()));
@@ -682,6 +741,33 @@ async fn run(
             }
         }
     }
+}
+
+/// A write the disk never confirms raises no error, so flag it as degraded once it
+/// outlives `STALL_WARNING_AFTER`. Completion replaces the flag with its outcome.
+async fn flag_stall<T>(
+    work: impl Future<Output = T>,
+    session_id: MakimaId,
+    status: &Mutex<WriterStatus>,
+    journals: &Mutex<Vec<Weak<SessionJournal>>>,
+) -> T {
+    let mut work = pin!(work);
+    let finished = smol::future::or(async { Some(work.as_mut().await) }, async {
+        smol::Timer::after(STALL_WARNING_AFTER).await;
+        None
+    })
+    .await;
+    if let Some(output) = finished {
+        return output;
+    }
+    let error = writer_error(
+        session_id,
+        format!("{STALLED} after {STALL_WARNING_AFTER:?}; changes are waiting in memory"),
+    );
+    warn!(%session_id, after = ?STALL_WARNING_AFTER, "session write stalled");
+    status.lock_unpoisoned().error = Some(error.clone());
+    update_journals(journals, Some(error.to_string()));
+    work.await
 }
 
 fn encode_record(record: &Record, seq: &mut u64, encoded: &mut Vec<u8>) -> io::Result<()> {
@@ -808,8 +894,8 @@ fn evict(path: &Path, writer: &SessionWriter) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSED, Record, SessionFile, SessionIo, SessionWriter, StoredSession, WriterStatus, forget,
-        open_log,
+        ABANDONED, CLOSED, MAX_INITIALIZE_ATTEMPTS, Record, STALLED, SessionFile, SessionIo,
+        SessionWriter, StoredSession, WriterStatus, forget, open_log,
     };
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
@@ -822,8 +908,11 @@ mod tests {
     use std::{
         fs::{create_dir, read, remove_file, write},
         io,
-        sync::{Arc, Mutex},
-        time::Duration,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU32, Ordering},
+        },
+        time::{Duration, Instant},
     };
     use test_case::test_case;
 
@@ -1150,6 +1239,71 @@ mod tests {
             assert_eq!(record["seq"], 17);
             assert_eq!(record["id"], "retained");
             assert!(writer.status().error.is_none());
+        });
+    }
+
+    #[test]
+    fn initialization_stops_retrying_after_max_attempts() {
+        smol::block_on(async {
+            let attempts = Arc::new(AtomicU32::new(0));
+            let counted = Arc::clone(&attempts);
+            let writer = SessionWriter::with_factory(MakimaId::generate(), move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(DISK_FULL))
+            });
+            assert!(writer.append(vec![output("retained")]).await.is_err());
+            while !writer
+                .append(Vec::new())
+                .await
+                .unwrap_err()
+                .message
+                .contains(ABANDONED)
+            {}
+            assert_eq!(attempts.load(Ordering::SeqCst), MAX_INITIALIZE_ATTEMPTS);
+
+            let error = writer.append(vec![output("later")]).await.unwrap_err();
+            assert!(error.message.contains(ABANDONED));
+            assert_eq!(attempts.load(Ordering::SeqCst), MAX_INITIALIZE_ATTEMPTS);
+            let status = writer.status();
+            assert_eq!(status.unsaved_records, 2);
+            assert!(status.error.unwrap().message.contains(ABANDONED));
+            writer.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn stalled_write_is_flagged_until_it_completes() {
+        smol::block_on(async {
+            let (synced, _) = flume::unbounded();
+            let (release, gate) = flume::bounded(1);
+            let writer = SessionWriter::with_io(
+                MakimaId::generate(),
+                FakeIo {
+                    bytes: Arc::new(Mutex::new(Vec::new())),
+                    fail_write: false,
+                    fail_sync: false,
+                    partial: false,
+                    synced,
+                    retry_gate: Some(gate),
+                },
+                0,
+            );
+            let journal = Arc::new(
+                SessionJournal::from_session(&StoredSession::new("test", "/test")).unwrap(),
+            );
+            writer.attach_journal(&journal);
+            let receipt = writer.append(vec![output("stalled")]);
+            let deadline = Instant::now() + RECEIPT_TIMEOUT;
+            while !journal
+                .persistence_error()
+                .is_some_and(|error| error.contains(STALLED))
+            {
+                assert!(Instant::now() < deadline, "stall was never flagged");
+                smol::Timer::after(Duration::from_millis(5)).await;
+            }
+            release.send(()).unwrap();
+            receipt.await.unwrap();
+            assert!(journal.persistence_error().is_none());
         });
     }
 
