@@ -28,10 +28,7 @@ use tracing::warn;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const MAX_INITIALIZE_ATTEMPTS: u32 = 5;
-#[cfg(not(test))]
 const STALL_WARNING_AFTER: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const STALL_WARNING_AFTER: Duration = Duration::from_millis(50);
 const CLOSED: &str = "session writer closed";
 const ABANDONED: &str = "restart makima to retry";
 const STALLED: &str = "the disk has not confirmed a write";
@@ -250,6 +247,14 @@ impl SessionWriter {
         session_id: MakimaId,
         factory: impl FnMut() -> io::Result<OpenedSessionIo> + Send + 'static,
     ) -> Self {
+        Self::spawn(session_id, STALL_WARNING_AFTER, factory)
+    }
+
+    fn spawn(
+        session_id: MakimaId,
+        stall_after: Duration,
+        factory: impl FnMut() -> io::Result<OpenedSessionIo> + Send + 'static,
+    ) -> Self {
         let (tx, rx) = flume::unbounded();
         let status = Arc::new(Mutex::new(WriterStatus::default()));
         let journals = Arc::new(Mutex::new(Vec::new()));
@@ -258,6 +263,7 @@ impl SessionWriter {
         thread::spawn(move || {
             smol::block_on(initialize(
                 session_id,
+                stall_after,
                 Box::new(factory),
                 rx,
                 worker_status,
@@ -395,6 +401,7 @@ pub(crate) fn open_log(path: &Path) -> io::Result<(File, u64)> {
 
 async fn initialize(
     session_id: MakimaId,
+    stall_after: Duration,
     mut factory: Box<dyn FnMut() -> io::Result<OpenedSessionIo> + Send>,
     rx: flume::Receiver<Request>,
     status: Arc<Mutex<WriterStatus>>,
@@ -440,13 +447,15 @@ async fn initialize(
             let result = publish(guard.as_ref(), &mut factory);
             (factory, result)
         });
-        let (returned_factory, opened) = flag_stall(opening, session_id, &status, &journals).await;
+        let (returned_factory, opened) =
+            flag_stall(opening, stall_after, session_id, &status, &journals).await;
         factory = returned_factory;
         match opened {
             Ok((io, next_seq)) => {
                 drop(factory);
                 run(
                     session_id,
+                    stall_after,
                     (io, next_seq),
                     rx,
                     status,
@@ -532,6 +541,7 @@ async fn give_up(
 
 async fn run(
     session_id: MakimaId,
+    stall_after: Duration,
     opened: OpenedSessionIo,
     rx: flume::Receiver<Request>,
     status: Arc<Mutex<WriterStatus>>,
@@ -618,7 +628,7 @@ async fn run(
                         (io, result)
                     });
                     let (returned_io, result) =
-                        flag_stall(writing, session_id, &status, &journals).await;
+                        flag_stall(writing, stall_after, session_id, &status, &journals).await;
                     io = returned_io;
                     let fenced = matches!(&result, Err(AtomicWriteError::Rollback { .. }));
                     let visible = accept_visible
@@ -699,7 +709,7 @@ async fn run(
             });
             (io, bytes, written, publication_guard, result)
         });
-        let result = flag_stall(writing, session_id, &status, &journals).await;
+        let result = flag_stall(writing, stall_after, session_id, &status, &journals).await;
         (io, bytes, written, publication_guard) = (result.0, result.1, result.2, result.3);
         match result.4 {
             Ok(()) => {
@@ -744,16 +754,17 @@ async fn run(
 }
 
 /// A write the disk never confirms raises no error, so flag it as degraded once it
-/// outlives `STALL_WARNING_AFTER`. Completion replaces the flag with its outcome.
+/// outlives `stall_after`. Completion replaces the flag with its outcome.
 async fn flag_stall<T>(
     work: impl Future<Output = T>,
+    stall_after: Duration,
     session_id: MakimaId,
     status: &Mutex<WriterStatus>,
     journals: &Mutex<Vec<Weak<SessionJournal>>>,
 ) -> T {
     let mut work = pin!(work);
     let finished = smol::future::or(async { Some(work.as_mut().await) }, async {
-        smol::Timer::after(STALL_WARNING_AFTER).await;
+        smol::Timer::after(stall_after).await;
         None
     })
     .await;
@@ -762,9 +773,9 @@ async fn flag_stall<T>(
     }
     let error = writer_error(
         session_id,
-        format!("{STALLED} after {STALL_WARNING_AFTER:?}; changes are waiting in memory"),
+        format!("{STALLED} after {stall_after:?}; changes are waiting in memory"),
     );
-    warn!(%session_id, after = ?STALL_WARNING_AFTER, "session write stalled");
+    warn!(%session_id, after = ?stall_after, "session write stalled");
     status.lock_unpoisoned().error = Some(error.clone());
     update_journals(journals, Some(error.to_string()));
     work.await
@@ -894,8 +905,8 @@ fn evict(path: &Path, writer: &SessionWriter) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ABANDONED, CLOSED, MAX_INITIALIZE_ATTEMPTS, Record, STALLED, SessionFile, SessionIo,
-        SessionWriter, StoredSession, WriterStatus, forget, open_log,
+        ABANDONED, CLOSED, MAX_INITIALIZE_ATTEMPTS, OpenedSessionIo, Record, STALLED, SessionFile,
+        SessionIo, SessionWriter, StoredSession, WriterStatus, forget, open_log,
     };
     use crate::journal::{JournalChange, JournalCommit, SessionJournal};
     use makima_providers::Message;
@@ -918,6 +929,7 @@ mod tests {
 
     const DISK_FULL: i32 = libc::ENOSPC;
     const RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_STALL_AFTER: Duration = Duration::from_millis(50);
 
     fn output(id: &str) -> Record {
         Record::Out {
@@ -1276,18 +1288,22 @@ mod tests {
         smol::block_on(async {
             let (synced, _) = flume::unbounded();
             let (release, gate) = flume::bounded(1);
-            let writer = SessionWriter::with_io(
-                MakimaId::generate(),
-                FakeIo {
+            let mut opened: Option<OpenedSessionIo> = Some((
+                Box::new(FakeIo {
                     bytes: Arc::new(Mutex::new(Vec::new())),
                     fail_write: false,
                     fail_sync: false,
                     partial: false,
                     synced,
                     retry_gate: Some(gate),
-                },
+                }),
                 0,
-            );
+            ));
+            let writer = SessionWriter::spawn(MakimaId::generate(), TEST_STALL_AFTER, move || {
+                opened
+                    .take()
+                    .ok_or_else(|| io::Error::other("test I/O already opened"))
+            });
             let journal = Arc::new(
                 SessionJournal::from_session(&StoredSession::new("test", "/test")).unwrap(),
             );
