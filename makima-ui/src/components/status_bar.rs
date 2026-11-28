@@ -1,5 +1,8 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -44,6 +47,9 @@ pub struct UsageStats {
     pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
+    /// List-rate cost of subsidised turns with no recorded source.
+    pub list_cost: Option<f64>,
+    pub list_cost_by_source: BTreeMap<String, f64>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -312,10 +318,19 @@ impl StatusBar {
                     format_tokens(ctx.stats.context_window),
                     pct,
                 );
-                let rest_text = match ctx.stats.cost {
-                    Some(cost) => format!("{context_text} ${cost:.3} "),
-                    None => format!("{context_text} "),
-                };
+                let mut rest_text = context_text;
+                if let Some(cost) = ctx.stats.cost {
+                    rest_text.push_str(&format!(" ${cost:.3}"));
+                }
+                for (source, list) in &ctx.stats.list_cost_by_source {
+                    if *list > 0.0 {
+                        rest_text.push_str(&format!(" (~${list:.3} {source})"));
+                    }
+                }
+                if let Some(list) = ctx.stats.list_cost.filter(|list| *list > 0.0) {
+                    rest_text.push_str(&format!(" (~${list:.3} list)"));
+                }
+                rest_text.push(' ');
                 rest_spans.push(Span::styled(
                     rest_text,
                     Style::new().fg(theme::current().foreground),
@@ -616,7 +631,6 @@ fn watch_branch(cwd: &Path) -> Option<BranchWatcher> {
 mod tests {
     use std::env;
     use std::fs;
-    use std::sync::Arc;
 
     use super::*;
     use crate::repaint::expect::QUIET;
@@ -632,6 +646,7 @@ mod tests {
     const CHAT_COST: f64 = 0.25;
     const CHAT_COST_TEXT: &str = "$0.250";
     const SESSION_COST: f64 = 1.5;
+    const LIST_COST: f64 = 0.75;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
     const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -663,6 +678,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -804,6 +821,88 @@ mod tests {
     }
 
     fn render(global_cost: Option<f64>, show_global: bool) -> String {
+        render_stats(UsageStats {
+            global_cost,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: None,
+            list_cost_by_source: BTreeMap::new(),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global,
+        })
+    }
+
+    /// A subscription prepays the bill, so the `$0` it charged reads next to
+    /// the published list price it covered.
+    #[test]
+    fn a_subsidised_chat_shows_the_list_price_beside_its_zero_bill() {
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(0.0),
+            list_cost: Some(LIST_COST),
+            list_cost_by_source: BTreeMap::new(),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(
+            text.contains(&format!("(~${LIST_COST:.3} list)")),
+            "no list price in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_metered_chat_shows_only_its_bill() {
+        let text = render(None, false);
+        assert!(text.contains(CHAT_COST_TEXT), "{text}");
+        assert!(!text.contains("(~$"), "{text}");
+    }
+
+    #[test]
+    fn mixed_metered_and_subsidised_turns_show_historical_list_cost() {
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: Some(LIST_COST),
+            list_cost_by_source: BTreeMap::new(),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(text.contains(CHAT_COST_TEXT), "{text}");
+        assert!(text.contains(&format!("(~${LIST_COST:.3} list)")), "{text}");
+    }
+
+    #[test]
+    fn multiple_sources_and_legacy_total_are_displayed_separately() {
+        const FIRST_SOURCE: &str = "First";
+        const SECOND_SOURCE: &str = "Second";
+        const FIRST_COST: f64 = 0.25;
+        const SECOND_COST: f64 = 0.5;
+        let text = render_stats(UsageStats {
+            global_cost: None,
+            context_size: CONTEXT_SIZE,
+            cost: Some(CHAT_COST),
+            list_cost: Some(LIST_COST),
+            list_cost_by_source: BTreeMap::from([
+                (FIRST_SOURCE.into(), FIRST_COST),
+                (SECOND_SOURCE.into(), SECOND_COST),
+            ]),
+            context_window: crate::components::TEST_CONTEXT_WINDOW,
+            show_global: false,
+        });
+        assert!(
+            text.contains(&format!("(~${FIRST_COST:.3} {FIRST_SOURCE})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("(~${SECOND_COST:.3} {SECOND_SOURCE})")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("(~${LIST_COST:.3} list)")), "{text}");
+    }
+
+    fn render_stats(stats: UsageStats) -> String {
         let bar = StatusBar::new(FLASH_TTL, test_cwd());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
@@ -813,13 +912,7 @@ mod tests {
             mode_style: Style::new(),
             model_id: MODEL_ID,
             model_switch_queued: false,
-            stats: UsageStats {
-                global_cost,
-                context_size: CONTEXT_SIZE,
-                cost: Some(CHAT_COST),
-                context_window: crate::components::TEST_CONTEXT_WINDOW,
-                show_global,
-            },
+            stats,
             auto_scroll: true,
             retry_info: None,
             thinking_label: None,
@@ -860,6 +953,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -911,6 +1006,8 @@ mod tests {
                 global_cost: None,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global: false,
             },
@@ -1167,6 +1264,8 @@ mod tests {
                 global_cost: None,
                 context_size: 0,
                 cost: None,
+                list_cost: None,
+                list_cost_by_source: BTreeMap::new(),
                 context_window: 0,
                 show_global: false,
             },

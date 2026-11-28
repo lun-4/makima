@@ -2249,6 +2249,8 @@ mod tests {
             usage,
             model: "test-model".into(),
             cost: Some(cost),
+            list_cost: None,
+            subsidy_source: None,
             context_size: None,
             context_window: 0,
         }))

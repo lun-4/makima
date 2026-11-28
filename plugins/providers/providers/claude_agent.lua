@@ -269,6 +269,12 @@ function M.provider(cache)
         makima.log.warn("claude-agent: model cache not written: " .. write_err)
       end
     end
+    local account = type(body.account) == "table" and body.account or {}
+    if account.api_provider == "firstParty" and (account.subscription == "pro" or account.subscription == "max") then
+      for _, model in ipairs(models) do
+        model.subsidised_by = "Claude " .. account.subscription:gsub("^%l", string.upper)
+      end
+    end
     return models
   end
 

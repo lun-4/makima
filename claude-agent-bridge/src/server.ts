@@ -87,6 +87,7 @@ export function handler(conversations: Conversations, probeClaude: ProbeClaude, 
   async function models(response: ServerResponse): Promise<void> {
     const result = await probeModels()
     json(response, 200, {
+      account: { subscription: result.account.subscriptionType, api_provider: result.account.apiProvider },
       models: result.models.map((model) => ({
         value: model.value,
         resolved_model: model.resolvedModel,

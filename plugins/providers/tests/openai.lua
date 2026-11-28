@@ -589,9 +589,14 @@ t.case("discovery_lists_the_account_plan_models", function()
     nova = model.id == "gpt-7-nova" and model or nova
   end
   t.eq(nova.provider_data.account_id, ACCOUNT)
+  for _, model in ipairs(models) do
+    t.eq(model.subsidised_by, "ChatGPT")
+  end
   t.eq(#models, #spec.models + 1)
   ctx = t.provider_ctx({ t.response({ "down" }, { status = 503 }) }, tokens())
-  t.eq(#assert(spec.discover(ctx, {})), #spec.models)
+  local fallback = assert(spec.discover(ctx, {}))
+  t.eq(#fallback, #spec.models)
+  t.eq(fallback[1].subsidised_by, "ChatGPT")
 end)
 
 t.case("state_setup_errors_are_reported", function()
@@ -600,6 +605,13 @@ t.case("state_setup_errors_are_reported", function()
   local _, prepare_err = spec.prepare(t.provider_ctx({}), { id = "gpt-4.1" }, config)
   t.same(discover_err, prepare_err)
   t.eq(discover_err.kind, http.CONFIG_KIND)
+end)
+
+t.case("prepare_uses_current_auth_not_stale_discovery_metadata", function()
+  local _, _, plan_model = prepared({}, { id = "gpt-5.5" }, tokens())
+  t.eq(plan_model.subsidised_by, "ChatGPT")
+  local _, _, key_model = prepared({ [KEY_ENV] = "sk" }, { id = "gpt-5.5", subsidised_by = "ChatGPT" })
+  t.eq(key_model.subsidised_by, nil)
 end)
 
 t.case("discovery_with_an_api_key_lists_platform_models", function()
@@ -611,6 +623,9 @@ t.case("discovery_with_an_api_key_lists_platform_models", function()
   t.eq(ctx.requests[1].url, API .. "/models")
   t.eq(models[#models].id, "gpt-new")
   t.eq(#models, #spec.models + 1)
+  for _, model in ipairs(models) do
+    t.eq(model.subsidised_by, nil)
+  end
 end)
 
 t.case("unreadable_oauth_falls_back_to_api_key_status", function()

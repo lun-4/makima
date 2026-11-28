@@ -180,6 +180,8 @@ fn finish_compact(
         usage: response.usage,
         model: model.id.clone(),
         cost: model.billed_cost(&response.usage, false),
+        list_cost: model.subsidised_list_cost(&response.usage, false),
+        subsidy_source: model.subsidised_by.clone(),
         context_size: Some(response.usage.output),
         context_window: model.context_window,
     })));
@@ -517,6 +519,42 @@ mod tests {
                 provider.sessions.lock().unwrap().as_slice(),
                 &[Some(session)]
             );
+        });
+    }
+
+    #[test_case(Some("Compaction plan"); "subsidised")]
+    #[test_case(None; "metered")]
+    fn compaction_event_captures_its_model_subsidy_source(source: Option<&str>) {
+        smol::block_on(async {
+            let provider = dyn_provider(&MockProvider::new(vec![Ok(text_response(
+                StopReason::EndTurn,
+            ))]));
+            let mut model = default_model();
+            model.subsidised_by = source.map(Arc::from);
+            let (raw_tx, events) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+            compact(
+                &provider,
+                &provider,
+                &model,
+                &mut history,
+                &EventSender::new(raw_tx),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            model.subsidised_by = Some(Arc::from("Changed"));
+            let event = events
+                .drain()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::TurnComplete(event) => Some(event),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(event.subsidy_source.as_deref(), source);
         });
     }
 

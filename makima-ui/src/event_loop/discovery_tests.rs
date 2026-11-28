@@ -1,4 +1,4 @@
-use super::{EventLoop, tests::with_event_loop_providers};
+use super::{EventLoop, InternalEvent, tests::with_event_loop_providers};
 use crate::components::{Action, key, model_picker::ModelPickerAction};
 use crossterm::event::KeyCode;
 use makima_config::ModelPolicy;
@@ -278,5 +278,20 @@ fn refresh_keeps_catalog_and_recents_through_slow_provider_failure() {
                 .handle_key(key(KeyCode::Enter)),
             ModelPickerAction::Select(selection) if selection == ModelSelection::default()
         ));
+    });
+}
+
+#[test]
+fn discovery_batches_coalesce_into_one_refresh() {
+    with_event_loop_providers(Arc::new(ProviderRegistry::default()), |event_loop| {
+        open(event_loop, RECENT);
+        let before = event_loop.models_refreshed;
+        for _ in 0..4 {
+            event_loop.handle_internal(InternalEvent::ModelsDiscovered);
+        }
+        event_loop.flush_model_discovery();
+        assert_eq!(event_loop.models_refreshed, before + 1);
+        event_loop.flush_model_discovery();
+        assert_eq!(event_loop.models_refreshed, before + 1);
     });
 }

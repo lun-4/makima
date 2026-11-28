@@ -77,6 +77,11 @@ pub struct ModelInfo {
     /// Offered at no charge; the model picker marks it.
     #[serde(default)]
     pub free: Option<bool>,
+    /// The subscription prepaying this model's bill, such as `"Max"`. The
+    /// rates stay the published list price, which the status bar shows beside
+    /// the `$0` the subscription actually charged.
+    #[serde(default)]
+    pub subsidised_by: Option<Arc<str>>,
     #[serde(default)]
     pub provider_data: Option<Value>,
 }
@@ -281,6 +286,9 @@ pub struct Model {
     pub context_window: u32,
     /// Offered at no charge, as the provider's descriptor says.
     pub free: bool,
+    /// The subscription prepaying this model's bill, `None` when every token
+    /// is billed per rate.
+    pub subsidised_by: Option<Arc<str>>,
 }
 
 impl Model {
@@ -304,6 +312,7 @@ impl Model {
             max_output_tokens: info.max_output_tokens,
             context_window: info.context_window.unwrap_or(UNKNOWN_CONTEXT_WINDOW),
             free: info.free == Some(true),
+            subsidised_by: info.subsidised_by.clone(),
         }
     }
 
@@ -348,6 +357,12 @@ impl Model {
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        if self.subsidised_by.is_some() {
+            // Prepaid by a subscription: the turn ran, nothing was billed per
+            // token. A real price table is still required so an unpriced model
+            // does not report a false "$0.000".
+            return self.list_cost(usage, fast).map(|_| 0.0);
+        }
         let cost = self.list_cost(usage, fast)?;
         Some(
             self.pricing_schedule
@@ -362,6 +377,22 @@ impl Model {
     /// the honest guess.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast && self.supports_fast()))
+    }
+
+    /// What a subsidised turn would have cost at [`Self::list_cost`] rates,
+    /// kept as a reference beside the `$0` it billed. `None` on a metered
+    /// model, which has no redundant figure to show.
+    pub fn subsidised_list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        self.subsidised_by
+            .is_some()
+            .then(|| self.list_cost(usage, fast))
+            .flatten()
+    }
+
+    /// The subscription covering this model's bill, `None` when it is billed
+    /// per token as usual.
+    pub fn subsidy_source(&self) -> Option<&str> {
+        self.subsidised_by.as_deref()
     }
 
     pub fn parse_spec(spec: &str) -> Result<(&str, &str), ModelError> {
@@ -413,6 +444,7 @@ impl From<TokenUsage> for StoredTokenUsage {
             cache_creation: s.cache_creation,
             cache_read: s.cache_read,
             cost: None,
+            list_cost: None,
         }
     }
 }
@@ -433,12 +465,24 @@ impl TokenUsage {
     /// purpose: a caller that forgets the cost quietly loses money from the
     /// session total, so saying it out loud is mandatory.
     pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+        self.billed_with_list_cost(cost, None)
+    }
+
+    /// Like [`Self::billed`], also keeping what a subsidised turn would have
+    /// cost at list rates. `None` on every metered turn, so the stored figure
+    /// never duplicates the bill.
+    pub fn billed_with_list_cost(
+        &self,
+        cost: Option<f64>,
+        list_cost: Option<f64>,
+    ) -> StoredTokenUsage {
         StoredTokenUsage {
             input: self.input,
             output: self.output,
             cache_creation: self.cache_creation,
             cache_read: self.cache_read,
             cost,
+            list_cost,
         }
     }
 
@@ -551,6 +595,7 @@ mod tests {
         cache_read: 44,
     };
     const RECORDED_COST: f64 = 0.25;
+    const SUBSIDY_SOURCE: &str = "Max";
     const FAST_RATE: f64 = 30.0;
 
     #[test_case(999, "999"         ; "under_thousand")]
@@ -839,6 +884,39 @@ mod tests {
         assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
     }
 
+    fn subsidised_model(input_rate: Option<f64>) -> Model {
+        let pricing = input_rate.map(
+            |input| json!({"input": input, "output": 0.0, "cache_write": 0.0, "cache_read": 0.0}),
+        );
+        let info: ModelInfo = serde_json::from_value(json!({
+            "id": SCHEDULED_MODEL,
+            "pricing": pricing,
+            "subsidised_by": SUBSIDY_SOURCE,
+        }))
+        .unwrap();
+        Model::from_info(SCHEDULED_PROVIDER, &info)
+    }
+
+    /// A subscription prepays the bill, so it reads `$0` while the published
+    /// list price stays available as the reference beside it.
+    #[test]
+    fn a_subscription_bills_nothing_and_keeps_the_list_price() {
+        let model = subsidised_model(Some(SCHEDULED_INPUT_RATE));
+        let list = model.list_cost(&INPUT_ONLY, false).unwrap();
+        assert!(list > 0.0);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), Some(0.0));
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), Some(list));
+        assert_eq!(model.subsidy_source(), Some(SUBSIDY_SOURCE));
+    }
+
+    /// A subsidy must not turn "no price table" into a false `$0.000`.
+    #[test]
+    fn a_subscription_without_rates_stays_unpriced() {
+        let model = subsidised_model(None);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
+    }
+
     /// Every later total is rebuilt from what was stored, so storing a turn must
     /// not shuffle the counters, invent one, or drop the cost.
     #[test]
@@ -851,6 +929,7 @@ mod tests {
                 cache_creation: COUNTERS.cache_creation,
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
+                list_cost: None,
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);

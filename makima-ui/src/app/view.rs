@@ -564,6 +564,8 @@ impl App {
                 global_cost: self.state.cost,
                 context_size: chat.context_size,
                 cost: chat.cost,
+                list_cost: chat.list_cost,
+                list_cost_by_source: chat.list_cost_by_source.clone(),
                 context_window: if let Some(config) = &config {
                     config.model.context_window
                 } else if self.focused_streaming() {

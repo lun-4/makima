@@ -50,6 +50,9 @@ pub(crate) struct SessionState {
     /// since. Kept running, because re-deriving it from the counters would
     /// re-price history at today's rates. `None` while nothing was priced.
     pub cost: Option<f64>,
+    /// What the subsidised turns in this session would have cost at list
+    /// rates, restored from the per-model totals beside `cost`.
+    pub list_cost: Option<f64>,
     pub context_size: u32,
     /// UI-owned plan bookkeeping. The agent's committed mode carries the plan
     /// path; whether the plan is drafted or ready is only tracked here.
@@ -100,6 +103,11 @@ impl SessionState {
             fast,
             providers,
         );
+        let list_cost = session
+            .usage_by_model()
+            .values()
+            .filter_map(|usage| usage.list_cost)
+            .reduce(|total, list| total + list);
         let context_size = session.meta.context_size;
 
         Self {
@@ -107,6 +115,7 @@ impl SessionState {
             session: Arc::new(session),
             token_usage,
             cost,
+            list_cost,
             context_size,
             plan,
             warnings,

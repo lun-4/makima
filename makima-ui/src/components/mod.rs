@@ -501,6 +501,7 @@ pub(crate) fn test_model() -> makima_providers::Model {
         max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
         free: false,
+        subsidised_by: None,
     }
 }
 
