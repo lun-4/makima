@@ -1,10 +1,11 @@
-//! Shared plumbing for tools. The registry itself lives in `registry.rs`; this file
-//! holds the helpers every tool leans on: `ToolFilter` to enable/disable per caller,
-//! `Deadline` so a parent tool can cap a child's timeout, the walker that skips `.git`,
-//! and `sanitize_tool_input` which patches up small JSON mistakes models make (stray
+//! Shared plumbing for tools. The registry itself lives in `registry.rs` and the
+//! call deadline in `deadline.rs`; this file holds the helpers every tool leans on:
+//! `ToolFilter` to enable/disable per caller, the walker that skips `.git`, and
+//! `sanitize_tool_input` which patches up small JSON mistakes models make (stray
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
+mod deadline;
 pub mod file_locks;
 mod file_tracker;
 pub mod grep;
@@ -14,6 +15,8 @@ pub mod offload;
 pub mod registry;
 pub mod schema;
 
+pub(crate) use deadline::DEADLINE_EXCEEDED;
+pub use deadline::Deadline;
 pub use file_locks::FileWriteLocks;
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
@@ -230,7 +233,6 @@ pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 pub const WRITE_TOOL_NAME: &str = "write";
 
 pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan mode";
-pub(crate) const DEADLINE_EXCEEDED: &str = "timeout exceeded";
 /// How long a timed-out tool's output hook and offload write may still run.
 /// Both cross threads, so a loaded machine needs seconds here; a shorter window
 /// throws away partial output a slow scheduler was about to deliver.
@@ -238,50 +240,6 @@ pub const TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(5
 /// Provider and model id of the placeholder model a context without a model
 /// carries.
 const NO_MODEL: &str = "none";
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Deadline {
-    #[default]
-    None,
-    At(Instant),
-}
-
-impl Deadline {
-    pub fn after(duration: Duration) -> Self {
-        Self::At(Instant::now() + duration)
-    }
-
-    pub fn min(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::None, deadline) | (deadline, Self::None) => deadline,
-            (Self::At(left), Self::At(right)) => Self::At(left.min(right)),
-        }
-    }
-
-    pub fn check(self) -> Result<(), String> {
-        match self {
-            Self::None => Ok(()),
-            Self::At(instant) if instant.saturating_duration_since(Instant::now()).is_zero() => {
-                Err(DEADLINE_EXCEEDED.into())
-            }
-            Self::At(_) => Ok(()),
-        }
-    }
-
-    pub fn cap_timeout(self, timeout_secs: u64) -> Result<u64, String> {
-        match self {
-            Self::None => Ok(timeout_secs),
-            Self::At(instant) => {
-                let remaining = instant.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Err(DEADLINE_EXCEEDED.into())
-                } else {
-                    Ok(timeout_secs.min(remaining.as_secs().max(1)))
-                }
-            }
-        }
-    }
-}
 
 pub fn timeout_annotation(secs: u64) -> String {
     let d = Duration::from_secs(secs);
@@ -542,10 +500,10 @@ impl ToolContext {
         let Some(pending) = &self.pending_output_limits else {
             return false;
         };
-        opts.deadline = match (opts.deadline, self.deadline) {
-            (Some(current), Deadline::At(deadline)) => Some(current.min(deadline)),
-            (None, Deadline::At(deadline)) => Some(deadline),
-            (current, Deadline::None) => current,
+        opts.deadline = match (opts.deadline, self.deadline.instant()) {
+            (Some(current), Some(deadline)) => Some(current.min(deadline)),
+            (None, Some(deadline)) => Some(deadline),
+            (current, None) => current,
         };
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         let metadata = pending.get_or_insert_with(|| OutputFinalization {
@@ -886,7 +844,7 @@ pub fn interpreter_ctx(
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
-        deadline: Deadline::None,
+        deadline: Deadline::default(),
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         request_tools: None,
@@ -1206,26 +1164,6 @@ mod tests {
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
         assert_eq!(timeout_annotation(secs), expected);
-    }
-
-    #[test_case(Deadline::None,                          120, 120 ; "none_passes_through")]
-    #[test_case(Deadline::after(Duration::from_secs(60)), 10,  10  ; "requested_under_remaining")]
-    fn cap_timeout_ok(deadline: Deadline, requested: u64, expected: u64) {
-        assert_eq!(deadline.cap_timeout(requested).unwrap(), expected);
-    }
-
-    #[test]
-    fn cap_timeout_clamps_to_remaining() {
-        let clamped = Deadline::after(Duration::from_secs(3600))
-            .cap_timeout(7200)
-            .unwrap();
-        assert!(clamped <= 3600, "expected <= 3600, got {clamped}");
-    }
-
-    #[test]
-    fn cap_timeout_expired() {
-        let expired = Deadline::At(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-        assert_eq!(expired.cap_timeout(120).unwrap_err(), DEADLINE_EXCEEDED);
     }
 
     #[test_case("short",                            "short"                             ; "short_passthrough")]

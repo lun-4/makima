@@ -505,7 +505,7 @@ impl ToolInvocation for LuaToolInvocation {
         // tool dispatched is built while its parent is being polled, and that
         // is the only moment we can tell it runs under the parent's slot.
         let nested = crate::runtime::under_inflight_slot();
-        let deadline = ctx.deadline;
+        let deadline = ctx.deadline.clone();
         let plugin = self.plugin;
         let tool = self.tool;
         let generation = self.generation;
@@ -515,14 +515,15 @@ impl ToolInvocation for LuaToolInvocation {
 
         Box::pin(async move {
             let now = Instant::now();
-            let invocation_deadline = invocation_deadline(deadline, tool_timeout, now);
+            let invocation = invocation_deadline(&deadline, tool_timeout, now);
+            let invocation_deadline = invocation.instant();
             let effective_secs = invocation_deadline
                 .map(|deadline| deadline.saturating_duration_since(now).as_secs());
             if let Err(error) = deadline.check() {
                 return Err(error).into();
             }
             let mut invocation_ctx = ctx.clone();
-            invocation_ctx.deadline = invocation_deadline.map_or(Deadline::None, Deadline::At);
+            invocation_ctx.deadline = invocation.clone();
             let ctx = &invocation_ctx;
             let (reply_tx, reply_rx) = flume::bounded::<ToolCallReply>(1);
             let live = ctx.tool_use_id.clone().map(|id| LiveCtx {
@@ -538,7 +539,6 @@ impl ToolInvocation for LuaToolInvocation {
                     generation,
                     input,
                     ctx: Box::new(lua_ctx),
-                    deadline: invocation_deadline,
                     reply: reply_tx,
                     live,
                     nested,
@@ -551,7 +551,7 @@ impl ToolInvocation for LuaToolInvocation {
 
             let recv = async { Some(reply_rx.recv_async().await) };
             let result = match invocation_deadline {
-                Some(deadline) => {
+                Some(_) => {
                     let call = ctx.call.clone();
                     let timeout = async move {
                         let moved = async {
@@ -564,7 +564,18 @@ impl ToolInvocation for LuaToolInvocation {
                             }
                         };
                         let timer = async {
-                            smol::Timer::at(deadline + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
+                            loop {
+                                let Some(at) = invocation.instant() else {
+                                    std::future::pending::<()>().await;
+                                    return false;
+                                };
+                                smol::Timer::at(at + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT).await;
+                                if invocation.instant().is_some_and(|at| {
+                                    Instant::now() >= at + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT
+                                }) {
+                                    break;
+                                }
+                            }
                             false
                         };
                         if futures_lite::future::or(moved, timer).await {
@@ -590,7 +601,7 @@ impl ToolInvocation for LuaToolInvocation {
                     reply.deadline = if reply.timeout_cleanup {
                         Some(Instant::now() + TIMEOUT_CLEANUP_FINALIZATION_TIMEOUT)
                     } else {
-                        match (reply.deadline, invocation_deadline) {
+                        match (reply.deadline, ctx.deadline.instant()) {
                             (Some(runtime), Some(invocation)) => Some(runtime.min(invocation)),
                             (runtime, invocation) => runtime.or(invocation),
                         }
@@ -688,16 +699,10 @@ impl ToolInvocation for LuaToolInvocation {
     }
 }
 
-fn invocation_deadline(
-    inherited: Deadline,
-    timeout: Option<Duration>,
-    now: Instant,
-) -> Option<Instant> {
-    let deadline =
-        inherited.min(timeout.map_or(Deadline::None, |timeout| Deadline::At(now + timeout)));
-    match deadline {
-        Deadline::At(deadline) => Some(deadline),
-        Deadline::None => None,
+fn invocation_deadline(inherited: &Deadline, timeout: Option<Duration>, now: Instant) -> Deadline {
+    match timeout {
+        Some(timeout) => inherited.min(&Deadline::at(now + timeout)),
+        None => inherited.clone(),
     }
 }
 
@@ -2306,7 +2311,7 @@ impl ToolCallReply {
 
     async fn finalize(mut self, ctx: &ToolContext) -> Self {
         let mut ctx = ctx.clone();
-        ctx.deadline = self.deadline.map_or(Deadline::None, Deadline::At);
+        ctx.deadline = Deadline::from(self.deadline);
         if let Some(pending) = &ctx.pending_output_limits {
             let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
             let metadata = pending.get_or_insert_with(|| OutputFinalization {
@@ -2585,9 +2590,9 @@ mod tests {
         expected: Option<Duration>,
     ) {
         let now = Instant::now();
-        let inherited = inherited.map_or(Deadline::None, |duration| Deadline::At(now + duration));
+        let inherited = Deadline::from(inherited.map(|duration| now + duration));
         assert_eq!(
-            invocation_deadline(inherited, timeout, now),
+            invocation_deadline(&inherited, timeout, now).instant(),
             expected.map(|duration| now + duration)
         );
     }

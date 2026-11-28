@@ -1019,7 +1019,7 @@ end)
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.registry = Arc::clone(&reg);
-    ctx.deadline = Deadline::None;
+    ctx.deadline = Deadline::default();
     ctx.offload = Some(Arc::new(OffloadStore::on_disk(
         dir.path().canonicalize().unwrap(),
     )));

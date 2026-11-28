@@ -431,7 +431,7 @@ fn handler_set_deadline_bounds_output_finalization() {
     let (registry, _host) = host();
     let gate = Gate::new();
     let mut ctx = dispatch_ctx(&registry, &gate);
-    ctx.deadline = Deadline::None;
+    ctx.deadline = Deadline::default();
     let caller = dispatch(
         ctx,
         "return",
