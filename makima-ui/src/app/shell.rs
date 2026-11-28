@@ -1,23 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
-use async_process::{Command, Stdio};
-use futures_lite::StreamExt;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
-use makima_agent::{
-    AgentConfig, AgentId, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent,
-};
-use makima_providers::Message;
+use makima_agent::{AgentId, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent};
 
 use super::App;
-
-const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
-const SHELL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShellPrefix {
@@ -62,24 +47,21 @@ pub(crate) enum ShellEvent {
     },
     Done {
         id: String,
-        command: String,
         output: String,
         is_error: bool,
-        visible: bool,
     },
 }
 
 #[derive(Default)]
 pub(crate) struct ShellState {
     cancel_triggers: HashMap<String, CancelTrigger>,
-    pending_results: HashMap<Option<AgentId>, Vec<Message>>,
-    targets: HashMap<String, Option<AgentId>>,
+    targets: HashMap<String, AgentId>,
     id_counter: u64,
     active_ids: HashSet<String>,
 }
 
 impl ShellState {
-    pub(crate) fn reserve_for(&mut self, target: Option<AgentId>) -> String {
+    pub(crate) fn reserve_for(&mut self, target: AgentId) -> String {
         self.id_counter += 1;
         let id = format!("shell-{}", self.id_counter);
         self.active_ids.insert(id.clone());
@@ -101,7 +83,7 @@ impl ShellState {
         self.cancel_triggers.insert(id, trigger);
     }
 
-    pub fn cancel_for(&mut self, target: Option<AgentId>) {
+    pub fn cancel_for(&mut self, target: AgentId) {
         let ids: Vec<_> = self
             .targets
             .iter()
@@ -113,18 +95,6 @@ impl ShellState {
                 trigger.cancel();
             }
         }
-    }
-
-    pub fn results_for(&self, target: Option<AgentId>) -> &[Message] {
-        self.pending_results.get(&target).map_or(&[], Vec::as_slice)
-    }
-
-    pub fn drain_results_for(&mut self, target: Option<AgentId>) -> Vec<Message> {
-        self.pending_results.remove(&target).unwrap_or_default()
-    }
-
-    pub fn drain_results(&mut self) -> Vec<Message> {
-        self.drain_results_for(None)
     }
 }
 
@@ -138,14 +108,14 @@ impl App {
         let Some(target) = self.shell.targets.get(id).copied() else {
             return;
         };
-        let chat_idx = match target {
-            Some(target) => self
-                .chats
-                .iter()
-                .position(|chat| chat.agent_id == Some(target)),
-            None => Some(0),
-        };
-        let Some(chat_idx) = chat_idx else {
+        if matches!(event, ShellEvent::Done { .. }) {
+            self.shell.release_id(id);
+        }
+        let Some(chat_idx) = self
+            .chats
+            .iter()
+            .position(|chat| chat.agent_id == Some(target))
+        else {
             return;
         };
         match event {
@@ -169,213 +139,25 @@ impl App {
             }
             ShellEvent::Done {
                 id,
-                command,
                 output,
                 is_error,
-                visible,
             } => {
-                let result_msg = if visible {
-                    let label = if is_error { "Error" } else { "Output" };
-                    Some(Message::user(format!(
-                        "I ran: $ {command}\n\n{label}:\n{output}"
-                    )))
-                } else {
-                    None
-                };
                 self.chats[chat_idx].shell_tool_done(ToolDoneEvent {
-                    id: id.clone(),
+                    id,
                     tool: "bash".into(),
                     output: ToolOutput::Plain(output.into()),
                     is_error,
                     annotation: None,
                     written_path: None,
                 });
-                if let Some(msg) = result_msg {
-                    self.shell
-                        .pending_results
-                        .entry(target)
-                        .or_default()
-                        .push(msg);
-                }
-                self.shell.release_id(&id);
             }
         }
     }
-}
-
-pub(crate) fn spawn_shell(
-    command: String,
-    id: String,
-    visible: bool,
-    tx: flume::Sender<ShellEvent>,
-    cancel: CancelToken,
-    config: AgentConfig,
-    cwd: PathBuf,
-) {
-    smol::spawn(async move {
-        let _ = tx.send(ShellEvent::Start {
-            id: id.clone(),
-            command: command.clone(),
-        });
-
-        let result = run_command(&command, &id, &tx, &cancel, &config, &cwd).await;
-
-        let (output, is_error) = match result {
-            Ok(out) => (out, false),
-            Err(err) => (err, true),
-        };
-
-        let _ = tx.send(ShellEvent::Done {
-            id,
-            command,
-            output,
-            is_error,
-            visible,
-        });
-    })
-    .detach();
-}
-
-async fn run_command(
-    command: &str,
-    id: &str,
-    tx: &flume::Sender<ShellEvent>,
-    cancel: &CancelToken,
-    config: &AgentConfig,
-    cwd: &Path,
-) -> Result<String, String> {
-    let mut std_cmd = makima_agent::shell::command(config.shell, command);
-    std_cmd.current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0");
-
-    #[cfg(unix)]
-    unsafe {
-        std_cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-
-    let mut cmd: Command = std_cmd.into();
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
-
-    let (line_tx, line_rx) = flume::unbounded::<String>();
-    if let Some(stdout) = child.stdout.take() {
-        spawn_line_reader(BufReader::new(stdout), line_tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_line_reader(BufReader::new(stderr), line_tx.clone());
-    }
-    let mut guard = makima_agent::ChildGuard::new(child);
-    drop(line_tx);
-
-    let mut output = String::new();
-    let mut line_count: usize = 0;
-    let mut truncated = false;
-    let mut last_flush = Instant::now();
-    let deadline = Instant::now() + SHELL_TIMEOUT;
-
-    macro_rules! race_deadline {
-        ($future:expr) => {
-            futures_lite::future::race(
-                $future,
-                futures_lite::future::race(
-                    async {
-                        smol::Timer::at(deadline).await;
-                        Err(format!("timed out after {}s", SHELL_TIMEOUT.as_secs()))
-                    },
-                    async {
-                        cancel.cancelled().await;
-                        Err("cancelled".to_string())
-                    },
-                ),
-            )
-            .await
-        };
-    }
-
-    loop {
-        let line = race_deadline!(async { Ok(line_rx.recv_async().await.ok()) });
-        match line {
-            Ok(Some(line)) => {
-                if !truncated {
-                    if !output.is_empty() {
-                        output.push('\n');
-                    }
-                    output.push_str(&line);
-                    line_count += 1;
-                    if output.len() > config.max_output_bytes
-                        || line_count >= config.max_output_lines
-                    {
-                        truncated = true;
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                guard.kill_and_reap().await;
-                return Err(e);
-            }
-        }
-
-        if last_flush.elapsed() >= STREAM_FLUSH_INTERVAL && !output.is_empty() {
-            flush_output(tx, id, &output);
-            last_flush = Instant::now();
-        }
-    }
-
-    let status =
-        race_deadline!(async { guard.status().await.map_err(|e| format!("wait error: {e}")) });
-    match status {
-        Ok(status) => {
-            flush_output(tx, id, &output);
-            if truncated {
-                output.push_str("\n[truncated]");
-            }
-            if !status.success() {
-                if output.is_empty() {
-                    return Err(format!("exited with code {}", status.code().unwrap_or(-1)));
-                }
-                return Err(output);
-            }
-            Ok(output)
-        }
-        Err(e) => {
-            guard.kill_and_reap().await;
-            Err(e)
-        }
-    }
-}
-
-fn flush_output(tx: &flume::Sender<ShellEvent>, id: &str, output: &str) {
-    let _ = tx.send(ShellEvent::Output {
-        id: id.to_string(),
-        content: output.to_string(),
-    });
-}
-
-fn spawn_line_reader<R: futures_lite::io::AsyncRead + Unpin + Send + 'static>(
-    reader: BufReader<R>,
-    tx: flume::Sender<String>,
-) {
-    smol::spawn(async move {
-        let mut lines = reader.lines();
-        while let Some(line) = lines.next().await {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    })
-    .detach();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ShellPrefix, parse_shell_prefix};
     use test_case::test_case;
 
     #[test_case("! ls",                     Some(ShellPrefix { prefix_len: 2, command: "ls".into(), visible: true })           ; "simple_visible")]

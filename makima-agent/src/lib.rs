@@ -7,6 +7,7 @@ pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
+pub mod journal;
 pub mod mailbox;
 pub mod manager;
 pub mod mcp;
@@ -16,30 +17,31 @@ pub mod modes;
 pub use actor::{
     ActorBackend, ActorError, ActorEvent, ActorLifecycle, ActorSnapshot, ActorStatus, ActorWork,
     AgentActorHandle, AgentContextSnapshot, BackendResult, CompactionStatus, CompletionPolicy,
-    ConfigChange, ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryBoundary,
-    HistoryChange, InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel,
-    QueueProjection, SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission,
-    TurnAdmissionOptions, TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult,
-    TurnTicket, WorkKind,
+    ConfigChange, ConfigCommit, ConfigPatch, ControlWork, EffectiveAgentConfig, HistoryChange,
+    InterruptQueue, PendingQueueEntry, PendingSubmission, PreparedModel, QueueProjection,
+    SubmissionId, TranscriptRequest, TranscriptSnapshot, TurnAdmission, TurnAdmissionOptions,
+    TurnContext, TurnOrigin, TurnOutput, TurnProvenance, TurnResult, TurnTicket, WorkKind,
 };
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
-    ModelSource, RunSettings, SharedMessages, SharedModel, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, end_conversation_detached, find_subdirectory_instructions,
-    is_instruction_file,
+    RESTART_TOOL_INTERRUPTION, RunSettings, SharedMessages, UNAVAILABLE_RESULT,
+    USER_TOOL_INTERRUPTION, close_dangling_tool_calls, end_conversation_detached,
+    find_subdirectory_instructions, is_instruction_file,
 };
 pub use call_scope::{CallGuard, CallHome, CallScope, MoveError, MovedBy};
 pub use cancel::{
-    CancelMap, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
+    CancelMap, CancelScope, CancelToken, CancelTrigger, ReasonedCancelToken, ReasonedCancelTrigger,
+    SessionCancellation,
 };
 pub use mailbox::{
     BackgroundCallInfo, BackgroundMoveError, MailboxError, PreparedSessionMailbox, SessionMailbox,
 };
 pub use makima_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use manager::{
-    AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentRef,
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentNodeSnapshot, AgentReactivator, AgentRef,
     CurrentManagedTurn, GraphEvents, GraphLifecycle, ManagedPromptWait, ManagerError,
-    PromptWaitError, ShutdownReport, TurnPermitLease,
+    PromptWaitError, ShutdownReport, SubmitError, SubmitOptions, SubmitWhen, TurnPermitLease,
+    WakeError, WeakAgentManagerHandle,
 };
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
@@ -47,15 +49,31 @@ pub use mcp::{
 pub use modes::{ModeDef, ModeDefSpec, ModeError, ModeId, ModeRegistry};
 pub mod command;
 pub mod config_change;
+pub mod context;
+#[cfg(test)]
+mod context_journal_tests;
 pub mod diff;
 pub mod permissions;
+pub mod plan_state;
 pub mod prompt;
+pub mod session;
 pub mod session_checkpoint;
 pub mod session_coordinator;
 pub mod session_defaults;
 pub mod session_options;
+pub mod session_recovery;
+pub mod session_writer;
+pub mod state;
+pub use state::{
+    RawStateSnapshot, StateAccess, StateChangeEvent, StateChangeReason, StateEdit, StateError,
+    StateRevision, StateScope, StateSlot, StateSlotSpec, StateSnapshot,
+};
+pub mod rewind;
 pub mod shell;
+mod subagents;
 pub mod template;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod tools;
 pub use tools::ToolFilter;
 pub mod types;
@@ -69,6 +87,7 @@ pub use makima_domain::{POST_LEVELS, Post, PostLevel};
 pub use makima_providers::AgentError;
 use makima_providers::Message;
 pub use makima_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
+use serde::{Deserialize, Serialize};
 pub use types::{
     ActorWorkIdentity, ActorWorkKind, AgentEvent, AgentId, BufferSnapshot, DoneReason, Envelope,
     EventSender, EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock,
@@ -135,13 +154,14 @@ pub fn batchable(input: &AgentInput) -> bool {
     input.prompt.is_none()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpPromptRef {
     pub qualified_name: String,
     pub arguments: HashMap<String, String>,
 }
 
 /// No `Default` on this struct so adding a field forces every call site to update.
+#[derive(Serialize, Deserialize)]
 pub struct AgentInput {
     pub message: String,
     pub images: Vec<ImageSource>,

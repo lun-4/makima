@@ -9,6 +9,7 @@
 //! `Request` RPCs on `EventHandle` (see `collect_completion_items` /
 //! `expand_references`), never touching `Lua` directly.
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -119,11 +120,7 @@ fn register_completion_source(
             .app_data_mut::<CompletionStore>()
             .ok_or_else(|| mlua::Error::runtime("completion store not available"))?;
         if crate::runtime::loading_plugin_is(lua, &plugin) {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(prefix, get_items);
+            pending.lock_unpoisoned().0.insert(prefix, get_items);
         } else {
             store.0.entry(plugin).or_default().insert(prefix, get_items);
         }
@@ -167,11 +164,7 @@ fn register_expander(
             .app_data_mut::<ExpanderStore>()
             .ok_or_else(|| mlua::Error::runtime("expander store not available"))?;
         if crate::runtime::loading_plugin_is(lua, &plugin) {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(prefix, f);
+            pending.lock_unpoisoned().0.insert(prefix, f);
         } else {
             store.0.entry(plugin).or_default().insert(prefix, f);
         }
@@ -291,17 +284,16 @@ fn raw_token_end(text: &str, start: usize, limit: usize) -> usize {
     end
 }
 
-/// Scan one token with `limit` as the exclusive visible end. Passing the full
-/// text makes this the submit scanner; passing a cursor byte makes it the
-/// completion scanner for the same state machine.
-/// Whether the colon at {colon} follows a single ASCII letter and the byte
-/// after it starts a path, as in `C:\Users` or `C:/Users`.
+/// Matches the drive prefix of an absolute Windows path.
 fn is_drive_letter(text: &str, start: usize, colon: usize) -> bool {
     colon == start + 2
         && text.as_bytes()[start + 1].is_ascii_alphabetic()
         && text[colon + 1..].starts_with(&['/', '\\'][..])
 }
 
+/// Scan one token with `limit` as the exclusive visible end. Passing the full
+/// text makes this the submit scanner; passing a cursor byte makes it the
+/// completion scanner for the same state machine.
 fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToken> {
     if start >= limit || !text.get(start..)?.starts_with('@') || !at_is_token_start(text, start) {
         return None;
@@ -325,8 +317,6 @@ fn scan_at_token(text: &str, start: usize, limit: usize) -> Option<ScannedAtToke
             cursor += c.len_utf8();
         }
         match colon {
-            // `@C:\dirile`: a drive letter is not a tag prefix, or every
-            // absolute Windows path would read as an unknown reference.
             Some(colon) if is_drive_letter(text, start, colon) => (None, start + 1, None),
             Some(colon) => {
                 let value_start = colon + 1;

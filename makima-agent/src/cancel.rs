@@ -3,7 +3,9 @@
 //! `CancelTrigger` fires on Drop, so cleanup happens even if the trigger is forgotten.
 //! `cancelled()` uses a double-check around the listener to close the TOCTOU window between flag read and listener registration.
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -11,7 +13,71 @@ use std::sync::{Arc, Mutex, Weak};
 use event_listener::Event;
 use makima_storage::checkpoint::CheckpointPublication;
 
-use crate::types::TurnCancellationReason;
+use crate::actor::{ActorError, TurnTicket};
+use crate::manager::{AgentManagerHandle, ManagerError};
+use crate::types::{AgentId, TurnCancellationReason};
+
+pub enum CancelScope {
+    Turn(TurnTicket),
+    Subtree(AgentId),
+    ToolUse(String),
+}
+
+#[derive(Clone)]
+pub struct SessionCancellation {
+    manager: AgentManagerHandle,
+    root: AgentId,
+    tools: Arc<CancelMap<String>>,
+    startup: Arc<Mutex<Option<CancelTrigger>>>,
+}
+
+impl SessionCancellation {
+    pub fn new(
+        manager: AgentManagerHandle,
+        root: AgentId,
+        tools: Arc<CancelMap<String>>,
+        startup: Option<CancelTrigger>,
+    ) -> Self {
+        Self {
+            manager,
+            root,
+            tools,
+            startup: Arc::new(Mutex::new(startup)),
+        }
+    }
+
+    pub fn cancel(&self, scope: CancelScope) -> Result<(), ManagerError> {
+        match scope {
+            CancelScope::Turn(ticket) => Self::cancel_turn(&self.manager, &ticket),
+            CancelScope::Subtree(agent) => {
+                if agent == self.root {
+                    if let Some(trigger) = self.startup.lock_unpoisoned().take() {
+                        trigger.cancel();
+                    }
+                    self.tools.cancel_all();
+                }
+                self.manager.cancel_subtree(agent)
+            }
+            CancelScope::ToolUse(id) => {
+                self.tools.cancel_or_precancel(id);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn cancel_turn(
+        manager: &AgentManagerHandle,
+        ticket: &TurnTicket,
+    ) -> Result<(), ManagerError> {
+        let actor = manager.actor_for_ticket(ticket)?;
+        let agent_id = actor.agent_id();
+        let turn_id = ticket.turn_id();
+        actor.cancel_turn(turn_id).map_err(|error| match error {
+            ActorError::Closed | ActorError::Shutdown => ManagerError::NonLiveAgent(agent_id),
+            _ => ManagerError::InactiveTurn { agent_id, turn_id },
+        })
+    }
+}
 
 #[derive(Default)]
 struct CancellationState {
@@ -42,15 +108,12 @@ impl Shared {
     }
 
     fn fire(&self) {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         self.fire_locked();
     }
 
     fn fire_locked(&self) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_unpoisoned();
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -87,11 +150,46 @@ impl Drop for PublicationRegistration {
             let publication = Arc::downgrade(&self.publication);
             source
                 .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .lock_unpoisoned()
                 .publications
                 .retain(|registered| !registered.ptr_eq(&publication));
         }
+    }
+}
+
+pub struct PublicationGuard(CheckpointPublication);
+
+impl Debug for PublicationGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicationGuard").finish_non_exhaustive()
+    }
+}
+
+impl PublicationGuard {
+    pub(crate) fn new(publication: CheckpointPublication) -> Self {
+        Self(publication)
+    }
+
+    pub(crate) fn register(
+        publication: &CheckpointPublication,
+        registrations: &mut Vec<Weak<Self>>,
+    ) -> Arc<Self> {
+        registrations.retain(|registration| registration.strong_count() > 0);
+        let guard = Arc::new(Self(publication.clone()));
+        registrations.push(Arc::downgrade(&guard));
+        guard
+    }
+
+    pub(crate) fn cancel_all(registrations: &mut Vec<Weak<Self>>) {
+        for guard in registrations.drain(..).filter_map(|guard| guard.upgrade()) {
+            guard.0.cancel();
+        }
+    }
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -104,8 +202,7 @@ impl Drop for CancelRegistration {
     fn drop(&mut self) {
         self.source
             .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .children
             .retain(|registered| !registered.ptr_eq(&self.child));
     }
@@ -113,17 +210,25 @@ impl Drop for CancelRegistration {
 
 /// Fires once, from the first trigger to drop, then keeps the winning reason.
 struct ReasonedShared {
-    cancelled: AtomicBool,
-    reason: Mutex<Option<TurnCancellationReason>>,
+    cause: Mutex<Option<CancelCause>>,
     event: Event,
 }
 
+#[derive(Clone, Copy)]
+enum CancelCause {
+    Stop(TurnCancellationReason),
+    /// Unwind the runtime without cancelling the persisted turn.
+    Suspend,
+}
+
 impl ReasonedShared {
-    fn fire(&self, reason: TurnCancellationReason) {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
+    fn fire(&self, cause: CancelCause) {
+        let mut current = self.cause.lock_unpoisoned();
+        if current.is_some() {
             return;
         }
-        *self.reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+        *current = Some(cause);
+        drop(current);
         self.event.notify(usize::MAX);
     }
 }
@@ -148,8 +253,7 @@ pub struct ReasonedCancelTrigger(Arc<ReasonedShared>);
 impl ReasonedCancelToken {
     pub fn new() -> (ReasonedCancelTrigger, Self) {
         let shared = Arc::new(ReasonedShared {
-            cancelled: AtomicBool::new(false),
-            reason: Mutex::new(None),
+            cause: Mutex::new(None),
             event: Event::new(),
         });
         (ReasonedCancelTrigger(Arc::clone(&shared)), Self(shared))
@@ -157,18 +261,38 @@ impl ReasonedCancelToken {
 
     pub fn none() -> Self {
         Self(Arc::new(ReasonedShared {
-            cancelled: AtomicBool::new(false),
-            reason: Mutex::new(None),
+            cause: Mutex::new(None),
             event: Event::new(),
         }))
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.reason().is_some()
     }
 
     pub fn reason(&self) -> Option<TurnCancellationReason> {
-        *self.0.reason.lock().unwrap_or_else(|e| e.into_inner())
+        self.0.cause.lock_unpoisoned().map(|cause| match cause {
+            CancelCause::Stop(reason) => reason,
+            CancelCause::Suspend => TurnCancellationReason::Shutdown,
+        })
+    }
+
+    pub(crate) fn is_suspended(&self) -> bool {
+        matches!(*self.0.cause.lock_unpoisoned(), Some(CancelCause::Suspend))
+    }
+
+    pub(crate) fn unless_suspended(&self, effect: impl FnOnce()) {
+        let cause = self.0.cause.lock_unpoisoned();
+        if !matches!(*cause, Some(CancelCause::Suspend)) {
+            effect();
+        }
+    }
+
+    pub(crate) async fn suspended(&self) {
+        self.cancelled().await;
+        if !self.is_suspended() {
+            std::future::pending::<()>().await;
+        }
     }
 
     /// Waits until the token fires, returning the winning reason.
@@ -201,13 +325,17 @@ impl ReasonedCancelToken {
 
 impl ReasonedCancelTrigger {
     pub fn cancel(self, reason: TurnCancellationReason) {
-        self.0.fire(reason);
+        self.0.fire(CancelCause::Stop(reason));
+    }
+
+    pub(crate) fn suspend(self) {
+        self.0.fire(CancelCause::Suspend);
     }
 }
 
 impl Drop for ReasonedCancelTrigger {
     fn drop(&mut self) {
-        self.0.fire(crate::types::TurnCancellationReason::User);
+        self.0.fire(CancelCause::Stop(TurnCancellationReason::User));
     }
 }
 
@@ -239,6 +367,23 @@ impl CancelToken {
         self.0.cancelled()
     }
 
+    pub fn with_effect<T>(tokens: &[&Self], effect: impl FnOnce() -> T) -> Option<T> {
+        let mut gates = tokens
+            .iter()
+            .map(|token| &token.0.publication_gate)
+            .collect::<Vec<_>>();
+        gates.sort_unstable_by_key(|gate| Arc::as_ptr(gate));
+        gates.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let _guards = gates
+            .iter()
+            .map(|gate| gate.lock_unpoisoned())
+            .collect::<Vec<_>>();
+        if tokens.iter().any(|token| token.is_cancelled()) {
+            return None;
+        }
+        Some(effect())
+    }
+
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
         if self.is_cancelled() {
             return Err("cancelled".into());
@@ -267,7 +412,7 @@ impl CancelToken {
         &self,
         publication: &CheckpointPublication,
     ) -> PublicationRegistration {
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.state.lock_unpoisoned();
         let publication = Arc::new(publication.clone());
         if self.is_cancelled() {
             publication.cancel();
@@ -291,11 +436,7 @@ impl CancelToken {
         publication: &CheckpointPublication,
         valid: impl FnOnce() -> bool,
     ) -> bool {
-        let _gate = self
-            .0
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.0.publication_gate.lock_unpoisoned();
         if self.is_cancelled() || !valid() {
             publication.cancel();
             return false;
@@ -307,7 +448,7 @@ impl CancelToken {
     /// longer reaches it. A token under a parent that already fired is fired
     /// here instead, so it never escapes a cancel the parent has not drained.
     pub fn unlink(&self, parent: &CancelToken) {
-        let mut state = parent.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = parent.0.state.lock_unpoisoned();
         if parent.is_cancelled() {
             drop(state);
             self.0.fire();
@@ -321,12 +462,8 @@ impl CancelToken {
     }
 
     pub fn child(&self) -> (CancelTrigger, Self) {
-        let _gate = self
-            .0
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _gate = self.0.publication_gate.lock_unpoisoned();
+        let mut state = self.0.state.lock_unpoisoned();
         let shared = Arc::new_cyclic(|child| Shared {
             cancelled: AtomicBool::new(false),
             state: Mutex::default(),
@@ -397,7 +534,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Registers {trigger} under {id}, alongside any already there, and
     /// returns the slot to hand back to [`retire`](Self::retire).
     pub fn insert(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.entries.lock_unpoisoned();
         let slot = CancelSlot(self.next_slot.fetch_add(1, Ordering::Relaxed));
         let entry = map.entry(id).or_default();
         let trigger = if entry.cancelled {
@@ -413,7 +550,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Retires one registration, dropping its trigger when it is still
     /// active and leaving its siblings alone.
     pub fn retire(&self, id: &K, slot: CancelSlot) {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.entries.lock_unpoisoned();
         let Some(entry) = map.get_mut(id) else {
             return;
         };
@@ -428,7 +565,7 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Cancels everything under {id} and marks later siblings cancelled.
     /// The entry stays until every registered sibling retires.
     pub fn cancel_or_precancel(&self, id: K) {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.entries.lock_unpoisoned();
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
         for registration in &mut entry.registrations {
@@ -437,25 +574,16 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     }
 
     pub fn remove(&self, id: &K) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+        self.entries.lock_unpoisoned().remove(id);
     }
 
     #[cfg(test)]
     fn has_key(&self, id: &K) -> bool {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(id)
+        self.entries.lock_unpoisoned().contains_key(id)
     }
 
     pub fn cancel_all(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain();
+        self.entries.lock_unpoisoned().drain();
     }
 }
 

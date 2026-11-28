@@ -24,6 +24,8 @@ pub struct ConversationLink {
     pub id: Arc<str>,
     pub relation: ConversationRelation,
     pub shared: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,7 @@ impl ConversationState {
                 id: Arc::clone(&self.id),
                 relation,
                 shared: sent.min(kept),
+                cancelled: false,
             }),
             None => self.previous.as_ref().map(|previous| ConversationLink {
                 id: Arc::clone(&previous.id),
@@ -73,6 +76,7 @@ impl ConversationState {
                     _ => ConversationRelation::Branches,
                 },
                 shared: previous.shared.min(kept),
+                cancelled: previous.cancelled,
             }),
         }
     }
@@ -98,6 +102,7 @@ mod tests {
                 id: EARLIER.into(),
                 relation,
                 shared,
+                cancelled: true,
             }),
             sent,
         }
@@ -117,6 +122,10 @@ mod tests {
         expected: Option<(&str, ConversationRelation, usize)>,
     ) {
         let link = state(sent, previous).link(relation, kept);
+        assert_eq!(
+            link.as_ref().map(|link| link.cancelled),
+            expected.map(|_| sent.is_none())
+        );
         assert_eq!(
             link.map(|link| (link.id.to_string(), link.relation, link.shared)),
             expected.map(|(id, relation, shared)| (id.to_owned(), relation, shared))

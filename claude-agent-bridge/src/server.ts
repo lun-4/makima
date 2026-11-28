@@ -122,6 +122,7 @@ export function handler(conversations: Conversations, probeClaude: ProbeClaude, 
     }
     try {
       const result = await conversations.step(parsed, sink, abort.signal)
+      if (abort.signal.aborted) return
       finished = true
       frame(response, "done", result)
     } catch (error) {

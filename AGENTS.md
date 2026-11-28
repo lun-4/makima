@@ -50,13 +50,13 @@ Dev builds skip debug info for deps and vendored C (our crates keep it); to debu
 
 Rust workspace, key crates in root dir:
 
-- makima-ui: Uses ratatui for an interactive UI (elm like architecture). `makima-ui/src/click.rs` holds the per-frame hit registry: components record `HitTarget`s while they render, `App::view` appends them in render order, and `app/mouse.rs` arbitrates clicks, scrollbar drags, hover, and the modal outside-click gate.
+- makima-ui: Ratatui client (elm like architecture) that renders the journal's session projection and calls agent-layer operations; it writes no session state. `makima-ui/src/click.rs` holds the per-frame hit registry: components record `HitTarget`s while they render, `App::view` appends them in render order, and `app/mouse.rs` arbitrates clicks, scrollbar drags, hover, and the modal outside-click gate.
 - makima-providers: Provider-neutral types (messages, events, `ModelInfo`, `ThinkingConfig`, errors), the `Provider` trait, `ProviderRegistry` and the login driver (`login.rs`: `drive_login`, `auth_status`, `logout`, `InteractionService`). It knows no provider by name
-- makima-agent: Owns the smol-based agent loop and the persistent actor shared by TUI roots and Lua agent sessions
+- makima-agent: Owns the session pipeline and journal, the shared agent backend, persistent actors, and the durable agent graph.
 - makima-interpreter: code_execution tool implementation using pydantic/monty (a minimal python sandbox)
-- makima-storage: Persistent state across runs (e.g. sessions, auth); cross-process session locks (`session_lock`) keep a session that is open in another terminal from being resumed here; per-session offload dirs (`sessions/offload/<id>/`) hold tool output past the limits, written through `makima-agent`'s `tools::offload` store
+- makima-storage: Persistent state across runs (e.g. sessions, auth); append-only v3 session logs retain messages, compactions, forks, and ordered state and agent revisions. Cross-process session locks (`session_lock`) guard resume and publication. Per-session offload dirs (`sessions/offload/<id>/`) hold tool output past the limits, written through `makima-agent`'s `tools::offload` store
 - makima-config: User config
-- makima-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir. Provider host: `makima.api.register_provider` (`api/provider.rs`), `LuaProvider` (`provider.rs`), `ctx.credentials` (`credentials.rs`), the login `ui` (`login_ui.rs`) and streaming `makima.net.send` (`api/net/send.rs`)
+- makima-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir. `makima.state` registers versioned agent- or session-scoped JSON slots backed by the session journal; plugin VM objects remain transient. Provider host: `makima.api.register_provider` (`api/provider.rs`), `LuaProvider` (`provider.rs`), `ctx.credentials` (`credentials.rs`), the login `ui` (`login_ui.rs`) and streaming `makima.net.send` (`api/net/send.rs`)
 - makima-match: shared fuzzy matching (nucleo): `fuzzy_match`/`fuzzy_resolve` used by command-argument resolution and the `makima.match` Lua API
 - makima-acp: ACP ndjson stdio server
 - claude-agent-bridge: TypeScript bridge that serves the `claude-agent` provider through the Claude Agent SDK over a Unix socket (`just bridge-check`)

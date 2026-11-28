@@ -147,6 +147,15 @@ pub fn canonical_key(path: &Path) -> PathBuf {
     incremental_canonicalize(&abs).unwrap_or_else(|| normalize_path(&abs))
 }
 
+/// {path} with its parent resolved by `canonical_key` and its final name kept,
+/// so a symlink at the destination stays visible to no-follow checks.
+pub fn canonical_parent(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => canonical_key(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Strip the `\\?\` prefix that Windows `canonicalize` adds, using the
 /// Rust `Prefix` enum for correct WTF-8 handling (no `.to_str()` lossy
 /// conversion).

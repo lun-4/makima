@@ -3,19 +3,16 @@
 //! Every push, pop, interrupt extraction, removal, clear, snapshot, and drain
 //! goes through this one lock-backed deque.
 
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
-use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission};
+use super::{ActorInner, ActorWork, PendingQueueEntry, TurnAdmission, TurnOrigin};
 use crate::types::TurnId;
 use crate::{AgentInput, ExtractedCommand};
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Neutral projection of one queued item, enough for the TUI to draw the
 /// queue panel without importing UI types.
@@ -56,20 +53,46 @@ impl ActorQueue {
 
     /// Pushes `work` at the back and wakes the runner.
     pub fn push(&self, work: ActorWork) {
-        lock(&self.items).push_back(work);
+        self.items.lock_unpoisoned().push_back(work);
         self.notify();
     }
 
     /// Pops the front item, or `None` when the queue is empty.
     pub fn pop(&self) -> Option<ActorWork> {
-        lock(&self.items).pop_front()
+        self.items.lock_unpoisoned().pop_front()
+    }
+
+    fn runs_during_input_hold(work: &ActorWork) -> bool {
+        !matches!(work, ActorWork::Turn(admission) if admission.ticket.provenance().origin == TurnOrigin::User)
+    }
+
+    pub(super) fn pop_unheld(&self) -> Option<ActorWork> {
+        let mut items = self.items.lock_unpoisoned();
+        let index = items.iter().position(Self::runs_during_input_hold)?;
+        items.remove(index)
+    }
+
+    pub(super) fn has_unheld_work(&self) -> bool {
+        self.items
+            .lock_unpoisoned()
+            .iter()
+            .any(Self::runs_during_input_hold)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) fn unheld_len(&self) -> usize {
+        self.items
+            .lock_unpoisoned()
+            .iter()
+            .filter(|work| Self::runs_during_input_hold(work))
+            .count()
     }
 
     /// Extracts the given admitted turn from anywhere in the queue without
     /// disturbing the others. Returns `None` when it is not queued (already
     /// running or already consumed).
     pub fn remove_turn(&self, turn_id: TurnId) -> Option<TurnAdmission> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         let index = items
             .iter()
             .position(|w| matches!(w, ActorWork::Turn(a) if a.turn_id == turn_id))?;
@@ -80,7 +103,7 @@ impl ActorQueue {
     }
 
     pub(super) fn remove_compact(&self, operation_id: u64) -> Option<PendingQueueEntry> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         let index = items.iter().position(
             |work| matches!(work, ActorWork::Compact { operation_id: id, .. } if *id == operation_id),
         )?;
@@ -99,7 +122,7 @@ impl ActorQueue {
     }
 
     pub(super) fn has_prepared_turn(&self, turn_id: TurnId) -> bool {
-        lock(&self.items).iter().any(|work| {
+        self.items.lock_unpoisoned().iter().any(|work| {
             matches!(work, ActorWork::Turn(admission)
                 if admission.turn_id == turn_id && admission.admission.is_some())
         })
@@ -110,7 +133,7 @@ impl ActorQueue {
         turn_id: TurnId,
         input: AgentInput,
     ) -> Result<(), Box<AgentInput>> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         for work in items.iter_mut() {
             if let ActorWork::Turn(admission) = work
                 && admission.turn_id == turn_id
@@ -134,7 +157,7 @@ impl ActorQueue {
     /// Removes every queued item whose correlation matches, returning them in
     /// FIFO order. Unrelated items stay untouched.
     pub fn remove_correlation(&self, correlation: &str) -> Vec<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         let matching: Vec<usize> = items
             .iter()
             .enumerate()
@@ -152,22 +175,22 @@ impl ActorQueue {
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.items).len()
+        self.items.lock_unpoisoned().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.items).is_empty()
+        self.items.lock_unpoisoned().is_empty()
     }
 
     /// Removes every item and returns them in FIFO order.
     pub fn drain_all(&self) -> Vec<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         std::mem::take(&mut *items).into()
     }
 
     /// Drains every item `keep` does not select; kept items stay in order.
     pub fn drain_except(&self, keep: impl Fn(&ActorWork) -> bool) -> Vec<ActorWork> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         let mut drained = Vec::new();
         let mut kept = VecDeque::with_capacity(items.len());
         for work in std::mem::take(&mut *items) {
@@ -186,7 +209,8 @@ impl ActorQueue {
         &self,
         messages: &impl Fn(TurnId) -> Vec<PendingQueueEntry>,
     ) -> Vec<PendingQueueEntry> {
-        lock(&self.items)
+        self.items
+            .lock_unpoisoned()
             .iter()
             .flat_map(|work| match work {
                 ActorWork::Turn(turn) => messages(turn.turn_id),
@@ -206,7 +230,11 @@ impl ActorQueue {
     }
 
     pub fn snapshot(&self) -> Vec<QueueProjection> {
-        lock(&self.items).iter().map(Into::into).collect()
+        self.items
+            .lock_unpoisoned()
+            .iter()
+            .map(Into::into)
+            .collect()
     }
 
     /// Wakes the runner. Debounced by the bounded channel: at most one token
@@ -218,15 +246,14 @@ impl ActorQueue {
     /// Hands the runner its notify receiver. Called exactly once per queue.
     pub(crate) fn take_notify_rx(&self) -> flume::Receiver<()> {
         self.notify_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .take()
             .expect("actor queue notify receiver taken once")
     }
 
     /// Extracts a same-policy compaction without crossing ordered work.
     pub(crate) fn pop_interrupt(&self, generation: u64) -> Option<ExtractedCommand> {
-        let mut items = lock(&self.items);
+        let mut items = self.items.lock_unpoisoned();
         match items.front() {
             Some(ActorWork::Compact {
                 generation: compact_generation,
@@ -278,7 +305,7 @@ impl crate::InterruptSource for InterruptQueue {
     }
 
     fn poll(&self) -> Option<ExtractedCommand> {
-        let state = lock(&self.inner.state);
+        let state = self.inner.state.lock_unpoisoned();
         (state.cancellation_generation == self.cancellation_generation)
             .then(|| self.inner.queue.pop_interrupt(self.policy_generation))
             .flatten()

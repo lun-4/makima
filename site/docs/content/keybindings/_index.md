@@ -42,7 +42,6 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+G` | Scroll to top |
 | `Ctrl+Alt+G` | Scroll to bottom |
 | `Ctrl+Q` | Pop queue |
-| `Esc Esc` | Rewind |
 | `Alt+O` | Edit input in external editor |
 
 ### macOS-specific
@@ -58,7 +57,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `Ctrl+B` | Move the running tool call to the background |
 | `↑` / `↓` | Navigate input history |
-| `Esc Esc` | Cancel agent |
+| `Esc Esc` | Cancel active work on the viewed agent or open its rewind picker if it is idle |
 
 ## Form
 
@@ -122,7 +121,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 
@@ -155,5 +154,5 @@ The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 
 These are input conventions, not remappable key rows:
 
-- Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
+- Prefix a line with `!` to run a shell command yourself (5 minute timeout). The selected agent receives the result with its next user turn, even after reopening the session. Use `!!` to hide the command and its output from the agent.
 - `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.

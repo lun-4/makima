@@ -2,7 +2,8 @@
 //! the stream still runs, so lineage and cleanup only ever name a
 //! conversation the server holds.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use makima_domain::LockExt;
+use std::sync::{Arc, Mutex};
 
 use flume::{Receiver, Sender};
 
@@ -29,10 +30,6 @@ struct RequestDeliveryShared {
 }
 
 impl RequestDeliveryShared {
-    fn lock(&self) -> MutexGuard<'_, RequestDeliveryState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn deliver(&self, state: &mut RequestDeliveryState) {
         if !state.delivered {
             state.delivered = true;
@@ -57,7 +54,7 @@ impl RequestDelivery {
     /// Records delivery. Returns false, recording nothing, once the attempt
     /// has been retired: the caller must not start the request then.
     pub fn mark(&self) -> bool {
-        let mut state = self.shared.lock();
+        let mut state = self.shared.state.lock_unpoisoned();
         if state.open_attempt != Some(self.attempt) {
             return false;
         }
@@ -66,7 +63,7 @@ impl RequestDelivery {
     }
 
     pub fn is_delivered(&self) -> bool {
-        self.shared.lock().delivered
+        self.shared.state.lock_unpoisoned().delivered
     }
 }
 
@@ -98,7 +95,7 @@ impl RequestDeliveryTracker {
 
     /// Opens {attempt}, retiring any earlier one.
     pub fn attempt(&self, attempt: u32) -> RequestDelivery {
-        self.shared.lock().open_attempt = Some(attempt);
+        self.shared.state.lock_unpoisoned().open_attempt = Some(attempt);
         RequestDelivery {
             shared: Arc::clone(&self.shared),
             attempt,
@@ -109,7 +106,7 @@ impl RequestDeliveryTracker {
     /// opens. A successful attempt counts as delivered even when its
     /// provider never marked: the server answered it.
     pub fn end_attempt(&self, succeeded: bool) {
-        let mut state = self.shared.lock();
+        let mut state = self.shared.state.lock_unpoisoned();
         if succeeded && state.open_attempt.is_some() {
             self.shared.deliver(&mut state);
         }
@@ -117,7 +114,7 @@ impl RequestDeliveryTracker {
     }
 
     pub fn is_delivered(&self) -> bool {
-        self.shared.lock().delivered
+        self.shared.state.lock_unpoisoned().delivered
     }
 
     /// Resolves once, on the first delivery of any attempt.
@@ -130,7 +127,7 @@ impl RequestDeliveryTracker {
 /// so a handle that outlives it cannot record a delivery nobody reads.
 impl Drop for RequestDeliveryTracker {
     fn drop(&mut self) {
-        self.shared.lock().open_attempt = None;
+        self.shared.state.lock_unpoisoned().open_attempt = None;
     }
 }
 

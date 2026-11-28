@@ -1,6 +1,7 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use makima_agent::session_coordinator::{
     SessionCoordinatorError, SessionOptionCatalog, settable_builtin_definitions,
@@ -56,10 +57,6 @@ impl Drop for ValidationGuard {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 impl PendingSessionOptions {
     pub(crate) fn new(plugin: Arc<str>, generation: u64) -> Self {
         Self {
@@ -71,15 +68,15 @@ impl PendingSessionOptions {
     }
 
     pub(crate) fn definitions(&self) -> Vec<SessionOptionDefinition> {
-        lock(&self.definitions).clone()
+        self.definitions.lock_unpoisoned().clone()
     }
 
     pub(crate) fn validators(&self) -> BTreeMap<Arc<str>, Function> {
-        lock(&self.validators).clone()
+        self.validators.lock_unpoisoned().clone()
     }
 
     pub(crate) fn insert_validator(&self, id: Arc<str>, function: Function) {
-        lock(&self.validators).insert(id, function);
+        self.validators.lock_unpoisoned().insert(id, function);
     }
 }
 
@@ -305,7 +302,7 @@ fn register_session_option(
 ) -> LuaResult<()> {
     crate::runtime::require_plugin_load(lua, &pending.plugin, "register_session_option")?;
     let (definition, validator) = parse_definition(&pending, &spec)?;
-    let mut definitions = lock(&pending.definitions);
+    let mut definitions = pending.definitions.lock_unpoisoned();
     if definitions
         .iter()
         .any(|current| current.id == definition.id)
@@ -390,7 +387,7 @@ pub(crate) async fn commit_catalog(
     pending: &PendingSessionOptions,
 ) -> Result<(), String> {
     let validators = pending.validators();
-    catalog
+    match catalog
         .replace_plugin_options_with_validator(
             Arc::clone(&pending.plugin),
             pending.definitions(),
@@ -414,8 +411,14 @@ pub(crate) async fn commit_catalog(
             },
         )
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    {
+        Ok(_) => Ok(()),
+        Err(error @ SessionCoordinatorError::OptionsInstalled(_)) => {
+            tracing::warn!(plugin = %pending.plugin, %error);
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub(crate) fn activate_pending(lua: &Lua, pending: &PendingSessionOptions) {
@@ -459,18 +462,25 @@ pub(crate) async fn unload(
     lua: &Lua,
     catalog: &SessionOptionCatalog,
     plugin: &str,
-) -> Result<(), String> {
-    catalog
+) -> Result<(), SessionCoordinatorError> {
+    let result = catalog
         .replace_plugin_options(plugin, Vec::new())
         .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())?;
-    if let Some(mut validators) = lua.app_data_mut::<SessionOptionValidators>() {
-        validators
-            .0
-            .retain(|(owner, _, _), _| owner.as_ref() != plugin);
+        .map(|_| ());
+    if matches!(
+        &result,
+        Ok(()) | Err(SessionCoordinatorError::OptionsInstalled(_))
+    ) {
+        if let Some(mut validators) = lua.app_data_mut::<SessionOptionValidators>() {
+            validators
+                .0
+                .retain(|(owner, _, _), _| owner.as_ref() != plugin);
+        }
+        if let Some(mut store) = lua.app_data_mut::<SessionOptionStore>() {
+            store.invalidate(plugin);
+        }
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -481,14 +491,14 @@ mod tests {
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
-    use makima_storage::checkpoint::{CheckpointWriter, accept_all};
+    use makima_storage::checkpoint::{CheckpointWriter, ClaimingWriter};
     use makima_storage::id::MakimaId;
     use test_case::test_case;
 
     use super::*;
 
     fn coordinator(id: MakimaId, catalog: &SessionOptionCatalog) -> SessionCoordinatorHandle {
-        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = accept_all();
+        let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = ClaimingWriter::accept_all();
         SessionCoordinatorHandle::register(SessionCoordinatorParams {
             session_id: id,
             catalog: catalog.clone(),

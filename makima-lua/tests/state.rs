@@ -1,0 +1,1023 @@
+mod common;
+
+use std::sync::Arc;
+
+use makima_agent::{
+    ActorBackend, AgentLimits, AgentRef, CancelTrigger,
+    state::{StateScope, StateSlotSpec},
+    tools::{ToolContext, ToolRegistry, TurnToolBindings},
+};
+use makima_lua::{PluginHost, test_support::InMemoryFs, ui_sink::HostUi};
+use serde_json::{Value, json};
+use test_case::test_case;
+
+const PLUGIN: &str = "state_fixture";
+const TOOL: &str = "state_fixture";
+const FIXTURE: &str = r#"
+local slot = makima.state.register("value", { scope = "agent", version = VERSION, migrate = MIGRATE })
+local session = makima.state.register("shared", { scope = "session", version = 1 })
+local held
+makima.api.register_tool({
+    name = "state_fixture", description = "state fixture",
+    schema = { type = "object", properties = { action = { type = "string" }, count = { type = "number" }, error = { type = "string" } } },
+    handler = function(input, ctx)
+        local value, revision = slot:get(ctx)
+        if input.action == "expect_error" then
+            assert(value == nil and string.find(revision, input.error, 1, true), tostring(revision))
+            return "rejected"
+        end
+        assert(type(revision) == "number", tostring(revision))
+        if input.action == "write" then
+            local candidate = { count = input.count, null = makima.state.null, nested = { makima.state.null, 1.5, {} } }
+            local committed, err = slot:set(ctx, candidate, { expect = revision })
+            assert(committed, err)
+            candidate.count = -1
+            local copy, read_revision = slot:get(ctx)
+            assert(copy.count == input.count and copy.null == makima.state.null and read_revision == committed)
+            assert(#copy.nested == 3 and copy.nested[1] == makima.state.null and copy.nested[2] == 1.5)
+            assert(next(copy.nested[3]) == nil)
+            copy.nested[2] = 0
+            assert(slot:get(ctx).nested[2] == 1.5)
+            copy.count = -2
+            assert(slot:get(ctx).count == input.count)
+            local agent = assert(ctx:agent())
+            local retained, retained_revision = agent:state(ctx, "state_fixture/value")
+            assert(retained.count == input.count and retained_revision == committed)
+            return tostring(committed)
+        elseif input.action == "update" then
+            local calls = 0
+            local updated, committed = slot:update(ctx, function(cur)
+                calls = calls + 1
+                cur.count = cur.count + 1
+                return cur
+            end)
+            assert(calls == 1 and updated.count == input.count, tostring(committed))
+            return tostring(committed)
+        elseif input.action == "conflict" then
+            local calls = 0
+            local updated, err = slot:update(ctx, function(cur)
+                calls = calls + 1
+                assert(slot:set(ctx, { count = input.count }))
+                cur.count = -1
+                return cur
+            end)
+            assert(updated == nil and string.find(err, "state_conflict", 1, true), tostring(err))
+            assert(calls == 1 and slot:get(ctx).count == input.count)
+            return "conflict"
+        elseif input.action == "invalid" then
+            local cyclic = {}; cyclic.self = cyclic
+            local invalid = { cyclic, function() end, { [1] = true, [3] = false }, { [false] = true }, 0/0, math.huge }
+            for _, candidate in ipairs(invalid) do
+                local committed, err = slot:set(ctx, candidate)
+                assert(committed == nil and type(err) == "string")
+                local unchanged, same_revision = slot:get(ctx)
+                assert(unchanged.count == value.count and same_revision == revision)
+            end
+            local yielding, yield_error = slot:update(ctx, function() coroutine.yield(); return {} end)
+            assert(yielding == nil and type(yield_error) == "string")
+            local unchanged, same_revision = slot:get(ctx)
+            assert(unchanged.count == value.count and same_revision == revision)
+            return "invalid"
+        elseif input.action == "nested" then
+            local out, err = makima.agent.call_tool(ctx, "state_nested", {})
+            assert(out == "nested" and err == nil, tostring(err))
+            local after, committed = slot:get(ctx)
+            assert(after.count == 12 and committed > revision)
+            return "nested"
+        elseif input.action == "delete" then
+            local deleted, err = slot:delete(ctx, { expect = revision })
+            assert(deleted, err)
+            local absent, tombstone = slot:get(ctx)
+            assert(absent == nil and tombstone == deleted)
+            local stale, conflict = slot:set(ctx, {}, { expect = revision })
+            assert(stale == nil and string.find(conflict, "state_conflict", 1, true))
+            return tostring(deleted)
+        elseif input.action == "nil" then
+            local committed, err = slot:set(ctx, nil, { expect = revision })
+            assert(committed, err)
+            local stored, current = slot:get(ctx)
+            assert(stored == makima.state.null and current == committed)
+            local updated, next_revision = slot:update(ctx, function(cur)
+                assert(cur == makima.state.null)
+                return nil
+            end)
+            assert(updated == makima.state.null and next_revision > current)
+            assert(slot:get(ctx) == makima.state.null)
+            return tostring(next_revision)
+        elseif input.action == "capture" then
+            held = ctx
+            return "captured"
+        elseif input.action == "expired" then
+            local committed, err = slot:set(held, {})
+            assert(committed == nil and type(err) == "string")
+            return "expired"
+        elseif input.action == "session" then
+            local before, rev = session:get(ctx)
+            local committed, err = session:set(ctx, { count = input.count }, { expect = rev })
+            assert(committed, err)
+            local after, current = session:get(ctx)
+            assert(after.count == input.count and current == committed)
+            return tostring(committed)
+        else
+            return makima.json.encode({ value = value, revision = revision })
+        end
+    end,
+})
+makima.api.register_tool({
+    name = "state_nested", description = "nested state fixture", schema = { type = "object", properties = {} },
+    handler = function(_, ctx)
+        local before, revision = slot:get(ctx)
+        local updated, committed = slot:update(ctx, function(cur) cur.count = 12; return cur end)
+        assert(updated.count == 12 and committed > revision)
+        return "nested"
+    end,
+})
+"#;
+
+fn source(version: u32, migrate: &str) -> String {
+    FIXTURE
+        .replace("VERSION", &version.to_string())
+        .replace("MIGRATE", migrate)
+}
+
+#[test]
+fn state_fixture_copies_cas_tombstones_and_failed_reload() {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, &source(1, "nil")).unwrap();
+    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    ctx.registry = Arc::clone(&registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(&host, &registry, &mut ctx, config, AgentLimits::default());
+    let call = |input| common::exec_tool_text(&registry, &ctx, TOOL, input).unwrap();
+    let first: u64 = call(json!({ "action": "write", "count": 3 }))
+        .parse()
+        .unwrap();
+    let second: u64 = call(json!({ "action": "update", "count": 4 }))
+        .parse()
+        .unwrap();
+    assert!(second > first);
+    assert_eq!(
+        call(json!({ "action": "conflict", "count": 5 })),
+        "conflict"
+    );
+    assert_eq!(call(json!({ "action": "invalid" })), "invalid");
+    assert_eq!(call(json!({ "action": "nested" })), "nested");
+    assert_eq!(call(json!({ "action": "capture" })), "captured");
+    assert_eq!(call(json!({ "action": "expired" })), "expired");
+    assert!(
+        host.load_source(PLUGIN, &(source(2, "nil") + "\nerror('candidate fails')"))
+            .is_err()
+    );
+    let current: Value = serde_json::from_str(&call(json!({}))).unwrap();
+    assert_eq!(current["value"]["count"], 12);
+    host.unload(PLUGIN).unwrap();
+    host.load_source(PLUGIN, &source(1, "nil")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
+        current
+    );
+    let null_revision: u64 = call(json!({ "action": "nil" })).parse().unwrap();
+    assert!(null_revision > second);
+    let deleted: u64 = call(json!({ "action": "delete" })).parse().unwrap();
+    assert!(deleted > null_revision);
+    let current: Value = serde_json::from_str(&call(json!({}))).unwrap();
+    assert_eq!(current["revision"], deleted);
+    assert!(current.get("value").is_none());
+    call(json!({ "action": "session", "count": 7 }));
+}
+
+#[test]
+fn state_fixture_migrates_once_and_preserves_failed_and_newer_values() {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, &source(1, "nil")).unwrap();
+    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    ctx.registry = Arc::clone(&registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(&host, &registry, &mut ctx, config, AgentLimits::default());
+    let call = |input| common::exec_tool_text(&registry, &ctx, TOOL, input).unwrap();
+    call(json!({ "action": "write", "count": 3 }));
+    let before: Value = serde_json::from_str(&call(json!({}))).unwrap();
+    host.load_source(
+        PLUGIN,
+        &source(
+            3,
+            "(function() local calls = 0; return function(cur, from_version) calls = calls + 1; assert(from_version == calls); cur.count = 99; if from_version == 2 then error('migration failed') end; return cur end end)()",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        call(json!({ "action": "expect_error", "error": "migration failed" })),
+        "rejected"
+    );
+    host.load_source(PLUGIN, &source(1, "nil")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
+        before
+    );
+    host.load_source(PLUGIN, &source(3, "(function() local calls = 0; return function(cur, from_version) calls = calls + 1; assert(from_version == calls); cur.steps = cur.steps or {}; table.insert(cur.steps, from_version); cur.count = cur.count + from_version; return cur end end)()")).unwrap();
+    let migrated: Value = serde_json::from_str(&call(json!({}))).unwrap();
+    assert_eq!(migrated["value"]["count"], 6);
+    assert_eq!(migrated["value"]["steps"], json!([1, 2]));
+    assert_ne!(migrated["revision"], before["revision"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
+        migrated
+    );
+    host.load_source(PLUGIN, &source(1, "nil")).unwrap();
+    assert_eq!(
+        call(json!({ "action": "expect_error", "error": "state_newer_version" })),
+        "rejected"
+    );
+    host.load_source(PLUGIN, &source(3, "nil")).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&call(json!({}))).unwrap(),
+        migrated
+    );
+}
+
+const NOTICE: &str = "state notification delivered";
+const DORMANT_SOURCE: &str = r#"
+local slot = makima.state.register("dormant", { scope = "agent", version = 1 })
+slot:on_change(function(ctx, event)
+    local value, revision = slot:get(ctx)
+    assert(value.count == 8 and revision == event.revision)
+    local agent = assert(makima.agent.get(ctx, event.agent:ref()))
+    local retained, retained_revision = agent:state(ctx, "state_fixture/dormant")
+    assert(retained.count == 8 and retained_revision == revision)
+    assert(ctx:mode() == nil)
+    assert(event.agent ~= nil and (event.reason == "commit" or event.reason == "resume"))
+    makima.ui.flash("state notification delivered")
+end)
+makima.api.register_command({
+    name = "state_dormant", description = "exercise dormant state", tui_only = false, handler = function(_, ctx)
+        local revision, err = slot:set(ctx, { count = 8 })
+        assert(revision, err)
+        local value, current = slot:get(ctx)
+        assert(value.count == 8 and current == revision)
+    end,
+})
+"#;
+
+#[test]
+fn trusted_dormant_state_and_nonveto_install_notifications() {
+    use makima_agent::{ActorBackend, AgentManagerHandle};
+    use makima_lua::{UiAction, test_support::run_command};
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, DORMANT_SOURCE).unwrap();
+    let (template, _events, _cancel) = common::ctx_with_canned_provider();
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(common::effective_config(&template)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
+    let target = common::install_root(&host, root.clone(), template);
+    struct DormantTarget(makima_lua::orchestration::TrustedTarget);
+    impl makima_lua::orchestration::OrchestrationServices for DormantTarget {
+        fn resolve_target(
+            &self,
+            _: Option<&makima_commands::CommandInvocation>,
+        ) -> Result<Option<makima_lua::orchestration::TrustedTarget>, String> {
+            Ok(Some(self.0.clone()))
+        }
+        fn template(
+            &self,
+            _: &makima_agent::AgentRef,
+        ) -> Result<makima_agent::tools::ToolContext, String> {
+            Ok(self.0.template.clone())
+        }
+    }
+    host.event_handle()
+        .install_orchestration_services(Arc::new(DormantTarget(target.clone())));
+    host.wait_for_worker_barrier_for_test();
+    manager
+        .detach_incarnation(&root.incarnation().unwrap())
+        .unwrap();
+    assert!(!manager.is_live(root.id()));
+    let finished = run_command(&host.command_registry(), "/state_dormant", 0, Some(target));
+    assert_eq!(
+        smol::block_on(common::bounded(finished.recv_async())).unwrap(),
+        Ok(())
+    );
+    let notices = host.ui_action_rx();
+    let receive = || {
+        let notice = smol::block_on(common::bounded(notices.recv_async())).unwrap();
+        assert!(matches!(notice, UiAction::Flash(ref text) if text == NOTICE));
+    };
+    receive();
+    host.event_handle().notify_state_restored(root.clone());
+    receive();
+    assert!(!manager.is_live(root.id()));
+}
+
+const READONLY_TOOL: &str = "state_readonly";
+const READONLY_SOURCE: &str = r#"
+local migrations = 0
+local slot = makima.state.register("readonly", {
+    scope = "agent", version = VERSION,
+    migrate = function(value) migrations = migrations + 1; return { count = value.count + 1 } end,
+})
+local function probe(input, ctx)
+    local value, revision = slot:get(ctx)
+    if input.error then
+        assert(value == nil and string.find(revision, input.error, 1, true), tostring(revision))
+    else
+        assert(value.count == input.count and type(revision) == "number", tostring(revision))
+    end
+    local committed, err = slot:set(ctx, { count = 999 })
+    assert(committed == nil and string.find(err, "state_read_only", 1, true), tostring(err))
+    committed, err = slot:delete(ctx)
+    assert(committed == nil and string.find(err, "state_read_only", 1, true), tostring(err))
+    local updated; updated, err = slot:update(ctx, function() return { count = 999 } end)
+    assert(updated == nil and string.find(err, "state_read_only", 1, true), tostring(err))
+    assert(migrations == (input.migrations or 0))
+    local buf = makima.ui.buf(); buf:line("readonly verified"); return buf
+end
+makima.api.register_tool({
+    name = "state_readonly", description = "readonly state fixture",     schema = { type = "object", properties = { count = { type = "number" }, migrations = { type = "number" }, error = { type = "string" } } },
+    start = function(input, ctx) ctx:live_buf(probe(input, ctx)) end,
+    restore = function(input, _, _, ctx) return probe(input, ctx) end,
+    handler = function() return "unused" end,
+})
+"#;
+const READONLY_OK: &str = "readonly verified";
+const RESTORE_ID: &str = "state-readonly-restore";
+
+#[test]
+fn start_and_restore_read_only_migrate_copies_of_captured_target() {
+    use makima_agent::{
+        ActorBackend, AgentEvent, AgentManagerHandle, EventSender,
+        state::{StateScope, StateSlotSpec},
+    };
+    use makima_config::ToolOutputLines;
+    use makima_lua::RestoreItem;
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, &READONLY_SOURCE.replace("VERSION", "1"))
+        .unwrap();
+    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    ctx.registry = Arc::clone(&registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(
+        &host,
+        &registry,
+        &mut ctx,
+        config.clone(),
+        AgentLimits::default(),
+    );
+    let current = ctx.managed_turn.as_ref().unwrap();
+    let target = current.manager().reference(current.agent_id());
+    let manager = current.manager();
+    let slot = manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/readonly".into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap();
+    let revision = slot
+        .set(&target.state_access(), json!({ "count": 31 }), None)
+        .unwrap();
+    let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let focused = smol::block_on(other.create_root_with_config(
+        Some(config),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
+    common::install_root(&host, focused, ctx.clone());
+
+    let restore = |input: Value, captured| {
+        let (tx, rx) = flume::unbounded();
+        host.event_handle().request_restore(
+            RestoreItem {
+                tool: READONLY_TOOL.into(),
+                tool_use_id: RESTORE_ID.into(),
+                output: String::new(),
+                input,
+                is_error: false,
+                tool_output_lines: ToolOutputLines::default(),
+                theme_gen: None,
+                clicks: Vec::new(),
+                state: None,
+                state_target: captured,
+            },
+            EventSender::new(tx),
+        );
+        host.event_handle().wait_restore_complete_for_test();
+        let texts: Vec<_> = rx
+            .drain()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::ToolSnapshot { snapshot, .. } => Some(
+                    snapshot
+                        .lines
+                        .iter()
+                        .flat_map(|line| line.spans.iter())
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|text| text == READONLY_OK), "{texts:?}");
+    };
+    let start = |input| {
+        let (tx, rx) = flume::unbounded();
+        let mut invocation_ctx = ctx.clone();
+        invocation_ctx.tool_use_id = Some(RESTORE_ID.into());
+        invocation_ctx.event_tx = EventSender::new(tx);
+        let invocation = registry
+            .get(READONLY_TOOL)
+            .unwrap()
+            .tool
+            .parse(&input)
+            .unwrap();
+        smol::block_on(common::bounded(invocation.start(&invocation_ctx)));
+        assert!(
+            rx.drain()
+                .any(|envelope| matches!(envelope.event, AgentEvent::LiveToolBuf { .. })),
+            "start callback failed"
+        );
+    };
+    start(json!({ "count": 31 }));
+    restore(json!({ "count": 31 }), Some(target.clone()));
+    restore(json!({ "error": "state_target_unavailable" }), None);
+    host.load_source(PLUGIN, &READONLY_SOURCE.replace("VERSION", "2"))
+        .unwrap();
+    start(json!({ "count": 32, "migrations": 1 }));
+    restore(
+        json!({ "count": 32, "migrations": 2 }),
+        Some(target.clone()),
+    );
+    let stored = slot.get_raw(&target.state_access()).unwrap();
+    assert_eq!(stored.version, 1);
+    assert_eq!(stored.revision, revision);
+    assert_eq!(stored.value, Some(json!({ "count": 31 })));
+}
+
+const RETAINED_TOOL: &str = "state_retained";
+const RETAINED_SOURCE: &str = r#"
+local migrations = 0
+local slot = makima.state.register("retained", {
+    scope = "agent", version = VERSION,
+    migrate = function(value) migrations = migrations + 1; value.count = 99; return value end,
+})
+makima.state.register("absent", { scope = "agent", version = 1 })
+makima.state.register("shared", { scope = "session", version = 1 })
+local captured
+local function probe(input, ctx)
+    local agent = input.agent and assert(makima.agent.get(ctx, input.agent)) or assert(ctx:agent())
+    if input.capture then captured = agent; return end
+    if input.denied then
+        local value, err = captured:state(ctx, "state_fixture/retained")
+        assert(value == nil and err == "agent is not a descendant of the caller", tostring(err))
+        return "retained verified"
+    end
+    if input.errors then
+        for _, key in ipairs({ "malformed", "state_fixture/unknown", "state_fixture/too/many", "" }) do
+            local value, err = agent:state(ctx, key)
+            assert(value == nil and err == "state_slot_unavailable", tostring(err))
+        end
+        local value, err = agent:state(ctx, "state_fixture/shared")
+        assert(value == nil and err == "state slot is not agent-scoped", tostring(err))
+        return "retained verified"
+    end
+    local value, revision = agent:state(ctx, "state_fixture/retained")
+    assert(value.count == (input.migration and 99 or 6) and type(revision) == "number", tostring(revision))
+    value.count = -1
+    local copy, same_revision = agent:state(ctx, "state_fixture/retained")
+    assert(copy.count == (input.migration and 99 or 6) and same_revision == revision)
+    assert(migrations == (input.migration and 2 or 0))
+    if not input.agent then
+        local own, own_revision = slot:get(ctx)
+        assert(own.count == copy.count and own_revision == revision)
+        local absent, absent_revision = agent:state(ctx, "state_fixture/absent")
+        assert(absent == nil and type(absent_revision) == "number")
+    end
+    return "retained verified"
+end
+makima.api.register_tool({
+    name = "state_retained", description = "retained migration authority", schema = { type = "object", properties = { agent = { type = "string" }, migration = { type = "boolean" }, denied = { type = "boolean" }, errors = { type = "boolean" } } },
+    handler = probe,
+})
+makima.api.register_command({
+    name = "state_retained", description = "retained state read", tui_only = false,
+    arguments = { raw = true, required = true },
+    handler = function(opts, ctx) probe(assert(makima.json.decode(opts.args)), ctx) end,
+})
+"#;
+const RETAINED_OK: &str = "retained verified";
+
+fn retained_fixture() -> (PluginHost, ToolContext, CancelTrigger, AgentRef, AgentRef) {
+    use makima_agent::AgentMetadata;
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, &RETAINED_SOURCE.replace("VERSION", "1"))
+        .unwrap();
+    let (mut ctx, _events, cancel) = common::ctx_with_canned_provider();
+    ctx.registry = Arc::clone(&registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(
+        &host,
+        &registry,
+        &mut ctx,
+        config.clone(),
+        AgentLimits::default(),
+    );
+    let current = ctx.managed_turn.as_ref().unwrap();
+    let manager = current.manager();
+    let parent = manager.reference(current.agent_id());
+    let child = smol::block_on(manager.spawn_child_trusted_with_config(
+        &parent,
+        config.clone(),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
+    let slot = manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/retained".into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap();
+    for target in [&parent, &child] {
+        slot.set(&target.state_access(), json!({ "count": 6 }), None)
+            .unwrap();
+    }
+    (host, ctx, cancel, parent, child)
+}
+
+#[test]
+fn resident_retained_reads_match_slot_and_return_copies_and_absence() {
+    let (_host, ctx, _cancel, parent, _) = retained_fixture();
+    let before = parent.manager().journal().snapshot();
+    assert_eq!(
+        common::exec_tool_text(&ctx.registry, &ctx, RETAINED_TOOL, json!({})).unwrap(),
+        RETAINED_OK
+    );
+    assert_eq!(parent.manager().journal().snapshot().state, before.state);
+}
+
+#[test_case(false; "own_agent")]
+#[test_case(true; "descendant")]
+fn delegated_retained_reads_migrate_copies_without_journaling(descendant: bool) {
+    let (host, ctx, _cancel, parent, child) = retained_fixture();
+    host.load_source(PLUGIN, &RETAINED_SOURCE.replace("VERSION", "2"))
+        .unwrap();
+    let journal = parent.manager().journal();
+    let before = journal.snapshot();
+    assert_eq!(
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "agent": if descendant { child.id() } else { parent.id() }.to_string(), "migration": true })
+        )
+        .unwrap(),
+        RETAINED_OK
+    );
+    let after = journal.snapshot();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.seq, before.seq);
+    assert_eq!(after.revision, before.revision);
+}
+
+#[test]
+fn retained_reads_reject_session_unknown_and_malformed_slots() {
+    let (_host, ctx, _cancel, parent, _) = retained_fixture();
+    let before = parent.manager().journal().snapshot();
+    assert_eq!(
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "errors": true })
+        )
+        .unwrap(),
+        RETAINED_OK
+    );
+    assert_eq!(parent.manager().journal().snapshot().state, before.state);
+}
+
+#[test]
+fn retained_reads_reject_unrelated_agent_topology() {
+    use makima_agent::{AgentInput, AgentMetadata};
+
+    let (host, mut ctx, _cancel, parent, sibling) = retained_fixture();
+    let manager = parent.manager();
+    let completed = makima_lua::test_support::run_command(
+        &host.command_registry(),
+        &format!(
+            "/state_retained {}",
+            json!({ "agent": sibling.id().to_string(), "capture": true })
+        ),
+        0,
+        Some(makima_lua::orchestration::TrustedTarget {
+            target: parent.clone(),
+            template: ctx.clone(),
+        }),
+    );
+    smol::block_on(common::bounded(completed.recv_async()))
+        .unwrap()
+        .unwrap();
+    let (entered, current) = flume::bounded(1);
+    let caller = smol::block_on(manager.spawn_child_trusted_with_config(
+        &parent,
+        common::effective_config(&ctx),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| {
+            let backend = common::MockBackend::STRICT.with_turn(move |_, context, _, _| {
+                entered.send(context.managed_turn.unwrap()).unwrap();
+                Box::pin(std::future::pending())
+            });
+            Ok::<_, String>(Box::new(backend) as Box<dyn ActorBackend>)
+        },
+    ))
+    .unwrap();
+    caller
+        .actor()
+        .unwrap()
+        .admit_turn(
+            AgentInput::new("read sibling".into(), Vec::new()),
+            None,
+            "read sibling".into(),
+        )
+        .unwrap();
+    ctx.managed_turn = Some(smol::block_on(common::bounded(current.recv_async())).unwrap());
+    ctx.execution_agent_id = Some(caller.id());
+    let before = manager.journal().snapshot();
+    assert_eq!(
+        common::exec_tool_text(
+            &ctx.registry,
+            &ctx,
+            RETAINED_TOOL,
+            json!({ "denied": true })
+        )
+        .unwrap(),
+        RETAINED_OK
+    );
+    assert_eq!(manager.journal().snapshot().state, before.state);
+}
+
+#[test]
+fn retained_reads_after_restart_leave_child_dormant() {
+    use makima_agent::AgentMetadata;
+    use makima_storage::StateDir;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = StateDir::from_path(directory.path().into());
+    let mut session = common::TestSession::new(
+        &common::default_model().spec(),
+        directory.path().to_str().unwrap(),
+    );
+    session.save(&storage).unwrap();
+    let fs = Arc::new(InMemoryFs::new());
+    fs.seed(
+        &directory
+            .path()
+            .join("plugins")
+            .join(format!("{PLUGIN}.lua")),
+        RETAINED_SOURCE.replace("VERSION", "1").into_bytes(),
+    );
+    let host = common::RestartHost::open_with_provider(
+        directory.path(),
+        session.id,
+        fs,
+        vec![PLUGIN.into()],
+        Arc::new(common::CannedProvider::new(Vec::new())),
+    );
+    let child = smol::block_on(host.manager.spawn_child_trusted_with_config(
+        &host.root.target,
+        common::effective_config(&host.root.template),
+        AgentMetadata::default(),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
+    host.manager
+        .journal()
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/retained".into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap()
+        .set(&child.state_access(), json!({ "count": 6 }), None)
+        .unwrap();
+    let id = child.id();
+    let host = host.restart_host(directory.path());
+    assert!(!host.manager.is_live(id));
+    let before = host.manager.journal().snapshot();
+    let completed = makima_lua::test_support::run_command(
+        &host.host.command_registry(),
+        &format!("/state_retained {}", json!({ "agent": id.to_string() })),
+        0,
+        Some(host.root.clone()),
+    );
+    smol::block_on(common::bounded(completed.recv_async()))
+        .unwrap()
+        .unwrap();
+    assert!(!host.manager.is_live(id));
+    let after = host.manager.journal().snapshot();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.revision, before.revision);
+}
+
+const COMPACT_GATE: &str = "state_compact_gate";
+const COMPACT_TOOL: &str = "state_compact_probe";
+const COMPACT_OK: &str = "fresh invocation committed";
+const COMPACT_SOURCE: &str = r#"
+local slot = makima.state.register("compact", { scope = "agent", version = 1 })
+makima.api.register_tool({
+    name = "state_compact_probe", description = "state epoch fixture", schema = { type = "object", properties = { old = { type = "boolean" } } },
+    handler = function(input, ctx)
+        if input.old then
+            assert(slot:set(ctx, { count = 1 }))
+            local output, err = makima.agent.call_tool(ctx, "state_compact_gate", {})
+            assert(output == "compacted" and err == nil, tostring(err))
+            local committed; committed, err = slot:set(ctx, { count = 99 })
+            assert(committed == nil and string.find(err, "state_stale_access", 1, true), tostring(err))
+            local value, revision = slot:get(ctx)
+            assert(value == nil and string.find(revision, "state_stale_access", 1, true), tostring(revision))
+            return "old invocation fenced"
+        end
+        local value, revision = slot:get(ctx)
+        assert(value.count == 1 and type(revision) == "number", tostring(revision))
+        assert(slot:set(ctx, { count = 2 }, { expect = revision }))
+        return "fresh invocation committed"
+    end,
+})
+"#;
+
+#[test]
+fn compaction_fences_old_context_but_new_invocation_captures_current_epoch() {
+    use makima_agent::{
+        ToolOutput,
+        journal::JournalCommit,
+        tools::{
+            DescriptionContext, Tool, ToolContext, ToolInvocation, ToolSource,
+            registry::{ExecFuture, HeaderFuture, HeaderResult, ParseError, ToolExecResult},
+        },
+    };
+    use makima_storage::sessions::HistorySnapshot;
+    use std::borrow::Cow;
+
+    struct CompactGate;
+    impl Tool for CompactGate {
+        fn name(&self) -> &str {
+            COMPACT_GATE
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            "rotate the state epoch".into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(Self))
+        }
+    }
+    impl ToolInvocation for CompactGate {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(COMPACT_GATE.into()))
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let current = ctx.managed_turn.as_ref().unwrap();
+                let journal = current.manager().journal();
+                let previous = journal.snapshot().histories[&current.agent_id()].clone();
+                let mut compacted = HistorySnapshot::new(previous.messages.as_ref().clone());
+                compacted.compacted = true;
+                journal
+                    .commit(JournalCommit {
+                        histories: [(current.agent_id(), compacted)].into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain("compacted".into())))
+            })
+        }
+    }
+    let registry = Arc::new(ToolRegistry::new());
+    registry
+        .register(
+            Arc::new(CompactGate),
+            ToolSource::Lua {
+                plugin: "state_host_gate".into(),
+            },
+        )
+        .unwrap();
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, COMPACT_SOURCE).unwrap();
+    let (mut ctx, _events, _cancel) = common::ctx_with_canned_provider();
+    ctx.registry = Arc::clone(&registry);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        &registry,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
+    let config = common::effective_config(&ctx);
+    common::bind_parked_root(&host, &registry, &mut ctx, config, AgentLimits::default());
+    assert_eq!(
+        common::exec_tool_text(&registry, &ctx, COMPACT_TOOL, json!({ "old": true })).unwrap(),
+        "old invocation fenced"
+    );
+    assert_eq!(
+        common::exec_tool_text(&registry, &ctx, COMPACT_TOOL, json!({})).unwrap(),
+        COMPACT_OK
+    );
+}
+
+const RESUME_SOURCE: &str = r#"
+local migrations = 0
+local last = 0
+local slot = makima.state.register("resume", {
+    scope = "agent", version = 2,
+    migrate = function(value, version)
+        assert(version == 1 and value.count == 4)
+        migrations = migrations + 1
+        value.count = 5
+        return value
+    end,
+})
+slot:on_change(function(ctx, event)
+    assert(event.agent ~= nil and ctx:mode() == nil)
+    if event.reason == "resume" then
+        assert(migrations == 0)
+        local notified_revision = event.revision
+        assert(type(notified_revision) == "number")
+        local current, revision = slot:get(ctx)
+        assert(current.count == 5 and migrations == 1 and revision > notified_revision)
+        assert(event.revision == notified_revision)
+        makima.ui.flash("resume revision:" .. tostring(notified_revision))
+        error("notification cannot veto")
+    end
+    assert(event.reason == "commit" and event.revision > last)
+    last = event.revision
+    makima.ui.flash("host commit:" .. tostring(event.revision))
+end)
+"#;
+const RESUME_PREFIX: &str = "resume revision:";
+const COMMIT_PREFIX: &str = "host commit:";
+#[test]
+fn resume_callback_keeps_replayed_revision_and_host_notices_keep_commit_order() {
+    use makima_agent::{
+        ActorBackend, AgentManagerHandle,
+        state::{StateScope, StateSlotSpec},
+    };
+    use makima_lua::UiAction;
+
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_session_provider_preparer(
+        Arc::clone(&registry),
+        Default::default(),
+        true,
+        Arc::new(InMemoryFs::new()),
+        None,
+        None,
+        HostUi::Frontend,
+    )
+    .unwrap();
+    host.load_source(PLUGIN, RESUME_SOURCE).unwrap();
+    let (template, _events, _cancel) = common::ctx_with_canned_provider();
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(common::effective_config(&template)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
+    let journal = manager.journal();
+    let old = journal
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/resume".into(),
+            scope: StateScope::Agent,
+            version: 1,
+        })
+        .unwrap();
+    let replayed = old
+        .set(&root.state_access(), json!({ "count": 4 }), None)
+        .unwrap();
+    common::install_root(&host, root.clone(), template);
+    host.event_handle().notify_state_restored(root.clone());
+    let actions = host.ui_action_rx();
+    let receive = || match smol::block_on(common::bounded(actions.recv_async())).unwrap() {
+        UiAction::Flash(text) => text,
+        _ => panic!("unexpected notification"),
+    };
+    assert_eq!(receive(), format!("{RESUME_PREFIX}{}", replayed.0));
+    let migrated = old.get_raw(&root.state_access()).unwrap();
+    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.value, Some(json!({ "count": 5 })));
+    assert_eq!(receive(), format!("{COMMIT_PREFIX}{}", migrated.revision.0));
+    let current = journal
+        .register_state::<Value>(StateSlotSpec {
+            key: "state_fixture/resume".into(),
+            scope: StateScope::Agent,
+            version: 2,
+        })
+        .unwrap();
+    let first = current
+        .set(&root.state_access(), json!({ "count": 6 }), None)
+        .unwrap();
+    let second = current
+        .set(&root.state_access(), json!({ "count": 7 }), None)
+        .unwrap();
+    assert_eq!(receive(), format!("{COMMIT_PREFIX}{}", first.0));
+    assert_eq!(receive(), format!("{COMMIT_PREFIX}{}", second.0));
+    assert_eq!(
+        current.get_raw(&root.state_access()).unwrap().value,
+        Some(json!({ "count": 7 }))
+    );
+}

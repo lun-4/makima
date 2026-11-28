@@ -1,5 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -30,7 +31,7 @@ pub enum MakimaIdParseError {
 /// chronologically. Nothing in makima sorts by the string form today;
 /// storage uses the embedded timestamp directly. See issue #264 for future
 /// tree-ordered history work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MakimaId([u8; UUID_BYTES]);
 
 impl MakimaId {
@@ -41,6 +42,88 @@ impl MakimaId {
 
     pub fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
+    }
+
+    /// The wall-clock time embedded at generation, with millisecond
+    /// precision. `None` for ids that are not UUIDv7.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        let (secs, nanos) = Uuid::from_bytes(self.0).get_timestamp()?.to_unix();
+        Some(UNIX_EPOCH + Duration::new(secs, nanos))
+    }
+}
+
+macro_rules! lifecycle_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(MakimaId);
+
+        impl $name {
+            pub fn generate() -> Self {
+                Self(MakimaId::generate())
+            }
+
+            pub fn created_at(&self) -> Option<SystemTime> {
+                self.0.created_at()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = MakimaIdParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                value.parse().map(Self)
+            }
+        }
+    };
+}
+
+lifecycle_id!(AgentId, "Durable identity of one logical agent.");
+/// Stable identity of one accepted agent turn.
+///
+/// Agent and turn identities are nominal and cannot be interchanged:
+///
+/// ```compile_fail
+/// use makima_storage::id::{AgentId, TurnId};
+///
+/// fn accepts_turn(_: TurnId) {}
+/// accepts_turn(AgentId::generate());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(MakimaId);
+
+impl TurnId {
+    pub fn generate() -> Self {
+        Self(MakimaId::generate())
+    }
+
+    /// When the turn was admitted.
+    pub fn created_at(&self) -> Option<SystemTime> {
+        self.0.created_at()
+    }
+}
+
+impl fmt::Display for TurnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for TurnId {
+    type Err = MakimaIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
     }
 }
 
@@ -164,12 +247,22 @@ mod tests {
 
     const SAMPLE_HEX: &str = "01965087-4c71-7f00-8000-000000000000";
     const SAMPLE_BASE58: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const SAMPLE_MILLIS: u64 = 0x0196_5087_4c71;
+    const V4_HEX: &str = "01965087-4c71-4f00-8000-000000000000";
 
     #[test]
     fn generate_is_v7() {
         let id = MakimaId::generate();
         let uuid = Uuid::from_bytes(id.0);
         assert_eq!(uuid.get_version(), Some(uuid::Version::SortRand));
+    }
+
+    #[test_case(SAMPLE_HEX => Some(Duration::from_millis(SAMPLE_MILLIS)) ; "v7")]
+    #[test_case(V4_HEX => None ; "v4")]
+    fn created_at_reads_the_v7_timestamp(hex: &str) -> Option<Duration> {
+        let id = MakimaId(Uuid::parse_str(hex).unwrap().into_bytes());
+        id.created_at()
+            .map(|time| time.duration_since(UNIX_EPOCH).unwrap())
     }
 
     #[test]
@@ -208,6 +301,32 @@ mod tests {
         assert!((23..=24).contains(&s.len()));
         let back: MakimaId = serde_json::from_str(&s).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test_case(true; "agent")]
+    #[test_case(false; "turn")]
+    fn lifecycle_ids_preserve_storage_encoding(agent: bool) {
+        fn check<T>(id: T)
+        where
+            T: Copy
+                + fmt::Debug
+                + fmt::Display
+                + FromStr<Err = MakimaIdParseError>
+                + PartialEq
+                + Serialize,
+            for<'de> T: Deserialize<'de>,
+        {
+            let encoded = serde_json::to_string(&id).unwrap();
+            assert_eq!(encoded, format!("\"{id}\""));
+            assert_eq!(serde_json::from_str::<T>(&encoded).unwrap(), id);
+            assert_eq!(id.to_string().parse::<T>().unwrap(), id);
+        }
+
+        if agent {
+            check(AgentId::generate());
+        } else {
+            check(TurnId::generate());
+        }
     }
 
     #[test]

@@ -1,0 +1,1132 @@
+use crate::{
+    id::{AgentId, MakimaId, TurnId},
+    sessions::StoredRule,
+};
+use imbl::{OrdMap, OrdSet};
+use makima_domain::{ModelSelection, StoredThinking, TokenUsage};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+};
+use thiserror::Error;
+
+pub const MAX_STORED_TURN_RESULTS: usize = 128;
+pub const MAX_PLUGIN_VALUE_DEPTH: usize = 64;
+pub const MAX_PLUGIN_VALUE_BYTES: usize = 256 * 1024;
+pub const MAX_INLINE_TURN_RESULT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredStateRecord {
+    pub seq: u64,
+    pub agent: Option<AgentId>,
+    pub generation: u64,
+    pub change: StateChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateChange {
+    InputHold {
+        held: bool,
+    },
+    Preamble {
+        id: MakimaId,
+        message: String,
+    },
+    Admitted {
+        turn: TurnId,
+        origin: StoredTurnOrigin,
+    },
+    TurnInput {
+        turn: TurnId,
+        input: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        promoted: Option<MakimaId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preambles: Vec<MakimaId>,
+    },
+    JoinedInput {
+        turn: TurnId,
+        id: MakimaId,
+        input: Option<StoredJoinedInput>,
+    },
+    Config(StoredAgentConfig),
+    Rules {
+        rules: Vec<StoredRule>,
+        yolo: Option<bool>,
+    },
+    #[serde(rename = "context")]
+    Context {
+        #[serde(rename = "source")]
+        source: String,
+        #[serde(rename = "hash")]
+        hash: String,
+        #[serde(rename = "content")]
+        content: String,
+    },
+    Plugin {
+        key: String,
+        version: u32,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "plugin_value"
+        )]
+        value: Option<Value>,
+    },
+    Turn {
+        turn: TurnId,
+        result: StoredTurnResult,
+    },
+    Delivery {
+        id: (AgentId, TurnId),
+        op: StoredDeliveryOp,
+    },
+    Compaction {
+        epoch: u64,
+    },
+}
+
+fn plugin_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredAgentConfig {
+    pub cwd: String,
+    pub model: String,
+    pub thinking: Option<StoredThinking>,
+    pub fast: bool,
+    pub workflow: bool,
+    pub mode: StoredModeSnapshot,
+    pub options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredModeSnapshot {
+    pub id: String,
+    pub label: String,
+    pub system_prompt: Option<String>,
+    pub restrict_write_to: Option<PathBuf>,
+    pub tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredAgentLifecycle {
+    Open,
+    Closed,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredAgentRecord {
+    pub id: AgentId,
+    pub parent: Option<AgentId>,
+    pub depth: u32,
+    pub transcript_key: String,
+    pub lifecycle: StoredAgentLifecycle,
+    pub ancestry_unknown: bool,
+    pub label: Option<String>,
+    pub spawned_by_tool_use_id: Option<String>,
+    pub spec: Option<StoredAgentSpec>,
+    pub restorable: Result<(), String>,
+    pub usage: TokenUsage,
+    pub created_seq: u64,
+    pub updated_seq: u64,
+    pub legacy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredAgentSpec {
+    pub model: ModelSelection,
+    pub system: String,
+    pub tools: Vec<Value>,
+    pub audience: String,
+    pub mcp: bool,
+    pub output_schema: Option<Value>,
+    pub name: Option<String>,
+    pub silent: bool,
+    pub auto_deliver: bool,
+    pub inherit_provider: bool,
+    pub mode_ceiling: StoredModeCeiling,
+    pub plugin: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredModeCeiling {
+    pub restrict_write_to: Option<PathBuf>,
+    pub tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentLink {
+    pub session: MakimaId,
+    pub message: Option<MakimaId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredTurnOrigin {
+    Internal,
+    User,
+    Plugin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTurnProvenance {
+    pub origin: StoredTurnOrigin,
+    pub plugin: Option<String>,
+    pub plugin_generation: Option<u64>,
+    pub source_agent: Option<AgentId>,
+    pub source_turn: Option<TurnId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredOffloadRef {
+    pub session: MakimaId,
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "storage", content = "value", rename_all = "snake_case")]
+pub enum StoredPayload<T> {
+    Inline(T),
+    Offloaded(StoredOffloadRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredTurnResult {
+    pub outcome: StoredTurnOutcome,
+    pub text: StoredPayload<String>,
+    pub output: StoredPayload<Vec<Value>>,
+    pub provenance: StoredTurnProvenance,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredTurnOutcome {
+    pub agent_id: AgentId,
+    pub turn_id: TurnId,
+    pub usage: TokenUsage,
+    pub num_turns: u32,
+    pub cost: Option<f64>,
+    pub list_cost: Option<f64>,
+    pub context_size: u32,
+    pub context_window: u32,
+    #[serde(flatten)]
+    pub status: StoredTurnStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StoredTurnStatus {
+    Completed { reason: StoredDoneReason },
+    Failed { failure: StoredTurnFailure },
+    Cancelled { reason: StoredCancellationReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredDoneReason {
+    EndTurn,
+    MaxTokens,
+    MaxTurns,
+    Compact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredCancellationReason {
+    User,
+    Closed,
+    Shutdown,
+    Interrupted,
+    Withdrawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredTurnFailureKind {
+    Provider,
+    Authentication,
+    Timeout,
+    Tool,
+    Transport,
+    InvalidResponse,
+    Internal,
+    Compaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTurnFailure {
+    pub kind: StoredTurnFailureKind,
+    pub diagnostic: String,
+    pub user_message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredDelivery {
+    pub label: Option<String>,
+    pub result: StoredTurnResult,
+    #[serde(default)]
+    pub held: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", content = "delivery", rename_all = "snake_case")]
+pub enum StoredDeliveryOp {
+    Queued(Box<StoredDelivery>),
+    Consumed,
+    Withdrawn,
+    Dropped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContext {
+    pub hash: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredPluginValue {
+    pub revision: u64,
+    pub version: u32,
+    pub value: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredJoinedInput {
+    pub input: Value,
+    pub mcp_startup_notice: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoredScopeState {
+    pub input_held: bool,
+    pub preambles: Vec<(MakimaId, String)>,
+    pub generation: u64,
+    pub config: Option<StoredAgentConfig>,
+    pub rules: Vec<StoredRule>,
+    pub yolo: Option<bool>,
+    pub context: BTreeMap<String, StoredContext>,
+    pub plugins: BTreeMap<String, StoredPluginValue>,
+    pub admitted: BTreeMap<TurnId, StoredTurnOrigin>,
+    pub turn_inputs: BTreeMap<TurnId, Value>,
+    pub joined_inputs: BTreeMap<TurnId, BTreeMap<MakimaId, StoredJoinedInput>>,
+    pub results: VecDeque<(TurnId, StoredTurnResult)>,
+    pub deliveries: BTreeMap<(AgentId, TurnId), StoredDeliveryOp>,
+}
+
+impl StoredScopeState {
+    pub fn holds_input(&self, origin: &StoredTurnOrigin) -> bool {
+        self.input_held && *origin == StoredTurnOrigin::User
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionStateView {
+    pub agents: BTreeMap<AgentId, StoredAgentRecord>,
+    pub scopes: BTreeMap<Option<AgentId>, StoredScopeState>,
+    pub compactions: BTreeMap<AgentId, (u64, u64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionStateReducer {
+    pub agents: OrdMap<AgentId, Arc<StoredAgentRecord>>,
+    scopes: OrdMap<Option<AgentId>, ReducedScope>,
+    compactions: OrdMap<AgentId, (u64, u64)>,
+    state_sequences: OrdSet<u64>,
+    agent_sequences: OrdSet<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReducedScope {
+    input_held: bool,
+    preambles: Arc<Vec<(MakimaId, String)>>,
+    generation: u64,
+    config: Option<Arc<StoredAgentConfig>>,
+    rules: Arc<Vec<StoredRule>>,
+    yolo: Option<bool>,
+    context: OrdMap<String, Arc<StoredContext>>,
+    plugins: OrdMap<String, Arc<StoredPluginValue>>,
+    admitted: OrdMap<TurnId, Arc<StoredTurnOrigin>>,
+    turn_inputs: OrdMap<TurnId, Arc<Value>>,
+    joined_inputs: OrdMap<TurnId, Arc<BTreeMap<MakimaId, Arc<StoredJoinedInput>>>>,
+    results: Arc<VecDeque<(TurnId, StoredTurnResult)>>,
+    deliveries: OrdMap<(AgentId, TurnId), Arc<StoredDeliveryOp>>,
+    delivery_sequences: OrdMap<(AgentId, TurnId), u64>,
+}
+
+impl ReducedScope {
+    fn remove_joined_input(&mut self, turn: &TurnId, id: &MakimaId) {
+        if let Some(inputs) = self.joined_inputs.get_mut(turn) {
+            Arc::make_mut(inputs).remove(id);
+            if inputs.is_empty() {
+                self.joined_inputs.remove(turn);
+            }
+        }
+    }
+
+    fn materialize(&self) -> StoredScopeState {
+        StoredScopeState {
+            input_held: self.input_held,
+            preambles: self.preambles.as_ref().clone(),
+            generation: self.generation,
+            config: self.config.as_deref().cloned(),
+            rules: self.rules.as_ref().clone(),
+            yolo: self.yolo,
+            context: self
+                .context
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+            plugins: self
+                .plugins
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+            admitted: self
+                .admitted
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            turn_inputs: self
+                .turn_inputs
+                .iter()
+                .map(|(turn, input)| (*turn, input.as_ref().clone()))
+                .collect(),
+            joined_inputs: self
+                .joined_inputs
+                .iter()
+                .map(|(turn, inputs)| {
+                    (
+                        *turn,
+                        inputs
+                            .iter()
+                            .map(|(id, input)| (*id, input.as_ref().clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            results: self.results.as_ref().clone(),
+            deliveries: self
+                .deliveries
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+        }
+    }
+}
+
+impl SessionStateReducer {
+    pub fn from_ordered(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+    ) -> Result<Self, StateFoldError> {
+        Self::validate_structure(state, revisions)?;
+        let mut reducer = Self::default();
+        for (seq, agent) in revisions {
+            reducer.apply_agent(*seq, agent)?;
+        }
+        for record in state {
+            reducer.apply_record(record)?;
+        }
+        Ok(reducer)
+    }
+
+    pub fn validate_structure(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+    ) -> Result<(), StateFoldError> {
+        validate_sequence("state", state.iter().map(|record| record.seq))?;
+        validate_sequence("agent", revisions.iter().map(|(seq, _)| *seq))?;
+        let state_sequences: BTreeSet<_> = state.iter().map(|record| record.seq).collect();
+        for (seq, agent) in revisions {
+            if state_sequences.contains(seq) {
+                return Err(StateFoldError::DuplicateSequence { seq: *seq });
+            }
+            if agent.updated_seq != *seq || agent.created_seq > agent.updated_seq {
+                return Err(StateFoldError::InvalidAgentRevision { seq: *seq });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn materialize(&self) -> SessionStateView {
+        SessionStateView {
+            agents: self
+                .agents
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().clone()))
+                .collect(),
+            scopes: self
+                .scopes
+                .iter()
+                .map(|(key, value)| (*key, value.materialize()))
+                .collect(),
+            compactions: self
+                .compactions
+                .iter()
+                .map(|(key, value)| (*key, *value))
+                .collect(),
+        }
+    }
+
+    pub fn plugin(&self, agent: Option<AgentId>, key: &str) -> Option<&StoredPluginValue> {
+        self.scopes.get(&agent)?.plugins.get(key).map(Arc::as_ref)
+    }
+
+    pub fn deliveries(
+        &self,
+        parent: AgentId,
+    ) -> impl Iterator<Item = ((AgentId, TurnId), &StoredDeliveryOp, u64)> {
+        self.scopes
+            .get(&Some(parent))
+            .into_iter()
+            .flat_map(|scope| {
+                scope.deliveries.iter().map(|(id, op)| {
+                    (
+                        *id,
+                        op.as_ref(),
+                        scope.delivery_sequences.get(id).copied().unwrap_or(0),
+                    )
+                })
+            })
+    }
+
+    pub fn delivery(&self, parent: AgentId, id: (AgentId, TurnId)) -> Option<&StoredDeliveryOp> {
+        self.scopes
+            .get(&Some(parent))?
+            .deliveries
+            .get(&id)
+            .map(Arc::as_ref)
+    }
+
+    pub fn result(&self, agent: AgentId, turn: TurnId) -> Option<&StoredTurnResult> {
+        self.scopes
+            .get(&Some(agent))?
+            .results
+            .iter()
+            .find(|(id, _)| *id == turn)
+            .map(|(_, result)| result)
+    }
+
+    pub fn apply_agent(
+        &mut self,
+        seq: u64,
+        agent: &StoredAgentRecord,
+    ) -> Result<(), StateFoldError> {
+        if self.state_sequences.contains(&seq) || self.agent_sequences.contains(&seq) {
+            return Err(StateFoldError::DuplicateSequence { seq });
+        }
+        if agent.updated_seq != seq || agent.created_seq > agent.updated_seq {
+            return Err(StateFoldError::InvalidAgentRevision { seq });
+        }
+        self.agent_sequences.insert(seq);
+        self.agents.insert(agent.id, Arc::new(agent.clone()));
+        Ok(())
+    }
+
+    pub fn apply_record(&mut self, record: &StoredStateRecord) -> Result<(), StateFoldError> {
+        let seq = record.seq;
+        if self.state_sequences.contains(&seq) || self.agent_sequences.contains(&seq) {
+            return Err(StateFoldError::DuplicateSequence { seq });
+        }
+        validate_record(record)?;
+        let mut candidate = self.clone();
+        candidate.apply_change(record)?;
+        candidate.state_sequences.insert(seq);
+        *self = candidate;
+        Ok(())
+    }
+
+    fn apply_change(&mut self, record: &StoredStateRecord) -> Result<(), StateFoldError> {
+        let seq = record.seq;
+        let mut scope = self.scopes.get(&record.agent).cloned().unwrap_or_default();
+        scope.generation = record.generation;
+        match &record.change {
+            StateChange::InputHold { held } => scope.input_held = *held,
+            StateChange::Preamble { id, message } => {
+                Arc::make_mut(&mut scope.preambles).push((*id, message.clone()));
+            }
+            StateChange::Admitted { turn, origin } => {
+                if !scope.results.iter().any(|(id, _)| id == turn) {
+                    scope.admitted.insert(*turn, Arc::new(origin.clone()));
+                }
+            }
+            StateChange::TurnInput {
+                turn,
+                input,
+                promoted,
+                preambles,
+            } => {
+                if !preambles.is_empty() {
+                    Arc::make_mut(&mut scope.preambles).retain(|(id, _)| !preambles.contains(id));
+                    scope.input_held = false;
+                }
+                if let Some(id) = promoted {
+                    scope.remove_joined_input(turn, id);
+                }
+                if let Some(input) = input {
+                    if !scope.results.iter().any(|(id, _)| id == turn) {
+                        if !preambles.is_empty() {
+                            scope
+                                .admitted
+                                .insert(*turn, Arc::new(StoredTurnOrigin::User));
+                        }
+                        scope.turn_inputs.insert(*turn, Arc::new(input.clone()));
+                    }
+                } else {
+                    scope.turn_inputs.remove(turn);
+                }
+            }
+            StateChange::JoinedInput { turn, id, input } => {
+                if let Some(input) = input {
+                    if scope.admitted.contains_key(turn) {
+                        Arc::make_mut(scope.joined_inputs.entry(*turn).or_default())
+                            .insert(*id, Arc::new(input.clone()));
+                    }
+                } else {
+                    scope.remove_joined_input(turn, id);
+                }
+            }
+            StateChange::Config(config) => scope.config = Some(Arc::new(config.clone())),
+            StateChange::Rules { rules, yolo } => {
+                scope.rules = Arc::new(rules.clone());
+                scope.yolo = *yolo;
+            }
+            StateChange::Context {
+                source,
+                hash,
+                content,
+            } => {
+                scope.context.insert(
+                    source.clone(),
+                    Arc::new(StoredContext {
+                        hash: hash.clone(),
+                        content: content.clone(),
+                    }),
+                );
+            }
+            StateChange::Plugin {
+                key,
+                version,
+                value,
+            } => {
+                scope.plugins.insert(
+                    key.clone(),
+                    Arc::new(StoredPluginValue {
+                        revision: seq,
+                        version: *version,
+                        value: value.clone(),
+                    }),
+                );
+            }
+            StateChange::Turn { turn, result } => {
+                scope.admitted.remove(turn);
+                scope.turn_inputs.remove(turn);
+                scope.joined_inputs.remove(turn);
+                let results = Arc::make_mut(&mut scope.results);
+                results.retain(|(id, _)| id != turn);
+                results.push_back((*turn, result.clone()));
+                if results.len() > MAX_STORED_TURN_RESULTS {
+                    results.pop_front();
+                }
+            }
+            StateChange::Delivery { id, op } => {
+                scope.delivery_sequences.insert(*id, seq);
+                if !scope.deliveries.get(id).is_some_and(|previous| {
+                    !matches!(previous.as_ref(), StoredDeliveryOp::Queued(_))
+                }) {
+                    scope.deliveries.insert(*id, Arc::new(op.clone()));
+                }
+            }
+            StateChange::Compaction { epoch } => {
+                let agent = record
+                    .agent
+                    .ok_or(StateFoldError::MissingCompactionAgent { seq })?;
+                self.compactions.insert(agent, (seq, *epoch));
+            }
+        }
+        self.scopes.insert(record.agent, scope);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum StateFoldError {
+    #[error("{stream} sequence {seq} does not follow {previous}")]
+    UnorderedSequence {
+        stream: &'static str,
+        previous: u64,
+        seq: u64,
+    },
+    #[error("sequence {seq} is used by both a state and agent record")]
+    DuplicateSequence { seq: u64 },
+    #[error("agent revision at sequence {seq} has invalid creation/update sequences")]
+    InvalidAgentRevision { seq: u64 },
+    #[error("preamble at sequence {seq} requires an agent")]
+    MissingPreambleAgent { seq: u64 },
+    #[error("compaction at sequence {seq} requires an agent")]
+    MissingCompactionAgent { seq: u64 },
+    #[error("turn result at sequence {seq} does not match its agent and turn identity")]
+    TurnIdentityMismatch { seq: u64 },
+    #[error("delivery at sequence {seq} does not match its result identity")]
+    DeliveryIdentityMismatch { seq: u64 },
+    #[error("plugin value at sequence {seq} exceeds depth {MAX_PLUGIN_VALUE_DEPTH}")]
+    PluginDepth { seq: u64 },
+    #[error("plugin value at sequence {seq} exceeds {MAX_PLUGIN_VALUE_BYTES} encoded bytes")]
+    PluginSize { seq: u64 },
+}
+
+impl SessionStateView {
+    pub fn fold(
+        state: &[StoredStateRecord],
+        revisions: &[(u64, StoredAgentRecord)],
+    ) -> Result<Self, StateFoldError> {
+        Ok(SessionStateReducer::from_ordered(state, revisions)?.materialize())
+    }
+}
+
+pub fn validate_record(record: &StoredStateRecord) -> Result<(), StateFoldError> {
+    let seq = record.seq;
+    match &record.change {
+        StateChange::Plugin {
+            value: Some(value), ..
+        } => validate_plugin_value(value, seq),
+        StateChange::Turn { turn, result }
+            if result.outcome.turn_id != *turn || record.agent != Some(result.outcome.agent_id) =>
+        {
+            Err(StateFoldError::TurnIdentityMismatch { seq })
+        }
+        StateChange::Delivery {
+            id,
+            op: StoredDeliveryOp::Queued(delivery),
+        } if (
+            delivery.result.outcome.agent_id,
+            delivery.result.outcome.turn_id,
+        ) != *id =>
+        {
+            Err(StateFoldError::DeliveryIdentityMismatch { seq })
+        }
+        StateChange::Preamble { .. } if record.agent.is_none() => {
+            Err(StateFoldError::MissingPreambleAgent { seq })
+        }
+        StateChange::Compaction { .. } if record.agent.is_none() => {
+            Err(StateFoldError::MissingCompactionAgent { seq })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_sequence(
+    stream: &'static str,
+    seqs: impl Iterator<Item = u64>,
+) -> Result<(), StateFoldError> {
+    let mut previous = None;
+    for seq in seqs {
+        if let Some(previous) = previous
+            && seq <= previous
+        {
+            return Err(StateFoldError::UnorderedSequence {
+                stream,
+                previous,
+                seq,
+            });
+        }
+        previous = Some(seq);
+    }
+    Ok(())
+}
+
+pub fn validate_plugin_value(value: &Value, seq: u64) -> Result<(), StateFoldError> {
+    let mut pending = vec![(value, 0)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_PLUGIN_VALUE_DEPTH {
+            return Err(StateFoldError::PluginDepth { seq });
+        }
+        match value {
+            Value::Array(values) => pending.extend(values.iter().map(|value| (value, depth + 1))),
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, depth + 1)))
+            }
+            _ => {}
+        }
+    }
+    if serde_json::to_vec(value).map_or(true, |encoded| encoded.len() > MAX_PLUGIN_VALUE_BYTES) {
+        return Err(StateFoldError::PluginSize { seq });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, MAX_STORED_TURN_RESULTS, SessionStateView,
+        StateChange, StateFoldError, StoredAgentConfig, StoredAgentRecord, StoredDelivery,
+        StoredDeliveryOp, StoredStateRecord, StoredTurnResult,
+    };
+    use crate::id::{AgentId, MakimaId, TurnId};
+    use serde_json::{Value, json};
+
+    use test_case::test_case;
+
+    const SLOT: &str = "test.slot";
+    fn config() -> Value {
+        json!({"cwd":"/saved", "model":"test/model", "thinking":{"kind":"off"},
+            "fast":true, "workflow":false, "options":{"key":"value"},
+            "mode":{"id":"custom", "label":"Custom", "system_prompt":"saved prompt",
+                "restrict_write_to":"plan.md", "tools":[]}})
+    }
+    fn agent(id: AgentId, seq: u64) -> StoredAgentRecord {
+        serde_json::from_value(json!({
+            "id":id, "parent":null, "depth":0, "transcript_key":"root", "lifecycle":"open",
+            "ancestry_unknown":false, "label":"Root", "spawned_by_tool_use_id":null,
+            "restorable":{"Ok":null}, "usage":{}, "created_seq":seq, "updated_seq":seq,
+            "legacy":false, "spec":{"model":{}, "system":"prompt", "tools":[{"name":"read"}],
+                "audience":"general", "mcp":true, "output_schema":{"type":"string"},
+                "name":"worker", "silent":false, "auto_deliver":true, "inherit_provider":false,
+                "mode_ceiling":{"restrict_write_to":null,"tools":[]}, "plugin":"test"}
+        }))
+        .unwrap()
+    }
+    fn result(agent: AgentId, turn: TurnId) -> Value {
+        json!({"outcome":{"agent_id":agent, "turn_id":turn, "usage":{"input":12,"output":3,"cache_creation":0,"cache_read":0},
+                "num_turns":1, "cost":0.01, "list_cost":0.02, "context_size":20,
+                "context_window":100, "status":"completed", "reason":"end_turn"},
+            "text":{"storage":"inline","value":"done"},
+            "output":{"storage":"inline","value":[{"ok":true}]},
+            "provenance":{"origin":"plugin", "plugin":"test", "plugin_generation":2,
+                "source_agent":agent, "source_turn":turn}, "duration_ms":7})
+    }
+    fn state(seq: u64, agent: Option<AgentId>, change: Value) -> StoredStateRecord {
+        let record =
+            serde_json::from_value(json!({"seq":seq,"agent":agent,"generation":1,"change":change}))
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<StoredStateRecord>(&serde_json::to_vec(&record).unwrap())
+                .unwrap(),
+            record
+        );
+        record
+    }
+    fn fold(state: &[StoredStateRecord]) -> SessionStateView {
+        SessionStateView::fold(state, &[]).unwrap()
+    }
+
+    #[test_case(false; "consumed")]
+    #[test_case(true; "terminal")]
+    fn admitted_input_survives_roundtrip_until_consumed_or_terminal(terminal: bool) {
+        let agent = AgentId::generate();
+        let turn = TurnId::generate();
+        let input = json!({"message":"queued input", "images":[], "preamble":[{"saved":"preamble"}],
+            "prompt":{"qualified_name":"server.prompt", "arguments":{"key":"value"}}});
+        let mut records = vec![
+            state(
+                1,
+                Some(agent),
+                json!({"kind":"admitted", "turn":turn, "origin":"user"}),
+            ),
+            state(
+                2,
+                Some(agent),
+                json!({"kind":"turn_input", "turn":turn, "input":input}),
+            ),
+        ];
+        assert_eq!(
+            fold(&records).scopes[&Some(agent)].turn_inputs[&turn],
+            input
+        );
+        records.push(state(
+            3,
+            Some(agent),
+            if terminal {
+                json!({"kind":"turn", "turn":turn, "result":result(agent, turn)})
+            } else {
+                json!({"kind":"turn_input", "turn":turn, "input":null})
+            },
+        ));
+        let restored = fold(&records);
+        let scope = &restored.scopes[&Some(agent)];
+        assert!(scope.turn_inputs.is_empty());
+        assert_eq!(scope.admitted.contains_key(&turn), !terminal);
+    }
+
+    #[test_case(false ; "released")]
+    #[test_case(true ; "held_until_user_turn")]
+    fn delivery_hold_survives_serde_and_fold(held: bool) {
+        let agent = AgentId::generate();
+        let turn = TurnId::generate();
+        let mut delivery: StoredDelivery =
+            serde_json::from_value(json!({"label":null,"result":result(agent, turn)})).unwrap();
+        assert!(!delivery.held);
+        delivery.held = held;
+        let record = state(
+            1,
+            Some(agent),
+            json!({"kind":"delivery", "id":[agent, turn],
+            "op":{"op":"queued", "delivery":delivery}}),
+        );
+        let view = fold(&[record]);
+        let StoredDeliveryOp::Queued(restored) =
+            &view.scopes[&Some(agent)].deliveries[&(agent, turn)]
+        else {
+            panic!("queued delivery missing")
+        };
+        assert_eq!(restored.held, held);
+    }
+
+    #[test_case("consumed" ; "consumed")]
+    #[test_case("withdrawn" ; "withdrawn")]
+    #[test_case("dropped" ; "dropped")]
+    fn compaction_preserves_other_scopes_and_tombstones(terminal: &str) {
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        let turn = TurnId::generate();
+        let queued = json!({"kind":"delivery","id":[child,turn],"op":{"op":"queued","delivery":{"label":null,"result":result(child,turn)}}});
+        let records = [
+            (
+                None,
+                json!({"kind":"rules","rules":[{"tool":"write","effect":"deny"}],"yolo":false}),
+            ),
+            (
+                Some(child),
+                json!({"kind":"context","source":"instructions","hash":"old","content":"old"}),
+            ),
+            (Some(root), queued.clone()),
+            (
+                Some(root),
+                json!({"kind":"delivery","id":[child,turn],"op":{"op":terminal}}),
+            ),
+            (Some(root), json!({"kind":"compaction","epoch":2})),
+            (Some(root), queued),
+            (
+                Some(child),
+                json!({"kind":"context","source":"instructions","hash":"new","content":"new"}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (agent, change))| state(index as u64 + 1, agent, change))
+        .collect::<Vec<_>>();
+        let view = fold(&records);
+        assert_eq!(view.scopes[&None].rules.len(), 1);
+        assert_eq!(view.scopes[&None].yolo, Some(false));
+        assert_eq!(
+            view.scopes[&Some(child)].context["instructions"].hash,
+            "new"
+        );
+        assert_eq!(
+            serde_json::to_value(&view.scopes[&Some(root)].deliveries[&(child, turn)]).unwrap(),
+            json!({"op":terminal})
+        );
+        assert_eq!(view.compactions[&root], (5, 2));
+    }
+
+    #[test_case(None ; "deletion")]
+    #[test_case(Some(Value::Null) ; "explicit_null")]
+    #[test_case(Some(json!({"items":[1,true]})) ; "object")]
+    fn plugin_null_deletion_and_scope(value: Option<Value>) {
+        let root = AgentId::generate();
+        let mut last = json!({"kind":"plugin","key":SLOT,"version":2});
+        if let Some(value) = &value {
+            last["value"] = value.clone();
+        }
+        let records = [
+            state(
+                1,
+                None,
+                json!({"kind":"plugin","key":SLOT,"version":1,"value":"session"}),
+            ),
+            state(
+                2,
+                Some(root),
+                json!({"kind":"plugin","key":SLOT,"version":1,"value":"old"}),
+            ),
+            state(3, Some(root), last),
+        ];
+        let view = fold(&records);
+        assert_eq!(
+            view.scopes[&None].plugins[SLOT].value,
+            Some(json!("session"))
+        );
+        let stored = &view.scopes[&Some(root)].plugins[SLOT];
+        assert_eq!(stored.value, value);
+        assert_eq!((stored.revision, stored.version), (3, 2));
+    }
+
+    #[test]
+    fn turn_results_evict_by_commit_order_per_agent() {
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        let child_turn = TurnId::generate();
+        let mut records = vec![state(
+            0,
+            Some(child),
+            json!({"kind":"turn","turn":child_turn,"result":result(child,child_turn)}),
+        )];
+        let turns: Vec<_> = (0..=MAX_STORED_TURN_RESULTS)
+            .map(|_| TurnId::generate())
+            .collect();
+        for (index, turn) in turns.iter().enumerate() {
+            records.push(state(
+                index as u64 + 1,
+                Some(root),
+                json!({"kind":"turn","turn":turn,"result":result(root,*turn)}),
+            ));
+        }
+        let view = fold(&records);
+        let results = &view.scopes[&Some(root)].results;
+        assert_eq!(results.len(), MAX_STORED_TURN_RESULTS);
+        assert_eq!(results.front().unwrap().0, turns[1]);
+        assert_eq!(
+            view.scopes[&Some(child)].results.front().unwrap().0,
+            child_turn
+        );
+    }
+
+    #[test_case(vec![2, 1] ; "decreasing")]
+    #[test_case(vec![1, 1] ; "duplicate")]
+    fn invalid_sequence_order_rejected(seqs: Vec<u64>) {
+        let root = AgentId::generate();
+        let records: Vec<_> = seqs
+            .iter()
+            .map(|seq| state(*seq, Some(root), json!({"kind":"compaction","epoch":2})))
+            .collect();
+        let revisions: Vec<_> = seqs.iter().map(|seq| (*seq, agent(root, *seq))).collect();
+        for (stream, folded) in [
+            ("state", SessionStateView::fold(&records, &[])),
+            ("agent", SessionStateView::fold(&[], &revisions)),
+        ] {
+            let expected = StateFoldError::UnorderedSequence {
+                stream,
+                previous: seqs[0],
+                seq: seqs[1],
+            };
+            assert_eq!(folded, Err(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_records_return_typed_errors() {
+        let root = AgentId::generate();
+        let child = AgentId::generate();
+        let turn = TurnId::generate();
+        let cases = [
+            (
+                None,
+                json!({"kind":"compaction","epoch":2}),
+                StateFoldError::MissingCompactionAgent { seq: 1 },
+            ),
+            (
+                Some(root),
+                json!({"kind":"turn","turn":turn,"result":result(child,turn)}),
+                StateFoldError::TurnIdentityMismatch { seq: 1 },
+            ),
+            (
+                Some(root),
+                json!({"kind":"delivery","id":[child,turn],"op":{"op":"queued","delivery":{"label":null,"result":result(root,turn)}}}),
+                StateFoldError::DeliveryIdentityMismatch { seq: 1 },
+            ),
+        ];
+        for (agent, change, error) in cases {
+            let record = state(1, agent, change);
+            assert_eq!(super::validate_record(&record), Err(error.clone()));
+            assert_eq!(SessionStateView::fold(&[record], &[]), Err(error));
+        }
+        let records = [state(1, Some(root), json!({"kind":"compaction","epoch":2}))];
+        assert_eq!(
+            SessionStateView::fold(&records, &[(1, agent(root, 1))]),
+            Err(StateFoldError::DuplicateSequence { seq: 1 })
+        );
+        let mut revision = agent(root, 2);
+        revision.updated_seq = 1;
+        for seq in [1, 2] {
+            let expected = StateFoldError::InvalidAgentRevision { seq };
+            assert_eq!(
+                SessionStateView::fold(&[], &[(seq, revision.clone())]),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test_case(MAX_PLUGIN_VALUE_DEPTH, true, true ; "depth_limit")]
+    #[test_case(MAX_PLUGIN_VALUE_DEPTH + 1, true, false ; "depth_over_limit")]
+    #[test_case(MAX_PLUGIN_VALUE_BYTES - 2, false, true ; "encoded_byte_limit")]
+    #[test_case(MAX_PLUGIN_VALUE_BYTES - 1, false, false ; "encoded_byte_over_limit")]
+    fn plugin_limits(size: usize, depth: bool, accepted: bool) {
+        let mut value = if depth {
+            Value::Null
+        } else {
+            json!("x".repeat(size))
+        };
+        if depth {
+            for _ in 0..size {
+                value = Value::Array(vec![value]);
+            }
+        }
+        let record = StoredStateRecord {
+            seq: 1,
+            agent: None,
+            generation: 1,
+            change: StateChange::Plugin {
+                key: SLOT.into(),
+                version: 1,
+                value: Some(value),
+            },
+        };
+        let validation = super::validate_record(&record);
+        let folded = SessionStateView::fold(&[record], &[]);
+        if accepted {
+            assert!(validation.is_ok());
+            assert!(folded.is_ok());
+        } else {
+            let expected = if depth {
+                StateFoldError::PluginDepth { seq: 1 }
+            } else {
+                StateFoldError::PluginSize { seq: 1 }
+            };
+            assert_eq!(validation, Err(expected.clone()));
+            assert_eq!(folded, Err(expected));
+        }
+    }
+
+    #[test_case(None ; "unrestricted")]
+    #[test_case(Some(vec![]) ; "no_tools")]
+    #[test_case(Some(vec!["read".into()]) ; "selected_tools")]
+    fn required_mode_snapshot_preserves_optional_tools(tools: Option<Vec<String>>) {
+        let mut encoded = config();
+        encoded["mode"]["tools"] = json!(tools);
+        let config: StoredAgentConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(config.mode.tools, tools);
+        assert_eq!(serde_json::to_value(config).unwrap(), encoded);
+        encoded.as_object_mut().unwrap().remove("mode");
+        assert!(serde_json::from_value::<StoredAgentConfig>(encoded).is_err());
+    }
+
+    #[test_case(json!({"status":"completed","reason":"max_turns"}) ; "completed")]
+    #[test_case(json!({"status":"cancelled","reason":"interrupted"}) ; "interrupted")]
+    #[test_case(json!({"status":"failed","failure":{"kind":"provider","diagnostic":"failed","user_message":"failed","retryable":true}}) ; "failed")]
+    fn typed_results_and_offload_round_trip(status: Value) {
+        let root = AgentId::generate();
+        let mut encoded = result(root, TurnId::generate());
+        encoded["outcome"].as_object_mut().unwrap().remove("reason");
+        encoded["outcome"]
+            .as_object_mut()
+            .unwrap()
+            .extend(status.as_object().unwrap().clone());
+        let offload = json!({"storage":"offloaded","value":{"session":MakimaId::generate(),"path":"result.json","bytes":100000}});
+        encoded["text"] = offload.clone();
+        encoded["output"] = offload;
+        let result: StoredTurnResult = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), encoded);
+    }
+}

@@ -8,9 +8,11 @@ use std::{
 
 use makima_agent::{
     ActorBackend, AgentContextSnapshot, AgentInput, AgentManagerHandle, AgentMode, BackendResult,
-    ConfigChange, ConfigPatch, ControlWork, DoneReason, History, PreparedModel, RunSettings,
-    ToolOutput, TurnContext, TurnOutcome, WorkKind,
-    actor::{ActorEvent, DeliveryStatus, EffectiveAgentConfig, graph_quiescence_barrier},
+    ConfigChange, ConfigPatch, ControlWork, DoneReason, PreparedModel, RunSettings, ToolOutput,
+    TurnContext, TurnOutcome, WorkKind,
+    actor::{
+        ActorEvent, ActorHistory, DeliveryStatus, EffectiveAgentConfig, graph_quiescence_barrier,
+    },
     cancel::CancelTrigger,
     tools::{ToolContext, ToolRegistry, TurnToolBindings},
 };
@@ -26,6 +28,7 @@ use makima_providers::{
     provider::{BoxFuture, Provider},
 };
 use makima_storage::id::{MakimaId, SessionRef};
+use makima_storage::paths::canonicalize_clean;
 use serde_json::{Value, json};
 
 mod common;
@@ -34,7 +37,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL: &str = "alignment initial";
 const STEERING: &str = "alignment steering";
 const USER_INTERRUPT_PREFIX: &str = "<user-interrupt>\n";
-const UNKNOWN_TASK_ERR: &str = "unknown task_id";
 const REPLY: &str = "alignment complete";
 const PROVIDER_FAILURE: &str = "alignment provider failure";
 const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
@@ -325,8 +327,11 @@ impl Fixture {
         let (spawned, ready) = flume::unbounded();
         let (release, release_rx) = flume::unbounded();
         let held_context = Arc::new(Mutex::new(None));
-        let root = manager
-            .create_root_with_config(Some(policy(&context)), Vec::new(), None, |_| {
+        let root = smol::block_on(manager.create_root_with_config(
+            Some(policy(&context)),
+            Vec::new(),
+            None,
+            |_| {
                 Ok::<_, String>(Box::new(ManagedDriver {
                     context: context.clone(),
                     registry: Arc::clone(&registry),
@@ -335,8 +340,9 @@ impl Fixture {
                     started: true,
                     held_context: Some(Arc::clone(&held_context)),
                 }) as Box<dyn ActorBackend>)
-            })
-            .unwrap();
+            },
+        ))
+        .unwrap();
         host.event_handle()
             .install_orchestration_services(Arc::new(Targets(Mutex::new(vec![TrustedTarget {
                 target: root.clone(),
@@ -562,8 +568,8 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
     smol::block_on(async {
         let old_dir = tempfile::tempdir().unwrap();
         let new_dir = tempfile::tempdir().unwrap();
-        let old = old_dir.path().canonicalize().unwrap();
-        let new = new_dir.path().canonicalize().unwrap();
+        let old = canonicalize_clean(old_dir.path());
+        let new = canonicalize_clean(new_dir.path());
         let fixture = Fixture::with_context(None, Some(old.as_path()));
         let task = fixture.spawn(INITIAL);
         let first = fixture.request().await;
@@ -625,6 +631,7 @@ fn lua_cwd_admission_order_is_target_local(spawn_child: bool) {
                 cwd.join(MARKER).is_file(),
                 "the tool's process must run in {cwd:?}"
             );
+            std::fs::remove_file(cwd.join(MARKER)).unwrap();
             if spawn_child {
                 assert_eq!(context["child"], REPLY);
             }
@@ -1045,7 +1052,7 @@ struct ManagedDriver {
 impl ActorBackend for ManagedDriver {
     fn run_turn<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         context: TurnContext,
         _: AgentInput,
         _: WorkKind,
@@ -1119,7 +1126,7 @@ impl ActorBackend for ManagedDriver {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1128,7 +1135,7 @@ impl ActorBackend for ManagedDriver {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1238,6 +1245,7 @@ fn automatic_graph_continuations(extra_continuation: bool) {
                     held_context: None,
                 }) as Box<dyn ActorBackend>)
             })
+            .await
             .unwrap();
         let driver = root
             .actor()
@@ -1471,7 +1479,15 @@ fn task_send_after_despawn_rejects() {
             json!({ "task_id": task["task_id"], "message": STEERING }),
         )
         .unwrap_err();
-        assert!(error.contains(UNKNOWN_TASK_ERR));
+        let agent_id = task["task_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            error,
+            makima_agent::ManagerError::NonLiveAgent(agent_id).to_string()
+        );
+        assert_eq!(
+            fixture.manager.node(agent_id).unwrap().graph_lifecycle,
+            makima_agent::GraphLifecycle::Closed
+        );
         assert!(fixture.requests.is_empty());
     });
 }

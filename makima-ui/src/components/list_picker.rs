@@ -1,5 +1,5 @@
 use std::mem;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use makima_match::{
     CompletionMatch, CompletionMatchOptions, CompletionRanking, compare_completion_matches,
@@ -38,17 +38,15 @@ const DEPTH_INDENT_WIDTH: usize = 2;
 const AGE_TITLE_MIN_WIDTH: usize = 4;
 const AGE_ELLIPSIS_MIN_WIDTH: usize = 6;
 
-/// One sampling of both clocks used by a picker draw. Monotonic time measures
-/// task ages; Unix time measures timestamps supplied by Lua.
+/// The wall clock sampled once per picker draw, so every row ages from the
+/// same instant.
 pub struct ClockSample {
-    pub monotonic: Instant,
     pub unix: Duration,
 }
 
 impl ClockSample {
     pub fn now() -> Self {
         Self {
-            monotonic: Instant::now(),
             unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default(),
@@ -1504,7 +1502,6 @@ mod tests {
 
     fn fixed_clock() -> ClockSample {
         ClockSample {
-            monotonic: Instant::now(),
             unix: Duration::ZERO,
         }
     }

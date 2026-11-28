@@ -147,8 +147,7 @@ fn load_probe_host(ctx: &ToolContext) -> (Arc<ToolRegistry>, PluginHost) {
     )
     .unwrap();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root(Vec::new(), None, Box::new(common::IdleRoot))
+    let root = smol::block_on(manager.create_root(Vec::new(), None, Box::new(common::idle_root())))
         .unwrap();
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);

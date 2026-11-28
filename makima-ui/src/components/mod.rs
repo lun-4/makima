@@ -22,7 +22,6 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
-pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod split_layout;
@@ -37,12 +36,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use makima_agent::actor::HistoryBoundary;
 use makima_agent::{
     AgentId, AgentInput, AgentRef, BufferSnapshot, PostLevel, ToolInput, ToolOutput, TurnId,
 };
+use makima_lua::orchestration::PinnedCommandTarget;
 use makima_providers::{ImageSource, ModelTier};
 use ratatui::text::{Line, Span};
+
+use self::input::Submission;
 
 pub(crate) use makima_providers::IMAGE_PLACEHOLDER;
 
@@ -201,24 +202,29 @@ pub enum SessionReplacementKind {
     Reset {
         ended_id: makima_storage::id::MakimaId,
     },
+    Linked,
+    Planning,
     #[cfg(test)]
     Load,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionReplacementRequest {
     pub(crate) session: crate::AppSession,
     pub(crate) kind: SessionReplacementKind,
+    pub(crate) provider: Option<makima_providers::PreparedProvider>,
 }
 
 pub enum Action {
     SendMessage(Box<AgentInput>),
     RunKeybind(u64),
     ManualExit,
+    WakeForInput {
+        target: AgentRef,
+        submission: Submission,
+    },
     ShellCommand {
-        target: Option<AgentId>,
-        cwd: PathBuf,
-        id: String,
+        submission: Submission,
         command: String,
         visible: bool,
     },
@@ -226,21 +232,16 @@ pub enum Action {
         turn_id: Option<TurnId>,
         run_id: u64,
     },
-    CancelSubagent {
-        tool_use_id: String,
-    },
     /// Move the running tool call of this chat to the background.
     MoveToBackground {
         agent: Option<makima_agent::AgentId>,
     },
+    BeginRewind,
+    CommitRewind(usize),
     ReplaceSession(Box<SessionReplacementRequest>),
-    RewindAgent {
-        target: AgentRef,
-        boundary: HistoryBoundary,
-    },
     ChangeModel(String),
     SelectPinnedModel {
-        target: AgentRef,
+        target: Box<PinnedCommandTarget>,
         selection: makima_commands::ModelSelection,
     },
     SelectModel(makima_commands::ModelSelection),
@@ -354,10 +355,9 @@ pub struct DisplayMessage {
     pub annotation: Option<String>,
     pub plan_path: Option<String>,
     pub result_agent: Option<AgentId>,
-    pub result_historical: bool,
     pub result_preview: Option<String>,
     pub result_expanded: bool,
-    pub post_agent: Option<String>,
+    pub post_agent: Option<AgentId>,
     pub timestamp: Option<String>,
     pub turn_usage: Option<String>,
     pub truncated_lines: usize,
@@ -380,7 +380,6 @@ impl DisplayMessage {
             annotation: None,
             plan_path: None,
             result_agent: None,
-            result_historical: false,
             result_preview: None,
             result_expanded: false,
             post_agent: None,
@@ -418,7 +417,6 @@ impl DisplayMessage {
             annotation: None,
             plan_path: Some(plan_path),
             result_agent: None,
-            result_historical: false,
             result_preview: None,
             result_expanded: false,
             post_agent: None,

@@ -2,32 +2,37 @@ use std::sync::Arc;
 
 use makima_agent::actor::{ActorError, ActorLifecycle, ActorStatus, ConfigChange, ConfigPatch};
 use makima_agent::config_change::prepare_selection;
+use makima_agent::manager::RetainedTurn;
 use makima_agent::session_coordinator::SessionCoordinatorHandle;
 use makima_agent::session_options::{
     DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionError,
     THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
 };
 use makima_agent::{
-    AgentInput, AgentRef, CurrentManagedTurn, TranscriptRequest, TurnAdmissionOptions, TurnId,
-    TurnOrigin, TurnProvenance,
+    AgentInput, AgentRef, CurrentManagedTurn, GraphLifecycle, SubmitError, SubmitOptions,
+    SubmitWhen, TranscriptRequest, TurnAdmissionOptions, TurnId, TurnOrigin, TurnProvenance,
 };
 use makima_lua_macro::{lua_class, lua_fn};
-use mlua::{Lua, Table, UserDataMethods, UserDataRef, Value as LuaValue};
+use makima_providers::CompleteModelSelection;
+use makima_storage::checkpoint::CheckpointPublication;
+use mlua::{IntoLuaMulti, Lua, MultiValue, Table, UserDataRef, Value as LuaValue};
 
-use super::authority::{authorize, destination_template, observe, retire_closed};
+use super::authority::{authorize, destination_template, lookup, observe, retire_closed};
 use super::projection::selection_table;
 use super::subscriptions::{
     on_close__doc, on_close__register, on_config_change__doc, on_config_change__register,
     on_idle__doc, on_idle__register, on_turn_end__doc, on_turn_end__register, on_turn_start__doc,
     on_turn_start__register,
 };
-use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn};
+use super::tickets::observe_turn;
+use super::{AgentOwners, LuaAgent, LuaAgentRef, LuaAgentTurn, session_state};
 use crate::agent_errors::{
-    AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, NO_PLUGIN_AUTHORITY,
-    RESTRICTED_MODE_CHANGE, SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
+    AGENT_BUSY, AGENT_CONFIG_UNAVAILABLE, NO_ORCHESTRATION_SERVICES, RESTRICTED_MODE_CHANGE,
+    SESSION_LEVEL_OPTION, STALE_TURN, TYPED_OPTION_SETTER,
 };
 use crate::api::agent::{
-    LuaTaskOwner, SessionProviderPreparer, session_model_preparer, validate_required_output_mode,
+    SessionProviderPreparer, ensure_agent_resident, session_model_preparer,
+    validate_required_output_mode,
 };
 use crate::api::env::host_state_dir;
 use crate::api::session_option::{ensure_validation_not_in_progress, validate_option_value};
@@ -35,7 +40,7 @@ use crate::api::util::convert::json_to_lua;
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::api::util::selection::selection_from_lua;
-use crate::orchestration::{self, plugin_authority};
+use crate::orchestration;
 use crate::runtime::{
     current_managed_turn, current_plugin, register_defer_close, validate_plugin_effect,
 };
@@ -48,29 +53,53 @@ const AFTER_TURN_NEEDS_IDLE: &str = "send: after_turn needs when = \"idle\"";
 const NO_SESSION_OPTIONS: &str = "agent belongs to no session with options";
 const TYPED_OPTIONS: [&str; 3] = [MODEL_OPTION_ID, THINKING_OPTION_ID, FAST_OPTION_ID];
 
-/// Read the stable agent ID.
-/// @return (string?, string?) Agent ID.
+/// Read the durable agent ID, retained across session restart.
+/// @return (string?, string?) Agent ID, distinct from the session ID and turn IDs.
 #[lua_fn(name = "id")]
 fn agent_id(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<String>> {
     Ok((Some(this.identity()), None))
 }
 
+/// Check whether this agent currently has an open resident actor.
+/// @return (boolean?, string?) Liveness without restoring the agent.
+#[lua_fn(name = "is_live")]
+fn agent_is_live(_lua: &Lua, this: &LuaAgent) -> mlua::Result<Pair<bool>> {
+    Ok((Some(this.manager.is_live(this.id)), None))
+}
+
 /// Read lifecycle, active turn, queue size, and cumulative usage.
 /// @param ctx LuaCtx Invocation context.
-/// @return (table?, string?) Fields: id (string), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Authorized held managed handles retain a closed snapshot after graph removal.
+/// @return (table?, string?) Fields: id (string), live (boolean, whether an open resident actor exists), status ("idle", "working", or "closed", the vocabulary `makima.session` uses, which adds "needs_input"), queued (integer), active_turn (string or nil), input_tokens and output_tokens (cumulative integers). Dormant agents report live=false without reactivation. Authorized held managed handles retain a closed snapshot after graph removal.
 #[lua_fn(name = "status")]
 fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
     try_pair!(observe(lua, &ctx, this));
     let table = lua.create_table()?;
     table.set("id", this.identity())?;
-    let snapshot = if let Some(held) = &this.held {
-        try_pair!(
-            try_pair!(held.snapshot())
-                .actor
+    let node = try_pair!(
+        this.manager
+            .reference(this.id)
+            .snapshot()
+            .or_else(|error| { this.held.as_ref().map_or(Err(error), AgentRef::snapshot) })
+    );
+    table.set("live", this.manager.is_live(this.id))?;
+    let Some(snapshot) = node.actor else {
+        let record = try_pair!(
+            this.manager
+                .journal()
+                .agent(this.id)
                 .ok_or("agent snapshot is unavailable")
-        )
-    } else {
-        try_pair!(this.manager.actor(this.id)).snapshot()
+        );
+        let status = match node.graph_lifecycle {
+            GraphLifecycle::Closed | GraphLifecycle::Retired | GraphLifecycle::Removed => {
+                STATUS_CLOSED
+            }
+            _ => STATUS_IDLE,
+        };
+        table.set("status", status)?;
+        table.set("queued", 0)?;
+        table.set("input_tokens", record.usage.total_input())?;
+        table.set("output_tokens", record.usage.output)?;
+        return Ok((Some(table), None));
     };
     let status = match snapshot.lifecycle {
         ActorLifecycle::Closed | ActorLifecycle::Shutdown => STATUS_CLOSED,
@@ -90,17 +119,72 @@ fn agent_status(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::R
 /// The coordinator of the session {agent} works in; a child shares its
 /// root's.
 fn session_coordinator(lua: &Lua, agent: &LuaAgent) -> Result<SessionCoordinatorHandle, String> {
-    let template = destination_template(lua, agent)?;
+    let root_id = agent
+        .manager
+        .node(agent.id)
+        .map_err(|error| error.to_string())?
+        .root_id;
+    let root = lookup(agent.manager.clone(), root_id, lua)?;
+    let template = destination_template(lua, &root)?;
     let session = template.session_id.as_ref().ok_or(NO_SESSION_OPTIONS)?;
     SessionCoordinatorHandle::resolve(session.id()).map_err(|error| error.to_string())
 }
 
-/// Read the committed configuration.
+/// Read the committed configuration without reactivating a dormant agent.
 /// @param ctx LuaCtx Invocation context.
 /// @return (table?, string?) `{ version, model, mode, options }`. version is the committed config generation; model is the normalized selection `{spec, thinking, fast}` (thinking is a setting string or budget integer, disabled options are "off" and false); mode is the registered mode name; options maps every other session option id (workflow, yolo, plugin options such as `bash.auto_mode`) to its value. workflow is the agent's own; yolo and plugin options belong to the session, so a child reads its root's. The committed config is what the next turn admits; `ctx:model()` and `ctx:mode()` describe the turn already running.
 #[lua_fn(name = "config")]
 fn agent_config(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<Table>> {
-    try_pair!(authorize(lua, &ctx, this));
+    try_pair!(observe(lua, &ctx, this));
+    if !this.manager.is_live(this.id) {
+        let snapshot = try_pair!(this.manager.journal().checkpoint_snapshot());
+        let view = try_pair!(snapshot.fold());
+        let scope = try_pair!(
+            view.scopes
+                .get(&Some(this.id))
+                .ok_or(AGENT_CONFIG_UNAVAILABLE)
+        );
+        let stored = try_pair!(scope.config.as_ref().ok_or(AGENT_CONFIG_UNAVAILABLE));
+        let config = lua.create_table()?;
+        config.set("version", scope.generation)?;
+        let selection = CompleteModelSelection {
+            spec: Arc::from(stored.model.as_str()),
+            thinking: stored.thinking.map(Into::into).unwrap_or_default(),
+            fast: stored.fast,
+        };
+        config.set(
+            "model",
+            json_to_lua(
+                lua,
+                &serde_json::to_value(selection).map_err(mlua::Error::external)?,
+            )?,
+        )?;
+        config.set("mode", stored.mode.id.as_str())?;
+        let options = lua.create_table()?;
+        let root = try_pair!(this.manager.node(this.id)).root_id;
+        let session_config = view
+            .scopes
+            .get(&Some(root))
+            .and_then(|scope| scope.config.as_ref())
+            .unwrap_or(stored);
+        if let Ok(coordinator) = session_coordinator(lua, this) {
+            for state in coordinator.read().options().options.iter() {
+                let id = state.definition.id.as_ref();
+                if !TYPED_OPTIONS.contains(&id) {
+                    options.set(id, state.current_value.as_ref())?;
+                }
+            }
+        } else {
+            for (id, value) in &session_config.options {
+                if !TYPED_OPTIONS.contains(&id.as_str()) {
+                    options.set(id.as_str(), value.as_str())?;
+                }
+            }
+        }
+        options.set(WORKFLOW_OPTION_ID, toggle_value(stored.workflow))?;
+        config.set("options", options)?;
+        return Ok((Some(config), None));
+    }
     let actor = try_pair!(this.manager.actor(this.id));
     let commit = try_pair!(actor.config_snapshot().ok_or(AGENT_CONFIG_UNAVAILABLE));
     let options = lua.create_table()?;
@@ -157,6 +241,15 @@ async fn agent_set_option(
         return Ok((Some(true), None));
     }
     let coordinator = try_pair!(session_coordinator(&lua, &this));
+    let publication = CheckpointPublication::default();
+    let claim = try_pair!(ctx.agent_publication_claim(&lua, &target, &publication));
+    let _origin_registrations = if let Ok(trusted) = ctx.trusted(&lua) {
+        let incarnation = try_pair!(trusted.target_incarnation(&trusted.target));
+        let origin = try_pair!(trusted.target.manager().actor_for_incarnation(&incarnation));
+        try_pair!(origin.register_publication(&publication))
+    } else {
+        Vec::new()
+    };
     drop(this);
     drop(ctx);
     let snapshot = coordinator.read().options();
@@ -169,7 +262,7 @@ async fn agent_set_option(
     }
     try_pair!(
         coordinator
-            .set_option_if_version(id, value, Some(snapshot.version))
+            .set_option_if_version_with_claim(id, value, Some(snapshot.version), publication, claim)
             .await
     );
     Ok((Some(true), None))
@@ -230,7 +323,7 @@ fn agent_available_models(
     this: &LuaAgent,
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<Table>> {
-    try_pair!(authorize(lua, &ctx, this));
+    try_pair!(observe(lua, &ctx, this));
     let service =
         try_pair!(orchestration::services(lua).ok_or("host model catalog is unavailable"));
     let target = try_pair!(this.manager.lookup(this.id));
@@ -253,15 +346,17 @@ fn agent_transcript(
     ctx: UserDataRef<LuaCtx>,
     opts: Table,
 ) -> mlua::Result<Pair<Table>> {
-    try_pair!(authorize(lua, &ctx, this));
+    try_pair!(observe(lua, &ctx, this));
     let through_turn = opts.get::<Option<String>>("through_turn")?;
     let through_turn = try_pair!(through_turn.map(|id| id.parse::<TurnId>()).transpose());
-    let actor = try_pair!(this.manager.actor(this.id));
-    let snapshot = try_pair!(actor.transcript(TranscriptRequest {
-        through_turn,
-        last_messages: opts.get::<usize>("last_messages")?,
-        max_bytes: opts.get::<usize>("max_bytes")?,
-    }));
+    let snapshot = try_pair!(this.manager.transcript(
+        this.id,
+        TranscriptRequest {
+            through_turn,
+            last_messages: opts.get::<usize>("last_messages")?,
+            max_bytes: opts.get::<usize>("max_bytes")?,
+        }
+    ));
     let table = lua.create_table()?;
     table.set("agent_id", this.identity())?;
     table.set("messages", json_to_lua(lua, &snapshot.messages)?)?;
@@ -291,15 +386,16 @@ fn admit(
     agent: &LuaAgent,
     ctx: &LuaCtx,
     message: String,
-    options: TurnAdmissionOptions,
-    submit: bool,
+    when: SubmitWhen,
+    admission: TurnAdmissionOptions,
 ) -> Result<LuaAgentTurn, String> {
     authorize(lua, ctx, agent)?;
-    let actor = agent
-        .manager
-        .actor(agent.id)
-        .map_err(|error| error.to_string())?;
-    actor.effective_config().ok_or(AGENT_CONFIG_UNAVAILABLE)?;
+    let target = agent.manager.reference(agent.id);
+    target
+        .actor()
+        .map_err(|error| error.to_string())?
+        .effective_config()
+        .ok_or(AGENT_CONFIG_UNAVAILABLE)?;
     let input = AgentInput {
         message,
         images: Vec::new(),
@@ -324,42 +420,28 @@ fn admit(
             source_turn: current.as_ref().map(CurrentManagedTurn::turn_id),
         }
     };
-    let options = TurnAdmissionOptions {
-        provenance,
-        ..options
+    let options = SubmitOptions {
+        when,
+        admission: TurnAdmissionOptions {
+            provenance,
+            ..admission
+        },
+        ..Default::default()
     };
-    let ticket = if submit {
-        actor.submit(input, None, String::new(), options)
-    } else {
-        actor.admit_turn_with_options(input, None, String::new(), options)
-    }
-    .map_err(|error| match error {
-        ActorError::Busy => AGENT_BUSY.to_owned(),
-        ActorError::StaleTurn => STALE_TURN.to_owned(),
+    let (ticket, _) = target.submit(input, options).map_err(|error| match error {
+        SubmitError::Admission(ActorError::Busy) => AGENT_BUSY.to_owned(),
+        SubmitError::Admission(ActorError::StaleTurn) => STALE_TURN.to_owned(),
         other => other.to_string(),
     })?;
-    Ok(LuaAgentTurn {
-        agent: agent.clone(),
-        ticket,
-    })
-}
-
-/// When a turn a plugin sends starts.
-enum When {
-    /// Only when the agent has no active, preparing or queued work.
-    Idle,
-    /// Join compatible admitted work, or start a turn when there is none.
-    Join,
-    /// A distinct FIFO turn behind already admitted work.
-    Queue,
+    Ok(LuaAgentTurn::new(agent, RetainedTurn::Ticket(ticket)))
 }
 
 /// Reads `send`'s options; a malformed table is a programmer error.
-fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
+fn send_options(opts: &Table) -> mlua::Result<(SubmitWhen, TurnAdmissionOptions)> {
     let when = match opts.get::<Option<String>>("when")?.as_deref() {
-        Some("idle") => When::Idle,
-        Some("join") => When::Join,
-        Some("queue") => When::Queue,
+        Some("idle") => SubmitWhen::Idle,
+        Some("join") => SubmitWhen::Join,
+        Some("queue") => SubmitWhen::Queue,
         _ => return Err(mlua::Error::runtime(SEND_WHEN_REQUIRED)),
     };
     let existing_only = opts.get::<Option<bool>>("existing_only")?;
@@ -367,14 +449,13 @@ fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
         .get::<Option<String>>("after_turn")?
         .map(|id| id.parse::<TurnId>().map_err(mlua::Error::runtime))
         .transpose()?;
-    if existing_only.is_some() && !matches!(when, When::Join) {
+    if existing_only.is_some() && !matches!(when, SubmitWhen::Join) {
         return Err(mlua::Error::runtime(EXISTING_ONLY_NEEDS_JOIN));
     }
-    if after_turn.is_some() && !matches!(when, When::Idle) {
+    if after_turn.is_some() && !matches!(when, SubmitWhen::Idle) {
         return Err(mlua::Error::runtime(AFTER_TURN_NEEDS_IDLE));
     }
     let options = TurnAdmissionOptions {
-        idle_only: matches!(when, When::Idle),
         existing_only: existing_only.unwrap_or_default(),
         after_turn,
         ..Default::default()
@@ -389,28 +470,49 @@ fn send_options(opts: &Table) -> mlua::Result<(When, TurnAdmissionOptions)> {
 /// without interrupting a provider request or tool, or starts a turn when
 /// there is none; `"queue"` queues a distinct turn behind admitted work.
 /// Wait for the result with `AgentTurn:wait`.
+/// A dormant agent is reactivated from its saved configuration and capabilities
+/// before admission. Reactivation can fail with `not_restorable`,
+/// `provider_unavailable`, `model_unavailable`, `tool_unavailable`,
+/// `mcp_unavailable`, or `tool_completion_pending` while earlier writes settle.
+/// A failed reactivation admits no turn.
 /// @param ctx LuaCtx Invocation context.
 /// @param message string User message (text only).
 /// @param opts table Required `when` ("idle", "join" or "queue"). `existing_only` (join only) joins compatible work or returns busy without starting a turn. `after_turn` (idle only) must match the latest terminal turn, including failure or cancellation.
 /// @return (AgentTurn?, string?) Exact-turn ticket, or an admission error. Bounded inbox rejection does not cancel accepted work.
 #[lua_fn(name = "send")]
-fn agent_send(
-    lua: &Lua,
-    this: &LuaAgent,
+async fn agent_send(
+    lua: Lua,
+    this: UserDataRef<LuaAgent>,
     ctx: UserDataRef<LuaCtx>,
     message: String,
     opts: Table,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     let (when, options) = send_options(&opts)?;
-    let turn = try_pair!(admit(
-        lua,
-        this,
-        &ctx,
-        message,
-        options,
-        matches!(when, When::Join),
-    ));
+    try_pair!(authorize(&lua, &ctx, &this));
+    let agent = (*this).clone();
+    drop(this);
+    let context = (*ctx).clone();
+    drop(ctx);
+    try_pair!(ensure_agent_resident(&lua, &context, &agent).await);
+    let turn = try_pair!(admit(&lua, &agent, &context, message, when, options));
     Ok((Some(turn), None))
+}
+
+/// Resolve an exact retained turn without starting or restoring the agent.
+/// @param ctx LuaCtx Invocation context.
+/// @param turn_id string Stable turn ID.
+/// @return (AgentTurn?, string?) Exact-turn ticket or a retention error.
+#[lua_fn(name = "turn")]
+fn agent_turn(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    turn_id: String,
+) -> mlua::Result<Pair<LuaAgentTurn>> {
+    try_pair!(observe(lua, &ctx, this));
+    let turn_id = try_pair!(turn_id.parse::<TurnId>());
+    let turn = try_pair!(observe_turn(lua, this, Some(turn_id)));
+    Ok((turn.map(|turn| LuaAgentTurn::new(this, turn)), None))
 }
 
 /// Read the most recently admitted turn, including turns the runtime admitted
@@ -424,14 +526,8 @@ fn agent_latest_turn(
     ctx: UserDataRef<LuaCtx>,
 ) -> mlua::Result<Pair<LuaAgentTurn>> {
     try_pair!(observe(lua, &ctx, this));
-    let actor = try_pair!(this.manager.actor(this.id));
-    Ok((
-        actor.latest_ticket().map(|ticket| LuaAgentTurn {
-            agent: this.clone(),
-            ticket,
-        }),
-        None,
-    ))
+    let turn = try_pair!(observe_turn(lua, this, None));
+    Ok((turn.map(|turn| LuaAgentTurn::new(this, turn)), None))
 }
 
 /// Switch model through a reserved actor configuration operation.
@@ -504,10 +600,7 @@ async fn agent_set_mode(
     {
         return Ok(err_pair(RESTRICTED_MODE_CHANGE));
     }
-    let structured = this
-        .state
-        .as_ref()
-        .is_some_and(|state| state.structured.is_some());
+    let structured = session_state(&lua, this.id).is_some_and(|state| state.structured.is_some());
     let state_dir = try_pair!(host_state_dir(&lua));
     let ticket = try_pair!(orchestration::reserve_config_change(&*services, &target));
     let commit = ticket
@@ -561,8 +654,33 @@ fn agent_cancel_subtree(
 #[lua_fn(name = "close")]
 fn agent_close(lua: &Lua, this: &LuaAgent, ctx: UserDataRef<LuaCtx>) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(lua, &ctx, this));
-    try_pair!(this.manager.close_subtree(this.id));
+    if let Ok(trusted) = ctx.trusted(lua) {
+        let incarnation = try_pair!(trusted.target_incarnation(&this.manager.reference(this.id)));
+        try_pair!(this.manager.close_incarnation(&incarnation));
+    } else {
+        try_pair!(this.manager.close_subtree(this.id));
+    }
     retire_closed(lua);
+    Ok((Some(true), None))
+}
+
+/// Retire a quiescent leaf, preserving its retained results and transcript.
+/// @param ctx LuaCtx Invocation context.
+/// @return (boolean?, string?) Success or a retirement error.
+#[lua_fn(name = "retire")]
+async fn agent_retire(
+    lua: Lua,
+    this: UserDataRef<LuaAgent>,
+    ctx: UserDataRef<LuaCtx>,
+) -> mlua::Result<Pair<bool>> {
+    let active = try_pair!(authorize(&lua, &ctx, &this));
+    let manager = this.manager.clone();
+    let id = this.id;
+    try_pair!(match active {
+        Some(active) => manager.retire(&active, id).await,
+        None => manager.retire_trusted(&manager.reference(id)).await,
+    });
+    retire_closed(&lua);
     Ok((Some(true), None))
 }
 
@@ -577,14 +695,16 @@ fn agent_defer_close(
 ) -> mlua::Result<Pair<bool>> {
     try_pair!(authorize(lua, &ctx, this));
     let manager = this.manager.clone();
-    let id = this.id;
+    let incarnation = try_pair!(manager.incarnation(this.id));
     let sessions = lua
         .app_data_ref::<AgentOwners>()
         .map(|sessions| sessions.clone());
     try_pair!(register_defer_close(
         lua,
         Box::new(move || {
-            let _ = manager.close_subtree(id);
+            if manager.close_incarnation(&incarnation).is_err() {
+                return;
+            }
             if let Some(sessions) = sessions {
                 sessions.retire_settled();
             }
@@ -593,36 +713,36 @@ fn agent_defer_close(
     Ok((Some(true), None))
 }
 
-// Bundled task plugin internals, not public API. `_makima_session_id` reads the
-// task/UI identity. `_makima_task_owner` returns a host-stamped guard whose
-// `_makima_can_control` checks plugin generation, host and parent branch, and whose
-// `_makima_retired` reports a closed child. The guard authorizes no effect.
-fn agent_internal_methods<M: UserDataMethods<LuaAgent>>(methods: &mut M) {
-    methods.add_method(
-        "_makima_task_owner",
-        |lua, this, ctx: UserDataRef<LuaCtx>| {
-            authorize(lua, &ctx, this).map_err(mlua::Error::runtime)?;
-            let (plugin, generation) =
-                current_plugin(lua).ok_or_else(|| mlua::Error::runtime(NO_PLUGIN_AUTHORITY))?;
-            Ok(LuaTaskOwner {
-                owner_id: this.state.as_ref().and_then(|state| state.parent_agent_id),
-                owner: plugin_authority(lua, plugin.clone()),
-                plugin,
-                generation,
-                target: this
-                    .manager
-                    .lookup(this.id)
-                    .map_err(mlua::Error::external)?,
-            })
-        },
-    );
-    methods.add_method("_makima_session_id", |_, this, ()| {
-        Ok(this
-            .state
-            .as_ref()
-            .map(|state| state.ui_id.clone())
-            .unwrap_or_else(|| this.identity()))
-    });
+/// Read a registered agent-scoped slot without reactivating this agent.
+/// Uses the same topology authorization as makima.agent.get. Values are copied.
+/// Older values return a migrated copy without journaling; slot:get journals owner migrations.
+/// Unknown keys return state_slot_unavailable; session-scoped slots are rejected.
+/// @param ctx LuaCtx Invocation context.
+/// @param key string Plugin-qualified slot key, <plugin>/<name>.
+/// @return (any?, integer|string) Value and stored revision, including nil for an absent value, or nil and error.
+#[lua_fn(name = "state")]
+fn agent_state(
+    lua: &Lua,
+    this: &LuaAgent,
+    ctx: UserDataRef<LuaCtx>,
+    key: String,
+) -> mlua::Result<MultiValue> {
+    let context = (*ctx).clone();
+    drop(ctx);
+    let result: Result<_, String> = (|| {
+        observe(lua, &context, this)?;
+        let access = context.state_access(lua)?;
+        Ok(if access.target() == this.id {
+            access
+        } else {
+            this.manager.reference(this.id).state_access()
+        }
+        .read_only())
+    })();
+    match result {
+        Ok(access) => crate::api::state::retained(lua, &context, access, &key),
+        Err(error) => err_pair::<LuaValue>(error).into_lua_multi(lua),
+    }
 }
 
 lua_class! {
@@ -630,10 +750,9 @@ lua_class! {
     /// Reads and effects require current invocation authority; identity is context-free.
     /// A held managed handle retains authorized closed-status reads, not mutation rights.
     "makima.agent.Agent" => LuaAgent, AGENT_DOCS [
-        agent_id, agent_latest_turn, agent_status, agent_config, agent_available_models,
-        agent_transcript, agent_ref, agent_send, agent_set_model,
-        agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_defer_close,
+        agent_id, agent_is_live, agent_turn, agent_latest_turn, agent_status, agent_config, agent_available_models,
+        agent_transcript, agent_state, agent_ref, agent_send, agent_set_model,
+        agent_set_mode, agent_set_option, agent_cancel, agent_cancel_subtree, agent_close, agent_retire, agent_defer_close,
         on_turn_start, on_turn_end, on_idle, on_config_change, on_close,
     ]
-    extra agent_internal_methods
 }

@@ -3,13 +3,14 @@ use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use makima_agent::shell::{ResolvedShell, command};
 #[cfg(test)]
 use makima_config::Shell;
+use makima_domain::LockExt;
 use makima_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 
@@ -54,7 +55,7 @@ pub(crate) struct JobStore {
 /// Receivers whose `jobwait` future died. A `Drop` can run inside a Luau GC
 /// sweep, where any call into the VM aborts, so the receiver parks here and
 /// the next safe point gives it back to the store.
-type ReleasedReceivers = Arc<std::sync::Mutex<Vec<(u32, flume::Receiver<JobEvent>)>>>;
+type ReleasedReceivers = Arc<Mutex<Vec<(u32, flume::Receiver<JobEvent>)>>>;
 
 pub(crate) struct CheckedOutReceiver {
     job_id: u32,
@@ -260,12 +261,7 @@ impl JobStore {
     }
 
     pub(crate) fn reclaim_released(&mut self) {
-        let released = std::mem::take(
-            &mut *self
-                .released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
+        let released = std::mem::take(&mut *self.released.lock_unpoisoned());
         for (job_id, receiver) in released {
             self.restore_receiver(job_id, receiver);
         }
@@ -387,8 +383,7 @@ impl Drop for CheckedOutReceiver {
     fn drop(&mut self) {
         if let Some(receiver) = self.receiver.take() {
             self.released
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .push((self.job_id, receiver));
         }
     }

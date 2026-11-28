@@ -12,6 +12,9 @@
 mod in_memory;
 mod real;
 
+#[cfg(test)]
+pub(crate) use real::mutate as mutate_for_test;
+
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -22,6 +25,7 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use crate::api::util::convert::{bytes_arg, opt_bool};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
+use crate::runtime::validate_fs_mutation;
 
 #[cfg(feature = "test-support")]
 pub use in_memory::{InMemoryFs, InMemoryOffloadBackend};
@@ -461,6 +465,7 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 async fn write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.write")?;
     let abs = make_absolute(&path)?;
+    try_pair!(validate_fs_mutation(&lua));
     let result = backend(&lua).write(abs, content).await;
     Ok(pair(result.map(|()| true)))
 }
@@ -479,6 +484,7 @@ async fn write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> 
 async fn atomic_write(lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
     let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = make_absolute(&path)?;
+    try_pair!(validate_fs_mutation(&lua));
     let result = backend(&lua).atomic_write(abs, content).await;
     Ok(pair(result.map(|()| true)))
 }
@@ -507,6 +513,7 @@ async fn rm(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool>
         .and_then(|t| opt_bool(t, "force"))
         .unwrap_or(false);
     let fs = backend(&lua);
+    try_pair!(validate_fs_mutation(&lua));
     let result = fs.rm(abs, recursive, force).await;
     Ok(pair(result.map(|()| true)))
 }
@@ -527,6 +534,7 @@ async fn mkdir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bo
         .and_then(|t| opt_bool(t, "parents"))
         .unwrap_or(false);
     let fs = backend(&lua);
+    try_pair!(validate_fs_mutation(&lua));
     let result = fs.mkdir(abs, parents).await;
     Ok(pair(result.map(|()| true)))
 }

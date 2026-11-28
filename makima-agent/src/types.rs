@@ -1,7 +1,9 @@
+use makima_domain::LockExt;
 use std::any::Any;
-use std::fmt::{self, Write};
+#[cfg(test)]
+use std::fmt;
+use std::fmt::Write;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -12,9 +14,11 @@ use makima_providers::{
     AgentError, ContentBlock, ImageSource, Message, RetryKind, Role, StopReason, TokenUsage,
     add_cost,
 };
-use makima_storage::id::{MakimaId, MakimaIdParseError};
+pub use makima_storage::id::{AgentId, TurnId};
 use serde::{Deserialize, Serialize};
 use strum::Display;
+
+use crate::session::AnswerKey;
 
 pub const NO_FILES_FOUND: &str = "No files found";
 const CHECKPOINT_FAILED_PREFIX: &str = "failed to checkpoint completed turn";
@@ -490,78 +494,6 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     }
 }
 
-macro_rules! lifecycle_id {
-    ($name:ident, $doc:literal) => {
-        #[doc = $doc]
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(MakimaId);
-
-        impl $name {
-            pub fn generate() -> Self {
-                Self(MakimaId::generate())
-            }
-
-            pub fn as_makima_id(self) -> MakimaId {
-                self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = MakimaIdParseError;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                value.parse().map(Self)
-            }
-        }
-    };
-}
-
-lifecycle_id!(AgentId, "Stable identity of one runtime agent instance.");
-/// Stable identity of one accepted agent turn.
-///
-/// Agent and turn identities are nominal and cannot be interchanged:
-///
-/// ```compile_fail
-/// use makima_agent::{AgentId, TurnId};
-///
-/// fn accepts_turn(_: TurnId) {}
-/// accepts_turn(AgentId::generate());
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TurnId(MakimaId);
-
-impl TurnId {
-    pub fn generate() -> Self {
-        Self(MakimaId::generate())
-    }
-
-    pub fn as_makima_id(self) -> MakimaId {
-        self.0
-    }
-}
-
-impl fmt::Display for TurnId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromStr for TurnId {
-    type Err = MakimaIdParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse().map(Self)
-    }
-}
-
 /// Why a successfully completed run ended. The provider's `StopReason`
 /// describes one model turn, while this describes the whole agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
@@ -765,9 +697,11 @@ impl TurnOutcome {
         }
     }
 
-    /// The turn's outcome once its history could not be checkpointed: a
-    /// failure that keeps what the turn used and cost.
+    /// Converts an unsuccessful durability receipt into a failure without replacing cancellation.
     pub fn checkpoint_failed(&self, error: String) -> Self {
+        if matches!(self, Self::Cancelled { .. }) {
+            return self.clone();
+        }
         Self::Failed {
             agent_id: self.agent_id(),
             turn_id: self.turn_id(),
@@ -851,7 +785,7 @@ impl TurnOutcome {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     TextDelta {
@@ -941,6 +875,7 @@ pub enum AgentEvent {
     },
     PermissionRequest {
         id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
     },
@@ -948,9 +883,12 @@ pub enum AgentEvent {
     /// host (e.g. an ACP elicitation form) instead of the makima TUI.
     Question {
         id: String,
+        ask: AnswerKey,
         questions: serde_json::Value,
     },
-    AuthRequired,
+    AuthRequired {
+        ask: AnswerKey,
+    },
     Nudge,
     SubagentHistory {
         tool_use_id: String,
@@ -1015,15 +953,15 @@ impl SharedBuf {
     }
 
     pub fn set_click(&self, f: Arc<dyn Any + Send + Sync>) {
-        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+        *self.click.lock_unpoisoned() = Some(f);
     }
 
     pub fn click(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.click.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.click.lock_unpoisoned().clone()
     }
 
     pub fn clear_click(&self) {
-        *self.click.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.click.lock_unpoisoned() = None;
     }
 
     /// Fires synchronously after every `append`/`set_lines`, on the
@@ -1031,24 +969,20 @@ impl SharedBuf {
     /// notifications are silently dropped. One slot only: a second call
     /// replaces the previous watcher.
     pub fn set_on_change(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+        *self.on_change.lock_unpoisoned() = Some(Arc::new(f));
     }
 
     /// A watcher keeps everything it captured alive for as long as it is
     /// installed, so owners must clear it once the watching task retires.
     pub fn clear_on_change(&self) {
-        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.on_change.lock_unpoisoned() = None;
     }
 
     fn notify_change(&self) {
         if self.notifying.swap(true, Ordering::AcqRel) {
             return;
         }
-        let cb = self
-            .on_change
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cb = self.on_change.lock_unpoisoned().clone();
         if let Some(cb) = cb {
             cb();
         }
@@ -1056,7 +990,7 @@ impl SharedBuf {
     }
 
     pub fn append(&self, line: SnapshotLine) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.committed.lock_unpoisoned();
         Arc::make_mut(&mut guard).push(line);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
@@ -1064,7 +998,7 @@ impl SharedBuf {
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.committed.lock_unpoisoned();
         *guard = Arc::new(lines);
         drop(guard);
         self.dirty.store(true, Ordering::Release);
@@ -1072,10 +1006,7 @@ impl SharedBuf {
     }
 
     pub fn len(&self) -> usize {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.committed.lock_unpoisoned().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1083,7 +1014,7 @@ impl SharedBuf {
     }
 
     pub fn read(&self) -> Arc<Vec<SnapshotLine>> {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         Arc::clone(&guard)
     }
 
@@ -1091,7 +1022,7 @@ impl SharedBuf {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return None;
         }
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         Some(Arc::clone(&guard))
     }
 
@@ -1100,7 +1031,7 @@ impl SharedBuf {
     /// events are stale), which would strand the last repaint a tool made
     /// on its way out. Re-reading the same lines once costs nothing.
     pub fn take(&self) -> BufferSnapshot {
-        let guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.committed.lock_unpoisoned();
         BufferSnapshot::from_arc(Arc::clone(&guard))
     }
 }
@@ -1202,7 +1133,7 @@ pub struct InlineStyle {
     pub reversed: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TurnCompleteEvent {
     pub message: Message,
     pub usage: TokenUsage,
@@ -1249,7 +1180,7 @@ impl RunLedger {
     /// A poisoned lock only means another run panicked mid-update. The totals
     /// are still sound, and dropping a session's accounting over it is worse.
     fn locked(&self) -> MutexGuard<'_, RunTotals> {
-        self.totals.lock().unwrap_or_else(|e| e.into_inner())
+        self.totals.lock_unpoisoned()
     }
 }
 
@@ -1290,8 +1221,6 @@ pub struct SubagentInfo {
     /// the parent's settings.
     #[serde(skip)]
     pub opts: Option<makima_providers::RequestOptions>,
-    #[serde(skip)]
-    pub answer_tx: Option<flume::Sender<String>>,
     /// Cancel currently executing and queued work without closing the session.
     #[serde(skip)]
     pub cancel: Option<SubagentCancel>,
@@ -1471,7 +1400,7 @@ impl EventSender {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Envelope {
     #[serde(flatten)]
     pub event: AgentEvent,
@@ -1574,7 +1503,22 @@ impl SessionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use makima_storage::id::MakimaIdParseError;
+    use std::str::FromStr;
     use test_case::test_case;
+
+    #[test]
+    fn checkpoint_failure_preserves_cancelled_turn() {
+        const FAILURE: &str = "session ownership lost";
+        let outcome = TurnOutcome::cancelled(
+            AgentId::generate(),
+            TurnId::generate(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        );
+        assert_eq!(outcome.checkpoint_failed(FAILURE.into()), outcome);
+    }
 
     #[test_case(false; "send")]
     #[test_case(true; "try_send")]

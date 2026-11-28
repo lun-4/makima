@@ -27,7 +27,7 @@ pub struct Post {
     pub text: String,
     #[serde(default, skip_serializing_if = "is_info")]
     pub level: PostLevel,
-    /// Transcript id of the child agent the post is about.
+    /// Durable id of the agent the post is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }

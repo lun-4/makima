@@ -3,6 +3,7 @@
 //! `notify` (a one-line notice whose default any plugin can swap via
 //! `makima.set_notify_handler`).
 
+use makima_domain::LockExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -228,7 +229,7 @@ pub(crate) fn install_notify_handler(lua: &Lua, plugin: Arc<str>, handler: Value
 }
 
 fn locked(slot: &NotifyHandler) -> std::sync::MutexGuard<'_, Option<(Arc<str>, RegistryKey)>> {
-    slot.0.lock().unwrap_or_else(|e| e.into_inner())
+    slot.0.lock_unpoisoned()
 }
 
 /// Hand the slot back when {plugin} is unloaded. Its handler closes over an

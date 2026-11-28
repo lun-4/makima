@@ -17,19 +17,16 @@ use std::time::{Duration, Instant};
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use makima_agent::agent::isolated_turn::collect_answer;
 use makima_agent::cancel::CancelToken;
-use makima_agent::command::{
-    self, SessionCommandHost, StandardCommands, StandardCompletions, session_capabilities,
-};
-use makima_agent::headless::{self, InteractiveHandle, InteractiveParams, ProviderPreparation};
+use makima_agent::command::{self, StandardCommands, StandardCompletions, session_capabilities};
+use makima_agent::headless::{self, FrontendProfile, InteractiveParams, ProviderPreparation};
 use makima_agent::permissions::PluginRuleStore;
-use makima_agent::session_coordinator::{
-    SessionCoordinatorHandle, SessionCoordinatorParams, SessionOptionCatalog,
-    builtin_option_definitions,
-};
+use makima_agent::session::{Durability, OpenRequest, SessionEvent, SessionHandle, open};
+use makima_agent::session_coordinator::SessionOptionCatalog;
 use makima_agent::session_defaults;
+use makima_agent::tools::QUESTION_TOOL_NAME;
 use makima_agent::tools::offload::OffloadCleanup;
-use makima_agent::tools::{QUESTION_TOOL_NAME, QuestionMode};
 use makima_agent::{
     AgentConfig, AgentEvent, AgentInput, DoneReason, Envelope, ImageSource, PermissionsConfig,
     TurnOutcome,
@@ -40,13 +37,12 @@ use makima_commands::{
 use makima_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use makima_lua::EventHandle;
 use makima_lua::orchestration::{
-    self, ACTIVE_DISCOVERY_BOUND, Discovery, ModelCatalog, TrustedTarget,
+    self, ACTIVE_DISCOVERY_BOUND, Discovery, HeadlessServices, ModelCatalog, PinnedCommandTarget,
+    TrustedTarget,
 };
-use makima_lua::session_snapshot::HeadlessObserver;
 use makima_providers::model::Model;
 use makima_providers::{ProviderRegistry, TokenUsage, add_cost};
 use makima_storage::StateDir;
-use makima_storage::checkpoint::ClaimingWriter;
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::sessions::{SessionMeta, read_prefs};
 use serde::Serialize;
@@ -201,13 +197,18 @@ fn dispatch_print(
     registry: &CommandRegistry,
     target: &TargetHandle,
     literal: AgentInput,
+    admission: &PinnedCommandTarget,
 ) -> Result<PrintWork> {
     let content = CommandContent {
         text: Arc::from(literal.message.as_str()),
         attachments: command_attachments::from_images(&literal.images),
     };
     Ok(
-        match smol::block_on(registry.dispatch_input(target, content)) {
+        match smol::block_on(registry.dispatch_input_with_admission(
+            target,
+            content,
+            Arc::new(admission.clone()),
+        )) {
             InputDispatch::Dispatched(CommandOutcome::AgentTurn(turn)) => {
                 PrintWork::Turn(command_attachments::agent_input(turn)?)
             }
@@ -304,11 +305,8 @@ fn run_and_settle<T>(
     }
 }
 
-/// A print run's root: an ordinary managed root whose session coordinator
-/// publishes into a writer that saves nothing.
 struct PrintSession {
-    handle: InteractiveHandle,
-    coordinator: SessionCoordinatorHandle,
+    handle: SessionHandle,
     root: TrustedTarget,
     commands: TargetHandle,
     _discovery: Discovery,
@@ -324,72 +322,43 @@ fn start_print_session(
 ) -> Result<PrintSession> {
     let catalog = ModelCatalog::offline(Arc::clone(&params.providers), &params.model_policy);
     let active_provider = params.model.provider.to_string();
-    let definitions = builtin_option_definitions(
-        Arc::from(params.model.spec()),
-        catalog.snapshot(),
-        params.permissions_config.yolo,
-        params.defaults.fast,
-        params.defaults.workflow,
-        params.defaults.thinking.into(),
-    );
-    let model_policy = Arc::clone(&params.model_policy);
     let providers = Arc::clone(&params.providers);
-    let (binding, root_target) = orchestration::root_binding();
-    let handle = headless::spawn_interactive_with_binding(params, prepare, None, Some(binding));
-    smol::block_on(handle.initialized_root()).map_err(|error| eyre!(error))?;
-    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
-        session_id: handle.session_id.id(),
-        catalog: session_options,
-        definitions,
-        persisted_options: Default::default(),
-        model_policy: Arc::clone(&model_policy),
-        checkpoint: ClaimingWriter::accept_all(),
-        mailbox: handle.mailbox.clone(),
-    })
-    .map_err(|error| eyre!("register print session coordinator: {error}"))?;
-    let root = smol::block_on(orchestration::bind_frontend_root(
-        &handle,
-        &coordinator,
-        &root_target,
-        headless::default_model_preparer(Arc::clone(&providers)),
-    ))
-    .map_err(|error| eyre!("bind print root: {error}"))?;
-    let orchestration = Arc::new(orchestration::frontend_root(
-        &catalog,
-        root.clone(),
-        Arc::new(|_, publication| Ok(orchestration::nonpersistent_config_mutation(publication))),
-        coordinator.clone(),
-    ));
-    catalog.attach(&orchestration);
+    let mut services =
+        HeadlessServices::new("print", &catalog, lua_handle.clone()).ignore_stream_closed();
+    let handle = smol::block_on(open(OpenRequest {
+        params,
+        durability: Durability::Ephemeral,
+        continue_turns: false,
+        options: session_options,
+        model_options: catalog.snapshot(),
+        prepare,
+        services: &mut services,
+    }))?;
+    let bound = services.into_bound().map_err(|error| eyre!(error))?;
     let discovery = discover(&catalog, active_provider);
     smol::block_on(discovery.wait_active(ACTIVE_DISCOVERY_BOUND));
     let commands = registry.bind_target(
         session_capabilities(),
         Arc::new(orchestration::PinnedCommandHost::new(
-            SessionCommandHost::new(
-                handle.control_tx.clone(),
-                coordinator.clone(),
-                Arc::clone(&providers),
-            ),
-            root.clone(),
-            &orchestration,
+            handle.command_host(),
+            bound.root.clone(),
+            &bound.orchestration,
             headless::default_model_preparer(providers),
         )),
     );
-    orchestration.bind_commands(
-        &root.target,
+    bound.orchestration.bind_commands(
+        &bound.root.target,
         orchestration::command_runner(
             registry.clone(),
             commands.clone(),
-            orchestration::headless_outcomes(&handle),
+            orchestration::headless_session_outcomes(&handle),
         ),
     );
-    lua_handle.install_orchestration_services(orchestration);
+    bound.activate();
     lua_handle.save_no_preferences();
     Ok(PrintSession {
         handle,
-        coordinator,
-        root,
+        root: bound.root,
         commands,
         _discovery: discovery,
     })
@@ -402,26 +371,17 @@ fn with_print_session<T>(
     body: impl FnOnce(&PrintSession) -> Result<T>,
 ) -> Result<T> {
     let result = catch_unwind(AssertUnwindSafe(|| body(&session)));
-    let PrintSession {
-        handle,
-        coordinator,
-        ..
-    } = session;
-    let InteractiveHandle {
-        manager,
-        task,
-        offload_cleanup,
-        input_tx,
-        ..
-    } = handle;
-    drop(input_tx);
+    let manager = session.handle.manager.clone();
+    let coordinator = session.handle.coordinator.clone();
+    let (task, offload_cleanup) = session.handle.into_ephemeral_shutdown();
+    let task = task.ok_or_else(|| eyre!("print session task is closed"))?;
     let closing = coordinator.clone();
     let settled = run_and_settle(
         task,
         offload_cleanup,
         async move |deadline| {
             futures_lite::future::zip(
-                manager.shutdown(deadline.saturating_duration_since(Instant::now())),
+                manager.suspend(deadline.saturating_duration_since(Instant::now())),
                 async {
                     let _ = closing.close().await;
                 },
@@ -524,10 +484,15 @@ pub fn run(
                 permissions_config,
                 timeouts,
                 prompt_slots: lua_handle.prompt_slot_source(),
-                excluded_tools: vec![QUESTION_TOOL_NAME],
+                profile: FrontendProfile {
+                    excluded_tools: vec![QUESTION_TOOL_NAME],
+                    ..Default::default()
+                },
                 mcp_handle,
                 initial_wd: cwd,
                 session_id: None,
+                root_id: None,
+                journal: None,
                 initial_history: Vec::new(),
                 yolo: false,
                 system_prompt_override,
@@ -536,7 +501,6 @@ pub fn run(
                 model_policy: Arc::clone(&model_policy),
                 providers: Arc::clone(&providers),
                 modes: lua_handle.mode_registry(),
-                question_mode: QuestionMode::Headless,
                 plugin_rules: Arc::clone(&plugin_rules),
                 project_config,
                 local_tools: Default::default(),
@@ -552,35 +516,38 @@ pub fn run(
 
         with_print_session(session, |session| {
             let handle = &session.handle;
-            let observer = HeadlessObserver::new(lua_handle.clone(), handle.session_id.id());
-            observer.install(session.root.target.clone());
-            let work = dispatch_print(&command_registry, &session.commands, literal)?;
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            let work = dispatch_print(&command_registry, &session.commands, literal, &admission)?;
             let session_id = &handle.session_id;
             let start = Instant::now();
             let (mut result, verbose_out) = match work {
                 PrintWork::Turn(_) | PrintWork::Completed => {
                     let wait = match work {
                         PrintWork::Turn(input) => {
-                            smol::block_on(handle.input_tx.admit(input))
+                            handle
+                                .input_tx
+                                .admitter()
+                                .for_actor(admission.actor().map_err(|error| eyre!(error))?)
+                                .submit(input)
                                 .map_err(|error| eyre!(error))?;
                             true
                         }
                         _ => false,
                     };
-                    let event_rx = &handle.event_rx;
+                    let events = handle.events.subscribe();
                     let next = || {
                         if wait {
-                            smol::block_on(event_rx.recv_async()).ok()
+                            smol::block_on(events.next())
                         } else {
-                            event_rx.try_recv().ok()
+                            events.try_next()
                         }
                     };
                     let tool_names = &handle.tool_names;
-                    let config = session
-                        .root
-                        .target
-                        .effective_config()
+                    let config = admission
+                        .actor()
                         .map_err(|error| eyre!(error))?
+                        .effective_config()
                         .ok_or_else(|| eyre!(UNCOMMITTED_ROOT_ERR))?;
                     let cwd = &*config.context.cwd().to_string_lossy();
                     (|| -> Result<_> {
@@ -607,11 +574,10 @@ pub fn run(
                         // rate it paid.
                         let mut cost = None;
 
-                        while let Some(envelope) = next() {
+                        while let Some(SessionEvent::Agent(envelope)) = next() {
                             if matches!(envelope.event, AgentEvent::StreamClosed) {
                                 break;
                             }
-                            observer.observe(&envelope);
                             let Envelope {
                                 ref event,
                                 ref subagent,
@@ -641,7 +607,7 @@ pub fn run(
                                 | AgentEvent::QueueSettled
                                 | AgentEvent::AutoCompacting { .. }
                                 | AgentEvent::CompactionDone { .. }
-                                | AgentEvent::AuthRequired
+                                | AgentEvent::AuthRequired { .. }
                                 | AgentEvent::PermissionRequest { .. }
                                 | AgentEvent::Question { .. }
                                 | AgentEvent::SubagentHistory { .. }
@@ -738,18 +704,21 @@ pub fn run(
                 }
                 PrintWork::IsolatedTurn(turn) => {
                     let images = command_attachments::into_images(&turn.content.attachments)?;
-                    let answer = smol::block_on(handle.control_tx.ask_isolated(
-                        turn.content.text.to_string(),
-                        images,
-                        CancelToken::none(),
-                    ));
+                    admission.validate().map_err(|error| eyre!(error))?;
+                    let answer = admission
+                        .target
+                        .ask_isolated(turn.content.text.to_string(), images, CancelToken::none())
+                        .map_err(|error| error.to_string());
+                    let answer = smol::block_on(async { collect_answer(answer?).await });
                     (operation_result(answer, session_id), None)
                 }
                 PrintWork::Reply(text) => (operation_result(Ok(text), session_id), None),
                 PrintWork::Compaction(instructions) => {
-                    let compacted = smol::block_on(
-                        handle.control_tx.compact(instructions, CancelToken::none()),
-                    );
+                    let compacted = smol::block_on(handle.control_tx.compact_to(
+                        admission.actor().map_err(|error| eyre!(error))?,
+                        instructions,
+                        CancelToken::none(),
+                    ));
                     (
                         operation_result(compacted.map(|()| String::new()), session_id),
                         None,
@@ -805,8 +774,11 @@ pub fn run(
 mod tests {
     use super::*;
     use flume::{Receiver, Sender};
+    use makima_agent::session_coordinator::SessionCoordinatorHandle;
     use makima_agent::{
-        AgentError, AgentId, SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
+        ActorLifecycle, ActorStatus, AgentError, AgentId, AgentManagerHandle, GraphLifecycle,
+        SubagentInfo, ToolOutput, TurnCancellationReason, TurnFailure, TurnId,
+        manager::AgentResidency,
         tools::{
             DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool,
             ToolContext, ToolInvocation, ToolRegistry, ToolSource,
@@ -907,7 +879,6 @@ mod tests {
                 prompt: None,
                 model: None,
                 opts: None,
-                answer_tx: None,
                 cancel: None,
             }),
             identity: None,
@@ -1079,10 +1050,12 @@ mod tests {
             permissions_config: PermissionsConfig::default(),
             timeouts: Default::default(),
             prompt_slots: Default::default(),
-            excluded_tools: Vec::new(),
+            profile: FrontendProfile::default(),
             mcp_handle: None,
             initial_wd: cwd.to_path_buf(),
             session_id: None,
+            root_id: None,
+            journal: None,
             initial_history: Vec::new(),
             yolo: false,
             system_prompt_override: None,
@@ -1091,7 +1064,6 @@ mod tests {
             model_policy: Arc::default(),
             providers: print_providers(),
             modes: EventHandle::disconnected_for_test().mode_registry(),
-            question_mode: QuestionMode::Headless,
             plugin_rules: Arc::default(),
             project_config: ProjectConfig::for_project(cwd),
             local_tools: Default::default(),
@@ -1123,6 +1095,34 @@ mod tests {
         .unwrap();
         smol::block_on(session.handle.input_tx.admit(input(message))).unwrap();
         session
+    }
+
+    fn assert_print_graph_settled(manager: &AgentManagerHandle) {
+        let graph = manager.snapshot();
+        assert!(!graph.is_empty());
+        assert!(!manager.journal().is_persistent());
+        for node in graph {
+            assert!(matches!(
+                node.graph_lifecycle,
+                GraphLifecycle::Closed | GraphLifecycle::Dormant
+            ));
+            assert_eq!(node.residency, AgentResidency::Dormant);
+            assert!(manager.runner_finished(node.agent_id).unwrap());
+            let retained = manager.lookup(node.agent_id).unwrap();
+            assert!(!retained.is_live());
+            assert!(retained.validate_live().is_err());
+            assert!(retained.actor().is_err());
+            assert!(retained.effective_config().is_err());
+            if let Some(actor) = node.actor {
+                assert!(matches!(
+                    actor.lifecycle,
+                    ActorLifecycle::Closed | ActorLifecycle::Shutdown
+                ));
+                assert_eq!(actor.status, ActorStatus::Idle);
+                assert_eq!(actor.active_turn, None);
+                assert_eq!(actor.queued, 0);
+            }
+        }
     }
 
     fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -1360,8 +1360,10 @@ mod tests {
             .unwrap();
         let (polled, polling) = flume::bounded(1);
         let (release, gate) = flume::bounded(1);
+        let mut params = print_params(&std::env::temp_dir(), None);
+        params.permissions_config.yolo = true;
         let session = spawn_started(
-            print_params(&std::env::temp_dir(), None),
+            params,
             name,
             Arc::new(GatedToolProvider {
                 name,
@@ -1371,6 +1373,8 @@ mod tests {
         );
         polling.recv_timeout(GATE_TIMEOUT).unwrap();
         let manager = session.handle.manager.clone();
+        let root = session.handle.root().clone();
+        let actor = root.actor().unwrap();
         let session_id = session.handle.session_id.id();
         let result = catch_unwind(AssertUnwindSafe(|| {
             with_print_session(session, |_| {
@@ -1389,7 +1393,15 @@ mod tests {
         } else {
             assert_eq!(result.unwrap().unwrap_err().to_string(), OUTPUT_ERROR);
         }
-        assert!(manager.snapshot().is_empty());
+        assert_print_graph_settled(&manager);
+        assert_eq!(manager.snapshot().len(), 1);
+        assert_eq!(manager.snapshot()[0].agent_id, root.id());
+        assert!(actor.snapshot().latest.is_none());
+        assert!(
+            manager.journal().snapshot().fold().unwrap().scopes[&Some(root.id())]
+                .results
+                .is_empty()
+        );
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         let _ = release.send(());
         assert!(execution.try_recv().is_err());
@@ -1475,7 +1487,7 @@ mod tests {
         .unwrap();
 
         with_print_session(session, |session| {
-            let config = session.root.target.effective_config().unwrap().unwrap();
+            let config = session.handle.root().effective_config().unwrap().unwrap();
             assert_eq!(config.model.context_window, DISCOVERED_WINDOW);
             host.wait_for_worker_barrier_for_test();
             assert!(matches!(
@@ -1718,7 +1730,7 @@ mod tests {
         let mut ran = false;
         let result = with_print_session(session, |session| {
             let handle = &session.handle;
-            let root = session.root.target.clone();
+            let root = handle.root().clone();
             assert!(session.root.template.opts.fast);
             let target = &session.commands;
             assert_eq!(root.effective_config().unwrap().unwrap().context.cwd(), cwd);
@@ -1764,7 +1776,9 @@ mod tests {
                     "initialized command did not finish"
                 );
             }
-            let work = dispatch_print(&registry, target, literal)?;
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            let work = dispatch_print(&registry, target, literal, &admission)?;
             if let PrintWork::Reply(reply) = &work {
                 assert_eq!(
                     root.effective_config().unwrap().unwrap().context.cwd(),
@@ -1787,15 +1801,30 @@ mod tests {
                     let child_actor = if nested {
                         entering.recv_timeout(GATE_TIMEOUT).unwrap();
                         let graph = manager.snapshot();
-                        assert_eq!(graph.len(), 3);
+                        assert_eq!(graph.len(), 4);
+                        let closed_child = graph
+                            .iter()
+                            .find(|node| node.graph_lifecycle == GraphLifecycle::Closed)
+                            .unwrap();
+                        assert_eq!(closed_child.parent_id, Some(root.id()));
+                        let retained = manager.lookup(closed_child.agent_id).unwrap();
+                        assert!(retained.validate_live().is_err());
+                        assert!(retained.actor().is_err());
+                        assert!(manager.runner_finished(closed_child.agent_id).unwrap());
+                        assert_eq!(
+                            graph
+                                .iter()
+                                .filter(|node| node.graph_lifecycle == GraphLifecycle::Live)
+                                .count(),
+                            3
+                        );
+                        let grandchild = graph.iter().find(|node| node.depth == 2).unwrap();
                         let child = graph
                             .iter()
-                            .find(|node| node.parent_id == Some(root.id()))
+                            .find(|node| Some(node.agent_id) == grandchild.parent_id)
                             .unwrap();
-                        let grandchild = graph
-                            .iter()
-                            .find(|node| node.parent_id == Some(child.agent_id))
-                            .unwrap();
+                        assert_eq!(child.parent_id, Some(root.id()));
+                        assert_ne!(child.agent_id, closed_child.agent_id);
                         assert_eq!((child.depth, grandchild.depth), (1, 2));
                         assert_eq!(grandchild.root_id, root.id());
                         let actor = manager.lookup(child.agent_id).unwrap().actor().unwrap();
@@ -1805,11 +1834,11 @@ mod tests {
                     } else {
                         None
                     };
-                    let events = handle.event_rx.clone();
+                    let events = handle.events.subscribe();
                     let state = smol::block_on(futures_lite::future::or(
                         async {
                             let mut state = PrintTurnState::default();
-                            while let Ok(envelope) = events.recv_async().await {
+                            while let Some(SessionEvent::Agent(envelope)) = events.next().await {
                                 if let AgentEvent::TextDelta { text } = &envelope.event
                                     && envelope.subagent.is_none()
                                 {
@@ -1851,7 +1880,17 @@ mod tests {
         } else {
             result.unwrap();
         }
-        assert!(manager.snapshot().is_empty());
+        assert_print_graph_settled(&manager);
+        assert_eq!(
+            manager.snapshot().len(),
+            if nested {
+                4
+            } else if outcome == "turn" {
+                2
+            } else {
+                1
+            }
+        );
         assert!(SessionCoordinatorHandle::resolve(session_id).is_err());
         assert!(!dir.exists());
         assert_eq!(files_under(state_dir.path()), Vec::<PathBuf>::new());
@@ -1895,7 +1934,9 @@ mod tests {
         )
         .unwrap();
         with_print_session(session, |session| {
-            dispatch_print(registry, &session.commands, literal)
+            let admission =
+                PinnedCommandTarget::pin(session.root.clone()).map_err(|error| eyre!(error))?;
+            dispatch_print(registry, &session.commands, literal, &admission)
         })
     }
 
@@ -2023,6 +2064,21 @@ mod tests {
         assert!(matches!(
             dispatch_idle(&registry, input("/done")).unwrap(),
             PrintWork::Completed
+        ));
+    }
+
+    #[test_case("/new"; "builtin")]
+    #[test_case("/clear"; "alias")]
+    fn print_rejects_session_reset(command: &str) {
+        let registry = CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let Err(error) = dispatch_idle(&registry, input(command)) else {
+            panic!("print accepted session replacement");
+        };
+        assert!(matches!(
+            error.downcast_ref::<CommandError>(),
+            Some(CommandError::Producer(message)) if message.as_ref() == command::SESSION_RESET_UNSUPPORTED
         ));
     }
 

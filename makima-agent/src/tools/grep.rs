@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -126,7 +127,7 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
-                    let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = results.lock_unpoisoned();
                     guard.push(GrepFileEntry { path: rel, groups });
                 }
                 WalkState::Continue
@@ -134,7 +135,7 @@ pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), 
         }
     });
 
-    let mut entries = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut entries = std::mem::take(&mut *results.lock_unpoisoned());
 
     if entries.is_empty() {
         return Ok((base.to_path_buf(), entries));

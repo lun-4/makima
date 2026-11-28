@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
@@ -341,8 +342,7 @@ impl CommandCompletion for VariadicCompletionProbe {
         _cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         self.calls
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .push((Arc::clone(&context.argument), context.preceding_arguments));
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -407,10 +407,7 @@ impl CommandCompletion for CompletionProbe {
         if let Some(registry) = &self.reenter {
             drop(registry.create_producer(ProducerPrecedence::Plugin));
         }
-        self.events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(event.clone());
+        self.events.lock_unpoisoned().push(event.clone());
         Ok(())
     }
 }
@@ -434,11 +431,7 @@ impl CommandCompletion for SnapshotProvider {
         let release = Arc::clone(&self.release);
         Box::pin(async move {
             started.send(publisher).unwrap();
-            release
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .recv()
-                .unwrap();
+            release.lock_unpoisoned().recv().unwrap();
             Ok(())
         })
     }
@@ -448,10 +441,7 @@ impl CommandCompletion for SnapshotProvider {
         _context: &CompletionContext,
         _item: &CompletionItem,
     ) -> CompletionItemNavigation {
-        *self
-            .navigation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        *self.navigation.lock_unpoisoned()
     }
 
     fn lifecycle(
@@ -464,10 +454,7 @@ impl CommandCompletion for SnapshotProvider {
             CompletionLifecycleEvent::Highlight(item) => Some(item.clone()),
             _ => None,
         };
-        self.events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(event.clone());
+        self.events.lock_unpoisoned().push(event.clone());
         Ok(())
     }
 }
@@ -491,11 +478,7 @@ impl CommandCompletion for FirstRequestBlockingCompletion {
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         if context.generation == 0 {
             self.entered.send(()).unwrap();
-            self.release
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .recv()
-                .unwrap();
+            self.release.lock_unpoisoned().recv().unwrap();
         }
         Box::pin(async {
             Ok(vec![CompletionItem {
@@ -514,11 +497,7 @@ impl CommandCompletion for BlockingCompletion {
         _cancellation: CancellationToken,
     ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
         self.entered.send(()).unwrap();
-        self.release
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .recv()
-            .unwrap();
+        self.release.lock_unpoisoned().recv().unwrap();
         Box::pin(async {
             Ok(vec![CompletionItem {
                 label: Arc::from("candidate"),
@@ -534,10 +513,7 @@ impl CommandCompletion for BlockingCompletion {
         event: &CompletionLifecycleEvent,
         _cancellation: &CancellationToken,
     ) -> Result<(), CompletionError> {
-        self.events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(event.clone());
+        self.events.lock_unpoisoned().push(event.clone());
         Ok(())
     }
 }
@@ -1616,22 +1592,13 @@ fn replacement_publishes_only_after_sessions_are_stale() {
     let command = session.command().clone();
     let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
     let initial = registry.snapshot_for(&target).unwrap();
-    let session_lock = session
-        .owner
-        .core
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let session_lock = session.owner.core.state.lock_unpoisoned();
     let producer_for_thread = producer.clone();
     let worker = thread::spawn(move || producer_for_thread.replace(Vec::new()));
 
     let deadline = std::time::Instant::now() + LOCK_RELEASE_TIMEOUT;
     loop {
-        let state = registry
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = registry.0.state.lock_unpoisoned();
         if state.producers[0].generation % 2 == 1 {
             break;
         }
@@ -1697,12 +1664,7 @@ fn completion_invalidation_detaches_without_locking_sessions() {
     let registry = CommandRegistry::new();
     let producer = registry.create_producer(ProducerPrecedence::Application);
     let session = completion_session(&registry, &producer, Arc::new(CompletionProbe::default()));
-    let session_lock = session
-        .owner
-        .core
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let session_lock = session.owner.core.state.lock_unpoisoned();
     let registry_for_thread = registry.clone();
     let producer_id = producer.id();
     let (detached_tx, detached_rx) = mpsc::sync_channel(1);
@@ -1711,8 +1673,7 @@ fn completion_invalidation_detaches_without_locking_sessions() {
         let invalidations = registry_for_thread
             .0
             .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .invalidate_completion_sessions(producer_id);
         detached_tx.send(invalidations).unwrap();
     });
@@ -1766,10 +1727,7 @@ fn producer_replacement_cancels_completion_once_and_rejects_reuse() {
     ));
     assert_eq!(probe.completions.load(Ordering::Relaxed), 1);
     assert_eq!(
-        *probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *probe.events.lock_unpoisoned(),
         [CompletionLifecycleEvent::Cancel]
     );
     session.cancel().unwrap();
@@ -1789,10 +1747,7 @@ fn producer_removal_cancels_completion_outside_registry_lock() {
     assert!(producer.remove());
 
     assert_eq!(
-        *probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *probe.events.lock_unpoisoned(),
         [CompletionLifecycleEvent::Cancel]
     );
     assert!(!producer.remove());
@@ -1853,20 +1808,11 @@ fn query_refresh_retains_provider_until_session_cancel() {
             CompletionResult::Items(_)
         ));
     }
-    assert!(
-        probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_empty()
-    );
+    assert!(probe.events.lock_unpoisoned().is_empty());
 
     session.cancel().unwrap();
     assert_eq!(
-        *probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *probe.events.lock_unpoisoned(),
         [CompletionLifecycleEvent::Cancel]
     );
 }
@@ -1908,10 +1854,7 @@ fn invalidating_in_flight_completion_returns_cancelled_then_stale() {
         CompletionResult::Stale
     ));
     assert_eq!(
-        *completion
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *completion.events.lock_unpoisoned(),
         [CompletionLifecycleEvent::Cancel]
     );
 }
@@ -1926,20 +1869,11 @@ fn final_session_owner_drop_cancels_once() {
     complete_once(&session);
 
     drop(session);
-    assert!(
-        probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_empty()
-    );
+    assert!(probe.events.lock_unpoisoned().is_empty());
     drop(clone);
 
     assert_eq!(
-        *probe
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *probe.events.lock_unpoisoned(),
         vec![CompletionLifecycleEvent::Cancel]
     );
 }
@@ -1980,10 +1914,7 @@ fn final_owner_drop_cancels_in_flight_completion() {
 
     assert_eq!(worker.join().unwrap(), CompletionResult::Cancelled);
     assert_eq!(
-        *completion
-            .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        *completion.events.lock_unpoisoned(),
         vec![CompletionLifecycleEvent::Cancel]
     );
 }
@@ -2015,8 +1946,7 @@ fn accepting_completion_is_terminal_and_fires_once() {
     assert!(matches!(
         probe
             .events
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .lock_unpoisoned()
             .as_slice(),
         [CompletionLifecycleEvent::Accept(item)] if item.insertion.as_ref() == "candidate"
     ));

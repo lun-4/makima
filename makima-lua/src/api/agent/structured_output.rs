@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::{Arc, Mutex};
 
 use crate::agent_errors::OUTPUT_SCHEMA_NOT_OBJECT;
@@ -55,20 +56,20 @@ impl StructuredOutput {
     }
 
     pub(super) fn begin_turn(&self, output: TurnOutput) {
-        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = ReportState {
+        *self.state.lock_unpoisoned() = ReportState {
             output: Some(output),
             ..Default::default()
         };
     }
 
     pub(super) fn invalidate(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         state.fresh_from = state.reports.len();
         state.last_errors = None;
     }
 
     pub(super) fn finish_turn(&self) {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         if let Some(output) = &state.output {
             for report in &state.reports[state.fresh_from..] {
                 output.append_output(report.clone());
@@ -84,7 +85,7 @@ impl StructuredOutput {
             .map(|error| format!("at {}: {error}", error.instance_path))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock_unpoisoned();
         if !errors.is_empty() {
             let mut end = errors.len().min(MAX_ERROR_BYTES);
             while !errors.is_char_boundary(end) {
@@ -106,20 +107,16 @@ impl StructuredOutput {
 
     #[cfg(test)]
     pub(super) fn reports(&self) -> Vec<Value> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .reports
-            .clone()
+        self.state.lock_unpoisoned().reports.clone()
     }
 
     pub(super) fn completion_check(&self) -> Result<Option<String>, String> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         Ok((state.reports.len() == state.fresh_from).then(|| NUDGE.into()))
     }
 
     pub(super) fn completion_exhausted(&self) -> String {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state.lock_unpoisoned();
         state.last_errors.as_ref().map_or_else(
             || MISSING.into(),
             |errors| format!("agent result does not match output_schema:\n{errors}"),
@@ -161,7 +158,8 @@ mod tests {
     #[test]
     fn accepted_reports_are_captured_before_settlement_and_cannot_change_frozen_results() {
         use makima_agent::{
-            AgentActorHandle, AgentId, AgentInput, History, TurnCancellationReason, TurnOutcome,
+            AgentActorHandle, AgentId, AgentInput, TurnCancellationReason, TurnOutcome,
+            actor::ActorHistory,
             actor::{ActorBackend, BackendResult, TurnContext, WorkKind},
         };
         use makima_providers::TokenUsage;
@@ -169,7 +167,7 @@ mod tests {
         impl ActorBackend for Backend {
             fn run_turn<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 context: TurnContext,
                 _input: AgentInput,
                 _work: WorkKind,
@@ -188,7 +186,7 @@ mod tests {
             }
             fn run_control<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 _context: TurnContext,
                 _control: &'a makima_agent::actor::ControlWork,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>
@@ -197,7 +195,7 @@ mod tests {
             }
             fn run_compact<'a>(
                 &'a mut self,
-                _history: &'a mut History,
+                _history: ActorHistory<'a>,
                 _context: TurnContext,
                 _instructions: Option<&'a str>,
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BackendResult> + Send + 'a>>

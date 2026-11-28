@@ -11,7 +11,10 @@ use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use makima_lua_macro::{lua_fn, lua_table};
+use makima_storage::id::MakimaId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
+
+use crate::api::util::pair::{Pair, try_pair};
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 const MILLIS_PER_SEC: u128 = 1_000;
@@ -19,6 +22,7 @@ const SECS_PER_MIN: u64 = 60;
 const SECS_PER_HOUR: u64 = 60 * SECS_PER_MIN;
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
 const U64_RANGE_END: f64 = 18_446_744_073_709_551_616.0;
+const ID_WITHOUT_TIME_ERR: &str = "id carries no creation time";
 const TIMESTAMP_FIELD_ERR: &str =
     "timestamp requires non-negative integer secs and nanosecs 0..1e9";
 
@@ -110,6 +114,31 @@ fn at(lua: &Lua, secs: u64) -> LuaResult<Table> {
     ts_to_table(lua, Timestamp { secs, nanosecs: 0 })
 }
 
+/// Read when a makima id (agent, turn, session, ...) was created, as a
+/// timestamp object readable by `makima.time.ago`. Ids embed their creation
+/// time with millisecond precision; a turn id's time is when the turn was
+/// admitted, so its age includes time spent queued.
+///
+/// @param id string Any makima id, e.g. from `agent:id()` or `turn:id()`.
+/// @return (table?, string?) `{secs, nanosecs}` timestamp, or nil and an error for an invalid id.
+/// @example
+/// print(makima.time.ago(makima.time.of_id(turn:id())))
+#[lua_fn]
+fn of_id(lua: &Lua, id: String) -> LuaResult<Pair<Table>> {
+    let id = try_pair!(id.parse::<MakimaId>());
+    let created = try_pair!(id.created_at().ok_or(ID_WITHOUT_TIME_ERR));
+    let since_epoch = try_pair!(
+        created
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ID_WITHOUT_TIME_ERR)
+    );
+    let timestamp = Timestamp {
+        secs: since_epoch.as_secs(),
+        nanosecs: since_epoch.subsec_nanos(),
+    };
+    Ok((Some(ts_to_table(lua, timestamp)?), None))
+}
+
 /// Format {instant} as a live delta like `9s` or `4d 7h 23m 9s`.
 /// {instant} is a timestamp from `makima.time.now` (or `makima.time.at`). If
 /// {reference} is given, age is measured from it instead of the current time.
@@ -174,7 +203,7 @@ lua_table! {
     /// print(makima.time.ago(t0))
     /// ```
     "makima.time" => pub(crate) fn create_time_table(), DOCS [
-        now, at, ago,
+        now, at, of_id, ago,
     ]
 }
 
@@ -284,6 +313,25 @@ mod tests {
             .call::<String>((bad_range, ts_tbl(&lua, EPOCH_SECS, 0)))
             .unwrap_err();
         assert!(err.to_string().contains(TIMESTAMP_FIELD_ERR));
+    }
+
+    const V7_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const V7_ID_SECS: u64 = 1_745_107_766;
+    const V7_ID_NANOSECS: u32 = 385_000_000;
+    const V4_ID: &str = "CNK1hV6DpQC3BJJ27EY9D";
+    const NOT_AN_ID: &str = "not-an-id";
+
+    #[test_case(V7_ID => Ok((V7_ID_SECS, V7_ID_NANOSECS)) ; "v7_id")]
+    #[test_case(V4_ID => Err(ID_WITHOUT_TIME_ERR.to_owned()) ; "v4_id")]
+    #[test_case(NOT_AN_ID => Err(NOT_AN_ID.parse::<MakimaId>().unwrap_err().to_string()) ; "invalid_id")]
+    fn of_id_reads_the_creation_time(id: &str) -> Result<(u64, u32), String> {
+        let lua = Lua::new();
+        let of_id: mlua::Function = create_time_table(&lua).unwrap().get("of_id").unwrap();
+        match of_id.call::<(Option<Table>, Option<String>)>(id).unwrap() {
+            (Some(t), None) => Ok((t.get("secs").unwrap(), t.get("nanosecs").unwrap())),
+            (None, Some(err)) => Err(err),
+            other => panic!("unexpected pair {other:?}"),
+        }
     }
 
     #[test]

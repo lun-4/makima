@@ -1,5 +1,7 @@
 //! Canonical domain contracts shared by storage, providers, and agent consumers.
 
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use serde::{Deserialize, Serialize};
 
 pub mod makima_thinking;
@@ -17,6 +19,31 @@ pub use makima_thinking::{
     Effort, FALLBACK_MAX_THINKING_BUDGET, MIN_THINKING_BUDGET, StoredThinking, THINKING_METADATA,
     THINKING_OPTIONS, ThinkingConfig, ThinkingMetadata, ThinkingParseError,
 };
+
+pub trait LockExt<T: ?Sized> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T: ?Sized> LockExt<T> for Mutex<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+pub trait RwLockExt<T: ?Sized> {
+    fn read_unpoisoned(&self) -> RwLockReadGuard<'_, T>;
+    fn write_unpoisoned(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
+    fn read_unpoisoned(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_unpoisoned(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {

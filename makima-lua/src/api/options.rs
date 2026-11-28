@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -280,7 +281,7 @@ fn register_options(
         }
     }
 
-    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = pending.lock_unpoisoned();
     if pending.is_some() {
         return Err(mlua::Error::runtime(
             "register_options: called more than once; call it once at the top level of the plugin",

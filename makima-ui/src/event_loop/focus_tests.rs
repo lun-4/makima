@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use makima_agent::actor::{ConfigChange, ConfigPatch, PendingQueueEntry, PreparedModel};
@@ -15,18 +14,16 @@ use makima_storage::id::SessionRef;
 use makima_storage::sessions::{Effort as StoredEffort, StoredThinking};
 use test_case::test_case;
 
-use super::tests::{select_child_chat, with_event_loop, with_event_loop_providers};
+use super::tests::{pump_until, select_child_chat, with_event_loop, with_event_loop_providers};
 use super::{
     AppSession, CLOSED_TARGET_ERR, CommandEvent, EventLoop, PreparedProvider, SESSION_OP_TIMEOUT,
     SessionRequest, UiAction,
 };
-use crate::app::shell::ShellEvent;
 use crate::chat::Chat;
 use crate::components::Action;
 
 const RESTORED_CHAT: &str = "restored task";
 const PROMPT: &str = "session prompt";
-const SHELL_OUTPUT: &str = "shell output";
 const EXPANDER_PLUGIN: &str = "session_prompt_expanders";
 const EXPANDER_FAILURE: &str = "reference expansion rejected";
 const EXPANDED_PROMPT: &str = "expanded task";
@@ -226,7 +223,9 @@ fn live_slash_controls_commit_on_the_admitted_actor(command: &str) {
             "/fast" => assert_eq!(commit.config.fast, !previous.fast),
             "/workflow" => assert_eq!(commit.config.workflow, !previous.workflow),
             _ => {
-                let root = Path::new(&event_loop.session_cwd)
+                let root = previous
+                    .context
+                    .cwd()
                     .ancestors()
                     .find(|path| path.parent().is_none())
                     .unwrap();
@@ -503,19 +502,9 @@ fn session_prompt_expands_once_and_busy_submission_is_queued() {
 
 #[test_case(false; "expander_failure")]
 #[test_case(true; "admission_failure")]
-fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
+fn rejected_session_prompt_leaves_queue_empty(oversized: bool) {
     with_event_loop(|event_loop| {
         let _host = install_expanders(event_loop);
-        let id = event_loop.sessions[0].app.shell.reserve_for(None);
-        event_loop.sessions[0]
-            .app
-            .handle_shell_event(ShellEvent::Done {
-                id,
-                command: PROMPT.into(),
-                output: SHELL_OUTPUT.into(),
-                is_error: false,
-                visible: true,
-            });
         let prompt = if oversized {
             "x".repeat(OVERSIZED_PROMPT_BYTES)
         } else {
@@ -525,13 +514,6 @@ fn rejected_session_prompt_preserves_shell_context(oversized: bool) {
         if !oversized {
             assert_eq!(error, EXPANDER_FAILURE);
         }
-        assert!(
-            !event_loop.sessions[0]
-                .app
-                .shell
-                .results_for(None)
-                .is_empty()
-        );
         assert!(event_loop.sessions[0].handles.queue.is_empty());
     });
 }
@@ -627,7 +609,7 @@ fn blank_session_sends_always_thinking_to_the_provider() {
         let runtime = event_loop
             .ctx
             .spawn_runtime_with_provider(
-                AppSession::new(THINKING_MODEL, &event_loop.session_cwd),
+                AppSession::new(THINKING_MODEL, &event_loop.ctx.workspace_cwd),
                 Some(PreparedProvider {
                     model: model.clone(),
                     provider,
@@ -645,6 +627,11 @@ fn blank_session_sends_always_thinking_to_the_provider() {
             }
             .clamped(&model)
         );
+        pump_until(event_loop, |event_loop| {
+            let (manager, root) = event_loop.sessions[index].handles.manager_and_root();
+            let snapshot = manager.actor(root).unwrap().snapshot();
+            snapshot.status == makima_agent::actor::ActorStatus::Idle && snapshot.latest.is_some()
+        });
     });
 }
 

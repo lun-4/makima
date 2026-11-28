@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::mem;
 use std::sync::Arc;
 
@@ -749,9 +750,7 @@ impl CommandPalette {
         let request = session.complete_input_with_sink(
             completion_input,
             Some(CompletionSnapshotSink::new(move |snapshot| {
-                *sink_snapshot
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+                *sink_snapshot.lock_unpoisoned() = Some(snapshot);
             })),
         );
         smol::spawn(async move {
@@ -777,11 +776,11 @@ impl CommandPalette {
             return Dirty::NO;
         }
         let mut dirty = Dirty::NO;
-        if let Some(latest) = pending.snapshots.as_deref().and_then(|slab| {
-            slab.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        }) && latest.revision >= self.argument_revision
+        if let Some(latest) = pending
+            .snapshots
+            .as_deref()
+            .and_then(|slab| slab.lock_unpoisoned().take())
+            && latest.revision >= self.argument_revision
         {
             let publication = if self.argument_publication.is_pending() {
                 self.argument_publication

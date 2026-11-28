@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::Arc;
 
 use makima_providers::Message;
@@ -8,7 +9,10 @@ use super::{
     ConfigCommit, HistoryEditWork, PreparedOperationTicket, PreparedTurn, TurnTicket,
     lifecycle_error,
 };
-use crate::{AgentId, TurnId};
+use crate::{
+    AgentId, TurnId,
+    journal::{JournalError, SessionJournal},
+};
 
 #[derive(Clone)]
 pub struct ActorSourceSnapshot {
@@ -42,12 +46,7 @@ impl ActorIdleGuard {
     }
 
     pub fn source_snapshot(&self) -> Result<ActorSourceSnapshot, ActorError> {
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }
@@ -73,22 +72,44 @@ impl ActorIdleGuard {
         })
     }
 
+    pub(crate) fn cut_rewind_queue(
+        &self,
+        journal: &SessionJournal,
+    ) -> Result<Vec<TurnId>, JournalError> {
+        let mut state = self.actor.inner.state.lock_unpoisoned();
+        let cleared_turns = journal.admitted_input_turns(self.actor.agent_id())?;
+        if cleared_turns.iter().any(|turn| {
+            state
+                .instructions
+                .get(turn)
+                .is_some_and(|inbox| inbox.submit_operation == Some(state.next_operation_id))
+        }) {
+            // Advance the batch boundary without closing an inbox the fork might leave intact.
+            state.next_operation_id = state.next_operation_id.wrapping_add(1);
+        }
+        Ok(cleared_turns)
+    }
+
+    pub(crate) fn rewind_history(&self) -> HistorySnapshot<Message> {
+        self.actor.inner.history.load_full().as_ref().clone()
+    }
+
+    pub(crate) fn install_rewind(&self, snapshot: HistorySnapshot<Message>) {
+        let mut state = self.actor.inner.state.lock_unpoisoned();
+        state.latest_history_turn = None;
+        self.actor.inner.history.store(Arc::new(snapshot));
+    }
+
     pub fn allow_turn(&self, ticket: &TurnTicket) -> Result<(), ActorError> {
         if !self.actor.owns_ticket(ticket) {
             return Err(ActorError::PolicyCancelled);
         }
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         let retired = !self
             .actor
             .inner
             .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .contains_key(&ticket.turn_id());
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
@@ -116,15 +137,11 @@ impl Drop for ActorIdleGuard {
         if !self.release {
             return;
         }
-        let mut state = self
-            .actor
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = self.actor.inner.state.lock_unpoisoned();
         if state.owned_idle(&self.owner).is_some() {
             state.idle = None;
             super::drive_operations(&self.actor.inner, &mut state);
+            self.actor.inner.policy_changed.notify(usize::MAX);
             self.actor.inner.queue.notify();
         }
     }
@@ -137,20 +154,37 @@ impl ActorState {
             .filter(|reservation| Arc::ptr_eq(&reservation.owner, owner))
     }
 
-    pub(super) fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+    fn has_pending_nonqueued_work(&self) -> bool {
         self.status != ActorStatus::Idle
             || self.active.is_some()
             || self.processing.is_some()
+            || self.config_publication.is_some()
             || self.pending_publications != 0
             || !self.operations.is_empty()
-            || !queue.is_empty()
+    }
+
+    pub(super) fn has_pending_work(&self, queue: &ActorQueue) -> bool {
+        self.has_pending_nonqueued_work() || !queue.is_empty()
+    }
+
+    pub(super) fn has_pending_unheld_work(&self, queue: &ActorQueue) -> bool {
+        self.has_pending_nonqueued_work()
+            || if self.input_held {
+                queue.has_unheld_work()
+            } else {
+                !queue.is_empty()
+            }
     }
 
     /// While reserved, only the permitted turn may start, and starting it
     /// ends the reservation so it runs like any other turn.
     pub(super) fn pop_work(&mut self, queue: &ActorQueue) -> Option<ActorWork> {
         let Some(reservation) = &mut self.idle else {
-            return queue.pop();
+            return if self.input_held {
+                queue.pop_unheld()
+            } else {
+                queue.pop()
+            };
         };
         if let Some(edit) = reservation.edit.take() {
             return Some(ActorWork::HistoryEdit(edit));
@@ -177,8 +211,7 @@ impl AgentActorHandle {
     pub(crate) fn has_pending_work(&self) -> bool {
         self.inner
             .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .has_pending_work(&self.inner.queue)
     }
 
@@ -187,7 +220,7 @@ impl AgentActorHandle {
         loop {
             let listener = self.inner.policy_changed.listen();
             {
-                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.inner.state.lock_unpoisoned();
                 if state.idle.is_none() || state.lifecycle != ActorLifecycle::Open {
                     return;
                 }
@@ -196,8 +229,12 @@ impl AgentActorHandle {
         }
     }
 
+    pub(crate) fn prepare_rewind(&self) -> Result<ActorIdleGuard, ActorError> {
+        self.prepare_idle()
+    }
+
     pub fn prepare_idle(&self) -> Result<ActorIdleGuard, ActorError> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Err(lifecycle_error(state.lifecycle));
         }

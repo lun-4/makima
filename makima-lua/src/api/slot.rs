@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::mem;
@@ -158,7 +159,7 @@ fn slot_snapshot(
     if plugin.is_some_and(|plugin| crate::runtime::loading_plugin_is(lua, plugin))
         && let Some(pending) = lua.app_data_ref::<PendingSlotStore>()
     {
-        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let pending = pending.lock_unpoisoned();
         return pending.slots.get(name).and_then(snapshot);
     }
     let store = lua.app_data_ref::<SlotStore>()?;
@@ -173,7 +174,7 @@ fn with_slot_store<T>(
     if crate::runtime::loading_plugin_is(lua, plugin)
         && let Some(pending) = lua.app_data_ref::<PendingSlotStore>()
     {
-        return f(&mut pending.lock().unwrap_or_else(|e| e.into_inner()));
+        return f(&mut pending.lock_unpoisoned());
     }
     let mut store = lua
         .app_data_mut::<SlotStore>()
@@ -482,9 +483,7 @@ fn get_slots(lua: &Lua) -> LuaResult<Table> {
     let out = lua.create_table()?;
     let pending = lua.app_data_ref::<PendingSlotStore>();
     let store_guard = lua.app_data_ref::<SlotStore>();
-    let pending_guard = pending
-        .as_ref()
-        .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()));
+    let pending_guard = pending.as_ref().map(|p| p.lock_unpoisoned());
     let slots_map: &HashMap<String, SlotEntry> = if let Some(p) = pending_guard.as_ref() {
         &p.slots
     } else if let Some(s) = store_guard.as_ref() {

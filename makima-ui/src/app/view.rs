@@ -431,6 +431,15 @@ impl App {
             self.absorb_hits(hits);
         }
 
+        if self.rewind_picker.is_open() {
+            let rect = self.rewind_picker.view(frame, full);
+            self.hits
+                .surface(Surface::Picker(PickerId::Rewind), rect, true);
+            rects.push(rect);
+            let hits = self.rewind_picker.hits();
+            self.absorb_hits(hits);
+        }
+
         if self.task_picker.is_open() {
             let rect = self.task_picker.view(frame, full);
             self.hits
@@ -471,7 +480,6 @@ impl App {
             };
         }
 
-        render_if_open!(self.rewind_picker, Rewind);
         render_if_open!(self.theme_picker, Theme);
         render_if_open!(self.model_picker, Model);
         render_if_open!(self.login_picker, Login);
@@ -526,17 +534,15 @@ impl App {
         let (mode_label, mode_style) = self.mode_label();
         // A subagent chat names its own model. The main chat shows the model the
         // run is on, and marks a change the run has not reached yet.
+        let session_model = self.root_config().model.spec();
         let (model_id, model_switch_queued) = match chat.model_id.as_deref() {
             Some(model_id) => (model_id, false),
-            None => {
-                let session_model = self.state.session.model.as_str();
-                match self.run_model.as_deref() {
-                    Some(running) if self.status == Status::Streaming => {
-                        (running, running != session_model)
-                    }
-                    _ => (session_model, false),
+            None => match self.run_model.as_deref() {
+                Some(running) if self.status == Status::Streaming => {
+                    (running, running != session_model)
                 }
-            }
+                _ => (session_model.as_str(), false),
+            },
         };
         let config = self.focused_config();
         let model_switch_queued = render_chat == 0 && model_switch_queued;
@@ -561,7 +567,7 @@ impl App {
             model_id,
             model_switch_queued,
             stats: UsageStats {
-                global_cost: self.state.cost,
+                global_cost: self.session_cost(),
                 context_size: chat.context_size,
                 cost: chat.cost,
                 context_window: if let Some(config) = &config {
@@ -762,8 +768,6 @@ impl App {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
-        } else if self.rewind_picker.is_open() {
-            contexts.push(KeybindContext::RewindPicker);
         } else if self.task_picker.is_open() {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {

@@ -7,6 +7,7 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+imbl = { workspace = true }
 event-listener = { workspace = true }
 makima-domain = { workspace = true }
 getrandom = { workspace = true }

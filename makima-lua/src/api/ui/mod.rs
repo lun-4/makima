@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -12,9 +13,7 @@ use strum::VariantNames;
 
 use makima_agent::{POST_LEVELS, Post, PostLevel};
 
-use crate::agent_errors::{
-    BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION, UNLINKABLE_POST_AGENT,
-};
+use crate::agent_errors::{BLANK_POST, UNKNOWN_POST_LEVEL, UNKNOWN_POST_OPTION};
 use crate::api::agent::{LuaAgent, LuaAgentRef, focused_agent_ref, send_post};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
@@ -867,8 +866,7 @@ fn post(
             )));
         }
         if let Some(agent) = opts.get::<Option<UserDataRef<LuaAgent>>>("agent")? {
-            post.agent =
-                Some(try_pair!(agent.transcript_id().ok_or(UNLINKABLE_POST_AGENT)).to_owned());
+            post.agent = Some(agent.identity());
         }
     }
     try_pair!(send_post(lua, target, post));
@@ -1025,7 +1023,7 @@ pub(crate) fn create_ui_table(
                         ));
                     }
                 };
-                *pending.lock().unwrap_or_else(|e| e.into_inner()) = spans;
+                *pending.lock_unpoisoned() = spans;
                 return Ok(());
             }
             match value {
@@ -1274,7 +1272,7 @@ mod tests {
         }
         use makima_agent::{
             ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentRef, BackendResult,
-            ControlWork, CurrentManagedTurn, History, TurnContext, WorkKind,
+            ControlWork, CurrentManagedTurn, TurnContext, WorkKind, actor::ActorHistory,
         };
         use std::{future::Future, pin::Pin};
 
@@ -1282,7 +1280,7 @@ mod tests {
         impl ActorBackend for Backend {
             fn run_turn<'a>(
                 &'a mut self,
-                _: &'a mut History,
+                _: ActorHistory<'a>,
                 context: TurnContext,
                 _: AgentInput,
                 _: WorkKind,
@@ -1295,7 +1293,7 @@ mod tests {
             }
             fn run_control<'a>(
                 &'a mut self,
-                _: &'a mut History,
+                _: ActorHistory<'a>,
                 _: TurnContext,
                 _: &'a ControlWork,
             ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1303,7 +1301,7 @@ mod tests {
             }
             fn run_compact<'a>(
                 &'a mut self,
-                _: &'a mut History,
+                _: ActorHistory<'a>,
                 _: TurnContext,
                 _: Option<&'a str>,
             ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -1316,6 +1314,7 @@ mod tests {
             let (release_tx, release_rx) = flume::bounded(1);
             let root = manager
                 .create_root(Vec::new(), None, Box::new(Backend(entered_tx, release_rx)))
+                .await
                 .unwrap();
             let ticket = manager
                 .actor(root.id())

@@ -8,6 +8,7 @@ mod image_paste;
 pub(crate) mod mode;
 mod mouse;
 mod queue;
+mod rewind;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -19,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::AppSession;
 use crate::chat::Chat;
@@ -28,7 +29,6 @@ use crate::click::{ClickTarget, CompletionGrid, HitRegistry, PickerId, ScrollOwn
 use crate::clipboard::ClipboardState;
 use crate::command_runtime::{CommandRuntime, PreparedCommandTarget};
 use crate::model_capabilities::ModelCapabilityCache;
-use makima_agent::HistorySnapshot;
 
 use crate::components::btw_modal::BtwModal;
 #[cfg(test)]
@@ -50,7 +50,6 @@ use crate::components::menu::{Menu, MenuAction, MenuItem, MenuKind};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -62,20 +61,23 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::text_buffer::is_newline_key;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 #[cfg(test)]
 pub(crate) use crossterm::event::KeyEventKind;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseEvent,
 };
-use makima_agent::actor::{EffectiveAgentConfig, TranscriptRequest};
-use makima_agent::agent::isolated_turn::IsolatedTurnRequest;
+use makima_agent::actor::EffectiveAgentConfig;
 use makima_agent::permissions::PermissionManager;
+#[cfg(test)]
+use makima_agent::permissions::PermissionSnapshot;
+use makima_agent::rewind::RewindGuard;
+use makima_agent::session::{AnswerKey, AnswerRouter};
 use makima_agent::tools::ToolFilter;
 use makima_agent::{
-    ActorWorkKind, AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope,
+    AgentConfig, AgentEvent, AgentId, AgentInput, AgentMode, AgentRef, Envelope, GraphLifecycle,
     ImageMediaType, ImageSource, McpConfigErrors, McpPromptRef, McpSnapshotReader, Post, SharedBuf,
-    SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput, TurnCompleteEvent,
+    SharedMessages, SubagentInfo, ToolDoneEvent, ToolOutput,
 };
 use makima_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -85,7 +87,7 @@ use makima_commands::{
 use makima_config::project::{self, GatedFile, TrustQuestion};
 use makima_config::{ModelPolicy, ToolKey, UiConfig};
 use makima_lua::agent_autocmd::SESSION_CWD_CHANGED_EVENT;
-use makima_lua::orchestration::TrustedTarget;
+use makima_lua::orchestration::PinnedCommandTarget;
 use makima_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
@@ -95,17 +97,17 @@ use makima_providers::{
     ThinkingConfig, add_cost, format_tokens,
 };
 use makima_storage::StateDir;
-use makima_storage::conversation::ConversationState;
 use makima_storage::input_history::InputHistory;
 use makima_storage::model::persist_model;
-use makima_storage::sessions::StoredPost;
+use makima_storage::session_state::StoredAgentLifecycle;
 
-use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
+#[cfg(test)]
+use makima_agent::journal::SessionJournal;
+#[cfg(test)]
+use makima_agent::session_writer::SessionWriter;
 use ratatui::layout::Position;
 
-const COMMAND_TRANSCRIPT_MESSAGES: usize = 1000;
-const COMMAND_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 const SUBAGENT_IDLE_STATUS: Status = Status::Idle;
 #[cfg(test)]
@@ -118,10 +120,8 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
 use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
-pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, SubmitOutcome};
-use session::Sent;
+pub(crate) use queue::{EMPTY_PROMPT_ERR, MessageQueue, RESTORE_IN_PROGRESS, SubmitOutcome};
 pub(crate) use session::session_has_content;
-pub(crate) use session_state::stored_to_rules;
 use session_state::{ConfigSource, SessionState};
 
 const CANCEL_MSG: &str = "Cancelled.";
@@ -270,7 +270,7 @@ pub(super) struct BackgroundCallView {
     chat_index: usize,
     tool: String,
     summary: String,
-    started_at: Instant,
+    started_at: SystemTime,
     /// `None` while the work runs, `Some(is_error)` once it settled.
     finished: Option<bool>,
 }
@@ -286,7 +286,7 @@ pub(super) struct TaskEntry {
     /// First `SNIPPET_CHARS` of the subagent chat's last message, shown dimly.
     snippet: String,
     context: String,
-    started_at: Option<Instant>,
+    started_at: Option<SystemTime>,
 }
 
 impl PickerItem for TaskEntry {
@@ -309,19 +309,12 @@ impl PickerItem for TaskEntry {
         (!self.context.is_empty()).then_some(self.context.as_str())
     }
     fn age(&self, now: &ClockSample) -> Option<Duration> {
-        self.started_at
-            .map(|started| now.monotonic.saturating_duration_since(started))
+        let started = self.started_at?.duration_since(UNIX_EPOCH).ok()?;
+        Some(now.unix.saturating_sub(started))
     }
     fn is_finished(&self) -> bool {
         matches!(self.finished, Some(true))
     }
-}
-
-/// Channels held for a live subagent tab.
-#[derive(Clone, Default)]
-struct SubagentChannels {
-    answer_tx: Option<flume::Sender<String>>,
-    closed: bool,
 }
 
 fn truncate_snippet(text: &str) -> String {
@@ -332,15 +325,6 @@ fn truncate_snippet(text: &str) -> String {
     } else {
         truncated
     }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(super) enum PendingInput {
-    #[default]
-    None,
-    AuthRetry {
-        agent_id: Option<makima_agent::AgentId>,
-    },
 }
 
 pub enum Msg {
@@ -362,10 +346,10 @@ pub(crate) enum InputKind {
 /// not opened (and does not contaminate overlay state) until activation.
 #[derive(Debug, Clone)]
 pub(crate) struct PermissionPayload {
-    id: String,
+    ask: AnswerKey,
     tool: ToolKey,
     scopes: Vec<String>,
-    agent_id: Option<makima_agent::AgentId>,
+    is_subagent: bool,
 }
 
 /// One entry in the input-arbitration queue. FIFO: only the head can activate.
@@ -390,12 +374,15 @@ pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
-    pub(super) live_chat_index: HashMap<makima_agent::AgentId, usize>,
-    terminal_subagents: HashSet<makima_agent::AgentId>,
+    pub(super) agent_chat_index: HashMap<makima_agent::AgentId, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(crate) command_runtime: Arc<CommandRuntime>,
     pub(crate) command_target: TargetHandle,
+    pub(super) rewind_picker: ListPicker<rewind::RewindEntry>,
+    pub(crate) rewind_guard: Option<RewindGuard>,
+    pub(crate) rewind_pending: bool,
+    pub(crate) input_wake_pending: bool,
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) background_calls: Vec<BackgroundCallView>,
@@ -403,11 +390,10 @@ pub struct App {
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     model_picker_purpose: ModelPickerPurpose,
-    pub(crate) model_picker_target: Option<AgentRef>,
+    pub(crate) model_picker_target: Option<PinnedCommandTarget>,
     pub(crate) plan_approval_pending: bool,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
-    pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -427,11 +413,9 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
-    recoverable_queue: Vec<String>,
-    pub answer_tx: Option<flume::Sender<String>>,
+    pub answers: Option<AnswerRouter>,
     pub(crate) root_agent: Option<makima_agent::AgentRef>,
-    pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
-    pub(super) pending_input: PendingInput,
+    pending_auth: VecDeque<AnswerKey>,
     pub(crate) run_id: u64,
     /// The model the in-flight turn started on. A turn captures its provider
     /// when it starts, so a model changed part-way through applies to the next
@@ -467,10 +451,10 @@ pub struct App {
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     model_picker_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
-    pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
-    storage_writer: Arc<StorageWriter>,
-    last_sent: Option<Sent>,
+    #[cfg(test)]
+    fixture_journal: Option<Arc<SessionJournal>>,
+    pub(crate) restore_in_progress: bool,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
@@ -486,8 +470,8 @@ pub struct App {
     pub(crate) suppress_status_content: Arc<AtomicBool>,
     pub(crate) restore_event_tx: Option<makima_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
-    /// Per-live-agent channels for interrupt replies and background input.
-    subagent_channels: HashMap<makima_agent::AgentId, SubagentChannels>,
+    /// The first live event for a restored chat reopens it.
+    observed_live_agents: HashSet<AgentId>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(makima_agent::AgentId, makima_agent::TurnId)>,
 }
@@ -499,7 +483,7 @@ pub(crate) struct PreparedApp {
 
 impl PreparedApp {
     pub(crate) fn session_id(&self) -> makima_storage::id::MakimaId {
-        self.app.state.session.id
+        self.app.session_projection().id
     }
 
     #[cfg(test)]
@@ -559,7 +543,6 @@ impl App {
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         status_content_reader: StatusContentReader,
-        storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
@@ -569,13 +552,9 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
         model_capabilities: Arc<ModelCapabilityCache>,
-    ) -> PreparedApp {
-        let mut state =
-            SessionState::from_session(session, &config.model, &model_policy, &providers);
+    ) -> color_eyre::Result<PreparedApp> {
+        let mut state = SessionState::from_session(&session)?;
         state.adopt(&config);
-        permissions.load_session_rules(session_state::stored_to_rules(
-            &state.session.meta.session_rules,
-        ));
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -599,8 +578,7 @@ impl App {
             )],
             active_chat: 0,
             chat_index: HashMap::new(),
-            live_chat_index: HashMap::new(),
-            terminal_subagents: HashSet::new(),
+            agent_chat_index: HashMap::new(),
             input_box,
             command_runtime: Arc::clone(&command_runtime),
             command_target: command_target.clone(),
@@ -609,8 +587,12 @@ impl App {
                 command_target,
                 prepared_command_target.snapshot(),
                 command_palette_defaults(&command_runtime),
-                Arc::from(state.session.cwd.as_str()),
+                Arc::from(config.context.cwd().to_string_lossy().as_ref()),
             ),
+            rewind_picker: ListPicker::new().with_picker(PickerId::Rewind),
+            rewind_guard: None,
+            rewind_pending: false,
+            input_wake_pending: false,
             task_picker: ListPicker::new().with_picker(PickerId::Task),
             task_picker_original: None,
             background_calls: Vec::new(),
@@ -626,7 +608,6 @@ impl App {
             plan_approval_pending: false,
             login_picker,
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
-            rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
@@ -646,11 +627,9 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
-            recoverable_queue: Vec::new(),
-            answer_tx: None,
+            answers: None,
             root_agent: None,
-            cmd_tx: None,
-            pending_input: PendingInput::None,
+            pending_auth: VecDeque::new(),
             run_id: 0,
             run_model: None,
             run_context_window: None,
@@ -674,10 +653,10 @@ impl App {
             available_models,
             model_picker_models,
             shared_history: None,
-            btw_system: None,
             image_paste_rx: vec![],
-            storage_writer,
-            last_sent: None,
+            #[cfg(test)]
+            fixture_journal: None,
+            restore_in_progress: false,
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
@@ -692,7 +671,7 @@ impl App {
             status_content_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
-            subagent_channels: HashMap::new(),
+            observed_live_agents: HashSet::new(),
             stamped_subagent_outcomes: HashSet::new(),
             pending_dirty: Dirty::NO,
         };
@@ -702,10 +681,10 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
-        PreparedApp {
+        Ok(PreparedApp {
             app,
             command_target: prepared_command_target,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -720,7 +699,7 @@ impl App {
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
         status_content_reader: StatusContentReader,
-        storage_writer: Arc<StorageWriter>,
+        session_writer: Option<SessionWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
@@ -729,21 +708,32 @@ impl App {
         theme_provider: Arc<dyn ThemesProvider>,
         command_runtime: Arc<CommandRuntime>,
     ) -> Self {
-        let config = session_state::SessionState::from_session(
-            session.clone(),
-            model,
-            &model_policy,
-            &ProviderRegistry::default(),
-        )
-        .starting_config(
-            Arc::new(DetachedProvider),
-            model,
-            PathBuf::from(&session.cwd),
-            &lua_event_handle.mode_registry(),
-            &storage,
-            makima_config::SessionDefaults::default(),
-        );
-        Self::prepare(
+        let config = SessionState::from_session(&session)
+            .unwrap()
+            .starting_config(
+                Arc::new(DetachedProvider),
+                model,
+                PathBuf::from(&session.cwd),
+                &lua_event_handle.mode_registry(),
+                &storage,
+                makima_config::SessionDefaults::default(),
+            )
+            .unwrap();
+        let view = session.latest_state().unwrap();
+        let snapshot = view
+            .scopes
+            .get(&None)
+            .map_or_else(
+                || PermissionSnapshot::from_stored(&session.meta.session_rules, session.meta.yolo),
+                |scope| PermissionSnapshot::from_stored(&scope.rules, scope.yolo),
+            )
+            .unwrap();
+        permissions.restore(snapshot);
+        let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+        if let Some(writer) = session_writer {
+            journal.bind_writer(writer).unwrap();
+        }
+        let mut app = Self::prepare(
             config,
             &AgentConfig::default(),
             session,
@@ -754,7 +744,6 @@ impl App {
             keymap_reader,
             hint_reader,
             status_content_reader,
-            storage_writer,
             ui_config,
             input_history_size,
             permissions,
@@ -765,7 +754,11 @@ impl App {
             command_runtime,
             ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {}),
         )
-        .activate()
+        .unwrap()
+        .activate();
+        app.fixture_journal = Some(journal);
+        app.refresh_session_projection();
+        app
     }
 
     pub(crate) fn focused_config(&self) -> Option<Arc<makima_agent::EffectiveAgentConfig>> {
@@ -829,7 +822,7 @@ impl App {
     pub(crate) fn focused_cwd(&self) -> PathBuf {
         self.focused_config()
             .map(|config| config.context.cwd().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(&self.state.session.cwd))
+            .unwrap_or_else(|| PathBuf::from(self.state.projection.cwd()))
     }
 
     pub(crate) fn selected_agent_id(&self) -> Option<makima_agent::AgentId> {
@@ -848,10 +841,8 @@ impl App {
 
     pub(super) fn focused_streaming(&self) -> bool {
         if let Some(actor) = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| Some(target.id()) == self.selected_agent_id())
-            .and_then(|target| target.actor().ok())
+            .selected_agent_id()
+            .and_then(|id| self.root_agent.as_ref()?.manager().actor(id).ok())
         {
             return matches!(
                 actor.snapshot().status,
@@ -859,6 +850,13 @@ impl App {
             );
         }
         *self.status_for_chat(self.active_chat) == Status::Streaming
+    }
+
+    fn focused_can_cancel(&self) -> bool {
+        self.focused_streaming()
+            || self
+                .focused_input_target()
+                .is_some_and(|target| target.input_held())
     }
 
     fn status_for_chat(&self, chat_idx: usize) -> &Status {
@@ -882,6 +880,28 @@ impl App {
             self.focused_config()
                 .and_then(|config| config.mode.plan_path().map(Path::to_path_buf))
         }
+    }
+
+    fn focused_plan_agent(&self) -> Option<makima_agent::AgentRef> {
+        self.command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| Some(target.id()) == self.selected_agent_id())
+            .or_else(|| {
+                self.is_main_chat()
+                    .then(|| self.root_agent.clone())
+                    .flatten()
+            })
+    }
+
+    pub(crate) fn stage_plan_selection(&mut self, selection: ModelSelection) {
+        if let (Some(target), Some(path)) = (self.focused_plan_agent(), self.focused_plan_path())
+            && let Err(error) =
+                makima_agent::plan_state::set_staged_model(&target, &path, selection.clone())
+        {
+            self.flash(error.to_string());
+            return;
+        }
+        self.plan_form.set_implementation_selection(selection);
     }
 
     fn sync_plan_form_target(&mut self) {
@@ -919,6 +939,25 @@ impl App {
             return;
         };
         self.sync_plan_form_path(self.plan_form_target, path.as_deref());
+        if let Some(target) = self.focused_plan_agent() {
+            let access = target.state_access();
+            if let Ok(slot) = makima_agent::plan_state::slot(&access)
+                && let Ok(snapshot) = slot.get(&access)
+                && let Some(entry) = snapshot
+                    .value
+                    .as_ref()
+                    .and_then(|plans| plans.get(&target.id()))
+                && path.as_deref().is_some_and(|path| {
+                    makima_agent::plan_state::plan_path_matches(&target, &entry.path, path)
+                })
+            {
+                let staged = entry.staged_model.clone().unwrap_or_default();
+                if self.plan_form.implementation_selection() != &staged {
+                    self.plan_form.set_implementation_selection(staged);
+                }
+                self.plan_form.restore_ready(entry.written);
+            }
+        }
         if path.is_none() && self.plan_picker_edits(self.plan_form_target) {
             self.close_model_picker();
             self.pending_dirty |= Dirty::YES;
@@ -983,8 +1022,7 @@ impl App {
     }
 
     pub(crate) fn update_model(&mut self, model: &Model) {
-        self.state.update_model(model);
-        persist_model(&self.storage, &self.state.session.model);
+        persist_model(&self.storage, &model.spec());
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -999,11 +1037,16 @@ impl App {
         self.status_bar.flash(msg);
     }
 
+    #[cfg(test)]
+    pub(crate) fn flash_text(&self) -> Option<&str> {
+        self.status_bar.flash_text()
+    }
+
     pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
         if let Some(map) = data.as_object_mut() {
             map.insert(
                 "session_id".into(),
-                serde_json::Value::String(self.state.session.id.to_string()),
+                serde_json::Value::String(self.session_projection().id.to_string()),
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
@@ -1018,7 +1061,7 @@ impl App {
                 .and_then(|t| normalize_preview(&t.to_string()));
             return Some(Notification::PermissionRequested { tool });
         }
-        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+        if !self.pending_auth.is_empty() {
             return Some(Notification::AuthenticationRequired);
         }
         if self.status != Status::Streaming && self.plan_form_active() {
@@ -1142,32 +1185,50 @@ impl App {
         actions
     }
 
-    fn send_answer(&self, answer: String) {
-        if let Some(tx) = &self.answer_tx {
-            let _ = tx.try_send(answer);
+    fn send_answer(&self, ask: AnswerKey, answer: String) {
+        if let Some(answers) = &self.answers {
+            let _ = answers.answer(ask, answer);
         }
     }
 
     fn active_subagent_closed(&self) -> bool {
-        if !self.is_main_chat() && self.selected_agent_id().is_none() {
-            return true;
-        }
-        self.chats
-            .get(self.active_chat)
-            .and_then(|chat| chat.agent_id)
-            .and_then(|agent_id| self.subagent_channels.get(&agent_id))
-            .is_some_and(|channels| channels.closed)
+        !self.is_main_chat()
+            && self
+                .selected_agent_id()
+                .is_none_or(|id| self.agent_closed(id))
     }
 
-    fn send_to_agent(&self, agent_id: Option<makima_agent::AgentId>, answer: String) {
-        let routed = agent_id
-            .and_then(|id| self.subagent_channels.get(&id))
-            .and_then(|channels| channels.answer_tx.as_ref());
-        if let Some(tx) = routed {
-            let _ = tx.try_send(answer);
-        } else {
-            self.send_answer(answer);
+    fn agent_closed(&self, id: AgentId) -> bool {
+        if let Some(root) = &self.root_agent {
+            let manager = root.manager();
+            if let Ok(node) = manager.node(id) {
+                return matches!(
+                    node.graph_lifecycle,
+                    GraphLifecycle::Closing
+                        | GraphLifecycle::Closed
+                        | GraphLifecycle::Retired
+                        | GraphLifecycle::Removed
+                );
+            }
+            if let Some(record) = manager.journal().agent(id) {
+                return record.lifecycle != StoredAgentLifecycle::Open;
+            }
         }
+        self.state
+            .projection
+            .agent_revisions
+            .iter()
+            .rev()
+            .find_map(|(_, record)| (record.id == id).then_some(record))
+            .is_some_and(|record| record.lifecycle != StoredAgentLifecycle::Open)
+    }
+
+    fn focused_input_target(&self) -> Option<AgentRef> {
+        let id = self.selected_agent_id()?;
+        self.command_runtime
+            .target_agent(&self.command_target)
+            .filter(|target| target.id() == id)
+            .or_else(|| self.root_agent.as_ref()?.manager().lookup(id).ok())
     }
 
     pub(super) fn scroll_content_len(&self, owner: ScrollOwner) -> Option<u16> {
@@ -1176,13 +1237,13 @@ impl App {
             ScrollOwner::Input => Some(self.input_box.content_len()),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.content_len(),
+                PickerId::Rewind => self.rewind_picker.content_len(),
                 PickerId::Task => self
                     .task_picker
                     .is_open()
                     .then(|| self.task_picker.content_len())
                     .flatten(),
                 PickerId::Theme => self.theme_picker.content_len(),
-                PickerId::Rewind => self.rewind_picker.content_len(),
                 PickerId::Login => self.login_picker.content_len(),
                 PickerId::Mcp => self.mcp_picker.content_len(),
                 PickerId::Lua => self.lua_picker.content_len(),
@@ -1210,9 +1271,9 @@ impl App {
             ScrollOwner::Input => self.input_box.scroll_y(),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_line().unwrap_or(0),
+                PickerId::Rewind => self.rewind_picker.scroll_line(),
                 PickerId::Task => self.task_picker.scroll_line(),
                 PickerId::Theme => self.theme_picker.scroll_line().unwrap_or(0),
-                PickerId::Rewind => self.rewind_picker.scroll_line().unwrap_or(0),
                 PickerId::Login => self.login_picker.scroll_line().unwrap_or(0),
                 PickerId::Mcp => self.mcp_picker.scroll_line().unwrap_or(0),
                 PickerId::Lua => self.lua_picker.scroll_line().unwrap_or(0),
@@ -1232,9 +1293,9 @@ impl App {
             ScrollOwner::Input => self.input_box.scroll_to_line(line),
             ScrollOwner::Picker(picker) => match picker {
                 PickerId::Model => self.model_picker.scroll_to_line(line),
+                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
                 PickerId::Task => self.task_picker.scroll_to_line(line),
                 PickerId::Theme => self.theme_picker.scroll_to_line(line),
-                PickerId::Rewind => self.rewind_picker.scroll_to_line(line),
                 PickerId::Login => self.login_picker.scroll_to_line(line),
                 PickerId::Mcp => self.mcp_picker.scroll_to_line(line),
                 PickerId::Lua => self.lua_picker.scroll_to_line(line),
@@ -1248,11 +1309,10 @@ impl App {
     }
 
     fn answer_permission(&mut self, answer: makima_agent::permissions::PermissionAnswer) {
-        let agent_id = self.permission_prompt.agent_id();
-        let request_id = self.permission_prompt.request_id().unwrap_or_default();
-        let encoded = makima_agent::permissions::TaggedAnswer::new(request_id, answer).encode();
+        if let Some(ask) = self.permission_prompt.answer_key().cloned() {
+            self.send_answer(ask, answer.encode());
+        }
         self.permission_prompt.close();
-        self.send_to_agent(agent_id, encoded);
     }
 
     pub(super) fn dispatch_click(&mut self, target: ClickTarget, pos: Position) -> Vec<Action> {
@@ -1273,9 +1333,9 @@ impl App {
             ClickTarget::PickerInput(picker) => {
                 match picker {
                     PickerId::Model => self.model_picker.click_input(pos),
+                    PickerId::Rewind => self.rewind_picker.click_input(pos),
                     PickerId::Task => self.task_picker.click_input(pos),
                     PickerId::Theme => self.theme_picker.click_input(pos),
-                    PickerId::Rewind => self.rewind_picker.click_input(pos),
                     PickerId::Login => self.login_picker.click_input(pos),
                     PickerId::Mcp => self.mcp_picker.click_input(pos),
                     PickerId::Lua => self.lua_picker.click_input(pos),
@@ -1383,6 +1443,7 @@ impl App {
 
     fn handle_picker_key(&mut self, picker: PickerId, key: KeyEvent) -> Vec<Action> {
         match picker {
+            PickerId::Rewind => self.handle_rewind_key(key),
             PickerId::Lua => match self.lua_picker.handle_key(key) {
                 LuaPickerAction::Confirming(msg) => {
                     self.flash(msg);
@@ -1477,11 +1538,6 @@ impl App {
                     }
                 }
             }
-            PickerId::Rewind => match self.rewind_picker.handle_key(key) {
-                RewindPickerAction::Consumed => vec![],
-                RewindPickerAction::Select(entry) => self.rewind_to(entry),
-                RewindPickerAction::Close => vec![],
-            },
             PickerId::Theme => match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
@@ -1507,9 +1563,9 @@ impl App {
     fn select_picker_row(&mut self, picker: PickerId, index: usize) -> bool {
         match picker {
             PickerId::Model => self.model_picker.select(index),
+            PickerId::Rewind => self.rewind_picker.select(index),
             PickerId::Task => self.task_picker.select(index),
             PickerId::Theme => self.theme_picker.select(index),
-            PickerId::Rewind => self.rewind_picker.select(index),
             PickerId::Login => self.login_picker.click_row(index),
             PickerId::Mcp => self.mcp_picker.select(index),
             PickerId::Lua => self.lua_picker.select(index),
@@ -1622,9 +1678,9 @@ impl App {
     fn scroll_surface(&mut self, surface: Surface, delta: i32) {
         match surface {
             Surface::Picker(PickerId::Model) => self.model_picker.scroll(delta),
+            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
             Surface::Picker(PickerId::Task) => self.task_picker.scroll(delta),
             Surface::Picker(PickerId::Theme) => self.theme_picker.scroll(delta),
-            Surface::Picker(PickerId::Rewind) => self.rewind_picker.scroll(delta),
             Surface::Picker(PickerId::Login) => self.login_picker.scroll(delta),
             Surface::Picker(PickerId::Mcp) => self.mcp_picker.scroll(delta),
             Surface::Picker(PickerId::Lua) => self.lua_picker.scroll(delta),
@@ -1673,15 +1729,12 @@ impl App {
             chat_index,
             tool: tool.to_string(),
             summary: summary.to_owned(),
-            started_at: Instant::now(),
+            started_at: SystemTime::now(),
             finished: None,
         });
     }
 
     fn settle_background_call(&mut self, chat_idx: usize, done: &ToolDoneEvent) {
-        self.state
-            .session_mut()
-            .insert_tool_output(done.id.clone(), done.output.clone());
         self.chats[chat_idx].handle_event(AgentEvent::BackgroundDone(Box::new(done.clone())), None);
         if self.background_calls.iter().all(|call| call.id != done.id) {
             self.track_background_call(chat_idx, &done.id, &done.tool, "");
@@ -1749,7 +1802,7 @@ impl App {
                 finished: Some(call.finished.is_some()),
                 chat_index: call.chat_index,
                 identity: TaskIdentity::Background(call.id.clone()),
-                parent_chat_index: None,
+                parent_chat_index: Some(call.chat_index),
                 depth: 0,
                 snippet: String::new(),
                 context: match call.finished {
@@ -1771,7 +1824,11 @@ impl App {
         ) {
             entry.depth = depth;
             let parent = entry.chat_index;
+            let leaf = matches!(entry.identity, TaskIdentity::Background(_));
             ordered.push(entry);
+            if leaf {
+                return;
+            }
             while let Some(index) = remaining
                 .iter()
                 .position(|entry| entry.parent_chat_index == Some(parent))
@@ -1869,7 +1926,7 @@ impl App {
             self.command_runtime.registry.clone(),
             self.command_target.clone(),
             command_palette_defaults(&self.command_runtime),
-            Arc::from(self.state.session.cwd.as_str()),
+            Arc::from(self.focused_cwd().to_string_lossy().as_ref()),
         );
     }
 
@@ -1881,7 +1938,7 @@ impl App {
             self.close_command_palette();
             self.sync_file_completion();
             return Some(if self.input_box.is_empty() {
-                if self.focused_streaming() {
+                if self.focused_can_cancel() {
                     return Some(self.handle_cancel());
                 }
                 self.quit()
@@ -1925,6 +1982,13 @@ impl App {
         if key::DEFER_INPUT.matches(key) {
             self.toggle_defer_input();
             return Some(vec![]);
+        }
+
+        if self.rewind_pending {
+            return Some(vec![]);
+        }
+        if self.rewind_picker.is_open() {
+            return Some(self.handle_rewind_key(key));
         }
 
         if self.permission_active() {
@@ -1986,7 +2050,13 @@ impl App {
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
         if self.plan_form_active() {
             let model = self.focused_model_spec();
+            let before = self.plan_form.implementation_selection().clone();
             self.plan_form.clear_model_if_current(&model);
+            let selection = self.plan_form.implementation_selection().clone();
+            if selection != before {
+                self.plan_form.set_implementation_selection(before);
+                self.stage_plan_selection(selection);
+            }
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
@@ -2030,10 +2100,6 @@ impl App {
             return Some(self.handle_picker_key(PickerId::Task, key));
         }
 
-        if self.rewind_picker.is_open() {
-            return Some(self.handle_picker_key(PickerId::Rewind, key));
-        }
-
         if self.theme_picker.is_open() {
             return Some(self.handle_picker_key(PickerId::Theme, key));
         }
@@ -2065,14 +2131,16 @@ impl App {
 
     pub(crate) fn open_pinned_model_picker(
         &mut self,
-        target: AgentRef,
+        target: PinnedCommandTarget,
     ) -> Result<(), CommandError> {
         target
+            .target
             .validate_live()
             .map_err(|_| CommandError::StaleTarget)?;
         let config = target
-            .effective_config()
+            .actor()
             .map_err(|_| CommandError::StaleTarget)?
+            .effective_config()
             .ok_or(CommandError::StaleTarget)?;
         self.model_picker_purpose = ModelPickerPurpose::Session;
         self.model_picker_target = Some(target);
@@ -2086,7 +2154,7 @@ impl App {
 
     fn open_model_picker(&mut self, purpose: ModelPickerPurpose) {
         if purpose == ModelPickerPurpose::Session
-            && let Some(target) = self.command_runtime.target_agent(&self.command_target)
+            && let Some(target) = self.command_runtime.target_admission(&self.command_target)
         {
             if let Err(error) = self.open_pinned_model_picker(target) {
                 self.close_model_picker();
@@ -2133,10 +2201,13 @@ impl App {
                 let target = self.model_picker_target.clone();
                 self.close_model_picker();
                 if purpose == ModelPickerPurpose::PlanImplementation {
-                    self.plan_form.set_implementation_selection(selection);
+                    self.stage_plan_selection(selection);
                     vec![]
                 } else if let Some(target) = target {
-                    vec![Action::SelectPinnedModel { target, selection }]
+                    vec![Action::SelectPinnedModel {
+                        target: Box::new(target),
+                        selection,
+                    }]
                 } else {
                     vec![Action::SelectModel(selection)]
                 }
@@ -2203,7 +2274,7 @@ impl App {
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
             BuiltinAction::FilePicker => {
-                self.file_picker.open(&self.state.session.cwd);
+                self.file_picker.open(&self.focused_cwd().to_string_lossy());
             }
             BuiltinAction::Search => {
                 let top = self.chats[self.active_chat].scroll_top();
@@ -2267,7 +2338,7 @@ impl App {
             return vec![];
         }
 
-        if !(self.focused_streaming() && is_streaming_stop_key(key))
+        if !(is_streaming_stop_key(key) && self.focused_can_cancel())
             && let Some(id) = self.dispatch_override(key)
         {
             return vec![Action::RunKeybind(id)];
@@ -2295,6 +2366,9 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if self.input_wake_pending {
+            return vec![];
+        }
         if key::SHOW_ALL_THINKING.matches(key) {
             return self.run_builtin(BuiltinAction::ShowAllThinking);
         }
@@ -2451,15 +2525,15 @@ impl App {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
                         {
-                            if streaming {
+                            if self.focused_can_cancel() {
                                 self.handle_cancel()
                             } else {
-                                self.open_rewind_picker()
+                                self.open_rewind()
                             }
                         } else {
                             self.last_esc = Some(Instant::now());
                             self.status_bar.flash(
-                                if streaming {
+                                if self.focused_can_cancel() {
                                     FLASH_CANCEL
                                 } else {
                                     FLASH_REWIND
@@ -2614,51 +2688,72 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    pub(crate) fn handle_submit(&mut self, mut sub: Submission) -> Vec<Action> {
+    pub(crate) fn accept_submission(&mut self, sub: &Submission) {
+        self.input_box.accept_submission(sub);
+        if self
+            .input_box
+            .buffer
+            .lines()
+            .iter()
+            .map(String::as_str)
+            .eq([""])
+            && let Some(journal) = self.journal()
+        {
+            journal.set_draft(None);
+        }
+    }
+
+    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         // Any main-input submit releases a manual Alt+M hold, so the deferred
         // panel re-promotes once the user has placed their message.
         self.submit_released = true;
-        match std::mem::take(&mut self.pending_input) {
-            PendingInput::AuthRetry { agent_id } => {
-                self.send_to_agent(agent_id, String::new());
-                return vec![];
-            }
-            PendingInput::None => {}
+        if let Some(ask) = self.pending_auth.pop_front() {
+            self.send_answer(ask, String::new());
+            self.accept_submission(&sub);
+            return vec![];
         }
         if sub.is_empty() {
             return vec![];
         }
+        if self.restore_in_progress {
+            self.flash(RESTORE_IN_PROGRESS.into());
+            return vec![];
+        }
         if sub.text.trim() == "exit" {
+            self.accept_submission(&sub);
             return self.quit();
         }
-
-        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+        if self.input_wake_pending {
+            return vec![];
+        }
+        let class = classify_input(&sub.text);
+        if !matches!(class, SlashClass::Command(_)) {
             if self.active_subagent_closed() {
                 self.flash(queue::NO_SUBAGENT_ERR.into());
                 return vec![];
             }
-            let cmd = prefix.command.trim();
-            if cmd == "cd" || cmd.starts_with("cd ") {
-                self.flash("Only /cd can change the working directory".into());
+            if let Some(target) = self.focused_input_target()
+                && target
+                    .snapshot()
+                    .is_ok_and(|node| node.graph_lifecycle == GraphLifecycle::Dormant)
+            {
+                self.input_wake_pending = true;
+                return vec![Action::WakeForInput {
+                    target,
+                    submission: sub,
+                }];
             }
-            let id = self.shell.reserve_for(self.selected_agent_id());
-            let sigil = if prefix.visible { "!" } else { "!!" };
-            let display = format!("{sigil} {}", prefix.command);
-            self.active_chat().show_user_message(display, Vec::new());
+        }
+        if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
             return vec![Action::ShellCommand {
-                target: self.selected_agent_id(),
-                cwd: self.focused_cwd(),
-                id,
+                submission: sub,
                 command: prefix.command,
                 visible: prefix.visible,
             }];
         }
-        match classify_input(&sub.text) {
-            SlashClass::Plain => self.submit_or_queue(sub.into()),
-            SlashClass::EscapedLiteral(literal) => {
-                sub.text = literal.to_owned();
-                self.submit_or_queue(sub.into())
-            }
+        match class {
+            SlashClass::Plain => self.submit_or_queue(&sub, sub.text.clone()),
+            SlashClass::EscapedLiteral(literal) => self.submit_or_queue(&sub, literal.to_owned()),
             SlashClass::Command(_) => {
                 let attachments = sub
                     .images
@@ -2675,9 +2770,20 @@ impl App {
                         attachments,
                     },
                 );
+                self.accept_submission(&sub);
                 vec![]
             }
         }
+    }
+
+    pub(crate) fn accept_shell_command(&mut self, sub: &Submission, command: &str, visible: bool) {
+        if command == "cd" || command.starts_with("cd ") {
+            self.flash("Only /cd can change the working directory".into());
+        }
+        let sigil = if visible { "!" } else { "!!" };
+        self.active_chat()
+            .show_user_message(format!("{sigil} {command}"), Vec::new());
+        self.accept_submission(sub);
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -2697,7 +2803,8 @@ impl App {
                 return Vec::new();
             }
         };
-        self.shell.cancel_for(Some(target.id()));
+        self.clear_agent_auth(target.id());
+        self.shell.cancel_for(target.id());
         self.active_chat().flush();
         self.active_chat().cancel_in_progress();
         self.active_chat().retry_info = None;
@@ -2708,12 +2815,10 @@ impl App {
         self.run_id = fence;
         self.queue.fence_cancelled_presentations(fence);
         self.close_all_overlays();
-        self.pending_input = PendingInput::None;
         self.input_queue.clear();
         self.active_input = None;
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
-        self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent { turn_id, run_id }]
     }
@@ -2730,14 +2835,7 @@ impl App {
             && presentation > self.run_id
             && self.queue.accepts_actor_presentation(presentation)
         {
-            if envelope
-                .identity
-                .is_some_and(|identity| matches!(identity.kind, ActorWorkKind::Compact { .. }))
-            {
-                self.record_presentation_start(presentation);
-            } else {
-                self.record_run_start(presentation);
-            }
+            self.record_run_start(presentation);
         }
     }
 
@@ -2758,18 +2856,23 @@ impl App {
                 } => (id, snapshot, theme_gen, true),
                 _ => return vec![],
             };
-            for chat in &mut self.chats {
+            if let Some(chat) = self.chats.iter_mut().find(|chat| chat.has_tool(&id)) {
                 if is_header {
-                    chat.tool_header_snapshot(&id, snapshot.clone(), theme_gen);
+                    chat.tool_header_snapshot(&id, snapshot, theme_gen);
                 } else {
-                    chat.tool_snapshot(&id, snapshot.clone(), theme_gen);
+                    chat.tool_snapshot(&id, snapshot, theme_gen);
                 }
+            } else {
+                tracing::warn!(
+                    tool_id = %id,
+                    is_header, "snapshot dropped: no tool message with this id"
+                );
             }
             return vec![];
         }
         // Posts belong to no run, so the stale-run filter below must not see them.
         if let AgentEvent::Post(post) = envelope.event {
-            self.push_post(envelope.subagent.as_ref(), post, None);
+            self.display_post(envelope.subagent.as_ref(), &post);
             return vec![];
         }
         // A moved call reports after the turn that took its receipt is gone,
@@ -2847,56 +2950,34 @@ impl App {
         }
 
         if let Some(subagent) = &envelope.subagent {
-            if self.terminal_subagents.contains(&subagent.agent_id) {
-                match envelope.event {
-                    AgentEvent::SubagentHistory {
-                        tool_use_id,
-                        history_epoch,
-                        conversation_id,
-                        messages,
-                    } => {
-                        self.state.session_mut().adopt_subagent_history(
-                            tool_use_id,
-                            &HistorySnapshot {
-                                epoch: history_epoch,
-                                compacted: false,
-                                conversation: conversation_id.map(ConversationState::new),
-                                messages: Arc::new(messages),
-                            },
-                        );
-                    }
-                    AgentEvent::TurnComplete(turn) => {
-                        let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
-                        self.account_turn_complete(chat_idx, &turn);
-                    }
-                    _ => {}
-                }
-                return vec![];
-            }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {
                 self.finish_child_plan_approval(subagent.agent_id);
                 if self.plan_picker_edits(Some(subagent.agent_id))
                     || self
                         .model_picker_target
                         .as_ref()
-                        .is_some_and(|target| target.id() == subagent.agent_id)
+                        .is_some_and(|target| target.target.id() == subagent.agent_id)
                 {
                     self.close_model_picker();
-                }
-                self.terminal_subagents.insert(subagent.agent_id);
-                if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
-                    channels.closed = true;
                 }
                 self.stamped_subagent_outcomes
                     .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
                 self.cleanup_subagent_input(subagent.agent_id);
-                if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
+                if let Some(&chat_idx) = self.agent_chat_index.get(&subagent.agent_id) {
                     self.chats[chat_idx].cancel_in_progress();
                     self.chats[chat_idx].retry_info = None;
                     if !self.chats[chat_idx].is_finished() {
                         self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
                     }
                     self.sync_task_picker();
+                }
+                return vec![];
+            }
+            if self.agent_closed(subagent.agent_id) {
+                if let AgentEvent::TurnComplete(turn) = envelope.event
+                    && let Some(&chat_idx) = self.agent_chat_index.get(&subagent.agent_id)
+                {
+                    add_cost(&mut self.chats[chat_idx].cost, turn.cost);
                 }
                 return vec![];
             }
@@ -2932,13 +3013,7 @@ impl App {
         }
 
         let subagent_agent_id = envelope.subagent.as_ref().map(|subagent| subagent.agent_id);
-        if let AgentEvent::SubagentHistory {
-            tool_use_id,
-            history_epoch,
-            conversation_id,
-            messages,
-        } = envelope.event
-        {
+        if let AgentEvent::SubagentHistory { tool_use_id, .. } = envelope.event {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
             let subagent_chat = envelope
@@ -2953,15 +3028,6 @@ impl App {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
             self.sync_task_picker();
-            self.state.session_mut().adopt_subagent_history(
-                tool_use_id,
-                &HistorySnapshot {
-                    epoch: history_epoch,
-                    compacted: false,
-                    conversation: conversation_id.map(ConversationState::new),
-                    messages: Arc::new(messages),
-                },
-            );
             return vec![];
         }
 
@@ -2984,12 +3050,13 @@ impl App {
                 AgentEvent::TurnOutcome(_) | AgentEvent::SubagentHistory { .. }
             )
         {
-            self.chats[chat_idx].reopen();
+            self.chats[chat_idx].reopen(envelope.identity.and_then(|identity| identity.turn_id()));
             self.sync_task_picker();
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
-            if chat_idx > 0
+            if !e.is_error
+                && chat_idx > 0
                 && self
                     .focused_config()
                     .filter(|_| self.active_chat == chat_idx)
@@ -2998,16 +3065,14 @@ impl App {
             {
                 self.plan_form.on_plan_ready();
             }
-            if chat_idx == 0
+            if !e.is_error
+                && chat_idx == 0
                 && self.root_mode() == Mode::Plan
                 && !self.plan_submit_active()
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
-            self.state
-                .session_mut()
-                .insert_tool_output(e.id.clone(), e.output.clone());
             let sub_idx = subagent_agent_id
                 .is_none()
                 .then(|| self.chat_index.get(&e.id).copied())
@@ -3054,12 +3119,9 @@ impl App {
         self.chats[chat_idx].retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.account_turn_complete(Some(chat_idx), tc);
+            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
-            if chat_idx == 0 {
-                self.state.context_size = ctx_size;
-            }
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
@@ -3094,16 +3156,16 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+        if let ChatEventResult::PermissionRequest { ask, tool, scopes } = result {
             let demand = InputDemand {
                 kind: InputKind::Permission,
                 blocked_by_modal: self.has_blocking_modal(),
                 hold_until_submit: false,
                 perm: Some(PermissionPayload {
-                    id,
+                    ask,
                     tool,
                     scopes,
-                    agent_id: subagent_agent_id,
+                    is_subagent: subagent_agent_id.is_some(),
                 }),
             };
             let defer = self.begin_input_demand(demand);
@@ -3113,7 +3175,11 @@ impl App {
             return vec![];
         }
 
-        if let ChatEventResult::AuthRequired = result {
+        if let ChatEventResult::AuthRequired { ask } = result {
+            if self.pending_auth.contains(&ask) {
+                return vec![];
+            }
+            self.pending_auth.push_back(ask);
             self.chats[chat_idx].push(DisplayMessage::new(
                 DisplayRole::Error,
                 AUTH_EXPIRED_MSG.into(),
@@ -3124,9 +3190,6 @@ impl App {
                     AUTH_EXPIRED_MSG.into(),
                 ));
             }
-            self.pending_input = PendingInput::AuthRetry {
-                agent_id: subagent_agent_id,
-            };
             return vec![];
         }
 
@@ -3148,20 +3211,11 @@ impl App {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
                     self.terminalize_turn(&message);
-                    let pending = self.queue.root_text_messages();
-                    if envelope.identity.is_some_and(|identity| {
-                        matches!(identity.kind, ActorWorkKind::Compact { .. })
-                    }) {
-                        self.recoverable_queue.extend(pending);
-                    } else {
-                        self.recoverable_queue = pending;
-                    }
-                    self.queue.clear_root_user_work();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
                 }
-                ChatEventResult::AuthRequired
+                ChatEventResult::AuthRequired { .. }
                 | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
                 ChatEventResult::ControlComplete => {
@@ -3171,16 +3225,6 @@ impl App {
             }
         }
         actions
-    }
-
-    fn account_turn_complete(&mut self, chat_idx: Option<usize>, turn: &TurnCompleteEvent) {
-        self.state.token_usage += turn.usage;
-        if let Some(chat_idx) = chat_idx {
-            add_cost(&mut self.chats[chat_idx].cost, turn.cost);
-        }
-        self.state
-            .session_mut()
-            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went
@@ -3215,88 +3259,52 @@ impl App {
         !defer
     }
 
-    pub(crate) fn push_post(
-        &mut self,
-        subagent: Option<&SubagentInfo>,
-        post: Post,
-        committed_messages: Option<usize>,
-    ) {
-        let (chat_idx, chat) = match subagent {
-            Some(subagent) => (
-                self.resolve_or_create_chat(subagent),
-                Some(subagent.parent_tool_use_id.clone()),
-            ),
-            None => (0, None),
-        };
-        self.chats[chat_idx].push_post(&post);
-        let session = &self.state.session;
-        let after_message = committed_messages.unwrap_or_else(|| match &chat {
-            Some(id) => session
-                .subagent_messages()
-                .get(id)
-                .map_or(0, |messages| messages.len()),
-            None => session.messages().len(),
+    fn display_post(&mut self, subagent: Option<&SubagentInfo>, post: &Post) {
+        let chat_idx = subagent.map_or(0, |subagent| {
+            self.agent_chat_index
+                .get(&subagent.agent_id)
+                .copied()
+                .unwrap_or_else(|| self.resolve_or_create_chat(subagent))
         });
-        self.state.session_mut().push_post(StoredPost {
-            chat,
-            after_message,
-            post,
-        });
-    }
-
-    fn historical_chat_index(&self, agent_id: makima_agent::AgentId) -> Option<usize> {
-        let session = &self.state.session;
-        let id = agent_id.to_string();
-        let mut matching = session
-            .subagents()
-            .iter()
-            .filter(|entry| entry.agent_id.as_deref() == Some(&id));
-        let entry = matching.next()?;
-        if entry.ambiguous
-            || matching.next().is_some()
-            || session
-                .subagents()
-                .iter()
-                .filter(|other| other.tool_use_id == entry.tool_use_id)
-                .count()
-                != 1
-            || !session.subagent_messages().contains_key(&entry.tool_use_id)
-        {
-            return None;
-        }
-        let mut chats = self
-            .chats
-            .iter()
-            .enumerate()
-            .filter(|(_, chat)| chat.subagent_id.as_deref() == Some(&entry.tool_use_id));
-        let (index, chat) = chats.next()?;
-        if chat.agent_id.is_some() || chats.next().is_some() {
-            return None;
-        }
-        Some(index)
+        self.chats[chat_idx].push_post(post);
     }
 
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
+        let name = || {
+            self.root_agent
+                .as_ref()
+                .and_then(|root| root.manager().journal().agent(subagent.agent_id))
+                .map_or_else(
+                    || subagent.name.clone(),
+                    |record| record.label.unwrap_or_else(|| record.id.to_string()),
+                )
+        };
         let id = &subagent.parent_tool_use_id;
-        if let Some(&idx) = self.live_chat_index.get(&subagent.agent_id) {
+        if let Some(&idx) = self.agent_chat_index.get(&subagent.agent_id) {
+            if !self.observed_live_agents.insert(subagent.agent_id) {
+                return idx;
+            }
+            let name = name();
+            let chat = &mut self.chats[idx];
+            chat.name = name;
+            chat.model_id = subagent.model.clone();
+            chat.opts = subagent.opts;
+            chat.parent_agent_id = subagent.parent_agent_id;
+            chat.reopen(None);
+            self.sync_task_picker();
             return idx;
         }
         let idx = self.chats.len();
         self.chat_index.entry(id.clone()).or_insert(idx);
-        self.live_chat_index.insert(subagent.agent_id, idx);
-        self.subagent_channels.insert(
-            subagent.agent_id,
-            SubagentChannels {
-                answer_tx: subagent.answer_tx.clone(),
-                closed: false,
-            },
-        );
-        self.chats[0].update_tool_summary(id, &subagent.name);
+        self.agent_chat_index.insert(subagent.agent_id, idx);
+        self.observed_live_agents.insert(subagent.agent_id);
+        let name = name();
+        self.chats[0].update_tool_summary(id, &name);
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
         let mut chat = Chat::new(
-            subagent.name.clone(),
+            name,
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
             Arc::clone(&self.theme_provider),
@@ -3306,14 +3314,15 @@ impl App {
         chat.opts = subagent.opts;
         chat.subagent_id = Some(id.clone());
         chat.agent_id = Some(subagent.agent_id);
+        chat.set_restore_target(
+            self.root_agent
+                .as_ref()
+                .map(|root| root.manager().reference(subagent.agent_id)),
+        );
         chat.parent_agent_id = subagent.parent_agent_id;
         chat.set_started_at_now();
-        if let Some(ref prompt) = subagent.prompt {
-            chat.push_user_message(prompt);
-        }
         self.chats.push(chat);
         self.sync_task_picker();
-        self.sync_subagents();
         idx
     }
 
@@ -3468,9 +3477,9 @@ impl App {
                     | HostContextRequest::FastModeSupported => {
                         return Err(CommandError::StaleTarget);
                     }
-                    HostContextRequest::SessionId => {
-                        HostContextResponse::SessionId(Arc::from(self.state.session.id.to_string()))
-                    }
+                    HostContextRequest::SessionId => HostContextResponse::SessionId(Arc::from(
+                        self.session_projection().id.to_string(),
+                    )),
                 };
                 return Ok((HostResponse::Context(response), vec![]));
             }
@@ -3482,6 +3491,7 @@ impl App {
                 vec![]
             }
             BuiltinOperation::Compact(_)
+            | BuiltinOperation::ReloadContext
             | BuiltinOperation::ChangeDirectory { .. }
             | BuiltinOperation::ToggleFast
             | BuiltinOperation::ToggleWorkflow => return Err(CommandError::StaleTarget),
@@ -3558,40 +3568,16 @@ impl App {
     pub(crate) fn submit_isolated_turn(
         &mut self,
         turn: makima_commands::IsolatedTurn,
-        admission: Option<&TrustedTarget>,
+        admission: Option<&PinnedCommandTarget>,
     ) -> Vec<Action> {
         let Some(admission) = admission else {
             self.flash(CommandError::StaleTarget.to_string());
             return vec![];
         };
-        let actor = match admission
-            .target
-            .validate_live()
-            .and_then(|()| admission.target.actor())
-        {
-            Ok(actor) => actor,
-            Err(error) => {
-                self.flash(error.to_string());
-                return vec![];
-            }
-        };
-        let history = match actor
-            .transcript(TranscriptRequest {
-                through_turn: None,
-                last_messages: COMMAND_TRANSCRIPT_MESSAGES,
-                max_bytes: COMMAND_TRANSCRIPT_BYTES,
-            })
-            .map_err(|error| error.to_string())
-            .and_then(|snapshot| {
-                serde_json::from_value::<Vec<Message>>(snapshot.messages)
-                    .map_err(|error| error.to_string())
-            }) {
-            Ok(history) => history,
-            Err(error) => {
-                self.flash(error);
-                return vec![];
-            }
-        };
+        if let Err(error) = admission.validate() {
+            self.flash(error);
+            return vec![];
+        }
         let images = turn
             .content
             .attachments
@@ -3601,26 +3587,7 @@ impl App {
                     .map(|media_type| ImageSource::new(media_type, Arc::clone(&attachment.data)))
             })
             .collect();
-        let system = if self.chats[0].agent_id == Some(admission.target.id()) {
-            self.btw_system
-                .as_ref()
-                .map(|system| String::clone(&system.load()))
-                .filter(|system| !system.is_empty())
-        } else {
-            None
-        }
-        .unwrap_or_else(|| btw::BTW_FALLBACK_SYSTEM.to_string());
-        self.start_btw_request(IsolatedTurnRequest {
-            provider: Arc::clone(&admission.template.provider),
-            model: (*admission.template.model).clone(),
-            history,
-            previous: None,
-            system,
-            question: turn.content.text.to_string(),
-            images,
-            session_id: admission.template.session_id.clone(),
-            cancel: makima_agent::CancelToken::none(),
-        });
+        self.start_btw_on(&admission.target, turn.content.text.to_string(), images);
         vec![]
     }
 
@@ -3634,7 +3601,7 @@ impl App {
     pub(crate) fn submit_command_turn(
         &mut self,
         turn: AgentTurn,
-        admission: Option<&TrustedTarget>,
+        admission: Option<&PinnedCommandTarget>,
     ) -> Vec<Action> {
         let Some(admission) = admission else {
             self.flash(CommandError::StaleTarget.to_string());
@@ -3664,7 +3631,14 @@ impl App {
                 })
             }),
         };
-        if let Err(error) = self.admit_user_turn(&admission.target, input, None) {
+        let actor = match admission.actor() {
+            Ok(actor) => actor,
+            Err(error) => {
+                self.flash(error);
+                return vec![];
+            }
+        };
+        if let Err(error) = self.admit_user_turn_on(&admission.target, actor, input, None) {
             self.flash(error);
         }
         vec![]
@@ -3678,9 +3652,7 @@ impl App {
     /// The app-side half of `/cd`, run once the coordinator has adopted the
     /// canonical path.
     pub(crate) fn apply_directory_change(&mut self, path: PathBuf) {
-        self.state
-            .session_mut()
-            .set_cwd(path.to_string_lossy().into_owned());
+        self.refresh_session_projection();
         self.status_bar.set_cwd(path.clone());
         self.fire_session_autocmd(
             SESSION_CWD_CHANGED_EVENT,
@@ -3701,9 +3673,9 @@ impl App {
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
+            &self.rewind_picker,
             &self.task_picker,
             &self.lua_picker,
-            &self.rewind_picker,
             &self.theme_picker,
             &self.model_picker,
             &self.login_picker,
@@ -3719,9 +3691,9 @@ impl App {
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
+            &mut self.rewind_picker,
             &mut self.task_picker,
             &mut self.lua_picker,
-            &mut self.rewind_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
             &mut self.login_picker,
@@ -3758,24 +3730,21 @@ impl App {
         }
     }
 
-    fn cleanup_subagent_input(&mut self, agent_id: makima_agent::AgentId) {
+    fn clear_agent_auth(&mut self, agent_id: AgentId) {
+        self.pending_auth.retain(|ask| ask.agent_id() != agent_id);
+    }
+
+    fn cleanup_subagent_input(&mut self, agent_id: AgentId) {
         self.input_queue.retain(|demand| {
             demand
                 .perm
                 .as_ref()
-                .is_none_or(|perm| perm.agent_id != Some(agent_id))
+                .is_none_or(|perm| perm.ask.agent_id() != agent_id)
         });
-        if self.permission_prompt.agent_id() == Some(agent_id) {
+        if self.permission_prompt.answer_key().map(AnswerKey::agent_id) == Some(agent_id) {
             self.permission_prompt.close();
         }
-        if matches!(
-            self.pending_input,
-            PendingInput::AuthRetry {
-                agent_id: Some(retry_agent_id)
-            } if retry_agent_id == agent_id
-        ) {
-            self.pending_input = PendingInput::None;
-        }
+        self.clear_agent_auth(agent_id);
         self.reconcile_active();
         let dirty = self.promote_deferred_if_ready();
         self.pending_dirty |= dirty;
@@ -3811,17 +3780,8 @@ impl App {
         }
         self.active_input = Some(demand.kind);
         if let Some(perm) = demand.perm {
-            self.permission_prompt.open_for_agent(
-                perm.id,
-                perm.tool,
-                perm.scopes,
-                perm.agent_id.and_then(|id| {
-                    self.live_chat_index
-                        .get(&id)
-                        .and_then(|&index| self.chats[index].subagent_id.clone())
-                }),
-                perm.agent_id,
-            );
+            self.permission_prompt
+                .open_request(perm.ask, perm.tool, perm.scopes, perm.is_subagent);
         }
         false
     }
@@ -3868,16 +3828,11 @@ impl App {
         let bell = match d.kind {
             InputKind::Permission => {
                 if let Some(perm) = d.perm {
-                    self.permission_prompt.open_for_agent(
-                        perm.id,
+                    self.permission_prompt.open_request(
+                        perm.ask,
                         perm.tool,
                         perm.scopes,
-                        perm.agent_id.and_then(|id| {
-                            self.live_chat_index
-                                .get(&id)
-                                .and_then(|&index| self.chats[index].subagent_id.clone())
-                        }),
-                        perm.agent_id,
+                        perm.is_subagent,
                     );
                 }
                 self.ui_config.bell.permission
@@ -3951,16 +3906,16 @@ impl App {
     fn active_permission_payload(&self) -> PermissionPayload {
         match &self.permission_prompt {
             PermissionPrompt::Open {
-                id,
+                ask,
                 tool,
                 scopes,
-                agent_id,
+                is_subagent,
                 ..
             } => PermissionPayload {
-                id: id.clone(),
+                ask: ask.clone(),
                 tool: tool.clone(),
                 scopes: scopes.clone(),
-                agent_id: *agent_id,
+                is_subagent: *is_subagent,
             },
             PermissionPrompt::Closed => unreachable!("permission_active requires an open prompt"),
         }
@@ -3999,15 +3954,7 @@ impl App {
     /// True when the agent is parked on user input. Drives the `needs_input`
     /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_active()
-            || self.pending_input != PendingInput::None
-            || self.question_active()
-    }
-
-    /// True while `recoverable_queue` holds user text captured at an agent
-    /// error; a background run would wipe it (`start_run` clears the queue).
-    pub(crate) fn holds_recovery_text(&self) -> bool {
-        !self.recoverable_queue.is_empty()
+        self.permission_active() || !self.pending_auth.is_empty() || self.question_active()
     }
 
     pub fn has_modal_overlay(&self) -> bool {
@@ -4015,6 +3962,7 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        self.rewind_guard = None;
         self.close_model_picker();
         self.close_command_palette();
         self.file_completion.close();
@@ -4121,7 +4069,6 @@ impl App {
     /// Finishes only the main turn's tools; descendants own their terminal events.
     fn terminalize_turn(&mut self, message: &str) {
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        self.sync_subagents();
         self.sync_task_picker();
     }
 
@@ -4132,6 +4079,12 @@ impl App {
     }
 
     fn route_paste(&mut self, text: &str) {
+        if self.rewind_pending {
+            return;
+        }
+        if self.rewind_picker.handle_paste(text) {
+            return;
+        }
         if self.permission_active() {
             self.permission_prompt.handle_paste(text);
             return;
@@ -4172,13 +4125,13 @@ impl App {
             };
         }
         try_picker!(self.file_picker);
-        try_picker!(self.task_picker);
         try_picker!(self.rewind_picker);
+        try_picker!(self.task_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if self.attach_pasted_images(text) {
+        if self.input_wake_pending || self.attach_pasted_images(text) {
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
@@ -4208,7 +4161,7 @@ impl App {
     fn handle_plan_form_action(&mut self, action: PlanFormAction) -> Vec<Action> {
         match action {
             PlanFormAction::UseCurrentModel => {
-                self.plan_form.use_current_model();
+                self.stage_plan_selection(ModelSelection::default());
                 vec![]
             }
             PlanFormAction::OpenModelPicker => {

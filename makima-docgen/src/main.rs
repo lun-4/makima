@@ -130,6 +130,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::ExitCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use color_eyre::eyre::{Result, eyre};
@@ -207,10 +208,16 @@ mod tests {
         let sinks = Sinks::default();
         let pages: [Page; 2] = [("one", generated_page), ("two", generated_page)];
 
-        let _ = run_generation(false, &pages, sinks.check(), sinks.write()).expect("generation");
+        assert_eq!(
+            run_generation(false, &pages, sinks.check(), sinks.write()).expect("generation"),
+            ExitCode::SUCCESS
+        );
         assert_eq!(sinks.counts(), (0, 2));
 
-        let _ = run_generation(true, &pages, sinks.check(), sinks.write()).expect("check");
+        assert_eq!(
+            run_generation(true, &pages, sinks.check(), sinks.write()).expect("check"),
+            ExitCode::SUCCESS
+        );
         assert_eq!(sinks.counts(), (2, 2));
     }
 }

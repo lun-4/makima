@@ -151,8 +151,9 @@ Ring the terminal bell (`\x07`) on these events. All values are `bool`, defaulti
 | `max_turn_output` | u32 | `32768` | 1024 | Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit |
 | `max_concurrent_agent_turns` | usize | `8` | 1 | Max agent turns running concurrently |
 | `max_agent_depth` | usize | `4` | 1 | Max nesting depth for child agents |
-| `max_children_per_agent` | usize | `16` | 1 | Max child agents created by one agent |
-| `max_live_agents` | usize | `64` | 1 | Max live agents in one outer session |
+| `max_children_per_agent` | usize | `16` | 1 | Max direct children with outstanding work |
+| `max_active_agents` | usize | `64` | 1 | Max agents with outstanding work in one outer session |
+| `max_retained_agents` | usize | `1024` | 1 | Max non-retired agent identities in one outer session; imported legacy agents are exempt |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |

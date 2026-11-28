@@ -1,17 +1,20 @@
 use makima_agent::SessionMailbox;
+use makima_agent::agent::TurnSetup;
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::manager::AgentResidency;
 use makima_agent::session_coordinator::{
     ConfigMutation, SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
     SessionOptionCatalog, builtin_option_definitions,
 };
 use makima_agent::session_options::SessionOptionError;
+use makima_agent::test_util::poll_until;
 use makima_agent::{
     ActorBackend, AgentId, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, DoneReason, History, ManagerError, ModeId, RunSettings, TurnCancellationReason,
-    TurnContext, TurnId, TurnOutcome, WorkKind,
+    ControlWork, DoneReason, GraphLifecycle, ManagerError, ModeId, RunSettings,
+    TurnCancellationReason, TurnContext, TurnId, TurnOutcome, WorkKind,
     actor::{
-        ActorEvent, ActorLifecycle, DeliveryStatus, EffectiveAgentConfig, TurnOrigin,
-        TurnProvenance,
+        ActorEvent, ActorHistory, AdmissionPreparation, AgentContextSnapshot, DeliveryStatus,
+        EffectiveAgentConfig, PreparedReadiness, TurnOrigin, TurnProvenance,
     },
     cancel::CancelToken,
     tools::{PLAN_WRITE_RESTRICTED, ToolContext, ToolRegistry},
@@ -45,6 +48,7 @@ use makima_storage::checkpoint::{
 };
 use makima_storage::id::{MakimaId, SessionRef};
 use makima_storage::plans::PLANS_DIR;
+use makima_storage::session_state::StoredAgentLifecycle;
 use makima_storage::sessions::{HistorySnapshot, read_prefs};
 use serde_json::{Value, json};
 use std::{
@@ -71,6 +75,7 @@ const UPDATED_MODEL: &str = "anthropic/claude-opus-4-20250514";
 const FAST_MODEL: &str = "anthropic/claude-opus-4-8";
 const MODEL_CATALOG_UNAVAILABLE: &str = "host model catalog is unavailable";
 const TOOLS_ONLY_MODE: &str = "pr5_tools_only";
+const BUNDLED_TASK_INSTRUCTIONS: &str = "admitted bundled task fixture instructions";
 
 async fn bounded<T>(future: impl Future<Output = T>, operation: &str) -> T {
     futures_lite::future::race(future, async {
@@ -113,15 +118,15 @@ async fn request_with_command_diagnostics(
 }
 
 async fn wait_for_gate_drop(request: &CapturedRequest, operation: &str) {
-    bounded(
-        async {
-            while !request.reply.is_disconnected() {
-                smol::future::yield_now().await;
-            }
-        },
-        operation,
-    )
-    .await;
+    assert!(
+        poll_until(TEST_TIMEOUT, || request
+            .reply
+            .is_disconnected()
+            .then_some(()))
+        .await
+        .is_some(),
+        "{operation} did not complete within {TEST_TIMEOUT:?}"
+    );
 }
 
 struct ScriptedProvider {
@@ -407,6 +412,7 @@ struct LuaInvocationBackend {
     observations: flume::Sender<(TurnId, TurnProvenance, Vec<Message>)>,
     invocation_cancel: Option<CancelToken>,
     sibling: Option<SiblingInvocation>,
+    setup: Option<TurnSetup>,
 }
 
 /// Receives the result of a sibling invocation of the fixture tool, run
@@ -416,20 +422,29 @@ struct LuaInvocationBackend {
 type SiblingInvocation = flume::Sender<Result<(), String>>;
 
 impl ActorBackend for LuaInvocationBackend {
+    fn admission_preparation(&self) -> Option<AdmissionPreparation> {
+        self.setup.clone().map(TurnSetup::preparation)
+    }
+
+    fn prepared_readiness(&self) -> Option<PreparedReadiness> {
+        self.setup.as_ref().map(|_| TurnSetup::readiness())
+    }
+
     fn run_turn<'a>(
         &'a mut self,
-        history: &'a mut History,
+        mut history: ActorHistory<'a>,
         context: TurnContext,
         mut input: AgentInput,
         _: WorkKind,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
         Box::pin(async move {
             if let Some(inbox) = &context.inbox {
+                let mut batch = history.input_batch().await;
                 for instruction in inbox.drain_instructions() {
-                    history.push(Message::user(instruction.message));
+                    batch.push(Message::user(instruction.message));
                 }
                 inbox.commit_completions(&mut |message| {
-                    history.push(message.clone());
+                    batch.push_observation(message.clone()).unwrap();
                     input.preamble.push(message);
                 });
                 inbox.instructions_submitted();
@@ -463,10 +478,27 @@ impl ActorBackend for LuaInvocationBackend {
                 self.context.mode = config.mode.clone();
                 self.context.mode_def = config.mode_def.clone().map(Arc::new);
             }
+            self.context.root_context = context
+                .admission
+                .as_ref()
+                .and_then(|admission| admission.prompt_inputs.as_ref())
+                .and_then(|inputs| inputs.root_context());
+            if self.setup.is_some() {
+                assert!(
+                    self.context
+                        .root_context
+                        .as_ref()
+                        .unwrap()
+                        .instructions
+                        .text
+                        .contains(BUNDLED_TASK_INSTRUCTIONS)
+                );
+            }
             self.context.cancel = self
                 .invocation_cancel
                 .clone()
                 .unwrap_or_else(|| context.cancel.clone());
+            self.context.execution_agent_id = Some(context.agent_id);
             self.context.managed_turn = context.managed_turn;
             let tool = &self.registry.get(self.tool).unwrap().tool;
             let execution = tool.parse(&json!({})).unwrap().execute(&self.context);
@@ -484,12 +516,13 @@ impl ActorBackend for LuaInvocationBackend {
             let _ = self.completed.send(result.clone());
             if let Some(inbox) = &context.inbox {
                 loop {
+                    let mut batch = history.input_batch().await;
                     for instruction in inbox.drain_instructions() {
-                        history.push(Message::user(instruction.message));
+                        batch.push(Message::user(instruction.message));
                     }
                     let mut observations = Vec::new();
                     inbox.commit_completions(&mut |message| {
-                        history.push(message.clone());
+                        batch.push_observation(message.clone()).unwrap();
                         observations.push(message);
                     });
                     if !observations.is_empty() {
@@ -522,7 +555,7 @@ impl ActorBackend for LuaInvocationBackend {
 
     fn run_control<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: &'a ControlWork,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -531,7 +564,7 @@ impl ActorBackend for LuaInvocationBackend {
 
     fn run_compact<'a>(
         &'a mut self,
-        _: &'a mut History,
+        _: ActorHistory<'a>,
         _: TurnContext,
         _: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
@@ -545,6 +578,7 @@ struct FixtureOptions {
     modes: Vec<makima_agent::ModeDefSpec>,
     limits: AgentLimits,
     bundled_tasks: bool,
+    real_orchestration: bool,
     authority_probes: bool,
     audience_ceiling: bool,
     nested_capture: bool,
@@ -556,21 +590,27 @@ struct FixtureOptions {
     sibling: Option<SiblingInvocation>,
 }
 
-async fn wait_for_child_reclamation(manager: &AgentManagerHandle, operation: &str) {
-    let wait = async {
-        loop {
-            if manager
-                .snapshot()
-                .iter()
-                .all(|node| node.parent_id.is_none())
-            {
-                return;
-            }
-            smol::future::yield_now().await;
-        }
-    };
-    let watchdog = async {
-        smol::Timer::after(TEST_TIMEOUT).await;
+async fn wait_for_retained_children(
+    manager: &AgentManagerHandle,
+    children: &[AgentId],
+    lifecycle: GraphLifecycle,
+    stored_lifecycle: StoredAgentLifecycle,
+    operation: &str,
+) {
+    let settled = poll_until(TEST_TIMEOUT, || {
+        children
+            .iter()
+            .all(|&id| {
+                manager.node(id).is_ok_and(|node| {
+                    node.graph_lifecycle == lifecycle
+                        && node.residency == AgentResidency::Dormant
+                        && node.actor.is_none()
+                }) && manager.runner_finished(id).unwrap()
+            })
+            .then_some(())
+    })
+    .await;
+    if settled.is_none() {
         let nodes: Vec<String> = manager
             .snapshot()
             .iter()
@@ -589,8 +629,21 @@ async fn wait_for_child_reclamation(manager: &AgentManagerHandle, operation: &st
             })
             .collect();
         panic!("{operation} did not complete: {nodes:?}");
-    };
-    futures_lite::future::race(wait, watchdog).await;
+    }
+    assert_eq!(
+        manager
+            .snapshot()
+            .iter()
+            .filter(|node| node.parent_id.is_some())
+            .count(),
+        children.len(),
+    );
+    for &id in children {
+        let node = manager.node(id).unwrap();
+        let record = manager.journal().agent(id).unwrap();
+        assert_eq!(record.lifecycle, stored_lifecycle);
+        assert_eq!(record.parent, node.parent_id);
+    }
 }
 
 async fn shutdown_manager(manager: &AgentManagerHandle) {
@@ -607,6 +660,7 @@ struct Fixture {
     completed: flume::Receiver<Result<(), String>>,
     observations: flume::Receiver<(TurnId, TurnProvenance, Vec<Message>)>,
     root_ticket: makima_agent::TurnTicket,
+    root_target: TrustedTarget,
 }
 
 impl Fixture {
@@ -631,6 +685,7 @@ impl Fixture {
             modes,
             limits,
             bundled_tasks,
+            real_orchestration,
             authority_probes,
             audience_ceiling,
             nested_capture,
@@ -744,6 +799,14 @@ impl Fixture {
         .unwrap();
         let (mut context, _events, _cancel) = common::ctx_with_provider(provider);
         context.mode = mode.clone();
+        if bundled_tasks {
+            context.cwd = state_dir.path().to_path_buf();
+            std::fs::write(
+                state_dir.path().join("AGENTS.md"),
+                BUNDLED_TASK_INSTRUCTIONS,
+            )
+            .unwrap();
+        }
         context.registry = Arc::clone(&registry);
         context.turn_bindings = Arc::new(makima_agent::tools::TurnToolBindings::capture(
             &registry,
@@ -816,32 +879,52 @@ impl Fixture {
             },
             mode.clone(),
         )
-        .with_mode_def(context.mode_def.as_deref().cloned());
+        .with_mode_def(context.mode_def.as_deref().cloned())
+        .with_context(AgentContextSnapshot::new(context.cwd.clone()));
+        let setup = bundled_tasks.then(|| TurnSetup {
+            registry: Arc::clone(&registry),
+            local_tools: Arc::clone(&context.local_tools),
+            mcp: context.mcp.clone(),
+            slots: host.event_handle().prompt_slot_source(),
+            modes: Arc::clone(&context.modes),
+            instructions: true,
+        });
         let manager = AgentManagerHandle::new(limits).unwrap();
         let (completed_tx, completed) = flume::bounded(1);
         let (observations_tx, observations) = flume::unbounded();
         let template = context.clone();
-        let root = manager
-            .create_root_with_config(Some(policy), Vec::new(), None, |_| {
-                Ok::<_, String>(Box::new(LuaInvocationBackend {
-                    registry: Arc::clone(&registry),
-                    context,
-                    tool,
-                    completed: completed_tx,
-                    observations: observations_tx,
-                    invocation_cancel,
-                    sibling,
-                }) as Box<dyn ActorBackend>)
-            })
+        let root =
+            smol::block_on(
+                manager.create_root_with_config(Some(policy), Vec::new(), None, |_| {
+                    Ok::<_, String>(Box::new(LuaInvocationBackend {
+                        registry: Arc::clone(&registry),
+                        context,
+                        tool,
+                        completed: completed_tx,
+                        observations: observations_tx,
+                        invocation_cancel,
+                        sibling,
+                        setup,
+                    }) as Box<dyn ActorBackend>)
+                }),
+            )
             .unwrap();
-        let mut services = RegisteredOrchestrationTargets::new(vec![TrustedTarget {
+        let target = TrustedTarget {
             target: root.clone(),
             template,
-        }]);
-        services.config_mutations = config_mutations;
-        services.completion = completion;
-        host.event_handle()
-            .install_orchestration_services(Arc::new(services));
+        };
+        let services: Arc<dyn OrchestrationServices> = if real_orchestration {
+            let services = AgentOrchestration::new(Arc::default());
+            services.register_root(target.clone(), config_mutations);
+            services.select(Some(root.clone()));
+            Arc::new(services)
+        } else {
+            let mut services = RegisteredOrchestrationTargets::new(vec![target.clone()]);
+            services.config_mutations = config_mutations;
+            services.completion = completion;
+            Arc::new(services)
+        };
+        host.event_handle().install_orchestration_services(services);
         host.wait_for_worker_barrier_for_test();
         let root_ticket = root
             .actor()
@@ -866,6 +949,7 @@ impl Fixture {
             completed,
             observations,
             root_ticket,
+            root_target: target,
         }
     }
 
@@ -1776,7 +1860,12 @@ fn trusted_command_controls_real_root_and_rejects_foreign_task_context() {
                 .effective_config()
                 .unwrap();
             if command == "/pr5_capture" {
-                let plans = fixture._state_dir.path().join(PLANS_DIR);
+                let plans = fixture
+                    ._state_dir
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(PLANS_DIR);
                 assert!(config.mode.plan_path().unwrap().starts_with(plans));
             } else {
                 assert_eq!(config.mode, AgentMode::Build);
@@ -2010,7 +2099,7 @@ fn trusted_spawn_inherits_configuration_committed_in_same_invocation() {
         assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::Low));
         assert!(config.fast);
         assert!(
-            matches!(&config.mode, AgentMode::Plan(path) if path.starts_with(fixture._state_dir.path())),
+            matches!(&config.mode, AgentMode::Plan(path) if path.starts_with(fixture._state_dir.path().canonicalize().unwrap())),
             "{:?}",
             config.mode
         );
@@ -2234,9 +2323,11 @@ fn tool_context_rejects_foreign_manager_handles_captured_by_trusted_command(rest
                         observations: flume::unbounded().0,
                         invocation_cancel: None,
                         sibling: None,
+                        setup: None,
                     }) as Box<dyn ActorBackend>)
                 },
             )
+            .await
             .unwrap();
         let ticket = child
             .actor()
@@ -2458,15 +2549,11 @@ fn focus_reads_and_keybind_targets_ignore_later_focus_changes() {
                 .unwrap()
                 .thinking
         };
-        bounded(
-            async {
-                while thinking(&pinned) != ThinkingConfig::Effort(Effort::Low) {
-                    smol::future::yield_now().await;
-                }
-            },
-            "pinned keybind target update",
-        )
-        .await;
+        poll_until(TEST_TIMEOUT, || {
+            (thinking(&pinned) == ThinkingConfig::Effort(Effort::Low)).then_some(())
+        })
+        .await
+        .expect("pinned keybind target did not update");
         assert_eq!(thinking(&focused), ThinkingConfig::Off);
         shutdown_manager(&focused.manager).await;
         shutdown_manager(&pinned.manager).await;
@@ -2570,23 +2657,18 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
                     .into_iter()
                     .find(|node| node.parent_id.is_some())
                     .unwrap();
-                let child_actor = fixture.manager.actor(child.agent_id).unwrap();
                 let (finished, result) = flume::bounded(1);
                 let host = fixture._host;
                 std::thread::spawn(move || {
                     let unloaded = host.unload(TOOL);
                     finished.send((host, unloaded)).unwrap();
                 });
-                bounded(
-                    async {
-                        while child_actor.snapshot().lifecycle == ActorLifecycle::Open {
-                            smol::future::yield_now().await;
-                        }
-                    },
-                    "plugin revocation child cleanup",
-                )
-                .await;
-                Some(result)
+                poll_until(TEST_TIMEOUT, || {
+                    (!fixture.manager.is_live(child.agent_id)).then_some(())
+                })
+                .await
+                .expect("plugin revocation did not detach child authority");
+                Some((result, child.agent_id))
             } else {
                 cancel.cancel();
                 let result = bounded(
@@ -2658,11 +2740,19 @@ fn tool_ctx_reads_the_admitted_model_after_the_agent_commits_a_change(
                 );
             }
         }
-        if let Some(unloading) = unloading {
+        if let Some((unloading, child)) = unloading {
             let (_host, result) = bounded(unloading.recv_async(), "plugin unload completion")
                 .await
                 .unwrap();
             result.unwrap();
+            wait_for_retained_children(
+                &fixture.manager,
+                &[child],
+                GraphLifecycle::Dormant,
+                StoredAgentLifecycle::Open,
+                "plugin revocation retains detached child",
+            )
+            .await;
         }
         bounded(fixture.root_ticket.wait(), "root turn settlement").await;
         shutdown_manager(&fixture.manager).await;
@@ -2982,6 +3072,83 @@ fn trusted_ticket_reads_survive_close_from_fresh_command_context() {
             .unwrap(),
             Ok(())
         );
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
+fn closed_child_callback_posts_stay_in_the_child_chat() {
+    const POST: &str = "closed child callback post";
+    const ACK: &str = "closed child callback posted";
+    smol::block_on(async {
+        let fixture = Fixture::start("post_callback_root", "");
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "root setup")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        bounded(fixture.root_ticket.wait(), "root settlement").await;
+        let (template, events, _cancel) = common::ctx_with_canned_provider();
+        fixture
+            ._host
+            .event_handle()
+            .install_orchestration_services(Arc::new(RegisteredOrchestrationTargets::new(vec![
+                TrustedTarget {
+                    target: fixture.manager.root().unwrap(),
+                    template,
+                },
+            ])));
+        fixture._host.load_source("post_callback", &format!(r#"
+            makima.api.register_command({{
+                name = "/post_closed_child", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.spawn(ctx, {{ inherit_provider = true, tools = {{}}, show = false }}))
+                    assert(child:on_close(ctx, function(event, callback_ctx)
+                        local ok, err = makima.ui.post(callback_ctx, "{POST}")
+                        makima.ui.flash(ok and "{ACK}" or err)
+                    end))
+                    assert(child:close(ctx))
+                end,
+            }})
+        "#)).unwrap();
+        let flashes = fixture._host.ui_action_rx();
+        assert_eq!(
+            run_command(
+                &fixture._host.command_registry(),
+                "/post_closed_child",
+                0,
+                None
+            )
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap(),
+            Ok(())
+        );
+        let ack = bounded(
+            async {
+                loop {
+                    if let UiAction::Flash(message) = flashes.recv_async().await.unwrap() {
+                        break message;
+                    }
+                }
+            },
+            "closed callback acknowledgement",
+        )
+        .await;
+        assert_eq!(ack, ACK);
+        let posts: Vec<_> = events
+            .drain()
+            .filter(|envelope| matches!(envelope.event, makima_agent::AgentEvent::Post(_)))
+            .collect();
+        assert_eq!(posts.len(), 1);
+        let owner = posts[0]
+            .subagent
+            .as_ref()
+            .expect("child-owned callback post");
+        let record = fixture.manager.journal().agent(owner.agent_id).unwrap();
+        assert_eq!(record.parent, Some(fixture.manager.root().unwrap().id()));
+        assert_eq!(record.transcript_key, owner.parent_tool_use_id);
+        assert_eq!(record.lifecycle, StoredAgentLifecycle::Closed);
         shutdown_manager(&fixture.manager).await;
     });
 }
@@ -3834,6 +4001,7 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
         const BEGIN: &str = "/pr5_reload_begin";
         const EXERCISE: &str = "/pr5_reload_exercise";
         const REPLY: &str = "resources survived";
+        const AGENTS_PER_BEGIN: usize = 2;
         let fixture = Fixture::start("pr5_reload_root", "");
         assert_eq!(
             bounded(fixture.completed.recv_async(), "reload root completion")
@@ -3939,6 +4107,14 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
         )
         .await
         .unwrap();
+        let children: Vec<_> = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .filter(|node| node.parent_id.is_some())
+            .map(|node| node.agent_id)
+            .collect();
+        assert_eq!(children.len(), AGENTS_PER_BEGIN * 2);
         fixture
             ._host
             .queue_load_source_for_test(OWNER, "")
@@ -3952,13 +4128,133 @@ fn rejected_reload_preserves_agents_and_subscriptions(candidate: &str) {
             "accepted reload callback cancellation",
         )
         .await;
-        wait_for_child_reclamation(&fixture.manager, "accepted reload closes owned agents").await;
+        wait_for_retained_children(
+            &fixture.manager,
+            &children,
+            GraphLifecycle::Dormant,
+            StoredAgentLifecycle::Open,
+            "accepted reload retains detached owned agents",
+        )
+        .await;
+        shutdown_manager(&fixture.manager).await;
+    });
+}
+
+#[test]
+fn reload_settles_running_child_once_before_wake() {
+    const OWNER: &str = "reload_running_child";
+    const START: &str = "/reload_running_child_start";
+    const WAKE: &str = "/reload_running_child_wake";
+    const NEXT_PROMPT: &str = "fresh turn after reload";
+    smol::block_on(async {
+        let fixture = Fixture::start_with_options(
+            "reload_running_child_root",
+            FixtureOptions {
+                real_orchestration: true,
+                ..Default::default()
+            },
+            "",
+        );
+        assert_eq!(
+            bounded(fixture.completed.recv_async(), "root completion")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        fixture._host.load_source(OWNER, r#"
+            makima.api.register_command({
+                name = "/reload_running_child_start", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.spawn(ctx, { inherit_provider = true, silent = true, tools = {} }))
+                    assert(child:send(ctx, "running before reload", { when = "idle" }))
+                end,
+            })
+        "#).unwrap();
+        let run = |command: &str| {
+            run_command(
+                &fixture._host.command_registry(),
+                command,
+                0,
+                Some(fixture.root_target.clone()),
+            )
+        };
+        assert_eq!(run(START).recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let active_request = fixture.request().await;
+        let child_id = fixture
+            .manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id.is_some())
+            .unwrap()
+            .agent_id;
+        let child = fixture.manager.lookup(child_id).unwrap();
+        let ticket = fixture
+            .manager
+            .latest_retained_turn_ticket(&child)
+            .unwrap()
+            .unwrap();
+        let turn = ticket.turn_id();
+        assert!(ticket.peek().is_none());
+        fixture._host.queue_load_source_for_test(OWNER, &format!(r#"
+            makima.api.register_command({{
+                name = "{WAKE}", tui_only = false,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.get(ctx, "{child_id}"))
+                    assert(child:send(ctx, "{NEXT_PROMPT}", {{ when = "idle", after_turn = "{turn}" }}))
+                end,
+            }})
+        "#)).unwrap().recv_timeout(TEST_TIMEOUT).unwrap().unwrap();
+        wait_for_gate_drop(&active_request, "reload cancellation").await;
+        let result = bounded(ticket.wait_result(), "retained child ticket").await;
+        assert!(matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                reason: TurnCancellationReason::Shutdown,
+                ..
+            }
+        ));
+        wait_for_retained_children(
+            &fixture.manager,
+            &[child_id],
+            GraphLifecycle::Dormant,
+            StoredAgentLifecycle::Open,
+            "reload detach",
+        )
+        .await;
+        assert_eq!(
+            child.turn_ticket(turn).unwrap().peek_result(),
+            Some(result.clone())
+        );
+
+        let command = run(WAKE);
+        let fresh = request_with_command_diagnostics(
+            &fixture.requests,
+            &command,
+            "fresh request after wake",
+        )
+        .await;
+        assert_eq!(
+            fresh.messages.last().and_then(Message::first_text_content),
+            Some(NEXT_PROMPT)
+        );
+        fresh.reply.send(common::canned_reply(FIRST_REPLY)).unwrap();
+        assert_eq!(command.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
+        let next = child.actor().unwrap().latest_ticket().unwrap();
+        assert_ne!(next.turn_id(), turn);
+        assert!(matches!(
+            bounded(next.wait(), "fresh turn settlement").await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert_eq!(child.turn_ticket(turn).unwrap().peek_result(), Some(result));
+        assert!(fixture.requests.is_empty());
         shutdown_manager(&fixture.manager).await;
     });
 }
 
 #[test]
 fn repeated_deferred_subtrees_close_and_release_provider_gates() {
+    const CYCLES: usize = 4;
+    const AGENTS_PER_CYCLE: usize = 2;
     smol::block_on(async {
         let fixture = Fixture::start("pr5_resource_root", "");
         assert_eq!(
@@ -3992,7 +4288,7 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
                 end,
             })
         "#).unwrap();
-        for _ in 0..4 {
+        for cycle in 1..=CYCLES {
             let command = run_command(
                 &fixture._host.command_registry(),
                 "/pr5_resource_cycle",
@@ -4015,13 +4311,28 @@ fn repeated_deferred_subtrees_close_and_release_provider_gates() {
             } else {
                 (b, a)
             };
+            let children: Vec<_> = fixture
+                .manager
+                .snapshot()
+                .into_iter()
+                .filter(|node| node.parent_id.is_some())
+                .map(|node| node.agent_id)
+                .collect();
+            assert_eq!(children.len(), cycle * AGENTS_PER_CYCLE);
             parent
                 .reply
                 .send(common::canned_reply("cycle finished"))
                 .unwrap();
             assert_eq!(command.recv_timeout(TEST_TIMEOUT).unwrap(), Ok(()));
             wait_for_gate_drop(&descendant, "deferred descendant provider cancellation").await;
-            wait_for_child_reclamation(&fixture.manager, "deferred subtree graph drain").await;
+            wait_for_retained_children(
+                &fixture.manager,
+                &children,
+                GraphLifecycle::Closed,
+                StoredAgentLifecycle::Closed,
+                "deferred subtree closes and releases runners",
+            )
+            .await;
         }
         fixture._host.unload("pr5_resource_cycles").unwrap();
         shutdown_manager(&fixture.manager).await;
@@ -4610,6 +4921,9 @@ fn managed_capacity_one_delivers_child_once_unless_waited(bundled_tasks: bool, w
         let request = bounded(fixture.requests.recv_async(), "capacity-one child request")
             .await
             .unwrap();
+        if bundled_tasks {
+            assert!(request.system.contains(BUNDLED_TASK_INSTRUCTIONS));
+        }
         if wait {
             assert!(fixture.root_ticket.peek().is_none());
             assert!(fixture.completed.is_empty());
@@ -4805,6 +5119,7 @@ fn managed_task_spawn_survives_origin_invocation_completion() {
         let gate = bounded(fixture.requests.recv_async(), "persistent child request")
             .await
             .unwrap();
+        assert!(gate.system.contains(BUNDLED_TASK_INSTRUCTIONS));
         assert_eq!(
             bounded(fixture.completed.recv_async(), "spawn caller completion")
                 .await

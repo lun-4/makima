@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,11 +96,7 @@ impl CompletionCallback {
 
 impl CompletionInvalidation {
     pub(super) fn prepare(self) -> Option<CompletionCallback> {
-        self.session
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .close()
+        self.session.state.lock_unpoisoned().close()
     }
 }
 
@@ -383,7 +380,7 @@ impl CompletionPublisher {
     ) -> Result<CompletionSnapshot, CompletionError> {
         let core = self.core.upgrade().ok_or(CompletionError::StaleSession)?;
         let (snapshot, sink) = {
-            let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = core.state.lock_unpoisoned();
             let current = current_request(&mut state, self.request_id)?;
             let entry = current
                 .providers
@@ -423,7 +420,7 @@ impl CompletionPublisher {
     ) -> Result<CompletionSnapshot, CompletionError> {
         let core = self.core.upgrade().ok_or(CompletionError::StaleSession)?;
         let (snapshot, sink) = {
-            let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = core.state.lock_unpoisoned();
             let current = current_request(&mut state, self.request_id)?;
             let entry = current
                 .providers
@@ -736,7 +733,7 @@ impl CompletionSession {
         );
         let core = Arc::clone(&self.owner.core);
         let (context, cancellation, request_id, providers, old_callback) = {
-            let mut state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = core.state.lock_unpoisoned();
             if state.closed {
                 return Box::pin(async { CompletionResult::Stale });
             }
@@ -810,8 +807,7 @@ impl CompletionSession {
                 {
                     Ok(()) => {
                         let needs_finish = {
-                            let state =
-                                core.state.lock().unwrap_or_else(|error| error.into_inner());
+                            let state = core.state.lock_unpoisoned();
                             state.current_request.as_ref().is_some_and(|current| {
                                 current.id == request_id
                                     && current
@@ -840,7 +836,7 @@ impl CompletionSession {
                     }
                 }
             }
-            let state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+            let state = core.state.lock_unpoisoned();
             if state.closed
                 || state
                     .current_request
@@ -867,7 +863,7 @@ impl CompletionSession {
             .upgrade()
             .ok_or(CompletionError::StaleCommand)?;
         let (command_registry_id, command_id, producer_id, target_id, invoked_name) = {
-            let state = core.state.lock().unwrap_or_else(|error| error.into_inner());
+            let state = core.state.lock_unpoisoned();
             if state.closed || candidate.session_id != core.id {
                 return Err(CompletionError::StaleSession);
             }
@@ -889,10 +885,7 @@ impl CompletionSession {
         if command_registry_id != registry.id || target_id.0 != registry.id {
             return Err(CompletionError::StaleCommand);
         }
-        let registry_state = registry
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let registry_state = registry.state.lock_unpoisoned();
         let Some(winner) = registry_state.winners.get(&invoked_name) else {
             return Err(CompletionError::StaleCommand);
         };
@@ -911,12 +904,7 @@ impl CompletionSession {
 
     pub fn accept(&self, candidate: CompletionCandidate) -> Result<(), CompletionError> {
         let callback = {
-            let mut state = self
-                .owner
-                .core
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.owner.core.state.lock_unpoisoned();
             if state.closed || candidate.session_id != self.owner.core.id {
                 return Err(CompletionError::StaleSession);
             }
@@ -957,13 +945,7 @@ impl CompletionSession {
     }
 
     pub fn cancel(&self) -> Result<(), CompletionError> {
-        let callback = self
-            .owner
-            .core
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .close();
+        let callback = self.owner.core.state.lock_unpoisoned().close();
         callback.map_or(Ok(()), CompletionCallback::call)
     }
 
@@ -973,12 +955,7 @@ impl CompletionSession {
         event: CompletionLifecycleEvent,
     ) -> Result<(), CompletionError> {
         let callback = {
-            let state = self
-                .owner
-                .core
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let state = self.owner.core.state.lock_unpoisoned();
             if state.closed || candidate.session_id != self.owner.core.id {
                 return Err(CompletionError::StaleSession);
             }
@@ -1070,12 +1047,7 @@ fn providers_for(
 
 impl Drop for CompletionSessionOwner {
     fn drop(&mut self) {
-        let callback = self
-            .core
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .close();
+        let callback = self.core.state.lock_unpoisoned().close();
         if let Some(callback) = callback {
             let _ = callback.call();
         }
@@ -1087,8 +1059,7 @@ impl Drop for CompletionSessionCore {
         if let Some(registry) = self.registry.upgrade() {
             registry
                 .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .lock_unpoisoned()
                 .completion_sessions
                 .remove(&self.id);
         }

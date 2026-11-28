@@ -9,19 +9,21 @@ use std::{
 use makima_commands::{
     AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
     CommandAttachment, CommandBehavior, CommandCompletion, CommandContent, CommandError,
-    CommandFuture, CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext,
-    CompletionError, CompletionItem, FrontendFeedback, HostContextRequest, HostContextResponse,
-    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
-    TargetCapabilities, TargetCapability, resolve_path,
+    CommandFuture, CommandHost, CommandInvocation, CommandOutcome, CommandRegistry,
+    CompletionContext, CompletionError, CompletionItem, FrontendFeedback, HostContextRequest,
+    HostContextResponse, HostRequest, HostResponse, Producer, ProducerPrecedence, Registration,
+    RegistrationError, TargetCapabilities, TargetCapability, resolve_path,
 };
 use makima_config::ProjectConfig;
 use makima_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
 use makima_providers::{ImageMediaType, ImageSource, Model, ProviderRegistry};
 
-use crate::headless::{InteractiveControl, InteractiveControlSender};
+use crate::config_change::ConfigChangeError;
+use crate::headless::InteractiveControlSender;
 use crate::session_coordinator::SessionCoordinatorHandle;
 use crate::session_options::{FAST_OPTION_ID, MODEL_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
-use crate::{AgentInput, McpPromptRef};
+use crate::{AgentActorHandle, AgentInput, McpPromptRef};
+use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -35,6 +37,8 @@ const LOCAL_COMMAND_ATTACHMENTS: &str = "local commands cannot include non-text 
 pub const NONINTERACTIVE_MODEL_USAGE: &str =
     "Usage: /model [spec] [thinking=value] [fast=true|false]";
 pub const FAST_UNSUPPORTED: &str = "Fast mode is unsupported by the current model";
+pub const CONTEXT_RELOADED: &str = "Recorded context reloaded";
+pub const SESSION_RESET_UNSUPPORTED: &str = "this frontend cannot replace the session";
 
 pub fn command_images(attachments: &[CommandAttachment]) -> Result<Vec<ImageSource>, String> {
     attachments
@@ -82,16 +86,15 @@ pub fn portable_capabilities() -> TargetCapabilities {
     ])
 }
 
-/// What a [`SessionCommandHost`] can run: the portable set plus replacing
-/// the session's history.
+/// Session command capabilities for frontends that handle replacement or return guidance.
 pub fn session_capabilities() -> TargetCapabilities {
-    portable_capabilities().union(TargetCapabilities::from_capability(
+    portable_capabilities().union(TargetCapabilities::from_slice(&[
         TargetCapability::SessionReplacement,
-    ))
+        TargetCapability::ReloadContext,
+    ]))
 }
 
 pub struct SessionCommandHost {
-    control_tx: InteractiveControlSender,
     coordinator: SessionCoordinatorHandle,
     providers: Arc<ProviderRegistry>,
     reset_session_guidance: Option<Arc<str>>,
@@ -100,12 +103,11 @@ pub struct SessionCommandHost {
 
 impl SessionCommandHost {
     pub fn new(
-        control_tx: InteractiveControlSender,
+        _control_tx: InteractiveControlSender,
         coordinator: SessionCoordinatorHandle,
         providers: Arc<ProviderRegistry>,
     ) -> Self {
         Self {
-            control_tx,
             coordinator,
             providers,
             reset_session_guidance: None,
@@ -125,6 +127,65 @@ impl SessionCommandHost {
         self
     }
 
+    /// Runs session-only effects without resolving a durable agent reference.
+    /// Agent-local config operations belong to the caller's pinned config FIFO.
+    pub fn request_for_actor(
+        &self,
+        request: HostRequest,
+        actor: AgentActorHandle,
+        validate: impl Fn() -> Result<(), ConfigChangeError> + Send + Sync + 'static,
+        publication: CheckpointPublication,
+        claim: CheckpointClaim,
+    ) -> CommandFuture<Result<HostResponse, CommandError>> {
+        if let Err(error) = validate() {
+            return Box::pin(async move { Err(producer_error(error)) });
+        }
+        match request {
+            HostRequest::Builtin(BuiltinOperation::ResetSession) => {
+                let response = self.reset_response();
+                Box::pin(async move {
+                    validate().map_err(producer_error)?;
+                    response
+                })
+            }
+            HostRequest::Builtin(BuiltinOperation::ToggleYolo) => {
+                let coordinator = self.coordinator.clone();
+                Box::pin(async move {
+                    coordinator
+                        .toggle_yolo_for_actor_with_claim(actor, validate, publication, claim)
+                        .await
+                        .map_err(producer_error)?;
+                    Ok(HostResponse::Completed)
+                })
+            }
+            HostRequest::Builtin(BuiltinOperation::ReloadContext) => {
+                let ticket = self.coordinator.reserve_context_reload_for_actor(
+                    actor,
+                    validate,
+                    publication,
+                    claim,
+                );
+                Box::pin(async move {
+                    ticket
+                        .map_err(producer_error)?
+                        .commit()
+                        .await
+                        .map_err(producer_error)?;
+                    Ok(HostResponse::Completed)
+                })
+            }
+            request @ (HostRequest::Context(_)
+            | HostRequest::Builtin(
+                BuiltinOperation::Compact(_) | BuiltinOperation::QuickQuestion { .. },
+            )) => self.request(request),
+            HostRequest::Builtin(operation) => Box::pin(async move {
+                Err(CommandError::Producer(Arc::from(format!(
+                    "unsupported builtin operation: {operation:?}"
+                ))))
+            }),
+        }
+    }
+
     fn toggle_option(&self, id: &'static str) -> CommandFuture<Result<HostResponse, CommandError>> {
         let coordinator = self.coordinator.clone();
         Box::pin(async move {
@@ -136,24 +197,11 @@ impl SessionCommandHost {
         })
     }
 
-    fn control(
-        &self,
-        make: impl FnOnce(flume::Sender<Result<(), String>>) -> InteractiveControl + Send + 'static,
-    ) -> CommandFuture<Result<HostResponse, CommandError>> {
-        let control_tx = self.control_tx.clone();
-        Box::pin(async move {
-            let (reply, response) = flume::bounded(1);
-            control_tx
-                .send(make(reply))
-                .await
-                .map_err(|_| CommandError::StaleTarget)?;
-            response
-                .recv_async()
-                .await
-                .map_err(|_| CommandError::StaleTarget)?
-                .map(|()| HostResponse::Completed)
-                .map_err(|error| CommandError::Producer(Arc::from(error)))
-        })
+    fn reset_response(&self) -> Result<HostResponse, CommandError> {
+        self.reset_session_guidance
+            .clone()
+            .map(|guidance| HostResponse::FrontendFeedback(FrontendFeedback::Text(guidance)))
+            .ok_or_else(|| producer_error(SESSION_RESET_UNSUPPORTED))
     }
 }
 
@@ -208,17 +256,17 @@ impl makima_commands::CommandHost for SessionCommandHost {
             BuiltinOperation::Compact(instructions) => {
                 Box::pin(async move { Ok(HostResponse::ManualCompaction(instructions)) })
             }
-            BuiltinOperation::ResetSession => match self.reset_session_guidance.clone() {
-                Some(guidance) => Box::pin(async move {
-                    Ok(HostResponse::FrontendFeedback(FrontendFeedback::Text(
-                        guidance,
-                    )))
-                }),
-                None => self.control(InteractiveControl::Reset),
-            },
+            BuiltinOperation::ResetSession => {
+                let response = self.reset_response();
+                Box::pin(async move { response })
+            }
             BuiltinOperation::ToggleYolo => self.toggle_option(YOLO_OPTION_ID),
             BuiltinOperation::ToggleFast => self.toggle_option(FAST_OPTION_ID),
             BuiltinOperation::ToggleWorkflow => self.toggle_option(WORKFLOW_OPTION_ID),
+            BuiltinOperation::ReloadContext => Box::pin(async move {
+                coordinator.reload_context().await.map_err(producer_error)?;
+                Ok(HostResponse::Completed)
+            }),
             BuiltinOperation::ChangeDirectory { path } => Box::pin(async move {
                 let canonical = coordinator
                     .change_directory(path)
@@ -551,6 +599,7 @@ impl CommandBehavior for BuiltinBehavior {
                 makima_commands::BuiltinId::Workflow => BuiltinOperation::ToggleWorkflow,
                 makima_commands::BuiltinId::Exit => BuiltinOperation::Exit,
                 makima_commands::BuiltinId::Reload => BuiltinOperation::Reload,
+                makima_commands::BuiltinId::ReloadContext => BuiltinOperation::ReloadContext,
                 makima_commands::BuiltinId::Trust => BuiltinOperation::Trust,
             };
             match invocation
@@ -838,6 +887,7 @@ mod tests {
     use makima_commands::CommandHost;
     use makima_commands::ModelSelection;
     use makima_config::ModelPolicy;
+    use makima_domain::LockExt;
     use makima_providers::{Effort, ThinkingConfig};
     use makima_storage::checkpoint::ClaimingWriter;
     use tempfile::TempDir;
@@ -916,6 +966,9 @@ mod tests {
             coordinator.clone(),
         );
         smol::block_on(handle.initialized_root()).unwrap();
+        coordinator
+            .bind_permissions(Arc::clone(&handle.permissions))
+            .unwrap();
         (coordinator, handle)
     }
 
@@ -929,10 +982,7 @@ mod tests {
         ) -> CommandFuture<Result<makima_commands::HostResponse, CommandError>> {
             match request {
                 HostRequest::Builtin(operation) => {
-                    self.0
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .push(operation);
+                    self.0.lock_unpoisoned().push(operation);
                     Box::pin(async { Ok(makima_commands::HostResponse::Completed) })
                 }
                 HostRequest::Context(request) => Box::pin(async move {
@@ -1061,7 +1111,7 @@ mod tests {
             ))
         ));
 
-        let operations = host.0.lock().unwrap_or_else(|error| error.into_inner());
+        let operations = host.0.lock_unpoisoned();
         assert_eq!(operations.len(), 2);
         assert_eq!(
             operations[0],
@@ -1094,6 +1144,7 @@ mod tests {
             r#"/theme "da"'rk'"#,
             "/btw explain this",
             "/fast",
+            "/reload-context",
         ] {
             let result = smol::block_on(registry.dispatch_input(&target, input.into()));
             assert!(matches!(
@@ -1103,7 +1154,7 @@ mod tests {
         }
 
         assert_eq!(
-            *host.0.lock().unwrap_or_else(|error| error.into_inner()),
+            *host.0.lock_unpoisoned(),
             vec![
                 makima_commands::BuiltinOperation::OpenModelPicker,
                 makima_commands::BuiltinOperation::SetModel {
@@ -1124,6 +1175,7 @@ mod tests {
                     attachments: Arc::from([]),
                 },
                 makima_commands::BuiltinOperation::ToggleFast,
+                makima_commands::BuiltinOperation::ReloadContext,
             ]
         );
 
@@ -1135,13 +1187,7 @@ mod tests {
                 CommandError::Producer(message)
             )) if message.as_ref() == NONINTERACTIVE_MODEL_USAGE
         ));
-        assert!(
-            portable_host
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-        );
+        assert!(portable_host.0.lock_unpoisoned().is_empty());
     }
 
     const STRUCTURED_MODEL_SPEC: &str = "openai/gpt-5";
@@ -1225,11 +1271,12 @@ mod tests {
         assert!(names.contains(&makima_commands::COMPACT_COMMAND_NAME));
         assert!(!names.contains(&"/new"));
         assert!(!names.contains(&"/clear"));
+        assert!(!names.contains(&"/reload-context"));
         assert!(matches!(
             smol::block_on(registry.dispatch_input(&target, "/compact".into())),
             makima_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
-        for input in ["/new", "/clear"] {
+        for input in ["/new", "/clear", "/reload-context"] {
             assert!(matches!(
                 smol::block_on(registry.dispatch_input(&target, input.into())),
                 makima_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
@@ -1237,6 +1284,17 @@ mod tests {
                 )) if name.as_ref() == input
             ));
         }
+        let host = Arc::new(RecordingCommandHost::default());
+        let session = registry.bind_target(session_capabilities(), host.clone());
+        assert!(registry.resolve_for(&session, "/reload-context").is_ok());
+        assert!(matches!(
+            smol::block_on(registry.dispatch_input(&session, "/reload-context".into())),
+            makima_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+        ));
+        assert_eq!(
+            *host.0.lock().unwrap(),
+            vec![BuiltinOperation::ReloadContext]
+        );
     }
 
     #[test]
@@ -1332,6 +1390,24 @@ mod tests {
         assert_eq!(
             option_value(&coordinator, crate::session_options::MODEL_OPTION_ID),
             model.spec().into()
+        );
+        let registry = CommandRegistry::new();
+        let _commands =
+            StandardCommands::register(&registry, &[], StandardCompletions::default()).unwrap();
+        let target = registry.bind_target(session_capabilities(), Arc::new(host));
+        let reloaded = smol::block_on(registry.dispatch_input(&target, "/reload-context".into()));
+        assert!(
+            matches!(
+                reloaded,
+                makima_commands::InputDispatch::Dispatched(CommandOutcome::Completed)
+            ),
+            "{reloaded:?}"
+        );
+        let root = smol::block_on(handle.initialized_root()).unwrap();
+        assert!(
+            crate::context::root_context(&root.state_access())
+                .unwrap()
+                .is_some()
         );
         smol::block_on(handle.task.cancel());
         smol::block_on(coordinator.close()).unwrap();

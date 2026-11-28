@@ -1,17 +1,19 @@
 use arc_swap::ArcSwapOption;
 use makima_agent::config_change::ConfigChangeError;
+use makima_agent::manager::AgentIncarnation;
 use makima_agent::session_coordinator::ConfigMutation;
 use makima_agent::{
-    AgentRef,
+    AgentActorHandle, AgentReactivator, AgentRef,
     agent::LoadedInstructions,
     cancel::CancelToken,
     tools::{Deadline, ToolContext, TurnToolBindings},
 };
 use makima_commands::CommandInvocation;
+use makima_domain::LockExt;
 use makima_providers::Message;
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::sessions::HistorySnapshot;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use super::{
     CommandRunner, ConfigMutationReserver, OrchestrationServices, TrustedTarget, TurnCompletion,
@@ -31,6 +33,7 @@ struct RootTarget {
 struct ChildTarget {
     target: TrustedTarget,
     history_key: String,
+    actor_identity: Arc<()>,
 }
 
 #[derive(Default)]
@@ -38,6 +41,7 @@ struct Targets {
     roots: Vec<RootTarget>,
     children: Vec<ChildTarget>,
     selected: Option<AgentRef>,
+    reactivator: Option<Arc<dyn AgentReactivator>>,
 }
 
 pub struct AgentOrchestration {
@@ -72,22 +76,22 @@ impl AgentOrchestration {
         self
     }
 
-    fn lock(&self) -> MutexGuard<'_, Targets> {
-        self.targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
     pub fn register_root(
         &self,
         target: TrustedTarget,
         config_mutations: Option<ConfigMutationReserver>,
     ) {
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         targets.roots.retain(|entry| {
             entry.target.target.validate_live().is_ok()
                 && !entry.target.target.same_manager(&target.target)
         });
+        if let Some(reactivator) = &targets.reactivator {
+            target
+                .target
+                .manager()
+                .set_reactivator(Some(reactivator.clone()));
+        }
         targets.roots.push(RootTarget {
             target,
             config_mutations,
@@ -99,7 +103,8 @@ impl AgentOrchestration {
     /// the frontend's own command target.
     pub fn bind_commands(&self, root: &AgentRef, runner: CommandRunner) {
         if let Some(entry) = self
-            .lock()
+            .targets
+            .lock_unpoisoned()
             .roots
             .iter_mut()
             .find(|entry| same_agent(&entry.target.target, root))
@@ -110,16 +115,27 @@ impl AgentOrchestration {
 
     pub fn history_key(&self, target: &AgentRef) -> Result<String, String> {
         self.validate_target(target)?;
-        self.lock()
+        let registered = self
+            .targets
+            .lock_unpoisoned()
             .children
             .iter()
             .find(|entry| same_agent(&entry.target.target, target))
-            .map(|entry| entry.history_key.clone())
+            .map(|entry| entry.history_key.clone());
+        registered
+            .or_else(|| {
+                target
+                    .snapshot()
+                    .ok()
+                    .filter(|node| node.parent_id.is_some())
+                    .and_then(|node| node.metadata.transcript_key)
+            })
             .ok_or_else(|| CHILD_HISTORY_KEY_UNAVAILABLE.into())
     }
 
     pub(super) fn roots(&self) -> Vec<TrustedTarget> {
-        self.lock()
+        self.targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .map(|entry| entry.target.clone())
@@ -127,7 +143,7 @@ impl AgentOrchestration {
     }
 
     pub fn select(&self, selected: Option<AgentRef>) {
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         targets.selected = selected;
         targets
             .roots
@@ -147,11 +163,29 @@ impl AgentOrchestration {
 }
 
 impl OrchestrationServices for AgentOrchestration {
+    fn set_reactivator(&self, reactivator: Arc<dyn AgentReactivator>) {
+        let mut targets = self.targets.lock_unpoisoned();
+        for root in &targets.roots {
+            root.target
+                .target
+                .manager()
+                .set_reactivator(Some(reactivator.clone()));
+        }
+        targets.reactivator = Some(reactivator);
+    }
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,
     ) -> Result<Option<TrustedTarget>, String> {
         if let Some(invocation) = invocation {
+            if let Some(pinned) = invocation.admission_context::<super::PinnedCommandTarget>() {
+                if pinned.validate().is_err() || pinned.target.validate_live().is_err() {
+                    return Ok(None);
+                }
+                self.validate_target(&pinned.target)?;
+                return Ok(Some(pinned.trusted()));
+            }
             let Some(pinned) = invocation.admission_context::<TrustedTarget>() else {
                 return Ok(None);
             };
@@ -161,7 +195,7 @@ impl OrchestrationServices for AgentOrchestration {
             self.validate_target(&pinned.target)?;
             return Ok(Some(pinned.clone()));
         }
-        let target = self.lock().selected.clone();
+        let target = self.targets.lock_unpoisoned().selected.clone();
         target
             .map(|target| {
                 self.template(&target)
@@ -170,13 +204,55 @@ impl OrchestrationServices for AgentOrchestration {
             .transpose()
     }
 
+    fn register_child_activation(
+        &self,
+        target: TrustedTarget,
+        history_key: String,
+        actor: &AgentActorHandle,
+        incarnation: &AgentIncarnation,
+    ) -> Result<(), String> {
+        self.validate_target(&target.target)?;
+        if actor.agent_id() != target.target.id() {
+            return Err("child activation actor identity does not match target".into());
+        }
+        let mut targets = self.targets.lock_unpoisoned();
+        target
+            .target
+            .manager()
+            .validate_activation(incarnation)
+            .map_err(|error| error.to_string())?;
+        if targets
+            .roots
+            .iter()
+            .any(|root| same_agent(&root.target.target, &target.target))
+        {
+            return Err("root template registration is owned by the host".into());
+        }
+        targets
+            .children
+            .retain(|entry| !same_agent(&entry.target.target, &target.target));
+        targets.children.push(ChildTarget {
+            target,
+            history_key,
+            actor_identity: actor.identity(),
+        });
+        Ok(())
+    }
+
+    fn unregister_child_target(&self, target: &AgentRef, identity: &Arc<()>) {
+        self.targets.lock_unpoisoned().children.retain(|entry| {
+            !same_agent(&entry.target.target, target)
+                || !Arc::ptr_eq(&entry.actor_identity, identity)
+        });
+    }
+
     fn register_child_target(
         &self,
         target: TrustedTarget,
         history_key: String,
     ) -> Result<(), String> {
         self.validate_target(&target.target)?;
-        let mut targets = self.lock();
+        let mut targets = self.targets.lock_unpoisoned();
         if targets
             .roots
             .iter()
@@ -188,16 +264,22 @@ impl OrchestrationServices for AgentOrchestration {
             entry.target.target.validate_live().is_ok()
                 && !same_agent(&entry.target.target, &target.target)
         });
+        let actor_identity = target
+            .target
+            .actor()
+            .map_err(|error| error.to_string())?
+            .identity();
         targets.children.push(ChildTarget {
             target,
             history_key,
+            actor_identity,
         });
         Ok(())
     }
 
     fn template(&self, target: &AgentRef) -> Result<ToolContext, String> {
         target.validate_live().map_err(|error| error.to_string())?;
-        let targets = self.lock();
+        let targets = self.targets.lock_unpoisoned();
         let root = targets
             .roots
             .iter()
@@ -235,8 +317,8 @@ impl OrchestrationServices for AgentOrchestration {
     }
 
     fn validate_target(&self, target: &AgentRef) -> Result<(), String> {
-        target.validate_live().map_err(|error| error.to_string())?;
-        if self.lock().roots.iter().any(|entry| {
+        target.snapshot().map_err(|error| error.to_string())?;
+        if self.targets.lock_unpoisoned().roots.iter().any(|entry| {
             entry.target.target.same_manager(target) && entry.target.target.validate_live().is_ok()
         }) {
             Ok(())
@@ -252,7 +334,8 @@ impl OrchestrationServices for AgentOrchestration {
     ) -> Result<ConfigMutation, ConfigChangeError> {
         self.validate_target(target)?;
         let reserve = self
-            .lock()
+            .targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .find(|root| root.target.target.same_manager(target))
@@ -279,7 +362,8 @@ impl OrchestrationServices for AgentOrchestration {
 
     fn command_runner(&self, target: &AgentRef) -> Result<CommandRunner, String> {
         self.validate_target(target)?;
-        self.lock()
+        self.targets
+            .lock_unpoisoned()
             .roots
             .iter()
             .find(|root| root.target.target.same_manager(target))
