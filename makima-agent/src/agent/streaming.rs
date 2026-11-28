@@ -152,13 +152,13 @@ impl From<StreamError> for AgentError {
 /// {delivery} learns, while the stream still runs, the first time any
 /// attempt reaches the provider's server.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn stream_with_retry(
+pub(crate) async fn stream_with_retry<'a>(
     provider: &dyn Provider,
     conversation: Conversation,
     model: &Model,
     messages: &[Message],
     system: &str,
-    tools: &Value,
+    tools: impl FnOnce() -> &'a Value + Send,
     event_tx: &EventSender,
     cancel: &CancelToken,
     opts: RequestOptions,
@@ -169,6 +169,12 @@ pub(crate) async fn stream_with_retry(
     let opts = opts.clamped(model);
     let messages = makima_providers::adapt_images_for_model(model, messages).await;
     let messages = &*messages;
+    if cancel.is_cancelled() {
+        return Err(StreamError::Cancelled {
+            streamed: String::new(),
+        });
+    }
+    let tools = tools();
     let mut retry = RetryState::new(retry_policy, provider.key_count());
     let mut invocation = conversation.invocation();
     if let Some(output) = event_tx.output() {
@@ -461,13 +467,14 @@ mod tests {
             let policy = instant_retry();
             let model = Model::from_spec("ollama/qwen3").unwrap();
             for _ in 0..2 {
+                let empty_tools = &json!([]);
                 stream_with_retry(
                     &provider,
                     test_conversation(),
                     &model,
                     &[],
                     "",
-                    &json!([]),
+                    || empty_tools,
                     &sender,
                     &CancelToken::none(),
                     RequestOptions::default(),
@@ -497,13 +504,14 @@ mod tests {
             let sender = EventSender::new(tx);
             let model = Model::from_spec("ollama/qwen3").unwrap();
             for _ in 0..2 {
+                let empty_tools = &json!([]);
                 stream_with_retry(
                     &provider,
                     test_conversation(),
                     &model,
                     &[],
                     "",
-                    &json!([]),
+                    || empty_tools,
                     &sender,
                     &CancelToken::none(),
                     RequestOptions::default(),
@@ -598,13 +606,14 @@ mod tests {
     async fn send_pooled(server: &PooledServer) -> Result<StreamResponse, StreamError> {
         let (tx, _rx) = flume::unbounded();
         let model = Model::from_spec("ollama/qwen3").unwrap();
+        let empty_tools = &json!([]);
         stream_with_retry(
             server,
             test_conversation(),
             &model,
             &[Message::user("hi".into())],
             "",
-            &json!([]),
+            || empty_tools,
             &EventSender::new(tx),
             &CancelToken::none(),
             RequestOptions::default(),
@@ -705,13 +714,14 @@ mod tests {
             };
             let tracker = RequestDeliveryTracker::new();
             let (tx, _rx) = flume::unbounded();
+            let empty_tools = &json!([]);
             let _ = stream_with_retry(
                 &provider,
                 test_conversation(),
                 &Model::from_spec("ollama/qwen3").unwrap(),
                 &[Message::user("hi".into())],
                 "",
-                &json!([]),
+                || empty_tools,
                 &EventSender::new(tx),
                 &CancelToken::none(),
                 RequestOptions::default(),

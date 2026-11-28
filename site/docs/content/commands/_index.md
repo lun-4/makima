@@ -44,6 +44,7 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 |---------|-------------|------|-----------|-----------|
 | `/automode` | Toggle bash auto mode (classifier gates every bash command) | none |  | all |
 | `/build` | Switch to build mode (full tool access) | none |  | all |
+| `/goal` | Show, set, pause, resume, or clear the root session goal | raw (optional) | [<objective>\|pause\|resume\|clear] | TUI only |
 | `/memory` | View, edit, and delete memory files | none |  | TUI only |
 | `/options` | Browse and change session options | none |  | TUI only |
 | `/plan` | Switch to plan mode (analyse and write only the plan file) | none |  | all |
@@ -53,6 +54,22 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. | none |  | TUI only |
 | `/thinking` | Set thinking effort (bare opens a selector) | typed | [effort] | all |
 | `/usage` | Show provider quota and focused-session token usage | none |  | TUI only |
+
+## Goals
+
+The default-enabled `goal` plugin keeps one objective per terminal session. Run it from the main chat, not a child chat. It is not available in print, the SDK, or ACP.
+
+- **`/goal <objective>`** sets or refines the objective and activates it if there is allowance left. It sends a normal user message announcing the goal, even mid-turn. A refinement keeps the turn counts. At the cap it still announces the change, but does not reactivate the goal.
+- **`/goal`** shows the objective, state, current and lifetime counts, and any stop reason without calling the model.
+- **`/goal pause`** stops automatic follow-ups without cancelling work or removing messages already queued.
+- **`/goal resume`** reactivates a paused, blocked, or capped goal and sends a fresh announcement. It uses the remaining allowance, or grants ten more turns if exhausted. A completed goal cannot be resumed; give it a new objective instead.
+- **`/goal clear`** forgets the objective and resets both counts. Like pause, clear does not withdraw queued messages.
+
+Each allowance is ten root turns. A turn counts once if any of its requests offered the `goal` tool, including turns started by normal input or child-result delivery, and turns that fail or are cancelled. Child turns never count. The gold `goal:0/10` badge starts at zero and includes the current turn as soon as the tool is offered. Only settled counts are saved. While the goal is active, it can start another turn when the root is idle and has no higher-priority work or recovery text.
+
+The root model reports completion with verification evidence or blocking with evidence of an external dependency. Reports are provisional until that turn finishes normally. Unlike the earlier checker design, no independent model or checker verifies the report. A valid completion on turn ten wins over the cap. Activation changes the tool list on new requests, which can affect provider caching; a request already in flight and its retries keep their original tool list.
+
+Cancelling root work, a terminal turn failure or limit, and entering plan mode pause Goal. Plan mode does not allow setting or resuming it, and leaving plan mode does not restart it. Reopening a session, reloading, or rewinding does not restart an active goal or replay its announcement. The saved objective and counts stay with the original session; a fork starts without a goal.
 
 ## Command arguments
 

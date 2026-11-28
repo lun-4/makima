@@ -182,37 +182,32 @@ impl Runner {
                 let _ = sender.send(result);
             }
         }
-        #[cfg(any(test, feature = "test-util"))]
-        {
-            let state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let probe = super::ActorRuntimeProbe {
-                operations: state.operations.len(),
-                queued: self.queue.len(),
-                deliveries: state.deliveries.len(),
-                pending_publications: state.pending_publications,
-                retained_results: state.retained_order.len(),
-                processing: state.processing.is_some()
-                    || state.active.is_some()
-                    || state.preparing.is_some(),
-            };
-            for observer in self
-                .inner
-                .runtime_probes
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .drain(..)
-            {
-                let _ = observer.send(probe.clone());
-            }
-        }
         debug!(agent_id = %self.inner.agent_id, "actor queue drained");
         let lifecycle = {
             let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.runner_busy = false;
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                let probe = super::ActorRuntimeProbe {
+                    operations: state.operations.len(),
+                    queued: self.queue.len(),
+                    deliveries: state.deliveries.len(),
+                    pending_publications: state.pending_publications,
+                    retained_results: state.retained_order.len(),
+                    processing: state.processing.is_some()
+                        || state.active.is_some()
+                        || state.preparing.is_some(),
+                };
+                for observer in self
+                    .inner
+                    .runtime_probes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .drain(..)
+                {
+                    let _ = observer.send(probe.clone());
+                }
+            }
             state.lifecycle
         };
         self.inner.drained.notify(usize::MAX);

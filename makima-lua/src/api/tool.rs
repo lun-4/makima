@@ -211,6 +211,7 @@ pub(crate) struct PendingTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
+    pub(crate) enabled_by_default: bool,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) handler_key: RegistryKey,
@@ -224,6 +225,7 @@ pub(crate) struct PendingTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) describe_key: Option<RegistryKey>,
+    pub(crate) lifecycle_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -240,6 +242,7 @@ pub(crate) struct LuaTool {
     pub(crate) name: Arc<str>,
     pub(crate) description: String,
     pub(crate) schema: &'static ParamSchema,
+    pub(crate) enabled_by_default: bool,
     pub(crate) audience: ToolAudience,
     pub(crate) kind: Option<Arc<str>>,
     pub(crate) tx: Sender<Request>,
@@ -254,9 +257,38 @@ pub(crate) struct LuaTool {
     pub(crate) start_annotation: Option<StartAnnotation>,
     pub(crate) examples: Option<Value>,
     pub(crate) has_describe_fn: bool,
+    pub(crate) has_lifecycle_controller: bool,
 }
 
 impl Tool for LuaTool {
+    fn has_lifecycle_controller(&self) -> bool {
+        self.has_lifecycle_controller
+    }
+
+    fn reconcile<'a>(
+        &'a self,
+        root: makima_agent::AgentRef,
+        trigger: makima_agent::actor::ToolLifecycleTrigger,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let (reply, rx) = flume::bounded(1);
+            self.tx
+                .send_async(Request::ToolLifecycle {
+                    plugin: self.plugin.clone(),
+                    tool: self.name.clone(),
+                    generation: self.generation,
+                    root,
+                    trigger,
+                    reply,
+                })
+                .await
+                .map_err(|_| "tool lifecycle host is unavailable".to_owned())?;
+            rx.recv_async()
+                .await
+                .map_err(|_| "tool lifecycle host is unavailable".to_owned())?
+        })
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -298,6 +330,10 @@ impl Tool for LuaTool {
 
     fn schema(&self) -> Value {
         to_json_schema(self.schema)
+    }
+
+    fn enabled_by_default(&self) -> bool {
+        self.enabled_by_default
     }
 
     fn audience(&self) -> ToolAudience {
@@ -813,6 +849,8 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                image       (table)   { media_type: string, data: string } base64 image.
 ///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
+///   enabled_by_default (boolean) Default true. When false, the tool is hidden and cannot dispatch unless the answering request advertised its exact binding. Its owning plugin may attach it to a pinned TUI root with `Agent:add_tool`; mode, audience, and permissions still apply.
+///   lifecycle       (function) Optional synchronous controller for an opt-in tool. Receives `(trigger, ctx)` for request reconciliation, pending facts, idle admission, or graceful closure (`"request"`, `"facts"`, `"idle"`, `"closing"`). Use `Agent:tool_transition` to reconcile the root. This callback must not yield.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
 ///   timeout         (number)   Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -1318,11 +1356,12 @@ fn set_prompt(
 /// available tools or for checking which tools are enabled.
 ///
 /// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
+/// `enabled` reflects default and config eligibility, not request attachments.
 /// Describe callbacks are not invoked (the static description is used).
 ///
 /// @param opts table? Options:
 ///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
-/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+/// @return (table[]) Array of tool entries: { name, schema, audiences, kind?, enabled_by_default, enabled }.
 /// @example
 /// local tools = makima.api.get_tools()
 /// for _, t in ipairs(tools) do
@@ -1346,7 +1385,10 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
     let out = lua.create_table()?;
     for (i, entry) in registry.iter().iter().enumerate() {
         let t = tool_entry_to_lua(lua, entry)?;
-        t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
+        t.set(
+            "enabled",
+            entry.tool.enabled_by_default() && is_tool_enabled(&disabled, entry.name()),
+        )?;
         out.set(i + 1, t)?;
     }
     Ok(out)
@@ -1358,7 +1400,7 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// throw).
 ///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, enabled_by_default, header?, restore? }, or nil if not found.
 /// @example
 /// local t = makima.api.get_tool("bash")
 /// if t then
@@ -1449,6 +1491,7 @@ fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
     t.set("name", entry.name())?;
     t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
     t.set("audiences", audiences_to_lua(lua, entry.tool.audience())?)?;
+    t.set("enabled_by_default", entry.tool.enabled_by_default())?;
     if let Some(kind) = entry.tool.tool_kind() {
         t.set("kind", kind)?;
     }
@@ -1746,6 +1789,24 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences, ToolAudience::default())?;
+    let enabled_by_default = match spec.get::<LuaValue>("enabled_by_default")? {
+        LuaValue::Nil => true,
+        LuaValue::Boolean(enabled) => enabled,
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'enabled_by_default' must be a boolean",
+            ));
+        }
+    };
+    let lifecycle_key = spec
+        .get::<Option<Function>>("lifecycle")?
+        .map(|callback| lua.create_registry_value(callback))
+        .transpose()?;
+    if lifecycle_key.is_some() && enabled_by_default {
+        return Err(mlua::Error::runtime(
+            "tool lifecycle requires enabled_by_default = false",
+        ));
+    }
     let timeout = parse_timeout(spec)?;
     let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
@@ -1777,6 +1838,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             name,
             description,
             schema: param_schema,
+            enabled_by_default,
             audience,
             kind,
             handler_key,
@@ -1790,6 +1852,7 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             start_annotation,
             examples,
             describe_key,
+            lifecycle_key,
         });
 
     Ok(())
@@ -2832,6 +2895,7 @@ mod tests {
             name: Arc::from("test_tool"),
             description: "test".into(),
             schema,
+            enabled_by_default: true,
             audience: ToolAudience::default(),
             kind: None,
             tx,
@@ -2846,6 +2910,7 @@ mod tests {
             has_start_fn: false,
             examples: None,
             has_describe_fn: false,
+            has_lifecycle_controller: false,
         }
     }
 

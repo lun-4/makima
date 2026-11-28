@@ -1892,6 +1892,10 @@ where
         let paths = [
             (Path::new(ARCHIVE_DIR).join(&session_id), "archives"),
             (
+                Path::new(crate::plugin_session::PLUGIN_STATE_DIR).join(&session_id),
+                "plugin sidecars",
+            ),
+            (
                 Path::new(OFFLOAD_DIR).join(&session_id),
                 "offloaded tool output",
             ),

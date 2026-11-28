@@ -1,5 +1,8 @@
 use makima_agent::template::Vars;
-use makima_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
+use makima_agent::tools::schema::sanitize_tool_input_schema;
+use makima_agent::tools::{
+    DescriptionContext, RegisteredTool, ToolAudience, ToolFilter, ToolRegistry, ToolSource,
+};
 use makima_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
 use serde_json::Value;
@@ -41,6 +44,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "task_send",
             "task_despawn",
             "task_stop",
+            "goal",
             "todo_write",
             "memory",
             "skill",
@@ -50,8 +54,10 @@ const SECTIONS: &[(&str, &[&str])] = &[
 ];
 
 struct ToolInfo {
-    def: Value,
+    description: String,
+    schema: Value,
     source: ToolSource,
+    conditional: bool,
 }
 
 struct Param {
@@ -145,21 +151,17 @@ fn write_param_table(out: &mut String, params: &[Param]) {
 }
 
 fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
-    let description = info
-        .def
-        .get("description")
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let schema = info.def.get("input_schema").cloned().unwrap_or(Value::Null);
-    let params = extract_params(&schema);
-    let summary = first_paragraph(description);
+    let params = extract_params(&info.schema);
+    let summary = first_paragraph(&info.description);
 
     writeln!(out).unwrap();
     let mut badges = String::new();
     if matches!(info.source, ToolSource::Mcp { .. }) {
         badges.push_str(" <span class=\"badge\">mcp</span>");
     }
-    if opt_in.contains(name) {
+    if info.conditional {
+        badges.push_str(" <span class=\"badge\">conditional</span>");
+    } else if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
     }
     writeln!(out, "### `{name}`{badges} {{#{name}}}").unwrap();
@@ -197,20 +199,6 @@ fn redact_env_and_dates(input: &str) -> String {
     DATE_RE.replace_all(&out, DATE_PLACEHOLDER).into_owned()
 }
 
-fn redact_def(def: &Value) -> Value {
-    let Some(d) = def.get("description").and_then(|v| v.as_str()) else {
-        return def.clone();
-    };
-    let redacted = redact_env_and_dates(d);
-    if redacted == d {
-        def.clone()
-    } else {
-        let mut out = def.clone();
-        out["description"] = Value::String(redacted);
-        out
-    }
-}
-
 fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
@@ -221,14 +209,20 @@ fn write_front_matter(out: &mut String) {
 }
 
 fn collect_tool_info(
-    def_map: &HashMap<String, &Value>,
-    entry: &makima_agent::tools::RegisteredTool,
+    entry: &RegisteredTool,
+    vars: &Vars,
+    ctx: &DescriptionContext,
 ) -> Option<ToolInfo> {
-    let name = entry.name();
-    let def = def_map.get(name)?;
+    let description = entry.tool.description(ctx);
+    let description = vars.apply(&description);
+    if description.trim().is_empty() {
+        return None;
+    }
     Some(ToolInfo {
-        def: redact_def(def),
+        description: redact_env_and_dates(&description),
+        schema: sanitize_tool_input_schema(entry.tool.schema()),
         source: entry.source.clone(),
+        conditional: !entry.tool.enabled_by_default(),
     })
 }
 
@@ -266,34 +260,18 @@ pub fn generate() -> String {
         .set("{date}", "YYYY-MM-DD");
 
     let (registry, opt_in) = load_registry_with_builtins();
-    let defs = registry.definitions(
-        &vars,
-        &DescriptionContext {
-            filter: &ToolFilter::All,
-            audience: ToolAudience::empty(),
-            workflow: false,
-            mcp: false,
-        },
-        false,
-    );
-    let def_map: HashMap<String, &Value> = defs
-        .as_array()
-        .expect("definitions should be an array")
-        .iter()
-        .filter_map(|t| {
-            t.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| (n.to_string(), t))
-        })
-        .collect();
-
+    let ctx = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience: ToolAudience::empty(),
+        workflow: false,
+        mcp: false,
+    };
+    // The reference includes registered tools that are not advertised by default.
     let snapshot = registry.iter();
-    let mut tools: HashMap<&str, ToolInfo> = HashMap::new();
-    for entry in snapshot.iter() {
-        if let Some(info) = collect_tool_info(&def_map, entry) {
-            tools.insert(entry.name(), info);
-        }
-    }
+    let tools: HashMap<&str, ToolInfo> = snapshot
+        .iter()
+        .filter_map(|entry| collect_tool_info(entry, &vars, &ctx).map(|info| (entry.name(), info)))
+        .collect();
 
     let total = tools.len();
     let mut out = String::new();
@@ -301,14 +279,21 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "# Tools").unwrap();
     writeln!(out).unwrap();
-    let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
-    let default_n = total - opt_in_n;
+    let opt_in_n = tools
+        .iter()
+        .filter(|(name, info)| !info.conditional && opt_in.contains(**name))
+        .count();
+    let conditional_n = tools.values().filter(|info| info.conditional).count();
+    let default_n = total - opt_in_n - conditional_n;
     writeln!(
         out,
         "Makima ships with {total} built-in tools in this reference \
-         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
-         Tools marked **opt-in** are off until you enable them under `plugins` \
-         in [Configuration](/docs/configuration/)."
+         ({default_n} on by default, {opt_in_n} opt-in via plugin options, \
+         {conditional_n} conditional). Tools marked **opt-in** are off until you enable them \
+         under `plugins` in [Configuration](/docs/configuration/). \
+         Tools marked **conditional** are only available when their plugin attaches them to a request. \
+         For example, `goal` is offered in the main TUI chat while a \
+         [session goal](/docs/commands/#goals) is active."
     )
     .unwrap();
 
@@ -402,6 +387,12 @@ mod tests {
     fn reference_includes_task_adapters(name: &str) {
         let reference = generate();
         assert!(reference.contains(&format!("### `{name}`")));
+    }
+
+    #[test]
+    fn reference_lists_goal_as_conditional() {
+        let reference = generate();
+        assert!(reference.contains("### `goal` <span class=\"badge\">conditional</span> {#goal}"));
     }
 
     #[test]

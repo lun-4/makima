@@ -583,6 +583,7 @@ impl App {
             restricted: self.trust_question.is_some(),
             restoring: self.restoring.load(Ordering::Relaxed),
             status_content: self.status_content.get(),
+            displayed_agent: chat.agent_id,
             suppress_status_content: self.suppress_status_content.load(Ordering::Acquire),
             hover: self.hover,
             thinking_supported: config.as_ref().map_or_else(

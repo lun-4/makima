@@ -550,7 +550,7 @@ fn spawn_agent_internal(
         max_children_per_agent: config.max_children_per_agent,
         max_live_agents: config.max_live_agents,
     };
-    let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
+    let manager = AgentManagerHandle::new_tui(limits).expect("validated agent limits");
     let (runner_start, start_rx) = flume::bounded(1);
     let mut orchestration_template = None;
     let root = manager

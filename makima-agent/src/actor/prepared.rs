@@ -502,6 +502,9 @@ impl PreparedOperation {
         let changed = commit.generation != state.policy_generation;
         if changed {
             state.policy_generation = commit.generation;
+            if matches!(commit.config.mode, crate::AgentMode::Plan(_)) {
+                state.stop_tools("plan mode");
+            }
             state.policy = Some(Arc::clone(&commit.config));
         }
         finalize(&commit);

@@ -556,6 +556,10 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
 }
 
 pub trait OrchestrationServices: Send + Sync + 'static {
+    fn roots_for_lifecycle(&self) -> Vec<AgentRef> {
+        Vec::new()
+    }
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,
@@ -715,6 +719,10 @@ impl TrustedContext {
             return Err("agent target does not belong to this host scope".into());
         }
         Ok(())
+    }
+
+    pub(crate) fn plugin_revocation(&self) -> &CancelToken {
+        &self.authority.owner.publication_cancel
     }
 
     pub(crate) fn validate_target(&self, lua: &Lua, target: &AgentRef) -> Result<(), String> {

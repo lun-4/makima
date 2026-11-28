@@ -245,6 +245,20 @@ pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str>;
     fn schema(&self) -> Value;
+    /// False for tools that require a request-scoped attachment.
+    fn enabled_by_default(&self) -> bool {
+        true
+    }
+    fn has_lifecycle_controller(&self) -> bool {
+        false
+    }
+    fn reconcile<'a>(
+        &'a self,
+        _root: crate::AgentRef,
+        _trigger: crate::actor::ToolLifecycleTrigger,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
     fn examples(&self) -> Option<Value> {
         None
     }
@@ -264,6 +278,15 @@ pub trait Tool: Send + Sync + 'static {
 pub struct RegisteredTool {
     pub tool: Arc<dyn Tool>,
     pub source: ToolSource,
+}
+
+impl std::fmt::Debug for RegisteredTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredTool")
+            .field("name", &self.name())
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl RegisteredTool {
@@ -535,9 +558,26 @@ impl ToolRegistry {
         ctx: &DescriptionContext,
         supports_examples: bool,
     ) -> Value {
+        let mut definitions = Vec::new();
+        self.visit_definitions(vars, ctx, supports_examples, false, |_, definition| {
+            definitions.push(definition);
+        });
+        Value::Array(definitions)
+    }
+
+    pub(super) fn visit_definitions(
+        &self,
+        vars: &Vars,
+        ctx: &DescriptionContext,
+        supports_examples: bool,
+        include_attachable: bool,
+        mut visit: impl FnMut(&RegisteredTool, Value),
+    ) {
         let snapshot = self.tools.load();
-        let mut out = Vec::with_capacity(snapshot.len());
         for entry in snapshot.iter() {
+            if !include_attachable && !entry.tool.enabled_by_default() {
+                continue;
+            }
             if !entry.tool.audience().contains(ctx.audience) {
                 continue;
             }
@@ -562,9 +602,8 @@ impl ToolRegistry {
                     def["description"] = Value::String(merged);
                 }
             }
-            out.push(def);
+            visit(entry, def);
         }
-        Value::Array(out)
     }
 
     pub fn iter(&self) -> RegistrySnapshot {

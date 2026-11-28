@@ -1327,6 +1327,7 @@ impl SessionTools {
             let initial =
                 RequestTools::assembled(definitions.clone(), &parent.context.config, model);
             let mut child_tools = parent_tools;
+            child_tools.clear_request_attachments();
             child_tools.audience = options.audience;
             child_tools.tool_filter = Arc::clone(initial.filter());
             let mut allowed: HashSet<_> = tool_dispatch::callable(&child_tools)
@@ -1503,6 +1504,7 @@ impl ChildSettings {
     ) -> ToolContext {
         let context = &parent.context;
         let mut template = context.to_tool_context();
+        template.clear_request_attachments();
         template.model = Arc::new(self.model.clone());
         template.provider = Arc::clone(&self.provider);
         template.opts = self.opts;

@@ -54,7 +54,7 @@ pub mod test_support {
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
-        StatusContentWriter,
+        StatusContentSnapshot, StatusContentWriter,
     };
     use crate::orchestration::TrustedTarget;
     use crate::{EventHandle, KeymapReader, PluginHost, TestCompletionBackend};
@@ -214,7 +214,10 @@ pub mod test_support {
 
     impl StatusContentWriterHandle {
         pub fn publish(&self, entries: StatusContentEntries) -> bool {
-            self.0.publish(entries)
+            self.0.publish(StatusContentSnapshot {
+                entries,
+                ..Default::default()
+            })
         }
     }
 

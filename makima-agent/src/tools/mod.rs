@@ -41,13 +41,13 @@ use crate::mcp::{
 };
 use crate::permissions::PermissionManager;
 use crate::{
-    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
+    AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf, TurnId,
 };
 use makima_config::{ModelPolicy, ToolOutputLines};
 use makima_providers::RequestOptions;
 use makima_providers::provider::Provider;
 use makima_providers::{Invocation, Model, ModelInfo, ProviderRegistry, RequestDelivery};
-use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, SessionRef};
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
@@ -141,6 +141,7 @@ pub(crate) const TOOL_NAME_FIELD: &str = "name";
 #[derive(Debug, Clone)]
 pub struct RequestTools {
     definitions: Arc<Value>,
+    attachable: Arc<[(RegisteredTool, Value)]>,
     filter: Arc<ToolFilter>,
 }
 
@@ -148,6 +149,7 @@ impl Default for RequestTools {
     fn default() -> Self {
         Self {
             definitions: Arc::new(Value::Array(Vec::new())),
+            attachable: Arc::from([]),
             filter: Arc::default(),
         }
     }
@@ -166,6 +168,35 @@ impl RequestTools {
         workflow: bool,
         mcp: bool,
     ) -> Self {
+        Self::build_inner(
+            registry, vars, model, config, excluded, workflow, mcp, false,
+        )
+    }
+
+    /// Preserve opt-in definitions and their exact registry bindings alongside
+    /// the default array. The unfiltered opt-in definitions never leave the host.
+    pub fn build_for_tui(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        workflow: bool,
+        mcp: bool,
+    ) -> Self {
+        Self::build_inner(registry, vars, model, config, &[], workflow, mcp, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_inner(
+        registry: &ToolRegistry,
+        vars: &crate::template::Vars,
+        model: &Model,
+        config: &AgentConfig,
+        excluded: &[&str],
+        workflow: bool,
+        mcp: bool,
+        include_attachable: bool,
+    ) -> Self {
         let filter = ToolFilter::from_config(config, model, excluded);
         let ctx = DescriptionContext {
             filter: &filter,
@@ -173,8 +204,24 @@ impl RequestTools {
             workflow,
             mcp,
         };
+        let mut attachable = Vec::new();
+        let mut definitions = Vec::new();
+        registry.visit_definitions(
+            vars,
+            &ctx,
+            model.supports_tool_examples(),
+            include_attachable,
+            |entry, definition| {
+                if entry.tool.enabled_by_default() {
+                    definitions.push(definition);
+                } else {
+                    attachable.push((entry.clone(), definition));
+                }
+            },
+        );
         Self {
-            definitions: Arc::new(registry.definitions(vars, &ctx, model.supports_tool_examples())),
+            definitions: Arc::new(Value::Array(definitions)),
+            attachable: attachable.into(),
             filter: Arc::new(filter),
         }
     }
@@ -203,6 +250,7 @@ impl RequestTools {
         );
         Self {
             definitions: Arc::new(definitions),
+            attachable: Arc::from([]),
             filter: Arc::new(filter),
         }
     }
@@ -211,8 +259,52 @@ impl RequestTools {
         &self.definitions
     }
 
+    pub(crate) fn attachable(&self) -> &[(RegisteredTool, Value)] {
+        &self.attachable
+    }
+
     pub fn filter(&self) -> &Arc<ToolFilter> {
         &self.filter
+    }
+}
+
+/// An activation is bound to one registration and the lifetime of its owner.
+/// Reattaching a removed tool creates a new identity without changing its schema.
+#[derive(Clone)]
+pub(crate) struct ToolActivation {
+    pub(crate) id: MakimaId,
+    pub(crate) entry: RegisteredTool,
+    pub(crate) owner: CancelToken,
+}
+
+impl ToolActivation {
+    pub(crate) fn matches(&self, entry: &RegisteredTool) -> bool {
+        !self.owner.is_cancelled() && Arc::ptr_eq(&self.entry.tool, &entry.tool)
+    }
+}
+
+/// Historical attribution, not authorization to change plugin state. A consumer
+/// committing state must still fence the activation at its own commit boundary.
+#[derive(Clone)]
+pub struct ToolClaim {
+    pub(crate) turn: CurrentManagedTurn,
+    pub(crate) tool: Arc<str>,
+    pub(crate) activation: MakimaId,
+}
+
+impl ToolClaim {
+    pub fn turn_id(&self) -> TurnId {
+        self.turn.turn_id()
+    }
+
+    pub fn activation(&self) -> MakimaId {
+        self.activation
+    }
+
+    pub fn is_current(&self, registry: &ToolRegistry) -> bool {
+        self.turn
+            .manager()
+            .has_tool_activation(&self.turn, &self.tool, self.activation, registry)
     }
 }
 
@@ -521,9 +613,34 @@ pub struct ToolContext {
     /// check input only and is never used for filesystem access.
     pub(crate) write_lock_chain: Arc<Vec<u64>>,
     pub managed_turn: Option<CurrentManagedTurn>,
+    pub(crate) advertised_attachments: Option<Arc<HashMap<String, ToolActivation>>>,
+    pub(crate) tool_claim: Option<ToolClaim>,
 }
 
 impl ToolContext {
+    /// Removes handler-only provenance while preserving the answering request's
+    /// dispatch allowlist for nested calls within that request.
+    pub fn clear_tool_claim(&mut self) {
+        self.tool_claim = None;
+    }
+
+    /// Clears all conditional tool state when preparing a different agent's template.
+    pub fn clear_request_attachments(&mut self) {
+        self.advertised_attachments = None;
+        self.clear_tool_claim();
+    }
+
+    pub fn tool_claim(&self) -> Option<&ToolClaim> {
+        self.tool_claim.as_ref()
+    }
+
+    pub(crate) fn advertised_attachment(&self, entry: &RegisteredTool) -> Option<&ToolActivation> {
+        self.advertised_attachments
+            .as_ref()?
+            .get(entry.name())
+            .filter(|activation| activation.matches(entry))
+    }
+
     /// Overlays an agent's committed configuration onto this template.
     pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
         self.cwd = config.context.cwd().to_path_buf();
@@ -917,6 +1034,8 @@ pub fn interpreter_ctx(
         pending_output_limits: None,
         write_lock_chain: Arc::new(Vec::new()),
         managed_turn: None,
+        advertised_attachments: None,
+        tool_claim: None,
     }
 }
 

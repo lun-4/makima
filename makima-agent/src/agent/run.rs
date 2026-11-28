@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::offload::OffloadStore;
 use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolActivation, ToolAudience, ToolContext,
     TurnToolBindings,
 };
 use crate::{
@@ -76,6 +76,34 @@ pub async fn resolve_compaction_model(
         return (prepared.provider, prepared.model);
     }
     (Arc::clone(provider), model.clone())
+}
+
+struct ModelRequestTools {
+    definitions: Value,
+    attachments: Option<Arc<HashMap<String, ToolActivation>>>,
+}
+
+impl ModelRequestTools {
+    fn publish(&mut self, turn: Option<&crate::CurrentManagedTurn>) -> &Value {
+        if let (Some(turn), Some(attachments)) = (turn, &mut self.attachments) {
+            let attachments = Arc::make_mut(attachments);
+            if let Some(definitions) = self.definitions.as_array_mut() {
+                definitions.retain(|definition| {
+                    let Some(name) = definition["name"].as_str() else {
+                        return true;
+                    };
+                    if let Some(activation) = attachments.get(name)
+                        && !turn.manager().record_tool_exposure(turn, name, activation)
+                    {
+                        attachments.remove(name);
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
+        &self.definitions
+    }
 }
 
 enum TurnProgress {
@@ -678,22 +706,46 @@ impl<'h> Agent<'h> {
         }
     }
 
+    #[cfg(test)]
     fn request_tools(&self) -> Result<Value, AgentError> {
+        Ok(self.model_request_tools()?.definitions)
+    }
+
+    fn model_request_tools(&self) -> Result<ModelRequestTools, AgentError> {
         let def = self.mode_def.as_ref().ok_or_else(|| AgentError::Config {
             message: format!("mode '{}' is not defined", self.mode.id().key()),
         })?;
-        let mut tools = match &self.mcp {
-            Some(mcp) => {
-                let mut tools = self.tools.definitions().clone();
-                self.turn_bindings.extend_mcp_tools(mcp, &mut tools);
-                Cow::Owned(tools)
+        let mut ctx = self.tool_context()?;
+        let candidates = self.tools.attachable();
+        let mut attachments = self
+            .managed_turn
+            .as_ref()
+            .filter(|turn| !candidates.is_empty() && turn.agent_id() == self.agent_id)
+            .map(|turn| turn.manager().tool_attachments(turn.agent_id(), candidates))
+            .unwrap_or_default();
+        let mut tools = Cow::Borrowed(self.tools.definitions());
+        if !attachments.is_empty() {
+            // Add in registry-definition order, not activation or hash order.
+            // A host tool sharing the name must never publish this schema.
+            attachments.retain(|name, _| !self.local_tools.contains_key(name));
+            if let Some(definitions) = tools.to_mut().as_array_mut() {
+                definitions.extend(
+                    candidates
+                        .iter()
+                        .filter(|(entry, _)| attachments.contains_key(entry.name()))
+                        .map(|(_, def)| def.clone()),
+                );
             }
-            None => Cow::Borrowed(self.tools.definitions()),
-        };
+        }
+        if let Some(mcp) = &self.mcp {
+            self.turn_bindings.extend_mcp_tools(mcp, tools.to_mut());
+        }
         if let Some(names) = &def.tools {
             tools = Cow::Owned(filter_tools(&tools, names));
         }
-        let ctx = self.tool_context()?;
+        if !attachments.is_empty() {
+            ctx.advertised_attachments = Some(Arc::new(attachments));
+        }
         if let Some(definitions) = tools.to_mut().as_array_mut() {
             definitions.retain(|definition| {
                 definition
@@ -702,7 +754,20 @@ impl<'h> Agent<'h> {
                     .is_some_and(|name| tool_dispatch::authorize_advertised(&ctx, name))
             });
         }
-        Ok(tools.into_owned())
+        // The answering batch may dispatch only the attachments that actually
+        // survived all publication filters. A retry never rebuilds this pair.
+        let attachments = ctx.advertised_attachments.and_then(|mut attachments| {
+            Arc::make_mut(&mut attachments).retain(|name, _| {
+                tools
+                    .as_array()
+                    .is_some_and(|defs| defs.iter().any(|def| def["name"].as_str() == Some(name)))
+            });
+            (!attachments.is_empty()).then_some(attachments)
+        });
+        Ok(ModelRequestTools {
+            definitions: tools.into_owned(),
+            attachments,
+        })
     }
 
     async fn turn(&mut self) -> Result<TurnProgress, AgentError> {
@@ -711,13 +776,18 @@ impl<'h> Agent<'h> {
         }
         self.consume_turn_inbox()?;
         self.pending_instruction_request = false;
-        let tools = self.request_tools()?;
+        if let Some(turn) = &self.managed_turn {
+            turn.manager().reconcile_request_tools(turn).await;
+        }
+        let mut tools = self.model_request_tools()?;
         if let Some(inbox) = &self.turn_inbox {
             inbox.instructions_submitted();
         }
         let messages = Arc::clone(&self.history.snapshot().messages);
         let delivery = RequestDeliveryTracker::new();
         let result = {
+            let managed = self.managed_turn.as_ref();
+            let request_tools = &mut tools;
             let mut stream = pin!(stream_with_retry(
                 &*self.provider,
                 Conversation {
@@ -729,7 +799,7 @@ impl<'h> Agent<'h> {
                 &self.model,
                 &messages,
                 &self.system,
-                &tools,
+                move || request_tools.publish(managed),
                 &self.event_tx,
                 &self.cancel,
                 self.opts,
@@ -806,7 +876,7 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
+            self.process_tool_calls(response, tools.attachments).await?;
             // A moved call's result can land between tool rounds; the model
             // gets it with the results instead of waiting for the next turn.
             self.land_mailbox();
@@ -935,8 +1005,13 @@ impl<'h> Agent<'h> {
         Ok(true)
     }
 
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
-        let ctx = self.tool_context()?;
+    async fn process_tool_calls(
+        &mut self,
+        response: StreamResponse,
+        attachments: Option<Arc<HashMap<String, ToolActivation>>>,
+    ) -> Result<(), AgentError> {
+        let mut ctx = self.tool_context()?;
+        ctx.advertised_attachments = attachments;
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -1005,6 +1080,8 @@ impl<'h> Agent<'h> {
             pending_output_limits: None,
             write_lock_chain: Arc::new(Vec::new()),
             managed_turn: self.managed_turn.clone(),
+            advertised_attachments: None,
+            tool_claim: None,
         }
     }
 

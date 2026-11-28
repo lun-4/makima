@@ -178,6 +178,18 @@ Read the executing turn's admitted mode. This can differ from Agent:config(ctx).
 
 **Returns:** (`string?`, `string?`) Registered mode name.
 
+---
+
+### `LuaCtx:tool_claim()` {#LuaCtx-tool_claim}
+
+```lua
+LuaCtx:tool_claim()
+```
+
+Read attribution for a direct model call to an attached tool. Nested, named, and background calls get nil, as do other live contexts without a claim. This describes the answering request, not the tool state at the time of dispatch.
+
+**Returns:** (`table?`, `string?`) {turn_id, activation, current}; IDs are opaque strings. current is a point-in-time check that the turn and attachment are still live, not authority to commit a plugin-state change. Fence commits separately.
+
 
 ## makima {#makima}
 
@@ -428,6 +440,8 @@ string or a table with richer output fields.
     - `image` (`table`) { media_type: string, data: string } base64 image.
     - `instructions` (`table`) Array of { path, content } blocks injected as context.
     - `state` (`any`) Serializable state forwarded to restore.
+  - `enabled_by_default` (`boolean`) Default true. When false, the tool is hidden and cannot dispatch unless the answering request advertised its exact binding. Its owning plugin may attach it to a pinned TUI root with `Agent:add_tool`; mode, audience, and permissions still apply.
+  - `lifecycle` (`function`) Optional synchronous controller for an opt-in tool. Receives `(trigger, ctx)` for request reconciliation, pending facts, idle admission, or graceful closure (`"request"`, `"facts"`, `"idle"`, `"closing"`). Use `Agent:tool_transition` to reconcile the root. This callback must not yield.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
   - `timeout` (`number`) Execution timeout in seconds. 0 or false disables. Default: inherits agent deadline.
@@ -739,6 +753,7 @@ Return a list of all registered tools. Useful for building UI that shows
 available tools or for checking which tools are enabled.
 
 Each entry has the tool's name, schema, audiences, and an `enabled` flag.
+`enabled` reflects default and config eligibility, not request attachments.
 Describe callbacks are not invoked (the static description is used).
 
 **Parameters:**
@@ -746,7 +761,7 @@ Describe callbacks are not invoked (the static description is used).
 - `{opts?}` (`table?`) Options:
   - `config` (`table`) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
 
-**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, enabled_by_default, enabled }.
 
 **Example:**
 
@@ -774,7 +789,7 @@ throw).
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, enabled_by_default, header?, restore? }, or nil if not found.
 
 **Example:**
 
@@ -1984,6 +1999,44 @@ Wait for the result with `AgentTurn:wait`.
 
 ---
 
+### `Agent:add_tool()` {#Agent-add_tool}
+
+```lua
+Agent:add_tool({ctx}, {name})
+```
+
+Attach an opt-in tool registered by this plugin to the pinned TUI root.
+The next new model request can advertise it, even in the same turn. In-flight
+requests and their retries do not change. Repeated calls keep the existing
+activation identity; this is not a plugin-state revision or commit fence.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation pinned to this exact root.
+- `{name}` (`string`) Registered tool name (`enabled_by_default = false`).
+
+**Returns:** (`boolean?`, `string?`) Success.
+
+---
+
+### `Agent:remove_tool()` {#Agent-remove_tool}
+
+```lua
+Agent:remove_tool({ctx}, {name})
+```
+
+Detach the plugin's opt-in tool from the pinned TUI root without unregistering it.
+Only new requests change. Removing a tool that is already detached succeeds.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation pinned to this exact root.
+- `{name}` (`string`) Registered tool name (`enabled_by_default = false`).
+
+**Returns:** (`boolean?`, `string?`) Success.
+
+---
+
 ### `Agent:set_model()` {#Agent-set_model}
 
 ```lua
@@ -2189,6 +2242,54 @@ Alias for `create_autocmd("AgentClosed", { agent = self, callback = handler })`.
 - `{handler}` (`function`) Called as handler(ev, ctx), like any autocmd callback.
 
 **Returns:** ([`AgentSubscription?`](#makima-agent-AgentSubscription), `string?`) Revocable subscription.
+
+---
+
+### `Agent:tool_transition()` {#Agent-tool_transition}
+
+```lua
+Agent:tool_transition({ctx}, {name}, {reduce})
+```
+
+Reduce actor-ordered facts for your opt-in tool on a pinned TUI root with a live session lease. The synchronous reducer must not yield. It receives {facts, latest, plan, faulted, closing, record}; facts are exposed {turn, scope}, settled {turn, outcome}, or stopped {reason}. latest is the latest settled turn ID. record:read(key) and record:write(key, table) are bounded, lease-checked sidecar operations valid only inside the reducer. A missing record returns nil without an error. Return {revision, scope} to publish an active revision, or nil to disarm and detach. This does not attach a detached tool. A failed reducer disarms the attachment.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation pinned to this exact root.
+- `{name}` (`string`) An opt-in tool owned by the invoking plugin, with a lifecycle controller.
+- `{reduce}` (`function`) Synchronous reducer. Use opaque IDs from new_revision_id() for activation revisions and counter scopes.
+
+**Returns:** (`table?`, `string?`) On success, may carry an opaque wake fence in wake when the revision is active and there is a settled turn.
+
+---
+
+### `Agent:wake_with_tool()` {#Agent-wake_with_tool}
+
+```lua
+Agent:wake_with_tool({ctx}, {wake}, {message})
+```
+
+Ask the TUI to admit an idle turn for a lifecycle-controlled attachment. The host first gives ordinary input and child delivery priority, then checks the exact settled turn, attachment, policy, and history fence. Busy or stale wakes are dropped, not queued. A successful return means only that the TUI received the request for consideration.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted invocation pinned to the same root.
+- `{wake}` (`userdata`) Fence returned by tool_transition.
+- `{message}` (`string`) User-role text for the new turn.
+
+**Returns:** (`boolean?`, `string?`) Success or a routing error.
+
+---
+
+### `Agent:new_revision_id()` {#Agent-new_revision_id}
+
+```lua
+Agent:new_revision_id()
+```
+
+Generate a fresh opaque ID for a lifecycle controller revision or scope.
+
+**Returns:** (`string`) Opaque ID.
 
 
 ## makima.agent.AgentRef {#makima-agent-AgentRef}
@@ -7200,6 +7301,26 @@ makima.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} 
 -- clickable entry:
 makima.ui.set_status_content({ {"refresh", "accent", function() makima.ui.flash("refreshing") end} })
 ```
+
+---
+
+### `makima.ui.set_root_status_content()` {#makima-ui-set_root_status_content}
+
+```lua
+makima.ui.set_root_status_content({ctx}, {spans})
+```
+
+Set your plugin's status spans for the root pinned to this trusted TUI invocation.
+They appear only when this exact root's chat is displayed, not on other roots
+or children. The spans coexist with global status and are removed on root close
+or plugin unload. Unlike global status, root spans are not clickable.
+
+**Parameters:**
+
+- `{ctx}` ([`LuaCtx`](#LuaCtx)) Trusted context pinned to a live TUI root.
+- `{spans}` (`table`) Sequence of {text, style_name} pairs. Styles may be semantic names or #RRGGBB foreground colors. Pass {} to clear.
+
+**Returns:** (`boolean?`, `string?`) Success or an authority error.
 
 ---
 

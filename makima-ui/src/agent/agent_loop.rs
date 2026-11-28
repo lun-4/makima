@@ -20,9 +20,7 @@ use makima_agent::permissions::PermissionManager;
 use makima_agent::template;
 use makima_agent::template::Vars;
 use makima_agent::tools::offload::OffloadStore;
-use makima_agent::tools::{
-    FileReadTracker, QuestionMode, RequestTools, ToolAudience, ToolRegistry,
-};
+use makima_agent::tools::{FileReadTracker, QuestionMode, RequestTools, ToolAudience};
 use makima_agent::{
     ActorWorkIdentity, Agent, AgentConfig, AgentEvent, AgentId, AgentInput, AgentParams,
     AgentRunParams, CancelMap, CancelToken, Envelope, EventSender, History, Instructions,
@@ -147,7 +145,7 @@ impl TuiActorBackend {
                 prompt_slots: Arc::new(makima_agent::prompt::ResolvedSlots::default()),
                 modes: self.lua_handle.mode_registry(),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
-                registry: Arc::clone(ToolRegistry::global_arc()),
+                registry: Arc::clone(self.lua_handle.tool_registry()),
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
@@ -380,7 +378,7 @@ impl TuiActorBackend {
                 prompt_slots,
                 modes: Arc::clone(&self.lua_handle.mode_registry()),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
-                registry: Arc::clone(makima_agent::tools::ToolRegistry::global_arc()),
+                registry: Arc::clone(self.lua_handle.tool_registry()),
                 audience: ToolAudience::MAIN,
                 question_mode: QuestionMode::Tui,
                 model_policy: Arc::clone(&self.model_policy),
@@ -414,12 +412,11 @@ impl TuiActorBackend {
     /// Base tools only. MCP definitions are injected per request by
     /// `Agent::request_tools`; baking them here would freeze the catalog.
     fn build_tools(&self, model: &Model, workflow: bool) -> RequestTools {
-        RequestTools::build(
-            ToolRegistry::global(),
+        RequestTools::build_for_tui(
+            self.lua_handle.tool_registry(),
             &self.vars,
             model,
             &self.config,
-            &[],
             workflow,
             self.mcp.is_some(),
         )
@@ -457,7 +454,7 @@ impl ActorBackend for TuiActorBackend {
         let lua_handle = self.lua_handle.clone();
         Some(
             makima_agent::agent::TurnSetup {
-                registry: Arc::clone(ToolRegistry::global_arc()),
+                registry: Arc::clone(self.lua_handle.tool_registry()),
                 local_tools: Default::default(),
                 mcp: self.mcp.clone(),
                 slots: self.lua_handle.prompt_slot_source(),
@@ -679,6 +676,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
 
 #[cfg(test)]
 mod tests {
+    use makima_agent::tools::ToolRegistry;
     use std::any::Any;
     use std::collections::HashMap;
     use std::pin::pin;

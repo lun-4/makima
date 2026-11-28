@@ -23,7 +23,7 @@ use crossterm::event::{
 };
 use makima_agent::actor::{
     ActorEvent, ConfigChange, ConfigCommit, ConfigPatch, HistoryChange, PreparedModel,
-    PreparedTransaction,
+    PreparedTransaction, ToolLifecycleTrigger, TurnAdmissionOptions,
 };
 use makima_agent::command::CustomCommand;
 use makima_agent::config_change::{
@@ -44,8 +44,8 @@ use makima_agent::session_options::{
 };
 use makima_agent::tools::offload::OffloadStore;
 use makima_agent::{
-    AgentConfig, AgentEvent, AgentRef, CancelToken, Envelope, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, mcp,
+    AgentConfig, AgentEvent, AgentInput, AgentRef, CancelToken, Envelope, McpCommand,
+    McpConfigErrors, McpHandle, McpSnapshotReader, TurnOrigin, TurnProvenance, mcp,
 };
 use makima_commands::{BuiltinOperation, CommandError, HostResponse};
 use makima_config::project::TrustQuestion;
@@ -72,6 +72,7 @@ use makima_storage::StateDir;
 use makima_storage::StorageError;
 use makima_storage::checkpoint::CheckpointPublication;
 use makima_storage::id::{MakimaId, MakimaIdParseError, SessionRef};
+use makima_storage::plugin_session::PluginSession;
 use makima_storage::session_lock::{self, ClaimedSessionLock};
 use makima_storage::sessions::{SESSIONS_DIR, SessionError, normalize_title};
 use serde_json::json;
@@ -420,6 +421,7 @@ impl Drop for HeartbeatCompletion {
 }
 
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
+    runtime.handles.manager_and_root().0.retire_plugin_session();
     runtime.session_lock = None;
     runtime.lock_lost = true;
     runtime.end_plan_approval();
@@ -857,6 +859,12 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
+        if let Some(SessionLockState::Held(lock)) = &session_lock
+            && let Some(binding) =
+                PluginSession::new(app.state.session.id, lock.publication_guard())
+        {
+            handles.manager_and_root().0.bind_plugin_session(binding);
+        }
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let config_commits = match observe_config_commits(
@@ -935,6 +943,12 @@ impl PreparedSessionRuntime {
         }
         let handles = handles.activate();
         let mut app = app.activate();
+        if let Some(SessionLockState::Held(lock)) = &session_lock
+            && let Some(binding) =
+                PluginSession::new(app.state.session.id, lock.publication_guard())
+        {
+            handles.manager_and_root().0.bind_plugin_session(binding);
+        }
         handles.apply_to_app(&mut app);
         app.coordinator = Some(coordinator.clone());
         let config_commits = match observe_config_commits(
@@ -2728,10 +2742,27 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-        // These two only fire Lua autocmds. Anything a handler does comes back
-        // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
+        for runtime in &self.sessions {
+            let (manager, id) = runtime.handles.manager_and_root();
+            let idle = runtime.quiescent() && runtime.app.exit_request == ExitRequest::None;
+            let notifications = manager.tool_lifecycle_notifications(id, idle);
+            if !notifications.is_empty()
+                && let Ok(root) = manager.lookup(id)
+            {
+                for (entry, trigger) in notifications {
+                    let (root, manager) = (root.clone(), manager.clone());
+                    smol::spawn(async move {
+                        if let Err(error) = entry.tool.reconcile(root, trigger).await {
+                            warn!(tool = entry.name(), %error, "conditional tool callback failed");
+                            manager.fail_tool_lifecycle(id, &entry);
+                        }
+                    })
+                    .detach();
+                }
+            }
+        }
         self.emit_status_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on the settled notification; a dead agent
@@ -3295,6 +3326,8 @@ impl<'t> EventLoop<'t> {
     /// non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         let mut rt = self.sessions.remove(idx);
+        drain_session_tool_lifecycles(std::iter::once(&rt.handles));
+        rt.handles.manager_and_root().0.retire_plugin_session();
         if let Err(error) = release_lock_state(rt.session_lock.take()) {
             warn!(id = %rt.id(), %error, "session lock release failed");
         }
@@ -3544,6 +3577,8 @@ impl<'t> EventLoop<'t> {
             session_lock,
             ..
         } = old;
+        drain_session_tool_lifecycles(std::iter::once(&handles));
+        handles.manager_and_root().0.retire_plugin_session();
         let retired_id = app.state.session.id;
         let replaced_session = retired_id != self.sessions[idx].id();
         let ended_conversation = replaced_session
@@ -4607,6 +4642,10 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        drain_session_tool_lifecycles(self.sessions.iter().map(|rt| &rt.handles));
+        for rt in &self.sessions {
+            rt.handles.manager_and_root().0.retire_plugin_session();
+        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -4720,6 +4759,48 @@ impl UiSink for EventLoop<'_> {
 
     fn render(&mut self, action: UiAction) {
         match action {
+            UiAction::ToolWake {
+                root,
+                message,
+                fence,
+                after,
+                plugin,
+                generation,
+            } => {
+                // The regular mailbox is consulted before plugin continuations.
+                let _ = self.start_mailbox_runs();
+                if let Some(rt) = self.sessions.iter().find(|rt| {
+                    let (manager, id) = rt.handles.manager_and_root();
+                    root.id() == id && manager.same_manager(&root.manager())
+                }) && rt.quiescent()
+                    && !rt.lock_lost
+                    && rt.app.exit_request == ExitRequest::None
+                    && let Ok(actor) = root.manager().actor(root.id())
+                {
+                    let _ = actor.admit_turn_with_options(
+                        AgentInput {
+                            message,
+                            images: Vec::new(),
+                            preamble: Vec::new(),
+                            prompt: None,
+                        },
+                        None,
+                        String::new(),
+                        TurnAdmissionOptions {
+                            idle_only: true,
+                            after_turn: Some(after),
+                            tool_fence: Some(fence),
+                            provenance: TurnProvenance {
+                                origin: TurnOrigin::Plugin,
+                                plugin: Some(plugin.to_string()),
+                                plugin_generation: Some(generation),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
             UiAction::Flash(text) => self.notify(text),
             UiAction::SetWindowTitle(title) => {
                 if let Err(error) = terminal::set_window_title(&title) {
@@ -4824,6 +4905,32 @@ fn provider_usage_limit(limit: makima_providers::UsageLimit) -> ProviderUsageLim
         reset_at_ms: limit.reset_at,
         detail: limit.detail,
         ui_shortname_hint: limit.ui_shortname_hint,
+    }
+}
+
+fn drain_session_tool_lifecycles<'a>(sessions: impl IntoIterator<Item = &'a AgentHandles>) {
+    // Cut every root before waiting on the first Lua writer.
+    let mut drains = Vec::new();
+    for handles in sessions {
+        let (manager, id) = handles.manager_and_root();
+        if let Ok(root) = manager.lookup(id) {
+            for entry in manager.close_tool_lifecycles(id, None) {
+                drains.push((root.clone(), entry));
+            }
+        }
+    }
+    let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
+    for (root, entry) in drains {
+        let result = smol::block_on(futures_lite::future::or(
+            entry.tool.reconcile(root, ToolLifecycleTrigger::Closing),
+            async {
+                smol::Timer::at(deadline).await;
+                Err("tool lifecycle drain timed out".into())
+            },
+        ));
+        if let Err(error) = result {
+            warn!(tool = entry.name(), %error, "conditional tool drain failed");
+        }
     }
 }
 
@@ -6052,6 +6159,369 @@ end })
         > {
             Box::pin(std::future::pending())
         }
+    }
+
+    struct GoalRequest {
+        messages: Vec<Message>,
+        tools: serde_json::Value,
+        finish: flume::Sender<()>,
+    }
+
+    struct GoalProvider(flume::Sender<GoalRequest>);
+
+    impl Provider for GoalProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            messages: &'a [Message],
+            _system: &'a str,
+            tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<makima_providers::ProviderEvent>,
+            _opts: makima_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+            _invocation: &'a Invocation,
+            _delivery: RequestDelivery,
+        ) -> makima_providers::provider::BoxFuture<
+            'a,
+            Result<makima_providers::StreamResponse, makima_providers::AgentError>,
+        > {
+            Box::pin(async move {
+                let (finish, wait) = flume::bounded(1);
+                self.0
+                    .send(GoalRequest {
+                        messages: messages.to_vec(),
+                        tools: tools.clone(),
+                        finish,
+                    })
+                    .unwrap();
+                wait.recv_async().await.unwrap();
+                Ok(makima_providers::StreamResponse {
+                    message: Message {
+                        role: makima_providers::Role::Assistant,
+                        content: vec![makima_providers::ContentBlock::Text {
+                            text: "working toward the objective".into(),
+                        }],
+                        ..Default::default()
+                    },
+                    usage: TokenUsage::default(),
+                    stop_reason: Some(makima_providers::StopReason::EndTurn),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GoalCompetingWork {
+        Input,
+        Recovery,
+        ChildDelivery,
+    }
+
+    #[test_case(GoalCompetingWork::Input; "pending_user_input_wins")]
+    #[test_case(GoalCompetingWork::Recovery; "recovery_text_wins")]
+    #[test_case(GoalCompetingWork::ChildDelivery; "child_delivery_wins")]
+    fn goal_guarded_continuation_respects_competing_work(work: GoalCompetingWork) {
+        const OBJECTIVE: &str = "Run the regression suite";
+        const USER_TEXT: &str = "prioritize this first";
+        let (requests_tx, requests) = flume::unbounded();
+        let mut host = PluginHost::with_command_registry(
+            Arc::new(ToolRegistry::new()),
+            makima_commands::CommandRegistry::new(),
+            false,
+            makima_lua::ui_sink::HostUi::Frontend,
+        )
+        .unwrap();
+        host.load_builtins(&makima_config::PluginsConfig {
+            enabled: true,
+            names: vec!["goal".into()],
+            opts: Default::default(),
+        })
+        .unwrap();
+        host.load_source(
+            "goal_test_status",
+            r#"
+            makima.ui.set_status_content({{"OTHER", "accent"}})
+            makima.api.register_command({
+                name = "/goal-test-child", tui_only = true,
+                handler = function(_, ctx)
+                    local child = assert(makima.agent.spawn(ctx, {
+                        inherit_provider = true, tools = {}, show = false,
+                    }))
+                    assert(child:send(ctx, "child prompt", { when = "idle" }))
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let actions = host.ui_action_rx();
+        let registry = host.command_registry();
+        let status = host.status_content_reader();
+        let request = || {
+            requests
+                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                .expect("provider request")
+        };
+        with_event_loop_runtime(
+            |harness| {
+                let session = harness.session();
+                let ctx = harness.ctx.as_mut().unwrap();
+                ctx.lua_event_handle = host.event_handle();
+                ctx.status_content_reader = status.clone();
+                ctx.command_runtime = Arc::new(CommandRuntime::new_for_test(
+                    &[],
+                    registry.clone(),
+                    Arc::new(ModelArgSource::new(
+                        ctx.catalog.specs(),
+                        crate::model_capabilities::test_support::seeded(&[], &[]),
+                    )),
+                    Arc::new(ThemeArgSource::new(
+                        crate::theme::default_provider().clone(),
+                    )),
+                ));
+                ctx.spawn_runtime_with_provider(
+                    session,
+                    Some(PreparedProvider {
+                        model: crate::components::test_model(),
+                        provider: Arc::new(GoalProvider(requests_tx)),
+                    }),
+                )
+                .unwrap()
+            },
+            |event_loop| {
+                host.event_handle()
+                    .install_orchestration_services(event_loop.orchestration.clone());
+                event_loop.sync_orchestration();
+                let (manager, root_id) = event_loop.sessions[0].handles.manager_and_root();
+                let root = manager.lookup(root_id).unwrap();
+                let actor = root.actor().unwrap();
+                let command = |event_loop: &mut EventLoop<'_>, text: String| {
+                    let result = smol::block_on(registry.dispatch_input(
+                        &event_loop.sessions[0].app.command_target,
+                        text.as_str().into(),
+                    ));
+                    assert!(
+                        matches!(
+                            result,
+                            makima_commands::InputDispatch::Dispatched(
+                                makima_commands::CommandOutcome::Completed
+                            )
+                        ),
+                        "{result:?}"
+                    );
+                };
+                let badge = |event_loop: &mut EventLoop<'_>, expected: &str| {
+                    let app = &mut event_loop.sessions[0].app;
+                    let _ = app.reconcile_status_content();
+                    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+                    terminal.draw(|frame| app.view(frame)).unwrap();
+                    let buf = terminal.backend().buffer();
+                    let text = crate::components::buffer_text(buf);
+                    assert!(text.contains("OTHER"), "{text}");
+                    assert!(text.contains(expected), "{text}");
+                    if !expected.is_empty() {
+                        let gold = buf
+                            .content()
+                            .iter()
+                            .filter(|cell| cell.fg == ratatui::style::Color::Rgb(255, 215, 0))
+                            .map(|cell| cell.symbol())
+                            .collect::<String>();
+                        assert!(gold.contains(expected), "{gold}");
+                    } else {
+                        assert!(!text.contains("goal:"), "{text}");
+                    }
+                };
+                let settle = |event_loop: &mut EventLoop<'_>, turn: TurnId| {
+                    let drained =
+                        smol::block_on(futures_lite::future::or(actor.runtime_barrier(), async {
+                            smol::Timer::after(RUNTIME_SHUTDOWN_TIMEOUT).await;
+                            panic!("root did not settle");
+                        }))
+                        .unwrap();
+                    assert!(!drained.processing);
+                    let deadline = Instant::now() + RUNTIME_SHUTDOWN_TIMEOUT;
+                    let agent_rx = event_loop.sessions[0].handles.agent_rx.clone();
+                    let actor_rx = event_loop.sessions[0].handles.actor_rx.clone();
+                    loop {
+                        let wake = flume::Selector::new()
+                            .recv(&agent_rx, |env| Wake::Agent(0, Box::new(env.unwrap())))
+                            .recv(&actor_rx, |ev| Wake::Actor(0, ev.unwrap()))
+                            .wait_timeout(deadline.saturating_duration_since(Instant::now()))
+                            .unwrap();
+                        event_loop.handle_wake(wake).unwrap();
+                        if actor.snapshot().active_turn.is_none()
+                            && event_loop.sessions[0].quiescent()
+                            && actor.latest_ticket().is_some_and(|ticket| {
+                                ticket.turn_id() == turn && ticket.peek_result().is_some()
+                            })
+                        {
+                            break;
+                        }
+                    }
+                };
+                let reconcile = |trigger| {
+                    let notifications = manager.tool_lifecycle_notifications(root_id, true);
+                    assert_eq!(notifications.len(), 1);
+                    let (entry, got) = notifications.into_iter().next().unwrap();
+                    assert_eq!(got.as_str(), trigger);
+                    smol::block_on(entry.tool.reconcile(root.clone(), got)).unwrap();
+                };
+
+                // Hold admission before the first provider request to observe zero.
+                let gate = actor.prepare_idle().unwrap();
+                command(event_loop, format!("/goal {OBJECTIVE}"));
+                badge(event_loop, "goal:0/10");
+                drop(gate);
+                let initial = request();
+                assert!(
+                    initial
+                        .tools
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["name"] == "goal")
+                );
+                assert!(
+                    initial
+                        .messages
+                        .last()
+                        .unwrap()
+                        .first_text_content()
+                        .unwrap()
+                        .contains(OBJECTIVE)
+                );
+                let turn = actor.snapshot().active_turn.unwrap();
+                reconcile("facts");
+                badge(event_loop, "goal:1/10");
+                let app = &mut event_loop.sessions[0].app;
+                app.chats[0].agent_id = Some(AgentId::generate());
+                badge(event_loop, "");
+                event_loop.sessions[0].app.chats[0].agent_id = Some(root_id);
+                initial.finish.send(()).unwrap();
+                settle(event_loop, turn);
+                reconcile("facts");
+                reconcile("idle");
+                assert!(
+                    manager
+                        .tool_lifecycle_notifications(root_id, true)
+                        .is_empty()
+                );
+                let wake = actions.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+                assert!(matches!(wake, UiAction::ToolWake { after, .. } if after == turn));
+                let child = if matches!(work, GoalCompetingWork::ChildDelivery) {
+                    command(event_loop, "/goal-test-child".into());
+                    let child = request();
+                    assert_eq!(
+                        child.messages.last().unwrap().first_text_content(),
+                        Some("child prompt")
+                    );
+                    assert!(
+                        !child
+                            .tools
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "goal")
+                    );
+                    let child_id = manager
+                        .snapshot()
+                        .into_iter()
+                        .find(|node| node.parent_id == Some(root_id))
+                        .unwrap()
+                        .agent_id;
+                    select_child_chat(event_loop, child_id, "Goal test child");
+                    badge(event_loop, "");
+                    command(event_loop, "/goal".into());
+                    assert!(
+                        matches!(actions.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(), UiAction::Flash(text) if text.contains("pinned session root"))
+                    );
+                    event_loop.sessions[0].app.active_chat = 0;
+                    event_loop.sync_orchestration();
+                    badge(event_loop, "goal:1/10");
+                    Some(child)
+                } else {
+                    None
+                };
+                event_loop.render(wake);
+                let continuation = request();
+                assert!(
+                    continuation
+                        .messages
+                        .last()
+                        .unwrap()
+                        .first_text_content()
+                        .unwrap()
+                        .contains("continue toward")
+                );
+                let next = actor.snapshot().active_turn.unwrap();
+                assert_ne!(turn, next);
+                continuation.finish.send(()).unwrap();
+                settle(event_loop, next);
+                reconcile("facts");
+                reconcile("idle");
+                let stale_wake = actions.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap();
+
+                if let Some(child) = child {
+                    child.finish.send(()).unwrap();
+                    let delivery = request();
+                    assert!(delivery.messages.iter().any(|message| {
+                        message
+                            .first_text_content()
+                            .is_some_and(|text| text.contains("internal child-result data"))
+                    }));
+                    assert!(
+                        delivery
+                            .tools
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "goal")
+                    );
+                    event_loop.render(stale_wake);
+                    let delivery_turn = actor.snapshot().active_turn.unwrap();
+                    delivery.finish.send(()).unwrap();
+                    settle(event_loop, delivery_turn);
+                    assert_eq!(actor.latest_ticket().unwrap().turn_id(), delivery_turn);
+                    command(event_loop, "/goal".into());
+                    assert!(
+                        matches!(actions.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT).unwrap(), UiAction::Flash(text) if text.contains("3/10, 3 lifetime"))
+                    );
+                } else if matches!(work, GoalCompetingWork::Recovery) {
+                    crate::app::tests::hold_recovery_text(
+                        &mut event_loop.sessions[0].app,
+                        USER_TEXT.into(),
+                    );
+                    assert!(event_loop.sessions[0].app.holds_recovery_text());
+                    assert!(actor.pending_submissions().is_empty());
+                    event_loop.render(stale_wake);
+                    assert!(event_loop.sessions[0].app.holds_recovery_text());
+                    assert_eq!(actor.latest_ticket().unwrap().turn_id(), next);
+                } else {
+                    assert_eq!(
+                        event_loop.submit_text(0, USER_TEXT.into()).unwrap(),
+                        "started"
+                    );
+                    let ordinary = request();
+                    event_loop.render(stale_wake);
+                    assert_eq!(
+                        ordinary
+                            .messages
+                            .last()
+                            .unwrap()
+                            .first_text_content()
+                            .unwrap(),
+                        USER_TEXT
+                    );
+                    let user_turn = actor.snapshot().active_turn.unwrap();
+                    ordinary.finish.send(()).unwrap();
+                    settle(event_loop, user_turn);
+                    assert_eq!(actor.latest_ticket().unwrap().turn_id(), user_turn);
+                }
+                command(event_loop, "/goal pause".into());
+                badge(event_loop, "");
+                assert!(requests.is_empty());
+                host.unload("goal").unwrap();
+            },
+        );
     }
 
     struct FocusedProvider;

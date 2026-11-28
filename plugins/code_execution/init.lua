@@ -232,7 +232,7 @@ local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
   local has_workflow_only = false
   for _, t in ipairs(interpreter_tools(makima.api.get_tools(), dctx.audience, dctx.workflow)) do
-    if matches_filter(t.name, dctx) then
+    if t.enabled_by_default ~= false and matches_filter(t.name, dctx) then
       has_workflow_only = has_workflow_only or t.workflow_only
       parts[#parts + 1] = signature(t) .. "\n"
     end

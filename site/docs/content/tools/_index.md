@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Makima ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Makima ships with 27 built-in tools in this reference (25 on by default, 1 opt-in via plugin options, 1 conditional). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/). Tools marked **conditional** are only available when their plugin attaches them to a request. For example, `goal` is offered in the main TUI chat while a [session goal](/docs/commands/#goals) is active.
 
 ## File Operations
 
@@ -219,6 +219,15 @@ Stop a background subagent or a tool call moved to the background. A moved call'
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task_id` | string | yes | Task id returned by task_spawn, or the call id of a tool moved to the background. |
+
+### `goal` <span class="badge">conditional</span> {#goal}
+
+Read the active goal with status. Report complete only with concrete verification, or blocked only with evidence of a concrete external dependency that prevents further progress. Reports are provisional until the current turn finishes normally.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `evidence` | string | no | Concrete evidence, required for complete and blocked. |
+| `op` | string | yes |  |
 
 ### `todo_write` {#todo_write}
 

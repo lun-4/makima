@@ -221,6 +221,11 @@ pub struct SessionPublicationGuard {
 }
 
 impl SessionPublicationGuard {
+    pub(crate) fn directory_for(&self, id: MakimaId) -> Option<&Path> {
+        let dir = self.path.parent()?;
+        (lock_path(dir, &id) == self.path).then_some(dir)
+    }
+
     pub fn publish<T>(&self, publish: impl FnOnce() -> T) -> io::Result<Option<T>> {
         #[cfg(test)]
         run_publish_before_lock_hook(&self.path);
