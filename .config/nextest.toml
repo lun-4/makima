@@ -3,3 +3,27 @@ fail-fast = false
 status-level = "slow"
 test-threads = 64
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Platform-specific behaviour the Windows job checks. CI passes the packages
+# with `-p` so only their test binaries build.
+[profile.ci-windows]
+default-filter = """
+(package(makima-agent) & kind(lib) & (test(tools::offload) | test(session_writer) | test(shell::tests)))
+| (package(makima-storage) & kind(lib) & (test(sessions::tests) | test(release_waits_for_in_flight_publication)))
+| (package(makima-lua) & kind(lib) & test(shell_reflects_platform_and_config))
+| (package(makima-lua) & binary(plugin_host) & test(configured_shell_is_used_when_builtins_load))
+| (package(makima-ui) & kind(lib) & (test(project_file_queries_match_on_open_and_update) | test(picker_matches_path_without_rewriting_search)))
+"""
+
+# What differs on macOS: the Luau VM and its collector, file locks and paths,
+# FSEvents watching, locale and keybinding cfgs. The release workflow runs
+# the full suite.
+[profile.ci-macos]
+default-filter = """
+(package(makima-agent) & kind(lib) & (test(tools::offload) | test(session_writer) | test(shell::tests)))
+| (package(makima-storage) & kind(lib))
+| (package(makima-match) & kind(lib))
+| (package(makima-lua) & kind(lib))
+| (package(makima-lua) & binary(plugin_host) & test(configured_shell_is_used_when_builtins_load))
+| (package(makima-ui) & kind(lib) & (test(/(clock|keybindings|plan_form|arg_completion|list_picker|color_compat)::/) | test(project_file_queries_match_on_open_and_update) | test(picker_matches_path_without_rewriting_search)))
+"""
