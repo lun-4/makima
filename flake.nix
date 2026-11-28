@@ -142,9 +142,6 @@
           '';
 
           commonArgs = {
-            # crane's cargoWithProfile turns this into `--profile release-lto`
-            # for both buildDepsOnly and buildPackage.
-            CARGO_PROFILE = "release-lto";
             nativeBuildInputs = with pkgs; [
               pkg-config
               perl
@@ -154,30 +151,38 @@
               openssl
               stdenv.cc.cc.lib
             ];
-            inherit cargoVendorDir;
+            inherit cargoVendorDir version;
+            src = workspaceSrc;
           };
 
-          cargoArtifacts = craneLib.buildDepsOnly (
-            commonArgs
-            // {
-              pname = "${packageName}-deps";
-              inherit version;
-              src = workspaceSrc;
-            }
-          );
+          # crane's cargoWithProfile turns CARGO_PROFILE into `--profile <name>`
+          # for both buildDepsOnly and buildPackage.
+          mkPackage =
+            profile:
+            let
+              args = commonArgs // {
+                CARGO_PROFILE = profile;
+              };
+            in
+            craneLib.buildPackage (
+              args
+              // {
+                pname = packageName;
+                cargoArtifacts = craneLib.buildDepsOnly (
+                  args
+                  // {
+                    pname = "${packageName}-deps";
+                  }
+                );
+                cargoExtraArgs = "--package ${packageName}";
+                doCheck = false;
+              }
+            );
         in
         {
-          default = craneLib.buildPackage (
-            commonArgs
-            // {
-              pname = packageName;
-              inherit version;
-              src = workspaceSrc;
-              cargoArtifacts = cargoArtifacts;
-              cargoExtraArgs = "--package ${packageName}";
-              doCheck = false;
-            }
-          );
+          default = mkPackage "release-lto";
+          # Thin LTO, so CI checks the flake builds without the fat LTO link.
+          ci = mkPackage "release";
         }
       );
 
