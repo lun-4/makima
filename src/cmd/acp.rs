@@ -56,7 +56,8 @@ pub fn run(
         .provider_registry(timeouts)
         .context("build provider registry")?;
 
-    let model = setup::resolve_model(&providers, model_arg.as_deref(), &config.provider, &storage)?;
+    let model_arg = model_arg.as_deref().or(cli.model.as_deref());
+    let model = setup::resolve_model(&providers, model_arg, &config.provider, &storage)?;
 
     setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
@@ -69,6 +70,7 @@ pub fn run(
 
     let result = makima_acp::run(makima_acp::AcpParams {
         model,
+        model_explicit: model_arg.is_some(),
         config: config.agent,
         permissions_config: config.permissions,
         timeouts,

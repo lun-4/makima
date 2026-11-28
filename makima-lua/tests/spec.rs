@@ -52,6 +52,7 @@ use test_case::test_case;
 #[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
 #[test_case("task", include_str!("../../plugins/task/tests/spec.lua") ; "task_plugin_spec")]
+#[test_case("task_list", include_str!("../../plugins/task/tests/list.lua") ; "task_list_plugin_spec")]
 #[test_case("usage", include_str!("../../plugins/usage/tests/spec.lua") ; "usage_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
@@ -63,6 +64,7 @@ fn plugin_spec(name: &str, spec: &str) {
     let source = match name {
         "sessions" => Some(include_str!("../../plugins/sessions/init.lua")),
         "thinking" => Some(include_str!("../../plugins/thinking/init.lua")),
+        "task" | "task_list" => Some(include_str!("../../plugins/task/init.lua")),
         _ => None,
     };
     let spec = source.map_or_else(

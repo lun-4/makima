@@ -52,7 +52,17 @@ After the match it always loads `AGENTS.local.md` from the same directory if pre
 
 That `web/AGENTS.md` is not dead weight. The first time the agent `read`s a file under a subdirectory whose instruction file was never loaded, Makima pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.
 
-Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; the next section explains why.
+Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short; [Four places to put knowledge](#four-places-to-put-knowledge) compares their cost with skills and memory.
+
+## Recorded context
+
+Saved sessions record the instruction text, source order, and resolved system-prompt contributions used by the main agent. Resume uses those recorded values. Editing, removing, or reordering an already recorded source does not silently change the next request. Makima reports `instructions changed on disk, run /reload-context` when it observes such a change. Repeated observations of the same change do not repeat the notice.
+
+Newly encountered instruction sources are still added when first loaded, including subdirectory rules. Recording context does not load every instruction file in the project in advance.
+
+Run `/reload-context` from any agent to reload the session's recorded context. The command adopts the current instruction sources and available prompt contributions for subsequent requests. If prompt contributions are unavailable during reload, their recorded values remain in use. Each child's own system prompt remains fixed at spawn.
+
+Context reload is part of recorded session state. See [Persistence and resume](/docs/agent-work/#persistence-and-resume).
 
 ## Four places to put knowledge
 
@@ -71,16 +81,7 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 Long sessions eventually approach the model's context limit. Makima reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers what the summary keeps.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Makima parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
-
-An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Makima you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
-
-```sh
-cd ~/.local/state/makima/sessions
-mv <session-id>.jsonl <session-id>.jsonl.bak
-cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-makima -c <session-id>
-```
+Compaction replaces older turns in the model's context with a summary. The original messages stay in [session storage](/docs/agent-work/#session-storage).
 
 `MAKIMA_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.
 

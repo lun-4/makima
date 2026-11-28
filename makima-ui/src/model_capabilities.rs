@@ -1,5 +1,6 @@
+use makima_domain::LockExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use makima_providers::{ModelCapabilities, ProviderRegistry};
 use tracing::debug;
@@ -46,7 +47,7 @@ impl ModelCapabilityCache {
 
     /// Returns the cached capabilities of `spec`, or starts resolving them.
     pub(crate) fn get(self: &Arc<Self>, spec: &str) -> Option<ModelCapabilities> {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         if let Some(capabilities) = state.resolved.get(spec) {
             return Some(*capabilities);
         }
@@ -66,7 +67,7 @@ impl ModelCapabilityCache {
     /// Returns the capabilities of `spec`, waiting for them if needed.
     pub(crate) async fn resolve(self: &Arc<Self>, spec: &str) -> ModelCapabilities {
         let epoch = {
-            let state = self.lock();
+            let state = self.state.lock_unpoisoned();
             if let Some(capabilities) = state.resolved.get(spec) {
                 return *capabilities;
             }
@@ -85,7 +86,7 @@ impl ModelCapabilityCache {
     /// Forgets everything, for when discovery or provider auth changes what
     /// a spec resolves to. Resolutions already running are discarded.
     pub(crate) fn clear(&self) {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         state.epoch = state.epoch.wrapping_add(1);
         state.resolved.clear();
         state.pending.clear();
@@ -93,7 +94,7 @@ impl ModelCapabilityCache {
 
     fn store(&self, spec: Arc<str>, epoch: u64, capabilities: ModelCapabilities) {
         {
-            let mut state = self.lock();
+            let mut state = self.state.lock_unpoisoned();
             if state.epoch != epoch {
                 return;
             }
@@ -101,10 +102,6 @@ impl ModelCapabilityCache {
             state.resolved.insert(spec, capabilities);
         }
         (self.notify)();
-    }
-
-    fn lock(&self) -> MutexGuard<'_, CacheState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -126,6 +123,7 @@ fn provider_adjusted(spec: &str, providers: &ProviderRegistry) -> ModelCapabilit
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use makima_domain::LockExt;
     use std::sync::Arc;
 
     use makima_providers::{ModelCapabilities, ThinkingSupport};
@@ -148,7 +146,7 @@ pub(crate) mod test_support {
         pending: &[&str],
     ) -> Arc<ModelCapabilityCache> {
         let cache = ModelCapabilityCache::new(|_| ModelCapabilities::NONE, || {});
-        let mut state = cache.lock();
+        let mut state = cache.state.lock_unpoisoned();
         for (spec, capabilities) in resolved {
             state.resolved.insert(Arc::from(*spec), *capabilities);
         }

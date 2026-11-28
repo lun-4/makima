@@ -122,7 +122,7 @@ One spec per line, warnings on stderr. Built-in and custom providers are listed 
 makima sessions --json
 ```
 
-Lists every stored session across all directories, most recently updated first. The command is `--json`-only and prints a JSON array; each entry carries the id, title, `updated_at` (epoch seconds), `cwd`, and `open_elsewhere` (true while another terminal has the session open). The ID is what you pass to `makima -c <ID>` from the same directory.
+Lists saved TUI, SDK, and ACP sessions across all directories, most recently updated first. Makima uses the first user text sent to the main agent to replace the default title. The command requires `--json` and returns an array with `id`, `title`, `updated_at` (epoch seconds), `cwd`, and `open_elsewhere` (true if another process holds the session lock). Run `makima -c <ID>` from the session directory to continue it.
 
 ### `makima mcp`
 

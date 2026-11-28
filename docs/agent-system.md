@@ -1,33 +1,28 @@
 # Agent system
 
-The reliable turn lifecycle, shared actor, and per-outer-session agent manager below describe the current implementation. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the public contract.
+The agent runtime uses a per-session journal, durable agent identities, resident actors, and a per-outer-session manager. See the [Lua API reference](../site/docs/content/lua-api/_index.md) and [plugin guide](../site/docs/content/plugins/_index.md) for the public contract.
 
 ## Vocabulary
 
-- **Outer session**: one frontend session (TUI, print, SDK or ACP) that owns one agent manager and one rooted agent graph.
-- **Agent**: one graph node with a stable `AgentId`, persistent actor, history, FIFO queue, and reusable lifecycle.
-- **Root agent**: the graph node with no parent. It uses the same actor implementation as descendants.
-- **Turn**: one accepted model/tool run, identified by a `TurnId` and ending in one `TurnOutcome`.
-- **Actor**: the per-agent scheduler and state owner.
-- **Manager**: the per-outer-session graph, factory, authority, task, and cross-agent concurrency owner.
-- **Subagent** and **task**: product-facing names for descendant agents. They are not separate core runtime types.
-- **Correlation id**: a frontend or protocol value such as a headless cancel key, task id, or provider tool-use id. It is not agent identity or authority.
+- Outer session: one session runtime with a journal, an agent manager, and one rooted agent graph.
+- Agent: one durable graph node with an `AgentId`, history, configuration, and lifecycle. An open node can have a resident actor or remain dormant.
+- Root agent: the graph node with no parent. It uses the same actor implementation as descendants.
+- Turn: one accepted model/tool run, identified by a `TurnId` and ending in one `TurnOutcome`.
+- Actor: the per-agent scheduler and state owner.
+- Manager: the per-outer-session graph, factory, authority, task, and cross-agent concurrency owner.
+- Subagent and task: product-facing names for descendant agents. They are not separate core runtime types.
+- Correlation id: a frontend or protocol value such as a headless cancel key or provider tool-use id. It is not agent identity or authority. The bundled task plugin uses the durable agent id as its task id.
 
 ## Architecture
 
 ```text
-Outer session (TUI, print, SDK or ACP)
-└── AgentManagerHandle
-    ├── graph, limits, runner tasks, turn permits, wait watchers
-    └── root AgentActorHandle
-        ├── history, FIFO queue, lifecycle, retained outcomes
-        └── Lua-created child AgentActorHandle
-            └── Lua-created grandchild AgentActorHandle
-
-AgentActorHandle
-└── ActorBackend (TUI, headless or Lua adapter)
-    └── transient Agent
-        └── Agent::run(turn_id, input) -> TurnOutcome
+Frontend (TUI, print, SDK or ACP)
+    |
+SessionHandle
+    +-- SessionJournal -> read-only projection
+    +-- AgentManagerHandle -> rooted agent graph
+            +-- AgentActorHandle (one per resident agent)
+                    +-- HeadlessBackend -> Agent::run(...) -> TurnOutcome
 ```
 
 The layers deliberately own different state:
@@ -37,9 +32,11 @@ The layers deliberately own different state:
 | `Agent::run` | One model/tool run, invocation-local usage and model-turn count, terminal outcome emission | The persistent queue, graph topology, or frontend lifecycle |
 | `AgentActorHandle` | One agent's stable identity, history, FIFO scheduling, active cancellation, tickets, outcomes, cumulative usage | Parent-child topology, graph limits, or a second copy of frontend state |
 | `AgentManagerHandle` | One outer session's rooted graph, actor factory, runner tasks, topology, spawn authority, global active-turn limit, subtree lifecycle | A second per-agent queue, history, or outcome store |
-| TUI, headless and Lua backends | Dynamic provider/model/tool/prompt preparation and presentation | Lifecycle truth or graph authority derived from presentation ids |
+| `SessionJournal` | Session records and the shared read projection | Actor scheduling or mutable conversation history |
+| `HeadlessBackend` | Provider, model, tool and prompt preparation and execution | Frontend presentation or graph authority |
+| Frontends | Input and presentation, including tabs or protocol correlation | Session records or a second scheduler |
 
-The core is dependency-neutral. `makima-agent` does not depend on `makima-ui` or `makima-lua`; those crates implement `ActorBackend` to prepare and execute their own turns against actor-owned history. `makima-agent::headless` holds the print, SDK and ACP backend.
+`makima-agent` owns the session pipeline and the shared `HeadlessBackend`. `FrontendServices` lets `makima-lua` bind the root and observe events without adding a dependency from `makima-agent` to Lua or the TUI. `FrontendProfile` controls question handling, interactive reauthentication, tool output limits, input hold after failure, excluded tools, owned or shared MCP, and setup error reporting. The shared backend resolves the compaction model for all frontends.
 
 ## Turn lifecycle
 
@@ -67,26 +64,70 @@ Every frontend, the coordinator and Lua commit a config change through one `conf
 
 Every mode name goes through one `modes::resolve`, against the registry the Lua host owns (`EventHandle::mode_registry`), and every frontend and Lua commit a mode with `ConfigChangeTicket::commit_mode`. `plan` keeps the current plan file or allocates one under the state directory. A mode is durable config committed once, like any other change: headless frontends admit turns without a mode of their own.
 
-An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration checkpoints use the existing session format and project onto stored metadata without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+An actor commit publishes its identity, generation, and full configuration to frontend projections. Provider slots and coordinator reads do not supply managed execution settings. Configuration commits append per-agent `Config` records without replacing history. The user-visible behaviour is described in [Modes: Configuration changes](../site/docs/content/modes/_index.md#configuration-changes).
+
+### Session state audit
+
+| State | Authority and restoration |
+|---|---|
+| Agent identity, ancestry, lifecycle, spawn specification and usage | Ordered agent revisions. Reservations, resident actors and runner tasks are rebuilt. |
+| Transcripts and observations | `Msg` records with stable message and agent IDs. Compactions and forks are separate records. |
+| Tool outputs and posts | `Out` and `Post` records. Posts refer to messages by ID. |
+| Turn admissions, outcomes and deliveries | Journal records. Recovery continues unfinished turns by default. Terminal delivery records prevent duplicate observations after restart and compaction. |
+| Model, thinking, effective fast setting, workflow, cwd and resolved mode | Per-agent `Config` records. Provider instances, model capabilities, runtime generations and caches are rebuilt. The spawn ceiling remains separate from mutable mode configuration. |
+| Deferred fast intent | A model-pinned internal Config option. Discovery consumes the intent with the committed setting change. |
+| Plugin options | All current values belong to Config history. Resume applies values whose current definitions declare persistence. |
+| Permission grants and explicit YOLO intent | Session-scoped `Rules` records. Invocation-only YOLO, config/project/plugin rules and cwd-derived boundary checks are rebuilt. Allow-once answers and pending prompts are discarded. |
+| Plan path, written status, approved content and staged implementation selection | The session-scoped `plan/state` slot records per-agent entries. Legacy metadata migrates into this slot. Approval that clears context creates an implementation session with a durable parent link. |
+| Title, draft and billed usage | Journal records and the shared projection. Draft attachments and pending compaction requests are not retained. |
+| Held input and pending `!` results | Journal state retains input holds and shell preambles per agent. See [Messages and turns](#shared-ordinary-message-submission). |
+| Provider sessions, MCP transports, background invocations and session locks | Rebuilt or interrupted. No live resource handle is deserialized. |
+| Plugin registrations, callbacks, timers and VM tables | Rebuilt when plugins load. `makima.state` stores registered, versioned JSON values in agent or session scope. VM tables, callbacks, timers and registrations are not stored. |
+| Focus, panels, scroll position and expanded rows | Transient UI state, except the existing persisted tool presentation state. Input history retains its separate storage. |
+
+Runtime configuration epochs and provider metadata are not independent durable settings. A restored actor receives its resolved mode definition with the configuration before admission. Saved mode snapshots do not consult changed or removed registry definitions. If the saved mode cannot be restored, recovery warns and falls back to read-only without automatically continuing the root.
 
 ### Durable publication
 
-Durable configuration changes commit through `PreparedOperationTicket::commit_durable`. History edits made under an idle guard (rewind, plan approval that clears context) commit through `ActorIdleGuard::commit_prepared_transaction_held`. In both, the actor captures a candidate snapshot, the host stages it on disk, and the actor commits only after the host has published it. One `CheckpointPublication` per request arbitrates between cancellation and the final replacement:
+Prepared configuration and history changes reserve an actor operation and a journal revision. `CheckpointPublication` is the claim that orders cancellation against journal installation. `LuaCtx::publication_claim` also checks plugin generation and invocation authority. Invalidation before the claim leaves the operation uncommitted. After the claim, dropping the waiter does not cancel publication. The save path installs the prepared records in the journal before acknowledging the write. An I/O error leaves installed records pending for retry.
 
-```text
-writer guard      SessionPublicationGuard: session lock held, owner still ours
-  plugin gate     PluginAuthority::publication_gate: plugin generation alive
-    task scope    TaskCell: invocation live, same plugin origin
-      cancel      CancelToken publication gate: not cancelled
-        CAS       CheckpointPublication PENDING -> PUBLISHING
-          rename  staged file replaces the session file
-```
+## Session journal and recovery
 
-The claim runs synchronously inside the writer guard and takes the locks in this order (`LuaCtx::publication_claim`). Hosts outside a Lua invocation use `session_coordinator::publication_claim`, which is the CAS alone. The claim callback must not take actor, manager, or option-catalog locks.
+`SessionJournal` owns session facts and orders their records in one sequence. The actor owns mutable conversation history. The journal retains the records that rebuild it and the latest values of other session state. `SessionJournal::projection()` returns an `Arc<SessionJournalSnapshot>` shared by readers. It includes committed transcripts, including those of dormant agents, before the writer flushes.
 
-Invalidation before the claim wins. Plugin revocation, the invocation ending, cancellation, or a dropped waiter moves the publication to `CANCELLED`. The staged file is discarded, the operation fails, and the finalizer never runs, so the actor, public options, host snapshot and disk all keep their previous state. A lost session lock or a failed rename has the same effect.
+Each fact has one write path. The journal derives the title from the first root user text while the title is still the default and records explicit renames. It folds usage once and projects live session cost. Shared tool dispatch records `Out` once per tool-use ID. Posts refer to the target agent's last committed message; `StoredPost.agent` identifies the target, with no agent ID for root posts. The journal also records draft changes, input holds, and shell preambles.
 
-After the claim, nothing can cancel the publication. The commit runs on an actor-owned task or the actor runner, so dropping the waiter does not drop it. Once the rename succeeds the actor commits, and the `PreparedFinalization` installs reserved public options and the host snapshot before observers see the new configuration. A publish callback that returns success without claiming is treated as a failure.
+### Session writer
+
+One `SessionWriter` in `makima-agent` serves each open saved session. The journal submits typed records to it. Frontends never append session records directly. The writer assigns sequence numbers in arrival order, appends batches to `sessions/<id>.jsonl`, and fsyncs once per batch. Turn completion, rewind, configuration changes, and spawns wait for durability. Streaming and presentation updates can enqueue without waiting. The writer holds no state mutex during I/O. Failed writes retain records for retry and return errors to waiting callers. See [Session storage](../site/docs/content/agent-work/_index.md#session-storage) for the TUI warning.
+
+Compaction and rewind leave prior records intact. The reader ignores a torn final line, which the writer truncates before appending. Opening a v2 log migrates it to v3 once and archives the original. There is no downgrade path. The v3 header starts with an empty feature set. Unknown versions, unsupported features, and complete records with unsupported schemas fail loading. Later incompatible schema additions require a named feature gate.
+
+### Opening and continuing a session
+
+TUI, SDK, ACP, and print use `makima_agent::session::{open, prepare}`. `prepare` builds a private runtime with one manager and root. For saved sessions, it claims the lease, loads under that lease, and selects the model. An explicit model wins. Otherwise it uses the saved model if available and allowed, or warns and uses the startup model. Print uses an in-memory journal.
+
+`PreparedSession::publish` installs the prepared state and returns a `SessionHandle`. `SessionHandle::activate` releases recovered runners after the frontend installs its routing and presentation. The TUI uses the phases separately for tab replacement. `reuse` transfers saved session resources for same-session replacement, and `close` shuts down the runtime.
+
+Recovery rebuilds runtime providers, tools, permissions, and authority from current registrations and saved state. It continues unfinished turns with their recorded turn IDs, including child turns and parents waiting on them. It requests a cut-off streaming reply again. It reissues only in-flight tool calls marked resumable and inserts an interruption result for the rest. `MAKIMA_CONTINUE_ALL_AGENTS=0` records unfinished turns as `Interrupted` instead. See [Restart](../site/docs/content/agent-work/_index.md#restart) for the user-visible notice and tool result.
+
+Child result and delivery records key by `(AgentId, TurnId)`. Recovery reconstructs pending deliveries but does not deliver a consumed or withdrawn result again. This is independent of best-effort presentation events. `/reload-context` can run from any agent. It reloads the session's recorded context and journals it on the root. Children retain the system prompt resolved at spawn.
+
+### Legacy import identity
+
+Decision: retain v2 import ambiguity markers and presentation fallbacks where duplicate transcript keys or conflicting historical metadata prevent unique identity resolution. Generated durable IDs identify imported records but do not resolve those conflicts. Ambiguous links remain unavailable across saves and merges. Remove historical lookup paths only where unique durable-ID resolution supersedes them.
+
+### History epochs
+
+History epochs are opaque identities with an order within one history namespace. Their numeric values are not portable identifiers. Import remints every distinct saved epoch into a fresh local epoch while preserving order, equality, and references from histories and compactions. Independent imported namespaces must not be merged by comparing their raw epoch numbers.
+
+### Rewind
+
+`AgentRef::begin_rewind` acquires the selected agent's idle guard. Any idle agent can be rewound. The guard prevents new work from starting on that agent while the picker is open. Dropping the guard without committing makes no log change. Selecting a prompt appends a `Fork` with a stable context target and a stored note, then installs the rebuilt conversation for that agent. The picker returns the selected prompt to the draft and drops the selected agent's pending messages. The fork does not change other agents, files, non-conversation state, or child-report delivery dispositions.
+
+Context replay applies the agent's `Msg`, `Compaction`, and `Fork` records in log order. A fork selects the context prefix ending at its target, then adds its note. An earlier branch or pre-compaction context remains selectable because the log retains those events.
+
+Clear-context plan approval creates a separate implementation session with a durable `ParentLink`. The root picker can follow that link as a separate navigation action. It suspends the implementation session and opens the planning session without appending a fork to either log.
 
 ## The actor
 
@@ -95,7 +136,7 @@ The actor API is exported from `makima-agent::actor` and re-exported from `makim
 ### Main types
 
 - `AgentActorHandle`: cloneable handle to one persistent actor.
-- `ActorBackend`: object-safe async adapter implemented by a frontend.
+- `ActorBackend`: object-safe async contract implemented by the shared backend.
 - `TurnContext`: stable identity, cancellation, correlation, interrupt source, and optional managed-turn capability for one execution.
 - `TurnTicket`: exact waiter allocated when an explicit turn is admitted.
 - `ActorSnapshot`: lifecycle, run status, queue projection, latest outcome, and cumulative usage.
@@ -119,11 +160,13 @@ The actor returns to `Idle` before publishing the retained outcome and resolving
 
 ### Shared ordinary-message submission
 
-TUI main input, child input, Lua `Agent:send` with `when = "join"`, and headless prompts (print, SDK, ACP, through `headless::RootSubmission`) use `AgentActorHandle::submit`, so a message sent while a turn runs joins it in every frontend. SDK and ACP submit under their own bookkeeping lock and record the turn's presentation before its events can reach their pump; an ACP prompt that joins is answered with the turn it joined, and one that gets a new turn waits behind the running one. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn; each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal.
+TUI input, child input, Lua `Agent:send` with `when = "join"`, and print, SDK, and ACP prompts use shared submit semantics. An ordinary message starts work or joins compatible work whose instruction admission remains open. The call returns the `TurnTicket` covering that message. Several submissions can share one turn. Each pending message has its own stable `SubmissionId` for queue projection, consumption, and removal. SDK and ACP register protocol correlation before the event pump can deliver events for the submission.
 
 The actor orders submissions with configuration, working-directory changes, controls, and explicit turns. Those operations prevent later messages from joining earlier work across the operation. Every backend consumes pending inputs before an eligible model request, preserving separate messages, images, preambles, and presentation metadata. Admission and finish share actor-state synchronization so an input joins the open turn or receives a new ticket.
 
-`admit_turn` still queues a distinct turn, and idle-only admission rejects a busy actor. These policies do not require a separate root scheduler. Controls and compact requests use the FIFO but never become turns.
+`admit_turn` queues a distinct turn. Idle-only admission rejects a busy actor. Controls and compact requests use the FIFO but never become turns. `AgentRef::ask_isolated` takes a history snapshot and runs outside the queue, even during an active turn. It does not change conversation history.
+
+If the profile enables input hold and user input is pending after a failed turn or compaction, the actor records `StateChange::InputHold`. Held input does not continue on wake or recovery. The next accepted user submission releases the hold and queues a separate turn behind the held work. Cancellation can discard held input. `AgentRef::run_shell` runs in the selected agent's working directory. The `!` form records a `StateChange::Preamble` for that agent's next accepted user submission. Previously held turns and mailbox wakes do not consume it. `!!` records no preamble.
 
 `CompletionPolicy::Independent` lets the main agent finish while children run. `CompletionPolicy::JoinReportingChildren` makes non-main agents wait for reporting children before completing. Both policies use the same submission mechanism. See [Agent work](../site/docs/content/agent-work/_index.md) for user-visible queue, cancellation, and late-report behavior.
 
@@ -135,7 +178,7 @@ The actor orders submissions with configuration, working-directory changes, cont
 - `run_control`: execute a standalone control with no turn identity.
 - `run_compact`: compact history with no turn identity.
 
-A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal checkpoint turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
+A turn backend returns `BackendResult::EnteredRun(outcome)` only after `Agent::run` has already attempted terminal event delivery. The actor retains that outcome but must not emit it again. A failed terminal journal flush turns that outcome into a failure that keeps the turn's usage and cost. If setup fails before entering `Agent::run`, the backend reports `SetupFailed`, optionally with its specific failure; the actor synthesizes and delivers the sole failed outcome, and the turn has no history.
 
 The `AgentInput` is moved exactly once from queue to backend. It is intentionally not cloned to paper over ownership or lifetime problems.
 
@@ -166,28 +209,28 @@ The graph stores each node's:
 - optional parent
 - immutable root id and depth
 - child ids
-- graph lifecycle
-- actor handle and runner task
+- durable lifecycle and current graph lifecycle
+- residency, incarnation reservation, actor handle and runner task
 - metadata: display label and spawning tool-use id
 
-Graph lifecycle is distinct from actor lifecycle:
+Durable lifecycle is `Open`, `Closed`, or `Retired`. Explicit close and `task_despawn` record `Closed`; `Agent:retire` and `/task-retire` retire eligible accessible quiescent leaf identities and release retained capacity. Runtime teardown, detachment, and process shutdown release resident resources without changing an open durable lifecycle.
 
-- `Reserved`: capacity and edge are reserved while the factory runs.
-- `Live`: actor committed and usable.
-- `Closing`: permanently closing but may still have owned runtime work.
-- `Closed`: runner settled.
-- `Removed`: retained tombstone state.
+Graph lifecycle describes runtime state: `Reserved`, `Dormant`, `Live`, `Closing`, `Closed`, `Retired`, or `Removed`. `Removed` is defined but is not assigned by the manager. Residency is separate: `Dormant`, `Activating`, or `Resident`. Closed and retired records remain inspectable. Ordinary turn completion does not close the durable agent.
 
-Closed nodes remain inspectable for the manager lifetime and do not consume live-node or direct-child capacity. `Removed` is present in the public enum and is also non-capacity-consuming, but the current manager has no observed transition into it; reservation rollback removes the node from the map instead. A turn ending does not change graph lifecycle.
+### Residency and reactivation
+
+Recovery rebuilds open child records as dormant nodes. Reactivation reserves one incarnation, prepares the backend outside the graph lock, then revalidates the reservation before installing it. Concurrent callers share the activation result. Retired, closed, stale, or unrestorable records cannot reactivate. Tools rebind by recorded name against current handlers; missing handlers or providers fail before admission. The immutable spawn mode ceiling still limits later configuration.
+
+A resident idle actor remains allocated during normal execution. The active-work limits do not count idle resident actors. The retained-identity limit bounds open and closed records; automatic idle actor eviction remains deferred. Detachment revokes the old incarnation and drains owned tool completions before releasing resident resources. Cleanup must not make the node appear reusable while detachment remains pending.
 
 ### Construction APIs
 
 ```rust
 let manager = AgentManagerHandle::new(limits)?;
-let root = manager.create_root(initial_messages, mirror, backend)?;
+let root = manager.create_root(initial_messages, mirror, backend).await?;
 
 // Only from a currently active managed turn:
-let child = manager.spawn_child(&current, metadata, initial_messages, mirror, backend)?;
+let child = manager.spawn_child(&current, metadata, initial_messages, mirror, backend).await?;
 ```
 
 `create_root` succeeds once; frontends use `create_root_deferred_with_config` so the root factory can run after the manager exists. `spawn_child` requires `CurrentManagedTurn`, a manager-issued capability for a specific active `(AgentId, TurnId)` and manager generation/nonce. `spawn_child_trusted_with_config` is the host-only path for trusted plugin handlers; it validates a live parent reference instead and must not be exposed as tool authority. The manager reserves topology and capacity under its graph lock, runs the caller's factory without that lock, then commits or rolls back. Returned factory errors and panics restore the reservation and capacity.
@@ -201,7 +244,7 @@ No graph lock may be held across an await, actor call, backend call, or factory 
 - `lookup(id)` and `list()` return `AgentRef`s.
 - `node(id)` returns one `AgentNodeSnapshot`.
 - `snapshot()` returns all nodes sorted deterministically by depth and id.
-- `actor(id)` returns the actor only for a live node.
+- `actor(id)` returns the actor only for a live resident node; reactivation is a separate prepared operation.
 - `AgentRef` bundles manager provenance with an id and provides `id`, `actor`, `snapshot`, `cancel`, and `close_subtree`.
 
 `AgentNodeSnapshot` and graph ids describe state. They do not grant delegated spawn or wait authority.
@@ -214,10 +257,11 @@ The manager enforces these per-outer-session limits:
 |---|---:|---|
 | `agent.max_concurrent_agent_turns` | 8 | Managed turns executing across the graph |
 | `agent.max_agent_depth` | 4 | Maximum child-edge depth; root depth is 0 |
-| `agent.max_children_per_agent` | 16 | Live or reserved direct children of one node |
-| `agent.max_live_agents` | 64 | Live, reserved, or closing nodes including root |
+| `agent.max_children_per_agent` | 16 | Direct children with outstanding work |
+| `agent.max_active_agents` | 64 | Agents with outstanding work, including the root when active |
+| `agent.max_retained_agents` | 1024 | Non-retired durable identities; imported legacy agents are exempt |
 
-Every value must be at least one. Limit checks and graph reservation are atomic. The manager's `max_concurrent_agent_turns` limiter is the only cross-agent turn limit.
+Every value must be at least one. The work ledger reserves active-agent and direct-child capacity atomically at admission and retains it through queued, running, delivery, and cleanup work. Reporting descendant work also retains capacity for its reporting ancestors. Idle resident and dormant agents consume neither limit. Retired identities release retained capacity. `max_live_agents` is an input alias for `max_active_agents`; new configuration uses the latter name. The manager's `max_concurrent_agent_turns` limiter is the only cross-agent turn limit.
 
 ### Managed turn authority
 
@@ -246,7 +290,7 @@ A parent that blocks on its own descendant must not consume the last permit and 
 5. When the last suspension ends, require the parent execution poll gate to reacquire capacity.
 6. Resume the waiting Lua continuation only after logical ownership is restored.
 
-Production waits use `TurnPermitLease::observe_descendant`: Lua `AgentTurn:wait`, `Agent:prompt` and the reporting-children completion join. A timeout or dropped wait ends the watcher, never the child. Parent cancellation signals its watchers and still reacquires capacity before polling backend cleanup, so cleanup cannot run outside the global limit. Ticket ownership is checked against the actor identity the ticket was issued by, so a child that finishes before the watcher registers is still observed.
+Production waits use `TurnPermitLease::observe_descendant`: Lua `AgentTurn:wait` and the reporting-children completion join. A timeout or dropped wait ends the watcher, never the child. Parent cancellation signals its watchers and still reacquires capacity before polling backend cleanup, so cleanup cannot run outside the global limit. Ticket ownership is checked against the actor identity the ticket was issued by, so a child that finishes before the watcher registers is still observed.
 
 A wait without a current managed invocation (a trusted plugin handler) uses an ordinary exact-ticket wait. The child remains subject to manager capacity, but there is no parent permit to yield.
 
@@ -258,7 +302,7 @@ A wait without a current managed invocation (a trusted plugin handler) uses an o
 | `cancel_subtree(id)` | Existing work on the captured node and descendants | No |
 | `close_descendants(id)` | Descendants, not the selected node | Yes |
 | `close_subtree(id)` | Selected node and descendants | Yes |
-| `shutdown(timeout)` | Entire graph and manager admission | Yes |
+| `shutdown(timeout)` | Entire runtime graph and manager admission | Runtime only; durable open agents remain open |
 
 Reusable subtree cancellation captures a graph revision, then applies one actor cancellation cut outside the graph lock. A child reserved before the graph cut is marked for cancellation when it commits; a child created after the cut survives. Permanent close marks nodes before actor closure so no descendant can commit beneath a closing branch.
 
@@ -270,21 +314,19 @@ Dropping ordinary `AgentRef` or actor-handle clones does not cancel work.
 
 ### TUI
 
-Each prepared TUI session runtime creates an `AgentManagerHandle`, creates exactly one root through it, and obtains the root actor from the returned `AgentRef`. The root backend still owns dynamic TUI preparation such as provider/model selection, prompts, tools, MCP state, cwd/instruction refresh, event stamping, and control handling.
+The TUI renders the shared session projection and reads in-flight history and queue state from the actors. It keeps no writable session copy or separate queue. It uses `ActorWorkIdentity` for runtime routing and `run_id` only for presentation and cancellation fences.
 
-The TUI queue is a presentation facade over the actor's one scheduling queue. It must not become a shadow scheduler. Every envelope carries the actor's `ActorWorkIdentity`, so `run_id` values are presentation and cancellation fences only.
+Child routing uses durable `AgentId`. The bundled task plugin returns that id as `task_id` and an exact `turn_id` for each admitted turn. Restorable dormant children can reactivate; imported legacy children without a complete spawn specification remain display-only. Tool-use ids remain history correlation. The UI is a flat list of agents, not a graph navigator.
 
-Live child routing uses `AgentId`; task ids and tool-use ids remain labels and history correlation. Restored child tabs without a live `AgentId` are display-only. The UI is a flat list of agents, not a graph navigator.
-
-Session runtime replacement is prepared inertly and activated as a transaction. The new manager/root, mailbox, command target, provider, permissions, and session-lock lease are not partially published before activation. Old manager shutdown starts only after the replacement is active.
+The TUI coordinates tab replacement and teardown and schedules session lease heartbeats. `ProviderSlot` projects the committed provider for discovery and usage. The replacement runtime stays inactive until the TUI installs the new tab and its routes.
 
 ### Lua agent API
 
 `makima.agent.spawn(ctx, opts)` is the only way to create a child agent. It requires an active managed turn or a trusted manager-backed invocation and fails closed otherwise.
 
 - Spawn creates a child through the manager and returns an `Agent` handle.
-- `Agent:send` admits a turn only when the agent has no active, preparing or queued work; `Agent:prompt` does the same and waits for that exact turn.
-- `Agent:enqueue` queues a distinct turn; `Agent:submit` uses the shared submission path above.
+- `Agent:send` requires `opts.when`: `idle` admits only when no work is active, preparing, or queued; `join` joins compatible work or starts a turn; `queue` admits a distinct queued turn.
+- Accepted sends return an exact `AgentTurn`. `Agent:turn(id)` and `Agent:latest_turn()` resolve retained results without following future turns.
 - `Agent:close` permanently closes the managed subtree.
 - Interactive child cancellation uses reusable actor cancellation and keeps the agent available for later turns.
 
@@ -292,17 +334,16 @@ A descendant's cancellation token is independent of the spawning parent turn. Ba
 
 `makima.async.run` inherits the originating task's exact managed authority, so its worker may act only while that turn remains active. Timer fires intentionally start without registration-time managed authority because they may run after the turn ends.
 
-The bundled task plugin's ids are labels, not graph identity.
+The bundled task plugin resolves durable task ids through the current manager. Exact-turn waits do not follow later turns, and result retention or session deletion can make an old turn unavailable.
 
 ### Frontend roots
 
-TUI, print, ACP and SDK all execute through a manager-owned root created by the configured or deferred root factory. No frontend constructs an unmanaged actor or a bare low-level agent for prompt execution. Print, SDK and ACP bind their root through `makima_lua::orchestration::bind_frontend_root`, and their root configuration and history commit through the session coordinator's durable publication. SDK and ACP coordinators write the session log; print's writes nothing (`accept_all`), so the same commits apply without reaching disk. The SDK and ACP report a turn's terminal result only after its history checkpoint settles.
+Frontends use the manager-owned root and call agent-layer operations. `AgentRef` exposes `submit`, `wake`, `run_shell`, `ask_isolated`, and `begin_rewind`. `SessionCancellation` takes a `CancelScope`, and `AnswerRouter` delivers answers to the registered agent and request. `ResetSeed` defines a fresh session for frontends that support reset. The shared event pump delivers events to the Lua observer and frontend subscribers without recording session facts. SDK and ACP wait for the terminal journal flush before reporting the turn result.
 
 ## Known implementation caveats
 
 These are current code observations, not intended invariants:
 
-- `ActorBackend::run_compact` is documented and checked by the runner as returning `BackendResult::CompactDone`, but the TUI backend returns `ControlFailed` on the error path. The user-facing compaction event comes from `agent::compact`, but the actor runner logs the backend result as unexpected.
 - `GraphLifecycle::Removed` is defined but is not currently assigned by the manager.
 - Manager shutdown uses a bounded 10 ms poll for runner completion before joining or handing ownership to the reaper.
 
@@ -312,14 +353,14 @@ Keep these visible when touching the relevant code. Fixing them should update or
 
 The following work is not part of the current implementation contract:
 
-- agent graph, outcome, and pending-delivery persistence, and restart recovery of live children (root and child configuration and history are saved; restored child tabs are display-only)
+- automatic eviction of idle resident actors
 - guest-defined agent presets and complete guest-defined mode bundles
 - guest implementations of build and plan workflows
 - graph/tree UI, arbitrary-agent focus, and a uniform full promptbox for every focused agent
 - removal of the native mode enum and remaining host special cases
 - queue coalescing and contextual automode
 
-Runtime `AgentId` and `TurnId` values are not yet restart-durable. Graph snapshots and tombstones are in-memory only. Do not document proposal examples from `.agents/` as available APIs until their delivery lands.
+Live execution resources, pending permission prompts, shell processes, and plugin VM objects do not survive restart. Durable ids and recorded results do not preserve a live invocation or grant authority in a new manager.
 
 ## Source map
 
@@ -334,15 +375,21 @@ Runtime `AgentId` and `TurnId` values are not yet restart-durable. Graph snapsho
 | Backend and work types | `makima-agent/src/actor/types.rs` |
 | Manager graph and permit machinery | `makima-agent/src/manager/mod.rs` |
 | Manager public projections | `makima-agent/src/manager/types.rs` |
+| Work capacity and graph transitions | `makima-agent/src/manager/work.rs` |
+| Session journal and durable state fold | `makima-agent/src/journal.rs`, `makima-storage/src/session_state.rs` |
+| Session pipeline and restart continuation | `makima-agent/src/session/open.rs`, `makima-agent/src/session_recovery.rs` |
+| Plugin state and recorded instructions | `makima-agent/src/state.rs`, `makima-lua/src/api/state.rs`, `makima-agent/src/context.rs` |
+| Per-agent rewind and plan slots | `makima-agent/src/rewind.rs`, `makima-agent/src/plan_state.rs` |
+| Session format | `makima-storage/src/sessions.rs` |
+| Append-only writer and save receipts | `makima-agent/src/session_writer.rs`, `makima-agent/src/session_checkpoint.rs` |
 | Manager errors | `makima-agent/src/manager/manager_error.rs` |
-| TUI root construction/backend | `makima-ui/src/agent/mod.rs`, `makima-ui/src/agent/agent_loop.rs` |
-| TUI cancellation routing | `makima-ui/src/agent/command_router.rs` |
+| TUI session setup and replacement | `makima-ui/src/event_loop.rs` |
 | Lua agent backend and API | `makima-lua/src/api/agent.rs`, `makima-lua/src/api/agent/handles/` |
 | Lua orchestration, targets and plugin authority | `makima-lua/src/orchestration.rs`, `makima-lua/src/orchestration/targets.rs` |
 | Prepared operations and durable commit | `makima-agent/src/actor/prepared.rs`, `makima-agent/src/actor/history_edit.rs` |
 | Publication state and session lock guard | `makima-storage/src/checkpoint.rs`, `makima-storage/src/session_lock.rs` |
-| Session coordinator and checkpoint projection | `makima-agent/src/session_coordinator.rs`, `makima-agent/src/session_checkpoint.rs` |
-| Print, SDK and ACP backend | `makima-agent/src/headless.rs` |
+| Session coordinator | `makima-agent/src/session_coordinator.rs` |
+| Shared backend and frontend profiles | `makima-agent/src/headless.rs` |
 | Lua turn-scoped authority | `makima-lua/src/runtime.rs`, `makima-lua/src/api/util/ctx.rs` |
 | Configured graph limits | `makima-config/src/lib.rs` |
 

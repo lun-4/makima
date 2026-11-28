@@ -49,6 +49,8 @@ jobs:
         uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.*', '**/*.nix', 'Cargo.lock') }}
+          # The push run saves; its pull_request twin would store a second 2.4 GB copy.
+          save: ${{ github.event_name == 'push' }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 4G
           purge: true
@@ -60,4 +62,4 @@ jobs:
       - name: Check Nix formatting
         run: nix build .#checks.x86_64-linux.fmt
       - name: Build
-        run: nix build
+        run: nix build .#ci

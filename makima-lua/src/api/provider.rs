@@ -1,5 +1,6 @@
+use makima_domain::LockExt;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use makima_config::providers::{ProviderDef, ProvidersConfig};
 use makima_lua_macro::{lua_fn, lua_table};
@@ -66,15 +67,11 @@ impl ProviderStore {
 
 /// Replaces {plugin}'s committed specs with the ones its load registered.
 pub(crate) fn commit_pending(lua: &Lua, plugin: &str, pending: &PendingProviders) {
-    let specs = std::mem::take(&mut *lock(pending));
+    let specs = std::mem::take(&mut *pending.lock_unpoisoned());
     if let Some(mut store) = lua.app_data_mut::<ProviderStore>() {
         store.clear_plugin(plugin);
         store.0.extend(specs);
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Serde skips function values in tables, so a present callback never reaches
@@ -352,7 +349,7 @@ fn register_provider(
         None => Vec::new(),
     };
 
-    let mut pending = lock(&pending);
+    let mut pending = pending.lock_unpoisoned();
     let owner = lua
         .app_data_ref::<ProviderStore>()
         .and_then(|store| store.foreign_owner(&fields.id, &plugin))

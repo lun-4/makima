@@ -3,10 +3,11 @@
 //! it runs and a new field is one edit instead of three `json!` blobs.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use makima_agent::{AgentEvent, AgentRef, Envelope};
-use makima_providers::{TokenUsage, add_cost};
+use makima_providers::TokenUsage;
 use makima_storage::id::MakimaId;
 use makima_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
@@ -38,7 +39,7 @@ pub struct SessionSnapshot {
 
 /// The `usage` of a session snapshot: `{total, models}`, models sorted by
 /// total tokens descending, then spec. Costs are what each turn billed, `None`
-/// when unpriced. A host that does not split usage by model passes none.
+/// when unpriced.
 pub fn session_usage(
     total: &TokenUsage,
     cost: Option<f64>,
@@ -76,30 +77,12 @@ pub fn session_usage(
     })
 }
 
-#[derive(Default)]
-struct Totals {
-    usage: TokenUsage,
-    cost: Option<f64>,
-    working: bool,
-}
-
-/// A poisoned lock only means some other run panicked mid-update. The
-/// numbers are still whole, so read them instead of losing the session's
-/// whole accounting over it.
-fn lock(totals: &Mutex<Totals>) -> MutexGuard<'_, Totals> {
-    totals.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// What a headless driver (print, SDK, ACP) feeds every envelope of its one
-/// session to: the totals `makima.session.read` answers from and the Lua turn
-/// autocmds, so plugins see the same events and numbers as under the TUI. The
-/// driver writes while the Lua thread reads, hence the lock, though the two
-/// rarely meet.
+/// Tracks headless session status and dispatches Lua autocmds.
 #[derive(Clone)]
 pub struct HeadlessObserver {
     handle: EventHandle,
     session_id: MakimaId,
-    totals: Arc<Mutex<Totals>>,
+    working: Arc<AtomicBool>,
     root: Arc<OnceLock<AgentRef>>,
 }
 
@@ -108,62 +91,51 @@ impl HeadlessObserver {
         Self {
             handle,
             session_id,
-            totals: Arc::default(),
+            working: Arc::default(),
             root: Arc::default(),
         }
     }
 
-    /// Folds one envelope into the totals, then fires its autocmd.
     pub fn observe(&self, envelope: &Envelope) {
-        self.fold(envelope);
+        self.working.store(
+            !matches!(
+                envelope.event,
+                AgentEvent::TurnOutcome(_)
+                    | AgentEvent::ControlComplete { .. }
+                    | AgentEvent::ControlError { .. }
+            ),
+            Ordering::Relaxed,
+        );
         if let Some(root) = self.root.get() {
             agent_autocmd::dispatch(&self.handle, root, envelope);
         }
     }
 
-    fn fold(&self, envelope: &Envelope) {
-        let event = &envelope.event;
-        let mut totals = lock(&self.totals);
-        // Envelopes only flow while a run is alive, so anything that is not
-        // an ending means the agent is busy. Sdk mode runs many turns and no
-        // driver has to remember to clear a flag between them.
-        totals.working = !matches!(
-            event,
-            AgentEvent::TurnOutcome(_)
-                | AgentEvent::ControlComplete { .. }
-                | AgentEvent::ControlError { .. }
-        );
-        if let AgentEvent::TurnOutcome(outcome) = event {
-            totals.usage += outcome.usage();
-            add_cost(&mut totals.cost, outcome.cost());
-        }
-    }
-
-    /// Installs the provider `makima.session.read` answers from. There is no
-    /// rename path under the headless drivers, so `title` stays nil rather
-    /// than echoing the id back as a fake one, and usage has no per-model
-    /// split.
+    /// Installs the provider for `makima.session.read`.
     pub fn install(&self, root: AgentRef) {
-        self.handle.observe_agents(&root.manager());
+        let manager = root.manager();
+        self.handle.observe_agents(&manager);
+        let journal = manager.journal();
         let _ = self.root.set(root);
-        let totals = Arc::clone(&self.totals);
+        let working = Arc::clone(&self.working);
         let id = self.session_id;
         self.handle.install_session_snapshot(Box::new(move |want| {
             // One session here, so any other id names a tab that is not ours.
             if want != id {
                 return Err(format!("session {want} not live"));
             }
-            let totals = lock(&totals);
+            let projection = journal.projection();
+            let usage = projection.usage();
             serde_json::to_value(SessionSnapshot {
                 id: id.to_string(),
-                title: None,
-                status: if totals.working {
+                title: Some(projection.title().to_owned()),
+                status: if working.load(Ordering::Relaxed) {
                     STATUS_WORKING
                 } else {
                     STATUS_IDLE
                 },
-                updated_at: makima_storage::now_epoch(),
-                usage: session_usage(&totals.usage, totals.cost, &HashMap::new()),
+                updated_at: projection.updated_at,
+                usage: session_usage(&usage.tokens, usage.cost, &usage.by_model),
             })
             .map_err(|e| e.to_string())
         }));
@@ -175,78 +147,41 @@ mod tests {
     use makima_agent::{AgentId, DoneReason, TurnCompleteEvent, TurnId, TurnOutcome};
     use makima_providers::Message;
 
-    use super::*;
+    use test_case::test_case;
 
-    const FIRST_TURN_INPUT: u32 = 1_000;
-    const SECOND_TURN_INPUT: u32 = 400;
-    const TURN_COST: f64 = 0.25;
-    const WINDOW: u32 = 200_000;
-    const GROWS_MSG: &str = "session totals add up across turns, they never restart at one turn";
-    const WORKING_MSG: &str = "a second turn has to read as working again";
+    use super::{AgentEvent, Envelope, EventHandle, HeadlessObserver, MakimaId, Ordering};
+    use super::{HashMap, StoredTokenUsage, TokenUsage, json, session_usage};
 
-    fn envelope(event: AgentEvent) -> Envelope {
-        Envelope {
-            event,
-            subagent: None,
-            identity: None,
-        }
-    }
-
-    /// Carries no usage or cost of its own, so a fold that summed these instead
-    /// of `Done` would leave the totals empty and fail below.
-    fn turn_complete(context_size: u32) -> Envelope {
-        envelope(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-            message: Message::user("go".into()),
-            usage: TokenUsage::default(),
-            model: String::new(),
-            cost: None,
-            context_size: Some(context_size),
-            context_window: WINDOW,
-        })))
-    }
-
-    fn done(input: u32) -> Envelope {
-        envelope(AgentEvent::TurnOutcome(TurnOutcome::Completed {
-            agent_id: AgentId::generate(),
-            turn_id: TurnId::generate(),
-            usage: TokenUsage {
-                input,
-                ..Default::default()
-            },
-            cost: Some(TURN_COST),
-            list_cost: None,
-            context_size: input,
-            context_window: WINDOW,
-            num_turns: 1,
-            reason: DoneReason::EndTurn,
-        }))
-    }
-
-    /// Sdk mode serves many turns on one session, so `Done` is a turn boundary
-    /// and not the end. Totals have to keep climbing and the status has to come
-    /// back to life on turn two, with no driver clearing anything by hand.
-    #[test]
-    fn totals_grow_and_status_revives_across_turns() {
+    #[test_case((); "consecutive_turns")]
+    fn status_tracks_turn_boundaries(_: ()) {
         let observer =
             HeadlessObserver::new(EventHandle::disconnected_for_test(), MakimaId::generate());
-
-        observer.fold(&turn_complete(FIRST_TURN_INPUT));
-        assert!(lock(&observer.totals).working);
-        observer.fold(&done(FIRST_TURN_INPUT));
-        assert!(!lock(&observer.totals).working);
-
-        observer.fold(&turn_complete(SECOND_TURN_INPUT));
-        assert!(lock(&observer.totals).working, "{WORKING_MSG}");
-        observer.fold(&done(SECOND_TURN_INPUT));
-
-        let totals = lock(&observer.totals);
-        assert!(!totals.working);
-        assert_eq!(
-            totals.usage.input,
-            FIRST_TURN_INPUT + SECOND_TURN_INPUT,
-            "{GROWS_MSG}"
-        );
-        assert_eq!(totals.cost, Some(TURN_COST * 2.0), "{GROWS_MSG}");
+        let observe = |event| {
+            observer.observe(&Envelope {
+                event,
+                subagent: None,
+                identity: None,
+            })
+        };
+        for _ in 0..2 {
+            observe(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Message::user("go".into()),
+                usage: TokenUsage::default(),
+                model: String::new(),
+                cost: None,
+                context_size: None,
+                context_window: 0,
+            })));
+            assert!(observer.working.load(Ordering::Relaxed));
+            observe(AgentEvent::TurnOutcome(TurnOutcome::completed(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                0,
+                DoneReason::EndTurn,
+            )));
+            assert!(!observer.working.load(Ordering::Relaxed));
+        }
     }
 
     #[test]

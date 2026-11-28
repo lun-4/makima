@@ -1,0 +1,2983 @@
+#[cfg(unix)]
+use crate::{
+    ActorError, AgentConfig, CancelToken,
+    actor::{AgentContextSnapshot, MAX_PENDING_INSTRUCTION_BYTES},
+    session_writer::SessionWriter,
+};
+
+#[cfg(unix)]
+use std::fs::write;
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    slice,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use futures_lite::future::{or, poll_once, yield_now};
+use makima_providers::{Message, Model, ObservationSource, provider::unconfigured};
+use makima_providers::{TokenUsage, provider::BoxFuture};
+use makima_storage::checkpoint::CheckpointPublication;
+use makima_storage::session_state::{
+    StateChange, StoredAgentConfig, StoredAgentLifecycle, StoredAgentRecord, StoredAgentSpec,
+    StoredDelivery, StoredDeliveryOp, StoredModeCeiling, StoredOffloadRef, StoredTurnOrigin,
+};
+use makima_storage::sessions::Session;
+use makima_storage::test_util::test_record;
+use test_case::test_case;
+
+use super::{
+    AgentLimits, AgentManagerHandle, AgentMetadata, AgentResidency, GraphLifecycle, ManagerError,
+    ReactivationError, ResidentAgent, ResidentInitialization, RetainedTurn, SubmitError,
+    SubmitOptions, SubmitWhen, WakeError,
+};
+use crate::{
+    ActorBackend, AgentId, AgentInput, AgentMode, BackendResult, ControlWork, History,
+    HistorySnapshot, ModeDef, ModeId, ReasonedCancelToken, RunSettings, TurnContext, TurnId,
+    WorkKind,
+    actor::{
+        ActiveCancel, ActorHistory, ChildDelivery, EffectiveAgentConfig, TurnAdmissionOptions,
+        TurnOrigin, TurnProvenance, TurnResult, graph_quiescence_barrier,
+    },
+    journal::{
+        JournalChange, JournalCommit, JournalIncarnation, SessionJournal, SessionJournalSnapshot,
+    },
+    test_util::{MockBackend, poll_until},
+};
+
+type StoredSession = Session<Message, TokenUsage, crate::ToolOutput>;
+
+const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+const HISTORY_TEXT: &str = "restored history";
+const INITIALIZATION_ERROR: &str = "initialization rejected";
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const RETAINED_AGENTS: usize = 4;
+const DETACH_TIMEOUT: Duration = Duration::from_secs(1);
+const PUBLICATION_PLUGIN: &str = "detach-publication";
+const PUBLICATION_VERSION: u32 = 2;
+const PUBLICATION_VALUE: &str = "published candidate";
+const INITIALIZATION_CONTROL: &str = "initialization-publication";
+
+#[test]
+fn agent_ref_wake_is_shared_and_submit_requires_residency() {
+    smol::block_on(async {
+        let records = records();
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let agent = manager.root().unwrap();
+        let input = || AgentInput {
+            message: HISTORY_TEXT.into(),
+            images: Vec::new(),
+            preamble: Vec::new(),
+            prompt: None,
+        };
+        assert!(matches!(
+            agent.submit(input(), SubmitOptions::default()),
+            Err(SubmitError::Manager(ManagerError::NonLiveAgent(id))) if id == agent.id()
+        ));
+
+        assert_eq!(
+            agent.wake().await,
+            Err(WakeError::ReactivatorUnavailable(agent.id()))
+        );
+
+        let failure = ReactivationError::Initialization(INITIALIZATION_ERROR.into());
+        let expected_failure = failure.clone();
+        let reactivate =
+            move |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                let failure = failure.clone();
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async { Err(failure) })
+                        .await?;
+                    Ok(())
+                })
+            };
+        manager.set_reactivator(Some(Arc::new(reactivate)));
+        assert_eq!(
+            agent.wake().await,
+            Err(WakeError::Manager(ManagerError::Reactivation(
+                expected_failure
+            )))
+        );
+        assert_eq!(agent.snapshot().unwrap().residency, AgentResidency::Dormant);
+        assert!(
+            manager
+                .latest_retained_turn_ticket(&agent)
+                .unwrap()
+                .is_none()
+        );
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = hook_calls.clone();
+        let (release_activation, activation_gate) = flume::bounded(1);
+        let (_hold_start, start_gate) = flume::bounded(1);
+        let reactivate =
+            move |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let activation_gate = activation_gate.clone();
+                let start_gate = start_gate.clone();
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async move {
+                            activation_gate.recv_async().await.unwrap();
+                            Ok(ResidentAgent {
+                                start: Some(start_gate),
+                                ..resident()
+                            })
+                        })
+                        .await?;
+                    Ok(())
+                })
+            };
+        manager.set_reactivator(Some(Arc::new(reactivate)));
+        let mut first = Box::pin(agent.wake());
+        assert!(poll_once(first.as_mut()).await.is_none());
+        assert!(matches!(
+            agent.submit(input(), SubmitOptions::default()),
+            Err(SubmitError::Manager(ManagerError::NonLiveAgent(id))) if id == agent.id()
+        ));
+        let mut sibling = Box::pin(agent.wake());
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        release_activation.send(()).unwrap();
+        first.await.unwrap();
+        sibling.await.unwrap();
+        agent.wake().await.unwrap();
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+
+        let (first, first_presentation) = agent.submit(input(), SubmitOptions::default()).unwrap();
+        let (joined, joined_presentation) =
+            agent.submit(input(), SubmitOptions::default()).unwrap();
+        assert_eq!(joined.turn_id(), first.turn_id());
+        assert_eq!(joined_presentation, first_presentation);
+        let (queued, queued_presentation) = agent
+            .submit(
+                input(),
+                SubmitOptions {
+                    when: SubmitWhen::Queue,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_ne!(queued.turn_id(), first.turn_id());
+        assert_ne!(queued_presentation, first_presentation);
+        let idle = SubmitOptions {
+            when: SubmitWhen::Idle,
+            ..Default::default()
+        };
+        assert!(matches!(
+            agent.submit(input(), idle),
+            Err(SubmitError::Admission(crate::ActorError::Busy))
+        ));
+
+        for (record, error) in [
+            (&records[2], ManagerError::NonLiveAgent(records[2].id)),
+            (&records[3], ManagerError::Retired(records[3].id)),
+        ] {
+            assert_eq!(manager.reference(record.id).wake().await, Err(error.into()));
+        }
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+        manager.set_reactivator(None);
+        let child = manager.lookup(records[1].id).unwrap();
+        assert_eq!(
+            child.wake().await,
+            Err(WakeError::ReactivatorUnavailable(child.id()))
+        );
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert_eq!(agent.wake().await, Err(ManagerError::GraphShutdown.into()));
+    });
+}
+
+#[test]
+fn deferred_close_cannot_close_replacement_incarnation() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let old = manager.incarnation(id).unwrap();
+        let (release, ready) = flume::bounded(1);
+        let cleanup_manager = manager.clone();
+        let cleanup_incarnation = old.clone();
+        let mut deferred = Box::pin(async move {
+            ready.recv_async().await.unwrap();
+            cleanup_manager.close_incarnation(&cleanup_incarnation)
+        });
+        assert!(poll_once(deferred.as_mut()).await.is_none());
+        manager.detach_incarnation(&old).unwrap();
+        let replacement = manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let actor = replacement.actor().unwrap();
+        let before = journal.checkpoint_snapshot().unwrap();
+        release.send(()).unwrap();
+        assert_eq!(deferred.await, Err(ManagerError::StaleIncarnation(id)));
+        assert!(manager.actor(id).unwrap().same_actor(&actor));
+        replacement.validate_live().unwrap();
+        assert_checkpoint(&journal, &before);
+        manager
+            .close_incarnation(&manager.incarnation(id).unwrap())
+            .unwrap();
+        assert_eq!(
+            journal.agent(id).unwrap().lifecycle,
+            StoredAgentLifecycle::Closed
+        );
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+fn publication_commit(binding: &JournalIncarnation) -> JournalCommit {
+    JournalCommit {
+        incarnations: vec![binding.clone()],
+        changes: vec![JournalChange {
+            agent: Some(binding.agent),
+            generation: 0,
+            change: StateChange::Plugin {
+                key: PUBLICATION_PLUGIN.into(),
+                version: PUBLICATION_VERSION,
+                value: Some(serde_json::json!(PUBLICATION_VALUE)),
+            },
+        }],
+        ..Default::default()
+    }
+}
+
+async fn wait_for_incarnation_cleanup(journal: &SessionJournal, binding: &JournalIncarnation) {
+    poll_until(DETACH_TIMEOUT, || {
+        (journal.incarnation(binding.agent) != *binding).then_some(())
+    })
+    .await
+    .expect("incarnation cleanup did not finish after publication released");
+}
+
+#[test]
+fn detach_after_publication_waits_for_install_and_runtime_finalization() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let old = manager.incarnation(id).unwrap();
+        let binding = journal.incarnation(id);
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = StoredSession::new(MODEL, ".");
+        session.bind_root_id(id).unwrap();
+        let mut token = journal.prepare(publication_commit(&binding)).await.unwrap();
+        token.snapshot().apply_to(&mut session).unwrap();
+        session.save_to(directory.path()).unwrap();
+        let published = StoredSession::load_from(session.id, directory.path()).unwrap();
+        let published_view = published.latest_state().unwrap();
+        let candidate = &published_view.scopes[&Some(id)].plugins[PUBLICATION_PLUGIN];
+        assert_eq!(candidate.version, PUBLICATION_VERSION);
+        assert_eq!(candidate.value, Some(serde_json::json!(PUBLICATION_VALUE)));
+
+        assert_eq!(manager.detach_incarnation(&old), Ok(()));
+        assert!(!manager.is_live(id));
+        assert_eq!(journal.incarnation(id), binding);
+        assert_eq!(manager.incarnation(id).unwrap(), old);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Resident
+        );
+        assert_eq!(
+            manager
+                .ensure_resident_with(id, |_| async {
+                    panic!("pending detach must reject replacement activation")
+                })
+                .await
+                .unwrap_err(),
+            ManagerError::Reactivation(ReactivationError::Cancelled)
+        );
+        token.install().unwrap();
+        poll_until(DETACH_TIMEOUT, || {
+            manager.lock_graph().nodes[&id]
+                .task
+                .as_ref()
+                .is_some_and(smol::Task::is_finished)
+                .then_some(())
+        })
+        .await
+        .expect("detached actor runner did not finish before publication released");
+        assert_eq!(journal.incarnation(id), binding);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Resident
+        );
+        drop(token);
+
+        wait_for_incarnation_cleanup(&journal, &binding).await;
+        assert_dormant(&manager, id);
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert_ne!(manager.incarnation(id).unwrap(), old);
+        journal
+            .checkpoint_snapshot()
+            .unwrap()
+            .apply_to(&mut session)
+            .unwrap();
+        session.save_to(directory.path()).unwrap();
+        let saved = StoredSession::load_from(session.id, directory.path()).unwrap();
+        assert_eq!(
+            &saved.latest_state().unwrap().scopes[&Some(id)].plugins[PUBLICATION_PLUGIN],
+            candidate
+        );
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn initializer_rollback_waits_for_prepared_publication_to_finalize() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (release, wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |_| {
+                Box::pin(async move {
+                    wait.recv_async().await.unwrap();
+                    Err(ReactivationError::Initialization(
+                        INITIALIZATION_ERROR.into(),
+                    ))
+                })
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        let old = manager.incarnation(id).unwrap();
+        let binding = journal.incarnation(id);
+        let mut token = journal.prepare(publication_commit(&binding)).await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            activation.await.unwrap_err(),
+            ManagerError::Reactivation(ReactivationError::Initialization(
+                INITIALIZATION_ERROR.into()
+            ))
+        );
+        assert_eq!(journal.incarnation(id), binding);
+        assert_eq!(manager.incarnation(id).unwrap(), old);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(!manager.is_live(id));
+        assert_eq!(
+            manager
+                .ensure_resident_with(id, |_| async {
+                    panic!("pending rollback must reject replacement activation")
+                })
+                .await
+                .unwrap_err(),
+            ManagerError::Reactivation(ReactivationError::Cancelled)
+        );
+        token.install().unwrap();
+        yield_now().await;
+        assert_eq!(journal.incarnation(id), binding);
+        drop(token);
+        wait_for_incarnation_cleanup(&journal, &binding).await;
+        assert_dormant(&manager, id);
+        let before = journal.checkpoint_snapshot().unwrap();
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert_ne!(manager.incarnation(id).unwrap(), old);
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn shutdown_deadline_includes_waiting_for_prepared_publication() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let agent = manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let actor = agent.actor().unwrap();
+        let binding = journal.incarnation(id);
+        let mut token = journal.prepare(publication_commit(&binding)).await.unwrap();
+        let mut shutdown = Box::pin(manager.shutdown(Duration::ZERO));
+        let report = poll_once(shutdown.as_mut())
+            .await
+            .expect("zero-deadline shutdown must not wait for the publication writer");
+        assert_eq!(report.timed_out, vec![id]);
+        assert!(report.joined.is_empty());
+        assert_eq!(journal.incarnation(id), binding);
+        assert!(matches!(
+            actor.admit_turn(
+                AgentInput {
+                    message: HISTORY_TEXT.into(),
+                    images: Vec::new(),
+                    preamble: Vec::new(),
+                    prompt: None,
+                },
+                None,
+                HISTORY_TEXT.into(),
+            ),
+            Err(crate::ActorError::Shutdown)
+        ));
+        token.install().unwrap();
+        assert_eq!(journal.incarnation(id), binding);
+        drop(token);
+        or(manager.wait_until_reaped(), async {
+            smol::Timer::after(DETACH_TIMEOUT).await;
+            panic!("shutdown reaper did not finish after publication released");
+        })
+        .await;
+        assert!(manager.runner_finished(id).unwrap());
+        assert_dormant(&manager, id);
+    });
+}
+
+#[test]
+fn dormant_transcript_caps_latest_without_inventing_turn_coverage() {
+    let records = records();
+    let id = records[1].id;
+    let journal = journal(&records);
+    let turn = TurnId::generate();
+    let result = crate::actor::TurnResult {
+        outcome: crate::TurnOutcome::cancelled(
+            id,
+            turn,
+            Default::default(),
+            0,
+            crate::TurnCancellationReason::User,
+        ),
+        text: String::new(),
+        output: Vec::new(),
+        provenance: crate::actor::TurnProvenance::default(),
+        duration_ms: 0,
+    }
+    .to_stored(journal.snapshot().epoch, None)
+    .unwrap();
+    journal
+        .commit(JournalCommit {
+            changes: vec![JournalChange {
+                agent: Some(id),
+                generation: 0,
+                change: StateChange::Turn { turn, result },
+            }],
+            histories: BTreeMap::from([(
+                id,
+                History::new(vec![
+                    Message::user(HISTORY_TEXT.into()),
+                    Message::user(INITIALIZATION_ERROR.into()),
+                ])
+                .snapshot()
+                .clone(),
+            )]),
+            ..Default::default()
+        })
+        .unwrap();
+    let before = journal.checkpoint_snapshot().unwrap();
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    let request = crate::actor::TranscriptRequest {
+        through_turn: None,
+        last_messages: 1,
+        max_bytes: 4096,
+    };
+    let latest = manager
+        .lookup(id)
+        .unwrap()
+        .transcript(request.clone())
+        .unwrap();
+    assert_eq!(latest.total_messages, 2);
+    assert_eq!(latest.omitted_messages, 1);
+    assert_eq!(latest.messages.as_array().unwrap().len(), 1);
+    assert_eq!(latest.epoch, before.histories[&id].epoch);
+    assert_eq!(latest.through_turn, None);
+    let capped = manager
+        .transcript(
+            id,
+            crate::actor::TranscriptRequest {
+                max_bytes: 2,
+                ..request.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(capped.messages, serde_json::json!([]));
+    assert!(capped.truncated);
+    assert!(
+        matches!(manager.transcript(id, crate::actor::TranscriptRequest { through_turn: Some(turn), ..request.clone() }), Err(crate::ActorError::UnavailableTurnHistory(actual)) if actual == turn)
+    );
+    let unknown = TurnId::generate();
+    assert!(
+        matches!(manager.transcript(id, crate::actor::TranscriptRequest { through_turn: Some(unknown), ..request }), Err(crate::ActorError::UnknownTurn(actual)) if actual == unknown)
+    );
+    assert_dormant(&manager, id);
+    assert_checkpoint(&journal, &before);
+}
+
+#[test_case(false; "factory_failure")]
+#[test_case(true; "factory_dropped")]
+fn close_pending_factory_settles_closed_without_resources(drop_factory: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (release, wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            wait.recv_async().await.unwrap();
+            Err(ReactivationError::Initialization(
+                INITIALIZATION_ERROR.into(),
+            ))
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        manager.close_subtree(id).unwrap();
+        let closed = journal.checkpoint_snapshot().unwrap();
+        if drop_factory {
+            drop(activation);
+        } else {
+            release.send(()).unwrap();
+            assert!(activation.await.is_err());
+        }
+        let node = manager.node(id).unwrap();
+        assert_eq!(node.graph_lifecycle, GraphLifecycle::Closed);
+        assert_eq!(node.residency, AgentResidency::Dormant);
+        assert!(node.actor.is_none());
+        assert!(manager.runner_finished(id).unwrap());
+        assert_eq!(
+            journal.agent(id).unwrap().lifecycle,
+            StoredAgentLifecycle::Closed
+        );
+        assert_checkpoint(&journal, &closed);
+    });
+}
+
+#[test_case(false; "direct_detach")]
+#[test_case(true; "publication_blocked")]
+fn detached_running_child_settles_retained_ticket_before_wake(publication_blocked: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (entered, running) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let (cleaned, cleanup) = flume::bounded(1);
+        let child = manager
+            .ensure_resident_with(id, |_| async move {
+                Ok(ResidentAgent {
+                    backend: Box::new(GatedCleanupBackend {
+                        entered,
+                        release: wait,
+                        cleaned,
+                    }),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let ticket = actor
+            .submit(
+                AgentInput::new(HISTORY_TEXT.into(), Vec::new()),
+                None,
+                HISTORY_TEXT.into(),
+                TurnAdmissionOptions::default(),
+            )
+            .unwrap();
+        running.recv_timeout(DETACH_TIMEOUT).unwrap();
+        let retained = manager
+            .retained_turn_ticket(&child, ticket.turn_id())
+            .unwrap();
+        let binding = journal.incarnation(id);
+        let publication = if publication_blocked {
+            Some(journal.reserve_publication().await)
+        } else {
+            None
+        };
+        manager
+            .detach_incarnation(&child.incarnation().unwrap())
+            .unwrap();
+        assert_eq!(journal.incarnation(id), binding);
+        assert!(matches!(
+            child.wake().await,
+            Err(WakeError::Manager(ManagerError::Reactivation(
+                ReactivationError::Cancelled
+            )))
+        ));
+        assert!(retained.peek().is_none());
+        drop(publication);
+        release.send(()).unwrap();
+        cleanup.recv_timeout(DETACH_TIMEOUT).unwrap();
+        wait_for_incarnation_cleanup(&journal, &binding).await;
+        assert_dormant(&manager, id);
+        let result = retained.wait_result().await;
+        assert!(matches!(
+            result.outcome,
+            crate::TurnOutcome::Cancelled {
+                reason: crate::TurnCancellationReason::Shutdown,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .retained_turn_ticket(&child, ticket.turn_id())
+                .unwrap()
+                .peek_result(),
+            Some(result.clone())
+        );
+
+        manager.set_reactivator(Some(Arc::new(
+            |manager: AgentManagerHandle, id| -> BoxFuture<'static, Result<(), WakeError>> {
+                Box::pin(async move {
+                    manager
+                        .ensure_resident_with(id, |_| async { Ok(resident()) })
+                        .await?;
+                    Ok(())
+                })
+            },
+        )));
+        child.wake().await.unwrap();
+        let replacement = child.actor().unwrap();
+        assert!(!replacement.same_actor(&actor));
+        assert!(
+            graph_quiescence_barrier(slice::from_ref(&replacement))
+                .await
+                .unwrap()[0]
+                .is_quiescent()
+        );
+        assert_eq!(
+            replacement
+                .turn_ticket(ticket.turn_id())
+                .unwrap()
+                .peek_result(),
+            Some(result)
+        );
+        let snapshot = journal.snapshot();
+        let view = snapshot.fold().unwrap();
+        assert!(
+            !view.scopes[&Some(id)]
+                .admitted
+                .contains_key(&ticket.turn_id())
+        );
+        assert_eq!(snapshot.state.iter().filter(|record| record.agent == Some(id) && matches!(&record.change, StateChange::Turn { turn, .. } if *turn == ticket.turn_id())).count(), 1);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+struct GatedCleanupBackend {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+    cleaned: flume::Sender<()>,
+}
+
+impl ActorBackend for GatedCleanupBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        mut history: ActorHistory<'a>,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.entered.send(()).unwrap();
+            context.cancel.cancelled().await;
+            self.release.recv_async().await.unwrap();
+            let _ = history
+                .push(Message::user(INITIALIZATION_ERROR.into()))
+                .await;
+            self.cleaned.send(()).unwrap();
+            BackendResult::EnteredRun(crate::TurnOutcome::cancelled(
+                context.agent_id,
+                context.turn_id.unwrap(),
+                Default::default(),
+                0,
+                crate::TurnCancellationReason::Shutdown,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn config() -> EffectiveAgentConfig {
+    EffectiveAgentConfig::new(
+        RunSettings {
+            provider: unconfigured(),
+            model: Model::from_spec(MODEL).unwrap(),
+            fast: true,
+            workflow: false,
+            thinking: Default::default(),
+        },
+        AgentMode::Build,
+    )
+    .with_mode_def(Some(ModeDef::default_for(ModeId::Build)))
+}
+
+fn resident() -> ResidentAgent {
+    ResidentAgent {
+        backend: Box::new(MockBackend::STRICT),
+        config: config(),
+        shared_messages: None,
+        start: None,
+        initialize: None,
+    }
+}
+
+fn records() -> [StoredAgentRecord; RETAINED_AGENTS] {
+    let root = AgentId::generate();
+    [
+        StoredAgentLifecycle::Open,
+        StoredAgentLifecycle::Open,
+        StoredAgentLifecycle::Closed,
+        StoredAgentLifecycle::Retired,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, lifecycle)| StoredAgentRecord {
+        transcript_key: if index == 0 {
+            String::new()
+        } else {
+            format!("child-{index}")
+        },
+        lifecycle,
+        label: Some(format!("agent-{index}")),
+        spawned_by_tool_use_id: (index != 0).then(|| format!("tool-{index}")),
+        ..test_record(
+            if index == 0 {
+                root
+            } else {
+                AgentId::generate()
+            },
+            (index != 0).then_some(root),
+        )
+    })
+    .collect::<Vec<_>>()
+    .try_into()
+    .unwrap()
+}
+
+fn journal(records: &[StoredAgentRecord]) -> Arc<SessionJournal> {
+    let journal = Arc::new(SessionJournal::default());
+    let saved_config = StoredAgentConfig {
+        cwd: ".".into(),
+        model: MODEL.into(),
+        thinking: None,
+        fast: true,
+        workflow: false,
+        mode: ModeDef::default_for(ModeId::Build).stored_snapshot(&AgentMode::Build),
+        options: BTreeMap::new(),
+    };
+    let mut history = History::new(vec![Message::user(HISTORY_TEXT.into())]);
+    history.mark_sent();
+    journal
+        .commit(JournalCommit {
+            agents: records.to_vec(),
+            changes: records
+                .iter()
+                .map(|record| JournalChange {
+                    agent: Some(record.id),
+                    generation: 0,
+                    change: StateChange::Config(saved_config.clone()),
+                })
+                .collect(),
+            histories: records
+                .iter()
+                .map(|record| (record.id, history.snapshot().clone()))
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    journal
+}
+
+fn restore(
+    journal: &Arc<SessionJournal>,
+    limits: AgentLimits,
+) -> Result<AgentManagerHandle, ManagerError> {
+    let snapshot = journal.checkpoint_snapshot().unwrap();
+    let view = snapshot.fold().unwrap();
+    AgentManagerHandle::restore_graph(limits, Arc::clone(journal), view, snapshot.histories)
+}
+
+fn queued_child_report(records: &[StoredAgentRecord]) -> (Arc<SessionJournal>, Arc<ChildDelivery>) {
+    let journal = journal(records);
+    let delivery = Arc::new(ChildDelivery {
+        label: records[2].label.clone(),
+        result: TurnResult {
+            outcome: crate::TurnOutcome::cancelled(
+                records[2].id,
+                TurnId::generate(),
+                Default::default(),
+                0,
+                crate::TurnCancellationReason::User,
+            ),
+            text: HISTORY_TEXT.into(),
+            output: Vec::new(),
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        },
+    });
+    let turn = delivery.result.outcome.turn_id();
+    let result = delivery
+        .result
+        .to_stored(journal.snapshot().epoch, None)
+        .unwrap();
+    journal
+        .commit(JournalCommit {
+            changes: vec![
+                JournalChange {
+                    agent: Some(records[2].id),
+                    generation: 0,
+                    change: StateChange::Turn {
+                        turn,
+                        result: result.clone(),
+                    },
+                },
+                crate::actor::delivery::change(
+                    records[0].id,
+                    &delivery,
+                    StoredDeliveryOp::Queued(Box::new(StoredDelivery {
+                        label: delivery.label.clone(),
+                        result,
+                        preview_bytes: None,
+                        held: false,
+                    })),
+                ),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    (journal, delivery)
+}
+
+fn rebuild_journal(journal: Arc<SessionJournal>, root: AgentId) -> Arc<SessionJournal> {
+    let mut session = StoredSession::new(MODEL, ".");
+    session.bind_root_id(root).unwrap();
+    journal
+        .checkpoint_snapshot()
+        .unwrap()
+        .apply_to(&mut session)
+        .unwrap();
+    drop(journal);
+    Arc::new(SessionJournal::from_session(&session).unwrap())
+}
+
+#[test]
+fn restored_report_survives_initializer_failure_and_hydrates_once() {
+    smol::block_on(async {
+        let records = records();
+        let parent = records[0].id;
+        let (journal, delivery) = queued_child_report(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert_eq!(manager.active_agent_count(), 2);
+        drop(manager);
+        let journal = rebuild_journal(journal, parent);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert_dormant(&manager, parent);
+        assert_eq!(manager.active_agent_count(), 2);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let error = manager
+            .ensure_resident_with(parent, |_| async {
+                let mut resident = resident();
+                resident.initialize = Some(Box::new(|input| {
+                    Box::pin(async move {
+                        assert_eq!(input.actor.inner.state.lock().unwrap().deliveries.len(), 1);
+                        Err(ReactivationError::Initialization(
+                            INITIALIZATION_ERROR.into(),
+                        ))
+                    })
+                }));
+                Ok(resident)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ManagerError::Reactivation(ReactivationError::Initialization(
+                INITIALIZATION_ERROR.into()
+            ))
+        );
+        assert_dormant(&manager, parent);
+        assert_eq!(manager.active_agent_count(), 2);
+        assert_checkpoint(&journal, &before);
+        let (_start, wait) = flume::bounded(1);
+        let parent_ref = manager
+            .ensure_resident_with(parent, |_| async move {
+                let mut resident = resident();
+                resident.start = Some(wait);
+                Ok(resident)
+            })
+            .await
+            .unwrap();
+        let actor = parent_ref.actor().unwrap();
+        assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+        assert_eq!(manager.active_agent_count(), 2);
+        let before = journal.checkpoint_snapshot().unwrap();
+        manager.deliver(parent, delivery).unwrap();
+        assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+        assert_checkpoint(&journal, &before);
+        manager.close_subtree(parent).unwrap();
+        assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 0);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert_eq!(manager.active_agent_count(), 0);
+    });
+}
+
+#[test]
+fn report_arriving_during_initializer_is_reconciled_with_its_work_hold() {
+    smol::block_on(async {
+        let records = records();
+        let parent = records[0].id;
+        let (_, delivery) = queued_child_report(&records);
+        let source = delivery.result.outcome.agent_id();
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (initializer_entered, entered) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let (_start, start_wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(parent, |_| async move {
+            let mut resident = resident();
+            resident.start = Some(start_wait);
+            resident.initialize = Some(Box::new(move |input| {
+                Box::pin(async move {
+                    assert!(
+                        input
+                            .actor
+                            .inner
+                            .state
+                            .lock()
+                            .unwrap()
+                            .deliveries
+                            .is_empty()
+                    );
+                    initializer_entered.send(input.actor).unwrap();
+                    wait.recv_async().await.unwrap();
+                    Ok(())
+                })
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        let initializing_actor = entered.recv().unwrap();
+        let mut source_work = manager.0.work.restore_hold(source).unwrap();
+        let report_work = source_work.take_report().unwrap();
+        drop(source_work);
+        manager
+            .deliver_reserved(parent, Arc::clone(&delivery), vec![report_work])
+            .unwrap();
+        assert!(
+            initializing_actor
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .deliveries
+                .is_empty()
+        );
+        assert_eq!(manager.active_agent_count(), 2);
+        let queued = journal.checkpoint_snapshot().unwrap();
+        release.send(()).unwrap();
+        let actor = activation.await.unwrap().actor().unwrap();
+        assert!(actor.same_actor(&initializing_actor));
+        assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+        assert_eq!(manager.active_agent_count(), 2);
+        assert_checkpoint(&journal, &queued);
+        manager.deliver(parent, delivery).unwrap();
+        assert_eq!(actor.inner.state.lock().unwrap().deliveries.len(), 1);
+        assert_eq!(manager.active_agent_count(), 2);
+        assert_checkpoint(&journal, &queued);
+        manager.close_subtree(parent).unwrap();
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert_eq!(manager.active_agent_count(), 0);
+    });
+}
+
+struct ReportObservationBackend {
+    expected: Message,
+    progress: flume::Sender<Option<TurnId>>,
+}
+
+impl ActorBackend for ReportObservationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        mut history: ActorHistory<'a>,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let inbox = context.inbox.unwrap();
+            let mut observed = 0;
+            inbox.commit_completions(&mut |message| {
+                assert_eq!(message, self.expected);
+                history.push_observation(message).unwrap();
+                observed += 1;
+            });
+            assert_eq!(observed, 1);
+            assert!(inbox.finish());
+            let turn = context.turn_id.unwrap();
+            self.progress.send(Some(turn)).unwrap();
+            BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                context.agent_id,
+                turn,
+                TokenUsage::default(),
+                0,
+                crate::DoneReason::EndTurn,
+            ))
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.progress.send(None).unwrap();
+            BackendResult::ControlDone
+        })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        _: TurnContext,
+        _: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+#[test]
+fn report_arriving_during_failed_finish_with_is_observed_once_after_retry() {
+    smol::block_on(async {
+        let records = records();
+        let parent = records[0].id;
+        let (_, delivery) = queued_child_report(&records);
+        let identity = (
+            delivery.result.outcome.agent_id(),
+            delivery.result.outcome.turn_id(),
+        );
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (finishing, entered) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(parent, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                let actor = input.actor.clone();
+                Box::pin(input.finish_with(async move {
+                    finishing.send(actor).unwrap();
+                    wait.recv_async().await.unwrap();
+                    Err(ReactivationError::Initialization(
+                        INITIALIZATION_ERROR.into(),
+                    ))
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        let finishing_actor = entered.recv_async().await.unwrap();
+        let old = manager.incarnation(parent).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(parent, |_| async {
+            panic!("failed finish_with waiter must share the activation")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        let mut source_work = manager.0.work.restore_hold(identity.0).unwrap();
+        let report_work = source_work.take_report().unwrap();
+        drop(source_work);
+        manager
+            .deliver_reserved(parent, Arc::clone(&delivery), vec![report_work])
+            .unwrap();
+        assert_eq!(
+            finishing_actor.inner.state.lock().unwrap().deliveries.len(),
+            1
+        );
+        let queued = journal.checkpoint_snapshot().unwrap();
+        assert!(matches!(
+            queued.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
+            StoredDeliveryOp::Queued(_)
+        ));
+        assert_eq!(manager.active_agent_count(), 2);
+        drop(activation);
+        release.send(()).unwrap();
+        assert_eq!(
+            sibling.await.unwrap_err(),
+            ManagerError::Reactivation(ReactivationError::Initialization(
+                INITIALIZATION_ERROR.into()
+            ))
+        );
+        assert_dormant(&manager, parent);
+        assert_checkpoint(&journal, &queued);
+        let rolled_back = journal.checkpoint_snapshot().unwrap();
+        assert!(matches!(
+            rolled_back.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
+            StoredDeliveryOp::Queued(_)
+        ));
+        assert_eq!(manager.active_agent_count(), 2);
+        manager.deliver(parent, Arc::clone(&delivery)).unwrap();
+        assert_checkpoint(&journal, &queued);
+
+        let expected = delivery.input().preamble.remove(0);
+        let (progress, events) = flume::unbounded();
+        let (start, start_wait) = flume::bounded(1);
+        let agent = manager
+            .ensure_resident_with(parent, |_| async move {
+                let mut resident = resident();
+                resident.backend = Box::new(ReportObservationBackend { expected, progress });
+                resident.start = Some(start_wait);
+                Ok(resident)
+            })
+            .await
+            .unwrap();
+        assert_ne!(manager.incarnation(parent).unwrap(), old);
+        let actor = agent.actor().unwrap();
+        manager.deliver(parent, Arc::clone(&delivery)).unwrap();
+        assert_checkpoint(&journal, &queued);
+        start.send(()).unwrap();
+        let turn = events.recv_async().await.unwrap().unwrap();
+        journal
+            .wait_terminal_conversion(parent, turn)
+            .await
+            .unwrap();
+        graph_quiescence_barrier(slice::from_ref(&actor))
+            .await
+            .unwrap();
+        let consumed = journal.checkpoint_snapshot().unwrap();
+        assert_eq!(
+            consumed.fold().unwrap().scopes[&Some(parent)].deliveries[&identity],
+            StoredDeliveryOp::Consumed
+        );
+        let source = ObservationSource::ChildResult {
+            agent_id: identity.0.to_string(),
+            turn_id: identity.1.to_string(),
+        };
+        assert_eq!(
+            consumed.histories[&parent]
+                .messages
+                .iter()
+                .filter(|message| message.observation_source.as_ref() == Some(&source))
+                .count(),
+            1
+        );
+        assert_eq!(
+            consumed
+                .state
+                .iter()
+                .filter(|record| {
+                    record.agent == Some(parent)
+                        && matches!(&record.change, StateChange::Delivery {
+                        id,
+                        op: StoredDeliveryOp::Consumed,
+                    } if *id == identity)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(manager.active_agent_count(), 0);
+        manager.deliver(parent, delivery).unwrap();
+        assert_checkpoint(&journal, &consumed);
+        actor
+            .push_control(
+                INITIALIZATION_CONTROL.into(),
+                INITIALIZATION_CONTROL.into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(events.recv_async().await.unwrap(), None);
+        graph_quiescence_barrier(slice::from_ref(&actor))
+            .await
+            .unwrap();
+        assert!(events.try_recv().is_err());
+        assert_checkpoint(&journal, &consumed);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn report_withdrawn_during_initializer_is_not_resurrected() {
+    smol::block_on(async {
+        let records = records();
+        let parent = records[0].id;
+        let (journal, delivery) = queued_child_report(&records);
+        let id = (
+            delivery.result.outcome.agent_id(),
+            delivery.result.outcome.turn_id(),
+        );
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (initializer_entered, entered) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let (_start, start_wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(parent, |_| async move {
+            let mut resident = resident();
+            resident.start = Some(start_wait);
+            resident.initialize = Some(Box::new(move |input| {
+                Box::pin(async move {
+                    assert_eq!(input.actor.inner.state.lock().unwrap().deliveries.len(), 1);
+                    initializer_entered.send(()).unwrap();
+                    wait.recv_async().await.unwrap();
+                    assert!(input.actor.withdraw_child_delivery(id.1));
+                    Ok(())
+                })
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        entered.recv().unwrap();
+        release.send(()).unwrap();
+        let actor = activation.await.unwrap().actor().unwrap();
+        assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
+        let withdrawn = journal.checkpoint_snapshot().unwrap();
+        let view = withdrawn.fold().unwrap();
+        assert_eq!(
+            view.scopes[&Some(parent)].deliveries[&id],
+            StoredDeliveryOp::Withdrawn
+        );
+        manager.deliver(parent, delivery).unwrap();
+        assert!(actor.inner.state.lock().unwrap().deliveries.is_empty());
+        assert_checkpoint(&journal, &withdrawn);
+        manager.close_subtree(parent).unwrap();
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert_eq!(manager.active_agent_count(), 0);
+    });
+}
+
+#[test]
+fn closing_dormant_restored_report_releases_hold_and_persists_drop() {
+    let records = records();
+    let parent = records[0].id;
+    let (journal, delivery) = queued_child_report(&records);
+    let id = (
+        delivery.result.outcome.agent_id(),
+        delivery.result.outcome.turn_id(),
+    );
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_dormant(&manager, parent);
+    assert_eq!(manager.active_agent_count(), 2);
+    drop(manager);
+    let journal = rebuild_journal(journal, parent);
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.active_agent_count(), 2);
+    manager.close_subtree(parent).unwrap();
+    assert_eq!(manager.active_agent_count(), 0);
+    manager.close_subtree(parent).unwrap();
+    assert_eq!(manager.active_agent_count(), 0);
+    drop(manager);
+    let journal = rebuild_journal(journal, parent);
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.active_agent_count(), 0);
+    assert_eq!(
+        manager.node(parent).unwrap().graph_lifecycle,
+        GraphLifecycle::Closed
+    );
+    let snapshot = journal.checkpoint_snapshot().unwrap();
+    let view = snapshot.fold().unwrap();
+    assert_eq!(
+        view.scopes[&Some(parent)].deliveries[&id],
+        StoredDeliveryOp::Dropped
+    );
+    let drops = snapshot
+        .state
+        .iter()
+        .filter(|record| {
+            matches!(&record.change, StateChange::Delivery {
+            id: actual,
+            op: StoredDeliveryOp::Dropped,
+        } if *actual == id)
+        })
+        .count();
+    assert_eq!(drops, 1);
+}
+
+fn assert_history(actual: &HistorySnapshot, expected: &HistorySnapshot) {
+    assert_eq!(actual.epoch, expected.epoch);
+    assert_eq!(actual.compacted, expected.compacted);
+    assert_eq!(actual.conversation, expected.conversation);
+    assert_eq!(actual.messages, expected.messages);
+}
+
+fn assert_checkpoint(journal: &SessionJournal, expected: &SessionJournalSnapshot) {
+    let actual = journal.checkpoint_snapshot().unwrap();
+    assert_eq!(actual.epoch, expected.epoch);
+    assert_eq!(actual.revision, expected.revision);
+    assert_eq!(actual.seq, expected.seq);
+    assert_eq!(actual.state, expected.state);
+    assert_eq!(actual.agent_revisions, expected.agent_revisions);
+    assert_eq!(actual.managed_histories, expected.managed_histories);
+    assert_eq!(actual.histories.len(), expected.histories.len());
+    for (id, history) in expected.histories.iter() {
+        assert_history(&actual.histories[id], history);
+    }
+}
+
+fn assert_dormant(manager: &AgentManagerHandle, id: AgentId) {
+    let node = manager.node(id).unwrap();
+    assert_eq!(node.graph_lifecycle, GraphLifecycle::Dormant);
+    assert_eq!(node.residency, AgentResidency::Dormant);
+    assert!(node.actor.is_none());
+    assert!(matches!(manager.actor(id), Err(ManagerError::NonLiveAgent(actual)) if actual == id));
+}
+
+#[test]
+fn failed_work_rebind_preserves_dormant_incarnation() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let binding = journal.incarnation(id);
+        let reservation = manager.incarnation(id).unwrap().reservation;
+        manager.0.work.remove(id).unwrap();
+        let error = manager
+            .ensure_resident_with(id, |_| async {
+                panic!("failed work rebind must not invoke the factory")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, ManagerError::UnknownAgent(id));
+        assert_eq!(journal.incarnation(id), binding);
+        assert_eq!(manager.incarnation(id).unwrap().reservation, reservation);
+        assert_dormant(&manager, id);
+    });
+}
+
+#[test]
+fn restore_preserves_dormant_root_and_readable_terminal_children() {
+    let records = records();
+    let journal = journal(&records);
+    let before = journal.checkpoint_snapshot().unwrap();
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    let root = manager.root().unwrap();
+    assert_eq!(root.id(), records[0].id);
+    assert_dormant(&manager, root.id());
+    assert_eq!(root.snapshot().unwrap().children.len(), records.len() - 1);
+    for (record, lifecycle) in records.iter().zip([
+        GraphLifecycle::Dormant,
+        GraphLifecycle::Dormant,
+        GraphLifecycle::Closed,
+        GraphLifecycle::Retired,
+    ]) {
+        let node = manager.lookup(record.id).unwrap().snapshot().unwrap();
+        assert_eq!(node.graph_lifecycle, lifecycle);
+        assert_eq!(node.parent_id, record.parent);
+        assert_eq!(node.root_id, root.id());
+        assert_eq!(node.depth, record.depth as usize);
+        assert_eq!(node.metadata.label, record.label);
+        assert_eq!(
+            node.metadata.spawned_by_tool_use_id,
+            record.spawned_by_tool_use_id
+        );
+        assert!(node.actor.is_none());
+    }
+    smol::block_on(async {
+        for record in &records[2..] {
+            let error = manager
+                .ensure_resident_with(record.id, |_| async {
+                    panic!("terminal identity must not invoke the factory")
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                if record.lifecycle == StoredAgentLifecycle::Retired {
+                    ManagerError::Retired(record.id)
+                } else {
+                    ManagerError::NonLiveAgent(record.id)
+                }
+            );
+        }
+    });
+    assert_checkpoint(&journal, &before);
+}
+
+#[test_case(false; "child")]
+#[test_case(true; "root")]
+fn gated_singleflight_preserves_identity_and_hides_uninitialized_actor(root: bool) {
+    smol::block_on(async {
+        let records = records();
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let id = records[usize::from(!root)].id;
+        let saved_record = journal.agent(id).unwrap();
+        let saved_history = before.histories[&id].clone();
+        let (factory_release, factory_wait) = flume::bounded(1);
+        let (init_release, init_wait) = flume::bounded(1);
+        let (initialized, initialization) = flume::bounded(1);
+        let mut calls = 0;
+        let mut first = Box::pin(manager.ensure_resident_with(id, |input| {
+            calls += 1;
+            assert_eq!(input.record, saved_record);
+            assert_history(&input.history, &saved_history);
+            assert_eq!(input.config.as_ref().unwrap().model, MODEL);
+            assert!(input.config.as_ref().unwrap().fast);
+            async move {
+                factory_wait.recv_async().await.unwrap();
+                let mut resident = resident();
+                resident.initialize = Some(Box::new(move |input| Box::pin(async move {
+                    assert_eq!(input.agent.id(), id);
+                    assert_eq!(input.actor.agent_id(), id);
+                    assert!(matches!(input.agent.actor(), Err(ManagerError::NonLiveAgent(actual)) if actual == id));
+                    input.agent.manager().validate_incarnation(&input.incarnation).unwrap();
+                    assert_history(&input.actor.committed_history_snapshot(), &saved_history);
+                    initialized.send((input.actor.identity(), input.incarnation)).unwrap();
+                    init_wait.recv_async().await.unwrap();
+                    Ok(())
+                })));
+                Ok(resident)
+            }
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("singleflight waiter must not invoke its factory")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        factory_release.send(()).unwrap();
+        assert!(poll_once(first.as_mut()).await.is_none());
+        let (identity, incarnation) = initialization.recv().unwrap();
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(!manager.is_live(id));
+        assert!(
+            matches!(manager.actor(id), Err(ManagerError::NonLiveAgent(actual)) if actual == id)
+        );
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        assert_checkpoint(&journal, &before);
+        init_release.send(()).unwrap();
+        let first = first.await.unwrap();
+        let sibling = sibling.await.unwrap();
+        assert_eq!(calls, 1);
+        assert!(Arc::ptr_eq(&identity, &first.actor().unwrap().identity()));
+        assert!(Arc::ptr_eq(&identity, &sibling.actor().unwrap().identity()));
+        assert_eq!(manager.incarnation(id).unwrap(), incarnation);
+        let again = manager
+            .ensure_resident_with(id, |_| async {
+                panic!("resident identity must not invoke another factory")
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&identity, &again.actor().unwrap().identity()));
+        assert_eq!(manager.list().len(), records.len());
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(ReactivationError::ProviderUnavailable { provider: "offline".into(), reason: "discovery failed".into() }; "provider")]
+#[test_case(ReactivationError::ToolUnavailable { tool: "missing".into() }; "tool")]
+#[test_case(ReactivationError::McpUnavailable { server: "offline".into() }; "mcp")]
+fn typed_factory_failure_preserves_exact_checkpoint_and_allows_retry(failure: ReactivationError) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let expected = ManagerError::Reactivation(failure.clone());
+        assert_eq!(
+            manager
+                .ensure_resident_with(id, |_| async { Err(failure) })
+                .await
+                .unwrap_err(),
+            expected
+        );
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert!(manager.is_live(id));
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "factory")]
+#[test_case(true; "initializer")]
+fn cancelled_activation_releases_waiter_and_retries_with_new_incarnation(initialize: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (_release, wait) = flume::bounded::<()>(1);
+        let mut first = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            if initialize {
+                resident.initialize = Some(Box::new(move |_| {
+                    Box::pin(async move {
+                        wait.recv_async().await.unwrap();
+                        Ok(())
+                    })
+                }));
+            } else {
+                wait.recv_async().await.unwrap();
+            }
+            Ok(resident)
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        let old = manager.incarnation(id).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("cancelled waiter must not invoke its factory")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        drop(first);
+        assert_eq!(
+            sibling.await.unwrap_err(),
+            ManagerError::Reactivation(ReactivationError::Cancelled)
+        );
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        let agent = manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let identity = agent.actor().unwrap().identity();
+        assert_ne!(manager.incarnation(id).unwrap(), old);
+        assert_eq!(
+            manager.detach_incarnation(&old),
+            Err(ManagerError::StaleIncarnation(id))
+        );
+        assert!(manager.is_live(id));
+        assert!(Arc::ptr_eq(
+            &identity,
+            &manager.actor(id).unwrap().identity()
+        ));
+        assert_checkpoint(&journal, &before);
+        let current = manager.incarnation(id).unwrap();
+        manager.detach_incarnation(&current).unwrap();
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "typed_failure")]
+#[test_case(true; "callback_closed_actor")]
+fn initializer_failure_discards_hidden_actor_and_retries(close_actor: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (sent, received) = flume::bounded(1);
+        let error = manager
+            .ensure_resident_with(id, |_| async {
+                let mut resident = resident();
+                resident.initialize = Some(Box::new(move |input| {
+                    Box::pin(async move {
+                        sent.send(input.actor.identity()).unwrap();
+                        if close_actor {
+                            input.actor.close();
+                            Ok(())
+                        } else {
+                            Err(ReactivationError::Initialization(
+                                INITIALIZATION_ERROR.into(),
+                            ))
+                        }
+                    })
+                }));
+                Ok(resident)
+            })
+            .await
+            .unwrap_err();
+        if !close_actor {
+            assert_eq!(
+                error,
+                ManagerError::Reactivation(ReactivationError::Initialization(
+                    INITIALIZATION_ERROR.into()
+                ))
+            );
+        }
+        let failed_identity = received.recv().unwrap();
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        let agent = manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &failed_identity,
+            &agent.actor().unwrap().identity()
+        ));
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "tool_ceiling")]
+#[test_case(true; "write_ceiling")]
+fn widened_restored_ceiling_fails_before_actor_or_journal_mutation(write: bool) {
+    smol::block_on(async {
+        let mut records = records();
+        let id = records[1].id;
+        records[1].spec = Some(StoredAgentSpec {
+            model: Default::default(),
+            system: String::new(),
+            tools: Vec::new(),
+            audience: String::new(),
+            mcp: false,
+            output_schema: None,
+            name: None,
+            silent: true,
+            auto_deliver: false,
+            inherit_provider: true,
+            plugin: None,
+            mode_ceiling: StoredModeCeiling {
+                restrict_write_to: write.then(|| "allowed".into()),
+                tools: (!write).then(|| vec!["read".into()]),
+            },
+        });
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let error = manager
+            .ensure_resident_with(id, |_| async {
+                let mut resident = resident();
+                resident.initialize = Some(Box::new(|_| {
+                    Box::pin(async { panic!("invalid ceiling must not reach initialization") })
+                }));
+                Ok(resident)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ManagerError::Reactivation(ReactivationError::ModeCeiling(_))
+        ));
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+    });
+}
+
+#[derive(Clone)]
+enum InvalidGraph {
+    MissingParent,
+    Cycle,
+    Depth,
+}
+
+#[test_case(InvalidGraph::MissingParent; "missing_parent")]
+#[test_case(InvalidGraph::Cycle; "parent_cycle")]
+#[test_case(InvalidGraph::Depth; "invalid_depth")]
+fn rejects_invalid_coherent_checkpoint_without_mutation(invalid: InvalidGraph) {
+    let mut records = records();
+    match invalid {
+        InvalidGraph::MissingParent => records[1].parent = Some(AgentId::generate()),
+        InvalidGraph::Cycle => {
+            records[1].parent = Some(records[2].id);
+            records[2].parent = Some(records[1].id);
+        }
+        InvalidGraph::Depth => records[1].depth += 1,
+    }
+    let journal = journal(&records);
+    let before = journal.checkpoint_snapshot().unwrap();
+    assert!(matches!(
+        restore(&journal, AgentLimits::default()),
+        Err(ManagerError::InvalidGraph(_))
+    ));
+    assert_checkpoint(&journal, &before);
+}
+
+#[test_case(false; "state_view")]
+#[test_case(true; "history")]
+fn rejects_mixed_checkpoint_inputs(history: bool) {
+    let records = records();
+    let journal = journal(&records);
+    let before = journal.checkpoint_snapshot().unwrap();
+    let mut view = before.fold().unwrap();
+    let mut histories = before.histories.clone();
+    if history {
+        histories.get_mut(&records[1].id).unwrap().epoch += 1;
+    } else {
+        view.agents.get_mut(&records[1].id).unwrap().label = None;
+    }
+    assert!(matches!(
+        AgentManagerHandle::restore_graph(
+            AgentLimits::default(),
+            Arc::clone(&journal),
+            view,
+            histories
+        ),
+        Err(ManagerError::InvalidGraph(_))
+    ));
+    assert_checkpoint(&journal, &before);
+}
+
+#[test_case(false; "factory")]
+#[test_case(true; "initializer")]
+fn detached_activation_cannot_publish_or_roll_back_replacement(initialize: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (release, wait) = flume::bounded(1);
+        let mut stale = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            if initialize {
+                resident.initialize = Some(Box::new(move |_| {
+                    Box::pin(async move {
+                        wait.recv_async().await.unwrap();
+                        Ok(())
+                    })
+                }));
+            } else {
+                wait.recv_async().await.unwrap();
+                resident.initialize = Some(Box::new(|_| {
+                    Box::pin(async { panic!("stale factory must not reach initialization") })
+                }));
+            }
+            Ok(resident)
+        }));
+        assert!(poll_once(stale.as_mut()).await.is_none());
+        let old = manager.incarnation(id).unwrap();
+        manager.detach_incarnation(&old).unwrap();
+        assert_eq!(
+            manager.validate_incarnation(&old),
+            Err(ManagerError::StaleIncarnation(id))
+        );
+        assert_dormant(&manager, id);
+        let replacement = manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let current = manager.incarnation(id).unwrap();
+        let identity = replacement.actor().unwrap().identity();
+        release.send(()).unwrap();
+        assert_eq!(stale.await.unwrap_err(), ManagerError::StaleIncarnation(id));
+        assert!(manager.is_live(id));
+        assert_eq!(manager.incarnation(id).unwrap(), current);
+        assert!(Arc::ptr_eq(
+            &identity,
+            &manager.actor(id).unwrap().identity()
+        ));
+        manager.validate_incarnation(&current).unwrap();
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum InitializationCut {
+    DropWaiter,
+    Shutdown,
+    ShutdownWithoutDrainBudget,
+}
+
+struct InitializationBackend {
+    journal: Arc<SessionJournal>,
+    returned: Arc<AtomicBool>,
+    started: flume::Sender<(bool, bool)>,
+    stub: MockBackend,
+}
+
+impl ActorBackend for InitializationBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        input: AgentInput,
+        kind: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        self.stub.run_turn(history, context, input, kind)
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: ActorHistory<'a>,
+        context: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let snapshot = self.journal.checkpoint_snapshot().unwrap();
+            let published = snapshot
+                .plugin(Some(context.agent_id), PUBLICATION_PLUGIN)
+                .is_some_and(|value| value.value == Some(serde_json::json!(PUBLICATION_VALUE)));
+            self.started
+                .send((published, self.returned.load(Ordering::Acquire)))
+                .unwrap();
+            BackendResult::ControlDone
+        })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        history: ActorHistory<'a>,
+        context: TurnContext,
+        instructions: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        self.stub.run_compact(history, context, instructions)
+    }
+}
+
+#[test_case(InitializationCut::DropWaiter; "dropped_waiter")]
+#[test_case(InitializationCut::Shutdown; "shutdown")]
+#[test_case(InitializationCut::ShutdownWithoutDrainBudget; "shutdown_zero_budget_waits_for_finishing_activation")]
+fn finish_with_retains_claimed_publication_until_work_returns(cut: InitializationCut) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let publication = CheckpointPublication::default();
+        let work_publication = publication.clone();
+        let work_journal = Arc::clone(&journal);
+        let returned = Arc::new(AtomicBool::new(false));
+        let work_returned = Arc::clone(&returned);
+        let (claimed, claim) = flume::bounded(1);
+        let (acknowledge, ack) = flume::bounded(1);
+        let (persisted, persistence) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let (started, start) = flume::bounded(1);
+        let backend = InitializationBackend {
+            journal: Arc::clone(&journal),
+            returned,
+            started,
+            stub: MockBackend::STRICT,
+        };
+        let mut first = Some(Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.backend = Box::new(backend);
+            resident.initialize = Some(Box::new(move |input: ResidentInitialization| {
+                Box::pin(async move {
+                    let actor = input.actor.clone();
+                    input
+                        .finish_with(async move {
+                            actor
+                                .push_control(
+                                    INITIALIZATION_CONTROL.into(),
+                                    INITIALIZATION_CONTROL.into(),
+                                    None,
+                                )
+                                .unwrap();
+                            let binding = work_journal.incarnation(id);
+                            let token = work_journal
+                                .prepare_with(|_| publication_commit(&binding))
+                                .await
+                                .unwrap();
+                            assert!(work_publication.try_publish());
+                            claimed.send(()).unwrap();
+                            ack.recv_async().await.unwrap();
+                            let candidate = token.snapshot().clone();
+                            token.commit().unwrap();
+                            work_journal.acknowledge(&candidate).unwrap();
+                            persisted.send(candidate).unwrap();
+                            wait.recv_async().await.unwrap();
+                            work_returned.store(true, Ordering::Release);
+                            Ok(())
+                        })
+                        .await
+                })
+            }));
+            Ok(resident)
+        })));
+        assert!(poll_once(first.as_mut().unwrap().as_mut()).await.is_none());
+        claim.recv_async().await.unwrap();
+        let incarnation = manager.incarnation(id).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("finish_with waiter must share the activation")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        assert!(!publication.cancel());
+        let shutdown_timeout = if cut == InitializationCut::ShutdownWithoutDrainBudget {
+            Duration::ZERO
+        } else {
+            SHUTDOWN_TIMEOUT
+        };
+        let mut shutdown = Box::pin(manager.shutdown(shutdown_timeout));
+        match cut {
+            InitializationCut::DropWaiter => drop(first.take()),
+            InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
+                assert!(poll_once(shutdown.as_mut()).await.is_none());
+            }
+        }
+        assert_checkpoint(&journal, &before);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(!manager.is_live(id));
+        assert!(start.try_recv().is_err());
+        acknowledge.send(()).unwrap();
+        let candidate = persistence.recv_async().await.unwrap();
+        assert_checkpoint(&journal, &candidate);
+        assert_eq!(manager.incarnation(id).unwrap(), incarnation);
+        assert_eq!(
+            manager.node(id).unwrap().residency,
+            AgentResidency::Activating
+        );
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        assert!(start.try_recv().is_err());
+        match cut {
+            InitializationCut::DropWaiter => {}
+            InitializationCut::Shutdown | InitializationCut::ShutdownWithoutDrainBudget => {
+                assert!(poll_once(shutdown.as_mut()).await.is_none());
+            }
+        }
+        release.send(()).unwrap();
+        let agent = sibling.await.unwrap();
+        if let Some(first) = first {
+            assert_eq!(first.await.unwrap().id(), agent.id());
+        }
+        if matches!(cut, InitializationCut::DropWaiter) {
+            assert_eq!(start.recv_async().await.unwrap(), (true, true));
+        }
+        assert_eq!(manager.incarnation(id).unwrap(), incarnation);
+        assert_checkpoint(&journal, &candidate);
+        match cut {
+            InitializationCut::Shutdown => assert!(shutdown.await.timed_out.is_empty()),
+            InitializationCut::ShutdownWithoutDrainBudget => {
+                let report = shutdown.await;
+                assert!(report.joined.contains(&id) || report.timed_out.contains(&id));
+                assert!(matches!(
+                    manager
+                        .ensure_resident_with(id, |_| async { Ok(resident()) })
+                        .await,
+                    Err(ManagerError::GraphShutdown)
+                ));
+                manager.wait_until_reaped().await;
+                assert!(manager.cleanup_finished());
+            }
+            InitializationCut::DropWaiter => {
+                agent.validate_live().unwrap();
+                assert!(
+                    manager
+                        .shutdown(SHUTDOWN_TIMEOUT)
+                        .await
+                        .timed_out
+                        .is_empty()
+                );
+            }
+        }
+    });
+}
+
+#[test_case(false, true; "cancel_before_claim")]
+#[test_case(false, false; "fail_before_claim")]
+#[test_case(true, false; "fail_after_claim")]
+fn finish_with_rejected_publication_preserves_checkpoint(claim: bool, cancel: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let publication = CheckpointPublication::default();
+        let work_publication = publication.clone();
+        let work_journal = Arc::clone(&journal);
+        let (prepared, preparation) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut first = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                Box::pin(input.finish_with(async move {
+                    let binding = work_journal.incarnation(id);
+                    let _token = work_journal
+                        .prepare_with(|_| publication_commit(&binding))
+                        .await
+                        .unwrap();
+                    if claim {
+                        assert!(work_publication.try_publish());
+                    }
+                    prepared.send(()).unwrap();
+                    wait.recv_async().await.unwrap();
+                    if cancel {
+                        assert!(!work_publication.try_publish());
+                        Err(ReactivationError::Cancelled)
+                    } else {
+                        Err(ReactivationError::Initialization(
+                            INITIALIZATION_ERROR.into(),
+                        ))
+                    }
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        preparation.recv_async().await.unwrap();
+        let old = manager.incarnation(id).unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("failed finish_with waiter must share the activation")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        if cancel {
+            assert!(publication.cancel());
+        } else {
+            assert!(!publication.is_cancelled());
+        }
+        assert_checkpoint(&journal, &before);
+        drop(first);
+        release.send(()).unwrap();
+        let expected = if cancel {
+            ReactivationError::Cancelled
+        } else {
+            ReactivationError::Initialization(INITIALIZATION_ERROR.into())
+        };
+        assert_eq!(
+            sibling.await.unwrap_err(),
+            ManagerError::Reactivation(expected)
+        );
+        assert_dormant(&manager, id);
+        assert_checkpoint(&journal, &before);
+        manager
+            .ensure_resident_with(id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        assert_ne!(manager.incarnation(id).unwrap(), old);
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(true; "close_incarnation")]
+#[test_case(false; "close_subtree")]
+fn close_during_finish_with_is_busy_without_mutation_and_succeeds_after_finish(incarnation: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (finishing, entered) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                let actor = input.actor.clone();
+                Box::pin(input.finish_with(async move {
+                    finishing.send(actor).unwrap();
+                    wait.recv_async().await.unwrap();
+                    Ok(())
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        let actor = entered.recv_async().await.unwrap();
+        let binding = manager.incarnation(id).unwrap();
+        let checkpoint = journal.checkpoint_snapshot().unwrap();
+        let (revision, next_reservation, nodes) = {
+            let graph = manager.lock_graph();
+            (
+                graph.revision,
+                graph.next_reservation,
+                graph
+                    .nodes
+                    .iter()
+                    .map(|(id, node)| {
+                        (
+                            *id,
+                            (
+                                node.lifecycle,
+                                node.residency,
+                                node.reservation,
+                                node.reservation_pending,
+                                node.detach_pending,
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        let close = || {
+            if incarnation {
+                manager.close_incarnation(&binding)
+            } else {
+                manager.close_subtree(id)
+            }
+        };
+        assert_eq!(close(), Err(ManagerError::BusySubtree(id)));
+        assert_checkpoint(&journal, &checkpoint);
+        assert_eq!(manager.incarnation(id).unwrap(), binding);
+        assert_eq!(actor.lifecycle(), crate::ActorLifecycle::Open);
+        assert!(!manager.is_live(id));
+        {
+            let graph = manager.lock_graph();
+            assert_eq!(graph.revision, revision);
+            assert_eq!(graph.next_reservation, next_reservation);
+            assert_eq!(graph.nodes.len(), nodes.len());
+            for (id, before) in &nodes {
+                let node = &graph.nodes[id];
+                assert_eq!(
+                    (
+                        node.lifecycle,
+                        node.residency,
+                        node.reservation,
+                        node.reservation_pending,
+                        node.detach_pending,
+                    ),
+                    *before
+                );
+            }
+            let node = &graph.nodes[&id];
+            assert!(node.actor.as_ref().unwrap().same_actor(&actor));
+            assert!(node.task.is_some());
+            assert!(node.activation_finishing);
+        }
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        release.send(()).unwrap();
+        let agent = activation.await.unwrap();
+        assert!(agent.actor().unwrap().same_actor(&actor));
+        assert_eq!(manager.incarnation(id).unwrap(), binding);
+        agent.validate_live().unwrap();
+        assert_checkpoint(&journal, &checkpoint);
+        close().unwrap();
+        for record in &records[..2] {
+            assert_eq!(
+                journal.agent(record.id).unwrap().lifecycle,
+                StoredAgentLifecycle::Closed
+            );
+        }
+        assert_eq!(actor.lifecycle(), crate::ActorLifecycle::Closed);
+        assert!(!manager.is_live(id));
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn finish_with_closed_actor_rejects_activation_without_checkpoint_changes() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let before = journal.checkpoint_snapshot().unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (entered, entry) = flume::bounded(1);
+        let (release, wait) = flume::bounded(1);
+        let mut first = Box::pin(manager.ensure_resident_with(id, |_| async move {
+            let mut resident = resident();
+            resident.initialize = Some(Box::new(move |input| {
+                let actor = input.actor.clone();
+                Box::pin(input.finish_with(async move {
+                    entered.send(actor.clone()).unwrap();
+                    wait.recv_async().await.unwrap();
+                    actor.close();
+                    Ok(())
+                }))
+            }));
+            Ok(resident)
+        }));
+        assert!(poll_once(first.as_mut()).await.is_none());
+        let actor = entry.recv_async().await.unwrap();
+        let mut sibling = Box::pin(manager.ensure_resident_with(id, |_| async {
+            panic!("closed finish_with actor must not start a replacement factory")
+        }));
+        assert!(poll_once(sibling.as_mut()).await.is_none());
+        drop(first);
+        release.send(()).unwrap();
+        assert!(matches!(sibling.await, Err(ManagerError::Reactivation(_))));
+        assert!(!manager.is_live(id));
+        assert_dormant(&manager, id);
+        assert_ne!(actor.lifecycle(), crate::ActorLifecycle::Open);
+        assert_checkpoint(&journal, &before);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn folded_legacy_identities_are_readable_but_exempt_from_retention_quota() {
+    smol::block_on(async {
+        let mut records = records();
+        records[2].legacy = true;
+        records[2].ancestry_unknown = true;
+        let journal = journal(&records);
+        let journal = rebuild_journal(journal, records[0].id);
+        let quota = 3;
+        let manager = restore(
+            &journal,
+            AgentLimits {
+                max_retained_agents: quota,
+                ..AgentLimits::default()
+            },
+        )
+        .unwrap();
+        let root = manager
+            .ensure_resident_with(records[0].id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let spawn = || {
+            manager.spawn_child_trusted_with_config(
+                &root,
+                config(),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<_, String>(Box::new(MockBackend::STRICT) as Box<dyn ActorBackend>),
+            )
+        };
+        let child = spawn().await.unwrap();
+        assert!(manager.lookup(records[2].id).is_ok());
+        assert_eq!(
+            manager.node(records[2].id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+        assert_eq!(
+            spawn().await.unwrap_err(),
+            ManagerError::RetentionLimit { max: quota }
+        );
+        child.close_subtree().unwrap();
+        assert_eq!(
+            spawn().await.unwrap_err(),
+            ManagerError::RetentionLimit { max: quota }
+        );
+        manager.retire_trusted(&child).await.unwrap();
+        let replacement = spawn().await.unwrap();
+        assert_ne!(replacement.id(), child.id());
+        assert_eq!(
+            journal.agent(child.id()).unwrap().lifecycle,
+            StoredAgentLifecycle::Retired
+        );
+        assert!(journal.agent(records[2].id).unwrap().legacy);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn retirement_preserves_identity_and_releases_retention_capacity() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[1].id;
+        let journal = journal(&records);
+        let retention_limit = RETAINED_AGENTS - 1;
+        let manager = restore(
+            &journal,
+            AgentLimits {
+                max_retained_agents: retention_limit,
+                ..AgentLimits::default()
+            },
+        )
+        .unwrap();
+        let root = manager
+            .ensure_resident_with(records[0].id, |_| async { Ok(resident()) })
+            .await
+            .unwrap();
+        let before = journal.checkpoint_snapshot().unwrap();
+        let error = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| -> Result<Box<dyn ActorBackend>, String> {
+                    panic!("retention failure must precede backend construction")
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ManagerError::RetentionLimit {
+                max: retention_limit
+            }
+        );
+        assert_checkpoint(&journal, &before);
+        assert_eq!(
+            manager.retire_trusted(&root).await,
+            Err(ManagerError::NotLeaf(root.id()))
+        );
+        let turn = TurnId::generate();
+        let actor = root.actor().unwrap();
+        {
+            let mut state = actor.inner.state.lock().unwrap();
+            state.status = crate::ActorStatus::Running(turn);
+            state.active = Some(ActiveCancel::new(None).0);
+        }
+        let (_cancel, token) = ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn, &token)
+                .await
+                .unwrap();
+        drop(guard);
+        {
+            let mut state = actor.inner.state.lock().unwrap();
+            state.status = crate::ActorStatus::Idle;
+            state.active = None;
+        }
+        assert_eq!(
+            manager.retire(&current, id).await,
+            Err(ManagerError::InactiveTurn {
+                agent_id: root.id(),
+                turn_id: turn
+            })
+        );
+        assert_checkpoint(&journal, &before);
+        let child = manager.lookup(id).unwrap();
+        manager.retire_trusted(&child).await.unwrap();
+        let retired = journal.agent(id).unwrap();
+        assert_eq!(retired.lifecycle, StoredAgentLifecycle::Retired);
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Retired
+        );
+        let before = journal.checkpoint_snapshot().unwrap();
+        manager.retire_trusted(&child).await.unwrap();
+        assert_eq!(
+            manager
+                .ensure_resident_with(id, |_| async {
+                    panic!("retired identity must not invoke a factory")
+                })
+                .await
+                .unwrap_err(),
+            ManagerError::Retired(id)
+        );
+        assert_checkpoint(&journal, &before);
+        let replacement = manager
+            .spawn_child_trusted_with_config(
+                &root,
+                config(),
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                |_| Ok::<Box<dyn ActorBackend>, String>(Box::new(MockBackend::STRICT)),
+            )
+            .await
+            .unwrap();
+        assert_ne!(replacement.id(), id);
+        assert_eq!(manager.list().len(), RETAINED_AGENTS + 1);
+        assert_eq!(journal.agent(id).unwrap(), retired);
+        assert_history(
+            &journal.checkpoint_snapshot().unwrap().histories[&id],
+            &before.histories[&id],
+        );
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+fn continuation_backend() -> MockBackend {
+    MockBackend::STRICT
+        .with_noop_controls()
+        .with_turn(|history, context, input, _| {
+            Box::pin(async move {
+                assert!(input.message.is_empty());
+                assert!(input.images.is_empty());
+                assert!(input.preamble.is_empty());
+                assert_eq!(
+                    history.snapshot().messages.as_slice(),
+                    &[Message::user(HISTORY_TEXT.into())]
+                );
+                assert_eq!(context.provenance.origin, crate::actor::TurnOrigin::User);
+                BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    TokenUsage::default(),
+                    0,
+                    crate::DoneReason::EndTurn,
+                ))
+            })
+        })
+}
+
+#[test]
+fn restored_held_input_waits_for_user_submit() {
+    smol::block_on(async {
+        let records = records();
+        let id = records[0].id;
+        let journal = journal(&records);
+        let turn = TurnId::generate();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Admitted {
+                        turn,
+                        origin: StoredTurnOrigin::User,
+                    },
+                    StateChange::InputHold { held: true },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(id),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert!(manager.pending_continuation_agents().unwrap().is_empty());
+        manager
+            .ensure_resident_with(id, |_| async {
+                Ok(ResidentAgent {
+                    backend: Box::new(continuation_backend()),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        let actor = manager.actor(id).unwrap();
+        assert!(actor.input_held());
+        assert!(actor.runtime_barrier().await.unwrap().is_quiescent());
+        assert_eq!(actor.snapshot().queued, 1);
+        let held = actor.turn_ticket(turn).unwrap();
+        let next = actor
+            .admit_turn_with_options(
+                AgentInput::new(String::new(), Vec::new()),
+                None,
+                String::new(),
+                TurnAdmissionOptions {
+                    provenance: TurnProvenance {
+                        origin: TurnOrigin::User,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            held.wait().await,
+            crate::TurnOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            next.wait().await,
+            crate::TurnOutcome::Completed { .. }
+        ));
+        assert!(!journal.snapshot().fold().unwrap().scopes[&Some(id)].input_held);
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[cfg(unix)]
+#[test_case(false, SubmitWhen::Join; "root")]
+#[test_case(true, SubmitWhen::Queue; "child")]
+fn shell_preamble_survives_reopen_and_is_consumed_once(child: bool, when: SubmitWhen) {
+    const COMMAND: &str = "cat shell-fixture";
+    const OUTPUT: &str = "agent working directory";
+    const PREAMBLE: &str = "I ran: $ cat shell-fixture\n\nOutput:\nagent working directory";
+    const OBSERVATION: &str = "existing preamble";
+
+    smol::block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        write(directory.path().join("shell-fixture"), OUTPUT).unwrap();
+        let records = records();
+        let target = records[usize::from(child)].id;
+        let other = records[usize::from(!child)].id;
+        let fixture = journal(&records);
+        let mut stored = StoredSession::new(MODEL, ".");
+        stored.bind_root_id(records[0].id).unwrap();
+        fixture
+            .checkpoint_snapshot()
+            .unwrap()
+            .apply_to(&mut stored)
+            .unwrap();
+        let reopen = || {
+            let journal = Arc::new(SessionJournal::from_session(&stored).unwrap());
+            journal
+                .bind_writer(SessionWriter::open_session(directory.path(), &stored).unwrap())
+                .unwrap();
+            let manager = restore(&journal, AgentLimits::default()).unwrap();
+            (journal, manager)
+        };
+        let (journal, manager) = reopen();
+        let agent = manager
+            .ensure_resident_with(target, |_| async {
+                Ok(ResidentAgent {
+                    config: config()
+                        .with_context(AgentContextSnapshot::new(directory.path().into())),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        for visible in [false, true] {
+            let result = agent
+                .run_shell(
+                    COMMAND,
+                    visible,
+                    &AgentConfig::default(),
+                    &CancelToken::none(),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+            assert_eq!(result.output, OUTPUT);
+        }
+        let held = TurnId::generate();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Admitted {
+                        turn: held,
+                        origin: StoredTurnOrigin::User,
+                    },
+                    StateChange::InputHold { held: true },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(target),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        journal.flush().await.unwrap();
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        drop(agent);
+        drop(manager);
+        drop(journal);
+
+        let stored = StoredSession::load_from(stored.id, directory.path()).unwrap();
+        let journal = Arc::new(SessionJournal::from_session(&stored).unwrap());
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let (tx, rx) = flume::unbounded();
+        for id in [target, other] {
+            let tx = tx.clone();
+            manager
+                .ensure_resident_with(id, |_| async {
+                    let backend = MockBackend::STRICT.with_noop_controls().with_turn(
+                        move |_, context, input, _| {
+                            tx.send((context.agent_id, input.preamble)).unwrap();
+                            Box::pin(async move {
+                                BackendResult::EnteredRun(crate::TurnOutcome::completed(
+                                    context.agent_id,
+                                    context.turn_id.unwrap(),
+                                    TokenUsage::default(),
+                                    0,
+                                    crate::DoneReason::EndTurn,
+                                ))
+                            })
+                        },
+                    );
+                    Ok(ResidentAgent {
+                        backend: Box::new(backend),
+                        ..resident()
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        let agent = manager.lookup(target).unwrap();
+        let submit = |id, input| {
+            manager.lookup(id).unwrap().submit(
+                input,
+                SubmitOptions {
+                    when,
+                    admission: TurnAdmissionOptions {
+                        provenance: TurnProvenance {
+                            origin: TurnOrigin::User,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let input = || AgentInput::new(OBSERVATION.into(), Vec::new());
+        assert!(agent.input_held());
+        submit(other, input()).unwrap().0.wait().await;
+        let mut rejected = input();
+        rejected.message = "x".repeat(MAX_PENDING_INSTRUCTION_BYTES + 1);
+        assert!(matches!(
+            submit(target, rejected),
+            Err(SubmitError::Admission(ActorError::InstructionOverflow))
+        ));
+        assert!(agent.input_held());
+        let mut next = input();
+        next.preamble.push(Message::observation(OBSERVATION.into()));
+        submit(target, next).unwrap().0.wait().await;
+        submit(target, input()).unwrap().0.wait().await;
+        for (id, expected) in [
+            (other, &[][..]),
+            (target, &[][..]),
+            (target, &[PREAMBLE, OBSERVATION][..]),
+            (target, &[][..]),
+        ] {
+            let (agent_id, preamble) = rx.try_recv().unwrap();
+            assert_eq!(agent_id, id);
+            assert_eq!(
+                preamble
+                    .iter()
+                    .filter_map(Message::user_text)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let view = journal.snapshot().fold().unwrap();
+        assert!(view.scopes[&Some(target)].preambles.is_empty());
+        assert!(!view.scopes[&Some(target)].input_held);
+        manager.shutdown(SHUTDOWN_TIMEOUT).await;
+    });
+}
+
+#[test_case(false; "root")]
+#[test_case(true; "child")]
+fn restored_admission_continues_original_turn_without_duplicate_input(child: bool) {
+    smol::block_on(async {
+        let records = records();
+        let id = records[usize::from(child)].id;
+        let journal = journal(&records);
+        let turns = [TurnId::generate(), TurnId::generate()];
+        journal
+            .commit(JournalCommit {
+                changes: turns
+                    .iter()
+                    .map(|turn| JournalChange {
+                        agent: Some(id),
+                        generation: 0,
+                        change: StateChange::Admitted {
+                            turn: *turn,
+                            origin: StoredTurnOrigin::User,
+                        },
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        assert_eq!(manager.pending_continuation_count().unwrap(), turns.len());
+        assert_eq!(manager.pending_continuation_agents().unwrap(), vec![id]);
+        let (release, ready) = flume::bounded(1);
+        manager
+            .ensure_resident_with(id, |_| async {
+                Ok(ResidentAgent {
+                    start: Some(ready),
+                    backend: Box::new(continuation_backend()),
+                    initialize: Some(Box::new(|initialization| {
+                        Box::pin(async move {
+                            initialization
+                                .actor
+                                .configure_restored_parent_delivery(false)
+                                .map_err(|error| {
+                                    ReactivationError::Initialization(error.to_string())
+                                })
+                        })
+                    })),
+                    ..resident()
+                })
+            })
+            .await
+            .unwrap();
+        let actor = manager.actor(id).unwrap();
+        let tickets: Vec<_> = turns
+            .iter()
+            .map(|turn| actor.turn_ticket(*turn).unwrap())
+            .collect();
+        release.send(()).unwrap();
+        for ticket in tickets {
+            let outcome = ticket.wait().await;
+            assert!(matches!(outcome, crate::TurnOutcome::Completed { .. }));
+        }
+        assert_eq!(manager.pending_continuation_count().unwrap(), 0);
+        assert_eq!(actor.snapshot().queued, 0);
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test_case(false; "activated")]
+#[test_case(true; "activation_failed")]
+fn restored_exact_and_latest_waits_pin_the_admission_before_activation(fail: bool) {
+    smol::block_on(async {
+        let records = records();
+        let child = records[1].id;
+        let journal = journal(&records);
+        let previous = TurnId::generate();
+        let admission = TurnId::generate();
+        let result = TurnResult {
+            outcome: crate::TurnOutcome::completed(
+                child,
+                previous,
+                TokenUsage::default(),
+                0,
+                crate::DoneReason::EndTurn,
+            ),
+            text: String::new(),
+            output: Vec::new(),
+            provenance: TurnProvenance::default(),
+            duration_ms: 0,
+        }
+        .to_stored(journal.snapshot().epoch, None)
+        .unwrap();
+        journal
+            .commit(JournalCommit {
+                changes: [
+                    StateChange::Turn {
+                        turn: previous,
+                        result,
+                    },
+                    StateChange::Admitted {
+                        turn: admission,
+                        origin: StoredTurnOrigin::User,
+                    },
+                ]
+                .into_iter()
+                .map(|change| JournalChange {
+                    agent: Some(child),
+                    generation: 0,
+                    change,
+                })
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = restore(&journal, AgentLimits::default()).unwrap();
+        let target = manager.reference(child);
+        let resolve = |_: &StoredOffloadRef| panic!("test results are inline");
+        let exact = manager
+            .observe_retained_turn(&target, Some(admission), resolve)
+            .unwrap();
+        let latest = manager
+            .observe_retained_turn(&target, None, resolve)
+            .unwrap();
+        let [
+            Some(RetainedTurn::Restoring(exact)),
+            Some(RetainedTurn::Restoring(latest)),
+        ] = [exact, latest]
+        else {
+            panic!("both lookups must expose the restored admission before the factory starts");
+        };
+        assert_eq!([exact, latest], [admission; 2]);
+
+        let (release, ready) = flume::bounded(1);
+        let mut activation = Box::pin(manager.ensure_resident_with(child, |_| async {
+            ready.recv_async().await.unwrap();
+            if fail {
+                return Err(ReactivationError::Initialization(
+                    INITIALIZATION_ERROR.into(),
+                ));
+            }
+            Ok(ResidentAgent {
+                backend: Box::new(continuation_backend()),
+                ..resident()
+            })
+        }));
+        assert!(poll_once(activation.as_mut()).await.is_none());
+        assert_eq!(
+            manager.node(child).unwrap().residency,
+            AgentResidency::Activating
+        );
+        let wait = |turn| manager.wait_for_restored_turn(&target, turn, resolve);
+        let mut exact_wait = Box::pin(wait(exact));
+        let mut latest_wait = Box::pin(wait(latest));
+        assert!(poll_once(exact_wait.as_mut()).await.is_none());
+        assert!(poll_once(latest_wait.as_mut()).await.is_none());
+
+        release.send(()).unwrap();
+        let activated = activation.await;
+        if fail {
+            assert!(activated.is_err());
+            assert!(poll_once(exact_wait.as_mut()).await.is_none());
+            assert!(poll_once(latest_wait.as_mut()).await.is_none());
+            manager
+                .fail_restored_turns(child, INITIALIZATION_ERROR.into())
+                .await
+                .unwrap();
+        } else {
+            activated.unwrap();
+        }
+        let exact = exact_wait.await.unwrap().wait().await;
+        assert_eq!(latest_wait.await.unwrap().wait().await, exact);
+        assert_eq!(exact.turn_id(), admission);
+        if fail {
+            assert!(matches!(exact, crate::TurnOutcome::Failed { .. }));
+        } else {
+            assert!(matches!(exact, crate::TurnOutcome::Completed { .. }));
+        }
+        assert!(
+            manager
+                .shutdown(SHUTDOWN_TIMEOUT)
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn root_continuation_suppression_preserves_children_and_survives_restart() {
+    let records = records();
+    let journal = journal(&records);
+    let root = records[0].id;
+    let child = records[1].id;
+    journal
+        .commit(JournalCommit {
+            changes: [root, child]
+                .into_iter()
+                .map(|agent| JournalChange {
+                    agent: Some(agent),
+                    generation: 0,
+                    change: StateChange::Admitted {
+                        turn: TurnId::generate(),
+                        origin: StoredTurnOrigin::User,
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.suppress_root_continuations().unwrap(), 1);
+    assert_eq!(manager.suppress_root_continuations().unwrap(), 0);
+    let manager = restore(&journal, AgentLimits::default()).unwrap();
+    assert_eq!(manager.pending_continuation_count().unwrap(), 1);
+    assert_eq!(manager.pending_continuation_agents().unwrap(), vec![child]);
+    assert!(
+        journal.snapshot().fold().unwrap().scopes[&Some(root)]
+            .admitted
+            .is_empty()
+    );
+}

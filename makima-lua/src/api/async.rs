@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,12 +63,7 @@ lua_class! {
 /// Throws if you already released this permit.
 #[lua_fn]
 fn release(_lua: &Lua, this: &LuaPermit) -> LuaResult<()> {
-    let released = this
-        .guard
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .is_some();
+    let released = this.guard.lock_unpoisoned().take().is_some();
     if !released {
         return Err(mlua::Error::runtime(PERMIT_RELEASED_ERR));
     }

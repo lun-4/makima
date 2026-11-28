@@ -184,7 +184,6 @@ pub enum KeybindContext {
     Picker,
     FormInput,
     TaskPicker,
-    RewindPicker,
     ThemePicker,
     ModelPicker,
     QueueFocus,
@@ -202,7 +201,6 @@ impl KeybindContext {
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
             Self::TaskPicker => "Task Picker",
-            Self::RewindPicker => "Rewind Picker",
             Self::ThemePicker => "Theme Picker",
             Self::ModelPicker => "Model Picker",
             Self::QueueFocus => "Queue",
@@ -215,7 +213,6 @@ impl KeybindContext {
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
             Self::TaskPicker
-            | Self::RewindPicker
             | Self::ThemePicker
             | Self::ModelPicker
             | Self::QueueFocus
@@ -488,12 +485,6 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("Esc Esc"),
-        description: "Rewind",
-        context: KeybindContext::Editing,
-        platform: Platform::All,
-    },
-    Keybind {
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
         context: KeybindContext::Editing,
@@ -513,7 +504,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
-        description: "Cancel agent",
+        description: "Cancel active work on the viewed agent or open its rewind picker if it is idle",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

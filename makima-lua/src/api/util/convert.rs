@@ -1,5 +1,9 @@
+use makima_storage::session_state::{
+    MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH, StateFoldError, validate_plugin_value,
+};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
+use std::{collections::HashSet, ffi::c_void};
 
 use crate::api::util::memory::unlimited;
 
@@ -11,6 +15,227 @@ pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error
 /// Past this the table is a sparse map, not an array, and the object encoding
 /// keeps every key while allocating per entry.
 const MAX_ARRAY_HOLES: usize = 4096;
+
+pub(crate) fn state_value_from_lua(lua: &Lua, value: &Value) -> LuaResult<JsonValue> {
+    let mut path = HashSet::new();
+    let mut remaining = MAX_PLUGIN_VALUE_BYTES;
+    let value = state_value_from_lua_inner(
+        lua,
+        value,
+        &lua.array_metatable(),
+        &mut path,
+        0,
+        &mut remaining,
+    )?;
+    validate_state_value(&value)?;
+    Ok(value)
+}
+
+fn state_value_from_lua_inner(
+    lua: &Lua,
+    value: &Value,
+    array_metatable: &Table,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+    remaining: &mut usize,
+) -> LuaResult<JsonValue> {
+    if depth > MAX_PLUGIN_VALUE_DEPTH {
+        return Err(mlua::Error::runtime(
+            "state value exceeds maximum nesting depth",
+        ));
+    }
+
+    let cost = match value {
+        Value::String(value) => value.as_bytes().len().max(1),
+        _ => 1,
+    };
+    *remaining = remaining
+        .checked_sub(cost)
+        .ok_or_else(|| mlua::Error::runtime("state value exceeds maximum encoded size"))?;
+    match value {
+        Value::Nil => Ok(JsonValue::Null),
+        Value::LightUserData(value) if value.0.is_null() => Ok(JsonValue::Null),
+        Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
+        Value::Integer(value) => {
+            if (*value as f64) as i128 != i128::from(*value) {
+                return Err(mlua::Error::runtime(
+                    "state value integer cannot be represented losslessly in Lua",
+                ));
+            }
+            Ok(JsonValue::Number((*value).into()))
+        }
+        Value::Number(value) => serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| mlua::Error::runtime("state value numbers must be finite")),
+        Value::String(value) => Ok(JsonValue::String(value.to_str()?.to_owned())),
+        Value::Table(table) => {
+            let pointer = table.to_pointer();
+            if !path.insert(pointer) {
+                return Err(mlua::Error::runtime("state value contains a table cycle"));
+            }
+            let result =
+                state_value_table_to_json(lua, table, array_metatable, path, depth, remaining);
+            path.remove(&pointer);
+            result
+        }
+        _ => Err(mlua::Error::runtime(format!(
+            "state value does not support Lua {} values",
+            value.type_name()
+        ))),
+    }
+}
+
+fn state_value_table_to_json(
+    lua: &Lua,
+    table: &Table,
+    array_metatable: &Table,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+    remaining: &mut usize,
+) -> LuaResult<JsonValue> {
+    let tagged_array = table.metatable().as_ref() == Some(array_metatable);
+    let mut integer_entries = Vec::new();
+    let mut object_entries = Vec::new();
+    let mut saw_integer = false;
+    let mut saw_string = false;
+    let mut max_index = 0usize;
+
+    for pair in table.pairs::<Value, Value>() {
+        if integer_entries.len() + object_entries.len() >= MAX_PLUGIN_VALUE_BYTES {
+            return Err(mlua::Error::runtime(
+                "state value exceeds maximum encoded size",
+            ));
+        }
+        let (key, value) = pair?;
+        match key {
+            Value::Integer(index) if index > 0 => {
+                if saw_string {
+                    return Err(mlua::Error::runtime(
+                        "state value tables cannot mix array and object keys",
+                    ));
+                }
+                saw_integer = true;
+                let index = usize::try_from(index)
+                    .map_err(|_| mlua::Error::runtime("state value array index is too large"))?;
+                max_index = max_index.max(index);
+                integer_entries.push((index, value));
+            }
+            Value::String(key) => {
+                if saw_integer {
+                    return Err(mlua::Error::runtime(
+                        "state value tables cannot mix array and object keys",
+                    ));
+                }
+                saw_string = true;
+                *remaining = remaining.checked_sub(key.as_bytes().len()).ok_or_else(|| {
+                    mlua::Error::runtime("state value exceeds maximum encoded size")
+                })?;
+                object_entries.push((key.to_str()?.to_owned(), value));
+            }
+            _ => {
+                return Err(mlua::Error::runtime(
+                    "state value table keys must be strings or positive integers",
+                ));
+            }
+        }
+    }
+
+    if tagged_array || saw_integer {
+        if saw_string || integer_entries.len() != max_index {
+            return Err(mlua::Error::runtime(
+                "state value arrays must have dense positive integer keys",
+            ));
+        }
+        let mut items = vec![JsonValue::Null; integer_entries.len()];
+        for (index, value) in integer_entries {
+            items[index - 1] = state_value_from_lua_inner(
+                lua,
+                &value,
+                array_metatable,
+                path,
+                depth + 1,
+                remaining,
+            )?;
+        }
+        return Ok(JsonValue::Array(items));
+    }
+
+    let mut object = serde_json::Map::new();
+    for (key, value) in object_entries {
+        object.insert(
+            key,
+            state_value_from_lua_inner(lua, &value, array_metatable, path, depth + 1, remaining)?,
+        );
+    }
+    Ok(JsonValue::Object(object))
+}
+
+pub(crate) fn state_value_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+    validate_state_value(value)?;
+    state_value_to_lua_inner(lua, value, false)
+}
+
+fn state_value_to_lua_inner(lua: &Lua, value: &JsonValue, in_table: bool) -> LuaResult<Value> {
+    Ok(match value {
+        JsonValue::Null => Value::NULL,
+        JsonValue::Bool(value) => Value::Boolean(*value),
+        JsonValue::Number(json_number) => {
+            if let Some(integer) = json_number.as_i64() {
+                if (integer as f64) as i128 != i128::from(integer) {
+                    return Err(mlua::Error::runtime(
+                        "state value integer cannot be represented losslessly in Lua",
+                    ));
+                }
+                Value::Integer(integer)
+            } else {
+                let number = json_number.as_f64().ok_or_else(|| {
+                    mlua::Error::runtime("state value number cannot be represented in Lua")
+                })?;
+                let roundtrip = serde_json::Number::from_f64(number).ok_or_else(|| {
+                    mlua::Error::runtime("state value number cannot be represented in Lua")
+                })?;
+                // Luau returns table numbers that fit in i64 as Lua integers.
+                let becomes_integer = in_table
+                    && ((number as i64) as f64).to_bits() == number.to_bits()
+                    && number < -(i64::MIN as f64);
+                if roundtrip != *json_number || becomes_integer {
+                    return Err(mlua::Error::runtime(
+                        "state value number cannot be represented losslessly in Lua",
+                    ));
+                }
+                Value::Number(number)
+            }
+        }
+        JsonValue::String(value) => Value::String(lua.create_string(value)?),
+        JsonValue::Array(items) => {
+            let table = lua.create_table_with_capacity(items.len(), 0)?;
+            for (index, item) in items.iter().enumerate() {
+                table.set(index + 1, state_value_to_lua_inner(lua, item, true)?)?;
+            }
+            table.set_metatable(Some(lua.array_metatable()))?;
+            Value::Table(table)
+        }
+        JsonValue::Object(items) => {
+            let table = lua.create_table_with_capacity(0, items.len())?;
+            for (key, item) in items {
+                table.set(key.as_str(), state_value_to_lua_inner(lua, item, true)?)?;
+            }
+            Value::Table(table)
+        }
+    })
+}
+
+fn validate_state_value(value: &JsonValue) -> LuaResult<()> {
+    validate_plugin_value(value, 1).map_err(|error| match error {
+        StateFoldError::PluginDepth { .. } => {
+            mlua::Error::runtime("state value exceeds maximum nesting depth")
+        }
+        StateFoldError::PluginSize { .. } => {
+            mlua::Error::runtime("state value exceeds maximum encoded size")
+        }
+        error => mlua::Error::external(error),
+    })
+}
 
 /// mlua reads `bool` by Lua truthiness and never fails, so `get::<bool>`
 /// answers `Ok(false)` for a missing key and quietly kills whatever
@@ -88,7 +313,7 @@ fn build_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
 /// Symmetric counterpart to [`json_to_lua`]. We avoid mlua's `from_value`
 /// for the same `arbitrary_precision` reason documented above.
 pub(crate) fn lua_to_json(lua: &Lua, val: &Value) -> LuaResult<JsonValue> {
-    within_template(lua, val, None)
+    within_template(lua, val, None, &mut HashSet::new(), 0)
 }
 
 /// [`lua_to_json`], guided by the JSON that [`json_to_lua`] built `val` from:
@@ -106,10 +331,21 @@ pub(crate) fn lua_to_json_within(
     val: &Value,
     template: &JsonValue,
 ) -> LuaResult<JsonValue> {
-    within_template(lua, val, Some(template))
+    within_template(lua, val, Some(template), &mut HashSet::new(), 0)
 }
 
-fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaResult<JsonValue> {
+fn within_template(
+    lua: &Lua,
+    val: &Value,
+    template: Option<&JsonValue>,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+) -> LuaResult<JsonValue> {
+    if depth > MAX_PLUGIN_VALUE_DEPTH {
+        return Err(mlua::Error::runtime(
+            "JSON value exceeds maximum nesting depth",
+        ));
+    }
     Ok(match val {
         Value::Nil => JsonValue::Null,
         Value::Boolean(b) => JsonValue::Bool(*b),
@@ -119,91 +355,114 @@ fn within_template(lua: &Lua, val: &Value, template: Option<&JsonValue>) -> LuaR
             .unwrap_or(JsonValue::Null),
         Value::String(s) => JsonValue::String(s.to_str()?.to_owned()),
         Value::Table(tbl) => {
-            // An untagged table serializes as a JSON array only when every key
-            // is a positive integer and they are dense from 1 (count == max),
-            // so no string key silently disappears and sparse tables like
-            // `{ [1] = "a", [3] = "c" }` deterministically become objects
-            // (`lua_rawlen` borders are implementation-defined for those).
-            // The array metatable outranks that, since `json_to_lua` writes it
-            // on every JSON array and a null element leaves an absent key:
-            // density cannot be re-derived, and the gaps are holes to fill with
-            // null. Keys an array cannot express still fall back to the object
-            // encoding, which keeps all of them.
-            let mut has_non_int = false;
-            let mut int_count = 0;
-            let mut max_int = 0;
-            let mut entries = Vec::new();
-            for pair in tbl.pairs::<Value, Value>() {
-                let (k, v) = pair?;
-                match k {
-                    Value::Integer(i) if i > 0 => {
-                        int_count += 1;
-                        max_int = max_int.max(i as usize);
-                    }
-                    _ => has_non_int = true,
-                }
-                entries.push((k, v));
+            let pointer = tbl.to_pointer();
+            if !path.insert(pointer) {
+                return Err(mlua::Error::runtime("JSON value contains a table cycle"));
             }
-
-            let tagged = tbl.metatable().as_ref() == Some(&lua.array_metatable());
-            // Slots the entries do not pay for. The array encoding has to
-            // materialize every one of them, and the largest key alone decides
-            // how many, so this is the only thing standing between
-            // `decoded[os.time()] = 1` and an allocation the size of a clock.
-            let holes = max_int - int_count;
-            let is_array = !has_non_int
-                && if tagged {
-                    holes <= MAX_ARRAY_HOLES
-                } else {
-                    int_count > 0 && holes == 0
-                };
-            if is_array {
-                let template = template.and_then(JsonValue::as_array);
-                // A trailing null never moved `max_int`, so only the template
-                // knows the array ran on past the last key the Lua side kept.
-                // A trailing non-null there was a real value the layer dropped.
-                let mut len = max_int;
-                while template.is_some_and(|t| t.get(len).is_some_and(JsonValue::is_null)) {
-                    len += 1;
-                }
-                let mut arr = vec![JsonValue::Null; len];
-                for (k, v) in entries {
-                    let Value::Integer(i) = k else { unreachable!() };
-                    let idx = i as usize - 1;
-                    arr[idx] = within_template(lua, &v, template.and_then(|t| t.get(idx)))?;
-                }
-                return Ok(JsonValue::Array(arr));
-            }
-
-            let template = template.and_then(JsonValue::as_object);
-            let mut map = serde_json::Map::new();
-            for (k, v) in entries {
-                let key = match k {
-                    Value::String(s) => s.to_str()?.to_owned(),
-                    Value::Integer(i) => i.to_string(),
-                    Value::Number(n) => n.to_string(),
-                    Value::Boolean(b) => b.to_string(),
-                    _ => continue,
-                };
-                let child = template.and_then(|t| t.get(&key));
-                map.insert(key, within_template(lua, &v, child)?);
-            }
-            for (key, _) in template.into_iter().flatten().filter(|(_, v)| v.is_null()) {
-                map.entry(key.as_str()).or_insert(JsonValue::Null);
-            }
-            JsonValue::Object(map)
+            let result = table_within_template(lua, tbl, template, path, depth);
+            path.remove(&pointer);
+            result?
         }
         _ => JsonValue::Null,
     })
 }
 
+fn table_within_template(
+    lua: &Lua,
+    tbl: &Table,
+    template: Option<&JsonValue>,
+    path: &mut HashSet<*const c_void>,
+    depth: usize,
+) -> LuaResult<JsonValue> {
+    // An untagged table serializes as a JSON array only when every key
+    // is a positive integer and they are dense from 1 (count == max),
+    // so no string key silently disappears and sparse tables like
+    // `{ [1] = "a", [3] = "c" }` deterministically become objects
+    // (`lua_rawlen` borders are implementation-defined for those).
+    // The array metatable outranks that, since `json_to_lua` writes it
+    // on every JSON array and a null element leaves an absent key:
+    // density cannot be re-derived, and the gaps are holes to fill with
+    // null. Keys an array cannot express still fall back to the object
+    // encoding, which keeps all of them.
+    let mut has_non_int = false;
+    let mut int_count = 0;
+    let mut max_int = 0;
+    let mut entries = Vec::new();
+    for pair in tbl.pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        match k {
+            Value::Integer(i) if i > 0 => {
+                int_count += 1;
+                max_int = max_int.max(i as usize);
+            }
+            _ => has_non_int = true,
+        }
+        entries.push((k, v));
+    }
+
+    let tagged = tbl.metatable().as_ref() == Some(&lua.array_metatable());
+    // Slots the entries do not pay for. The array encoding has to
+    // materialize every one of them, and the largest key alone decides
+    // how many, so this is the only thing standing between
+    // `decoded[os.time()] = 1` and an allocation the size of a clock.
+    let holes = max_int - int_count;
+    let is_array = !has_non_int
+        && if tagged {
+            holes <= MAX_ARRAY_HOLES
+        } else {
+            int_count > 0 && holes == 0
+        };
+    if is_array {
+        let template = template.and_then(JsonValue::as_array);
+        // A trailing null never moved `max_int`, so only the template
+        // knows the array ran on past the last key the Lua side kept.
+        // A trailing non-null there was a real value the layer dropped.
+        let mut len = max_int;
+        while template.is_some_and(|t| t.get(len).is_some_and(JsonValue::is_null)) {
+            len += 1;
+        }
+        let mut arr = vec![JsonValue::Null; len];
+        for (k, v) in entries {
+            let Value::Integer(i) = k else { unreachable!() };
+            let idx = i as usize - 1;
+            arr[idx] =
+                within_template(lua, &v, template.and_then(|t| t.get(idx)), path, depth + 1)?;
+        }
+        return Ok(JsonValue::Array(arr));
+    }
+
+    let template = template.and_then(JsonValue::as_object);
+    let mut map = serde_json::Map::new();
+    for (k, v) in entries {
+        let key = match k {
+            Value::String(s) => s.to_str()?.to_owned(),
+            Value::Integer(i) => i.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Boolean(b) => b.to_string(),
+            _ => continue,
+        };
+        let child = template.and_then(|t| t.get(&key));
+        map.insert(key, within_template(lua, &v, child, path, depth + 1)?);
+    }
+    for (key, _) in template.into_iter().flatten().filter(|(_, v)| v.is_null()) {
+        map.entry(key.as_str()).or_insert(JsonValue::Null);
+    }
+    Ok(JsonValue::Object(map))
+}
+
 #[cfg(test)]
 mod tests {
-    use mlua::{Lua, Value};
+    use mlua::{Lua, LuaSerdeExt, Value};
     use serde_json::Value as JsonValue;
     use test_case::test_case;
 
-    use super::{json_to_lua, lua_to_json, opt_bool};
+    use super::{
+        json_to_lua, lua_to_json, lua_to_json_within, opt_bool, state_value_from_lua,
+        state_value_to_lua,
+    };
+    use makima_storage::session_state::{MAX_PLUGIN_VALUE_BYTES, MAX_PLUGIN_VALUE_DEPTH};
+    use mlua::UserData;
+    use std::ffi::c_void;
 
     const FLAG_KEY: &str = "flag";
 
@@ -306,6 +565,54 @@ mod tests {
     }
 
     #[test]
+    fn lua_to_json_accepts_shared_tables_on_separate_paths() {
+        let lua = Lua::new();
+        let value = lua
+            .load("local child = {1}; return {left = child, right = child}")
+            .eval::<Value>()
+            .unwrap();
+        let expected = serde_json::json!({"left": [1], "right": [1]});
+        assert_eq!(lua_to_json(&lua, &value).unwrap(), expected);
+        assert_eq!(
+            lua_to_json_within(&lua, &value, &expected).unwrap(),
+            expected
+        );
+    }
+
+    #[test_case("local t = {}; t.self = t; return t"; "self_cycle")]
+    #[test_case("local t = {}; t[1] = { parent = t }; return t"; "array_object_cycle")]
+    fn lua_to_json_rejects_cycles(source: &str) {
+        let lua = Lua::new();
+        let value = lua.load(source).eval::<Value>().unwrap();
+        for result in [
+            lua_to_json(&lua, &value),
+            lua_to_json_within(&lua, &value, &JsonValue::Null),
+        ] {
+            assert!(result.unwrap_err().to_string().contains("table cycle"));
+        }
+    }
+
+    #[test_case(MAX_PLUGIN_VALUE_DEPTH, true; "at_limit")]
+    #[test_case(MAX_PLUGIN_VALUE_DEPTH + 1, false; "past_limit")]
+    fn lua_to_json_bounds_nesting(depth: usize, accepted: bool) {
+        let lua = Lua::new();
+        let value = lua
+            .load("local t = 1; for _ = 1, ... do t = { t } end; return t")
+            .call::<Value>(depth)
+            .unwrap();
+        for result in [
+            lua_to_json(&lua, &value),
+            lua_to_json_within(&lua, &value, &JsonValue::Null),
+        ] {
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("nesting depth"));
+            }
+        }
+    }
+
+    #[test]
     fn lua_to_json_sparse_table_becomes_object() {
         let lua = Lua::new();
         let tbl = lua.create_table().unwrap();
@@ -381,7 +688,214 @@ mod tests {
         let original: JsonValue = serde_json::from_str(ROUNDTRIP_CASES[idx]).unwrap();
         let lua = Lua::new();
         let lua_val = json_to_lua(&lua, &original).unwrap();
+        if original.is_null() {
+            assert_eq!(lua_val, Value::Nil);
+        }
         let back = lua_to_json(&lua, &lua_val).unwrap();
         assert_eq!(back, original);
+
+        let lua_value = state_value_to_lua(&lua, &original).unwrap();
+        if original.is_null() {
+            assert_eq!(lua_value, Value::NULL);
+        }
+        let back = state_value_from_lua(&lua, &lua_value).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test_case("[null,1,null]" ; "array_with_nulls")]
+    #[test_case(r#"{"a":null,"b":[true,"x"]}"# ; "nested_object_with_nulls")]
+    fn state_value_roundtrip_with_nulls(encoded: &str) {
+        let original: JsonValue = serde_json::from_str(encoded).unwrap();
+        let lua = Lua::new();
+        let lua_value = state_value_to_lua(&lua, &original).unwrap();
+        let back = state_value_from_lua(&lua, &lua_value).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn state_value_rejects_function_and_thread() {
+        let lua = Lua::new();
+        let function = lua.create_function(|_, ()| Ok(())).unwrap();
+        let thread = lua.create_thread(function.clone()).unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Function(function)).is_err());
+        assert!(state_value_from_lua(&lua, &Value::Thread(thread)).is_err());
+    }
+
+    struct TestUserData;
+
+    impl UserData for TestUserData {}
+
+    #[test]
+    fn state_value_rejects_userdata_and_non_null_lightuserdata() {
+        let lua = Lua::new();
+        let userdata = Value::UserData(lua.create_userdata(TestUserData).unwrap());
+        let mut byte = 0;
+        let pointer = std::ptr::addr_of_mut!(byte).cast::<c_void>();
+        let light_userdata = Value::LightUserData(mlua::LightUserData(pointer));
+        assert!(state_value_from_lua(&lua, &userdata).is_err());
+        assert!(state_value_from_lua(&lua, &light_userdata).is_err());
+    }
+
+    #[test_case(f64::NAN ; "nan")]
+    #[test_case(f64::INFINITY ; "positive_infinity")]
+    #[test_case(f64::NEG_INFINITY ; "negative_infinity")]
+    fn state_value_rejects_non_finite_numbers(number: f64) {
+        let lua = Lua::new();
+        assert!(state_value_from_lua(&lua, &Value::Number(number)).is_err());
+    }
+
+    #[test]
+    fn state_value_accepts_explicit_null_and_preserves_shared_tables() {
+        let lua = Lua::new();
+        let shared = lua.create_table().unwrap();
+        shared.set("value", Value::NULL).unwrap();
+        let root = lua.create_table().unwrap();
+        root.set("left", shared.clone()).unwrap();
+        root.set("right", shared).unwrap();
+        assert_eq!(
+            state_value_from_lua(&lua, &Value::Table(root)).unwrap(),
+            serde_json::json!({"left": {"value": null}, "right": {"value": null}})
+        );
+    }
+
+    #[test]
+    fn state_value_rejects_cycles_without_mutating_table() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("self", table.clone()).unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(table.clone())).is_err());
+        assert_eq!(table.get::<Value>("self").unwrap().as_table(), Some(&table));
+    }
+
+    #[test]
+    fn state_value_rejects_mixed_and_invalid_object_keys_without_mutation() {
+        let lua = Lua::new();
+        let mixed = lua.create_table().unwrap();
+        mixed.set(1, "first").unwrap();
+        mixed.set("second", "value").unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(mixed.clone())).is_err());
+        assert_eq!(mixed.get::<String>("second").unwrap(), "value");
+
+        let invalid = lua.create_table().unwrap();
+        invalid.set(false, "value").unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(invalid)).is_err());
+    }
+
+    #[test]
+    fn state_value_rejects_sparse_and_malformed_tagged_arrays() {
+        let lua = Lua::new();
+        let sparse = lua.create_table().unwrap();
+        sparse.set(1, "first").unwrap();
+        sparse.set(3, "third").unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(sparse)).is_err());
+
+        let tagged = lua.create_table().unwrap();
+        tagged.set(1, "first").unwrap();
+        tagged.set("extra", "value").unwrap();
+        tagged.set_metatable(Some(lua.array_metatable())).unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(tagged)).is_err());
+    }
+
+    #[test]
+    fn state_value_at_depth_limit_fits_stored_session_record() {
+        let lua = Lua::new();
+        let mut value = Value::Boolean(false);
+        for _ in 0..MAX_PLUGIN_VALUE_DEPTH {
+            let table = lua.create_table().unwrap();
+            table.set("nested", value).unwrap();
+            value = Value::Table(table);
+        }
+        let state = state_value_from_lua(&lua, &value).unwrap();
+        assert_eq!(
+            state_value_to_lua(&lua, &state)
+                .and_then(|copy| state_value_from_lua(&lua, &copy))
+                .unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn state_value_rejects_excessive_depth() {
+        let lua = Lua::new();
+        let mut value = Value::Boolean(false);
+        for _ in 0..=MAX_PLUGIN_VALUE_DEPTH {
+            let table = lua.create_table().unwrap();
+            table.set("nested", value).unwrap();
+            value = Value::Table(table);
+        }
+        assert!(state_value_from_lua(&lua, &value).is_err());
+    }
+    #[test_case("9007199254740993" ; "integer_rounding")]
+    #[test_case("18446744073709551615" ; "unsigned_rounding")]
+    fn state_value_rejects_lossy_stored_numbers(encoded: &str) {
+        let lua = Lua::new();
+        let value: JsonValue = serde_json::from_str(encoded).unwrap();
+        assert!(state_value_to_lua(&lua, &value).is_err());
+    }
+
+    #[test_case("[1.0]", false; "integral_float_changes_to_integer")]
+    #[test_case("[-0.0,1.5,9223372036854775808.0]", true; "float_kind_preserved")]
+    fn state_value_checks_nested_float_representation(encoded: &str, accepted: bool) {
+        let lua = Lua::new();
+        let value: JsonValue = serde_json::from_str(encoded).unwrap();
+        let converted = state_value_to_lua(&lua, &value);
+        if accepted {
+            let restored = state_value_from_lua(&lua, &converted.unwrap()).unwrap();
+            assert_eq!(restored, value);
+            assert!(restored[0].as_f64().unwrap().is_sign_negative());
+        } else {
+            assert!(converted.is_err());
+        }
+    }
+
+    #[test]
+    fn state_value_preserves_storage_decoded_decimal() {
+        let lua = Lua::new();
+        let stored: JsonValue = serde_json::from_str("1.00000000000000000001").unwrap();
+        assert_eq!(stored, serde_json::json!(1.0));
+        let converted = state_value_to_lua(&lua, &stored).unwrap();
+        assert_eq!(state_value_from_lua(&lua, &converted).unwrap(), stored);
+    }
+
+    #[test]
+    fn storage_decoder_rejects_unrepresentable_exponent_before_state_conversion() {
+        let error = serde_json::from_str::<JsonValue>("1e999").unwrap_err();
+        assert!(error.to_string().starts_with("number out of range"));
+    }
+
+    #[test_case(f64::MIN_POSITIVE ; "smallest_normal")]
+    #[test_case(f64::MAX ; "largest_finite")]
+    #[test_case(f64::from_bits(1) ; "smallest_subnormal")]
+    #[test_case(-0.0 ; "negative_zero")]
+    #[test_case(1.0000000000000002 ; "next_float_after_one")]
+    fn state_value_preserves_stored_float_bits(number: f64) {
+        let lua = Lua::new();
+        let stored = JsonValue::Number(serde_json::Number::from_f64(number).unwrap());
+        let converted = state_value_to_lua(&lua, &stored).unwrap();
+        let restored = state_value_from_lua(&lua, &converted).unwrap();
+        assert_eq!(restored.as_f64().unwrap().to_bits(), number.to_bits());
+    }
+
+    #[test_case(MAX_PLUGIN_VALUE_BYTES - 2, true ; "size_limit")]
+    #[test_case(MAX_PLUGIN_VALUE_BYTES - 1, false ; "over_size_limit")]
+    fn state_value_checks_encoded_size_both_ways(bytes: usize, accepted: bool) {
+        let lua = Lua::new();
+        let text = "x".repeat(bytes);
+        let value = Value::String(lua.create_string(&text).unwrap());
+        assert_eq!(state_value_from_lua(&lua, &value).is_ok(), accepted);
+        assert_eq!(
+            state_value_to_lua(&lua, &JsonValue::String(text)).is_ok(),
+            accepted
+        );
+    }
+
+    #[test]
+    fn state_value_rejects_non_utf8_strings_and_keys() {
+        let lua = Lua::new();
+        let invalid = lua.create_string([0xff]).unwrap();
+        assert!(state_value_from_lua(&lua, &Value::String(invalid.clone())).is_err());
+        let table = lua.create_table().unwrap();
+        table.set(invalid, true).unwrap();
+        assert!(state_value_from_lua(&lua, &Value::Table(table)).is_err());
     }
 }

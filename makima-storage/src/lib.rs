@@ -14,14 +14,21 @@ pub mod model;
 mod offload_cleanup;
 pub mod paths;
 pub mod plans;
+mod resources;
 pub mod session_lock;
+pub mod session_state;
 pub mod sessions;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod theme;
 pub mod trusted_folders;
 pub mod version;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod windows_offload;
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -34,6 +41,7 @@ use tempfile::NamedTempFile;
 
 pub use offload_cleanup::remove_offload_dir_from;
 use paths::state_dir;
+pub use resources::RootResource;
 
 #[cfg(windows)]
 const RENAME_ATTEMPTS: usize = 20;
@@ -43,11 +51,14 @@ pub struct StateDir(PathBuf);
 
 impl StateDir {
     pub fn resolve() -> Result<Self, StorageError> {
-        let dir = state_dir()?;
-        Ok(Self(dir))
+        Ok(Self::from_path(state_dir()?))
     }
 
+    /// Anchored stores walk below this root without following symlinks, so the
+    /// symlinks that already exist on the way to it are resolved once here.
     pub fn from_path(path: PathBuf) -> Self {
+        #[cfg(unix)]
+        let path = paths::canonical_key(&path);
         Self(path)
     }
 
@@ -194,24 +205,21 @@ pub(crate) fn persist(tmp: NamedTempFile, path: &Path) -> Result<(), StorageErro
         let _ = fs::remove_file(&tmp_path);
         StorageError::Io(e)
     })?;
-    sync_parent_dir(path);
+    if let Some(dir) = path.parent() {
+        let _ = sync_directory(dir);
+    }
     Ok(())
 }
 
-/// A rename is durable only once the directory entry reaches disk; without
-/// this a freshly created file can vanish after power loss even though the
-/// write returned Ok. Best effort: not every filesystem accepts a directory
-/// fsync. Windows gets the same from `MOVEFILE_WRITE_THROUGH` in
-/// `retry_rename`.
-pub(crate) fn sync_parent_dir(path: &Path) {
-    #[cfg(unix)]
-    if let Some(dir) = path.parent()
-        && let Ok(f) = fs::File::open(dir)
-    {
-        let _ = f.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+#[cfg(unix)]
+pub fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn sync_directory(_path: &Path) -> io::Result<()> {
+    // Windows does not document FlushFileBuffers for directory handles. Callers still flush the files they write.
+    Ok(())
 }
 
 /// Rename with fibonacci backoff to handle transient `PermissionDenied` from

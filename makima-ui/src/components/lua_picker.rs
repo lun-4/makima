@@ -326,7 +326,6 @@ mod tests {
 
     fn spoke_at(unix_secs: u64) -> ClockSample {
         ClockSample {
-            monotonic: Instant::now(),
             unix: Duration::from_secs(unix_secs),
         }
     }

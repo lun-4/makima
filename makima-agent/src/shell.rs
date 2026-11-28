@@ -4,8 +4,22 @@ use std::env;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+use async_process::{Command as AsyncCommand, Stdio};
+use futures_lite::StreamExt;
+use futures_lite::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use thiserror::Error;
+
+use crate::{ActorError, AgentConfig, AgentRef, CancelToken, ChildGuard, ManagerError};
 
 use makima_config::Shell;
+
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const SHELL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[cfg(windows)]
 const CMD_SCRIPT_FLAG: &str = "/C";
@@ -109,6 +123,183 @@ fn git_bash() -> Option<PathBuf> {
         let path = PathBuf::from(env::var_os(GIT_INSTALL_ROOT)?).join(GIT_BASH);
         path.is_file().then_some(path)
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ShellError {
+    #[error(transparent)]
+    Manager(#[from] ManagerError),
+    #[error(transparent)]
+    Actor(#[from] ActorError),
+    #[error("agent working directory is unavailable")]
+    MissingConfig,
+    #[error("could not save shell result: {0}")]
+    Persistence(String),
+}
+
+pub struct ShellOutput {
+    pub output: String,
+    pub is_error: bool,
+}
+
+impl AgentRef {
+    /// Runs an explicit user command. Both forms report output to the caller;
+    /// only `visible` commands add their result to the next user turn.
+    pub async fn run_shell(
+        &self,
+        command: &str,
+        visible: bool,
+        config: &AgentConfig,
+        cancel: &CancelToken,
+        on_output: impl Fn(&str) + Send,
+    ) -> Result<ShellOutput, ShellError> {
+        self.validate_live()?;
+        let actor = self.actor()?;
+        let policy = actor.effective_config().ok_or(ShellError::MissingConfig)?;
+        let (output, is_error) =
+            match run_command(command, on_output, cancel, config, policy.context.cwd()).await {
+                Ok(output) => (output, false),
+                Err(output) => (output, true),
+            };
+        if visible {
+            let label = if is_error { "Error" } else { "Output" };
+            actor.record_preamble(format!("I ran: $ {command}\n\n{label}:\n{output}"))?;
+            let journal = self.manager().journal();
+            if journal.has_writer() {
+                journal.flush().await.map_err(ShellError::Persistence)?;
+            }
+        }
+        Ok(ShellOutput { output, is_error })
+    }
+}
+
+async fn run_command(
+    command: &str,
+    on_output: impl Fn(&str),
+    cancel: &CancelToken,
+    config: &AgentConfig,
+    cwd: &Path,
+) -> Result<String, String> {
+    let mut std_cmd = self::command(config.shell, command);
+    std_cmd.current_dir(cwd).env("GIT_TERMINAL_PROMPT", "0");
+
+    #[cfg(unix)]
+    unsafe {
+        std_cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    let mut cmd: AsyncCommand = std_cmd.into();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
+
+    let (line_tx, line_rx) = flume::unbounded::<String>();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_line_reader(BufReader::new(stdout), line_tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_line_reader(BufReader::new(stderr), line_tx.clone());
+    }
+    let mut guard = ChildGuard::new(child);
+    drop(line_tx);
+
+    let mut output = String::new();
+    let mut line_count: usize = 0;
+    let mut truncated = false;
+    let mut last_flush = Instant::now();
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+
+    macro_rules! race_deadline {
+        ($future:expr) => {
+            futures_lite::future::race(
+                $future,
+                futures_lite::future::race(
+                    async {
+                        smol::Timer::at(deadline).await;
+                        Err(format!("timed out after {}s", SHELL_TIMEOUT.as_secs()))
+                    },
+                    async {
+                        cancel.cancelled().await;
+                        Err("cancelled".to_string())
+                    },
+                ),
+            )
+            .await
+        };
+    }
+
+    loop {
+        let line = race_deadline!(async { Ok(line_rx.recv_async().await.ok()) });
+        match line {
+            Ok(Some(line)) => {
+                if !truncated {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&line);
+                    line_count += 1;
+                    if output.len() > config.max_output_bytes
+                        || line_count >= config.max_output_lines
+                    {
+                        truncated = true;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                guard.kill_and_reap().await;
+                return Err(e);
+            }
+        }
+
+        if last_flush.elapsed() >= STREAM_FLUSH_INTERVAL && !output.is_empty() {
+            on_output(&output);
+            last_flush = Instant::now();
+        }
+    }
+
+    let status =
+        race_deadline!(async { guard.status().await.map_err(|e| format!("wait error: {e}")) });
+    match status {
+        Ok(status) => {
+            on_output(&output);
+            if truncated {
+                output.push_str("\n[truncated]");
+            }
+            if !status.success() {
+                if output.is_empty() {
+                    return Err(format!("exited with code {}", status.code().unwrap_or(-1)));
+                }
+                return Err(output);
+            }
+            Ok(output)
+        }
+        Err(e) => {
+            guard.kill_and_reap().await;
+            Err(e)
+        }
+    }
+}
+
+fn spawn_line_reader<R: AsyncRead + Unpin + Send + 'static>(
+    reader: BufReader<R>,
+    tx: flume::Sender<String>,
+) {
+    smol::spawn(async move {
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next().await {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

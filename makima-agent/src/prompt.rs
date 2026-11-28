@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use makima_providers::Model;
+use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
@@ -47,14 +48,27 @@ pub enum SlotKind {
     Aggregate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter)]
-#[strum(serialize_all = "snake_case")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter, Serialize, Deserialize,
+)]
 pub enum Slot {
+    #[serde(rename = "identity")]
+    #[strum(serialize = "identity")]
     Identity,
+    #[serde(rename = "tone")]
+    #[strum(serialize = "tone")]
     Tone,
+    #[serde(rename = "tool_usage")]
+    #[strum(serialize = "tool_usage")]
     ToolUsage,
+    #[serde(rename = "efficient_tools")]
+    #[strum(serialize = "efficient_tools")]
     EfficientTools,
+    #[serde(rename = "conventions")]
+    #[strum(serialize = "conventions")]
     Conventions,
+    #[serde(rename = "after_instructions")]
+    #[strum(serialize = "after_instructions")]
     AfterInstructions,
 }
 
@@ -101,11 +115,18 @@ impl Slot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter)]
-#[strum(serialize_all = "snake_case")]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, Display, EnumIter, Serialize, Deserialize,
+)]
 pub enum PromptId {
+    #[serde(rename = "system")]
+    #[strum(serialize = "system")]
     System,
+    #[serde(rename = "research")]
+    #[strum(serialize = "research")]
     Research,
+    #[serde(rename = "general")]
+    #[strum(serialize = "general")]
     General,
 }
 
@@ -116,14 +137,26 @@ impl PromptId {
 impl ValidNames for Slot {}
 impl ValidNames for PromptId {}
 
+#[derive(Clone)]
 pub struct SlotEntry {
     pub plugin: Arc<str>,
+    pub name: Arc<str>,
     pub content: String,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+pub struct PromptSource {
+    pub prompt: PromptId,
+    pub slot: Slot,
+    pub plugin: Arc<str>,
+    pub name: Arc<str>,
+    pub content: Option<String>,
+}
+
+#[derive(Clone, Default)]
 pub struct ResolvedSlots {
     entries: HashMap<(PromptId, Slot), Vec<SlotEntry>>,
+    observations: Vec<PromptSource>,
 }
 
 impl ResolvedSlots {
@@ -135,7 +168,29 @@ impl ResolvedSlots {
     }
 
     pub fn insert(&mut self, prompt: PromptId, slot: Slot, entry: SlotEntry) {
-        self.entries.entry((prompt, slot)).or_default().push(entry);
+        self.observe(PromptSource {
+            prompt,
+            slot,
+            plugin: entry.plugin,
+            name: entry.name,
+            content: Some(entry.content),
+        });
+    }
+
+    pub fn observe(&mut self, source: PromptSource) {
+        let address = (source.prompt, source.slot);
+        if let Some(content) = &source.content {
+            self.entries.entry(address).or_default().push(SlotEntry {
+                plugin: source.plugin.clone(),
+                name: source.name.clone(),
+                content: content.clone(),
+            });
+        }
+        self.observations.push(source);
+    }
+
+    pub fn sources(&self) -> &[PromptSource] {
+        &self.observations
     }
 }
 
@@ -240,6 +295,7 @@ mod tests {
                 slot,
                 SlotEntry {
                     plugin: Arc::from("p"),
+                    name: "default".into(),
                     content: content.into(),
                 },
             );
@@ -317,6 +373,174 @@ mod tests {
     }
 
     #[test]
+    fn sources_preserve_registration_order_for_reconstruction() {
+        let entries = [
+            (PromptId::General, Slot::ToolUsage, "z", "hint_4", "general"),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "z",
+                "hint_3",
+                "first hint",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "z",
+                "hint_1",
+                "first identity",
+            ),
+            (
+                PromptId::Research,
+                Slot::ToolUsage,
+                "a",
+                "hint_2",
+                "research",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "a",
+                "hint_0",
+                "second identity",
+            ),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "a",
+                "hint_5",
+                "second hint",
+            ),
+            (
+                PromptId::System,
+                Slot::Identity,
+                "z",
+                "hint_7",
+                "last identity",
+            ),
+            (
+                PromptId::System,
+                Slot::ToolUsage,
+                "z",
+                "hint_8",
+                "last hint",
+            ),
+            (PromptId::System, Slot::Tone, "a", "hint_6", "tone"),
+        ];
+        let mut slots = ResolvedSlots::default();
+        for (prompt, slot, plugin, name, content) in entries {
+            slots.insert(
+                prompt,
+                slot,
+                SlotEntry {
+                    plugin: Arc::from(plugin),
+                    name: name.into(),
+                    content: content.into(),
+                },
+            );
+        }
+        let sources = slots.sources();
+        let projected: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                (
+                    source.prompt,
+                    source.slot,
+                    source.plugin.as_ref(),
+                    source.name.as_ref(),
+                    source.content.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(projected, entries);
+
+        let mut restored = ResolvedSlots::default();
+        for source in sources {
+            restored.observe(source.clone());
+        }
+        for &prompt in PromptId::ALL {
+            assert_eq!(
+                assemble(prompt, &restored, ""),
+                assemble(prompt, &slots, "")
+            );
+        }
+        assert_eq!(
+            render_slot(&restored, PromptId::System, Slot::Identity),
+            entries[6].4
+        );
+        assert_eq!(
+            render_slot(&restored, PromptId::System, Slot::ToolUsage),
+            [entries[1].4, entries[5].4, entries[7].4].join("\n")
+        );
+    }
+
+    #[test]
+    fn observations_retain_omissions_without_rendering_or_duplicate_successes() {
+        let mut slots = ResolvedSlots::default();
+        let identity = "recorded identity";
+        slots.observe(PromptSource {
+            prompt: PromptId::General,
+            slot: Slot::ToolUsage,
+            plugin: Arc::from("missing"),
+            name: "default".into(),
+            content: None,
+        });
+        for (name, content) in [("first", None), ("second", Some(identity)), ("third", None)] {
+            slots.observe(PromptSource {
+                prompt: PromptId::System,
+                slot: Slot::Identity,
+                plugin: Arc::from("plugin"),
+                name: name.into(),
+                content: content.map(String::from),
+            });
+        }
+        let sources = slots.sources();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["default", "first", "second", "third"]
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.content.as_deref())
+                .collect::<Vec<_>>(),
+            [None, None, Some(identity), None]
+        );
+        assert_eq!(slots.get(PromptId::System, Slot::Identity).len(), 1);
+        assert!(slots.get(PromptId::General, Slot::ToolUsage).is_empty());
+        assert_eq!(
+            render_slot(&slots, PromptId::System, Slot::Identity),
+            identity
+        );
+        let mut restored = ResolvedSlots::default();
+        for source in sources {
+            restored.observe(source.clone());
+        }
+        assert_eq!(restored.sources().len(), 4);
+        for &prompt in PromptId::ALL {
+            assert_eq!(
+                assemble(prompt, &restored, ""),
+                assemble(prompt, &slots, "")
+            );
+        }
+    }
+
+    #[test]
+    fn source_identifiers_round_trip_through_serde() {
+        for &prompt in PromptId::ALL {
+            let encoded = serde_json::to_string(&prompt).unwrap();
+            assert_eq!(serde_json::from_str::<PromptId>(&encoded).unwrap(), prompt);
+        }
+        for slot in Slot::iter() {
+            let encoded = serde_json::to_string(&slot).unwrap();
+            assert_eq!(serde_json::from_str::<Slot>(&encoded).unwrap(), slot);
+        }
+    }
+
+    #[test]
     fn same_slot_preserves_insertion_order() {
         let s = slots(
             PromptId::System,
@@ -337,6 +561,7 @@ mod tests {
                 Slot::AfterInstructions,
                 SlotEntry {
                     plugin: Arc::from("p"),
+                    name: "default".into(),
                     content: "AFTER".into(),
                 },
             );
@@ -415,6 +640,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("user"),
+                name: "default".into(),
                 content: "Custom identity".into(),
             },
         );
@@ -431,6 +657,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("first"),
+                name: "default".into(),
                 content: "FIRST".into(),
             },
         );
@@ -439,6 +666,7 @@ mod tests {
             Slot::Identity,
             SlotEntry {
                 plugin: Arc::from("second"),
+                name: "default".into(),
                 content: "SECOND".into(),
             },
         );
@@ -470,6 +698,7 @@ mod tests {
             Slot::Conventions,
             SlotEntry {
                 plugin: Arc::from("plugin"),
+                name: "default".into(),
                 content: "- Extra rule".into(),
             },
         );

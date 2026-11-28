@@ -5,15 +5,17 @@
 //! turn's outcome, whether the turn completed, failed, was cancelled, was
 //! removed, or was terminalized by a close/clear.
 
+use makima_domain::LockExt;
 use std::mem::take;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use event_listener::Event;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{TurnId, TurnOutcome};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnResult {
     pub outcome: TurnOutcome,
     pub text: String,
@@ -22,7 +24,8 @@ pub struct TurnResult {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnOrigin {
     #[default]
     Internal,
@@ -30,7 +33,7 @@ pub enum TurnOrigin {
     Plugin,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnProvenance {
     pub origin: TurnOrigin,
     pub plugin: Option<String>,
@@ -54,22 +57,15 @@ pub struct TurnOutput(Arc<Mutex<OutputState>>);
 impl TurnOutput {
     /// Registers the presentation sink used only after the actor seals its result.
     pub fn set_terminal_sender(&self, sender: crate::EventSender) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .terminal_sender = Some(sender.without_output());
+        self.0.lock_unpoisoned().terminal_sender = Some(sender.without_output());
     }
 
     pub(super) fn take_terminal_sender(&self) -> Option<crate::EventSender> {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .terminal_sender
-            .take()
+        self.0.lock_unpoisoned().terminal_sender.take()
     }
 
     pub fn begin_text_attempt(&self) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.clear();
         }
@@ -80,7 +76,7 @@ impl TurnOutput {
     }
 
     pub fn reconcile_text_attempt(&self, text: &str) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.clear();
             state.text.push_str(text);
@@ -88,14 +84,14 @@ impl TurnOutput {
     }
 
     pub fn append_text(&self, text: &str) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.text.push_str(text);
         }
     }
 
     pub fn append_output(&self, output: serde_json::Value) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.lock_unpoisoned();
         if state.result.is_none() {
             state.output.push(output);
         }
@@ -117,6 +113,26 @@ struct Shared {
 }
 
 impl TurnTicket {
+    pub fn from_result(result: TurnResult) -> Self {
+        Self::from_result_for_actor(result, Arc::new(()))
+    }
+
+    pub(crate) fn from_result_for_actor(result: TurnResult, actor_identity: Arc<()>) -> Self {
+        Self {
+            turn_id: result.outcome.turn_id(),
+            actor_identity,
+            provenance: result.provenance.clone(),
+            shared: Arc::new(Shared {
+                outcome: Mutex::new(Some(result.outcome.clone())),
+                event: Event::new(),
+            }),
+            output: TurnOutput(Arc::new(Mutex::new(OutputState {
+                result: Some(result),
+                ..Default::default()
+            }))),
+        }
+    }
+
     pub(crate) fn new(turn_id: TurnId, actor_identity: Arc<()>) -> Self {
         Self {
             turn_id,
@@ -145,12 +161,7 @@ impl TurnTicket {
     }
 
     pub fn peek_result(&self) -> Option<TurnResult> {
-        self.output
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .result
-            .clone()
+        self.output.0.lock_unpoisoned().result.clone()
     }
 
     pub async fn wait_result(&self) -> TurnResult {
@@ -168,7 +179,7 @@ impl TurnTicket {
     }
 
     pub(crate) fn mark_started(&self) {
-        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.output.0.lock_unpoisoned();
         if state.result.is_none() && state.started.is_none() {
             state.started = Some(Instant::now());
         }
@@ -176,7 +187,7 @@ impl TurnTicket {
 
     /// Freezes the result for [`Self::peek_result`] without waking waiters.
     pub(crate) fn seal(&self, outcome: &TurnOutcome) {
-        let mut state = self.output.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.output.0.lock_unpoisoned();
         if state.result.is_none() {
             state.result = Some(TurnResult {
                 outcome: outcome.clone(),
@@ -190,12 +201,15 @@ impl TurnTicket {
         }
     }
 
+    pub(crate) fn replace_sealed_outcome(&self, outcome: &TurnOutcome) {
+        let mut state = self.output.0.lock_unpoisoned();
+        if let Some(result) = &mut state.result {
+            result.outcome = outcome.clone();
+        }
+    }
+
     pub(crate) fn resolve(&self, outcome: TurnOutcome) {
-        let mut outcome_slot = self
-            .shared
-            .outcome
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut outcome_slot = self.shared.outcome.lock_unpoisoned();
         if outcome_slot.is_none() {
             self.seal(&outcome);
             *outcome_slot = Some(outcome);
@@ -219,10 +233,75 @@ impl TurnTicket {
     }
 
     pub fn peek(&self) -> Option<TurnOutcome> {
-        self.shared
-            .outcome
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.shared.outcome.lock_unpoisoned().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures_lite::future::poll_once;
+    use makima_providers::TokenUsage;
+    use serde_json::json;
+
+    use super::{TurnOrigin, TurnProvenance, TurnResult, TurnTicket};
+    use crate::{AgentId, TurnCancellationReason, TurnId, TurnOutcome};
+
+    const TEXT: &str = "frozen response";
+    const LATE_TEXT: &str = "late response";
+    const PLUGIN: &str = "task";
+
+    #[test]
+    fn restored_ticket_is_resolved_without_actor_execution() {
+        let result = TurnResult {
+            outcome: TurnOutcome::cancelled(
+                AgentId::generate(),
+                TurnId::generate(),
+                TokenUsage::default(),
+                2,
+                TurnCancellationReason::Interrupted,
+            ),
+            text: TEXT.into(),
+            output: vec![json!({ "answer": [1, true, null] })],
+            provenance: TurnProvenance {
+                origin: TurnOrigin::Plugin,
+                plugin: Some(PLUGIN.into()),
+                plugin_generation: Some(3),
+                source_agent: Some(AgentId::generate()),
+                source_turn: Some(TurnId::generate()),
+            },
+            duration_ms: 42,
+        };
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TurnResult>(&encoded).unwrap(),
+            result
+        );
+        let ticket = TurnTicket::from_result(result.clone());
+        assert_eq!(ticket.turn_id(), result.outcome.turn_id());
+        assert_eq!(ticket.provenance(), &result.provenance);
+        assert!(!ticket.belongs_to(&Arc::new(())));
+        assert_eq!(
+            smol::block_on(poll_once(ticket.wait())),
+            Some(result.outcome.clone())
+        );
+        assert_eq!(
+            smol::block_on(poll_once(ticket.wait_result())),
+            Some(result.clone())
+        );
+        ticket.output().append_text(LATE_TEXT);
+        ticket.output().append_output(json!(LATE_TEXT));
+        ticket.output().begin_text_attempt();
+        ticket.mark_started();
+        ticket.resolve(TurnOutcome::cancelled(
+            result.outcome.agent_id(),
+            result.outcome.turn_id(),
+            TokenUsage::default(),
+            0,
+            TurnCancellationReason::User,
+        ));
+        assert_eq!(ticket.peek_result(), Some(result.clone()));
+        assert_eq!(ticket.peek(), Some(result.outcome));
     }
 }

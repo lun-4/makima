@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use makima_domain::LockExt;
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
 use crate::runtime::{TaskHandle, TaskScope, lock_cell, strip_traceback};
@@ -43,7 +44,7 @@ impl DepthGuard {
     pub(crate) fn enter(lua: &Lua, kind: &'static str, name: &str) -> Result<Self, DepthExceeded> {
         let store = depth_store(lua);
         let key = (kind, name.to_owned(), current_task(lua));
-        let mut depths = store.lock().unwrap_or_else(|error| error.into_inner());
+        let mut depths = store.lock_unpoisoned();
         let depth = depths.depths.entry(key.clone()).or_insert(0);
         if *depth >= MAX_HOOK_DEPTH {
             return Err(DepthExceeded);
@@ -65,7 +66,7 @@ fn depth_store(lua: &Lua) -> Arc<Mutex<DepthStore>> {
 
 impl Drop for DepthGuard {
     fn drop(&mut self) {
-        let mut store = self.store.lock().unwrap_or_else(|error| error.into_inner());
+        let mut store = self.store.lock_unpoisoned();
         if let Some(depth) = store.depths.get_mut(&self.key) {
             *depth -= 1;
             if *depth == 0 {
@@ -149,7 +150,7 @@ mod tests {
         drop(guards);
         assert!(DepthGuard::enter(&lua, "test", SEAM).is_ok());
         let store = depth_store(&lua);
-        let store = store.lock().unwrap_or_else(|error| error.into_inner());
+        let store = store.lock_unpoisoned();
         assert!(store.depths.is_empty(), "zero entries removed");
     }
 

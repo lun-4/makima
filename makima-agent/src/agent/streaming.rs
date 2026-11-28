@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +7,7 @@ use makima_providers::provider::Provider;
 use makima_providers::retry::{RetryPolicy, RetryState};
 use makima_providers::{
     ContentBlock, ConversationEnd, ConversationLink, Invocation, InvocationPurpose, Message, Model,
-    ProviderEvent, RequestDeliveryTracker, RequestOptions, StreamResponse,
+    ProviderEvent, RequestDeliveryTracker, RequestOptions, Role, StreamResponse,
 };
 use makima_storage::id::{MakimaId, SessionRef};
 use serde_json::Value;
@@ -149,12 +151,72 @@ impl From<StreamError> for AgentError {
     }
 }
 
+fn has_tool_results(message: &Message) -> bool {
+    message.role == Role::User
+        && message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+fn coalesce_tool_results<'a>(
+    messages: &'a [Message],
+    previous: Option<&mut ConversationLink>,
+) -> Cow<'a, [Message]> {
+    if !messages
+        .windows(2)
+        .any(|pair| pair.iter().all(has_tool_results))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut request = Vec::<Message>::with_capacity(messages.len());
+    let shared = previous.as_ref().map_or(0, |link| link.shared);
+    let mut request_shared = 0;
+    let mut index = 0;
+    while let Some(message) = messages.get(index) {
+        index += 1;
+        let mut message = message.clone();
+        if has_tool_results(&message) {
+            let start = index - 1;
+            while let Some(next) = messages.get(index).filter(|next| has_tool_results(next)) {
+                message.content.extend(next.content.iter().cloned());
+                index += 1;
+            }
+            if index > start + 1
+                && let Some(assistant) = request
+                    .last()
+                    .filter(|message| message.role == Role::Assistant)
+            {
+                let order: HashMap<_, _> = assistant
+                    .tool_uses()
+                    .enumerate()
+                    .map(|(index, (id, _, _))| (id, index))
+                    .collect();
+                message.content.sort_by_key(|block| match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => order
+                        .get(tool_use_id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    _ => usize::MAX,
+                });
+            }
+        }
+        request_shared += usize::from(index <= shared);
+        request.push(message);
+    }
+    if let Some(previous) = previous {
+        previous.shared = request_shared;
+    }
+    Cow::Owned(request)
+}
+
 /// {delivery} learns, while the stream still runs, the first time any
 /// attempt reaches the provider's server.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_with_retry(
     provider: &dyn Provider,
-    conversation: Conversation,
+    mut conversation: Conversation,
     model: &Model,
     messages: &[Message],
     system: &str,
@@ -167,7 +229,8 @@ pub(crate) async fn stream_with_retry(
     delivery: &RequestDeliveryTracker,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
-    let messages = makima_providers::adapt_images_for_model(model, messages).await;
+    let messages = coalesce_tool_results(messages, conversation.previous.as_mut());
+    let messages = makima_providers::adapt_images_for_model(model, &messages).await;
     let messages = &*messages;
     let mut retry = RetryState::new(retry_policy, provider.key_count());
     let mut invocation = conversation.invocation();

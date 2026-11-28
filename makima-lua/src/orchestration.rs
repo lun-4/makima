@@ -1,30 +1,36 @@
+use crate::EventHandle;
 use crate::agent_errors::{
     NO_ORCHESTRATION_SERVICES, ORCHESTRATION_CONTEXT_EXPIRED, ORCHESTRATION_SERVICES_EXPIRED,
 };
 use crate::runtime::{TaskHandle, active_task_id, lock_cell};
+use crate::session_snapshot::HeadlessObserver;
 use makima_agent::actor::{ConfigChange, ConfigCommit, EffectiveAgentConfig, PreparedTransaction};
 use makima_agent::cancel::{CancelToken, CancelTrigger, PublicationRegistration};
 use makima_agent::command::command_input;
 use makima_agent::config_change::{ConfigChangeError, ConfigChangeTicket};
-use makima_agent::headless::{InteractiveControl, InteractiveHandle, RootBinding};
-use makima_agent::permissions::PermissionManager;
-use makima_agent::session_checkpoint::SessionLogCheckpoint;
+use makima_agent::headless::{
+    InteractiveControl, InteractiveControlSender, InteractiveHandle, RootBinding, TurnAdmitter,
+};
+use makima_agent::manager::AgentIncarnation;
+use makima_agent::session::{FrontendObserver, FrontendServices, SessionHandle};
 use makima_agent::session_coordinator::{
     ConfigMutation, ModelPreparer, SessionCoordinatorHandle, publication_claim,
 };
-use makima_agent::session_options::YOLO_OPTION_ID;
+use makima_agent::session_writer::SessionWriter;
 use makima_agent::{
-    AgentRef, ModeRegistry, TurnAdmissionOptions, TurnOrigin, TurnProvenance, modes,
-    tools::ToolContext,
+    AgentActorHandle, AgentEvent, AgentReactivator, AgentRef, ModeRegistry, TurnAdmissionOptions,
+    TurnOrigin, TurnProvenance, tools::ToolContext,
 };
 use makima_commands::{
     CommandContent, CommandError, CommandInvocation, CommandOutcome, CommandRegistry,
     InputDispatch, ResolutionError, TargetHandle,
 };
+use makima_domain::LockExt;
 use makima_providers::Message;
+use makima_providers::provider::BoxFuture;
 use makima_storage::StateDir;
 use makima_storage::checkpoint::{CheckpointClaim, CheckpointPublication};
-use makima_storage::sessions::{HistorySnapshot, SessionMeta, StoredSubagent};
+use makima_storage::sessions::HistorySnapshot;
 use mlua::Lua;
 use std::{
     collections::HashMap,
@@ -72,25 +78,16 @@ impl PluginAuthority {
     }
 
     fn revoke(&self) {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         self.alive.store(false, Ordering::Release);
-        self.publication_trigger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.publication_trigger.lock_unpoisoned().take();
     }
 
     pub(crate) fn register_publication(
         &self,
         publication: &CheckpointPublication,
     ) -> PublicationRegistration {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         self.publication_cancel.register_publication(publication)
     }
 
@@ -98,14 +95,38 @@ impl PluginAuthority {
         &self,
         claim: impl FnOnce() -> Result<(), Arc<str>>,
     ) -> Result<(), Arc<str>> {
-        let _gate = self
-            .publication_gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _gate = self.publication_gate.lock_unpoisoned();
         if !self.is_alive() {
             return Err(Arc::from(crate::agent_errors::INVOCATION_EXPIRED));
         }
         claim()
+    }
+
+    pub(crate) fn claim_effect<T>(
+        &self,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _gate = self.publication_gate.lock_unpoisoned();
+        if !self.is_alive() {
+            return Err(crate::agent_errors::INVOCATION_EXPIRED.into());
+        }
+        effect()
+    }
+
+    pub(crate) fn claim_effect_with<T>(
+        &self,
+        other: Option<&Self>,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(other) = other.filter(|other| !std::ptr::eq(self, *other)) else {
+            return self.claim_effect(effect);
+        };
+        let (first, second) = if self.generation < other.generation {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        first.claim_effect(|| second.claim_effect(effect))
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -123,6 +144,71 @@ pub struct TrustedTarget {
     pub template: ToolContext,
 }
 
+#[derive(Clone)]
+pub struct PinnedCommandTarget {
+    trusted: TrustedTarget,
+    incarnation: AgentIncarnation,
+    actor: AgentActorHandle,
+}
+
+impl PinnedCommandTarget {
+    pub fn pin(target: TrustedTarget) -> Result<Self, String> {
+        let incarnation = target
+            .target
+            .incarnation()
+            .map_err(|error| error.to_string())?;
+        Self::pin_incarnation(target, incarnation)
+    }
+
+    pub fn pin_incarnation(
+        target: TrustedTarget,
+        incarnation: AgentIncarnation,
+    ) -> Result<Self, String> {
+        if target.target.id() != incarnation.agent_id {
+            return Err(CLOSED_TARGET_ERR.into());
+        }
+        let actor = target
+            .target
+            .manager()
+            .actor_for_incarnation(&incarnation)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            trusted: target,
+            incarnation,
+            actor,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.target
+            .manager()
+            .actor_for_incarnation(&self.incarnation)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn actor(&self) -> Result<AgentActorHandle, String> {
+        self.validate()?;
+        Ok(self.actor.clone())
+    }
+
+    pub fn trusted(&self) -> TrustedTarget {
+        self.trusted.clone()
+    }
+
+    pub fn incarnation(&self) -> AgentIncarnation {
+        self.incarnation.clone()
+    }
+}
+
+impl std::ops::Deref for PinnedCommandTarget {
+    type Target = TrustedTarget;
+
+    fn deref(&self) -> &Self::Target {
+        &self.trusted
+    }
+}
+
 pub type ConfigMutationReserver = Arc<
     dyn Fn(&AgentRef, CheckpointPublication) -> Result<ConfigMutation, ConfigChangeError>
         + Send
@@ -136,12 +222,12 @@ pub type TurnCompletionFuture = Pin<Box<dyn Future<Output = Result<(), String>> 
 /// handler has finished and the frontend has taken its outcome; a model turn
 /// or `/compact` it started may still be running.
 pub type CommandRunner =
-    Arc<dyn Fn(String, u8, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
+    Arc<dyn Fn(String, u8, PinnedCommandTarget) -> TurnCompletionFuture + Send + Sync>;
 
 /// Runs the outcome of a plugin-run command that is neither finished nor
 /// failed: a model turn, compaction, an isolated turn or feedback.
 pub type OutcomeExecutor =
-    Arc<dyn Fn(String, CommandOutcome, TrustedTarget) -> TurnCompletionFuture + Send + Sync>;
+    Arc<dyn Fn(String, CommandOutcome, PinnedCommandTarget) -> TurnCompletionFuture + Send + Sync>;
 
 pub(crate) const NEEDS_FRONTEND: &str = "needs a frontend to run it";
 pub const CLOSED_TARGET_ERR: &str = "the agent this command was pinned to has closed";
@@ -157,8 +243,7 @@ pub fn command_runner(
 ) -> CommandRunner {
     Arc::new(move |cmdline, depth, admission| {
         let dispatch = admission
-            .target
-            .validate_live()
+            .validate()
             .map_err(|_| CLOSED_TARGET_ERR.to_owned())
             .and_then(|()| {
                 registry
@@ -202,23 +287,50 @@ pub fn command_runner(
 /// prompt to answer.
 pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
     let root = handle.root.clone();
-    let admitter = handle.input_tx.admitter();
-    let control = handle.control_tx.clone();
+    outcomes(
+        move || {
+            let root = root.clone();
+            async move { root.get().await }
+        },
+        handle.input_tx.admitter(),
+        handle.control_tx.clone(),
+    )
+}
+
+pub fn headless_session_outcomes(handle: &SessionHandle) -> OutcomeExecutor {
+    let root = handle.root().clone();
+    outcomes(
+        move || std::future::ready(Ok(root.clone())),
+        handle.input_tx.admitter(),
+        handle.control_tx.clone(),
+    )
+}
+
+fn outcomes<F>(
+    root: impl Fn() -> F + Send + Sync + 'static,
+    admitter: TurnAdmitter,
+    control: InteractiveControlSender,
+) -> OutcomeExecutor
+where
+    F: Future<Output = Result<AgentRef, String>> + Send + 'static,
+{
     Arc::new(move |cmdline, outcome, admission| {
-        let root = root.clone();
+        let root = root();
         let admitter = admitter.clone();
         let control = control.clone();
         Box::pin(async move {
-            let root = root.get().await?;
-            let target = admission.target;
-            let child = (target.id() != root.id() || !target.same_manager(&root))
-                .then(|| target.actor().map_err(|error| error.to_string()))
-                .transpose()?;
+            let root = root.await?;
+            let actor = admission.actor()?;
+            let target = admission.target.clone();
+            let child =
+                (target.id() != root.id() || !target.same_manager(&root)).then_some(actor.clone());
             match (outcome, child) {
                 (CommandOutcome::FrontendFeedback(_), _) => Ok(()),
-                (CommandOutcome::AgentTurn(turn), None) => {
-                    admitter.admit(command_input(turn)?).await.map(|_| ())
-                }
+                (CommandOutcome::AgentTurn(turn), None) => admitter
+                    .for_actor(actor)
+                    .submit(command_input(turn)?)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
                 (CommandOutcome::AgentTurn(turn), Some(actor)) => actor
                     .admit_turn_with_options(
                         command_input(turn)?,
@@ -236,13 +348,14 @@ pub fn headless_outcomes(handle: &InteractiveHandle) -> OutcomeExecutor {
                     .map_err(|error| error.to_string()),
                 (CommandOutcome::ManualCompaction(instructions), None) => {
                     let (output, _) = flume::unbounded();
-                    control
-                        .send(InteractiveControl::ManualCompaction {
+                    control.send_to(
+                        actor,
+                        InteractiveControl::ManualCompaction {
                             instructions,
                             output,
                             cancel: CancelToken::none(),
-                        })
-                        .await
+                        },
+                    )
                 }
                 (CommandOutcome::ManualCompaction(instructions), Some(actor)) => {
                     let run_id = actor.reserve_presentation(actor.presentation_id());
@@ -282,92 +395,59 @@ pub type TurnCompletion =
 pub fn child_persistence(
     label: &'static str,
     services: Weak<AgentOrchestration>,
-    checkpoint: Arc<SessionLogCheckpoint>,
+    _writer: Arc<SessionWriter>,
 ) -> (ConfigMutationReserver, TurnCompletion) {
-    let destination = move |target: &AgentRef| -> Result<(String, String), String> {
-        let services = services
-            .upgrade()
-            .ok_or_else(|| format!("{label} orchestration is closed"))?;
-        let key = services.history_key(target)?;
-        let name = target
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .metadata
-            .label
-            .unwrap_or_default();
-        Ok((key, name))
-    };
-    let config_destination = destination.clone();
-    let completion_destination = destination;
-    let config_checkpoint = Arc::clone(&checkpoint);
+    journal_child_persistence(label, services)
+}
 
+fn journal_child_persistence(
+    label: &'static str,
+    services: Weak<AgentOrchestration>,
+) -> (ConfigMutationReserver, TurnCompletion) {
+    let config_services = services.clone();
     let reserver: ConfigMutationReserver = Arc::new(move |target, publication| {
-        let (key, name) = config_destination(target)?;
-        let agent_id = target.id().to_string();
-        let checkpoint = Arc::clone(&config_checkpoint);
+        config_services
+            .upgrade()
+            .ok_or_else(|| format!("{label} orchestration is closed"))?
+            .history_key(target)?;
+        let journal = target.manager().journal();
         Ok(Box::new(move |_, claim| {
             Ok(PreparedTransaction {
                 publication,
+                options: None,
+                state_edits: Vec::new(),
+                history_changed: false,
                 publish: Box::new(move |ready, publication| {
                     Box::pin(async move {
-                        checkpoint
-                            .checkpoint_child_config(
-                                StoredSubagent {
-                                    agent_id: Some(agent_id),
-                                    ..child_metadata(key, name, &ready.config)
-                                },
-                                publication,
-                                claim,
-                            )
-                            .await
-                            .map_err(|error| error.to_string())
+                        claim(&publication).map_err(|error| error.to_string())?;
+                        if let Some(install) = ready.install {
+                            install()?;
+                        }
+                        journal.flush().await
                     })
                 }),
                 finalize: Box::new(|_| {}),
             })
         }))
     });
-
-    let completion: TurnCompletion = Arc::new(move |target, history| {
-        let child = (|| {
-            let (key, name) = completion_destination(target)?;
-            let config = target
-                .effective_config()
-                .map_err(|error| error.to_string())?
-                .ok_or("child agent configuration is unavailable")?;
-            Ok::<_, String>(StoredSubagent {
-                agent_id: Some(target.id().to_string()),
-                ..child_metadata(key, name, &config)
-            })
-        })();
-        let checkpoint = Arc::clone(&checkpoint);
+    let completion: TurnCompletion = Arc::new(move |target, _| {
+        let destination = services
+            .upgrade()
+            .ok_or_else(|| format!("{label} orchestration is closed"))
+            .and_then(|services| services.history_key(target));
+        let journal = target.manager().journal();
         Box::pin(async move {
-            checkpoint
-                .checkpoint_child(child?, history)
-                .await
-                .map_err(|error| error.to_string())
+            destination?;
+            journal.flush().await
         })
     });
-
     (reserver, completion)
-}
-
-pub fn child_metadata(key: String, name: String, config: &EffectiveAgentConfig) -> StoredSubagent {
-    StoredSubagent {
-        agent_id: None,
-        ambiguous: false,
-        tool_use_id: key,
-        name,
-        model: Some(config.model.spec()),
-        thinking: Some(config.thinking.into()),
-        fast: config.fast,
-    }
 }
 
 /// A root binding that hands the bound root and its template to the frontend.
 pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
     let (ready, root) = flume::bounded(1);
-    let binding: RootBinding = Box::new(move |_, target, template| {
+    let binding: RootBinding = Box::new(move |_, target, template, _| {
         Box::pin(async move {
             ready
                 .send(TrustedTarget { target, template })
@@ -377,28 +457,24 @@ pub fn root_binding() -> (RootBinding, flume::Receiver<TrustedTarget>) {
     (binding, root)
 }
 
-/// Binds a headless frontend's root actor to {coordinator}, so committed
-/// config installs the model and cwd on {handle} and the YOLO option drives
-/// its permissions, and returns the root that {root_binding} delivered.
+/// Binds the root actor and its permissions to {coordinator} and returns
+/// the target delivered by {root_binding}.
 pub async fn bind_frontend_root(
     handle: &InteractiveHandle,
     coordinator: &SessionCoordinatorHandle,
     root_binding: &flume::Receiver<TrustedTarget>,
     prepare_model: ModelPreparer,
 ) -> Result<TrustedTarget, String> {
+    coordinator
+        .bind_permissions(Arc::clone(&handle.permissions))
+        .map_err(|error| error.to_string())?;
     let root = handle.initialized_root().await?;
-    let model = handle.model.clone();
-    project_yolo(coordinator, Arc::clone(&handle.permissions));
     let permissions = Arc::clone(&handle.permissions);
     coordinator
         .bind_actor(
             root,
             prepare_model,
             Arc::new(move |commit| {
-                model.install(
-                    Arc::clone(&commit.config.provider),
-                    commit.config.model.clone(),
-                );
                 permissions.set_cwd(commit.config.context.cwd().to_path_buf());
             }),
         )
@@ -409,38 +485,120 @@ pub async fn bind_frontend_root(
         .map_err(|error| error.to_string())
 }
 
-/// Keeps {permissions}' YOLO state on {coordinator}'s committed option,
-/// inside the commit. An unchanged value leaves a session that never chose
-/// YOLO on its seed.
-pub fn project_yolo(coordinator: &SessionCoordinatorHandle, permissions: Arc<PermissionManager>) {
-    coordinator.read().project_options(move |options| {
-        let enabled = options.enabled(YOLO_OPTION_ID);
-        if permissions.is_yolo() != enabled {
-            permissions.set_yolo(enabled);
-        }
-    });
-}
-
-/// The orchestration a non-UI frontend binds to its root graph: the root's
-/// config commits through {coordinator} and its children persist to
-/// {checkpoint}, and {catalog}'s discovery refreshes it. `label` names the
-/// frontend in the closed-graph error.
-pub fn durable_frontend(
+pub struct HeadlessServices<'a> {
     label: &'static str,
-    catalog: &ModelCatalog,
-    root: TrustedTarget,
-    coordinator: SessionCoordinatorHandle,
-    checkpoint: Arc<SessionLogCheckpoint>,
-) -> Arc<AgentOrchestration> {
-    let orchestration = Arc::new_cyclic(|services| {
-        let (child_config, completion) = child_persistence(label, services.clone(), checkpoint);
-        frontend_root(catalog, root, child_config, coordinator).with_completion(completion)
-    });
-    catalog.attach(&orchestration);
-    orchestration
+    catalog: &'a ModelCatalog,
+    events: EventHandle,
+    ignore_stream_closed: bool,
+    binding: Option<flume::Receiver<TrustedTarget>>,
+    bound: Option<BoundHeadless>,
 }
 
-/// The root half of [`durable_frontend`]: root config goes through
+pub struct BoundHeadless {
+    pub root: TrustedTarget,
+    pub orchestration: Arc<AgentOrchestration>,
+    events: EventHandle,
+    observer: HeadlessObserver,
+}
+
+impl BoundHeadless {
+    pub fn activate(&self) {
+        self.events
+            .install_orchestration_services(self.orchestration.clone());
+        self.observer.install(self.root.target.clone());
+    }
+}
+
+impl<'a> HeadlessServices<'a> {
+    pub fn new(label: &'static str, catalog: &'a ModelCatalog, events: EventHandle) -> Self {
+        Self {
+            label,
+            catalog,
+            events,
+            ignore_stream_closed: false,
+            binding: None,
+            bound: None,
+        }
+    }
+
+    pub fn ignore_stream_closed(mut self) -> Self {
+        self.ignore_stream_closed = true;
+        self
+    }
+
+    pub fn bound(&self) -> Result<&BoundHeadless, String> {
+        self.bound
+            .as_ref()
+            .ok_or_else(|| "headless root is not bound".to_owned())
+    }
+
+    pub fn into_bound(self) -> Result<BoundHeadless, String> {
+        self.bound
+            .ok_or_else(|| "headless root is not bound".to_owned())
+    }
+}
+
+impl FrontendServices for HeadlessServices<'_> {
+    fn root_binding(&mut self) -> Option<RootBinding> {
+        let (binding, root) = root_binding();
+        self.binding = Some(root);
+        Some(binding)
+    }
+
+    fn bind_root<'a>(
+        &'a mut self,
+        session: &'a SessionHandle,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let root = self
+                .binding
+                .take()
+                .ok_or_else(|| "headless root binding is missing".to_owned())?
+                .recv_async()
+                .await
+                .map_err(|error| error.to_string())?;
+            let coordinator = session.coordinator.clone();
+            let orchestration = if session.is_persistent() {
+                Arc::new_cyclic(|services| {
+                    let (config, completion) =
+                        journal_child_persistence(self.label, services.clone());
+                    frontend_root(self.catalog, root.clone(), config, coordinator)
+                        .with_completion(completion)
+                })
+            } else {
+                Arc::new(frontend_root(
+                    self.catalog,
+                    root.clone(),
+                    Arc::new(|_, publication| Ok(nonpersistent_config_mutation(publication))),
+                    coordinator,
+                ))
+            };
+            self.catalog.attach(&orchestration);
+            let observer = HeadlessObserver::new(self.events.clone(), session.session_id.id());
+            self.bound = Some(BoundHeadless {
+                root,
+                orchestration,
+                events: self.events.clone(),
+                observer,
+            });
+            Ok(())
+        })
+    }
+
+    fn observe(&mut self, _: &SessionHandle) -> FrontendObserver {
+        let observer = self.bound.as_ref().map(|bound| bound.observer.clone());
+        let ignore_stream_closed = self.ignore_stream_closed;
+        Box::new(move |event| {
+            if let Some(observer) = &observer
+                && !(ignore_stream_closed && matches!(event.event, AgentEvent::StreamClosed))
+            {
+                observer.observe(event);
+            }
+        })
+    }
+}
+
+/// Root config goes through
 /// {coordinator}, children through {child_config}.
 pub fn frontend_root(
     catalog: &ModelCatalog,
@@ -518,35 +676,13 @@ pub async fn set_mode(
         .await
 }
 
-/// Puts a resumed session's root back in the mode it was saved in, keeping a
-/// plan's file while it still exists. Every frontend that resumes calls it.
-pub async fn restore_mode(
-    services: &(impl OrchestrationServices + ?Sized),
-    target: &AgentRef,
-    registry: &ModeRegistry,
-    meta: &SessionMeta,
-    state_dir: &StateDir,
-) -> Result<(), ConfigChangeError> {
-    let Some((key, saved_plan)) = modes::saved(meta) else {
-        return Ok(());
-    };
-    reserve_config_change(services, target)?
-        .commit_mode(
-            target,
-            registry,
-            key,
-            state_dir,
-            saved_plan,
-            async |_, _| Ok(publication_claim()),
-        )
-        .await?;
-    Ok(())
-}
-
 pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> ConfigMutation {
     Box::new(move |_, claim| {
         Ok(PreparedTransaction {
             publication,
+            options: None,
+            state_edits: Vec::new(),
+            history_changed: false,
             publish: Box::new(move |_, publication| {
                 Box::pin(async move { claim(&publication).map_err(|error| error.to_string()) })
             }),
@@ -556,6 +692,8 @@ pub fn nonpersistent_config_mutation(publication: CheckpointPublication) -> Conf
 }
 
 pub trait OrchestrationServices: Send + Sync + 'static {
+    fn set_reactivator(&self, _reactivator: Arc<dyn AgentReactivator>) {}
+
     fn resolve_target(
         &self,
         invocation: Option<&CommandInvocation>,
@@ -583,6 +721,23 @@ pub trait OrchestrationServices: Send + Sync + 'static {
     ) -> TurnCompletionFuture {
         Box::pin(async { Ok(()) })
     }
+
+    fn register_child_activation(
+        &self,
+        target: TrustedTarget,
+        history_key: String,
+        _actor: &AgentActorHandle,
+        incarnation: &AgentIncarnation,
+    ) -> Result<(), String> {
+        target
+            .target
+            .manager()
+            .validate_activation(incarnation)
+            .map_err(|error| error.to_string())?;
+        self.register_child_target(target, history_key)
+    }
+
+    fn unregister_child_target(&self, _target: &AgentRef, _identity: &Arc<()>) {}
 
     fn register_child_target(
         &self,
@@ -638,19 +793,6 @@ pub(crate) fn plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthori
         .unwrap_or_else(|| Arc::new(PluginAuthority::new(false, 0)))
 }
 
-/// Whether the running code belongs to {plugin} at {generation} and the
-/// plugin's live authority is still {owner}.
-pub(crate) fn holds_plugin_grant(
-    lua: &Lua,
-    plugin: &Arc<str>,
-    generation: u64,
-    owner: &Arc<PluginAuthority>,
-) -> bool {
-    crate::runtime::current_plugin(lua).is_some_and(|(current, current_generation)| {
-        current == *plugin && current_generation == generation
-    }) && Arc::ptr_eq(owner, &plugin_authority(lua, plugin.clone()))
-}
-
 /// Grants a fresh authority when a plugin load commits; the previous one
 /// must already be revoked.
 pub(crate) fn install_plugin_authority(lua: &Lua, plugin: Arc<str>) -> Arc<PluginAuthority> {
@@ -674,6 +816,7 @@ pub(crate) struct TrustedContext {
     pub(crate) template: ToolContext,
     pub(crate) plugin: Arc<str>,
     pub(crate) generation: u64,
+    incarnation: Result<AgentIncarnation, String>,
     services: Option<Arc<dyn OrchestrationServices>>,
     authority: ScopeAuthority,
 }
@@ -691,10 +834,12 @@ impl TrustedContext {
         task: &TaskHandle,
         plugin: Arc<str>,
         owner: Arc<PluginAuthority>,
+        incarnation: Result<AgentIncarnation, String>,
     ) -> Self {
         Self {
             target: target.target,
             template: target.template,
+            incarnation,
             plugin,
             generation: owner.generation,
             services: services(lua),
@@ -717,8 +862,25 @@ impl TrustedContext {
         Ok(())
     }
 
+    pub(crate) fn target_incarnation(&self, target: &AgentRef) -> Result<AgentIncarnation, String> {
+        self.validate_incarnation()?;
+        if self.target.same_manager(target) && self.target.id() == target.id() {
+            return self.incarnation.clone();
+        }
+        target.incarnation().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn validate_incarnation(&self) -> Result<(), String> {
+        let incarnation = self.incarnation.as_ref().map_err(Clone::clone)?;
+        self.target
+            .manager()
+            .validate_incarnation(incarnation)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn validate_target(&self, lua: &Lua, target: &AgentRef) -> Result<(), String> {
         self.validate(lua)?;
+        self.validate_incarnation()?;
         self.services
             .as_ref()
             .ok_or(NO_ORCHESTRATION_SERVICES)?

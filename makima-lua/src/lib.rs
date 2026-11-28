@@ -51,6 +51,8 @@ pub use api::net::set_allowed_private_hosts;
 
 #[cfg(feature = "test-support")]
 pub mod test_support {
+    use std::path::PathBuf;
+
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, StatusContentEntries, StatusContentReader,
@@ -381,17 +383,17 @@ pub mod test_support {
     /// Never created on the real disk; hosts run on the in-memory backend.
     pub const TEST_STATE_DIR: &str = "/makima-test-state";
 
-    /// A path under [`TEST_STATE_DIR`] as the fs API resolves it: the backend
-    /// makes a rooted path without a drive absolute against the cwd, so the
-    /// two must be spelled the same way for a seed to land where a tool looks.
-    pub fn test_state_path(rel: &str) -> std::path::PathBuf {
+    /// Resolves [`TEST_STATE_DIR`] against the current drive on Windows so test seeds match paths resolved by the fs API.
+    pub fn test_state_path(rel: &str) -> PathBuf {
         std::env::current_dir()
             .expect("test process has a current directory")
             .join(TEST_STATE_DIR)
             .join(rel)
     }
 
-    pub use crate::api::fs::{InMemoryFs, InMemoryOffloadBackend};
+    pub use crate::api::fs::{
+        FsBackend, FsError, FsMeta, InMemoryFs, InMemoryOffloadBackend, RealFs,
+    };
 
     /// Boots a real `PluginHost` (background Lua thread) pre-loading the given
     /// builtins on an in-memory FS backend with a synthetic state dir, so the

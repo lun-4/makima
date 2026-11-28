@@ -77,6 +77,7 @@ pub struct StatusBarContext<'a> {
 
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
+    writer_warning: Option<String>,
     started_at: Instant,
     cwd: PathBuf,
     cwd_branch: String,
@@ -95,6 +96,7 @@ impl StatusBar {
     pub fn new(flash_duration: Duration, cwd: PathBuf) -> Self {
         Self {
             flash: None,
+            writer_warning: None,
             started_at: Instant::now(),
             cwd_branch: cwd_branch_label(&cwd),
             branch_watcher: watch_branch(&cwd),
@@ -142,6 +144,14 @@ impl StatusBar {
         let changed = branch != self.cwd_branch;
         self.cwd_branch = branch;
         Dirty::from(changed)
+    }
+
+    pub(crate) fn set_writer_warning(&mut self, warning: Option<String>) -> Dirty {
+        if self.writer_warning == warning {
+            return Dirty::NO;
+        }
+        self.writer_warning = warning;
+        Dirty::YES
     }
 
     pub fn clear_flash(&mut self) {
@@ -378,7 +388,11 @@ impl StatusBar {
             }
         }
 
-        if let Some((ref msg, _)) = self.flash {
+        if let Some(msg) = self
+            .writer_warning
+            .as_deref()
+            .or_else(|| self.flash.as_ref().map(|(msg, _)| msg.as_str()))
+        {
             left_spans.push(Span::styled(
                 format!(" {msg}"),
                 theme::current().status_notice,
@@ -1074,7 +1088,8 @@ mod tests {
     #[test_case(false => Dirty::NO  ; "unchanged_branch")]
     #[test_case(true  => Dirty::YES ; "switched_branch")]
     fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
-        let cwd = env::current_dir().unwrap();
+        let (_dir, path) = tmp_with_head(Some("ref: refs/heads/main\n"));
+        let cwd = PathBuf::from(path);
         let label = cwd_branch_label(&cwd);
         let (tx, rx) = flume::bounded(1);
         let mut bar = StatusBar::new(FLASH_TTL, cwd);
@@ -1132,6 +1147,20 @@ mod tests {
             !bar.branch_watcher.as_ref().unwrap().rx.is_disconnected(),
             "the bar must keep watching the cwd it moved to"
         );
+    }
+
+    #[test]
+    fn writer_warning_survives_flash_expiry_until_recovery() {
+        const WARNING: &str = "Session not saved: disk full";
+        let mut bar = StatusBar::new(Duration::ZERO, test_cwd());
+        assert_eq!(bar.set_writer_warning(Some(WARNING.into())), Dirty::YES);
+        bar.flash(FLASH_MSG.into());
+        assert_eq!(bar.clear_expired_hint(), Dirty::YES);
+        bar.clear_flash();
+        assert_eq!(bar.writer_warning.as_deref(), Some(WARNING));
+        assert_eq!(bar.set_writer_warning(Some(WARNING.into())), Dirty::NO);
+        assert_eq!(bar.set_writer_warning(None), Dirty::YES);
+        assert!(bar.writer_warning.is_none());
     }
 
     #[test]

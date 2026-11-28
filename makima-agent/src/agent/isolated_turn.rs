@@ -1,17 +1,36 @@
+use std::path::Path;
 use std::sync::Arc;
+
+use flume::Receiver;
+use futures_lite::future;
 
 use makima_providers::provider::Provider;
 use makima_providers::{
-    ConversationEnd, ConversationLink, ImageSource, Invocation, InvocationPurpose, Message, Model,
-    ProviderEvent, RequestDeliveryTracker, RequestOptions,
+    ConversationEnd, ConversationLink, ConversationRelation, ImageSource, Invocation,
+    InvocationPurpose, Message, Model, ProviderEvent, RequestDeliveryTracker, RequestOptions,
 };
 use makima_storage::id::SessionRef;
 use serde_json::Value;
+use thiserror::Error;
 
+use crate::actor::{ActorError, AgentActorHandle, EffectiveAgentConfig};
 use crate::cancel::CancelToken;
+use crate::context::{ContextBinding, ContextPolicy, RootContext, root_context};
+use crate::journal::{JournalCommit, JournalError, JournalIncarnation};
+use crate::prompt::ResolvedSlots;
+use crate::state::{StateAccess, StateError};
+use crate::template::env_vars_for;
+use crate::{AgentMode, AgentRef, HistorySnapshot, ManagerError, ModeDef, ModeRegistry};
 
 use super::streaming::{end_conversation_detached, fresh_id};
-use super::{UNAVAILABLE_RESULT, close_dangling_tool_calls};
+use super::{
+    Instructions, PromptSlotSource, UNAVAILABLE_RESULT, build_system_prompt_with_def,
+    close_dangling_tool_calls, load_instructions,
+};
+
+pub(crate) const OPERATION_CANCELLED: &str = "operation cancelled";
+const FALLBACK_SYSTEM: &str =
+    "You are a helpful coding assistant. Answer concisely from the conversation context.";
 
 const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
 single response.\n- You have NO tools: you cannot read files, run commands, or take any action.\n\
@@ -28,23 +47,235 @@ pub enum IsolatedTurnEvent {
     Error(String),
 }
 
-pub struct IsolatedTurnRequest {
-    pub provider: Arc<dyn Provider>,
-    pub model: Model,
-    pub history: Vec<Message>,
-    /// The link of the conversation `history` was copied from.
-    pub previous: Option<ConversationLink>,
-    pub system: String,
-    pub question: String,
-    pub images: Vec<ImageSource>,
-    pub session_id: Option<SessionRef>,
-    pub cancel: CancelToken,
+#[derive(Debug, Error)]
+pub enum IsolatedTurnError {
+    #[error(transparent)]
+    Manager(#[from] ManagerError),
+    #[error(transparent)]
+    Actor(#[from] ActorError),
+    #[error(transparent)]
+    State(#[from] StateError),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    #[error("agent configuration is not initialized")]
+    NoConfig,
 }
 
-pub async fn run_isolated_turn(
-    request: IsolatedTurnRequest,
-    output: flume::Sender<IsolatedTurnEvent>,
-) {
+#[derive(Clone)]
+pub struct IsolatedPrompt {
+    pub(crate) override_text: Option<Arc<str>>,
+    pub(crate) append_text: Option<Arc<str>>,
+    pub(crate) modes: Arc<ModeRegistry>,
+    pub(crate) cold_slots: Option<PromptSlotSource>,
+    pub(crate) session_id: Option<SessionRef>,
+}
+
+impl IsolatedPrompt {
+    pub(crate) fn system(
+        &self,
+        cwd: &Path,
+        mode: &AgentMode,
+        definition: Option<&ModeDef>,
+        instructions: &Instructions,
+        slots: &ResolvedSlots,
+    ) -> String {
+        self.compose(|| {
+            build_system_prompt_with_def(
+                &env_vars_for(cwd),
+                definition.unwrap_or(&self.modes.current(mode)),
+                mode,
+                &instructions.text,
+                slots,
+            )
+        })
+    }
+
+    fn compose(&self, default: impl FnOnce() -> String) -> String {
+        let mut system = self
+            .override_text
+            .as_deref()
+            .map_or_else(default, str::to_owned);
+        if let Some(append) = &self.append_text {
+            system.push('\n');
+            system.push_str(append);
+        }
+        system
+    }
+}
+
+pub(crate) struct IsolatedSnapshot {
+    pub(crate) config: Arc<EffectiveAgentConfig>,
+    pub(crate) history: Arc<HistorySnapshot>,
+    pub(crate) prompt: Option<IsolatedPrompt>,
+}
+
+impl AgentRef {
+    pub fn ask_isolated(
+        &self,
+        question: String,
+        images: Vec<ImageSource>,
+        cancel: CancelToken,
+    ) -> Result<Receiver<IsolatedTurnEvent>, IsolatedTurnError> {
+        let (output, events) = flume::bounded(64);
+        if cancel.is_cancelled() {
+            let _ = output.send(IsolatedTurnEvent::Cancelled);
+            return Ok(events);
+        }
+        self.validate_live()?;
+        let incarnation = self.incarnation()?;
+        let actor = self.manager().actor_for_incarnation(&incarnation)?;
+        let IsolatedSnapshot {
+            config,
+            history,
+            prompt,
+        } = actor.isolated_snapshot()?;
+        let recorded = root_context(&self.state_access())?;
+        let definition = prompt
+            .as_ref()
+            .map(|prompt| prompt.modes.current(&AgentMode::Build));
+        let cold_slots = prompt.as_ref().and_then(|prompt| prompt.cold_slots.clone());
+        let journal = self.manager().journal();
+        let session_id = prompt
+            .as_ref()
+            .and_then(|prompt| prompt.session_id.clone())
+            .or_else(|| journal.session_id().map(SessionRef::from));
+        let access = self.state_access();
+        let (stop, cancel) = cancel.child();
+        smol::spawn(async move {
+            let closed = smol::spawn({
+                let actor = actor.clone();
+                async move {
+                    actor.wait_closed().await;
+                    stop.cancel();
+                }
+            });
+            let recorded = if let (None, Some(slots)) = (&recorded, cold_slots) {
+                cancel
+                    .race(async {
+                        let slots = slots.current().await;
+                        initialize_context(
+                            &actor,
+                            access,
+                            config.context.cwd(),
+                            &slots,
+                            incarnation.reservation,
+                        )
+                        .map(Some)
+                    })
+                    .await
+            } else {
+                Ok(Ok(recorded))
+            };
+            match recorded {
+                Ok(Ok(recorded)) => {
+                    let system = match (&prompt, recorded) {
+                        (Some(prompt), Some(context)) => prompt.system(
+                            config.context.cwd(),
+                            &AgentMode::Build,
+                            definition.as_ref(),
+                            &context.instructions,
+                            &context.slots,
+                        ),
+                        (Some(prompt), None) => prompt.compose(|| FALLBACK_SYSTEM.into()),
+                        (None, _) => FALLBACK_SYSTEM.into(),
+                    };
+                    let previous = history.conversation.as_ref().and_then(|conversation| {
+                        conversation.link(ConversationRelation::Branches, history.messages.len())
+                    });
+                    run_isolated_turn(
+                        IsolatedTurnRequest {
+                            provider: Arc::clone(&config.provider),
+                            model: config.model.clone(),
+                            history: history.messages.as_ref().clone(),
+                            previous,
+                            system,
+                            question,
+                            images,
+                            session_id,
+                            cancel,
+                        },
+                        output,
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    let _ = output
+                        .send_async(IsolatedTurnEvent::Error(error.to_string()))
+                        .await;
+                }
+                Err(_) => {
+                    let _ = output.send_async(IsolatedTurnEvent::Cancelled).await;
+                }
+            }
+            closed.cancel().await;
+        })
+        .detach();
+        Ok(events)
+    }
+}
+
+fn initialize_context(
+    actor: &AgentActorHandle,
+    access: StateAccess,
+    cwd: &Path,
+    slots: &ResolvedSlots,
+    reservation: u64,
+) -> Result<Arc<RootContext>, IsolatedTurnError> {
+    let idle = actor.prepare_idle().ok();
+    if let Some(context) = root_context(&access)? {
+        return Ok(context);
+    }
+    let journal = Arc::clone(&access.journal);
+    let instructions = load_instructions(&cwd.to_string_lossy());
+    let (context, update) = ContextBinding::capture(access)?.prepare(
+        &instructions,
+        slots,
+        true,
+        ContextPolicy::Admission,
+    )?;
+    if idle.is_some() {
+        journal.commit_for(
+            JournalIncarnation {
+                agent: actor.agent_id(),
+                reservation,
+            },
+            JournalCommit {
+                context_updates: vec![update],
+                ..Default::default()
+            },
+        )?;
+    }
+    Ok(context)
+}
+
+pub async fn collect_answer(events: Receiver<IsolatedTurnEvent>) -> Result<String, String> {
+    let mut answer = String::new();
+    while let Ok(event) = events.recv_async().await {
+        match event {
+            IsolatedTurnEvent::TextDelta(text) => answer.push_str(&text),
+            IsolatedTurnEvent::ThinkingDelta(_) => {}
+            IsolatedTurnEvent::Done => return Ok(answer),
+            IsolatedTurnEvent::Error(error) => return Err(error),
+            IsolatedTurnEvent::Cancelled => break,
+        }
+    }
+    Err(OPERATION_CANCELLED.into())
+}
+
+struct IsolatedTurnRequest {
+    provider: Arc<dyn Provider>,
+    model: Model,
+    history: Vec<Message>,
+    /// The link of the conversation `history` was copied from.
+    previous: Option<ConversationLink>,
+    system: String,
+    question: String,
+    images: Vec<ImageSource>,
+    session_id: Option<SessionRef>,
+    cancel: CancelToken,
+}
+
+async fn run_isolated_turn(request: IsolatedTurnRequest, output: flume::Sender<IsolatedTurnEvent>) {
     let IsolatedTurnRequest {
         provider,
         model,
@@ -91,7 +322,7 @@ pub async fn run_isolated_turn(
         previous,
     };
     let delivery = RequestDeliveryTracker::new();
-    let result = futures_lite::future::race(
+    let result = future::race(
         provider.stream_message(
             &model,
             &messages,
@@ -265,6 +496,7 @@ mod tests {
             id: SOURCE_CONVERSATION.into(),
             relation: ConversationRelation::Branches,
             shared: SOURCE_SHARED,
+            cancelled: false,
         }
     }
 

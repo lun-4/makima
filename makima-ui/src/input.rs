@@ -1,7 +1,5 @@
-//! Terminal input on a dedicated thread. The event loop waits on all of its
-//! channels at once (input, plugin UI actions, agent events) via a flume
-//! `Selector`; blocking inside `crossterm::event::poll` would make terminal
-//! input the only thing able to wake it.
+//! Terminal input on a dedicated thread so the event loop can wait for input,
+//! plugin UI actions, and agent events together.
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -33,8 +31,13 @@ pub(crate) struct InputReader {
 impl InputReader {
     #[cfg(test)]
     pub(crate) fn disconnected() -> Self {
+        Self::from_receiver(flume::unbounded().1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_receiver(rx: flume::Receiver<Event>) -> Self {
         Self {
-            rx: flume::unbounded().1,
+            rx,
             ctl_tx: flume::unbounded().0,
             join: None,
         }

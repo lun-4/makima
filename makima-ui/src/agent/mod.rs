@@ -1,26 +1,27 @@
-mod agent_loop;
-mod command_router;
 pub(crate) mod pending;
+#[cfg(test)]
+mod runtime_tests;
 pub(crate) mod shared_queue;
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
-use makima_agent::permissions::PermissionManager;
-use makima_agent::tools::offload::OffloadStore;
+use makima_agent::actor::{ActorEvent, PreparedModel};
+use makima_agent::session::{SessionHandle, SessionSubscription};
+use makima_agent::session_coordinator::ModelPreparer;
+use makima_agent::tools::{ToolContext, offload::OffloadStore};
 use makima_agent::{
-    AgentConfig, AgentLimits, AgentManagerHandle, CancelMap, Envelope, HistorySnapshot, McpCommand,
-    McpHandle, PreparedSessionMailbox, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentManagerHandle, CancelScope, Envelope, McpCommand, McpHandle, SessionMailbox,
+    SharedMessages,
 };
-use makima_config::ModelPolicy;
-use makima_lua::EventHandle;
 use makima_providers::provider::{BoxFuture, Provider};
 use makima_providers::{
-    AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderRegistry,
-    ProviderUsage, RequestDelivery, RequestOptions, StreamResponse,
+    AgentError, ConversationEnd, Invocation, Message, Model, ProviderEvent, ProviderUsage,
+    RequestDelivery, RequestOptions, StreamResponse,
 };
 use makima_storage::id::SessionRef;
 use tracing::{info, warn};
@@ -28,10 +29,9 @@ use tracing::{info, warn};
 use crate::app::App;
 use crate::provider_usage::{ProviderAuthGeneration, ProviderIdentity, ProviderInstanceGeneration};
 
-use self::agent_loop::new_backend;
-use self::command_router::spawn_command_router;
-use self::shared_queue::actor_queue;
-pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
+use self::pending::PendingProvider;
+use self::shared_queue::QueueSender;
+pub(crate) use self::shared_queue::QueuedMessage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderChange {
@@ -47,17 +47,21 @@ pub(crate) struct TrackedProvider {
 }
 
 impl TrackedProvider {
-    fn new(
-        inner: Arc<dyn Provider>,
-        instance: ProviderInstanceGeneration,
-        change_tx: flume::Sender<ProviderChange>,
-    ) -> Self {
-        Self {
-            inner,
-            instance,
-            auth_generation: AtomicU64::new(0),
-            change_tx,
-        }
+    fn wrap(provider: Arc<dyn Provider>, change_tx: &flume::Sender<ProviderChange>) -> Arc<Self> {
+        let erased: Arc<dyn Any + Send + Sync> = provider.clone();
+        Arc::downcast(erased).unwrap_or_else(|_| {
+            Arc::new(Self {
+                inner: provider,
+                instance: next_provider_instance(),
+                auth_generation: AtomicU64::new(0),
+                change_tx: change_tx.clone(),
+            })
+        })
+    }
+
+    pub(crate) fn pending(&self) -> Option<&PendingProvider> {
+        let inner: &dyn Any = self.inner.as_ref();
+        inner.downcast_ref()
     }
 
     pub(crate) fn identity(&self) -> ProviderIdentity {
@@ -82,6 +86,10 @@ impl TrackedProvider {
 }
 
 impl Provider for TrackedProvider {
+    fn model_preparation(&self) -> Option<BoxFuture<'_, Result<&PreparedModel, AgentError>>> {
+        self.inner.model_preparation()
+    }
+
     fn stream_message<'a>(
         &'a self,
         model: &'a Model,
@@ -173,11 +181,7 @@ impl ProviderSlot {
         provider: Arc<dyn Provider>,
         change_tx: flume::Sender<ProviderChange>,
     ) -> Arc<Self> {
-        let tracked = Arc::new(TrackedProvider::new(
-            provider,
-            next_provider_instance(),
-            change_tx.clone(),
-        ));
+        let tracked = TrackedProvider::wrap(provider, &change_tx);
         Arc::new(Self {
             current: ArcSwap::from_pointee(ProviderSnapshot {
                 model,
@@ -195,6 +199,20 @@ impl ProviderSlot {
         self.change_tx.clone()
     }
 
+    pub(crate) fn track_model(&self, mut prepared: PreparedModel) -> PreparedModel {
+        prepared.provider = TrackedProvider::wrap(prepared.provider, &self.change_tx);
+        prepared
+    }
+
+    pub(crate) fn track_preparation(self: &Arc<Self>, prepare: ModelPreparer) -> ModelPreparer {
+        let slot = Arc::clone(self);
+        Arc::new(move |spec| {
+            let prepare = Arc::clone(&prepare);
+            let slot = Arc::clone(&slot);
+            Box::pin(async move { Ok(slot.track_model(prepare(spec).await?)) })
+        })
+    }
+
     pub(crate) fn project(&self, model: Model, provider: Arc<dyn Provider>) {
         let current = self.load();
         let tracked = Arc::clone(&current.provider) as Arc<dyn Provider>;
@@ -210,12 +228,7 @@ impl ProviderSlot {
     }
 
     pub(crate) fn install(&self, model: Model, provider: Arc<dyn Provider>) -> ProviderIdentity {
-        let instance = next_provider_instance();
-        let tracked = Arc::new(TrackedProvider::new(
-            provider,
-            instance,
-            self.change_tx.clone(),
-        ));
+        let tracked = TrackedProvider::wrap(provider, &self.change_tx);
         let identity = tracked.identity();
         self.current.store(Arc::new(ProviderSnapshot {
             model,
@@ -226,16 +239,6 @@ impl ProviderSlot {
     }
 }
 
-impl makima_agent::ModelSource for ProviderSlot {
-    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
-        let snapshot = self.load();
-        Some((
-            Arc::clone(&snapshot.provider) as Arc<dyn Provider>,
-            snapshot.model.clone(),
-        ))
-    }
-}
-
 /// Inherited via CLI across every session.
 #[derive(Clone, Default)]
 pub(crate) struct SystemPromptOverride {
@@ -243,168 +246,59 @@ pub(crate) struct SystemPromptOverride {
     pub(crate) append_text: Option<String>,
 }
 
-pub(crate) enum AgentCommand {
-    CancelAll,
-    CancelSubagent { tool_use_id: String },
-}
-
-/// Stale events on the output channel (`agent_tx`/`agent_rx`) are filtered
-/// by `run_id`, not by killing the channel.
-///
-/// The scheduler, history, lifecycle, and retained outcomes live in the
-/// actor owned here: `actor` is the handle, `task` the runner task.
-pub(crate) struct PreparedAgentHandles {
-    handles: Option<AgentHandles>,
-    mailbox: Option<PreparedSessionMailbox>,
-}
-
-impl PreparedAgentHandles {
-    #[cfg(test)]
-    pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, makima_agent::AgentId) {
-        let handles = self.handles.as_ref().expect("prepared handles");
-        (handles.manager.clone(), handles.root_id)
-    }
-
-    pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
-        self.handles.as_ref().expect("prepared handles").mailbox()
-    }
-
-    pub(crate) fn activate(mut self) -> AgentHandles {
-        if let Some(mailbox) = self.mailbox.take() {
-            let activated = mailbox.activate();
-            self.handles.as_mut().expect("prepared handles").mailbox = Some(activated);
-        }
-        self.handles.take().expect("prepared handles")
-    }
-}
-
-impl Drop for PreparedAgentHandles {
-    fn drop(&mut self) {
-        if let Some(handles) = self.handles.take() {
-            handles.shutdown_actor();
-        }
-    }
-}
-
-pub(crate) struct AgentHandles {
-    pub(crate) cmd_tx: flume::Sender<AgentCommand>,
-    pub(crate) agent_rx: flume::Receiver<Envelope>,
-    pub(crate) actor_rx: flume::Receiver<makima_agent::actor::ActorEvent>,
+pub(crate) struct RuntimeChannels {
+    pub(crate) session: SessionHandle,
+    pub(crate) events: SessionSubscription,
+    pub(crate) actor_rx: flume::Receiver<ActorEvent>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
-    pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
-    pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) queue: QueueSender,
-    mailbox: Option<SessionMailbox>,
-    cwd: Arc<ArcSwap<PathBuf>>,
     pub(crate) offload: Option<Arc<OffloadStore>>,
-    pub(crate) orchestration_template: makima_agent::tools::ToolContext,
-    subagent_cancels: Arc<CancelMap<String>>,
-    manager: AgentManagerHandle,
-    root_id: makima_agent::AgentId,
-    runner_start: Option<flume::Sender<()>>,
+    pub(crate) orchestration_template: ToolContext,
+    cwd: Arc<ArcSwap<PathBuf>>,
+    mcp_handle: Option<McpHandle>,
 }
 
-impl AgentHandles {
-    pub(crate) fn release_runner(&mut self) {
-        if let Some(start) = self.runner_start.take() {
-            let _ = start.send(());
+impl RuntimeChannels {
+    pub(crate) fn new(
+        session: SessionHandle,
+        actor_rx: flume::Receiver<ActorEvent>,
+        queue: QueueSender,
+        cwd: Arc<ArcSwap<PathBuf>>,
+        mcp_handle: Option<McpHandle>,
+    ) -> Self {
+        Self {
+            events: session.events.subscribe(),
+            agent_tx: session.agent_sender(),
+            history: session.shared_history(),
+            offload: session.offload(),
+            orchestration_template: session.template().clone(),
+            session,
+            actor_rx,
+            queue,
+            cwd,
+            mcp_handle,
         }
     }
 
-    /// MCP is shared across sessions; the event loop starts it once and shuts
-    /// it down at exit. Only the actor task lives here.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn(
-        model_slot: &Arc<ProviderSlot>,
-        initial_history: Vec<Message>,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
-        permissions: &Arc<PermissionManager>,
-        initial_cwd: PathBuf,
-        session_id: Option<SessionRef>,
-        timeouts: makima_providers::Timeouts,
-        lua_handle: EventHandle,
-        mcp_handle: Option<McpHandle>,
-        model_policy: Arc<ModelPolicy>,
-        providers: Arc<ProviderRegistry>,
-        system_prompt: SystemPromptOverride,
-    ) -> Self {
-        let selected = model_slot.load();
-        let initial_config = makima_agent::EffectiveAgentConfig::new(
-            makima_agent::RunSettings {
-                provider: Arc::clone(&selected.provider) as Arc<dyn Provider>,
-                model: selected.model.clone(),
-                fast: false,
-                workflow: false,
-                thinking: Default::default(),
-            },
-            makima_agent::AgentMode::Build,
-        );
-        drop(selected);
-        let mut handles = Self::prepare(
-            model_slot,
-            initial_config,
-            HistorySnapshot::new(initial_history),
-            config,
-            tool_output_lines,
-            permissions,
-            initial_cwd,
-            session_id,
-            None,
-            timeouts,
-            lua_handle,
-            mcp_handle,
-            model_policy,
-            providers,
-            system_prompt,
-        )
-        .activate();
-        handles.release_runner();
-        handles
+    pub(crate) fn cancel_root(&self) {
+        let _ = self
+            .session
+            .cancellation
+            .cancel(CancelScope::Subtree(self.session.root().id()));
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare(
-        model_slot: &Arc<ProviderSlot>,
-        initial_config: makima_agent::EffectiveAgentConfig,
-        initial_history: HistorySnapshot,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
-        permissions: &Arc<PermissionManager>,
-        initial_cwd: PathBuf,
-        session_id: Option<SessionRef>,
-        offload: Option<Arc<OffloadStore>>,
-        timeouts: makima_providers::Timeouts,
-        lua_handle: EventHandle,
-        mcp_handle: Option<McpHandle>,
-        model_policy: Arc<ModelPolicy>,
-        providers: Arc<ProviderRegistry>,
-        system_prompt: SystemPromptOverride,
-    ) -> PreparedAgentHandles {
-        spawn_agent_internal(
-            model_slot,
-            initial_config,
-            initial_history,
-            config,
-            tool_output_lines,
-            permissions,
-            Arc::new(ArcSwap::from_pointee(initial_cwd)),
-            mcp_handle,
-            session_id,
-            offload,
-            timeouts,
-            lua_handle,
-            model_policy,
-            providers,
-            system_prompt,
-        )
+    #[cfg(test)]
+    pub(crate) fn runner_start_is_pending(&self) -> bool {
+        self.session.runner_start_is_pending()
+    }
+
+    pub(crate) fn release_runner(&self) {
+        self.session.activate();
     }
 
     pub(crate) fn mailbox(&self) -> Option<SessionMailbox> {
-        self.mailbox.clone()
+        Some(self.session.mailbox().clone())
     }
 
     pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
@@ -412,29 +306,30 @@ impl AgentHandles {
     }
 
     pub(crate) fn manager_and_root(&self) -> (AgentManagerHandle, makima_agent::AgentId) {
-        (self.manager.clone(), self.root_id)
+        (self.session.manager.clone(), self.session.root().id())
     }
 
     pub(crate) fn identity(&self) -> Arc<()> {
-        self.manager
-            .actor(self.root_id)
+        self.session
+            .root()
+            .actor()
             .expect("live runtime actor")
             .identity()
     }
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
-        app.chats[0].agent_id = Some(self.root_id);
-        app.root_agent = Some(self.manager.reference(self.root_id));
-        app.lua_event_handle.observe_agents(&self.manager);
-        app.answer_tx = Some(self.answer_tx.clone());
-        app.cmd_tx = Some(self.cmd_tx.clone());
+        let (manager, root_id) = self.manager_and_root();
+        app.chats[0].agent_id = Some(root_id);
+        app.agent_chat_index.insert(root_id, 0);
+        app.root_agent = Some(self.session.root().clone());
+        app.lua_event_handle.observe_agents(&manager);
+        app.answers = Some(self.session.answers.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
         let restore_tx = makima_agent::EventSender::with_identity(
             self.agent_tx.clone(),
             Some(makima_agent::ActorWorkIdentity::new(
-                self.manager_and_root().1,
+                root_id,
                 makima_agent::ActorWorkKind::Control { operation_id: 0 },
                 crate::app::RESTORE_PRESENTATION,
             )),
@@ -442,19 +337,8 @@ impl AgentHandles {
         app.restore_event_tx = Some(restore_tx.clone());
         for chat in &mut app.chats {
             chat.set_restore_channel(Some(restore_tx.clone()));
+            chat.set_restore_target(chat.agent_id.map(|id| manager.reference(id)));
         }
-    }
-
-    /// Shuts the old actor down after the app and queue are repointed, so
-    /// its close cannot poison the replacement. Everything the old agent
-    /// still owns drains through the retained per-tab output channel.
-    fn shutdown_actor(&self) {
-        let manager = self.manager.clone();
-        smol::spawn(async move {
-            let _ = manager.shutdown(Duration::from_secs(3)).await;
-        })
-        .detach();
-        self.subagent_cancels.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -464,25 +348,27 @@ impl AgentHandles {
     }
 
     pub(crate) fn claim_mailbox_wake(&self) -> Vec<Message> {
-        self.mailbox
-            .as_ref()
-            .map(SessionMailbox::claim_wake)
-            .unwrap_or_default()
+        self.session.mailbox().claim_wake()
     }
 
     pub(crate) fn is_finished(&self) -> bool {
-        self.manager.runner_finished(self.root_id).unwrap_or(true)
+        self.session
+            .manager
+            .runner_finished(self.session.root().id())
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn suspend(self) -> smol::Task<()> {
+        smol::spawn(async move {
+            let _ = self.session.manager.suspend(Duration::from_secs(3)).await;
+        })
     }
 
     pub(crate) fn shutdown(self) -> smol::Task<()> {
-        self.subagent_cancels.cancel_all();
-        smol::spawn(async move {
-            let _ = self.manager.shutdown(Duration::from_secs(3)).await;
-        })
+        self.suspend()
     }
 }
 
-/// Wait for every agent task under one shared timeout, not one per task.
 pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
     info!(
         count = tasks.len(),
@@ -508,163 +394,23 @@ pub(crate) fn join_all(tasks: Vec<smol::Task<()>>, timeout: Duration) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_agent_internal(
-    model_slot: &Arc<ProviderSlot>,
-    initial_config: makima_agent::EffectiveAgentConfig,
-    initial_history: HistorySnapshot,
-    config: AgentConfig,
-    tool_output_lines: ToolOutputLines,
-    permissions: &Arc<PermissionManager>,
-    cwd: Arc<ArcSwap<PathBuf>>,
-    mcp_handle: Option<McpHandle>,
-    session_id: Option<SessionRef>,
-    offload: Option<Arc<OffloadStore>>,
-    timeouts: makima_providers::Timeouts,
-    lua_handle: EventHandle,
-    model_policy: Arc<ModelPolicy>,
-    providers: Arc<ProviderRegistry>,
-    system_prompt: SystemPromptOverride,
-) -> PreparedAgentHandles {
-    let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
-    let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    // Seeded empty because `AgentActorHandle::spawn` publishes the real
-    // snapshot synchronously, before any handle escapes.
-    let shared_history: SharedMessages = Arc::new(ArcSwap::from_pointee(initial_history.clone()));
-    let initial_history = Arc::unwrap_or_clone(initial_history.messages);
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
-    let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
-    let prepared_mailbox = session_id
-        .as_ref()
-        .map(|session_id| SessionMailbox::prepare(session_id.id()));
-    let mailbox = prepared_mailbox
-        .as_ref()
-        .map(PreparedSessionMailbox::mailbox);
-
-    let (init_trigger, init_cancel) = makima_agent::CancelToken::new();
-
-    let limits = AgentLimits {
-        max_concurrent_agent_turns: config.max_concurrent_agent_turns,
-        max_agent_depth: config.max_agent_depth,
-        max_children_per_agent: config.max_children_per_agent,
-        max_live_agents: config.max_live_agents,
-    };
-    let manager = AgentManagerHandle::new(limits).expect("validated agent limits");
-    let (runner_start, start_rx) = flume::bounded(1);
-    let mut orchestration_template = None;
-    let root = manager
-        .create_root_deferred_with_config(
-            Some(
-                initial_config.with_context(makima_agent::actor::AgentContextSnapshot::new(
-                    (**cwd.load()).clone(),
-                )),
-            ),
-            initial_history.clone(),
-            Some(Arc::clone(&shared_history)),
-            |agent_id| {
-                let backend = new_backend(
-                    agent_id,
-                    Arc::clone(model_slot),
-                    Arc::clone(&cwd),
-                    config,
-                    tool_output_lines,
-                    Arc::clone(&btw_system),
-                    mcp_handle.clone(),
-                    &initial_history,
-                    Arc::clone(permissions),
-                    agent_tx.clone(),
-                    answer_rx,
-                    session_id,
-                    mailbox.clone(),
-                    timeouts,
-                    lua_handle,
-                    Arc::clone(&subagent_cancels),
-                    Arc::clone(&model_policy),
-                    Arc::clone(&providers),
-                    system_prompt.clone(),
-                    Arc::new(makima_agent::tools::FileWriteLocks::new()),
-                    offload.clone(),
-                    init_cancel,
-                );
-                orchestration_template = Some(backend.orchestration_template());
-                Ok::<Box<dyn makima_agent::ActorBackend>, String>(Box::new(backend))
-            },
-            start_rx,
-        )
-        .expect("root agent factory");
-    let root_id = root.id();
-    let actor = Arc::new(root.actor().expect("committed root actor"));
-    let queue_tx = actor_queue(Arc::clone(&actor));
-
-    spawn_command_router(
-        cmd_rx,
-        manager.clone(),
-        root_id,
-        Arc::clone(&subagent_cancels),
-        init_trigger,
-    );
-
-    PreparedAgentHandles {
-        handles: Some(AgentHandles {
-            cmd_tx,
-            agent_rx,
-            actor_rx: actor.subscribe_events(),
-            agent_tx,
-            answer_tx,
-            history: shared_history,
-            btw_system,
-            mcp_handle,
-            queue: queue_tx,
-            mailbox,
-            cwd,
-            offload,
-            orchestration_template: orchestration_template
-                .expect("root factory prepares orchestration template"),
-            subagent_cancels,
-            manager,
-            root_id,
-            runner_start: Some(runner_start),
-        }),
-        mailbox: prepared_mailbox,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::Instant;
 
-    use makima_config::PermissionsConfig;
     use makima_providers::provider::BoxFuture;
     use makima_providers::{
         AgentError, Invocation, ProviderEvent, RequestDelivery, RequestOptions, StreamResponse,
     };
 
-    use super::*;
+    use super::{
+        Arc, Duration, Provider, ProviderAuthGeneration, ProviderChange, ProviderSlot, SessionRef,
+        join_all,
+    };
+    use makima_providers::{Message, Model};
 
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(50);
-    const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
-
-    struct StubProvider;
-
-    impl Provider for StubProvider {
-        fn stream_message<'a>(
-            &'a self,
-            _model: &'a Model,
-            _messages: &'a [Message],
-            _system: &'a str,
-            _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
-            _opts: RequestOptions,
-            _session_id: Option<&'a SessionRef>,
-            _invocation: &'a Invocation,
-            _delivery: RequestDelivery,
-        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            Box::pin(std::future::pending())
-        }
-    }
 
     struct AuthProvider {
         reload_ok: bool,
@@ -707,32 +453,6 @@ mod tests {
         ProviderSlot::new(
             crate::components::test_model(),
             Arc::new(AuthProvider { reload_ok }),
-        )
-    }
-
-    fn stub_spawn(initial_history: Vec<Message>) -> AgentHandles {
-        let (model_slot, _change_rx) =
-            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
-        let permissions = Arc::new(PermissionManager::new(
-            PermissionsConfig::default(),
-            PathBuf::from("/tmp"),
-            makima_config::ProjectConfig::for_project(std::path::Path::new("/tmp")),
-            Arc::default(),
-        ));
-        AgentHandles::spawn(
-            &model_slot,
-            initial_history,
-            AgentConfig::default(),
-            ToolOutputLines::default(),
-            &permissions,
-            PathBuf::from("/tmp"),
-            None,
-            makima_providers::Timeouts::default(),
-            EventHandle::disconnected_for_test(),
-            None,
-            Arc::new(ModelPolicy::default()),
-            Arc::default(),
-            SystemPromptOverride::default(),
         )
     }
 
@@ -798,20 +518,6 @@ mod tests {
         assert!(smol::block_on(failed.reload_auth()).is_err());
         assert_eq!(failed.identity().auth, ProviderAuthGeneration(0));
         assert!(failed_rx.is_empty());
-    }
-
-    /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint
-    /// would adopt it and wipe a resumed conversation from disk.
-    #[test]
-    fn spawn_publishes_the_resumed_history_before_the_handles_escape() {
-        let handles = stub_spawn(vec![Message::user(RESUMED_HISTORY_TEXT.into())]);
-        let snapshot = handles.history.load();
-        assert_eq!(
-            snapshot.messages.len(),
-            1,
-            "the seeded empty snapshot must be replaced synchronously"
-        );
-        assert_eq!(snapshot.messages[0].user_text(), Some(RESUMED_HISTORY_TEXT));
     }
 
     /// A session owns its provider slot, but the usage coordinator listens on

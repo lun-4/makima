@@ -10,6 +10,9 @@
 //! Only write paths (`claim`, `heartbeat`) mutate lock state. Readers (`open_elsewhere`)
 //! never reclaim: a stale lock is cleaned up by the next claim.
 
+#[cfg(test)]
+use makima_domain::LockExt;
+use std::fmt::{self, Debug, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 use tracing::warn;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
 
 use crate::id::MakimaId;
 
@@ -160,9 +165,7 @@ fn sidecar_read_error() -> &'static Mutex<Option<(PathBuf, io::ErrorKind)>> {
 
 #[cfg(test)]
 fn take_sidecar_read_error(path: &Path) -> Option<io::Error> {
-    let mut error = sidecar_read_error()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut error = sidecar_read_error().lock_unpoisoned();
     if error.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, kind) = error.take().expect("matching sidecar read error");
         return Some(io::Error::new(kind, "injected sidecar read failure"));
@@ -184,9 +187,7 @@ fn publish_before_lock_hook() -> &'static Mutex<Option<PublishHook>> {
 
 #[cfg(test)]
 fn run_publish_before_lock_hook(path: &Path) {
-    let mut hook = publish_before_lock_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut hook = publish_before_lock_hook().lock_unpoisoned();
     if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, callback) = hook.take().expect("matching publish hook");
         drop(hook);
@@ -196,9 +197,7 @@ fn run_publish_before_lock_hook(path: &Path) {
 
 #[cfg(test)]
 fn run_release_before_write_hook(path: &Path) {
-    let mut hook = release_before_write_hook()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut hook = release_before_write_hook().lock_unpoisoned();
     if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
         let (_, callback) = hook.take().expect("matching release hook");
         drop(hook);
@@ -207,14 +206,24 @@ fn run_release_before_write_hook(path: &Path) {
 }
 
 /// The sole identity-bearing lease for a claimed session lock.
-#[derive(Debug)]
 pub struct ClaimedSessionLock {
     path: PathBuf,
     owner: LockOwner,
     released: bool,
+    release_hooks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
-#[derive(Debug, Clone)]
+impl Debug for ClaimedSessionLock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaimedSessionLock")
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPublicationGuard {
     path: PathBuf,
     owner: LockOwner,
@@ -240,6 +249,10 @@ impl SessionPublicationGuard {
 }
 
 impl ClaimedSessionLock {
+    pub fn on_release(&mut self, hook: impl FnOnce() + Send + 'static) {
+        self.release_hooks.push(Box::new(hook));
+    }
+
     pub fn publication_guard(&self) -> SessionPublicationGuard {
         SessionPublicationGuard {
             path: self.path.clone(),
@@ -248,6 +261,8 @@ impl ClaimedSessionLock {
     }
 
     /// Refresh the lease only while the on-disk lock still has this lease's identity.
+    /// Liveness is the mtime alone and a lost beat after a crash only makes the
+    /// lease stale, so the beat touches the mtime without rewriting or syncing.
     pub fn heartbeat(&mut self) -> io::Result<LockBeat> {
         let Some(mut file) = open_existing_locked(&self.path)? else {
             return Ok(LockBeat::Lost);
@@ -256,7 +271,7 @@ impl ClaimedSessionLock {
             file.unlock()?;
             return Ok(LockBeat::Lost);
         }
-        write_record(&mut file, self.owner.pid.to_string().as_bytes())?;
+        file.set_modified(SystemTime::now())?;
         file.unlock()?;
         Ok(LockBeat::Held)
     }
@@ -267,6 +282,9 @@ impl ClaimedSessionLock {
     }
 
     fn release_inner(&mut self) -> io::Result<()> {
+        for hook in self.release_hooks.drain(..) {
+            hook();
+        }
         let Some(mut file) = open_existing_locked_blocking(&self.path)? else {
             self.released = true;
             return Ok(());
@@ -290,8 +308,7 @@ impl Drop for ClaimedSessionLock {
     }
 }
 
-/// `fs4` reports `LockFileEx` failures as raw Windows errors, so a lock that
-/// simply belongs to someone else is not `WouldBlock` there.
+// Windows can report lock contention as a raw lock or sharing violation.
 fn is_contended(error: &io::Error) -> bool {
     #[cfg(windows)]
     {
@@ -299,8 +316,7 @@ fn is_contended(error: &io::Error) -> bool {
             || matches!(
                 error.raw_os_error(),
                 Some(code)
-                    if code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
-                        || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+                    if code == ERROR_LOCK_VIOLATION as i32 || code == ERROR_SHARING_VIOLATION as i32
             )
     }
     #[cfg(not(windows))]
@@ -459,6 +475,7 @@ pub fn claim(dir: &Path, id: &MakimaId) -> io::Result<Option<ClaimedSessionLock>
         path,
         owner,
         released: false,
+        release_hooks: Vec::new(),
     }))
 }
 
@@ -565,9 +582,7 @@ mod tests {
         let mut file = File::options().read(true).write(true).open(path)?;
         file.try_lock_exclusive()?;
         // A second handle cannot read the region this one locked on Windows.
-        let mut record = String::new();
-        file.read_to_string(&mut record)?;
-        let holder: Option<u32> = record.trim().parse().ok();
+        let holder = read_pid(&mut file)?;
         let foreign = holder.is_some_and(|holder| holder != pid);
         if foreign
             && fs::metadata(path)
@@ -746,12 +761,29 @@ mod tests {
         let blocker = File::options().read(true).write(true).open(path).unwrap();
         blocker.lock_exclusive().unwrap();
 
+        assert!(claim(dir.path(), &id).unwrap().is_none());
         assert_eq!(
             lease.heartbeat().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         blocker.unlock().unwrap();
         assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+    }
+
+    #[test]
+    fn heartbeat_refreshes_backdated_lease_without_rewriting_it() {
+        let dir = tempdir().unwrap();
+        let id = MakimaId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let record = fs::read(&path).unwrap();
+        backdate(&path, STALE_AFTER + Duration::from_secs(5));
+
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(is_fresh(mtime, SystemTime::now()));
+        assert_eq!(fs::read(&path).unwrap(), record);
+        lease.release().unwrap();
     }
 
     #[test]

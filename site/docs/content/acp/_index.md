@@ -35,7 +35,7 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 
 ## What works
 
-- Sessions persist. Loading a session replays the full conversation in the editor. A session that is open in another terminal cannot be loaded.
+- Sessions persist. Loading a session sends its saved conversation to the editor. A session that is open in another terminal cannot be loaded.
 - Session options include Model, YOLO, Fast, Workflow, and available plugin options such as Bash auto mode. New and loaded sessions return the complete ordered option list. Option updates also contain the complete list.
 - Model switching uses the editor's model selector. All configured providers appear. Providers such as OpenRouter add discovered models in the background. A model change and any required Fast disablement appear as one update.
 - Modes switch between build mode and plan mode. Build mode has full tool access. Plan mode limits writes to the plan file.
@@ -44,12 +44,17 @@ The `model` value is a `provider/model-id` spec, same format as `makima --model`
 - Tool progress streams during execution, including sub-agents and batched calls.
 - Prompts can include images and editor-attached files.
 - The editor receives the target-scoped command list. The list updates when plugin or MCP registrations change. An available leading slash command runs before model input. Unknown and unavailable slash-prefixed text is rejected with an error. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Agent-turn commands preserve images and text resources. Local commands reject non-text content.
-- A `session/prompt` sent while a turn runs joins that turn, as typing does in the TUI (see [messages and turns](/docs/agent-work/#messages-and-turns)). Both prompts resolve when the turn ends, with the same stop reason. A prompt that cannot join, for example after a model switch, runs as the next turn and resolves with it. While `/compact` or `/btw` runs, a new prompt is rejected.
+- A `session/prompt` sent while a turn runs can [join that turn](/docs/agent-work/#messages-and-turns). Joined prompts resolve with the same stop reason. If a prompt cannot join, it resolves with its own turn. While `/compact` runs, ACP rejects new prompts.
 - `/compact` reports a `Compact context` tool call and saves the compacted model history before it reports success.
-- `/btw` runs one isolated model request with copied history and no tools. Its question and response do not change the primary model history.
+- `/btw` can run during an active turn. ACP shows the answer as a completed tool call as soon as the side question finishes. Prompts can still join the active turn. See [Isolated questions](/docs/agent-work/#isolated-questions).
 - `/cd` reports the canonical working directory as an agent message. Later relative tool locations use that directory.
+- `/reload-context` reloads the session's recorded context and can run from any agent. Normal resume keeps the recorded context. See [Recorded context](/docs/context/#recorded-context).
 
 ACP maps the target-scoped central registry to ACP command metadata. Commands that require TUI capabilities are omitted from ACP's advertised command list. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`). ACP hides `/new` and `/clear` because the ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference, reset model history, or mutate the active session. Custom Markdown commands, MCP prompts, and portable Lua commands use the same registry and collision rules as the TUI. See [Commands](/docs/commands/).
+
+Loaded ACP sessions follow the shared [persistence and resume rules](/docs/agent-work/#persistence-and-resume).
+
+Rewind is not available over ACP. See [Rewind](/docs/agent-work/#rewind).
 
 ACP cannot remove messages from the editor's visible transcript or change the editor's displayed session directory. `/compact` changes only the model context. `/cd` changes Makima's canonical working directory and reports it in the transcript, but the editor can continue to display its original directory field.
 

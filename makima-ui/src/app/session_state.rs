@@ -1,14 +1,30 @@
-use std::path::{Path, PathBuf};
+use color_eyre::Result;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use makima_agent::actor::{AgentContextSnapshot, EffectiveAgentConfig};
+use makima_agent::ModeId;
+use makima_agent::actor::EffectiveAgentConfig;
+#[cfg(test)]
+use makima_agent::actor::{AgentContextSnapshot, PreparedModel};
+use makima_agent::journal::{SessionJournal, SessionJournalSnapshot};
+use makima_agent::plan_state;
+#[cfg(test)]
 use makima_agent::{AgentMode, ModeRegistry, RunSettings, SessionDefaults};
+#[cfg(test)]
 use makima_agent::{modes, session_defaults};
-use makima_config::{Effect, ModelPolicy};
+#[cfg(test)]
+use makima_providers::Model;
+#[cfg(test)]
 use makima_providers::provider::Provider;
-use makima_providers::{Model, ProviderRegistry, TokenUsage, settle_session};
+#[cfg(test)]
 use makima_storage::StateDir;
-use makima_storage::sessions::{StoredEffect, StoredMode, StoredRule, read_prefs};
+#[cfg(test)]
+use makima_storage::session_state::StoredAgentConfig;
+use makima_storage::sessions::StoredMode;
+#[cfg(test)]
+use makima_storage::sessions::read_prefs;
 
 use crate::AppSession;
 
@@ -43,106 +59,127 @@ impl ConfigSource {
 }
 
 pub(crate) struct SessionState {
-    /// Shared with the writer thread, so a checkpoint is just a refcount bump.
-    pub session: Arc<AppSession>,
-    pub token_usage: TokenUsage,
-    /// What the session has billed so far: the restored total plus every turn
-    /// since. Kept running, because re-deriving it from the counters would
-    /// re-price history at today's rates. `None` while nothing was priced.
-    pub cost: Option<f64>,
-    pub context_size: u32,
-    /// UI-owned plan bookkeeping. The agent's committed mode carries the plan
-    /// path; whether the plan is drafted or ready is only tracked here.
+    pub(crate) projection: Arc<SessionJournalSnapshot>,
     pub plan: PlanState,
     pub warnings: Vec<String>,
-    /// A saved `/fast` the model cannot honour until discovery says whether it
-    /// supports fast. The agent runs without fast meanwhile; this keeps the
-    /// wish persisted.
-    pub fast_pending: bool,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
-const MODE_RESTORE_FAILED_WARNING: &str = "Could not restore the saved mode, resumed in build mode";
 
 impl SessionState {
-    pub fn from_session(
-        mut session: AppSession,
-        fallback_model: &Model,
-        model_policy: &ModelPolicy,
-        providers: &ProviderRegistry,
-    ) -> Self {
-        let model = resumed_model(&mut session, fallback_model, model_policy, providers);
+    pub fn from_session(session: &AppSession) -> Result<Self> {
+        Self::from_projection(SessionJournal::from_session(session)?.projection())
+    }
 
+    fn from_projection(projection: Arc<SessionJournalSnapshot>) -> Result<Self> {
+        let view = projection.fold()?;
+        let root = projection.root_agent_id();
+        let stored = root
+            .and_then(|root| view.scopes.get(&Some(root)))
+            .and_then(|scope| scope.config.as_ref());
         let mut warnings = Vec::new();
-
-        let plan = match &session.meta.plan_path {
-            Some(p) if Path::new(p).exists() => {
-                if session.meta.plan_written {
+        let entries = plan_state::plan_entries(&view).unwrap_or_default();
+        let entry = root.and_then(|root| entries.get(&root));
+        let plan_path = stored.map_or_else(
+            || entry.map(|entry| entry.path.as_path()),
+            |config| {
+                (ModeId::parse(&config.mode.id) == ModeId::Plan)
+                    .then_some(config.mode.restrict_write_to.as_deref())
+                    .flatten()
+            },
+        );
+        let plan = match plan_path {
+            Some(p) if p.exists() => {
+                if entry.is_some_and(|entry| entry.written) {
                     PlanState::Ready(PathBuf::from(p))
                 } else {
                     PlanState::Drafting(PathBuf::from(p))
                 }
             }
             Some(_) => {
-                warnings.push(PLAN_FILE_MISSING_WARNING.into());
+                if stored.is_none() {
+                    warnings.push(PLAN_FILE_MISSING_WARNING.into());
+                }
                 PlanState::None
             }
             None => PlanState::None,
         };
 
-        let fast_pending = session.meta.fast && !model.supports_fast() && model.fast_pending();
-        let token_usage = session.token_usage;
-        let fast = session.meta.fast && model.supports_fast();
-        let cost = settle_session(
-            &token_usage,
-            session.usage_by_model_mut(),
-            &model,
-            fast,
-            providers,
-        );
-        let context_size = session.meta.context_size;
-
-        Self {
-            fast_pending,
-            session: Arc::new(session),
-            token_usage,
-            cost,
-            context_size,
+        Ok(Self {
+            projection,
             plan,
             warnings,
-        }
-    }
-
-    pub fn session_mut(&mut self) -> &mut AppSession {
-        Arc::make_mut(&mut self.session)
+        })
     }
 
     /// The configuration the agent is seeded with: the session being resumed,
     /// or {defaults} for a blank one. The app shows it until the agent
     /// answers, then the agent's committed config.
+    #[cfg(test)]
     pub fn starting_config(
-        &self,
+        &mut self,
         provider: Arc<dyn Provider>,
         model: &Model,
         cwd: PathBuf,
         registry: &ModeRegistry,
         storage: &StateDir,
         defaults: SessionDefaults,
-    ) -> EffectiveAgentConfig {
-        let build = AgentMode::Build;
-        let (mode, mode_def) = modes::restored(registry, &self.session.meta, storage)
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "resuming in build mode");
-                (build.clone(), registry.current(&build))
-            });
+    ) -> Result<EffectiveAgentConfig> {
+        let view = self.projection.fold()?;
+        let stored = self.projection.root_agent_id().and_then(|root| {
+            view.scopes
+                .get(&Some(root))
+                .and_then(|scope| scope.config.as_ref())
+        });
+        let root = self.projection.root_agent_id();
+        let (mode, mode_def) = match (stored, root) {
+            (Some(config), Some(root)) => {
+                let restored =
+                    plan_state::prepare_restore_for_agent(&view, root, &config.mode, registry)?;
+                self.warnings.extend(restored.warning);
+                (restored.mode, restored.definition)
+            }
+            _ => {
+                let current = self
+                    .plan
+                    .path()
+                    .map(|path| AgentMode::Plan(path.to_path_buf()))
+                    .unwrap_or(AgentMode::Build);
+                let restored = modes::saved(self.projection.seed_meta()).map_or_else(
+                    || Ok((AgentMode::Build, registry.current(&AgentMode::Build))),
+                    |(key, _)| modes::resolve(registry, key, &current, storage),
+                );
+                restored.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "resuming in read-only mode");
+                    let fallback = modes::read_only_fallback(error);
+                    self.warnings.extend(fallback.warning);
+                    (fallback.mode, fallback.definition)
+                })
+            }
+        };
+        if let Some(config) = stored {
+            let mut selected = config.clone();
+            selected.model = model.spec();
+            return EffectiveAgentConfig::from_stored(
+                &selected,
+                PreparedModel {
+                    provider,
+                    model: model.clone(),
+                },
+                (mode, mode_def),
+            )
+            .map_err(Into::into);
+        }
         let settings = session_defaults::resolve(
             defaults,
             &read_prefs(storage),
-            &self.session.meta,
-            self.session.messages().is_empty(),
+            self.projection.seed_meta(),
+            self.projection
+                .root_history()
+                .is_none_or(|history| history.messages.is_empty()),
             model,
         );
-        EffectiveAgentConfig::new(
+        Ok(EffectiveAgentConfig::new(
             RunSettings {
                 provider,
                 model: model.clone(),
@@ -153,67 +190,34 @@ impl SessionState {
             mode,
         )
         .with_mode_def(Some(mode_def))
-        .with_context(AgentContextSnapshot::new(cwd))
+        .with_context(AgentContextSnapshot::new(cwd)))
     }
 
-    /// Adopts the plan path of the config the agent was seeded with, and
-    /// says so when the saved mode could not be restored.
+    /// Adopts the plan path of the config the agent was seeded with.
     pub fn adopt(&mut self, config: &EffectiveAgentConfig) {
-        if config.mode == AgentMode::Build && modes::saved(&self.session.meta).is_some() {
-            self.warnings.push(MODE_RESTORE_FAILED_WARNING.into());
-            self.session_mut().meta.mode = Some(StoredMode::Build);
-        }
-        if let Some(path) = config.mode.plan_path()
-            && self.plan.path() != Some(path)
-        {
-            self.plan = PlanState::Drafting(path.to_path_buf());
-        }
-    }
-
-    /// Records the root's committed model on the session. A model switch drops
-    /// a pending fast wish; discovery answering for the same model keeps it
-    /// while the model can still honour it.
-    pub fn update_model(&mut self, model: &Model) {
-        let spec = model.spec();
-        self.fast_pending &=
-            self.session.model == spec && (model.fast_pending() || model.supports_fast());
-        self.session_mut().set_model(spec);
-    }
-
-    /// Whether a pending fast wish can now be committed on `model`. A
-    /// committed fast settles the wish.
-    pub fn resolve_pending_fast(&mut self, fast: bool, model: &Model) -> bool {
-        self.fast_pending &= !fast;
-        self.fast_pending && model.supports_fast()
-    }
-}
-
-/// The model a resumed session is accounted against (cost, a pending /fast).
-fn resumed_model(
-    session: &mut AppSession,
-    fallback_model: &Model,
-    model_policy: &ModelPolicy,
-    providers: &ProviderRegistry,
-) -> Model {
-    // A caller that resolved the session's own model hands in a value that
-    // has already been through its provider, so it is richer than anything a
-    // rebuild from the spec could produce. Only a saved model the caller did
-    // not resolve gets rebuilt.
-    if model_policy.allows(&session.model) && fallback_model.spec() == session.model {
-        fallback_model.clone()
-    } else {
-        match model_policy
-            .allows(&session.model)
-            .then(|| providers.model(&session.model))
-            .transpose()
-            .ok()
-            .flatten()
-        {
-            Some(model) => model,
-            None => {
-                session.model = fallback_model.spec();
-                fallback_model.clone()
+        match config.mode.plan_path() {
+            Some(path) if self.plan.path() != Some(path) => {
+                let ready = self.projection.fold().ok().is_some_and(|view| {
+                    let Some(root) = self.projection.root_agent_id() else {
+                        return false;
+                    };
+                    plan_state::plan_entries(&view)
+                        .ok()
+                        .and_then(|plans| plans.get(&root).cloned())
+                        .is_some_and(|entry| {
+                            entry.written
+                                && plan_state::resolved_plan_path(&view, root, &entry.path)
+                                    .is_ok_and(|resolved| resolved == path)
+                        })
+                });
+                self.plan = if ready {
+                    PlanState::Ready(path.to_path_buf())
+                } else {
+                    PlanState::Drafting(path.to_path_buf())
+                };
             }
+            None => self.plan = PlanState::None,
+            Some(_) => {}
         }
     }
 }
@@ -228,206 +232,273 @@ impl From<Mode> for StoredMode {
     }
 }
 
-pub(crate) fn rules_to_stored(rules: &[makima_config::PermissionRule]) -> Vec<StoredRule> {
-    rules
-        .iter()
-        .map(|r| {
-            let effect = match r.effect {
-                Effect::Allow => StoredEffect::Allow,
-                Effect::Deny => StoredEffect::Deny,
-            };
-            StoredRule {
-                tool: r.tool.to_string(),
-                scope: r.scope.clone(),
-                effect,
-            }
-        })
-        .collect()
-}
-
-fn parse_stored_tool_key(s: &str) -> Option<makima_config::ToolKey> {
-    match makima_config::ToolKey::parse(s) {
-        Ok(key) => Some(key),
-        Err(e) => {
-            tracing::error!(key = s, error = %e, "malformed stored tool key — rule DROPPED; a deny rule may have been lost");
-            None
-        }
-    }
-}
-
-pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<makima_config::PermissionRule> {
-    stored
-        .iter()
-        .filter_map(|r| {
-            let tool = match parse_stored_tool_key(&r.tool) {
-                Some(t) => t,
-                None => {
-                    if matches!(r.effect, StoredEffect::Deny) {
-                        tracing::error!(
-                            key = %r.tool,
-                            "SECURITY: stored DENY rule dropped — tool may now be accessible. \
-                             Re-add this rule manually in permissions.toml"
-                        );
-                    }
-                    return None;
-                }
-            };
-            let effect = match r.effect {
-                StoredEffect::Allow => Effect::Allow,
-                StoredEffect::Deny => Effect::Deny,
-            };
-            Some(makima_config::PermissionRule {
-                tool,
-                scope: r.scope.clone(),
-                effect,
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::{test_model, test_pricing};
+    use crate::components::test_model;
+    use makima_agent::ModeDef;
+    use makima_agent::session_options::FAST_PENDING_MODEL_OPTION_ID;
+    use makima_providers::ThinkingConfig;
     use makima_providers::model::FastSupport;
-    use makima_providers::{FastPricing, ModelPricing, ThinkingConfig};
+    use makima_storage::id::AgentId;
+    use makima_storage::plans::{PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot};
+    use makima_storage::session_state::{StateChange, StoredStateRecord};
     use makima_storage::sessions::{Effort, Prefs, StoredThinking, write_prefs};
     use test_case::test_case;
 
-    const RECORDED_COST: f64 = 0.42;
-    /// A round million, so a per-million rate reads straight off the bill.
-    const MILLION_INPUT: TokenUsage = TokenUsage {
-        input: 1_000_000,
-        output: 0,
-        cache_creation: 0,
-        cache_read: 0,
-    };
-    /// [`MILLION_INPUT`] at `test_pricing`'s standard input rate.
-    const LIST_PRICE: f64 = 3.0;
-    /// Twice the standard rate, so a resume that ignores `fast` bills half.
-    const FAST_INPUT_RATE: f64 = 6.0;
-    const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
-
-    fn resumed(session: AppSession, model: &Model) -> SessionState {
-        SessionState::from_session(
-            session,
-            model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        )
-    }
-
-    /// An old session: counters, no per-model breakdown.
-    fn session_with_counters() -> AppSession {
-        let mut session = AppSession::new("test-model", "/tmp");
-        session.token_usage = MILLION_INPUT;
-        session
+    fn resumed(session: AppSession) -> SessionState {
+        SessionState::from_session(&session).unwrap()
     }
 
     fn make_plan_session(mode: Option<StoredMode>, plan_path: Option<String>) -> AppSession {
         let mut session = AppSession::new("test-model", "/tmp");
         session.meta.mode = mode;
-        session.meta.plan_path = plan_path;
+        if let Some(path) = plan_path {
+            let root = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            session.push_state(StoredStateRecord {
+                seq: 1,
+                agent: None,
+                generation: 0,
+                change: StateChange::Plugin {
+                    key: PLAN_STATE_KEY.into(),
+                    version: PLAN_STATE_VERSION,
+                    value: Some(
+                        serde_json::to_value(PlanSlot::from([(
+                            root,
+                            PlanEntry {
+                                path: path.into(),
+                                written: false,
+                                approved: None,
+                                staged_model: None,
+                            },
+                        )]))
+                        .unwrap(),
+                    ),
+                },
+            });
+        }
         session
     }
 
-    /// A resumed session opens on the bill it ran up, not on its counters
-    /// re-priced with whatever model is selected now. The model that recorded
-    /// this one prices to nothing, so only the recorded cost can answer.
-    #[test]
-    fn resumed_session_opens_on_the_cost_its_turns_recorded() {
-        let mut session = session_with_counters();
-        session.add_model_usage(
-            UNRESOLVABLE_MODEL,
-            session.token_usage.billed(Some(RECORDED_COST)),
-        );
-        let state = resumed(session, &test_model());
-        assert_eq!(state.cost, Some(RECORDED_COST));
-    }
-
-    /// Older sessions kept counters only, and those are priced with the
-    /// session's own clamped `fast` flag. A hardcoded `false` would open a
-    /// resumed fast session on half its bill.
-    #[test_case(false => Some(LIST_PRICE)     ; "standard_rates")]
-    #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
-    fn resume_without_a_breakdown_prices_the_counters(fast: bool) -> Option<f64> {
-        let mut session = session_with_counters();
-        session.meta.fast = fast;
-        let model = Model {
-            fast_support: Some(FastSupport::Supported),
-            pricing: ModelPricing {
-                fast: Some(FastPricing {
-                    input: FAST_INPUT_RATE,
-                    output: test_pricing().output,
-                }),
-                ..test_pricing()
-            },
-            ..test_model()
-        };
-
-        resumed(session, &model).cost
-    }
-
-    #[test_case(FastSupport::Pending, true, false ; "pending_preserves_saved_intent")]
-    #[test_case(FastSupport::Supported, false, true ; "supported_restores_fast")]
-    #[test_case(FastSupport::Unsupported, false, false ; "unsupported_clears_saved_intent")]
-    fn resume_fast_support(support: FastSupport, pending: bool, fast_rates: bool) {
-        let mut session = session_with_counters();
+    #[test_case(FastSupport::Pending, false ; "pending_disables_fast")]
+    #[test_case(FastSupport::Supported, true ; "supported_restores_fast")]
+    #[test_case(FastSupport::Unsupported, false ; "unsupported_disables_fast")]
+    fn resume_fast_support(support: FastSupport, expected_fast: bool) {
+        let mut session = AppSession::new("test-model", "/tmp");
         session.meta.fast = true;
         let mut model = test_model();
         model.fast_support = Some(support);
-        model.pricing.fast = Some(FastPricing {
-            input: FAST_INPUT_RATE,
-            output: test_pricing().output,
-        });
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
-        let state = SessionState::from_session(
-            session,
-            &model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        );
-        assert_eq!(state.fast_pending, pending);
+        let mut state = SessionState::from_session(&session).unwrap();
+        let seeded = state
+            .starting_config(
+                makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()).provider,
+                &model,
+                tmp.path().to_path_buf(),
+                &ModeRegistry::builtin(),
+                &storage,
+                SessionDefaults::default(),
+            )
+            .unwrap();
+        assert_eq!(seeded.fast, expected_fast);
+    }
+
+    fn stored_config(model: &Model) -> StoredAgentConfig {
+        let cwd = std::env::temp_dir().join("durable-cwd");
+        StoredAgentConfig {
+            cwd: cwd.to_string_lossy().into_owned(),
+            model: model.spec(),
+            thinking: Some(StoredThinking::Off),
+            fast: false,
+            workflow: false,
+            mode: ModeDef::default_for(makima_agent::ModeId::Build)
+                .stored_snapshot(&AgentMode::Build),
+            options: Default::default(),
+        }
+    }
+
+    #[test_case(false ; "durable_disabled_over_defaults_enabled")]
+    #[test_case(true ; "durable_enabled_over_defaults_disabled")]
+    fn starting_config_uses_durable_settings_cwd_and_exact_mode(enabled: bool) {
+        const MODE: &str = "unregistered-mode";
+        const PROMPT: &str = "saved mode prompt";
+        const TOOL: &str = "read";
+        let mut model = test_model();
+        model.fast_support = Some(FastSupport::Supported);
+        model.thinking_support = Some(makima_providers::ThinkingSupport::Yes);
+        let mut session = AppSession::new("test-model", "/tmp");
+        let mut stored = stored_config(&model);
+        stored.fast = enabled;
+        stored.workflow = enabled;
+        stored.thinking = Some(if enabled {
+            StoredThinking::Effort {
+                level: Effort::High,
+            }
+        } else {
+            StoredThinking::Off
+        });
+        stored.mode.id = MODE.into();
+        stored.mode.label = MODE.into();
+        stored.mode.system_prompt = Some(PROMPT.into());
+        stored.mode.tools = Some(vec![TOOL.into()]);
+        session.resolve_legacy_config(stored.clone()).unwrap();
+        session.meta.fast = !enabled;
+        session.meta.workflow = !enabled;
+        session.meta.mode = Some(StoredMode::Plan);
+        session.meta.thinking = Some(StoredThinking::Adaptive);
+        let mut state = resumed(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let config = state
+            .starting_config(
+                makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
+                &model,
+                tmp.path().to_path_buf(),
+                &ModeRegistry::builtin(),
+                &storage,
+                SessionDefaults {
+                    thinking: Some(StoredThinking::Adaptive),
+                    fast: !enabled,
+                    workflow: !enabled,
+                },
+            )
+            .unwrap();
+        state.adopt(&config);
+        assert_eq!(config.fast, stored.fast);
+        assert_eq!(config.workflow, stored.workflow);
+        assert_eq!(config.thinking, stored.thinking.into());
+        assert_eq!(config.context.cwd(), Path::new(&stored.cwd));
         assert_eq!(
-            state.cost,
-            Some(if fast_rates {
-                FAST_INPUT_RATE
-            } else {
-                LIST_PRICE
-            })
+            config
+                .mode_def
+                .as_ref()
+                .unwrap()
+                .stored_snapshot(&config.mode),
+            stored.mode
         );
-        let seeded = state.starting_config(
-            makima_agent::tools::cli_tool_ctx(std::env::current_dir().unwrap()).provider,
+        assert!(state.warnings.is_empty());
+    }
+
+    #[test_case(false ; "durable_build_ignores_legacy_plan")]
+    #[test_case(true ; "invalid_durable_plan_warns_before_adoption")]
+    fn durable_mode_controls_fallback_warnings(invalid_plan: bool) {
+        const MISSING_SLOT_WARNING: &str = "Could not restore the saved mode: Cannot restore plan file: Active Plan configuration has no plan slot entry. Resumed in read-only mode; waiting for user input.";
+        let model = test_model();
+        let mut session = AppSession::new("test-model", "/tmp");
+        let mut stored = stored_config(&model);
+        if invalid_plan {
+            stored.mode.id = ModeId::Plan.key().into();
+        }
+        session.resolve_legacy_config(stored).unwrap();
+        session.meta.mode = Some(StoredMode::Plan);
+        let mut state = resumed(session);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = state.starting_config(
+            makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
             &model,
             tmp.path().to_path_buf(),
             &ModeRegistry::builtin(),
-            &storage,
+            &StateDir::from_path(tmp.path().to_path_buf()),
             SessionDefaults::default(),
         );
-        assert_eq!(seeded.fast, fast_rates);
+        let config = config.unwrap();
+        if invalid_plan {
+            assert!(modes::is_read_only_fallback(&config.mode));
+            assert_eq!(state.warnings, [MISSING_SLOT_WARNING]);
+            assert!(state.plan.path().is_none());
+            state.adopt(&config);
+            assert_eq!(state.warnings, [MISSING_SLOT_WARNING]);
+            assert!(state.plan.path().is_none());
+            return;
+        }
+        assert_eq!(config.mode, AgentMode::Build);
+        assert!(state.warnings.is_empty());
+        state.adopt(&config);
+        assert!(state.warnings.is_empty());
+        assert!(state.plan.path().is_none());
     }
 
-    #[test_case(FastSupport::Supported, false, true ; "discovery_answers_supported")]
-    #[test_case(FastSupport::Unsupported, false, false ; "discovery_rejects_fast")]
-    #[test_case(FastSupport::Pending, false, false ; "still_pending_keeps_intent")]
-    #[test_case(FastSupport::Supported, true, false ; "switch_answers_pending_intent")]
-    fn pending_fast_model_update(support: FastSupport, switch: bool, ready: bool) {
-        let mut session = session_with_counters();
-        session.meta.fast = true;
-        let mut model = test_model();
-        model.fast_support = Some(FastSupport::Pending);
-        let mut state = resumed(session, &model);
-        assert!(state.fast_pending);
-        if switch {
-            model.id = UNRESOLVABLE_MODEL.into();
-        }
-        model.fast_support = Some(support);
-        state.update_model(&model);
-        assert_eq!(state.fast_pending, ready || support == FastSupport::Pending);
-        assert_eq!(state.resolve_pending_fast(false, &model), ready);
-        assert!(!state.resolve_pending_fast(true, &model));
-        assert!(!state.fast_pending);
+    #[test]
+    fn removed_legacy_mode_restores_without_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.meta.mode = Some(StoredMode::Custom("removed_mode".into()));
+        let (state, config) = restore(session, &storage);
+        assert!(modes::is_read_only_fallback(&config.mode));
+        assert_eq!(config.mode_def.unwrap().tools, Some(Vec::new()));
+        assert!(!state.warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_written_plan_resumes_read_only_without_recreating_ready_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(directory.path().to_path_buf());
+        let model = test_model();
+        let path = directory.path().join("missing-written.md");
+        let mut session = AppSession::new("test-model", "/tmp");
+        let mut stored = stored_config(&model);
+        let mode = AgentMode::Plan(path.clone());
+        stored.mode = ModeRegistry::builtin()
+            .current(&mode)
+            .stored_snapshot(&mode);
+        session.resolve_legacy_config(stored).unwrap();
+        let root = session.root_agent_id().unwrap();
+        let seq = session
+            .state()
+            .iter()
+            .map(|record| record.seq)
+            .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
+            .max()
+            .unwrap()
+            + 1;
+        let entry = PlanEntry {
+            path: path.clone(),
+            written: true,
+            approved: None,
+            staged_model: None,
+        };
+        session.push_state(StoredStateRecord {
+            seq,
+            agent: None,
+            generation: 0,
+            change: StateChange::Plugin {
+                key: PLAN_STATE_KEY.into(),
+                version: PLAN_STATE_VERSION,
+                value: Some(serde_json::to_value(PlanSlot::from([(root, entry.clone())])).unwrap()),
+            },
+        });
+        let (state, config) = restore(session, &storage);
+        assert!(modes::is_read_only_fallback(&config.mode));
+        assert!(state.plan.path().is_none());
+        assert!(!path.exists());
+        assert!(!state.warnings.is_empty());
+        assert_eq!(
+            plan_state::plan_entries(&state.projection.fold().unwrap()).unwrap()[&root],
+            entry
+        );
+    }
+
+    #[test]
+    fn model_projection_preserves_durable_fast_intent() {
+        let model = test_model();
+        let mut session = AppSession::new("test-model", "/tmp");
+        let mut stored = stored_config(&model);
+        stored
+            .options
+            .insert(FAST_PENDING_MODEL_OPTION_ID.into(), model.spec());
+        session.resolve_legacy_config(stored.clone()).unwrap();
+        let state = resumed(session);
+        assert_eq!(state.projection.model(), model.spec());
+        let view = state.projection.fold().unwrap();
+        assert_eq!(
+            view.scopes[&state.projection.root_agent_id()]
+                .config
+                .as_ref(),
+            Some(&stored)
+        );
     }
 
     const MISSING_CUSTOM_MODE: &str = "review";
@@ -436,20 +507,17 @@ mod tests {
     /// then let the app adopt it.
     fn restore(session: AppSession, storage: &StateDir) -> (SessionState, EffectiveAgentConfig) {
         let model = test_model();
-        let mut state = SessionState::from_session(
-            session,
-            &model,
-            &ModelPolicy::default(),
-            &ProviderRegistry::default(),
-        );
-        let config = state.starting_config(
-            makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
-            &model,
-            std::env::temp_dir(),
-            &ModeRegistry::builtin(),
-            storage,
-            SessionDefaults::default(),
-        );
+        let mut state = SessionState::from_session(&session).unwrap();
+        let config = state
+            .starting_config(
+                makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
+                &model,
+                std::env::temp_dir(),
+                &ModeRegistry::builtin(),
+                storage,
+                SessionDefaults::default(),
+            )
+            .unwrap();
         state.adopt(&config);
         (state, config)
     }
@@ -472,15 +540,17 @@ mod tests {
         .unwrap();
         let mut model = test_model();
         model.thinking_support = None;
-        let state = resumed(AppSession::new("test-model", "/tmp"), &model);
-        let config = state.starting_config(
-            makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
-            &model,
-            std::env::temp_dir(),
-            &ModeRegistry::builtin(),
-            &storage,
-            SessionDefaults::default(),
-        );
+        let mut state = resumed(AppSession::new("test-model", "/tmp"));
+        let config = state
+            .starting_config(
+                makima_agent::tools::cli_tool_ctx(std::env::temp_dir()).provider,
+                &model,
+                std::env::temp_dir(),
+                &ModeRegistry::builtin(),
+                &storage,
+                SessionDefaults::default(),
+            )
+            .unwrap();
         assert_eq!(config.thinking, ThinkingConfig::Effort(Effort::High));
     }
 
@@ -495,18 +565,21 @@ mod tests {
 
     #[test_case(Some(StoredMode::Plan), true ; "unallocatable_plan_path")]
     #[test_case(Some(StoredMode::Custom(MISSING_CUSTOM_MODE.into())), false ; "missing_custom_mode")]
-    fn unrestorable_mode_resumes_in_build_mode_and_warns(mode: Option<StoredMode>, blocked: bool) {
+    fn unrestorable_mode_resumes_read_only_and_warns(mode: Option<StoredMode>, blocked: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("state");
         if blocked {
             std::fs::write(&dir, "").unwrap();
         }
-        let (state, config) = restore(make_plan_session(mode, None), &StateDir::from_path(dir));
-        assert_eq!(config.mode, AgentMode::Build);
-        assert_eq!(config.mode_def.unwrap().id, makima_agent::ModeId::Build);
+        let (state, config) = restore(
+            make_plan_session(mode.clone(), None),
+            &StateDir::from_path(dir),
+        );
+        assert!(modes::is_read_only_fallback(&config.mode));
+        assert_eq!(config.mode_def.unwrap().tools, Some(Vec::new()));
         assert!(state.plan.path().is_none());
-        assert_eq!(state.session.meta.mode, Some(StoredMode::Build));
-        assert_eq!(state.warnings, [MODE_RESTORE_FAILED_WARNING]);
+        assert_eq!(state.projection.seed_meta().mode, mode);
+        assert_eq!(state.warnings.len(), 1);
     }
 
     #[test]
@@ -533,28 +606,6 @@ mod tests {
         );
         let (state, _) = restore(session, &storage);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
-    }
-
-    #[test]
-    fn disallowed_restored_model_uses_fallback() {
-        let fallback = test_model();
-        let mut session = make_plan_session(Some(StoredMode::Build), None);
-        session.model = "openai/gpt-5".into();
-        let raw: makima_config::RawConfig = serde_json::from_value(serde_json::json!({
-            "provider": {"allowed_models": [fallback.spec()]}
-        }))
-        .unwrap();
-        let policy = raw.into_config().unwrap().provider.model_policy;
-
-        let model = resumed_model(
-            &mut session,
-            &fallback,
-            &policy,
-            &ProviderRegistry::default(),
-        );
-
-        assert_eq!(model.spec(), fallback.spec());
-        assert_eq!(session.model, fallback.spec());
     }
 
     #[test]

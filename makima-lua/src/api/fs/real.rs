@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use makima_agent::GrepFileEntry;
 use makima_agent::tools::grep::GrepParams;
 
+use crate::runtime::MutationGuard;
+
 use super::{
     BoxFuture, DIR_MISSING_PREFIX, DIR_NOT_A_DIR_PREFIX, FsBackend, FsError, FsMeta,
     TYPE_DIRECTORY, TYPE_FILE, TYPE_LINK, TYPE_UNKNOWN,
@@ -15,6 +17,17 @@ use super::{
 /// Production backend: the exact semantics `makima.fs` always had — symlinks,
 /// gitignore, permissions, real mtimes.
 pub struct RealFs;
+
+pub(crate) async fn mutate<T: Send + 'static>(
+    operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    let guard = MutationGuard::capture().map_err(IoError::other)?;
+    smol::unblock(move || {
+        let _guard = guard;
+        operation()
+    })
+    .await
+}
 
 impl FsBackend for RealFs {
     fn read(&self, path: PathBuf) -> BoxFuture<'_, std::io::Result<String>> {
@@ -43,12 +56,12 @@ impl FsBackend for RealFs {
     }
 
     fn write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>> {
-        Box::pin(async move { smol::unblock(move || std::fs::write(&path, &content)).await })
+        Box::pin(async move { mutate(move || std::fs::write(&path, &content)).await })
     }
 
     fn atomic_write(&self, path: PathBuf, content: Vec<u8>) -> BoxFuture<'_, std::io::Result<()>> {
         Box::pin(async move {
-            smol::unblock(
+            mutate(
                 move || match makima_storage::atomic_write(&path, &content) {
                     Ok(()) => Ok(()),
                     Err(makima_storage::StorageError::Io(e)) => Err(e),
@@ -66,7 +79,7 @@ impl FsBackend for RealFs {
         force: bool,
     ) -> BoxFuture<'_, std::io::Result<()>> {
         Box::pin(async move {
-            smol::unblock(move || {
+            mutate(move || {
                 let meta = match std::fs::symlink_metadata(&path) {
                     Ok(m) => m,
                     Err(e) if force && e.kind() == ErrorKind::NotFound => return Ok(()),
@@ -94,7 +107,7 @@ impl FsBackend for RealFs {
 
     fn mkdir(&self, path: PathBuf, parents: bool) -> BoxFuture<'_, std::io::Result<()>> {
         Box::pin(async move {
-            smol::unblock(move || {
+            mutate(move || {
                 if parents {
                     std::fs::create_dir_all(&path)
                 } else {

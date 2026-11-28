@@ -6,8 +6,8 @@ import { effort, launchKey, sessionOptions } from "./options.ts"
 import type { Environment } from "./options.ts"
 import { BridgeError, configError, conflict, failure } from "./protocol.ts"
 import type { EndReason, Event, Message, StepRequest, StepResult } from "./protocol.ts"
-import { forkPoint, freshRecord } from "./records.ts"
-import type { Record, Records } from "./records.ts"
+import { forkPoint, freshRecord, hasReply, replyHash } from "./records.ts"
+import type { Boundary, Record, Records } from "./records.ts"
 import type { Effort, Probe, Session, StartSession } from "./session.ts"
 import { PendingTools, SERVER_NAME } from "./tools.ts"
 
@@ -100,12 +100,13 @@ export function unseen(record: Record, messages: readonly Message[]): Message[] 
     .filter((message) => message.content.length > 0)
 }
 
-// A conversation that starts again from the last reply Claude finished, for
-// when its transcript ends at a tool call nothing will answer.
-function restartedRecord(record: Record): Record {
-  const point = record.boundaries.at(-1)
+function forkedRecord(record: Record, point: Boundary | undefined): Record {
   if (!point) return freshRecord()
-  return { fork: { session: point.session, at: point.uuid }, seen: point.count, boundaries: [...record.boundaries] }
+  return {
+    fork: { session: point.session, at: point.uuid },
+    seen: point.count,
+    boundaries: record.boundaries.filter((boundary) => boundary.count <= point.count),
+  }
 }
 
 export class Conversations {
@@ -170,6 +171,8 @@ export class Conversations {
     await conversation.step?.catch(() => {})
     if (reason === "compacted" || reason === "closed") return this.discard(conversation)
     await this.settle(conversation)
+    const interrupted = conversation.record.interrupted
+    if (reason === "cancelled" && interrupted) interrupted.cancelled = true
     await this.save(conversation)
     clearTimeout(conversation.timer)
     conversation.timer = setTimeout(() => void this.discard(conversation), this.limits.graceMs)
@@ -213,32 +216,33 @@ export class Conversations {
         source.live = undefined
         this.active.delete(previous.id)
       }
-      conversation.record = record
+      conversation.record = source?.record ?? record
+      const interrupted = conversation.record.interrupted
+      if (previous.cancelled && interrupted) interrupted.cancelled = true
       await this.records.remove(previous.id)
       return
     }
-    const point = forkPoint(record, previous.shared)
+    const point = forkPoint(record, request.messages, previous.shared)
     // A different tool set needs a new process, and a forked transcript would
     // hold calls to tools the new one does not offer.
     if (!point || record.launch !== launchHash(request)) return
-    conversation.record = {
-      fork: { session: point.session, at: point.uuid },
-      seen: point.count,
-      boundaries: record.boundaries.filter((boundary) => boundary.count <= point.count),
-    }
+    conversation.record = forkedRecord(record, point)
   }
 
   private async run(conversation: Conversation, request: StepRequest, sink: StepSink, signal: AbortSignal): Promise<StepResult> {
     const messages = request.messages
     const launch = launchKey(request)
     const live = conversation.live
-    if (conversation.record.waiting && (!live || live.session.ended || live.launch !== launch)) {
+    const saved = conversation.record
+    const boundary = saved.boundaries.at(-1)
+    const interrupted = saved.interrupted && !saved.interrupted.cancelled
+    // Saving the SDK cursor does not mean Makima received or kept its reply.
+    const expectedReply = boundary?.count === saved.seen ? boundary.replyHash : undefined
+    const missingReply = !saved.interrupted && saved.seen > 0 && !hasReply(messages[saved.seen - 1], expectedReply)
+    const lostTools = saved.waiting && (!live || live.session.ended || live.launch !== launch)
+    if (interrupted || missingReply || lostTools || messages.length < saved.seen) {
       await this.stopLive(conversation)
-      conversation.record = restartedRecord(conversation.record)
-    }
-    if (messages.length < conversation.record.seen) {
-      await this.stopLive(conversation)
-      conversation.record = freshRecord()
+      conversation.record = forkedRecord(saved, forkPoint(saved, messages))
     }
     const plan = await this.plan(conversation, messages)
     sink.open()
@@ -256,12 +260,14 @@ export class Conversations {
     record.seen = messages.length
     record.interrupted = undefined
     record.launch = launchHash(request)
+    const boundaryCount = record.boundaries.length
     try {
       const end = await opened.session.readStep((message) => {
         this.checkToolServer(message, request)
         for (const event of translator.translate(message)) sink.event(event)
         return translator.endsToolStep(message)
       }, signal)
+      signal.throwIfAborted()
       this.noteSession(conversation, translator)
       if (end === "tools") {
         for (const call of translator.toolCalls) opened.pending.expect(call.id, call.claudeName)
@@ -273,19 +279,32 @@ export class Conversations {
       record.seen += 1
       const session = record.session
       if (conversation.persist && session && translator.lastAssistantUuid) {
-        record.boundaries.push({ count: record.seen, session, uuid: translator.lastAssistantUuid })
+        record.boundaries.push({ count: record.seen, session, uuid: translator.lastAssistantUuid, replyHash: replyHash(result.message) })
       }
       return result
     } catch (error) {
       this.noteSession(conversation, translator)
+      record.interrupted = { tools: [] }
       if (opened.session.running) {
         await opened.session.interrupt().catch(() => {})
         opened.pending.clear()
-        record.interrupted = { tools: [] }
       }
       throw error
     } finally {
       await this.save(conversation)
+      if (signal.aborted && !record.interrupted) {
+        // The SDK consumed the input, but Makima disconnected before `done`.
+        record.seen = messages.length
+        record.boundaries.length = boundaryCount
+        record.interrupted = { tools: record.waiting ?? [] }
+        record.waiting = undefined
+        if (opened.session.running) {
+          await opened.session.interrupt().catch(() => {})
+          opened.pending.clear()
+        }
+        await this.save(conversation)
+        signal.throwIfAborted()
+      }
     }
   }
 
@@ -297,7 +316,7 @@ export class Conversations {
     } catch (error) {
       // This step fails; the next one starts again from Claude's last finished reply.
       await this.stopLive(conversation)
-      conversation.record = restartedRecord(record)
+      conversation.record = forkedRecord(record, forkPoint(record, messages))
       await this.save(conversation)
       throw error
     }
@@ -375,7 +394,7 @@ export class Conversations {
       record.interrupted = { tools: record.waiting ?? [] }
       record.waiting = undefined
     } else if (record.waiting) {
-      conversation.record = restartedRecord(record)
+      conversation.record = forkedRecord(record, record.boundaries.at(-1))
     }
   }
 

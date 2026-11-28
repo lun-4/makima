@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use makima_agent::cancel::CancelToken;
 use makima_agent::tools::test_support::{stub_ctx, stub_ctx_with};
-use makima_agent::tools::{ToolContext, ToolRegistry};
+use makima_agent::tools::{ToolContext, ToolRegistry, TurnToolBindings};
 use makima_agent::{
     AgentEvent, AgentMode, BufferSnapshot, Envelope, EventSender, SpanStyle, ToolOutput,
 };
@@ -637,6 +637,7 @@ fn restore_snapshot_lines_opts(
     let (tx, rx) = flume::unbounded();
     handle.request_restore(
         makima_lua::RestoreItem {
+            state_target: None,
             tool: Arc::from(BATCH_TOOL),
             tool_use_id: BATCH_ID.to_owned(),
             output: output.to_owned(),
@@ -1190,6 +1191,11 @@ fn exec_batch_live(
     let event_tx = EventSender::new(tx);
     let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&event_tx), Some(BATCH_ID));
     ctx.registry = Arc::clone(reg);
+    ctx.turn_bindings = Arc::new(TurnToolBindings::capture(
+        reg,
+        &ctx.local_tools,
+        ctx.mcp.as_ref(),
+    ));
 
     let input = json!({ "tool_calls": tool_calls });
     let inv = reg

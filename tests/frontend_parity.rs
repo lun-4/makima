@@ -19,14 +19,14 @@
 //! by a Lua command) and
 //! `event_loop::focus_tests::blank_session_sends_always_thinking_to_the_provider`
 //! (session defaults) and
-//! `agent::agent_loop::tests::ordinary_submission_paths_have_runtime_parity`
-//! (a message sent mid-turn joins it). The UI round-trip has no TUI counterpart: the TUI is
-//! the UI.
+//! `agent::runtime_tests::ordinary_submission_paths_have_runtime_parity`
+//! (a message sent mid-turn joins it). The TUI handles the UI round-trip directly.
 //!
 //! Unix only: the isolated environment points `HOME` and the XDG dirs at a
 //! temp dir, which is not how Windows finds its config.
 #![cfg(unix)]
 
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -34,11 +34,17 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use makima_agent::ToolOutput;
+use makima_agent::permissions::PERMISSION_DENIED_PREFIX;
+use makima_agent::{AgentInput, AgentMode, ModeDef, ModeId, ToolOutput};
 use makima_lua::ui_sink::NO_UI_ERR;
-use makima_providers::{Message, TokenUsage};
+use makima_providers::{ContentBlock, Message, Role, TokenUsage};
 use makima_storage::StateDir;
-use makima_storage::sessions::{Effort, Prefs, Session, StoredMode, StoredThinking};
+use makima_storage::id::{AgentId, MakimaId, TurnId};
+use makima_storage::plans::{
+    ApprovedPlan, PLAN_STATE_KEY, PLAN_STATE_VERSION, PlanEntry, PlanSlot,
+};
+use makima_storage::session_state::{StateChange, StoredStateRecord, StoredTurnOrigin};
+use makima_storage::sessions::{Effort, Prefs, Session, StoredThinking};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -57,6 +63,8 @@ const BAD_THINKING_COMMAND: &str = "/thinking bogus";
 const PARITY_THINKING_COMMAND: &str = "/parity_thinking";
 const UI_ANSWER: &str = "ui answered: ";
 const ASK_COMMAND: &str = "/parity_ask";
+const ASK_POST: &str = "Permission flow completed.";
+const ASK_TOOL_USE: &str = "call_1";
 const ASK_PROMPT: &str = "run the asking tool";
 const CHILD_ASK_COMMAND: &str = "/parity_child_ask";
 const BACKGROUND_COMMAND: &str = "/parity_background";
@@ -97,8 +105,18 @@ const NO_RESULT: &str = "the turn's result never arrived";
 const NO_EXIT: &str = "makima did not exit after its input ended";
 const NO_RESPONSE: &str = "makima never answered the request";
 const REPLY: &str = "ok";
+const TURN_END: &str = "TurnEnd";
+const TURN_COMPLETED: &str = "completed";
+const ACP_END_TURN: &str = "end_turn";
+const NO_TURN_END: &str = "the root TurnEnd autocmd did not emit a notification";
 const PROMPT_ID: u64 = 3;
 const NO_INIT: &str = "the SDK never emitted its init event";
+const RESUME_TOOL: &str = "parity_resume_command";
+const RESUME_COMMAND: &str = "/parity_resumed";
+const RESUME_OUTPUT: &str = "resumed command ran";
+const HELD_PROMPT: &str = "held prompt";
+const PLAN_CONTENT: &str = "Implement the saved plan.";
+const MODIFIED_PLAN_CONTENT: &str = "Unexpected external edit.";
 const PLAN_FILE: &str = "saved-plan.md";
 const SSE_REPLY: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,",
@@ -252,6 +270,8 @@ impl Scenario {
                 assert!(prompt.contains("allowed for read-only investigation"));
                 assert!(prompt.contains("normal permission flow"));
                 let plans = home
+                    .canonicalize()
+                    .unwrap()
                     .join(".local/state")
                     .join(APP_DIR)
                     .join(makima_storage::plans::PLANS_DIR);
@@ -448,7 +468,7 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
             send(&mut stdin, sdk_user(PROMPT));
             output
         }
-        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work),
+        Frontend::Acp => acp_prompt(&mut child, &mut stdin, &work).0,
         Frontend::Print => unreachable!("print reads its whole input before it starts"),
     };
     drop(stdin);
@@ -465,9 +485,70 @@ fn closed_input_still_delivers_the_turn(frontend: Frontend) {
             assert_eq!(result["subtype"], "success", "{result}");
             assert_eq!(result["result"], REPLY);
         }
-        _ => assert_eq!(result["result"]["stopReason"], "end_turn", "{result}"),
+        _ => assert_eq!(result["result"]["stopReason"], ACP_END_TURN, "{result}"),
     }
     assert!(wait_exit(child).success());
+}
+
+#[test_case(Frontend::Sdk ; "sdk_delivers_turn_end_to_lua")]
+#[test_case(Frontend::Acp ; "acp_delivers_turn_end_to_lua")]
+fn root_turn_fires_autocmd(frontend: Frontend) {
+    let (base_url, _bodies) = mock_server();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &base_url, BLANK);
+    let mut init = OpenOptions::new()
+        .append(true)
+        .open(home.path().join(".config").join(APP_DIR).join("init.lua"))
+        .unwrap();
+    writeln!(
+        init,
+        r#"
+assert(makima.api.create_autocmd("{TURN_END}", {{
+  callback = function(ev)
+    if ev.data.parent_id then return end
+    makima.ui.flash(assert(makima.json.encode({{
+      event = ev.event,
+      session_id = ev.data.session_id,
+      status = ev.data.status,
+      text = ev.data.text,
+    }})))
+  end,
+}}))
+"#
+    )
+    .unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut child = spawn_makima(home.path(), &work, frontend_args(frontend));
+    let notifications = json_lines(child.stderr.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    let (_output, session_id) = match frontend {
+        Frontend::Sdk => {
+            let output = json_lines(child.stdout.take().unwrap());
+            send(&mut stdin, sdk_user(PROMPT));
+            let result = expect(&output, |message| message["type"] == "result");
+            assert_eq!(result["is_error"], false, "{result}");
+            assert_eq!(result["result"], REPLY);
+            (output, result["session_id"].clone())
+        }
+        Frontend::Acp => {
+            let (output, session_id) = acp_prompt(&mut child, &mut stdin, &work);
+            let response = expect(&output, |message| message["id"] == PROMPT_ID);
+            assert_eq!(response["result"]["stopReason"], ACP_END_TURN, "{response}");
+            (output, session_id)
+        }
+        Frontend::Print => unreachable!("print does not have an interactive session"),
+    };
+
+    // TurnEnd delivery is asynchronous with respect to the protocol result.
+    let notification = notifications.recv_timeout(TIMEOUT);
+    drop(stdin);
+    assert!(wait_exit(child).success());
+    assert_eq!(
+        notification.expect(NO_TURN_END),
+        json!({"event": TURN_END, "session_id": session_id, "status": TURN_COMPLETED, "text": REPLY}),
+    );
 }
 
 /// A command whose handler runs two turns gets one result, the last turn's
@@ -523,7 +604,14 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
             );
             let result = expect(&output, |message| message["type"] == "result");
             assert_eq!(result["is_error"], false, "{result}");
-            sdk_output = Some(output);
+            sdk_output = Some((
+                output,
+                result["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<MakimaId>()
+                    .unwrap(),
+            ));
         }
         Frontend::Acp => {
             let (output, session) = acp_session(&mut child, &mut stdin, &work);
@@ -550,8 +638,22 @@ fn command_waiting_on_an_answer_still_gets_it(frontend: Frontend) {
     let status = wait_exit(child);
     let log = stderr.join().unwrap();
     assert!(status.success(), "{log}");
-    if let Some(output) = sdk_output {
+    if let Some((output, id)) = sdk_output {
         assert_one_result_per_message(&output);
+        let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+        let session = Session::<Message, TokenUsage, ToolOutput>::load(id, &storage).unwrap();
+        let post = &session.posts()[0];
+        assert_eq!(post.post.text, ASK_POST);
+        assert_eq!(post.agent, None);
+        assert_eq!(
+            post.after_message,
+            session.chat_message_ids(None).last().copied()
+        );
+        assert!(
+            session.tool_outputs()[ASK_TOOL_USE]
+                .as_text()
+                .starts_with(PERMISSION_DENIED_PREFIX)
+        );
     }
     let bodies: Vec<_> = bodies.try_iter().collect();
     assert_eq!(bodies.len(), 2, "{bodies:?}");
@@ -656,7 +758,7 @@ fn message_sent_mid_turn_joins_it(frontend: Frontend) {
             );
             for id in [PROMPT_ID, FOLLOW_UP_ID] {
                 let response = expect(&output, |message| message["id"] == id);
-                assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+                assert_eq!(response["result"]["stopReason"], ACP_END_TURN, "{response}");
             }
             drop(stdin);
         }
@@ -705,24 +807,72 @@ fn print_refuses_a_child_ask_at_once() {
 
 /// Like the TUI and ACP, an SDK resume puts the session back in the mode it
 /// was saved in, here plan mode with its plan file.
-#[test]
-fn sdk_resume_restores_the_saved_mode() {
+#[test_case(None, "plan", "plan", None; "invocation_yolo_preserves_saved_plan")]
+#[test_case(Some("default"), "default", "build", Some(false); "explicit_default_exits_saved_plan")]
+#[test_case(Some("bypassPermissions"), "bypassPermissions", "build", Some(true); "explicit_bypass_exits_saved_plan")]
+#[test_case(Some("plan"), "plan", "plan", Some(false); "explicit_plan_disables_invocation_yolo")]
+fn sdk_resume_restores_the_saved_mode(
+    permission_mode: Option<&str>,
+    expected_permission_mode: &str,
+    expected_mode: &str,
+    expected_yolo: Option<bool>,
+) {
     let home = TempDir::new().unwrap();
     write_config(home.path(), DEAD_PROXY, BLANK);
-    let work = home.path().join("work");
+    let root = home.path().canonicalize().unwrap();
+    let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    let state = home.path().join(".local/state").join(APP_DIR);
+    let state = root.join(".local/state").join(APP_DIR);
     let plan = state.join(PLAN_FILE);
     std::fs::write(&plan, "").unwrap();
     let mut session: Session<Message, TokenUsage, ToolOutput> =
         Session::new(&format!("{PROVIDER}/{MODEL}"), &work.to_string_lossy());
     session.replace_messages(vec![Message::user(PROMPT.into())]);
-    session.meta.mode = Some(StoredMode::Plan);
-    session.meta.plan_path = Some(plan.to_string_lossy().into_owned());
-    session.save(&StateDir::from_path(state)).unwrap();
+    let mode = AgentMode::Plan(plan.clone());
+    let definition = ModeDef::default_for(ModeId::Plan);
+    session
+        .resolve_legacy_mode(definition.stored_snapshot(&mode))
+        .unwrap();
+    let plans: PlanSlot = [(
+        session.root_agent_id().unwrap(),
+        PlanEntry {
+            path: plan.clone(),
+            written: true,
+            approved: Some(ApprovedPlan {
+                content: PLAN_CONTENT.into(),
+                sha256: makima_agent::plan_state::content_sha256(PLAN_CONTENT),
+            }),
+            staged_model: None,
+        },
+    )]
+    .into();
+    let next_sequence = session
+        .state()
+        .iter()
+        .map(|record| record.seq)
+        .chain(session.agent_revisions().iter().map(|(seq, _)| *seq))
+        .max()
+        .unwrap_or_default()
+        + 1;
+    session.push_state(StoredStateRecord {
+        seq: next_sequence,
+        agent: None,
+        generation: 0,
+        change: StateChange::Plugin {
+            key: PLAN_STATE_KEY.into(),
+            version: PLAN_STATE_VERSION,
+            value: Some(serde_json::to_value(plans).unwrap()),
+        },
+    });
+    let storage = StateDir::from_path(state);
+    session.save(&storage).unwrap();
+    std::fs::write(&plan, MODIFIED_PLAN_CONTENT).unwrap();
 
     let mut args = frontend_args(Frontend::Sdk);
     args.extend(["-c".to_owned(), session.id.to_string()]);
+    if let Some(permission_mode) = permission_mode {
+        args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
+    }
     let mut child = spawn_makima(home.path(), &work, args);
     let output = json_lines(child.stdout.take().unwrap());
     let init = loop {
@@ -732,8 +882,252 @@ fn sdk_resume_restores_the_saved_mode() {
         }
     };
     drop(child.stdin.take());
-    assert_eq!(init["permissionMode"], "plan", "{init}");
+    assert_eq!(init["permissionMode"], expected_permission_mode, "{init}");
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), PLAN_CONTENT);
     assert!(wait_exit(child).success());
+    let restored: Session<Message, TokenUsage, ToolOutput> =
+        Session::load(session.id, &storage).unwrap();
+    let folded = restored.latest_state().unwrap();
+    let config = folded.scopes[&restored.root_agent_id()]
+        .config
+        .as_ref()
+        .unwrap();
+    assert_eq!(config.mode.id, expected_mode);
+    if expected_mode == ModeId::Plan.key() {
+        assert_eq!(
+            config.mode.restrict_write_to.as_deref(),
+            Some(plan.as_path())
+        );
+    }
+    assert_eq!(
+        folded.scopes.get(&None).and_then(|scope| scope.yolo),
+        expected_yolo
+    );
+}
+
+#[test_case(Frontend::Sdk; "sdk")]
+#[test_case(Frontend::Acp; "acp")]
+fn resumed_lua_snapshot_includes_saved_and_new_usage(frontend: Frontend) {
+    const SAVED_INPUT: u32 = 12;
+    const SAVED_COST: f64 = 0.25;
+    const REPLY_INPUT: u32 = 1;
+    const REPLY_OUTPUT: u32 = 1;
+    const TURN_START: &str = "TurnStart";
+
+    let home = TempDir::new().unwrap();
+    let (release, gate) = mpsc::channel();
+    let (base_url, bodies) = mock_server_with_gate(Some(gate));
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().canonicalize().unwrap().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+    let active_model = format!("{PROVIDER}/{MODEL}");
+    let saved_model = format!("{PROVIDER}/{OTHER_MODEL}");
+    let mut session =
+        Session::<Message, TokenUsage, ToolOutput>::new(&active_model, &work.to_string_lossy());
+    session.bind_root_id(AgentId::generate()).unwrap();
+    session.token_usage.input = SAVED_INPUT;
+    session.add_model_usage(&saved_model, session.token_usage.billed(Some(SAVED_COST)));
+    session.save(&storage).unwrap();
+    let mut init = OpenOptions::new()
+        .append(true)
+        .open(home.path().join(".config").join(APP_DIR).join("init.lua"))
+        .unwrap();
+    writeln!(
+        init,
+        r#"
+assert(makima.api.create_autocmd({{ "{TURN_START}", "{TURN_END}" }}, {{
+  callback = function(ev)
+    local snapshot, err = makima.session.read({{ session = "{id}" }})
+    assert(snapshot, err)
+    makima.ui.flash(assert(makima.json.encode({{ event = ev.event, usage = snapshot.usage }})))
+  end,
+}}))
+"#,
+        id = session.id
+    )
+    .unwrap();
+
+    let mut args = frontend_args(frontend);
+    if matches!(frontend, Frontend::Sdk) {
+        args.extend(["-c".into(), session.id.to_string()]);
+    }
+    let mut child = spawn_makima(home.path(), &work, args);
+    let notifications = json_lines(child.stderr.take().unwrap());
+    let output = json_lines(child.stdout.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    if matches!(frontend, Frontend::Acp) {
+        acp_load(&mut stdin, &output, &work, session.id);
+        send(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
+            "params": {"sessionId": session.id.to_string(), "prompt": [{"type": "text", "text": PROMPT}]}}),
+        );
+    } else {
+        send(&mut stdin, sdk_user(PROMPT));
+    }
+    bodies.recv_timeout(TIMEOUT).expect(NO_REQUEST);
+    let before = expect(&notifications, |message| message["event"] == TURN_START);
+    release.send(()).unwrap();
+    let after = expect(&notifications, |message| message["event"] == TURN_END);
+    drop(stdin);
+    assert!(wait_exit(child).success());
+
+    let saved = json!({"model": saved_model, "input": SAVED_INPUT, "output": 0,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST});
+    assert_eq!(
+        before["usage"],
+        json!({"total": {"input": SAVED_INPUT, "output": 0,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST}, "models": [saved]})
+    );
+    assert_eq!(
+        after["usage"],
+        json!({"total": {"input": SAVED_INPUT + REPLY_INPUT, "output": REPLY_OUTPUT,
+        "cache_creation": 0, "cache_read": 0, "cost": SAVED_COST}, "models": [saved,
+        {"model": MODEL, "input": REPLY_INPUT, "output": REPLY_OUTPUT,
+         "cache_creation": 0, "cache_read": 0}]})
+    );
+}
+
+#[test_case(Frontend::Sdk; "sdk")]
+#[test_case(Frontend::Acp; "acp")]
+fn resumed_tool_start_can_run_a_command(frontend: Frontend) {
+    let home = TempDir::new().unwrap();
+    let (base_url, bodies) = mock_server();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().canonicalize().unwrap().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+    let mut session = Session::<Message, TokenUsage, ToolOutput>::new(
+        &format!("{PROVIDER}/{MODEL}"),
+        &work.to_string_lossy(),
+    );
+    let root = AgentId::generate();
+    session.bind_root_id(root).unwrap();
+    session.replace_messages(vec![
+        Message::user(PROMPT.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: ASK_TOOL_USE.into(),
+                name: RESUME_TOOL.into(),
+                input: json!({}),
+                thought_signature: None,
+            }],
+            ..Default::default()
+        },
+    ]);
+    session.push_state(StoredStateRecord {
+        seq: session.next_state_seq(),
+        agent: Some(root),
+        generation: 0,
+        change: StateChange::Admitted {
+            turn: TurnId::generate(),
+            origin: StoredTurnOrigin::User,
+        },
+    });
+    session.save(&storage).unwrap();
+    resume_until_eof(
+        frontend,
+        home.path(),
+        &work,
+        session.id,
+        Some(RESUME_OUTPUT),
+    );
+    let body = bodies.try_recv().expect(NO_REQUEST);
+    let tool_result = body["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(tool_result["role"], "tool", "{tool_result}");
+    assert_eq!(content_text(&tool_result["content"]), RESUME_OUTPUT);
+}
+
+#[test_case(Frontend::Sdk; "sdk")]
+#[test_case(Frontend::Acp; "acp")]
+fn eof_preserves_held_input(frontend: Frontend) {
+    let home = TempDir::new().unwrap();
+    let (base_url, bodies) = mock_server();
+    write_config(home.path(), &base_url, BLANK);
+    let work = home.path().canonicalize().unwrap().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let storage = StateDir::from_path(home.path().join(".local/state").join(APP_DIR));
+    let mut session = Session::<Message, TokenUsage, ToolOutput>::new(
+        &format!("{PROVIDER}/{MODEL}"),
+        &work.to_string_lossy(),
+    );
+    let root = AgentId::generate();
+    session.bind_root_id(root).unwrap();
+    let turn = TurnId::generate();
+    let input = serde_json::to_value(AgentInput::new(HELD_PROMPT.into(), Vec::new())).unwrap();
+    for change in [
+        StateChange::Admitted {
+            turn,
+            origin: StoredTurnOrigin::User,
+        },
+        StateChange::TurnInput {
+            turn,
+            input: Some(input.clone()),
+            promoted: None,
+            preambles: Vec::new(),
+        },
+        StateChange::InputHold { held: true },
+    ] {
+        session.push_state(StoredStateRecord {
+            seq: session.next_state_seq(),
+            agent: Some(root),
+            generation: 0,
+            change,
+        });
+    }
+    session.save(&storage).unwrap();
+
+    resume_until_eof(frontend, home.path(), &work, session.id, None);
+    assert!(bodies.try_recv().is_err());
+    let saved = Session::<Message, TokenUsage, ToolOutput>::load(session.id, &storage).unwrap();
+    let state = saved.latest_state().unwrap();
+    let scope = &state.scopes[&Some(root)];
+    assert!(scope.input_held);
+    assert_eq!(scope.admitted.get(&turn), Some(&StoredTurnOrigin::User));
+    assert_eq!(scope.turn_inputs.get(&turn), Some(&input));
+}
+
+fn resume_until_eof(
+    frontend: Frontend,
+    home: &Path,
+    work: &Path,
+    id: MakimaId,
+    notification: Option<&str>,
+) {
+    let mut args = frontend_args(frontend);
+    if matches!(frontend, Frontend::Sdk) {
+        args.extend(["-c".into(), id.to_string()]);
+    }
+    let mut child = spawn_makima(home, work, args);
+    let stderr = child.stderr.take().unwrap();
+    let notifications = json_lines(stderr);
+    let output = json_lines(child.stdout.take().unwrap());
+    let mut stdin = child.stdin.take().unwrap();
+    if matches!(frontend, Frontend::Acp) {
+        acp_load(&mut stdin, &output, work, id);
+    }
+    if let Some(notification) = notification {
+        expect(&notifications, |message| message == notification);
+    }
+    drop(stdin);
+    assert!(wait_exit(child).success());
+}
+
+fn acp_load(stdin: &mut ChildStdin, output: &Receiver<Value>, work: &Path, id: MakimaId) {
+    send(
+        stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": 1, "clientCapabilities": {}}}),
+    );
+    send(
+        stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "session/load",
+                   "params": {"sessionId": id.to_string(), "cwd": work, "mcpServers": []}}),
+    );
+    let loaded = expect(output, |message| message["id"] == 2);
+    assert!(loaded.get("result").is_some(), "{loaded}");
 }
 
 /// Waits for {child} to exit, killing it if it outlives the bound.
@@ -872,15 +1266,15 @@ fn frontend_args(frontend: Frontend) -> Vec<String> {
 }
 
 /// `initialize`, `session/new`, then `session/prompt` on the new session id.
-/// Returns the rest of the server's output.
-fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> Receiver<Value> {
+/// Returns the rest of the server's output and the session id.
+fn acp_prompt(child: &mut Child, stdin: &mut ChildStdin, cwd: &Path) -> (Receiver<Value>, Value) {
     let (responses, session) = acp_session(child, stdin, cwd);
     send(
         stdin,
         json!({"jsonrpc": "2.0", "id": PROMPT_ID, "method": "session/prompt",
                "params": {"sessionId": session, "prompt": [{"type": "text", "text": PROMPT}]}}),
     );
-    responses
+    (responses, session)
 }
 
 /// `initialize` and `session/new`. Returns the server's output and the new
@@ -993,7 +1387,10 @@ makima.api.register_command({{
 }})
 makima.api.register_command({{
   name = "{ASK_COMMAND}", tui_only = false,
-  handler = function(_, ctx) prompt(ctx, "{ASK_PROMPT}") end,
+  handler = function(_, ctx)
+    prompt(ctx, "{ASK_PROMPT}")
+    assert(makima.ui.post(ctx, "{ASK_POST}"))
+  end,
 }})
 makima.api.register_command({{
   name = "{CHILD_ASK_COMMAND}", tui_only = false,
@@ -1018,6 +1415,23 @@ makima.api.register_command({{
     prompt(ctx, "{PROMPT}")
   end,
 }})
+makima.api.register_command({{
+  name = "{RESUME_COMMAND}", tui_only = false,
+  handler = function() makima.ui.flash(assert(makima.json.encode("{RESUME_OUTPUT}"))) end,
+}})
+makima.api.register_tool({{
+  name = "{RESUME_TOOL}", description = "Runs a command after recovery", resumable = true,
+  schema = {{ type = "object", properties = {{}} }},
+  handler = function() return "{RESUME_OUTPUT}" end,
+}})
+assert(makima.api.create_autocmd("ToolStart", {{
+  callback = function(ev, ctx)
+    if ev.data.tool == "{RESUME_TOOL}" then
+      local ok, err = makima.api.run_command(ctx, "{RESUME_COMMAND}")
+      assert(ok, err)
+    end
+  end,
+}}))
 makima.api.register_command({{
   name = "{UI_COMMAND}", tui_only = false,
   handler = function(_, ctx)
@@ -1070,6 +1484,10 @@ fn reply_to(body: &Value) -> &'static str {
 
 /// Serves chat completions on loopback and forwards each request body.
 fn mock_server() -> (String, Receiver<Value>) {
+    mock_server_with_gate(None)
+}
+
+fn mock_server_with_gate(mut gate: Option<Receiver<()>>) -> (String, Receiver<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
@@ -1099,6 +1517,11 @@ fn mock_server() -> (String, Receiver<Value>) {
                 let json: Value = serde_json::from_slice(&body).unwrap_or_default();
                 let reply = reply_to(&json);
                 let _ = tx.send(json);
+                if let Some(gate) = gate.take()
+                    && gate.recv_timeout(TIMEOUT).is_err()
+                {
+                    break;
+                }
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"

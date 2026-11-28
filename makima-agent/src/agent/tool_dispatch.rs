@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11,19 +12,24 @@ use futures_lite::FutureExt;
 use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
+use crate::actor::ActorHistory;
 use crate::call_scope::{CallGuard, CallScope, MovedBy};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::tools::hook::{
     Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, OUTPUT_TRAILER, Verdict,
 };
 use crate::tools::offload::{OutputLimitOptions, OutputLimits, PreviewShape};
-use crate::tools::registry::{InstalledHook, RegisteredTool, ToolInvocation};
+use crate::tools::registry::{InstalledHook, RegisteredTool, ToolExecResult, ToolInvocation};
 use crate::tools::{
     CallOrigin, DEADLINE_EXCEEDED, Deadline, LocalTool, LocalToolFn, ToolAudience, ToolContext,
     TurnToolRoute, truncate_scope,
 };
-use crate::{AgentError, AgentEvent, SessionMailbox, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use crate::{
+    AgentError, AgentEvent, EventSender, ReasonedCancelToken, SessionMailbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
+};
 use makima_config::{FILE_WRITE_TOOLS, ToolKey};
+use makima_providers::StreamResponse;
 use makima_storage::id::SessionRef;
 
 const MOVED_PERMISSION_ERR: &str = "tool moved to the background before permission was answered";
@@ -143,11 +149,7 @@ pub async fn run(
     let finalization = execution_ctx
         .pending_output_limits
         .as_ref()
-        .and_then(|slot| {
-            slot.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        });
+        .and_then(|slot| slot.lock_unpoisoned().take());
     let output_deadline = finalization.as_ref().map_or(ctx.deadline, |metadata| {
         let deadline = metadata.deadline.map_or(Deadline::None, Deadline::At);
         if metadata.terminal_cleanup {
@@ -229,6 +231,22 @@ pub async fn run(
                 done.output = ToolOutput::Plain(reason.into());
                 done.is_error = true;
             }
+        }
+    }
+    if let Some(path) = ctx.mode.plan_path().filter(|path| done.wrote_to(path))
+        && let Some(turn) = &ctx.managed_turn
+    {
+        let access = turn.state_access();
+        let result = crate::CancelToken::with_effect(&[&ctx.cancel], || {
+            crate::plan_state::set_written_with_access(&access, path, true)
+        });
+        if let Some(Err(error)) = result {
+            warn!(agent_id = %turn.agent_id(), %error, "could not record successful plan write");
+            done.output = ToolOutput::Plain(
+                format!("Plan file was written but its readiness could not be recorded: {error}")
+                    .into(),
+            );
+            done.is_error = true;
         }
     }
     done
@@ -774,15 +792,19 @@ async fn run_native_tool(
         }
     };
 
-    if let Some(target) = invocation.mutable_path(ctx) {
+    let mutable_path = match invocation.mutable_path(ctx).await {
+        Ok(path) => path,
+        Err(message) => return done_error(message),
+    };
+    if let Some(target) = mutable_path.as_ref() {
         if let Some(allowed) = ctx.restrict_write_to() {
-            let authorized = restricted_mutation_target(&target, &allowed, ctx);
+            let authorized = restricted_mutation_target(target, &allowed, ctx);
             if !authorized {
                 warn!(tool = %name, target = %target.display(), "blocked write in restricted mode");
                 return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
             }
         }
-        if let Some(reason) = ctx.permissions.boundary_block_reason(&target) {
+        if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
             return done_error(reason);
         }
     }
@@ -807,7 +829,7 @@ async fn run_native_tool(
     if let Err(e) = enforce_permission(invocation.as_ref(), name, ctx, &id).await {
         return done_error(e);
     }
-    let locked = match invocation.mutable_path(ctx) {
+    let locked = match mutable_path {
         Some(target) => {
             if let Some(allowed) = ctx.restrict_write_to()
                 && !restricted_mutation_target(&target, &allowed, ctx)
@@ -864,16 +886,34 @@ async fn run_native_tool(
             .send(AgentEvent::ToolExecutionStart { id: id.clone() });
     }
 
-    let result = match locked {
-        Some((exec_ctx, guard, key)) => {
-            let result = invocation.execute(&exec_ctx).await;
-            if result.output.is_ok() {
-                ctx.file_tracker.record_read(&key);
-            }
-            drop(guard);
-            result
+    let (exec_ctx, guard, key) = match locked {
+        Some((exec_ctx, guard, key)) => (exec_ctx, Some(guard), Some(key)),
+        None => (ctx.clone(), None, None),
+    };
+    let (result_tx, result_rx) = flume::bounded(1);
+    let completion = async move {
+        let _guard = guard;
+        let result = execute_caught(invocation, &exec_ctx).await;
+        if result.output.is_ok()
+            && let Some(key) = key
+        {
+            exec_ctx.file_tracker.record_read(&key);
         }
-        None => invocation.execute(ctx).await,
+        let _ = result_tx.send(result);
+    };
+    if let Some(turn) = &ctx.managed_turn {
+        if let Err(error) = turn
+            .manager()
+            .retain_tool_completion(turn.agent_id(), completion)
+        {
+            return done_error(error.to_string());
+        }
+    } else {
+        smol::spawn(completion).detach();
+    }
+    let result = match result_rx.recv_async().await {
+        Ok(result) => result,
+        Err(_) => return done_error("Tool completion owner disconnected".into()),
     };
     let elapsed = started.elapsed();
     match result.output {
@@ -903,6 +943,20 @@ async fn run_native_tool(
             );
             done_error(message)
         }
+    }
+}
+
+async fn execute_caught(invocation: Box<dyn ToolInvocation>, ctx: &ToolContext) -> ToolExecResult {
+    match AssertUnwindSafe(invocation.execute(ctx))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "internal error: tool panicked: {}",
+            panic_to_string(payload)
+        ))
+        .into(),
     }
 }
 
@@ -1033,7 +1087,7 @@ async fn enforce_permission(
                     &tool_key,
                     &scopes,
                     &ctx.event_tx,
-                    ctx.user_response_rx.as_deref(),
+                    ctx.answer_scope(),
                     id,
                     &ask_cancel,
                     ctx.restrict_write_to().as_deref(),
@@ -1091,7 +1145,7 @@ async fn execute_mcp_tool(
                 &perm_tool,
                 &perm_scopes,
                 &ctx.event_tx,
-                ctx.user_response_rx.as_deref(),
+                ctx.answer_scope(),
                 id,
                 &ask_cancel,
                 ctx.mode.plan_path(),
@@ -1131,11 +1185,12 @@ async fn execute_mcp_tool(
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 pub(super) async fn process_tool_calls(
-    response: makima_providers::StreamResponse,
+    response: StreamResponse,
     recent_calls: &mut RecentCalls,
-    history: &mut super::history::History,
-    event_tx: &crate::EventSender,
+    mut history: ActorHistory<'_>,
+    event_tx: &EventSender,
     ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
 ) -> Result<(), AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
@@ -1143,8 +1198,59 @@ pub(super) async fn process_tool_calls(
         .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
 
-    history.push(response.message);
+    history
+        .push_observation(response.message)
+        .map_err(|error| AgentError::Config {
+            message: error.to_string(),
+        })?;
 
+    execute_tool_calls(
+        tool_uses,
+        false,
+        recent_calls,
+        history,
+        event_tx,
+        ctx,
+        cancel_reason,
+    )
+    .await
+}
+
+pub(super) async fn resume_tool_calls(
+    recent_calls: &mut RecentCalls,
+    history: ActorHistory<'_>,
+    event_tx: &EventSender,
+    ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
+) -> Result<(), AgentError> {
+    if ctx.cancel.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    let calls = super::history::pending_tool_calls(history.as_slice());
+    if calls.is_empty() {
+        return Ok(());
+    }
+    execute_tool_calls(
+        calls,
+        true,
+        recent_calls,
+        history,
+        event_tx,
+        ctx,
+        cancel_reason,
+    )
+    .await
+}
+
+async fn execute_tool_calls(
+    tool_uses: Vec<(String, String, Value)>,
+    restarting: bool,
+    recent_calls: &mut RecentCalls,
+    mut history: ActorHistory<'_>,
+    event_tx: &EventSender,
+    ctx: &ToolContext,
+    cancel_reason: Option<&ReasonedCancelToken>,
+) -> Result<(), AgentError> {
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
@@ -1155,7 +1261,14 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        if restarting
+            && !matches!(resolve(ctx, &name).route, Route::Native(ref entry) if entry.tool.resumable())
+        {
+            immediate_errors.push(ToolDoneEvent::error(
+                id.clone(),
+                super::history::RESTART_TOOL_INTERRUPTION,
+            ));
+        } else if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
@@ -1164,7 +1277,11 @@ pub(super) async fn process_tool_calls(
         recent_calls.record(name, &input);
     }
 
+    let journal = history.journal().cloned();
     for err in &immediate_errors {
+        if let Some(journal) = &journal {
+            journal.record_tool_output(&err.id, &err.output);
+        }
         event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
@@ -1173,7 +1290,7 @@ pub(super) async fn process_tool_calls(
         .as_ref()
         .and_then(|session| SessionMailbox::open(session.id()).ok());
     let (move_tx, move_rx) = flume::unbounded::<String>();
-    let (result_tx, result_rx) = flume::unbounded::<(String, ToolDoneEvent)>();
+    let (result_tx, result_rx) = flume::unbounded::<ToolDoneEvent>();
     let mut pending: HashMap<String, smol::Task<()>> = HashMap::new();
     let mut scopes: HashMap<String, Arc<CallScope>> = HashMap::new();
 
@@ -1183,9 +1300,7 @@ pub(super) async fn process_tool_calls(
             id.clone(),
             Arc::clone(&tool_name),
             call_summary(&ctx.registry, &name, &input),
-            ctx.session_id
-                .as_ref()
-                .map(makima_storage::id::SessionRef::id),
+            ctx.session_id.as_ref().map(SessionRef::id),
             ctx.execution_agent_id,
             &ctx.cancel,
             Some(move_tx.clone()),
@@ -1207,6 +1322,8 @@ pub(super) async fn process_tool_calls(
         let result_tx_clone = result_tx.clone();
         let mailbox_clone = mailbox.clone();
         let task_scope = Arc::clone(&scope);
+        let cancel_reason = cancel_reason.cloned();
+        let journal = journal.clone();
         let task = smol::spawn(async move {
             let _guard = guard;
             let run_id = task_scope.id().to_owned();
@@ -1227,12 +1344,22 @@ pub(super) async fn process_tool_calls(
                     )
                 }
             };
+            if let Some(journal) = journal {
+                journal.record_tool_output(&done.id, &done.output);
+            }
             if task_scope.claim_foreground() {
-                event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
                 if let Some(mailbox) = &mailbox_clone {
                     mailbox.finish_call(task_scope.id());
                 }
-                let _ = result_tx_clone.send((task_scope.id().to_owned(), done));
+                let publish = || {
+                    let _ = result_tx_clone.send(done.clone());
+                };
+                if let Some(cancel) = cancel_reason {
+                    cancel.unless_suspended(publish);
+                } else {
+                    publish();
+                }
+                event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done)));
             } else {
                 // A move took the call, or the dispatcher already claimed the
                 // receipt. Either way the result belongs to the mailbox.
@@ -1253,17 +1380,18 @@ pub(super) async fn process_tool_calls(
     }
 
     enum Next {
-        Result(String, Box<ToolDoneEvent>),
+        Result(Box<ToolDoneEvent>),
+        Cancelled,
         Moved(String),
         Closed,
     }
 
-    let mut results: Vec<ToolDoneEvent> = Vec::new();
+    let mut results = immediate_errors;
     while !pending.is_empty() {
         let next = futures_lite::future::or(
             async {
                 match result_rx.recv_async().await {
-                    Ok((id, done)) => Next::Result(id, Box::new(done)),
+                    Ok(done) => Next::Result(Box::new(done)),
                     Err(_) => Next::Closed,
                 }
             },
@@ -1273,11 +1401,31 @@ pub(super) async fn process_tool_calls(
                     Err(_) => Next::Closed,
                 }
             },
+        );
+        let next = futures_lite::future::or(
+            async {
+                if restarting {
+                    ctx.cancel.cancelled().await;
+                } else if let Some(cancel) = cancel_reason {
+                    cancel.suspended().await;
+                } else {
+                    futures_lite::future::pending().await
+                }
+                Next::Cancelled
+            },
+            next,
         )
         .await;
         match next {
-            Next::Result(id, done) => {
-                if pending.remove(&id).is_some() {
+            Next::Cancelled => {
+                if !cancel_reason.is_some_and(ReasonedCancelToken::is_suspended) {
+                    return Err(AgentError::Cancelled);
+                }
+                results.extend(result_rx.try_iter());
+                break;
+            }
+            Next::Result(done) => {
+                if pending.remove(&done.id).is_some() {
                     results.push(*done);
                 }
             }
@@ -1320,13 +1468,23 @@ pub(super) async fn process_tool_calls(
         }
     }
 
-    let mut all_results = results;
-    all_results.extend(immediate_errors);
-    let tool_msg = crate::types::tool_results(all_results);
-    event_tx.send(AgentEvent::ToolResultsSubmitted {
-        message: Box::new(tool_msg.clone()),
-    })?;
-    history.push(tool_msg);
+    let suspended = cancel_reason.is_some_and(ReasonedCancelToken::is_suspended);
+    if !results.is_empty() {
+        let tool_msg = crate::types::tool_results(results);
+        history
+            .push_observation(tool_msg.clone())
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
+        if !suspended {
+            event_tx.send(AgentEvent::ToolResultsSubmitted {
+                message: Box::new(tool_msg),
+            })?;
+        }
+    }
+    if suspended {
+        return Err(AgentError::Cancelled);
+    }
     Ok(())
 }
 
@@ -1371,21 +1529,18 @@ fn background_text(scope: &CallScope, done: &ToolDoneEvent, lost: bool) -> Strin
 }
 
 fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
-    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+    if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_owned()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else {
         "unknown panic".into()
-    };
-    format!(
-        "{message}\n\nBacktrace:\n{}",
-        std::backtrace::Backtrace::force_capture()
-    )
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::read_to_string;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1396,7 +1551,7 @@ mod tests {
         DefaultEffect, Effect, Permission, PermissionRule, PermissionsConfig, ToolKey,
     };
     use makima_storage::checkpoint::{CheckpointWriter, accept_all};
-    use makima_storage::id::MakimaId;
+    use makima_storage::id::{AgentId, MakimaId};
     use test_case::test_case;
 
     use super::*;
@@ -1404,15 +1559,16 @@ mod tests {
     use crate::agent::history::History;
     use crate::call_scope::CallHome;
     use crate::cancel::CancelToken;
+    use crate::journal::SessionJournal;
     use crate::mcp::test_support::{stub_session, stub_session_with_result};
     use crate::mcp::tool_names;
-    use crate::permissions::{
-        PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager, TaggedAnswer,
-    };
+    use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionAnswer, PermissionManager};
+    use crate::session::AnswerRouter;
     use crate::session_coordinator::{
         SessionCheckpoint, SessionCoordinatorHandle, SessionCoordinatorParams,
         builtin_option_definitions,
     };
+    use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::template::Vars;
     use crate::tools::offload::{OFFLOAD_FOOTER_PREFIX, OffloadBackend, OffloadStore};
     use crate::tools::registry::{ToolRegistry, ToolSource};
@@ -1425,6 +1581,12 @@ mod tests {
         PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
         ToolHook, local_tool,
     };
+    use crate::{
+        ActorBackend, AgentLimits, AgentManagerHandle, AgentMetadata, AgentRef, BackendResult,
+        ControlWork, CurrentManagedTurn, DoneReason, EffectiveAgentConfig, RunSettings,
+        TurnContext, TurnOutcome, WorkKind,
+    };
+    use makima_storage::plans::PlanSlot;
 
     const TEST_ID: &str = "t1";
     const PROBE_WIRE: &str = "srv__probe";
@@ -1604,6 +1766,102 @@ mod tests {
     /// input, which is how a test sees the input each stage of dispatch got.
     struct HookMock(Option<Permission>);
 
+    struct RestartTool(bool);
+
+    impl Tool for RestartTool {
+        fn name(&self) -> &str {
+            HOOK_TOOL_NAME
+        }
+
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            "restart probe".into()
+        }
+
+        fn schema(&self) -> Value {
+            HookMock(None).schema()
+        }
+
+        fn resumable(&self) -> bool {
+            self.0
+        }
+
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            HookMock(None).parse(input)
+        }
+    }
+
+    #[test_case(false; "nonresumable_is_interrupted")]
+    #[test_case(true; "resumable_runs_again")]
+    fn restart_dispatch_preserves_call_and_completed_results(resumable: bool) {
+        use makima_providers::{ContentBlock, Message, Role};
+
+        smol::block_on(async {
+            const FINISHED_ID: &str = "finished";
+            const FINISHED_OUTPUT: &str = "already done";
+            let (tx, _rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(tx);
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.event_tx = event_tx.clone();
+            ctx.registry = Arc::new(ToolRegistry::new());
+            ctx.registry
+                .register(
+                    Arc::new(RestartTool(resumable)),
+                    ToolSource::Lua {
+                        plugin: Arc::from(TEST_PLUGIN),
+                    },
+                )
+                .unwrap();
+            pin(&mut ctx);
+            let assistant = Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use(TEST_ID, HOOK_TOOL_NAME, call_input(HOOK_PLAIN)),
+                    ContentBlock::tool_use(FINISHED_ID, HOOK_TOOL_NAME, call_input(HOOK_DENIED)),
+                ],
+                ..Default::default()
+            };
+            let completed = Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: FINISHED_ID.into(),
+                    content: FINISHED_OUTPUT.into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![assistant.clone(), completed.clone()]);
+            resume_tool_calls(
+                &mut RecentCalls::new(),
+                ActorHistory::new(&mut history),
+                &event_tx,
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.len(), 3);
+            assert_eq!(history.as_slice()[0], assistant);
+            assert_eq!(history.as_slice()[1], completed);
+            let results = &history.as_slice()[2].content;
+            assert_eq!(results.len(), 1);
+            assert!(
+                matches!(&results[0], ContentBlock::ToolResult { tool_use_id, content, is_error }
+                if tool_use_id == TEST_ID && *is_error != resumable
+                    && content == &if resumable { ran(HOOK_PLAIN) } else { super::super::history::RESTART_TOOL_INTERRUPTION.into() })
+            );
+            resume_tool_calls(
+                &mut RecentCalls::new(),
+                ActorHistory::new(&mut history),
+                &event_tx,
+                &ctx,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(history.len(), 3);
+        });
+    }
+
     struct HookMockInvocation(String);
 
     impl ToolInvocation for HookMockInvocation {
@@ -1618,8 +1876,14 @@ mod tests {
                 self.0.clone(),
             ))))
         }
-        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
-            self.0.starts_with('/').then(|| PathBuf::from(&self.0))
+        fn mutable_path<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+            Box::pin(std::future::ready(Ok(self
+                .0
+                .starts_with('/')
+                .then(|| PathBuf::from(&self.0)))))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -3161,6 +3425,7 @@ mod tests {
                         name: "write".into(),
                         gate: Arc::clone(&gate),
                         fail: false,
+                        content: None,
                     }),
                     ToolSource::Lua {
                         plugin: "write".into(),
@@ -3567,38 +3832,44 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (response_tx, response_rx) = flume::unbounded();
+            let answers = AnswerRouter::default();
             let allowed = answer.is_allow();
-            response_tx
-                .send(TaggedAnswer::new(TEST_ID, answer).encode())
-                .unwrap();
             let mut ctx = stub_ctx_with_permissions(&plan, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            ctx.answers = Some(answers.clone());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let mcp = stub_session_with_result(&[(PROBE_QUALIFIED, "")], HOOK_OUTPUT_TEXT);
             let ctx = with_mcp(ctx, &mcp);
-            let done = dispatch(&ctx, PROBE_WIRE, &json!({})).await;
+            let input = json!({});
+            let mut call = Box::pin(dispatch(&ctx, PROBE_WIRE, &input));
+            assert!(
+                futures_lite::future::poll_once(call.as_mut())
+                    .await
+                    .is_none()
+            );
+            let (id, ask, tool, scopes) = rx
+                .try_iter()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::PermissionRequest {
+                        id,
+                        ask,
+                        tool,
+                        scopes,
+                    } => Some((id, ask, tool, scopes)),
+                    _ => None,
+                })
+                .expect("expected permission request");
+            assert_eq!(id, TEST_ID);
+            assert_eq!(tool, ToolKey::parse(PROBE_QUALIFIED).unwrap());
+            assert_eq!(scopes, [input.to_string()]);
+            answers.answer(ask, answer.encode()).unwrap();
+            let done = call.await;
             assert_eq!(done.is_error, !allowed);
             if allowed {
                 assert_eq!(done.output.as_text(), HOOK_OUTPUT_TEXT);
             } else {
                 assert!(done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX));
             }
-            let requests: Vec<_> = rx
-                .try_iter()
-                .filter_map(|envelope| match envelope.event {
-                    AgentEvent::PermissionRequest { id, tool, scopes } => Some((id, tool, scopes)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                requests,
-                [(
-                    TEST_ID.into(),
-                    ToolKey::parse(PROBE_QUALIFIED).unwrap(),
-                    vec![json!({}).to_string()]
-                )]
-            );
             let mut tools = json!([]);
             mcp.extend_tools(&mut tools);
             assert_eq!(tool_names(&tools).contains(&PROBE_WIRE), allowed);
@@ -3776,25 +4047,36 @@ mod tests {
         name: String,
         gate: Arc<Gate>,
         fail: bool,
+        content: Option<&'static str>,
     }
 
     struct GatedWriteInvocation {
         gate: Arc<Gate>,
         path: String,
         fail: bool,
+        content: Option<&'static str>,
     }
 
     impl ToolInvocation for GatedWriteInvocation {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("gated".into()))
         }
-        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
-            Some(PathBuf::from(&self.path))
+        fn mutable_path<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+            Box::pin(std::future::ready(Ok(Some(PathBuf::from(&self.path)))))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
                 self.gate.entered.send(()).ok();
                 let _ = self.gate.release_rx.recv_async().await;
+                if let Some(content) = self.content {
+                    let path = self.path.clone();
+                    if let Err(error) = smol::unblock(move || std::fs::write(path, content)).await {
+                        return Err(error.to_string()).into();
+                    }
+                }
                 self.gate.exited.send(()).ok();
                 let output: Result<ToolOutput, String> = if self.fail {
                     Err("boom".into())
@@ -3825,6 +4107,7 @@ mod tests {
                 gate: Arc::clone(&self.gate),
                 path: input["path"].as_str().unwrap_or_default().to_owned(),
                 fail: self.fail,
+                content: self.content,
             }))
         }
     }
@@ -3836,6 +4119,7 @@ mod tests {
                     name: name.to_owned(),
                     gate,
                     fail,
+                    content: None,
                 }),
                 ToolSource::Lua {
                     plugin: "test".into(),
@@ -3871,6 +4155,221 @@ mod tests {
         .await
     }
 
+    const PLAN_WRITE_CONTENT: &str = "# Plan\nShared dispatch persists readiness.\n";
+    const PLAN_WRITE_FAILURE: &str = "plan write failed before publication";
+
+    struct PlanFileWrite(bool);
+    struct PlanFileWriteInvocation {
+        path: String,
+        fail: bool,
+    }
+
+    impl ToolInvocation for PlanFileWriteInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(TEST_ID.into()))
+        }
+        fn mutable_path<'a>(
+            &'a self,
+            _: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+            Box::pin(std::future::ready(Ok(Some(self.path.clone().into()))))
+        }
+        fn execute<'a>(self: Box<Self>, _: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                let output = if self.fail {
+                    Err(PLAN_WRITE_FAILURE.into())
+                } else {
+                    std::fs::write(&self.path, PLAN_WRITE_CONTENT)
+                        .map(|_| ToolOutput::Plain(TEST_ID.into()))
+                        .map_err(|error| error.to_string())
+                };
+                ToolExecResult::from(output).with_written_path(Some(self.path))
+            })
+        }
+    }
+    impl Tool for PlanFileWrite {
+        fn name(&self) -> &str {
+            "write"
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            TEST_ID.into()
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"object", "properties":{"path":{"type":"string"}}})
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(PlanFileWriteInvocation {
+                path: input["path"].as_str().unwrap().into(),
+                fail: self.0,
+            }))
+        }
+    }
+
+    struct PlanWriteBackend {
+        entered: flume::Sender<CurrentManagedTurn>,
+        release: flume::Receiver<()>,
+    }
+
+    impl ActorBackend for PlanWriteBackend {
+        fn run_turn<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            context: TurnContext,
+            _: crate::AgentInput,
+            _: WorkKind,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async move {
+                self.entered.send(context.managed_turn.unwrap()).unwrap();
+                self.release.recv_async().await.unwrap();
+                BackendResult::EnteredRun(TurnOutcome::completed(
+                    context.agent_id,
+                    context.turn_id.unwrap(),
+                    Default::default(),
+                    0,
+                    DoneReason::EndTurn,
+                ))
+            })
+        }
+        fn run_control<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: &'a ControlWork,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async { BackendResult::ControlDone })
+        }
+        fn run_compact<'a>(
+            &'a mut self,
+            _: ActorHistory<'a>,
+            _: TurnContext,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, BackendResult> {
+            Box::pin(async { BackendResult::CompactDone })
+        }
+    }
+
+    fn plan_write_backend() -> (
+        Box<dyn ActorBackend>,
+        flume::Receiver<CurrentManagedTurn>,
+        flume::Sender<()>,
+    ) {
+        let (entered, current) = flume::bounded(1);
+        let (release, receiver) = flume::bounded(1);
+        (
+            Box::new(PlanWriteBackend {
+                entered,
+                release: receiver,
+            }),
+            current,
+            release,
+        )
+    }
+
+    fn plan_config(path: &Path) -> EffectiveAgentConfig {
+        let ctx = stub_ctx(&AgentMode::Plan(path.to_path_buf()));
+        EffectiveAgentConfig::new(
+            RunSettings {
+                provider: ctx.provider,
+                model: (*ctx.model).clone(),
+                thinking: ctx.opts.thinking,
+                fast: ctx.opts.fast,
+                workflow: false,
+            },
+            ctx.mode,
+        )
+    }
+
+    fn journal_plans(manager: &AgentManagerHandle) -> PlanSlot {
+        let snapshot = manager.journal().snapshot();
+        let view = snapshot.fold().unwrap();
+        crate::plan_state::plan_entries(&view).unwrap()
+    }
+
+    #[test_case(false, false; "root_write")]
+    #[test_case(true, false; "child_write")]
+    #[test_case(false, true; "failed_root_write")]
+    #[test_case(true, true; "failed_child_write")]
+    fn managed_plan_writes_persist_without_ui_and_preserve_other_agents(child: bool, fail: bool) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let root_path = directory.path().join("root.md");
+            let child_path = directory.path().join("child.md");
+            let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+            let (backend, current, release) = plan_write_backend();
+            let root = manager
+                .create_root_with_config(Some(plan_config(&root_path)), Vec::new(), None, |_| {
+                    Ok::<_, String>(backend)
+                })
+                .await
+                .unwrap();
+            let target: AgentRef;
+            let current = if child {
+                let (backend, child_current, child_release) = plan_write_backend();
+                target = manager
+                    .spawn_child_trusted_with_config(
+                        &root,
+                        plan_config(&child_path),
+                        AgentMetadata::default(),
+                        Vec::new(),
+                        None,
+                        |_| Ok::<_, String>(backend),
+                    )
+                    .await
+                    .unwrap();
+                (child_current, child_release)
+            } else {
+                target = root.clone();
+                (current, release)
+            };
+            let initial = journal_plans(&manager);
+            assert!(!initial[&target.id()].written);
+            assert!(initial.values().all(|entry| entry.approved.is_none()));
+            let ticket = target
+                .actor()
+                .unwrap()
+                .admit_turn(
+                    crate::AgentInput::new(TEST_ID.into(), Vec::new()),
+                    None,
+                    TEST_ID.into(),
+                )
+                .unwrap();
+            let turn = current.0.recv_async().await.unwrap();
+            let path = initial[&target.id()].path.clone();
+            let mut ctx = stub_ctx(&AgentMode::Plan(path.clone()));
+            ctx.cwd = directory.path().to_path_buf();
+            ctx.managed_turn = Some(turn);
+            let registry = registered(Arc::new(PlanFileWrite(fail)));
+            let done = dispatch_gated(
+                registry,
+                ctx,
+                TEST_ID.into(),
+                "write".into(),
+                path.display().to_string(),
+            )
+            .await;
+            assert_eq!(done.is_error, fail);
+            if fail {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), PLAN_WRITE_CONTENT);
+            }
+            let plans = journal_plans(&manager);
+            assert_eq!(plans[&target.id()].written, !fail);
+            if child {
+                assert_eq!(plans[&root.id()], initial[&root.id()]);
+            }
+            current.1.send(()).unwrap();
+            ticket.wait_result().await;
+            assert!(
+                manager
+                    .shutdown(Duration::from_secs(1))
+                    .await
+                    .timed_out
+                    .is_empty()
+            );
+        });
+    }
+
     #[test]
     fn cloned_tool_contexts_share_write_locks() {
         let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
@@ -3884,6 +4383,40 @@ mod tests {
             0,
             "root contexts start with an empty owner chain"
         );
+    }
+
+    #[test]
+    fn caller_drop_keeps_write_lock_until_execution_completes() {
+        smol::block_on(async {
+            let ctx = stub_ctx(&AgentMode::Build);
+            let registry = Arc::new(ToolRegistry::new());
+            let gate = Gate::new();
+            register_gated(&registry, TEST_ID, Arc::clone(&gate));
+            let task = smol::spawn(dispatch_gated(
+                registry,
+                ctx.clone(),
+                TEST_ID.into(),
+                TEST_ID.into(),
+                "/detached-write".into(),
+            ));
+            gate.entered().await;
+            task.cancel().await;
+            let key = crate::tools::FileWriteLocks::lock_key("/detached-write", &ctx.cwd).unwrap();
+            let mut acquire =
+                Box::pin(
+                    ctx.file_write_locks
+                        .acquire(key, &[], &ctx.cancel, ctx.deadline),
+                );
+            assert!(
+                futures_lite::future::poll_once(&mut acquire)
+                    .await
+                    .is_none()
+            );
+            gate.release();
+            let guard = acquire.await.unwrap();
+            gate.exited().await;
+            drop(guard);
+        });
     }
 
     #[test]
@@ -4304,8 +4837,13 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("recursive".into()))
         }
-        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
-            self.input["path"].as_str().map(PathBuf::from)
+        fn mutable_path<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+            Box::pin(std::future::ready(Ok(self.input["path"]
+                .as_str()
+                .map(PathBuf::from))))
         }
         fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -4360,8 +4898,11 @@ mod tests {
         fn start_header(&self) -> HeaderFuture {
             HeaderFuture::Ready(HeaderResult::plain("inner".into()))
         }
-        fn mutable_path(&self, _ctx: &ToolContext) -> Option<PathBuf> {
-            Some(PathBuf::from(&self.path))
+        fn mutable_path<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PathBuf>, String>> {
+            Box::pin(std::future::ready(Ok(Some(PathBuf::from(&self.path)))))
         }
         fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async {
@@ -4591,10 +5132,10 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (_response_tx, response_rx) = flume::unbounded::<String>();
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::new(async_lock::Mutex::new(response_rx)));
+            ctx.answers = Some(AnswerRouter::default());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let (mut ctx, _hook) =
                 hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
             let (_run_trigger, run) = CancelToken::new();
@@ -4626,7 +5167,7 @@ mod tests {
     }
 
     #[test]
-    fn a_move_withdraws_the_permission_prompt_and_frees_the_channel() {
+    fn a_move_withdraws_the_permission_prompt() {
         smol::block_on(async {
             let permissions = Arc::new(PermissionManager::new(
                 PermissionsConfig::default(),
@@ -4635,11 +5176,11 @@ mod tests {
                 Arc::default(),
             ));
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
-            let (response_tx, response_rx) = flume::unbounded::<String>();
-            let responses = Arc::new(async_lock::Mutex::new(response_rx));
+            let answers = AnswerRouter::default();
             let mut ctx = stub_ctx_with_permissions(&AgentMode::Build, permissions);
             ctx.event_tx = crate::EventSender::new(tx);
-            ctx.user_response_rx = Some(Arc::clone(&responses));
+            ctx.answers = Some(answers.clone());
+            ctx.execution_agent_id = Some(AgentId::generate());
             let (mut ctx, _hook) =
                 hooked_with(ctx, Some(Permission::Run), RecordingHook::default());
             let (_run_trigger, run) = CancelToken::new();
@@ -4659,24 +5200,19 @@ mod tests {
                 dispatch_pinned(&ctx, HOOK_TOOL_NAME, &call_input(HOOK_PLAIN)).await
             });
             let prompt = async {
-                loop {
-                    match rx.recv_async().await {
-                        Ok(envelope)
-                            if matches!(envelope.event, AgentEvent::PermissionRequest { .. }) =>
-                        {
-                            break true;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => break false,
+                while let Ok(envelope) = rx.recv_async().await {
+                    if let AgentEvent::PermissionRequest { ask, .. } = envelope.event {
+                        return Some(ask);
                     }
                 }
+                None
             };
-            let prompted = futures_lite::future::or(prompt, async {
+            let ask = futures_lite::future::or(prompt, async {
                 smol::Timer::after(Duration::from_secs(2)).await;
-                false
+                None
             })
-            .await;
-            assert!(prompted, "the call must reach the prompt before the move");
+            .await
+            .expect("the call must reach the prompt before the move");
 
             let _trigger = scope
                 .move_to(CallHome {
@@ -4694,10 +5230,10 @@ mod tests {
                 done.output.as_text()
             );
             assert!(
-                responses.try_lock().is_some(),
-                "a withdrawn prompt must not hold the channel"
+                answers
+                    .answer(ask, PermissionAnswer::AllowOnce.encode())
+                    .is_err()
             );
-            drop(response_tx);
         });
     }
 
@@ -4710,7 +5246,14 @@ mod tests {
             let (started_tx, started_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
             let ctx = slow_tool_ctx(&event_tx, mailbox.session_id(), started_tx, release_rx);
-            let mut history = History::new(Vec::new());
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = StoredSession::new("test", "/test");
+            let root = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+            journal.bind_writer(writer).unwrap();
+            let mut history = History::new(Vec::new()).with_journal(root, Arc::clone(&journal));
             let mover = {
                 let mailbox = mailbox.clone();
                 smol::spawn(async move {
@@ -4722,9 +5265,10 @@ mod tests {
             process_tool_calls(
                 one_call(SLOW_ID),
                 &mut RecentCalls::new(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -4752,16 +5296,29 @@ mod tests {
             assert_eq!(mailbox.outstanding(), 0);
 
             let mut moved = false;
-            let mut done = false;
-            while let Ok(envelope) = events.try_recv() {
+            let output = loop {
+                let envelope = events.recv_async().await.unwrap();
                 match envelope.event {
                     AgentEvent::ToolMoved { id, .. } if id == SLOW_ID => moved = true,
-                    AgentEvent::BackgroundDone(event) if event.id == SLOW_ID => done = true,
+                    AgentEvent::BackgroundDone(event) if event.id == SLOW_ID => break event.output,
                     _ => {}
                 }
-            }
-            assert!(moved, "the UI must hear about the move");
-            assert!(done, "the UI must get the final result");
+            };
+            assert!(moved);
+            journal.flush().await.unwrap();
+            let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
+            let saved: Vec<_> = log
+                .lines()
+                .filter_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
+                    Record::Out { id, d } if id == SLOW_ID => Some(d),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&saved[0]).unwrap(),
+                serde_json::to_value(&output).unwrap()
+            );
         });
     }
 
@@ -4804,9 +5361,10 @@ mod tests {
             process_tool_calls(
                 one_call(SLOW_ID),
                 &mut RecentCalls::new(),
-                &mut history,
+                ActorHistory::new(&mut history),
                 &event_tx,
                 &ctx,
+                None,
             )
             .await
             .unwrap();
@@ -4824,9 +5382,12 @@ mod tests {
 
     #[test]
     fn a_moved_call_that_panics_reports_the_task_lost() {
+        const PANIC_MESSAGE: &str = "tool blew up";
+        const PANIC_NOT_SETTLED: &str = "background panic was not settled";
+        const LOST_RESULT: &str = "lost";
         smol::block_on(async {
             let (mailbox, _coordinator) = live_background_session();
-            let (event_tx, _events) = flume::unbounded();
+            let (event_tx, events) = flume::unbounded();
             let event_tx = crate::EventSender::new(event_tx);
             let (started_tx, started_rx) = flume::bounded(1);
             let (_release_tx, release_rx) = flume::bounded(1);
@@ -4849,7 +5410,7 @@ mod tests {
                         // A hook-free unwind: the task must catch the same
                         // payload a real panic produces without waiting on
                         // stderr capture under load.
-                        std::panic::resume_unwind(Box::new("tool blew up"));
+                        std::panic::resume_unwind(Box::new(PANIC_MESSAGE));
                     })
                 }),
             )]));
@@ -4866,9 +5427,10 @@ mod tests {
                 process_tool_calls(
                     one_call(SLOW_ID),
                     &mut RecentCalls::new(),
-                    &mut history,
+                    ActorHistory::new(&mut history),
                     &event_tx,
                     &ctx,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4877,8 +5439,26 @@ mod tests {
             run.await;
             panic_tx.send(()).unwrap();
 
-            let message = next_message(&mailbox).await;
-            assert!(message.contains("lost"), "{message}");
+            let delivered = async {
+                loop {
+                    let event = events.recv_async().await.unwrap();
+                    if let AgentEvent::BackgroundDone(done) = event.event {
+                        return done;
+                    }
+                }
+            };
+            let done = futures_lite::future::or(delivered, async {
+                smol::Timer::after(BACKGROUND_RESULT_TIMEOUT).await;
+                panic!("{PANIC_NOT_SETTLED}");
+            })
+            .await;
+            assert!(done.is_error);
+            assert!(done.output.as_text().contains(PANIC_MESSAGE));
+            assert_eq!(mailbox.outstanding(), 0);
+            assert!(mailbox.background_calls().is_empty());
+            let messages = mailbox.drain();
+            assert_eq!(messages.len(), 1);
+            assert!(messages[0].user_text().unwrap().contains(LOST_RESULT));
         });
     }
 }

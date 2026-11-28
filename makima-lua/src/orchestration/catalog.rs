@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -84,7 +85,7 @@ impl ModelCatalog {
     }
 
     pub fn attach(&self, orchestration: &Arc<AgentOrchestration>) {
-        let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+        let mut attached = self.attached.lock_unpoisoned();
         attached.retain(|weak| weak.strong_count() > 0);
         attached.push(Arc::downgrade(orchestration));
     }
@@ -168,8 +169,7 @@ impl ModelCatalog {
         let specs = grown.then(|| self.snapshot());
         let orchestrations = self
             .attached
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .iter()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();

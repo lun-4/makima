@@ -125,9 +125,21 @@ jobs:
         shell: bash
         run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
 
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - run: brew install ripgrep
+      - run: just test
+
   publish:
     name: Publish Release
-    needs: [build-linux, build-other]
+    needs: [build-linux, build-other, test-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

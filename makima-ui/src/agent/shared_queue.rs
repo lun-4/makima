@@ -12,20 +12,9 @@ use makima_agent::actor::{
 use makima_agent::{AgentInput, EffectiveAgentConfig, ImageSource};
 use tracing::warn;
 
-use crate::components::input::Submission;
-
 pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
-}
-
-impl From<Submission> for QueuedMessage {
-    fn from(sub: Submission) -> Self {
-        Self {
-            text: sub.text,
-            images: sub.images,
-        }
-    }
 }
 
 pub(crate) struct QueueItem {
@@ -59,6 +48,7 @@ pub(crate) fn visible_pending(actor: &AgentActorHandle) -> Vec<PendingQueueEntry
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn pending_texts(entries: Vec<PendingQueueEntry>) -> Vec<String> {
     entries
         .into_iter()
@@ -84,15 +74,27 @@ impl QueueSender {
         self.actor.reserve_presentation(displayed)
     }
 
+    #[cfg(test)]
     pub(crate) fn push(&self, entry: QueueItem) {
         if let Err(error) = self.try_push(entry) {
             warn!(error = %error, "agent queue push failed");
         }
     }
 
-    pub(crate) fn try_push(
+    pub(crate) fn push_mailbox(&self, entry: QueueItem) {
+        if let Err(error) = self.submit(entry, TurnOrigin::Internal) {
+            warn!(%error, "mailbox wake failed");
+        }
+    }
+
+    pub(crate) fn try_push(&self, entry: QueueItem) -> Result<(), ActorError> {
+        self.submit(entry, TurnOrigin::User)
+    }
+
+    fn submit(
         &self,
         QueueItem { input, displayed }: QueueItem,
+        origin: TurnOrigin,
     ) -> Result<(), ActorError> {
         self.actor.submit(
             input,
@@ -100,7 +102,7 @@ impl QueueSender {
             String::new(),
             TurnAdmissionOptions {
                 provenance: TurnProvenance {
-                    origin: TurnOrigin::User,
+                    origin,
                     ..Default::default()
                 },
                 already_displayed: displayed.is_some(),
@@ -125,10 +127,12 @@ impl QueueSender {
     }
 
     /// Clears what the user queued while keeping child-result deliveries.
+    #[cfg(test)]
     pub(crate) fn clear_user_work(&self) {
         let _ = self.actor.clear_user_work();
     }
 
+    #[cfg(test)]
     pub(crate) fn text_messages(&self) -> Vec<String> {
         pending_texts(visible_pending(&self.actor))
     }

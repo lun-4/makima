@@ -23,6 +23,7 @@ pub use registry::{
     ToolRegistry, ToolSource,
 };
 
+use makima_domain::LockExt;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -36,10 +37,12 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
+use crate::context::RootContext;
 use crate::mcp::{
     McpPublishedBinding, McpSession, McpToolBinding, TOOL_SEARCH_TOOL_NAME, wire_tool_name,
 };
 use crate::permissions::PermissionManager;
+use crate::session::AnswerRouter;
 use crate::{
     AgentConfig, AgentId, AgentMode, CurrentManagedTurn, EventSender, RunLedger, SharedBuf,
 };
@@ -353,32 +356,41 @@ impl TurnToolBindings {
         local_tools: &LocalTools,
         mcp: Option<&McpSession>,
     ) -> Self {
-        let mut routes = HashMap::new();
-        let mcp_published = mcp.map(McpSession::published_binding);
-        if let Some((mcp, published)) = mcp.zip(mcp_published.as_ref()) {
-            routes.insert(TOOL_SEARCH_TOOL_NAME.to_owned(), TurnToolRoute::ToolSearch);
-            for binding in mcp.tool_bindings(published) {
-                let qualified = binding.qualified_name().to_string();
-                routes.insert(
-                    wire_tool_name(&qualified),
-                    TurnToolRoute::Mcp(binding.clone()),
-                );
-                routes.insert(qualified, TurnToolRoute::Mcp(binding));
-            }
+        let mut bindings = Self::default();
+        if let Some(mcp) = mcp {
+            bindings.refresh_mcp(mcp);
         }
         for entry in registry.iter().iter() {
-            routes.insert(
+            bindings.routes.insert(
                 entry.name().to_owned(),
                 TurnToolRoute::Native(entry.clone()),
             );
         }
         for (name, tool) in local_tools.iter() {
-            routes.insert(name.clone(), TurnToolRoute::Local(tool.clone()));
+            bindings
+                .routes
+                .insert(name.clone(), TurnToolRoute::Local(tool.clone()));
         }
-        Self {
-            routes,
-            mcp_published,
+        bindings
+    }
+
+    pub(crate) fn refresh_mcp(&mut self, mcp: &McpSession) {
+        self.routes
+            .retain(|_, route| !matches!(route, TurnToolRoute::Mcp(_) | TurnToolRoute::ToolSearch));
+        let published = mcp.published_binding();
+        self.routes
+            .entry(TOOL_SEARCH_TOOL_NAME.into())
+            .or_insert(TurnToolRoute::ToolSearch);
+        for binding in mcp.tool_bindings(&published) {
+            let qualified = binding.qualified_name().to_string();
+            self.routes
+                .entry(wire_tool_name(&qualified))
+                .or_insert_with(|| TurnToolRoute::Mcp(binding.clone()));
+            self.routes
+                .entry(qualified)
+                .or_insert(TurnToolRoute::Mcp(binding));
         }
+        self.mcp_published = Some(published);
     }
 
     pub fn extend_mcp_tools(&self, mcp: &McpSession, tools: &mut Value) {
@@ -465,6 +477,7 @@ pub struct ToolContext {
     pub mode: AgentMode,
     pub mode_def: Option<Arc<crate::ModeDef>>,
     pub question_mode: QuestionMode,
+    pub interactive_reauth: bool,
     /// The session this run belongs to. A subagent inherits its parent's,
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `makima index` one-shot.
@@ -474,7 +487,7 @@ pub struct ToolContext {
     /// The model call this context serves, shared by nested calls. `None`
     /// outside a model call and for calls a batch started.
     pub call: Option<Arc<crate::call_scope::CallScope>>,
-    pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    pub answers: Option<AnswerRouter>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
@@ -488,6 +501,7 @@ pub struct ToolContext {
     pub timeouts: makima_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub root_context: Option<Arc<RootContext>>,
     pub modes: Arc<crate::ModeRegistry>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
@@ -524,6 +538,10 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn answer_scope(&self) -> Option<(&AnswerRouter, AgentId)> {
+        Some((self.answers.as_ref()?, self.execution_agent_id?))
+    }
+
     /// Overlays an agent's committed configuration onto this template.
     pub fn apply_effective_config(&mut self, config: &crate::EffectiveAgentConfig) {
         self.cwd = config.context.cwd().to_path_buf();
@@ -547,7 +565,7 @@ impl ToolContext {
             (None, Deadline::At(deadline)) => Some(deadline),
             (current, Deadline::None) => current,
         };
-        let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = pending.lock_unpoisoned();
         let metadata = pending.get_or_insert_with(|| OutputFinalization {
             limits: None,
             deadline: opts.deadline,
@@ -878,11 +896,12 @@ pub fn interpreter_ctx(
             _ => Some(Arc::new(modes.current(mode))),
         },
         question_mode: QuestionMode::Headless,
+        interactive_reauth: false,
         session_id: None,
         cwd,
         tool_use_id: None,
         call: None,
-        user_response_rx: None,
+        answers: None,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
         mcp: None,
@@ -895,6 +914,7 @@ pub fn interpreter_ctx(
         timeouts: makima_providers::Timeouts::default(),
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+        root_context: None,
         modes,
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),

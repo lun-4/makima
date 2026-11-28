@@ -17,6 +17,7 @@ use makima_providers::{ProviderRegistry, Timeouts};
 
 pub struct AcpParams {
     pub model: Model,
+    pub model_explicit: bool,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,

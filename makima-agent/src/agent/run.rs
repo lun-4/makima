@@ -1,3 +1,4 @@
+use makima_domain::LockExt;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,14 +17,17 @@ use makima_providers::{
 };
 
 use super::compaction;
-use super::history::{History, sanitize_cancelled_history};
+#[cfg(test)]
+use super::history::History;
 use super::instructions::LoadedInstructions;
 use super::streaming::{Conversation, StreamError, end_conversation_detached, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
-use crate::actor::{TurnContext, TurnInbox};
+use crate::actor::{ActorHistory, HistoryBatch, TurnContext, TurnInbox};
 use crate::cancel::{CancelMap, CancelToken, ReasonedCancelToken};
+use crate::context::RootContext;
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
+use crate::session::AnswerRouter;
 use crate::tools::offload::OffloadStore;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
@@ -35,7 +39,7 @@ use crate::{
     TurnCompleteEvent, TurnFailure, TurnId, TurnOutcome,
 };
 use makima_config::{ModelPolicy, ToolOutputLines};
-use makima_storage::id::SessionRef;
+use makima_storage::id::{MakimaId, SessionRef};
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 pub const NO_ADMITTED_CWD_ERR: &str = "turn has no admitted working directory";
@@ -117,6 +121,7 @@ pub struct TurnPromptInputs {
     pub mcp_prompt: Option<crate::mcp::McpPromptBinding>,
     pub resolved: Option<flume::Receiver<Result<ResolvedPromptInputs, String>>>,
     pub ready: Option<ResolvedPromptInputs>,
+    pub context: Option<super::admission::PromptContext>,
 }
 
 #[derive(Clone)]
@@ -136,33 +141,6 @@ pub struct RunSettings {
     pub thinking: ThinkingConfig,
 }
 
-/// The provider and model available when a run begins.
-pub trait ModelSource: Send + Sync {
-    /// `None` while the source has nothing to offer yet, which reads as "no
-    /// change" rather than forcing a caller to invent a placeholder provider.
-    fn current(&self) -> Option<(Arc<dyn Provider>, Model)>;
-}
-
-/// A [`ModelSource`] a frontend can install into. Adoption is a store rather
-/// than a round-trip to whatever loop owns the run.
-#[derive(Clone, Default)]
-pub struct SharedModel(Arc<arc_swap::ArcSwapOption<(Arc<dyn Provider>, Model)>>);
-
-impl SharedModel {
-    pub fn install(&self, provider: Arc<dyn Provider>, model: Model) {
-        self.0.store(Some(Arc::new((provider, model))));
-    }
-}
-
-impl ModelSource for SharedModel {
-    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
-        self.0
-            .load()
-            .as_ref()
-            .map(|snapshot| (Arc::clone(&snapshot.0), snapshot.1.clone()))
-    }
-}
-
 #[derive(Clone)]
 pub struct AgentParams {
     pub agent_id: AgentId,
@@ -176,11 +154,13 @@ pub struct AgentParams {
     pub timeouts: makima_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub root_context: Option<Arc<RootContext>>,
     pub modes: Arc<crate::ModeRegistry>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub question_mode: crate::tools::QuestionMode,
+    pub interactive_reauth: bool,
     pub model_policy: Arc<ModelPolicy>,
     pub providers: Arc<ProviderRegistry>,
     /// Same-process per-path mutation locks, cloned from the parent context
@@ -193,7 +173,7 @@ pub struct AgentParams {
 }
 
 pub struct AgentRunParams<'h> {
-    pub history: &'h mut History,
+    pub history: ActorHistory<'h>,
     pub system: String,
     pub event_tx: EventSender,
     pub tools: RequestTools,
@@ -203,13 +183,13 @@ pub struct Agent<'h> {
     agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
-    history: &'h mut History,
+    history: ActorHistory<'h>,
     system: String,
     event_tx: EventSender,
     tools: RequestTools,
     mode: AgentMode,
     mode_def: Option<Arc<crate::ModeDef>>,
-    user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    answers: Option<AnswerRouter>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     turn_inbox: Option<Arc<dyn TurnInbox>>,
     instruction_consumed_callback: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -227,6 +207,7 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
+    interactive_reauth: bool,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
@@ -234,6 +215,7 @@ pub struct Agent<'h> {
     timeouts: makima_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    root_context: Option<Arc<RootContext>>,
     modes: Arc<crate::ModeRegistry>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
@@ -263,6 +245,14 @@ impl<'h> Agent<'h> {
     ) -> Self {
         params.agent_id = context.agent_id;
         params.managed_turn = context.managed_turn.clone();
+        if let Some(root_context) = context
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.prompt_inputs.as_ref())
+            .and_then(|inputs| inputs.root_context())
+        {
+            params.root_context = Some(root_context);
+        }
         if let Some(policy) = &context.policy {
             params.provider = Arc::clone(&policy.provider);
             params.model = policy.model.clone();
@@ -290,8 +280,7 @@ impl<'h> Agent<'h> {
         agent
     }
 
-    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
-        crate::prompt::append_model_identity(&mut run.system, &params.model);
+    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
         Self {
             agent_id: params.agent_id,
             provider: params.provider,
@@ -306,7 +295,7 @@ impl<'h> Agent<'h> {
             tools: run.tools,
             mode: AgentMode::default(),
             mode_def: None,
-            user_response_rx: None,
+            answers: None,
             interrupt_source: None,
             turn_inbox: None,
             instruction_consumed_callback: None,
@@ -322,11 +311,13 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
+            interactive_reauth: params.interactive_reauth,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             mailbox: params.mailbox,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
+            root_context: params.root_context,
             modes: params.modes,
             subagent_cancels: params.subagent_cancels,
             registry: params.registry,
@@ -353,11 +344,8 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_user_response_rx(
-        mut self,
-        rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
-    ) -> Self {
-        self.user_response_rx = rx;
+    pub fn with_answers(mut self, answers: Option<AnswerRouter>) -> Self {
+        self.answers = answers;
         self
     }
 
@@ -451,20 +439,10 @@ impl<'h> Agent<'h> {
             preamble,
             prompt: _,
         } = input;
-        self.push_input_context(preamble);
-        // Observers read this event as "the turn has taken its input", so the
-        // preamble has to be in the history they read before it goes out.
-        if let Some(submission) = self
-            .turn_inbox
-            .as_ref()
-            .and_then(|inbox| inbox.take_initial_submission())
-        {
-            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
-                text: submission.text,
-                images: submission.images,
-                mcp_startup_notice: submission.mcp_startup_notice,
-                already_displayed: submission.already_displayed,
-            });
+        let mut initial = self.history.input_batch().await;
+        let mut messages = preamble;
+        if let Some(mailbox) = &self.mailbox {
+            messages.extend(mailbox.drain());
         }
         if !message.trim().is_empty() || !images.is_empty() {
             let mut user_message = Message::user_with_images(message.clone(), images);
@@ -485,7 +463,23 @@ impl<'h> Agent<'h> {
                     format!("{message}\n{notice}")
                 });
             }
-            self.history.push(user_message);
+            messages.push(user_message);
+        }
+        initial.append_turn_input(turn_id, messages);
+        drop(initial);
+        // Observers read this event as "the turn has taken its input", so the
+        // preamble has to be in the history they read before it goes out.
+        if let Some(submission) = self
+            .turn_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.take_initial_submission())
+        {
+            let _ = self.event_tx.send(AgentEvent::QueueItemConsumed {
+                text: submission.text,
+                images: submission.images,
+                mcp_startup_notice: submission.mcp_startup_notice,
+                already_displayed: submission.already_displayed,
+            });
         }
         self.mode_def = self
             .admission
@@ -535,9 +529,15 @@ impl<'h> Agent<'h> {
                 context_window,
             },
             Err(AgentError::Cancelled) => {
-                sanitize_cancelled_history(self.history, self.rollback_len);
-                if let Some(ended) = self.history.continue_conversation() {
-                    end_conversation_detached(&self.provider, ended, ConversationEnd::Cancelled);
+                if !self.is_suspended() {
+                    self.history.sanitize_cancelled(self.rollback_len).await;
+                    if let Some(ended) = self.history.continue_cancelled_conversation() {
+                        end_conversation_detached(
+                            &self.provider,
+                            ended,
+                            ConversationEnd::Cancelled,
+                        );
+                    }
                 }
                 let reason = match &self.cancel_reason_source {
                     Some(source) => source
@@ -573,23 +573,58 @@ impl<'h> Agent<'h> {
         outcome
     }
 
-    fn push_input_context(&mut self, preamble: Vec<Message>) {
-        for message in preamble {
-            self.history.push(message);
-        }
-        self.land_mailbox();
+    fn is_suspended(&self) -> bool {
+        self.cancel_reason_source
+            .as_ref()
+            .is_some_and(ReasonedCancelToken::is_suspended)
     }
 
-    fn land_mailbox(&mut self) {
+    async fn land_mailbox(&mut self) {
         let Some(mailbox) = &self.mailbox else {
             return;
         };
+        let mut history = self.history.input_batch().await;
         for message in mailbox.drain() {
-            self.history.push(message);
+            history.push(message);
         }
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
+        let prepared = match self.provider.model_preparation() {
+            Some(preparation) => Some(
+                self.cancel
+                    .race(preparation)
+                    .await
+                    .map_err(|_| AgentError::Cancelled)??
+                    .clone(),
+            ),
+            None => None,
+        };
+        if let Some(prepared) = prepared {
+            let switched = self.model.id != prepared.model.id
+                || self.model.provider != prepared.model.provider
+                || self.model.context_window != prepared.model.context_window;
+            self.provider = prepared.provider;
+            self.model = Arc::new(prepared.model);
+            if switched {
+                self.event_tx.send(AgentEvent::ModelSwitched {
+                    spec: self.model.spec(),
+                    context_window: self.model.context_window,
+                })?;
+            }
+        }
+        crate::prompt::append_model_identity(&mut self.system, &self.model);
+        if !super::history::pending_tool_calls(self.history.as_slice()).is_empty() {
+            let ctx = self.tool_context()?;
+            tool_dispatch::resume_tool_calls(
+                &mut self.recent_calls,
+                self.history.reborrow(),
+                &self.event_tx,
+                &ctx,
+                self.cancel_reason_source.as_ref(),
+            )
+            .await?;
+        }
         let mut completion_recovery_attempts = 0;
         loop {
             if self.cancel.is_cancelled() {
@@ -625,7 +660,7 @@ impl<'h> Agent<'h> {
                     if self.cancel.is_cancelled() {
                         return Err(AgentError::Cancelled);
                     }
-                    if self.consume_instruction_inbox()? {
+                    if self.consume_instruction_inbox().await? {
                         continue;
                     }
                     if let Some(inbox) = &self.turn_inbox
@@ -648,7 +683,12 @@ impl<'h> Agent<'h> {
                             return Err(self.completion_exhaustion(COMPLETION_RECOVERY_EXHAUSTED));
                         }
                         completion_recovery_attempts += 1;
-                        self.history.push(Message::user(message));
+                        self.history
+                            .push(Message::user(message))
+                            .await
+                            .map_err(|error| AgentError::Config {
+                                message: error.to_string(),
+                            })?;
                         continue;
                     }
                     if let Some(inbox) = self.turn_inbox.clone() {
@@ -667,7 +707,12 @@ impl<'h> Agent<'h> {
                             }
                             if inbox.is_managed_child() && !inbox.has_unsubmitted_instructions() {
                                 self.invalidate_reports();
-                                self.history.push(Message::user(LATE_REPORTS_NOTE.into()));
+                                self.history
+                                    .push(Message::user(LATE_REPORTS_NOTE.into()))
+                                    .await
+                                    .map_err(|error| AgentError::Config {
+                                        message: error.to_string(),
+                                    })?;
                             }
                             continue;
                         }
@@ -709,7 +754,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.consume_turn_inbox()?;
+        self.consume_turn_inbox().await?;
         self.pending_instruction_request = false;
         let tools = self.request_tools()?;
         if let Some(inbox) = &self.turn_inbox {
@@ -766,18 +811,22 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Cancelled { streamed }) => {
                 let streamed = streamed.trim_end();
-                if !streamed.is_empty() {
-                    self.history.push(Message {
-                        role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
-                        }],
-                        ..Default::default()
-                    });
+                if !streamed.is_empty() && !self.is_suspended() {
+                    self.history
+                        .push_observation(Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text {
+                                text: format!("{streamed}\n\n{CANCELLED_TEXT_NOTE}"),
+                            }],
+                            ..Default::default()
+                        })
+                        .map_err(|error| AgentError::Config {
+                            message: error.to_string(),
+                        })?;
                 }
                 return Err(AgentError::Cancelled);
             }
-            Err(StreamError::Other(e)) if e.is_auth_error() => {
+            Err(StreamError::Other(e)) if self.interactive_reauth && e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
             }
             Err(StreamError::Other(e)) => {
@@ -809,13 +858,17 @@ impl<'h> Agent<'h> {
             self.process_tool_calls(response).await?;
             // A moved call's result can land between tool rounds; the model
             // gets it with the results instead of waiting for the next turn.
-            self.land_mailbox();
+            self.land_mailbox().await;
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
             if response.message.first_text_content().is_some() {
-                self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+                self.history
+                    .push_observation(response.message)
+                    .map_err(|error| AgentError::Config {
+                        message: error.to_string(),
+                    })?;
+            } else if self.recover_stalled_turn().await? {
                 return Ok(TurnProgress::Continue);
             }
 
@@ -846,25 +899,21 @@ impl<'h> Agent<'h> {
             error!(error = %err, attempts = self.reauth_attempts, "max re-auth attempts reached");
             return Err(err);
         }
-        let Some(rx) = &self.user_response_rx else {
+        let Some(answers) = &self.answers else {
             error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
             return Err(err);
         };
         self.reauth_attempts += 1;
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
-        self.event_tx.send(AgentEvent::AuthRequired)?;
-        let rx = rx.lock().await;
-        match futures_lite::future::race(rx.recv_async(), async {
-            self.cancel.cancelled().await;
-            Err(flume::RecvError::Disconnected)
-        })
-        .await
-        {
-            Ok(_) => {
+        let pending = answers.register(self.agent_id);
+        self.event_tx
+            .send(AgentEvent::AuthRequired { ask: pending.key() })?;
+        match self.cancel.race(pending.recv()).await {
+            Ok(Ok(answer)) if answer.is_empty() => {
                 self.provider.refresh_auth().await?;
                 Ok(TurnProgress::Continue)
             }
-            Err(_) => Err(AgentError::Cancelled),
+            _ => Err(AgentError::Cancelled),
         }
     }
 
@@ -873,6 +922,8 @@ impl<'h> Agent<'h> {
         let cost = self.model.billed_cost(&response.usage, fast);
         let list_cost = self.model.list_cost(&response.usage, fast);
         self.ledger.add(response.usage, cost, list_cost);
+        self.history
+            .record_usage(&self.model.id, response.usage, cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
@@ -918,10 +969,14 @@ impl<'h> Agent<'h> {
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
     /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    async fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
+        self.history
+            .push_observation(Message::empty_marker())
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
         if !nudge {
             return Ok(false);
         }
@@ -931,7 +986,12 @@ impl<'h> Agent<'h> {
             "empty response after tool calls, nudging model to continue"
         );
         self.event_tx.send(AgentEvent::Nudge)?;
-        self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+        self.history
+            .push(Message::synthetic(NUDGE_PROMPT.into()))
+            .await
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
         Ok(true)
     }
 
@@ -940,9 +1000,10 @@ impl<'h> Agent<'h> {
         tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
-            self.history,
+            self.history.reborrow(),
             &self.event_tx,
             &ctx,
+            self.cancel_reason_source.as_ref(),
         )
         .await
     }
@@ -970,11 +1031,12 @@ impl<'h> Agent<'h> {
             mode: self.mode.clone(),
             mode_def: self.mode_def.clone(),
             question_mode: self.question_mode,
+            interactive_reauth: self.interactive_reauth,
             session_id: self.session_id.clone(),
             cwd,
             tool_use_id: None,
             call: None,
-            user_response_rx: self.user_response_rx.clone(),
+            answers: self.answers.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
@@ -987,6 +1049,7 @@ impl<'h> Agent<'h> {
             timeouts: self.timeouts,
             file_tracker: Arc::clone(&self.file_tracker),
             prompt_slots: Arc::clone(&self.prompt_slots),
+            root_context: self.root_context.clone(),
             modes: Arc::clone(&self.modes),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
@@ -1043,7 +1106,7 @@ impl<'h> Agent<'h> {
             &compact_provider,
             &self.provider,
             &compact_model,
-            self.history,
+            self.history.reborrow(),
             &self.event_tx,
             &self.cancel,
             &self.config,
@@ -1067,44 +1130,71 @@ impl<'h> Agent<'h> {
         self.history
             .push(Message::synthetic(compaction::continue_message(
                 &self.config,
-            )));
+            )))
+            .await
+            .map_err(|error| AgentError::Config {
+                message: error.to_string(),
+            })?;
         Ok(())
-    }
-
-    fn instruction_consumed(&mut self) {
-        self.pending_instruction_request = true;
-        self.invalidate_reports();
     }
 
     fn invalidate_reports(&self) {
         if let Some(capture) = &self.local_tool_capture {
-            *capture.lock().unwrap_or_else(|error| error.into_inner()) = None;
+            *capture.lock_unpoisoned() = None;
         }
         if let Some(callback) = &self.instruction_consumed_callback {
             callback();
         }
     }
 
-    fn consume_instruction_inbox(&mut self) -> Result<bool, AgentError> {
+    async fn consume_instruction_inbox(&mut self) -> Result<bool, AgentError> {
         let Some(inbox) = self.turn_inbox.clone() else {
             return Ok(false);
         };
+        let mut history = self.history.input_batch().await;
         let instructions = inbox.drain_presented_instructions();
         let consumed = !instructions.is_empty();
-        self.consume_presented_inputs(instructions.into_iter().map(|(presentation, input)| {
-            crate::PresentedInput {
-                input,
-                already_displayed: presentation.already_displayed,
-                mcp_startup_notice: presentation.mcp_startup_notice,
-            }
-        }))?;
+        consume_presented_inputs(
+            &mut history,
+            &self.event_tx,
+            self.mailbox.as_ref(),
+            instructions.into_iter().map(|(presentation, input)| {
+                (
+                    crate::PresentedInput {
+                        input,
+                        already_displayed: presentation.already_displayed,
+                        mcp_startup_notice: presentation.mcp_startup_notice,
+                    },
+                    presentation.journal_id.map(|id| (presentation.turn_id, id)),
+                )
+            }),
+            || {
+                self.pending_instruction_request = true;
+                if let Some(capture) = &self.local_tool_capture {
+                    *capture.lock_unpoisoned() = None;
+                }
+                if let Some(callback) = &self.instruction_consumed_callback {
+                    callback();
+                }
+            },
+        )?;
         Ok(consumed)
     }
 
-    fn consume_turn_inbox(&mut self) -> Result<(), AgentError> {
-        self.consume_instruction_inbox()?;
+    async fn consume_turn_inbox(&mut self) -> Result<(), AgentError> {
+        self.consume_instruction_inbox().await?;
         if let Some(inbox) = self.turn_inbox.clone() {
-            inbox.commit_completions(&mut |message| self.history.push(message));
+            let mut error = None;
+            inbox.commit_completions(&mut |message| {
+                if let Err(failure) = self.history.push_observation(message) {
+                    error = Some(AgentError::Config {
+                        message: failure.to_string(),
+                    });
+                }
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1113,6 +1203,7 @@ impl<'h> Agent<'h> {
         let Some(ref source) = self.interrupt_source else {
             return Ok(false);
         };
+        let mut history = self.history.input_batch().await;
         let Some(cmd) = self
             .cancel
             .race(source.poll_ready())
@@ -1123,73 +1214,117 @@ impl<'h> Agent<'h> {
         };
         match cmd {
             ExtractedCommand::Interrupt(inputs) => {
-                self.consume_presented_inputs(inputs.into_iter().map(|input| {
-                    crate::PresentedInput {
-                        input,
-                        already_displayed: true,
-                        mcp_startup_notice: None,
-                    }
-                }))?;
+                consume_presented_inputs(
+                    &mut history,
+                    &self.event_tx,
+                    self.mailbox.as_ref(),
+                    inputs.into_iter().map(|input| {
+                        (
+                            crate::PresentedInput {
+                                input,
+                                already_displayed: true,
+                                mcp_startup_notice: None,
+                            },
+                            None,
+                        )
+                    }),
+                    || {
+                        self.pending_instruction_request = true;
+                        if let Some(capture) = &self.local_tool_capture {
+                            *capture.lock_unpoisoned() = None;
+                        }
+                        if let Some(callback) = &self.instruction_consumed_callback {
+                            callback();
+                        }
+                    },
+                )?;
             }
             ExtractedCommand::PresentedInterrupt(inputs) => {
-                self.consume_presented_inputs(inputs)?;
+                consume_presented_inputs(
+                    &mut history,
+                    &self.event_tx,
+                    self.mailbox.as_ref(),
+                    inputs.into_iter().map(|input| (input, None)),
+                    || {
+                        self.pending_instruction_request = true;
+                        if let Some(capture) = &self.local_tool_capture {
+                            *capture.lock_unpoisoned() = None;
+                        }
+                        if let Some(callback) = &self.instruction_consumed_callback {
+                            callback();
+                        }
+                    },
+                )?;
             }
             ExtractedCommand::Compact(instructions) => {
+                drop(history);
                 self.do_compact(instructions.as_deref()).await?;
             }
         }
         Ok(true)
     }
+}
 
-    fn consume_presented_inputs(
-        &mut self,
-        inputs: impl IntoIterator<Item = crate::PresentedInput>,
-    ) -> Result<(), AgentError> {
-        let mut presentation_failed = false;
-        for presented in inputs {
-            let input = presented.input;
-            self.instruction_consumed();
-            presentation_failed |= self
-                .event_tx
-                .send(AgentEvent::QueueItemConsumed {
-                    text: input.message.clone(),
-                    images: input.images.clone(),
-                    mcp_startup_notice: presented.mcp_startup_notice,
-                    already_displayed: presented.already_displayed,
-                })
-                .is_err();
-            self.push_input_context(input.preamble);
-            let wrapped = format!(
-                "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+fn consume_presented_inputs(
+    history: &mut HistoryBatch<'_>,
+    event_tx: &EventSender,
+    mailbox: Option<&SessionMailbox>,
+    inputs: impl IntoIterator<Item = (crate::PresentedInput, Option<(TurnId, MakimaId)>)>,
+    mut consumed: impl FnMut(),
+) -> Result<(), AgentError> {
+    let mut presentation_failed = false;
+    for (presented, joined) in inputs {
+        let input = presented.input;
+        consumed();
+        presentation_failed |= event_tx
+            .send(AgentEvent::QueueItemConsumed {
+                text: input.message.clone(),
+                images: input.images.clone(),
+                mcp_startup_notice: presented.mcp_startup_notice,
+                already_displayed: presented.already_displayed,
+            })
+            .is_err();
+        let mut messages = input.preamble;
+        if let Some(mailbox) = mailbox {
+            messages.extend(mailbox.drain());
+        }
+        let wrapped = format!(
+            "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+            input.message
+        );
+        let mut message = Message {
+            display_text: Some(if input.message.is_empty() && !input.images.is_empty() {
+                IMAGE_PLACEHOLDER.into()
+            } else {
                 input.message
+            }),
+            ..Message::user_with_images(wrapped, input.images)
+        };
+        if let Some(count) = presented.mcp_startup_notice {
+            let notice = format!(
+                "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
             );
-            let mut message = Message {
-                display_text: Some(if input.message.is_empty() && !input.images.is_empty() {
-                    IMAGE_PLACEHOLDER.into()
-                } else {
-                    input.message
-                }),
-                ..Message::user_with_images(wrapped, input.images)
-            };
-            if let Some(count) = presented.mcp_startup_notice {
-                let notice = format!(
-                    "[system: {count} MCP servers are not ready; MCP tools are unavailable for this turn]"
-                );
-                message.content.push(ContentBlock::Text {
-                    text: notice.clone(),
-                });
-                if let Some(display) = &mut message.display_text {
-                    display.push('\n');
-                    display.push_str(&notice);
-                }
+            message.content.push(ContentBlock::Text {
+                text: notice.clone(),
+            });
+            if let Some(display) = &mut message.display_text {
+                display.push('\n');
+                display.push_str(&notice);
             }
-            self.history.push(message);
         }
-        if presentation_failed {
-            return Err(AgentError::Channel);
+        messages.push(message);
+        if let Some((turn, id)) = joined {
+            history.append_joined_input(turn, id, messages);
+        } else {
+            for message in messages {
+                history.push(message);
+            }
         }
-        Ok(())
     }
+    if presentation_failed {
+        return Err(AgentError::Channel);
+    }
+    Ok(())
 }
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -1227,19 +1362,38 @@ mod tests {
         ProviderEvent, RequestDelivery, RequestOptions, RetryKind, Role, StopReason,
         StreamResponse, TokenUsage,
     };
+    use makima_storage::test_util::test_record;
     use serde_json::Value;
     use test_case::test_case;
 
     use super::*;
-    use crate::actor::{EffectiveAgentConfig, PendingSubmission, SubmissionId};
-    use crate::agent::{HistorySnapshot, SharedMessages};
+
+    use crate::actor::{
+        AgentContextSnapshot, EffectiveAgentConfig, PendingSubmission, SubmissionId,
+    };
+    use crate::agent::admission::resolve_prompt_inputs;
+    use crate::agent::{
+        HistorySnapshot, InstructionSource, Instructions, PromptSlotSource, SharedMessages,
+        TurnSetup,
+    };
+    use crate::context::ContextPolicy;
+    use crate::journal::{JournalCommit, SessionJournal};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+    use crate::session::AnswerRouter;
+    use crate::session_writer::{Record, SessionWriter, StoredSession};
     use crate::{ActorWorkIdentity, ActorWorkKind, Envelope};
+    use std::fs::read_to_string;
 
     const TEST_CWD: &str = "/tmp";
     const TEST_PLAN_PATH: &str = "/tmp/plan.md";
     const TEST_THINKING_BUDGET: u32 = 8192;
+    const ROOT_CONTEXT_PATH: &str = "/actor-context/project/AGENTS.md";
+    const ROOT_CONTEXT_LABEL: &str = "root instructions";
+    const INHERITED_CONTEXT: &str = "inherited root context";
+    const ADMITTED_CONTEXT: &str = "admitted root context";
+    const ROOT_CONTEXT_PLUGIN: &str = "actor-context";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1569,6 +1723,7 @@ mod tests {
             mcp_prompt: None,
             resolved: None,
             ready: None,
+            context: None,
         };
         agent.admission = Some(TurnAdmissionSnapshot {
             mode_def: mode_def.map(Arc::new),
@@ -1659,6 +1814,7 @@ mod tests {
                 .map(|input| {
                     let presentation = PendingSubmission {
                         id: SUBMISSION,
+                        journal_id: None,
                         turn_id: TurnId::generate(),
                         text: input.message.clone(),
                         images: input.images.clone(),
@@ -1749,6 +1905,98 @@ mod tests {
         });
     }
 
+    #[test_case(false; "initial_input_waits_before_consumption")]
+    #[test_case(true; "joined_input_waits_before_drain")]
+    fn input_gate_precedes_consumption(joined: bool) {
+        struct InitialInbox(Arc<FinishRaceInbox>);
+
+        impl TurnInbox for InitialInbox {
+            fn instructions_submitted(&self) {}
+            fn has_unsubmitted_instructions(&self) -> bool {
+                false
+            }
+            fn take_initial_submission(&self) -> Option<PendingSubmission> {
+                let input = self.0.pending.lock().unwrap().pop()?;
+                Some(PendingSubmission {
+                    id: SubmissionId(1),
+                    journal_id: None,
+                    turn_id: TurnId::generate(),
+                    text: input.message,
+                    images: input.images,
+                    already_displayed: false,
+                    mcp_startup_notice: None,
+                })
+            }
+            fn drain_instructions(&self) -> Vec<AgentInput> {
+                Vec::new()
+            }
+            fn drain_presented_instructions(&self) -> Vec<(PendingSubmission, AgentInput)> {
+                Vec::new()
+            }
+            fn drain_completions(&self) -> Vec<Message> {
+                Vec::new()
+            }
+            fn finish(&self) -> bool {
+                true
+            }
+            fn finish_instructions(&self) -> bool {
+                true
+            }
+        }
+
+        smol::block_on(async {
+            let journal = Arc::new(crate::journal::SessionJournal::default());
+            let agent_id = AgentId::generate();
+            let mut history = History::new(Vec::new()).with_journal(agent_id, Arc::clone(&journal));
+            let inbox = Arc::new(FinishRaceInbox {
+                pending: Mutex::new(vec![default_input()]),
+                inject_on_finish: Mutex::new(false),
+                submitted: Mutex::new(true),
+            });
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let (agent, events) = make_agent(provider, &mut history);
+            let source: Arc<dyn TurnInbox> = if joined {
+                inbox.clone()
+            } else {
+                Arc::new(InitialInbox(Arc::clone(&inbox)))
+            };
+            let mut agent = agent.with_turn_inbox(Some(source));
+            let prepared = journal
+                .prepare(crate::journal::JournalCommit {
+                    changes: vec![crate::journal::JournalChange {
+                        agent: Some(agent_id),
+                        generation: 0,
+                        change: makima_storage::session_state::StateChange::Plugin {
+                            key: STEERING_MESSAGE.into(),
+                            version: 1,
+                            value: Some(Value::Null),
+                        },
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let mut landing = pin!(async {
+                if joined {
+                    agent.consume_instruction_inbox().await.unwrap();
+                } else {
+                    run_admitted(&mut agent, TurnId::generate(), default_input()).await;
+                }
+            });
+            assert!(future::poll_once(landing.as_mut()).await.is_none());
+            assert!(
+                !events
+                    .drain()
+                    .any(|event| matches!(event.event, AgentEvent::QueueItemConsumed { .. }))
+            );
+            assert_eq!(inbox.pending.lock().unwrap().len(), 1);
+            assert!(journal.snapshot().histories[&agent_id].messages.is_empty());
+            drop(prepared);
+            landing.await;
+            assert!(inbox.pending.lock().unwrap().is_empty());
+        });
+    }
+
     #[test_case(None; "accepted_instruction_reaches_next_request")]
     #[test_case(Some(1); "budget_failure_is_not_success")]
     fn accepted_instruction_request_coverage(max_turns: Option<u32>) {
@@ -1792,6 +2040,49 @@ mod tests {
                     .count(),
                 1
             );
+        });
+    }
+
+    #[test]
+    fn interactive_reauth_waits_for_its_own_answer() {
+        smol::block_on(async {
+            let provider = ScriptedProvider {
+                results: Mutex::new(VecDeque::from([
+                    Err(api_error(401, None)),
+                    Ok(text_response(StopReason::EndTurn)),
+                ])),
+            };
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            let answers = AnswerRouter::default();
+            let unrelated = answers.register(agent.agent_id);
+            let mut agent = agent.with_answers(Some(answers.clone()));
+            let mut run = Box::pin(run_admitted(
+                &mut agent,
+                TurnId::generate(),
+                default_input(),
+            ));
+            let ask = future::or(
+                async {
+                    let _ = run.as_mut().await;
+                    panic!("turn ended before authentication");
+                },
+                async {
+                    loop {
+                        if let AgentEvent::AuthRequired { ask } =
+                            events.recv_async().await.unwrap().event
+                        {
+                            break ask;
+                        }
+                    }
+                },
+            )
+            .await;
+            answers.answer(unrelated.key(), String::new()).unwrap();
+            assert!(future::poll_once(run.as_mut()).await.is_none());
+            answers.answer(ask, String::new()).unwrap();
+            let outcome = run.await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
         });
     }
 
@@ -1971,6 +2262,7 @@ mod tests {
                     .map(|input| {
                         let presentation = PendingSubmission {
                             id: SUBMISSION,
+                            journal_id: None,
                             turn_id: TurnId::generate(),
                             text: input.message.clone(),
                             images: input.images.clone(),
@@ -2359,7 +2651,7 @@ mod tests {
         let mut agent = Agent::for_actor_turn(
             params,
             AgentRunParams {
-                history: &mut history,
+                history: ActorHistory::new(&mut history),
                 system: system.into(),
                 event_tx: EventSender::new(raw_tx),
                 tools: RequestTools::default(),
@@ -2386,6 +2678,143 @@ mod tests {
         );
     }
 
+    fn root_context_fixture(content: &str) -> Arc<RootContext> {
+        let mut slots = ResolvedSlots::default();
+        slots.insert(
+            PromptId::System,
+            Slot::Identity,
+            SlotEntry {
+                plugin: ROOT_CONTEXT_PLUGIN.into(),
+                name: "default".into(),
+                content: content.into(),
+            },
+        );
+        Arc::new(RootContext {
+            instructions: Instructions::from_sources(vec![InstructionSource {
+                path: ROOT_CONTEXT_PATH.into(),
+                label: ROOT_CONTEXT_LABEL.into(),
+                content: content.into(),
+            }]),
+            slots: Arc::new(slots),
+        })
+    }
+
+    #[test_case(false; "child_followup_preserves_inherited_context")]
+    #[test_case(true; "root_admission_supersedes_inherited_context")]
+    fn actor_turn_carries_effective_root_context_into_tools(root_admission: bool) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let mut params = test_params(MockProvider::new(Vec::new()));
+            let inherited = root_context_fixture(INHERITED_CONTEXT);
+            params.root_context = Some(Arc::clone(&inherited));
+            params.prompt_slots = Arc::clone(&inherited.slots);
+            let observed = root_context_fixture(ADMITTED_CONTEXT);
+            let slots = Arc::clone(&observed.slots);
+            let setup = TurnSetup {
+                registry: Arc::clone(&params.registry),
+                local_tools: LocalTools::default(),
+                mcp: None,
+                slots: PromptSlotSource::new(move || {
+                    let (sender, receiver) = flume::bounded(1);
+                    sender.send((*slots).clone()).unwrap();
+                    receiver
+                }),
+                modes: Arc::clone(&params.modes),
+                instructions: root_admission,
+            };
+            let policy = EffectiveAgentConfig::new(
+                RunSettings {
+                    provider: Arc::clone(&params.provider),
+                    model: params.model.clone(),
+                    fast: false,
+                    workflow: false,
+                    thinking: ThinkingConfig::default(),
+                },
+                AgentMode::Build,
+            )
+            .with_context(AgentContextSnapshot::new(TEST_CWD.into()));
+            let mut admission = setup.snapshot(&default_input(), Some(&policy));
+            if root_admission {
+                let journal = Arc::new(SessionJournal::default());
+                journal
+                    .commit(JournalCommit {
+                        agents: vec![test_record(params.agent_id, None)],
+                        histories: [(params.agent_id, history.snapshot().clone())].into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let prompt = Arc::make_mut(admission.prompt_inputs.as_mut().unwrap());
+                prompt.instructions = observed.instructions.clone();
+                prompt
+                    .bind_context(journal.state_access(params.agent_id, None))
+                    .unwrap();
+            }
+            let admission = resolve_prompt_inputs(admission, true, ContextPolicy::Admission)
+                .await
+                .unwrap();
+            let admitted = admission.prompt_inputs.as_ref().unwrap().root_context();
+            let expected = if root_admission {
+                let admitted = admitted.unwrap();
+                assert!(!Arc::ptr_eq(&admitted, &inherited));
+                admitted
+            } else {
+                assert!(admitted.is_none());
+                Arc::clone(&inherited)
+            };
+            let context = TurnContext {
+                agent_id: params.agent_id,
+                turn_id: None,
+                work: ActorWorkIdentity::new(
+                    params.agent_id,
+                    ActorWorkKind::Turn {
+                        operation_id: 0,
+                        turn_id: TurnId::generate(),
+                    },
+                    0,
+                ),
+                output: Default::default(),
+                provenance: Default::default(),
+                cancel: CancelToken::none(),
+                cancel_reason: ReasonedCancelToken::none(),
+                generation: 0,
+                policy: Some(Arc::new(policy)),
+                interrupt: None,
+                inbox: None,
+                managed_turn: None,
+                admission: Some(admission),
+            };
+            let (sender, _events) = flume::unbounded();
+            let agent = Agent::for_actor_turn(
+                params,
+                AgentRunParams {
+                    history: ActorHistory::new(&mut history),
+                    system: expected.instructions.text.clone(),
+                    event_tx: EventSender::new(sender),
+                    tools: RequestTools::default(),
+                },
+                &context,
+                expected.instructions.loaded.clone(),
+            );
+            assert!(Arc::ptr_eq(agent.root_context.as_ref().unwrap(), &expected));
+            let tool_context = agent.tool_context().unwrap();
+            if !root_admission {
+                assert!(Arc::ptr_eq(&tool_context.prompt_slots, &inherited.slots));
+            }
+            let effective = tool_context.root_context.unwrap();
+            assert!(Arc::ptr_eq(&effective, &expected));
+            let content = if root_admission {
+                ADMITTED_CONTEXT
+            } else {
+                INHERITED_CONTEXT
+            };
+            assert_eq!(effective.instructions.sources[0].content, content);
+            assert_eq!(
+                effective.slots.get(PromptId::System, Slot::Identity)[0].content,
+                content
+            );
+        });
+    }
+
     fn test_params(provider: impl Provider + 'static) -> AgentParams {
         AgentParams {
             agent_id: AgentId::generate(),
@@ -2408,11 +2837,13 @@ mod tests {
             timeouts: makima_providers::Timeouts::default(),
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+            root_context: None,
             modes: crate::ModeRegistry::builtin().into(),
             subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
             registry: Arc::new(crate::tools::ToolRegistry::new()),
             audience: ToolAudience::MAIN,
             question_mode: crate::tools::QuestionMode::Tui,
+            interactive_reauth: true,
             model_policy: Arc::new(ModelPolicy::default()),
             providers: Arc::default(),
             file_write_locks: Arc::new(crate::tools::FileWriteLocks::new()),
@@ -2430,7 +2861,7 @@ mod tests {
         let agent = Agent::new(
             test_params(provider),
             AgentRunParams {
-                history,
+                history: ActorHistory::new(history),
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx),
                 tools: RequestTools::default(),
@@ -2696,6 +3127,74 @@ mod tests {
             assert_eq!(second.usage().input, 22);
             assert_eq!(first.num_turns(), 1);
             assert_eq!(second.num_turns(), 1);
+        });
+    }
+
+    #[test]
+    fn root_and_child_completions_write_cumulative_usage_once() {
+        const INPUTS: [u32; 3] = [11, 22, 33];
+        const TOTALS: [u32; 3] = [11, 33, 66];
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let model = default_model();
+            let mut session = StoredSession::new(&model.spec(), TEST_CWD);
+            let root = AgentId::generate();
+            let child = AgentId::generate();
+            session.bind_root_id(root).unwrap();
+            let writer = SessionWriter::open_session(dir.path(), &session).unwrap();
+            let journal = Arc::new(SessionJournal::from_session(&session).unwrap());
+            journal.bind_writer(writer).unwrap();
+            journal
+                .commit(JournalCommit {
+                    agents: vec![test_record(child, Some(root))],
+                    ..Default::default()
+                })
+                .unwrap();
+
+            for (id, input) in [root, child, root].into_iter().zip(INPUTS) {
+                let mut response = text_response(StopReason::EndTurn);
+                response.usage.input = input;
+                let mut history = History::new(Vec::new()).with_journal(id, Arc::clone(&journal));
+                let mut params = test_params(MockProvider::new(vec![response]));
+                params.agent_id = id;
+                let (tx, _rx) = flume::unbounded();
+                let mut agent = Agent::new(
+                    params,
+                    AgentRunParams {
+                        history: ActorHistory::new(&mut history),
+                        system: String::new(),
+                        event_tx: EventSender::new(tx),
+                        tools: RequestTools::default(),
+                    },
+                );
+                assert!(matches!(
+                    run_admitted(&mut agent, TurnId::generate(), default_input()).await,
+                    TurnOutcome::Completed { .. }
+                ));
+            }
+            journal.flush().await.unwrap();
+            let log = read_to_string(dir.path().join(format!("{}.jsonl", session.id))).unwrap();
+            let totals: Vec<_> = log
+                .lines()
+                .filter_map(|line| {
+                    let Record::Usage {
+                        token_usage,
+                        usage_by_model,
+                    } = serde_json::from_str(line).unwrap()
+                    else {
+                        return None;
+                    };
+                    assert_eq!(usage_by_model.len(), 1);
+                    assert_eq!(usage_by_model[&model.id], token_usage.billed(None));
+                    Some(token_usage.input)
+                })
+                .collect();
+            assert_eq!(totals, TOTALS);
+            let saved = StoredSession::load_from(session.id, dir.path()).unwrap();
+            assert_eq!(
+                SessionJournal::from_session(&saved).unwrap().usage(),
+                journal.usage()
+            );
         });
     }
 
@@ -3109,6 +3608,7 @@ mod tests {
                     id: original,
                     relation: ConversationRelation::Continues,
                     shared: *sent,
+                    cancelled: true,
                 })
             );
         });
@@ -3169,6 +3669,89 @@ mod tests {
             .await;
             assert!(matches!(outcome, TurnOutcome::Failed { .. }));
             assert_eq!(sent, Some(1));
+        });
+    }
+
+    #[test]
+    fn restart_closes_pending_calls_before_the_provider_request() {
+        smol::block_on(async {
+            const CALL_ID: &str = "interrupted-call";
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let assistant = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    CALL_ID,
+                    "bash",
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![
+                Message::user("continue task".into()),
+                assistant.clone(),
+            ]);
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            let outcome = run_admitted(
+                &mut agent,
+                TurnId::generate(),
+                AgentInput {
+                    message: String::new(),
+                    ..default_input()
+                },
+            )
+            .await;
+            assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].len(), 3);
+            assert_eq!(captured[0][1], assistant);
+            assert!(matches!(&captured[0][2].content[0],
+                ContentBlock::ToolResult { tool_use_id, content, is_error: true }
+                if tool_use_id == CALL_ID && content == super::super::history::RESTART_TOOL_INTERRUPTION));
+        });
+    }
+
+    #[test]
+    fn dropping_a_partial_stream_does_not_publish_the_response() {
+        const PARTIAL: &str = "uncommitted answer";
+        smol::block_on(async {
+            let provider = StubStreamProvider {
+                delta: Some(PARTIAL),
+                ..Default::default()
+            };
+            let mirror: SharedMessages =
+                Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+            let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+            let (mut agent, events) = make_agent(provider, &mut history);
+            {
+                let mut run = pin!(run_admitted(
+                    &mut agent,
+                    TurnId::generate(),
+                    default_input()
+                ));
+                futures_lite::future::or(
+                    async {
+                        let _ = (&mut run).await;
+                        panic!("stream must remain pending");
+                    },
+                    async {
+                        loop {
+                            if matches!(
+                                events.recv_async().await.unwrap().event,
+                                AgentEvent::TextDelta { .. }
+                            ) {
+                                break;
+                            }
+                        }
+                    },
+                )
+                .await;
+            }
+            drop(agent);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.as_slice()[0].role, Role::User);
+            assert_eq!(mirror.load().messages.as_slice(), history.as_slice());
         });
     }
 
@@ -3469,7 +4052,7 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Failed { num_turns: 0, .. }));
         assert!(agent.mode_def.is_none());
         assert_eq!(agent.history.conversation().sent, None);
-        assert_eq!(agent.history.continue_conversation(), None);
+        assert_eq!(agent.history.continue_cancelled_conversation(), None);
         assert_eq!(agent.history.conversation().previous, None);
     }
 

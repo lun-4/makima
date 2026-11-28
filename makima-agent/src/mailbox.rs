@@ -1,5 +1,6 @@
+use makima_domain::LockExt;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use makima_providers::Message;
@@ -67,10 +68,6 @@ pub struct SessionMailbox {
 
 pub struct PreparedSessionMailbox(SessionMailbox);
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 fn push_locked(state: &mut State, text: String, wake: bool) {
     if state.pending.len() == MAILBOX_CAPACITY {
         state.pending.pop_front();
@@ -127,7 +124,7 @@ impl SessionMailbox {
 
     /// Registers a running tool call so Ctrl+B and `task_stop` can find it.
     pub fn register_call(&self, scope: Arc<CallScope>) {
-        lock(&self.state).calls.push(CallEntry {
+        self.state.lock_unpoisoned().calls.push(CallEntry {
             scope,
             started_at: Instant::now(),
             moved: false,
@@ -141,7 +138,7 @@ impl SessionMailbox {
     /// which decides what the model is told.
     pub fn move_call(&self, id: &str, moved_by: MovedBy) -> Result<(), BackgroundMoveError> {
         let scope = {
-            let mut state = lock(&self.state);
+            let mut state = self.state.lock_unpoisoned();
             let scope = {
                 let entry = state
                     .calls
@@ -168,7 +165,7 @@ impl SessionMailbox {
                 return Err(error.into());
             }
         };
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         if let Some(entry) = state.calls.iter_mut().find(|entry| entry.scope.id() == id) {
             entry.trigger = Some(trigger);
         }
@@ -177,7 +174,7 @@ impl SessionMailbox {
 
     /// A move that never happened leaves no receipt behind.
     fn unmark_call(&self, id: &str) {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         state.outstanding.retain(|known| known != id);
         if let Some(entry) = state.calls.iter_mut().find(|entry| entry.scope.id() == id)
             && entry.trigger.is_none()
@@ -190,7 +187,7 @@ impl SessionMailbox {
     /// user just pressed Ctrl+B on. `agent` narrows it to one chat's calls.
     pub fn move_latest_for(&self, agent: Option<AgentId>) -> Result<String, BackgroundMoveError> {
         let id = {
-            let state = lock(&self.state);
+            let state = self.state.lock_unpoisoned();
             state
                 .calls
                 .iter()
@@ -213,12 +210,15 @@ impl SessionMailbox {
 
     /// The receipt never went out, so the model does not wait on it.
     pub(crate) fn forget_receipt(&self, id: &str) {
-        lock(&self.state).outstanding.retain(|known| known != id);
+        self.state
+            .lock_unpoisoned()
+            .outstanding
+            .retain(|known| known != id);
     }
 
     /// A foreground call ended: nothing waits on it.
     pub(crate) fn finish_call(&self, id: &str) {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         state.calls.retain(|entry| entry.scope.id() != id);
         state.outstanding.retain(|known| known != id);
     }
@@ -226,7 +226,7 @@ impl SessionMailbox {
     /// The moved work ended and its result is ready. `false` when the model
     /// never got a receipt, so the result must not answer anything.
     pub(crate) fn settle_call(&self, id: &str, text: String, wake: bool) -> bool {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         state.calls.retain(|entry| entry.scope.id() != id);
         let tracked = state.outstanding.iter().position(|known| known == id);
         let Some(index) = tracked else {
@@ -246,7 +246,7 @@ impl SessionMailbox {
     /// Stops one moved call. Its final result still arrives as a message.
     pub fn stop_call(&self, id: &str) -> Result<(), String> {
         let trigger = {
-            let mut state = lock(&self.state);
+            let mut state = self.state.lock_unpoisoned();
             let Some(entry) = state
                 .calls
                 .iter_mut()
@@ -262,7 +262,8 @@ impl SessionMailbox {
     }
 
     pub fn background_calls(&self) -> Vec<BackgroundCallInfo> {
-        lock(&self.state)
+        self.state
+            .lock_unpoisoned()
             .calls
             .iter()
             .map(|entry| BackgroundCallInfo {
@@ -277,21 +278,21 @@ impl SessionMailbox {
     }
 
     pub fn outstanding(&self) -> usize {
-        lock(&self.state).outstanding.len()
+        self.state.lock_unpoisoned().outstanding.len()
     }
 
     pub(crate) fn push(&self, text: String, wake: bool) {
-        push_locked(&mut lock(&self.state), text, wake);
+        push_locked(&mut self.state.lock_unpoisoned(), text, wake);
     }
 
     pub fn drain(&self) -> Vec<Message> {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         state.wake = false;
         state.pending.drain(..).collect()
     }
 
     pub fn claim_wake(&self) -> Vec<Message> {
-        let mut state = lock(&self.state);
+        let mut state = self.state.lock_unpoisoned();
         if !state.wake {
             return Vec::new();
         }

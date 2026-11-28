@@ -2,9 +2,10 @@
 //! Everything transport specific stays private to this module, so isahc can be
 //! swapped out without touching the Lua API.
 
+use makima_domain::LockExt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use futures_lite::future;
@@ -120,10 +121,6 @@ enum BodyState {
 
 type SharedBody = Arc<Mutex<BodyState>>;
 
-fn lock_body(body: &SharedBody) -> MutexGuard<'_, BodyState> {
-    body.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 pub(crate) struct LuaResponse {
     status: u16,
     headers: Vec<(String, String)>,
@@ -139,7 +136,7 @@ impl LuaResponse {
     /// stream is left at an unknown position.
     async fn next_chunk(&mut self) -> Result<Option<&[u8]>, String> {
         let mut body = {
-            let mut state = lock_body(&self.body);
+            let mut state = self.body.lock_unpoisoned();
             match std::mem::replace(&mut *state, BodyState::Reading) {
                 BodyState::Open(body) => body,
                 BodyState::Finished => {
@@ -158,7 +155,7 @@ impl LuaResponse {
             Err(io::Error::new(io::ErrorKind::TimedOut, IDLE_TIMEOUT_ERR))
         };
         let read = future::or(body.read(&mut self.buf), idle).await;
-        let mut state = lock_body(&self.body);
+        let mut state = self.body.lock_unpoisoned();
         if !matches!(*state, BodyState::Reading) {
             return Err(CLOSED_ERR.to_string());
         }
@@ -297,7 +294,7 @@ async fn send(lua: Lua, request: Table) -> LuaResult<Pair<LuaResponse>> {
     // Outside a task scope nothing ends the handle but `close` and GC.
     let _ = register_defer_close(
         &lua,
-        Box::new(move || *lock_body(&body) = BodyState::Closed),
+        Box::new(move || *body.lock_unpoisoned() = BodyState::Closed),
     );
     Ok((Some(response), None))
 }
@@ -326,7 +323,7 @@ async fn read(lua: Lua, mut this: UserDataRefMut<LuaResponse>) -> LuaResult<Pair
 /// res:close()
 #[lua_fn]
 fn close(_lua: &Lua, this: &mut LuaResponse) -> LuaResult<()> {
-    *lock_body(&this.body) = BodyState::Closed;
+    *this.body.lock_unpoisoned() = BodyState::Closed;
     Ok(())
 }
 

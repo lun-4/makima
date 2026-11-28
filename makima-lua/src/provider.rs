@@ -2,9 +2,10 @@
 //! Every call runs as a job on the Lua thread; nothing here touches Lua from
 //! any other thread.
 
+use makima_domain::LockExt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use flume::Sender;
@@ -466,7 +467,7 @@ pub(crate) struct ProviderConfigs(Mutex<Option<(ConfigStamp, Arc<ProvidersConfig
 impl ProviderConfigs {
     fn current(&self) -> Arc<ProvidersConfig> {
         let stamp = providers::file_stamp();
-        let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cached = self.0.lock_unpoisoned();
         if let Some((cached_stamp, config)) = &*cached
             && *cached_stamp == stamp
         {
@@ -597,12 +598,8 @@ struct EmitTarget {
 struct Emitter(Arc<Mutex<Option<EmitTarget>>>);
 
 impl Emitter {
-    fn lock(&self) -> MutexGuard<'_, Option<EmitTarget>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn send(&self, event: ProviderEvent) -> bool {
-        let mut target = self.lock();
+        let mut target = self.0.lock_unpoisoned();
         let Some(target) = target.as_mut() else {
             return false;
         };
@@ -617,7 +614,8 @@ impl Emitter {
     }
 
     fn mark_delivery(&self) -> bool {
-        self.lock()
+        self.0
+            .lock_unpoisoned()
             .as_ref()
             .is_some_and(|target| target.delivery.mark())
     }
@@ -627,7 +625,7 @@ struct CloseOnDrop(Emitter);
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        self.0.lock().take();
+        self.0.0.lock_unpoisoned().take();
     }
 }
 

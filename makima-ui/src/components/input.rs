@@ -60,6 +60,7 @@ pub enum InputAction {
     None,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
@@ -138,7 +139,7 @@ impl InputBox {
                 return InputAction::ContinueLine;
             }
             KeyCode::Enter => {
-                return match self.submit() {
+                return match self.current_submission() {
                     Some(sub) => InputAction::Submit(sub),
                     None => InputAction::Submit(Submission::empty()),
                 };
@@ -269,15 +270,29 @@ impl InputBox {
         self.buffer.add_line();
     }
 
-    pub fn submit(&mut self) -> Option<Submission> {
+    fn current_submission(&self) -> Option<Submission> {
         let text = self.buffer.value().trim().to_string();
-        let images = mem::take(&mut self.pending_images);
-        if text.is_empty() && images.is_empty() {
+        if text.is_empty() && self.pending_images.is_empty() {
             return None;
         }
-        self.history.push(text.clone());
-        self.discard();
-        Some(Submission { text, images })
+        Some(Submission {
+            text,
+            images: self.pending_images.clone(),
+        })
+    }
+
+    pub(crate) fn accept_submission(&mut self, sub: &Submission) {
+        if self.current_submission().as_ref() == Some(sub) {
+            self.history.push(sub.text.clone());
+            self.discard();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit(&mut self) -> Option<Submission> {
+        let sub = self.current_submission()?;
+        self.accept_submission(&sub);
+        Some(sub)
     }
 
     pub(crate) fn take_pending_images(&mut self) -> Vec<ImageSource> {
@@ -1223,9 +1238,11 @@ abcdef"
             for c in text.chars() {
                 input.handle_key(key(KeyCode::Char(c)));
             }
-            assert!(
-                matches!(input.handle_key(key(KeyCode::Enter)), InputAction::Submit(sub) if sub.text == text)
-            );
+            let InputAction::Submit(sub) = input.handle_key(key(KeyCode::Enter)) else {
+                panic!("expected submission");
+            };
+            assert_eq!(sub.text, text);
+            input.accept_submission(&sub);
         }
         for c in "draft".chars() {
             input.handle_key(key(KeyCode::Char(c)));

@@ -45,14 +45,13 @@ fn load_thinking_host(ctx: &mut ToolContext) -> (PluginHost, TrustedTarget) {
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("thinking_policy", PROBE_SRC).unwrap();
     let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
-    let root = manager
-        .create_root_with_config(
-            Some(common::effective_config(ctx)),
-            Vec::new(),
-            None,
-            |_| Ok::<_, String>(Box::new(common::IdleRoot) as Box<dyn ActorBackend>),
-        )
-        .unwrap();
+    let root = smol::block_on(manager.create_root_with_config(
+        Some(common::effective_config(ctx)),
+        Vec::new(),
+        None,
+        |_| Ok::<_, String>(Box::new(common::idle_root()) as Box<dyn ActorBackend>),
+    ))
+    .unwrap();
     ctx.execution_agent_id = Some(root.id());
     let mut template = with_request_tools(&reg, ctx);
     template.registry = Arc::clone(&reg);

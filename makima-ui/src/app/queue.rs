@@ -5,18 +5,24 @@ use makima_agent::actor::{
     AgentActorHandle, PendingQueueEntry, SubmissionId, TurnAdmissionOptions, TurnOrigin,
     TurnProvenance,
 };
-use makima_agent::{AgentId, AgentInput, AgentRef, EffectiveAgentConfig};
+use makima_agent::{
+    AgentId, AgentInput, AgentRef, EffectiveAgentConfig, SubmitOptions, SubmitWhen,
+};
 use makima_commands::COMPACT_COMMAND_NAME;
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{Action, App, Status};
 
-use crate::agent::shared_queue::{QueueItem, QueueSender, visible_pending};
+#[cfg(test)]
+use crate::agent::shared_queue::QueueItem;
+use crate::agent::shared_queue::{QueueSender, visible_pending};
+use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
+pub(crate) const RESTORE_IN_PROGRESS: &str = "Session restore is in progress";
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_SUBAGENT_ERR: &str = "subagent is no longer accepting messages";
 
@@ -141,10 +147,15 @@ impl MessageQueue {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_root_user_work(&mut self) {
         if let Some(ref shared) = self.shared {
             shared.clear_user_work();
         }
+        self.unfocus_root();
+    }
+
+    pub(crate) fn unfocus_root(&mut self) {
         if !self.child_selected {
             self.unfocus();
         }
@@ -159,6 +170,7 @@ impl MessageQueue {
         self.shared.as_ref()?.effective_config()
     }
 
+    #[cfg(test)]
     pub(crate) fn root_text_messages(&self) -> Vec<String> {
         self.shared
             .as_ref()
@@ -234,6 +246,9 @@ impl App {
     /// Submits raw keyboard input to the focused actor after reference expansion.
     /// The caller handles slash commands, `exit`, and shell prefixes.
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if self.restore_in_progress {
+            return SubmitOutcome::Rejected(RESTORE_IN_PROGRESS.into());
+        }
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR.into());
         }
@@ -250,28 +265,27 @@ impl App {
         self.submit_to_focused_actor(msg)
     }
 
-    /// Keyboard path: nobody is around to receive an `Err`, so
-    /// rejections flash on screen instead.
-    pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
-        match self.submit_prompt(msg) {
+    pub(super) fn submit_or_queue(&mut self, sub: &Submission, text: String) -> Vec<Action> {
+        let actions = match self.submit_prompt(QueuedMessage {
+            text,
+            images: sub.images.clone(),
+        }) {
             SubmitOutcome::Started(actions) => actions,
             SubmitOutcome::Queued => vec![],
-            SubmitOutcome::Rejected(e) => {
-                self.flash(e);
-                vec![]
+            SubmitOutcome::Rejected(error) => {
+                self.flash(error);
+                return vec![];
             }
-        }
+        };
+        self.accept_submission(sub);
+        actions
     }
 
     fn submit_to_focused_actor(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if self.active_subagent_closed() {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         }
-        let Some(target) = self
-            .command_runtime
-            .target_agent(&self.command_target)
-            .filter(|target| Some(target.id()) == self.selected_agent_id())
-        else {
+        let Some(target) = self.focused_input_target() else {
             return SubmitOutcome::Rejected(NO_SUBAGENT_ERR.into());
         };
         let input = self.build_agent_input(&msg);
@@ -291,21 +305,28 @@ impl App {
     pub(super) fn admit_user_turn(
         &mut self,
         target: &AgentRef,
-        mut input: AgentInput,
+        input: AgentInput,
         display: Option<String>,
     ) -> Result<bool, String> {
         let actor = target
             .validate_live()
             .and_then(|()| target.actor())
             .map_err(|error| error.to_string())?;
-        let root = self.chats[0].agent_id == Some(target.id());
-        input.preamble = self.shell.results_for(Some(target.id())).to_vec();
-        if root {
-            input
-                .preamble
-                .extend_from_slice(self.shell.results_for(None));
+        self.admit_user_turn_on(target, actor, input, display)
+    }
+
+    pub(super) fn admit_user_turn_on(
+        &mut self,
+        target: &AgentRef,
+        actor: AgentActorHandle,
+        input: AgentInput,
+        display: Option<String>,
+    ) -> Result<bool, String> {
+        if self.restore_in_progress {
+            return Err(RESTORE_IN_PROGRESS.into());
         }
-        let starting = root && self.status != Status::Streaming;
+        let root = self.chats[0].agent_id == Some(target.id());
+        let starting = root && self.status != Status::Streaming && !actor.input_held();
         let reserved = starting.then(|| actor.reserve_presentation(self.run_id));
         let images = input.images.clone();
         let options = TurnAdmissionOptions {
@@ -317,22 +338,22 @@ impl App {
             displayed_presentation: reserved,
             ..Default::default()
         };
-        let landed = if display.is_some() {
-            actor
-                .submit_presented(input, None, String::new(), options)
-                .map(|(_, presentation)| reserved.and(Some(presentation)))
-        } else {
-            actor
-                .admit_turn_with_options(input, None, String::new(), options)
-                .map(|_| reserved)
-        }
-        .map_err(|error| error.to_string())?;
-        self.shell.drain_results_for(Some(target.id()));
-        if root {
-            self.shell.drain_results();
-        }
-        if let Some(run_id) = landed {
-            self.record_run_start(run_id);
+        let (_, presentation) = target
+            .submit(
+                input,
+                SubmitOptions {
+                    when: if display.is_some() {
+                        SubmitWhen::Join
+                    } else {
+                        SubmitWhen::Queue
+                    },
+                    admission: options,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if reserved.is_some() {
+            self.record_run_start(presentation);
             if let Some(text) = display {
                 self.main_chat().show_user_message(text, images);
             }
@@ -343,6 +364,7 @@ impl App {
     /// Deferred path: the agent is busy, so park the message and let
     /// `QueueItemConsumed` draw it once the agent picks it up. Returns
     /// false when there is no shared queue, meaning the message was dropped.
+    #[cfg(test)]
     pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
         let Some(ref shared) = self.queue.shared else {
             return false;
@@ -354,22 +376,6 @@ impl App {
                 displayed: None,
             })
             .is_ok()
-    }
-
-    /// Push restored queue items only here, never in `restore_display`, which
-    /// runs before the loaded or rewound history is committed.
-    pub(crate) fn flush_restored_queue(&mut self) {
-        // The live queue owns the text from here on, so the recovery
-        // snapshot must stop overriding it on save.
-        self.recoverable_queue.clear();
-        // Read, not taken: the live queue is what the next checkpoint mirrors
-        // back into the session, so emptying it here changes nothing on disk.
-        for text in self.state.session.meta.queued_messages.clone() {
-            self.queue_and_notify(QueuedMessage {
-                text,
-                images: Vec::new(),
-            });
-        }
     }
 
     pub(crate) fn start_mailbox_run(
@@ -397,11 +403,6 @@ impl App {
     }
 
     pub(super) fn record_run_start(&mut self, run_id: u64) {
-        self.recoverable_queue.clear();
-        self.record_presentation_start(run_id);
-    }
-
-    pub(super) fn record_presentation_start(&mut self, run_id: u64) {
         self.run_id = run_id;
         self.queue.set_run_id(run_id);
         self.clear_exit_request();
@@ -409,7 +410,7 @@ impl App {
         self.status = Status::Streaming;
         // The turn runs on whatever the model is now; a change after this
         // point lands on the next turn.
-        self.run_model = Some(self.state.session.model.clone());
+        self.run_model = Some(self.root_config().model.spec());
         self.run_context_window = Some(self.root_config().model.context_window);
     }
 }

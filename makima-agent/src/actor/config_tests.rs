@@ -44,6 +44,7 @@ fn admitted_prompt_dependencies_remain_pinned() {
                     mcp_prompt: None,
                     resolved: Some(resolved_rx.clone()),
                     ready: None,
+                    context: None,
                 }));
                 snapshot
             }

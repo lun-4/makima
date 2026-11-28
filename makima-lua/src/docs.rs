@@ -90,6 +90,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::completion::DOCS,
         &api::perf::DOCS,
         &api::store::DOCS,
+        &api::state::DOCS,
         &api::autocmd::DOCS,
         &api::slot::DOCS,
         &api::agent::DOCS,
@@ -197,6 +198,7 @@ mod tests {
                     crate::api::keymap::PendingKeymaps::new(),
                 )),
                 pending_store: Arc::new(std::sync::Mutex::new(crate::api::store::Store::default())),
+                pending_state: crate::api::state::PendingState::default(),
                 pending_options: Arc::new(std::sync::Mutex::new(None)),
                 pending_sources: Arc::new(std::sync::Mutex::new(
                     crate::api::completion::PendingCompletionStore::default(),

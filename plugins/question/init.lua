@@ -35,6 +35,7 @@ end
 
 makima.api.register_tool({
   name = "question",
+  resumable = true,
   description = DESCRIPTION,
   schema = {
     type = "object",

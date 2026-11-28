@@ -1,13 +1,13 @@
+use makima_domain::LockExt;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use makima_providers::{ImageSource, Message};
+use makima_storage::id::MakimaId;
 
-use super::{
-    ActorInner, ActorLifecycle, AgentActorHandle, EffectiveAgentConfig, TurnProvenance, TurnTicket,
-};
+use super::{ActorInner, ActorLifecycle, EffectiveAgentConfig, TurnProvenance, TurnTicket};
 use crate::{AgentId, AgentInput, CurrentManagedTurn, TurnId};
 
 pub const MAX_PENDING_INSTRUCTIONS: usize = 64;
@@ -65,6 +65,7 @@ pub enum PendingQueueEntry {
 #[derive(Clone)]
 pub struct PendingSubmission {
     pub id: SubmissionId,
+    pub(crate) journal_id: Option<MakimaId>,
     pub turn_id: TurnId,
     pub text: String,
     pub images: Vec<ImageSource>,
@@ -73,6 +74,7 @@ pub struct PendingSubmission {
 }
 
 pub(super) struct InstructionEntry {
+    pub journal_id: Option<MakimaId>,
     pub presentation: PendingSubmission,
     pub input: AgentInput,
     pub provenance: TurnProvenance,
@@ -141,7 +143,7 @@ impl ActorTurnInbox {
     fn unsettled_reporting_child(
         current: &CurrentManagedTurn,
         skipped: &[AgentId],
-    ) -> Option<(AgentId, AgentActorHandle, TurnTicket)> {
+    ) -> Option<(AgentId, TurnTicket)> {
         let manager = current.manager();
         current
             .node_snapshot()
@@ -154,7 +156,7 @@ impl ActorTurnInbox {
                 if !actor.reports_to_parent() {
                     return None;
                 }
-                Some((child_id, actor.clone(), actor.unsettled_ticket()?))
+                Some((child_id, actor.unsettled_ticket()?))
             })
     }
 
@@ -162,11 +164,10 @@ impl ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return true;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let pending_completions = await_completions && !state.deliveries.is_empty();
+        let mut state = inner.state.lock_unpoisoned();
+        let pending_completions = await_completions
+            && !state.deliveries.is_empty()
+            && !super::delivery::held(&inner, &state);
         let Some(inbox) = state.instructions.get_mut(&self.turn_id) else {
             return true;
         };
@@ -188,10 +189,7 @@ impl TurnInbox for ActorTurnInbox {
 
     fn take_initial_submission(&self) -> Option<PendingSubmission> {
         let inner = self.inner.upgrade()?;
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         let submission = state.instructions.get_mut(&self.turn_id)?.initial.take()?;
         state.emit(super::ActorEvent::SubmissionConsumed(submission.clone()));
         Some(submission)
@@ -201,10 +199,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return Vec::new();
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if state.lifecycle != ActorLifecycle::Open {
             return Vec::new();
         }
@@ -217,7 +212,9 @@ impl TurnInbox for ActorTurnInbox {
         let mut inputs = Vec::with_capacity(inbox.pending.len());
         for entry in inbox.pending.drain(..) {
             inbox.drained.push((entry.provenance, entry.bytes));
-            inputs.push((entry.presentation, entry.input));
+            let mut presentation = entry.presentation;
+            presentation.journal_id = entry.journal_id;
+            inputs.push((presentation, entry.input));
         }
         for (submission, _) in &inputs {
             state.emit(super::ActorEvent::SubmissionConsumed(submission.clone()));
@@ -262,12 +259,11 @@ impl TurnInbox for ActorTurnInbox {
                 return;
             }
             let mut skipped = Vec::new();
-            while let Some((child_id, actor, ticket)) =
-                Self::unsettled_reporting_child(current, &skipped)
+            while let Some((child_id, ticket)) = Self::unsettled_reporting_child(current, &skipped)
             {
                 let waited = match current
                     .lease()
-                    .observe_descendant(current, child_id, &actor, ticket, None)
+                    .observe_descendant(current, child_id, ticket, None)
                 {
                     Ok(wait) => wait.wait().await.is_ok(),
                     Err(_) => false,
@@ -283,10 +279,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if let Some(inbox) = state.instructions.get_mut(&self.turn_id) {
             inbox.open = false;
         }
@@ -296,10 +289,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let mut state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = inner.state.lock_unpoisoned();
         if let Some(inbox) = state.instructions.get_mut(&self.turn_id) {
             inbox.drained.clear();
         }
@@ -309,10 +299,7 @@ impl TurnInbox for ActorTurnInbox {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
-        let state = inner
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = inner.state.lock_unpoisoned();
         state
             .instructions
             .get(&self.turn_id)

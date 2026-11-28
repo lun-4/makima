@@ -1,7 +1,8 @@
 //! One tool call's cancel subtree and the one gate that decides whether the
 //! call still answers its turn or has moved to the background.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use makima_domain::LockExt;
+use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 use makima_storage::id::MakimaId;
@@ -115,11 +116,11 @@ impl CallScope {
     }
 
     pub fn home(&self) -> Option<CallHome> {
-        self.lock().home.clone()
+        self.state.lock_unpoisoned().home.clone()
     }
 
     pub fn is_moved(&self) -> bool {
-        self.lock().home.is_some()
+        self.state.lock_unpoisoned().home.is_some()
     }
 
     pub fn moved_listener(&self) -> event_listener::EventListener {
@@ -136,7 +137,7 @@ impl CallScope {
     /// Detaches the call from the turn and hands its trigger to the mover.
     pub fn move_to(&self, home: CallHome) -> Result<CancelTrigger, MoveError> {
         let trigger = {
-            let mut state = self.lock();
+            let mut state = self.state.lock_unpoisoned();
             if state.home.is_some() || state.trigger.is_none() || state.foreground {
                 return Err(MoveError::AlreadyMoved);
             }
@@ -152,7 +153,7 @@ impl CallScope {
             drop(trigger);
             return Err(MoveError::Cancelled);
         }
-        self.lock().home = Some(home);
+        self.state.lock_unpoisoned().home = Some(home);
         if let Some(tx) = &self.move_tx {
             let _ = tx.try_send(self.id.clone());
         }
@@ -171,7 +172,7 @@ impl CallScope {
 
     /// The call finished before a move: its result answers the turn.
     pub fn claim_foreground(&self) -> bool {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         if state.home.is_some() || state.foreground || state.receipt {
             return false;
         }
@@ -182,7 +183,7 @@ impl CallScope {
     /// A move that still owes the model a receipt. `false` when the call
     /// already claimed its foreground result, which the turn still waits for.
     pub fn claim_receipt(&self) -> bool {
-        let mut state = self.lock();
+        let mut state = self.state.lock_unpoisoned();
         if state.home.is_some() && !state.foreground {
             state.receipt = true;
             true
@@ -193,12 +194,12 @@ impl CallScope {
 
     /// The model holds a receipt, so the task's result belongs to the mailbox.
     pub fn receipt(&self) -> bool {
-        self.lock().receipt
+        self.state.lock_unpoisoned().receipt
     }
 
     /// Ends the call unless a move took it first. `false` when the move won.
     pub fn end(&self) -> bool {
-        let trigger = self.lock().trigger.take();
+        let trigger = self.state.lock_unpoisoned().trigger.take();
         match trigger {
             Some(trigger) => {
                 trigger.cancel();
@@ -206,10 +207,6 @@ impl CallScope {
             }
             None => false,
         }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, CallState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

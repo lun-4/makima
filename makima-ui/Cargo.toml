@@ -37,7 +37,6 @@ base64 = { workspace = true }
 nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
 ignore = { workspace = true }
-async-process = { workspace = true }
 libc = { workspace = true }
 strum = { workspace = true }
 termini = { workspace = true }

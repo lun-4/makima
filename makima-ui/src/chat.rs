@@ -12,13 +12,16 @@ use crate::components::{DisplayMessage, DisplayRole, RetryInfo, ToolRole, ToolSt
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
+use makima_agent::session::AnswerKey;
 use makima_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use makima_agent::{
-    AgentEvent, AgentId, BufferSnapshot, Post, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, AgentId, AgentRef, BufferSnapshot, Post, PostLevel, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnId,
 };
 use makima_config::{ToolKey, ToolOutputLines, UiConfig};
 use makima_lua::WinView;
 use makima_providers::{ContentBlock, ImageSource, Message, ObservationSource, Role};
+use makima_storage::id::MakimaId;
 use makima_storage::sessions::StoredPost;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -26,7 +29,7 @@ use ratatui::style::Color;
 
 use crate::repaint::{Cadence, Dirty};
 use crate::theme::ThemesProvider;
-use std::time::Instant;
+use std::time::SystemTime;
 
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
@@ -51,11 +54,13 @@ pub enum ChatEventResult {
     },
     Error(String),
     PermissionRequest {
-        id: String,
+        ask: AnswerKey,
         tool: ToolKey,
         scopes: Vec<String>,
     },
-    AuthRequired,
+    AuthRequired {
+        ask: AnswerKey,
+    },
 }
 
 pub struct Chat {
@@ -74,7 +79,8 @@ pub struct Chat {
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     finished: bool,
-    started_at: Option<Instant>,
+    started_at: Option<SystemTime>,
+    turn: Option<TurnId>,
 }
 
 impl Chat {
@@ -98,15 +104,21 @@ impl Chat {
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle, theme_provider),
             finished: false,
             started_at: None,
+            turn: None,
         }
     }
 
-    pub fn started_at(&self) -> Option<Instant> {
+    pub fn started_at(&self) -> Option<SystemTime> {
         self.started_at
     }
 
     pub(crate) fn set_started_at_now(&mut self) {
-        self.started_at = Some(Instant::now());
+        self.started_at = Some(SystemTime::now());
+    }
+
+    pub(crate) fn restore_turn(&mut self, turn: Option<TurnId>, started_at: Option<SystemTime>) {
+        self.turn = turn;
+        self.started_at = started_at;
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -115,6 +127,10 @@ impl Chat {
 
     pub(crate) fn set_restore_channel(&mut self, event_tx: Option<makima_agent::EventSender>) {
         self.messages_panel.set_restore_channel(event_tx);
+    }
+
+    pub(crate) fn set_restore_target(&mut self, target: Option<AgentRef>) {
+        self.messages_panel.set_restore_target(target);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
@@ -210,12 +226,14 @@ impl Chat {
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
-            AgentEvent::PermissionRequest { id, tool, scopes } => {
-                return ChatEventResult::PermissionRequest { id, tool, scopes };
+            AgentEvent::PermissionRequest {
+                ask, tool, scopes, ..
+            } => {
+                return ChatEventResult::PermissionRequest { ask, tool, scopes };
             }
             AgentEvent::Question { .. } => {}
-            AgentEvent::AuthRequired => {
-                return ChatEventResult::AuthRequired;
+            AgentEvent::AuthRequired { ask } => {
+                return ChatEventResult::AuthRequired { ask };
             }
             AgentEvent::ToolSnapshot {
                 id,
@@ -403,12 +421,16 @@ impl Chat {
         self.messages_panel.result_navigation_at(row, area)
     }
 
-    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<&str> {
+    pub fn post_agent_at(&self, row: u16, area: Rect) -> Option<AgentId> {
         self.messages_panel.post_agent_at(row, area)
     }
 
     pub fn handle_click(&mut self, row: u16, area: Rect) {
         self.messages_panel.handle_click(row, area);
+    }
+
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
     }
 
     pub fn tool_snapshot(
@@ -456,9 +478,18 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
-    pub fn reopen(&mut self) {
+    /// Marks the chat running for {turn}. The age restarts only for a new
+    /// turn or a finished chat, and a turn's age counts from its admission.
+    pub fn reopen(&mut self, turn: Option<TurnId>) {
+        let new_turn = turn.is_some() && turn != self.turn;
+        if self.finished || new_turn || self.started_at.is_none() {
+            self.started_at = Some(
+                turn.and_then(|turn| turn.created_at())
+                    .unwrap_or_else(SystemTime::now),
+            );
+        }
+        self.turn = turn.or(self.turn);
         self.finished = false;
-        self.started_at = Some(Instant::now());
     }
 
     pub fn mark_finished(&mut self, role: DisplayRole, text: &str) {
@@ -507,6 +538,7 @@ impl Chat {
         self.messages_panel.push(post_message(post));
     }
 
+    #[cfg(test)]
     pub fn push_user_message(&mut self, text: impl Into<String>) {
         self.messages_panel
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
@@ -598,29 +630,62 @@ pub fn history_to_display(
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
-    history_to_display_with_lookup(messages, tool_outputs, tool_output_lines, posts, &|_| false)
+    history_to_display_with_target(messages, tool_outputs, tool_output_lines, posts, None, &[])
 }
 
-pub(crate) fn history_to_display_with_lookup(
+pub(crate) fn history_to_display_with_target(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
     posts: &[&StoredPost],
-    available: &impl Fn(AgentId) -> bool,
+    state_target: Option<AgentRef>,
+    message_ids: &[MakimaId],
 ) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
+    history_to_display_with_notes(
+        messages,
+        tool_outputs,
+        tool_output_lines,
+        posts,
+        state_target,
+        (message_ids, &HashMap::new()),
+    )
+}
+
+pub(crate) fn history_to_display_with_notes(
+    messages: &[Message],
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
+    tool_output_lines: &ToolOutputLines,
+    posts: &[&StoredPost],
+    state_target: Option<AgentRef>,
+    context: (&[MakimaId], &HashMap<MakimaId, String>),
+) -> (Vec<DisplayMessage>, Vec<makima_lua::RestoreItem>) {
+    let (message_ids, fork_notes) = context;
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<makima_lua::RestoreItem> = Vec::new();
+    let mut turn = 0;
     for (boundary, msg) in messages.iter().enumerate() {
-        push_posts_at(&mut display, posts, boundary, messages.len());
+        push_posts_at(&mut display, posts, boundary, message_ids);
+        if let Some(note) = message_ids.get(boundary).and_then(|id| fork_notes.get(id)) {
+            display.push(DisplayMessage::new(
+                DisplayRole::Done,
+                format!("Rewound from turn {}", turn + 1),
+            ));
+            display.push(DisplayMessage::new(
+                DisplayRole::Post(PostLevel::Info),
+                note.clone(),
+            ));
+            continue;
+        }
         if msg.is_observation() {
-            if let Some(notice) = child_result_notice(msg, available) {
+            if let Some(notice) = child_result_notice(msg) {
                 display.push(notice);
             }
             continue;
         }
         match msg.role {
             Role::User => {
+                turn += 1;
                 // An empty `display_text` marks a message the transcript never
                 // shows, so its attachments must not sneak in either.
                 if msg.display_text.as_deref() == Some("") {
@@ -708,6 +773,7 @@ pub(crate) fn history_to_display_with_lookup(
                                     theme_gen: None,
                                     clicks: Vec::new(),
                                     state,
+                                    state_target: state_target.clone(),
                                 });
                             }
                             display.push(DisplayMessage {
@@ -725,7 +791,6 @@ pub(crate) fn history_to_display_with_lookup(
                                 annotation,
                                 plan_path: None,
                                 result_agent: None,
-                                result_historical: false,
                                 result_expanded: false,
                                 result_preview: None,
                                 post_agent: None,
@@ -744,14 +809,11 @@ pub(crate) fn history_to_display_with_lookup(
             }
         }
     }
-    push_posts_at(&mut display, posts, messages.len(), messages.len());
+    push_posts_at(&mut display, posts, messages.len(), message_ids);
     (display, restore_items)
 }
 
-fn child_result_notice(
-    message: &Message,
-    available: &impl Fn(AgentId) -> bool,
-) -> Option<DisplayMessage> {
+fn child_result_notice(message: &Message) -> Option<DisplayMessage> {
     let ObservationSource::ChildResult { agent_id, turn_id } =
         message.observation_source.as_ref()?;
     let payload = message
@@ -768,10 +830,12 @@ fn child_result_notice(
     let source = envelope["label"].as_str().unwrap_or(agent_id);
     let text = envelope["text"].as_str()?;
     let output = envelope["output"].as_array().map_or(&[][..], Vec::as_slice);
-    let agent_id = agent_id.parse().ok().filter(|id| available(*id));
-    let mut notice = format_child_result_notice(source, text, output, agent_id);
-    notice.result_historical = true;
-    Some(notice)
+    Some(format_child_result_notice(
+        source,
+        text,
+        output,
+        agent_id.parse().ok(),
+    ))
 }
 
 pub(crate) fn format_child_result_notice(
@@ -818,24 +882,32 @@ pub(crate) fn format_child_result_notice(
     notice
 }
 
-/// Posts past the end, as after a compaction shortened the history, land last.
+/// Posts whose anchor is outside the active context are not displayed.
 fn push_posts_at(
     display: &mut Vec<DisplayMessage>,
     posts: &[&StoredPost],
     boundary: usize,
-    message_count: usize,
+    message_ids: &[MakimaId],
 ) {
     display.extend(
         posts
             .iter()
-            .filter(|stored| stored.after_message.min(message_count) == boundary)
+            .filter(|stored| match stored.after_message {
+                None => boundary == 0,
+                Some(id) => {
+                    boundary
+                        .checked_sub(1)
+                        .and_then(|index| message_ids.get(index))
+                        == Some(&id)
+                }
+            })
             .map(|stored| post_message(&stored.post)),
     );
 }
 
 fn post_message(post: &Post) -> DisplayMessage {
     DisplayMessage {
-        post_agent: post.agent.clone(),
+        post_agent: post.agent.as_deref().and_then(|id| id.parse().ok()),
         ..DisplayMessage::new(DisplayRole::Post(post.level), post.text.clone())
     }
 }
@@ -846,6 +918,7 @@ pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: makima_config::ToolOutputLines,
     theme_gen: u64,
+    state_target: Option<AgentRef>,
 ) -> Option<makima_lua::RestoreItem> {
     let DisplayRole::Tool(role) = &msg.role else {
         return None;
@@ -867,6 +940,7 @@ pub(crate) fn restore_item_for(
         theme_gen: Some(theme_gen),
         clicks: Vec::new(),
         state,
+        state_target,
     })
 }
 
@@ -962,6 +1036,31 @@ mod tests {
     const USER_TEXT: &str = "look at this";
     const TASK_ID: &str = "call_t1";
     const REPLY_TEXT: &str = "i see it";
+
+    #[test]
+    fn fork_notes_render_without_cut_off_messages() {
+        const NOTE: &str = "Files may differ. Existing tasks keep running.";
+        let first = MakimaId::generate();
+        let note = MakimaId::generate();
+        let messages = vec![
+            Message::user(USER_TEXT.into()),
+            Message::observation(NOTE.into()),
+        ];
+        let notes = HashMap::from([(note, NOTE.to_owned())]);
+        let (display, _) = history_to_display_with_notes(
+            &messages,
+            &HashMap::new(),
+            &ToolOutputLines::default(),
+            &[],
+            None,
+            (&[first, note], &notes),
+        );
+        assert_eq!(display.len(), 3);
+        assert_eq!(display[0].text, USER_TEXT);
+        assert_eq!(display[1].role, DisplayRole::Done);
+        assert_eq!(display[1].text, "Rewound from turn 2");
+        assert_eq!(display[2].text, NOTE);
+    }
 
     fn image() -> ImageSource {
         ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
@@ -1251,9 +1350,10 @@ mod tests {
     #[test_case(0, 0 ; "before_first_message")]
     #[test_case(1, 1 ; "between_messages")]
     #[test_case(2, 2 ; "after_last_message")]
-    #[test_case(5, 2 ; "past_a_shortened_history")]
+    #[test_case(5, 0 ; "anchor_outside_active_context")]
     fn restored_post_lands_at_its_message_boundary(after_message: usize, expected_index: usize) {
         const POST_TEXT: &str = "reviewer started";
+        let agent_id = AgentId::generate();
         let msgs = vec![
             Message::user(USER_TEXT.into()),
             Message {
@@ -1264,29 +1364,41 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let message_ids = vec![MakimaId::generate(), MakimaId::generate()];
         let post = StoredPost {
-            chat: None,
-            after_message,
+            agent: None,
+            after_message: after_message.checked_sub(1).map(|index| {
+                message_ids
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(MakimaId::generate)
+            }),
             post: Post {
                 text: POST_TEXT.into(),
                 level: PostLevel::Warn,
-                agent: Some(TASK_ID.into()),
+                agent: Some(agent_id.to_string()),
             },
         };
-        let display = history_to_display(
+        let display = history_to_display_with_target(
             &msgs,
             &empty_outputs(),
             &ToolOutputLines::default(),
             &[&post],
+            None,
+            &message_ids,
         )
         .0;
+        if after_message > message_ids.len() {
+            assert_eq!(display.len(), 2);
+            return;
+        }
         assert_eq!(display.len(), 3);
         assert_eq!(
             display[expected_index].role,
             DisplayRole::Post(PostLevel::Warn)
         );
         assert_eq!(display[expected_index].text, POST_TEXT);
-        assert_eq!(display[expected_index].post_agent.as_deref(), Some(TASK_ID));
+        assert_eq!(display[expected_index].post_agent, Some(agent_id));
     }
 
     #[test]
@@ -1305,8 +1417,8 @@ mod tests {
             ..Message::observation(format!("{DELIVERY_HEADER}\n{envelope}"))
         };
         let post = StoredPost {
-            chat: None,
-            after_message: 1,
+            agent: None,
+            after_message: Some(MakimaId::generate()),
             post: Post {
                 text: REPLY_TEXT.into(),
                 level: PostLevel::Warn,
@@ -1318,25 +1430,25 @@ mod tests {
             observation,
             Message::user(REPLY_TEXT.into()),
         ];
-        let display = history_to_display(
+        let display = history_to_display_with_target(
             &messages,
             &empty_outputs(),
             &ToolOutputLines::default(),
             &[&post],
+            None,
+            &[post.after_message.unwrap()],
         )
         .0;
         assert_eq!(display.len(), 4);
         assert_eq!(display[0].text, USER_TEXT);
         assert_eq!(display[1].text, REPLY_TEXT);
         assert_eq!(display[2].role, DisplayRole::Done);
-        assert_eq!(display[2].result_agent, None);
-        assert!(display[2].result_historical);
+        assert_eq!(display[2].result_agent, Some(agent_id));
         assert!(!display[2].result_expanded);
         let full = &display[2].text;
         let preview = display[2].result_preview.as_ref().unwrap();
         let suffix = format!(
-            "{COMPLETION_TRUNCATED}\n[Full result lookup: {reference}]\n[click to expand or collapse]\n[Child transcript unavailable; {} for Tasks]",
-            key::TASKS.label
+            "{COMPLETION_TRUNCATED}\n[Full result lookup: {reference}]\n[click to expand or collapse]\n[View child transcript]"
         );
         assert_eq!(
             *full,
@@ -1658,9 +1770,44 @@ mod tests {
     const RESTORE_THEME_GEN: u64 = 7;
 
     #[test]
+    fn history_and_rebake_restore_items_keep_explicit_agent_target() {
+        let manager = makima_agent::AgentManagerHandle::new(Default::default()).unwrap();
+        let agent = AgentId::generate();
+        let target = manager.reference(agent);
+        let messages = tool_use_pair(
+            "bash",
+            serde_json::json!({"command": "echo"}),
+            RESTORE_OUTPUT,
+            false,
+        );
+        let (_, items) = history_to_display_with_target(
+            &messages,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            &[],
+            Some(target.clone()),
+            &[],
+        );
+        let captured = items[0].state_target.as_ref().unwrap();
+        assert_eq!(captured.id(), agent);
+        assert!(captured.same_manager(&target));
+        let message = tool_msg_with_input("bash");
+        let rebaked = restore_item_for(
+            &message,
+            ToolOutputLines::default(),
+            RESTORE_THEME_GEN,
+            Some(target.clone()),
+        )
+        .unwrap();
+        let captured = rebaked.state_target.unwrap();
+        assert_eq!(captured.id(), agent);
+        assert!(captured.same_manager(&target));
+    }
+
+    #[test]
     fn restore_item_for_round_trips_fields() {
         let msg = tool_msg_with_input("bash");
-        let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN)
+        let item = restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN, None)
             .expect("tool message with input and output must produce a RestoreItem");
         assert_eq!(&*item.tool, "bash");
         assert_eq!(item.tool_use_id, "t1");
@@ -1674,7 +1821,9 @@ mod tests {
     fn restore_item_for_skips_structured_outputs_rust_renders() {
         let mut msg = tool_msg_with_input("edit");
         msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
-        assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
+        assert!(
+            restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN, None).is_none()
+        );
     }
 
     #[test]
@@ -1699,15 +1848,15 @@ mod tests {
         let tol = ToolOutputLines::default();
 
         let plain = DisplayMessage::new(DisplayRole::Assistant, "hi".into());
-        assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&plain, tol, RESTORE_THEME_GEN, None).is_none());
 
         let mut no_input = tool_msg_with_input("bash");
         no_input.tool_raw_input = None;
-        assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&no_input, tol, RESTORE_THEME_GEN, None).is_none());
 
         let mut no_output = tool_msg_with_input("bash");
         no_output.tool_output = None;
-        assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
+        assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN, None).is_none());
     }
 
     #[test]
